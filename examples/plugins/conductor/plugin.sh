@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
-# shux-conductor v0.3 — VT-poll watchdog + settle-snapshot archive
-# + multi-pane window aggregation + OS notifications, for
+# shux-conductor v0.4 — program-status watchdog + settle-snapshot
+# archive + multi-pane window aggregation + OS notifications, for
 # coding-agent panes.
+#
+# v0.4 — program status first. An agent that reports its state over
+# OSC 7501 (Claude Code does) is read through `pane.status`, never
+# scraped: its reported state drives conductor, shux draws its border
+# badge, and a reported `blocked` notifies — it is NEVER auto-dismissed,
+# whatever its screen shows. Panes whose program has not reported fall
+# back to the screen classifier below.
 #
 # Subscribes to pane.created / pane.exited. When a pane's command
 # looks like a known agent (claude / codex / opencode / gemini),
@@ -29,6 +36,7 @@
 #
 # Setup (default-deny permission model in v0.20+):
 #   shux plugin install ./examples/plugins/conductor/plugin.sh
+#   shux plugin grant conductor pane.status    # v0.4+, reported state
 #   shux plugin grant conductor pane.capture
 #   shux plugin grant conductor pane.set_title
 #   shux plugin grant conductor pane.send_keys
@@ -153,21 +161,25 @@ fire_rpc() {
     send_rpc "$method" "$params" "$(next_id)"
 }
 
-# Wait synchronously for a response with the given `id`. Any other
-# inbound frames (events, unrelated responses) are dispatched in
-# the meantime. Returns the response line on stdout. A 5s timeout
-# guards against the daemon hanging — on timeout, returns empty.
+# Wait synchronously for a response with the given `id`, leaving it in
+# AWAIT_RESULT. Any other inbound frames (events, unrelated responses)
+# are dispatched in the meantime -- so this must run in the main shell,
+# never inside $(): there an event's state changes and the RPCs it sends
+# would be lost into the substitution. A 5s timeout guards against the
+# daemon hanging.
+AWAIT_RESULT=""
 await_response() {
     local want="$1"
     local deadline_ms="$(($(epoch_ms) + 5000))"
     local line
+    AWAIT_RESULT=""
     while [ "$(epoch_ms)" -lt "$deadline_ms" ]; do
         if ! IFS= read -r -t 0.5 line; then
             continue
         fi
         case "$line" in
             *"\"id\":$want,"*|*"\"id\":$want}"*)
-                printf '%s' "$line"
+                AWAIT_RESULT="$line"
                 return 0
                 ;;
             *)
@@ -234,6 +246,8 @@ declare -A LAST_TITLE_SET   # pane_id -> last title we wrote (dedup)
 declare -A WINDOW_OF        # pane_id -> window_id (v0.3 — for window-level aggregation)
 declare -A SESSION_OF       # pane_id -> session_id (v0.3 — for notification context)
 declare -A WINDOW_INFLIGHT  # window_id -> count of agent panes whose state is NOT idle
+declare -A REPORTED         # pane_id -> 1 once its program reported status:
+                            # never auto-dismissed again, whatever happens
 declare -A WINDOW_NOTIFIED  # window_id -> 1 if we already fired the "all settled" notification
                             # for this batch (cleared when any pane in the window leaves idle)
 
@@ -245,9 +259,11 @@ maybe_log_permission_hint() {
     PERMISSION_HINT_SENT=1
     {
         echo "conductor: permission denied by daemon. Conductor needs:"
+        echo "  shux plugin grant conductor pane.status"
         echo "  shux plugin grant conductor pane.capture"
         echo "  shux plugin grant conductor pane.set_title"
         echo "  shux plugin grant conductor pane.send_keys"
+        echo "  shux plugin grant conductor pane.snapshot"
     } >&2
 }
 
@@ -299,6 +315,8 @@ handle_pane_exited() {
         unset 'LAST_HASH[$pane_id]'
         unset 'LAST_CHANGE_AT[$pane_id]'
         unset 'LAST_STATE[$pane_id]'
+        unset 'REPORTED[$pane_id]'
+        unset 'STATUS_DENIED_AT[$pane_id]'
         unset 'LAST_TITLE_SET[$pane_id]'
         unset 'WINDOW_OF[$pane_id]'
         unset 'SESSION_OF[$pane_id]'
@@ -326,9 +344,10 @@ capture_pane() {
     local id resp err_code
     id=$(next_id)
     send_rpc "pane.capture" "$params" "$id"
-    if ! resp=$(await_response "$id"); then
+    if ! await_response "$id"; then
         return 1
     fi
+    resp="$AWAIT_RESULT"
     err_code=$(printf '%s' "$resp" | jqr '.error.code // empty')
     if [ -n "$err_code" ]; then
         if [ "$err_code" = "-32004" ]; then
@@ -337,6 +356,55 @@ capture_pane() {
         return 1
     fi
     LAST_CAPTURE_TEXT=$(printf '%s' "$resp" | jqr '.result.text // empty')
+}
+
+# pane.status: sets LAST_STATUS_SEEN (true when the pane's program
+# reports, with the feature on) and LAST_STATUS_STATE (its summary
+# state, empty when nothing is active). Returns 1 when no answer came
+# (denied, error, timeout). A denied pane is asked again after
+# STATUS_RETRY_MS, so a later grant takes effect without a restart;
+# grants can be per pane, so so is the wait.
+LAST_STATUS_SEEN=""
+LAST_STATUS_STATE=""
+STATUS_RETRY_MS=30000
+declare -A STATUS_DENIED_AT  # pane_id -> epoch ms of its last denial
+status_pane() {
+    local pane_id="$1"
+    LAST_STATUS_SEEN=""
+    LAST_STATUS_STATE=""
+    local denied="${STATUS_DENIED_AT[$pane_id]:-0}"
+    if [ "$denied" -gt 0 ] && [ "$(($(epoch_ms) - denied))" -lt "$STATUS_RETRY_MS" ]; then
+        return 1
+    fi
+    local params id resp err_code
+    params=$(jq -cn --arg p "$pane_id" '{pane_id: $p}')
+    id=$(next_id)
+    send_rpc "pane.status" "$params" "$id"
+    if ! await_response "$id"; then
+        return 1
+    fi
+    resp="$AWAIT_RESULT"
+    err_code=$(printf '%s' "$resp" | jqr '.error.code // empty')
+    if [ -n "$err_code" ]; then
+        if [ "$err_code" = "-32004" ]; then
+            STATUS_DENIED_AT[$pane_id]=$(epoch_ms)
+            maybe_log_permission_hint
+        fi
+        return 1
+    fi
+    unset 'STATUS_DENIED_AT[$pane_id]'
+    LAST_STATUS_SEEN=$(printf '%s' "$resp" | jqr '(.result.enabled and .result.seen) // false')
+    LAST_STATUS_STATE=$(printf '%s' "$resp" | jqr '.result.summary.state // empty')
+}
+
+# A reported program state, in conductor's vocabulary.
+state_for_status() {
+    case "$1" in
+        blocked) echo "blocked" ;;
+        working) echo "thinking" ;;
+        error)   echo "error" ;;
+        *)       echo "idle" ;;   # done, idle, or nothing active
+    esac
 }
 
 # Set the pane border title. Deduplicates so we don't churn the bus.
@@ -394,10 +462,11 @@ snapshot_pane_settled() {
     params=$(jq -cn --arg p "$pane_id" '{pane_id: $p}')
     id=$(next_id)
     send_rpc "pane.snapshot" "$params" "$id"
-    if ! resp=$(await_response "$id"); then
+    if ! await_response "$id"; then
         echo "conductor: pane.snapshot timed out for $pane_id" >&2
         return 1
     fi
+    resp="$AWAIT_RESULT"
     err_code=$(printf '%s' "$resp" | jqr '.error.code // empty')
     if [ -n "$err_code" ]; then
         if [ "$err_code" = "-32004" ]; then maybe_log_permission_hint; fi
@@ -490,7 +559,7 @@ maybe_notify_window_settled() {
     if [ "$cur" -gt 0 ]; then return 0; fi
     if [ "${WINDOW_NOTIFIED[$window_id]:-0}" = "1" ]; then return 0; fi
     WINDOW_NOTIFIED[$window_id]=1
-    fire_notification "$window_id"
+    fire_notification "window $window_id: all agent panes idle"
 }
 
 # Backend-aware notification dispatch. NOTIFY=stdout dumps a
@@ -499,9 +568,7 @@ maybe_notify_window_settled() {
 # osascript on macOS, notify-send on Linux, and falls back to
 # stdout if neither is available.
 fire_notification() {
-    local window_id="$1"
-    local body
-    body="window $window_id: all agent panes idle"
+    local body="$1"
     case "$NOTIFY" in
         off)    return 0 ;;
         stdout) echo "conductor[notify]: $body" >&2; return 0 ;;
@@ -524,27 +591,56 @@ fire_notification() {
 # Cheap hash on the captured text decides if anything changed; if
 # the grid is unchanged for >= SETTLE_MS we promote ready → idle.
 poll_tick() {
-    local pane_id agent text hash now state new_state
+    local pane_id agent text hash now state new_state reported
     now=$(epoch_ms)
     for pane_id in "${!TRACKED[@]}"; do
+        # An exit handled during an earlier pane's wait drops this one.
+        [ -n "${TRACKED[$pane_id]:-}" ] || continue
         agent="${TRACKED[$pane_id]}"
-        capture_pane "$pane_id" || continue
-        text="$LAST_CAPTURE_TEXT"
-        hash=$(printf '%s' "$text" | shasum -a 256 | cut -d' ' -f1)
-        if [ "$hash" != "${LAST_HASH[$pane_id]:-}" ]; then
-            LAST_HASH[$pane_id]="$hash"
-            LAST_CHANGE_AT[$pane_id]=$now
-        fi
-        new_state=$(classify_grid "$text")
         state="${LAST_STATE[$pane_id]:-ready}"
-        local since=$((now - LAST_CHANGE_AT[$pane_id]))
-        # Promote ready → idle if the grid has been still for SETTLE_MS.
-        if [ "$new_state" = "ready" ] && [ "$since" -ge "$SETTLE_MS" ]; then
-            new_state="idle"
+        reported=0
+        if status_pane "$pane_id"; then
+            if [ "$LAST_STATUS_SEEN" = "true" ]; then
+                reported=1
+                REPORTED[$pane_id]=1
+            fi
+        elif [ "${REPORTED[$pane_id]:-0}" = "1" ]; then
+            # No answer for a pane that reports: keep what it last said
+            # rather than guess from its screen.
+            continue
         fi
-        # Auto-dismiss stuck prompts.
-        if [ "$new_state" = "stuck" ] && [ "$AUTO_DISMISS" = "1" ]; then
-            send_enter "$pane_id"
+        # ...or during this pane's own status wait.
+        [ -n "${TRACKED[$pane_id]:-}" ] || continue
+        if [ "$reported" = "1" ]; then
+            new_state=$(state_for_status "$LAST_STATUS_STATE")
+            # The screen goes unread meanwhile: a fallback later starts a
+            # fresh settle interval rather than trusting this one.
+            LAST_HASH[$pane_id]=""
+            LAST_CHANGE_AT[$pane_id]=$now
+        else
+            capture_pane "$pane_id" || continue
+            [ -n "${TRACKED[$pane_id]:-}" ] || continue
+            text="$LAST_CAPTURE_TEXT"
+            hash=$(printf '%s' "$text" | shasum -a 256 | cut -d' ' -f1)
+            if [ "$hash" != "${LAST_HASH[$pane_id]:-}" ]; then
+                LAST_HASH[$pane_id]="$hash"
+                LAST_CHANGE_AT[$pane_id]=$now
+            fi
+            new_state=$(classify_grid "$text")
+            local since=$((now - LAST_CHANGE_AT[$pane_id]))
+            # Promote ready → idle if the grid has been still for SETTLE_MS.
+            if [ "$new_state" = "ready" ] && [ "$since" -ge "$SETTLE_MS" ]; then
+                new_state="idle"
+            fi
+            # Auto-dismiss only what the screen alone suggests: a program
+            # that has ever reported its own state is never answered for.
+            if [ "$new_state" = "stuck" ] && [ "$AUTO_DISMISS" = "1" ] \
+                && [ "${REPORTED[$pane_id]:-0}" != "1" ]; then
+                send_enter "$pane_id"
+            fi
+        fi
+        if [ "$new_state" = "blocked" ] && [ "$state" != "blocked" ]; then
+            fire_notification "$agent in pane ${pane_id:0:8} is waiting for you"
         fi
         if [ "$new_state" != "$state" ]; then
             LAST_STATE[$pane_id]="$new_state"
@@ -564,17 +660,22 @@ poll_tick() {
                 note_pane_busy "$pane_id"
             fi
         fi
-        set_pane_title "$pane_id" "$agent · $(emoji_for_state "$new_state")"
+        # A reporting pane's state is shux's border badge; no marker.
+        if [ "$reported" = "1" ]; then
+            set_pane_title "$pane_id" "$agent"
+        else
+            set_pane_title "$pane_id" "$agent · $(emoji_for_state "$new_state")"
+        fi
     done
 }
 
 # --- main loop -----------------------------------------------------
 # Handshake: read the daemon's plugin.init, reply with manifest.
 IFS= read -r _ || exit 1
-printf '%s\n' '{"jsonrpc":"2.0","id":"init","result":{"name":"conductor","version":"0.3.0","subscribes":["pane.created","pane.exited"],"provides":[],"capabilities":[]}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":"init","result":{"name":"conductor","version":"0.4.0","subscribes":["pane.created","pane.exited"],"provides":[],"capabilities":[]}}'
 
 last_poll=$(epoch_ms)
-echo "conductor: v0.3 up (poll_ms=$POLL_MS, settle_ms=$SETTLE_MS, snapshots=$SNAPSHOTS, notify=$NOTIFY)" >&2
+echo "conductor: v0.4 up (poll_ms=$POLL_MS, settle_ms=$SETTLE_MS, snapshots=$SNAPSHOTS, notify=$NOTIFY)" >&2
 
 while true; do
     # Wait briefly for inbound; if nothing arrives, fall through to

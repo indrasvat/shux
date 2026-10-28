@@ -416,6 +416,10 @@ test-vt-dirty-regions: release ## Drive dirty-region tracking evidence, performa
 reap: ## Stop shux daemons from this checkout left behind by an interrupted run
 	@.shux/scripts/reap_daemons.sh
 
+.PHONY: test-conductor
+test-conductor: build ## Conductor reads program status where a pane reports it, and scrapes only where it does not
+	@.shux/scripts/no_leak_guard.sh bash .shux/scripts/conductor_status_check.sh
+
 .PHONY: test-shux-leak-guard
 test-shux-leak-guard: release ## Verify shux automation leak guard catches and kills orphan daemons
 	@echo "$(COLOR_BLUE)▶ Running shux leak-guard self-test...$(COLOR_RESET)"

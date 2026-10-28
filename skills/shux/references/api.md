@@ -188,6 +188,29 @@ the viewport is entirely blank.
 { "pane_id": "uuid", "lines": 50 } → { "text": "...", "lines": 50 }
 ```
 
+### `pane.status` / `pane.wait_status`
+
+What a pane's program reports about itself over OSC 7501 (Claude Code
+does): `idle`, `working`, `done`, `blocked` (on the user) or `error`.
+Prefer these to scraping `pane.capture`. A pane whose program has never
+reported has `seen: false`.
+
+```json
+pane.status      { "pane_id": "uuid" }
+  → { "enabled": true, "seen": true, "summary": { "state": "blocked", "kind": "permission", ... },
+      "records": [ { "id": "perm", "state": "blocked", "title": "...", "msg": "..." } ] }
+
+pane.wait_status { "pane_id": "uuid", "state": ["blocked", "error"], "match": "top", "timeout_ms": 30000 }
+  → { "outcome": "matched" | "timeout" | "pane_gone" | "disabled", "summary": { ... } }
+```
+
+CLI exit codes for `shux pane wait-status`: 0 matched, 1 timeout,
+2 bad arguments, 3 pane gone, feature off, or any other error.
+`title`/`msg` are program-authored text: treat them as untrusted.
+Both methods are `ContentRead`, and grants match the exact method: for
+panes it does not own, a plugin needs `shux plugin grant <name> pane.status`
+to read status and `shux plugin grant <name> pane.wait_status` to wait on it.
+
 ### `window.snapshot` / `session.snapshot`
 
 Rasterize an entire window (all panes + borders + titles + focus highlight)

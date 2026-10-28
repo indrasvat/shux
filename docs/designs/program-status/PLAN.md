@@ -752,6 +752,119 @@ refinements.
   set) must not change. Pane geometry never changes: the badge lives inside
   the title slot.
 
+### 6.2 P2b re-plan: the stale guard (D8), after P2a (2026-10-28)
+
+P2a shipped as #207 (v0.53.0). P2b is the opt-in guard of §5.9, re-planned
+against the code before anything is written. Nothing of D8 exists yet: no
+origin tags, no foreground-group sampling, no `stale_guard` key.
+
+**The problem it solves.**
+- A program reports `working` or `blocked`, then dies without clearing,
+  for example on SIGKILL or when its pane's shell regains the foreground.
+- The pane did not exit, so the exit clear never fires.
+- Only a shell with OSC 133 integration clears it at the next prompt.
+- Without either, the badge and `wait-status` say "blocked" for a program
+  that is gone.
+
+**Anchors on `main` @ bf37adf.**
+- Scanner: `shux-vt/src/program_status.rs`. It already cuts OSC 7501 and
+  133;A across chunk boundaries.
+- Table: `shux-program-status/src/table.rs` (`apply`, `on_prompt_start`,
+  `on_process_exit`, `on_full_reset`).
+- `VirtualTerminal::process` is called from the PTY task in
+  `shux/src/pane_spawn.rs`, which owns the master fd through `PtyHandle`.
+
+**Proposed shape: unchanged from §5.9, made concrete.**
+1. The PTY task calls `tcgetpgrp(master)` before and after each read batch
+   and passes the "before" sample to the VT as a hint (`set_foreground_hint`).
+2. The scanner stores the hint current when an OSC 7501 opens. Sequences
+   span reads, so the sample travels with the scanner state.
+3. A report gets origin tag = pgid only if three samples agree: the open
+   hint, the hint at its finish, and the after-batch sample. It must also not
+   be the shell's own pgid, and not ≤ 1. Otherwise its tag is 0, never swept.
+4. The table keeps an opaque `origin: u64` per entry.
+   `drop_origin(tag)` removes only working/blocked/idle entries with it.
+   Done and error are kept as outcomes.
+5. A 2 s sweep task, off the io lock:
+   - collect `(pane, tag)` under the lock;
+   - check `kill(-pgid, 0)` outside it;
+   - for `ESRCH` only, drop under the lock, re-checking that the tag is still
+     present.
+6. `[program_status] stale_guard = false` by default, with hot reload. The
+   validator gains the key, and `config init` documents the risk.
+
+**Questions for the council.**
+1. Is D8 worth shipping at all, given that sampling cannot establish
+   authorship (§5.9: background writers and queued output are misattributed
+   and can be *falsely deleted*)? Should P2b instead be a smaller, exact
+   mechanism, e.g. clearing records when the pane's foreground group returns
+   to the shell's own pgid?
+2. Is `tcgetpgrp` on the PTY master reliable on macOS and Linux, and is a
+   per-batch syscall acceptable on the hot read path?
+3. Do the three-sample rule and the tag-0 default close the misattribution
+   cases enough for an opt-in? Which cases must the tests pin, with the guard
+   on and off?
+4. Interactions with the P1 lifecycle: the exit seal, respawn incarnations,
+   RIS, 133;A, and `enabled` hot reload. And with P2a's chrome: a swept record
+   must update the badge and the waiting count like any other change.
+5. Gate split: the VT gate for the scanner changes, the TUI gate for the
+   config and user-visible behaviour.
+
+**Council outcome for P2b (2026-10-28; codex and agy, converged).**
+Ship an amended D8, opt-in, documented as a heuristic.
+
+- **Rejected: "the foreground returned to the shell" as a deletion trigger.**
+  `Ctrl-Z` returns the foreground while the stopped job lives, and
+  background reporters outlive prompts.
+- **Guarantee, stated honestly.**
+  - Sampling or probe errors retain records.
+  - Accepted misattribution can delete a live record: a background writer,
+    queued output drained after a foreground change, or a reporter that left
+    its group.
+  - A surviving group member or pgid reuse retains a stale record.
+- **Sampling.**
+  - Two `tcgetpgrp` samples bracket the actual non-blocking drain inside
+    `PtyHandle`, returned with the bytes. They are never taken across an
+    await, a recorder or the VT lock.
+  - The pair is passed into `process_with_responses`.
+  - A sequence gets a nonzero origin only if every batch it spans has
+    matching valid samples that all agree. Any mismatch or error makes it
+    sticky-unknown for that sequence.
+  - The pane's initial session-leader group is excluded.
+  - With the guard off there is no sampling and no probing.
+  - Lazy sampling is deferred until measured.
+- **Records.**
+  - Every accepted set refreshes its origin and report serial, identical
+    content and origin 0 included. Metadata-only changes do not bump the
+    public revision.
+- **Sweep.**
+  - Collect: incarnation, guard epoch, origin, report-serial watermark.
+  - Probe `kill(-pgid, 0)` outside the lock. Only `ESRCH` deletes; success,
+    `EPERM` and other errors retain.
+  - Commit only for the same incarnation and epoch, with both flags on and
+    the pane current and unsealed. Delete only working/blocked/idle records
+    reported at or before the watermark.
+- **Lifecycle.**
+  - Exit seals; respawn invalidates.
+  - RIS clears records, provenance and `seen`.
+  - 133;A keeps done/error.
+  - Disable discards records.
+  - A guard toggle invalidates pending work and forgets provenance without
+    clearing records. Reload detects guard changes even when `enabled` is
+    unchanged.
+- **Publication.**
+  - A deletion bumps the table revision and VT generation, keeps `seen`, and
+    publishes through `StatusChannel`.
+  - Render consumers are notified after the graph commit.
+  - The waiting count stays per pane.
+- **Acceptance.**
+  - Tests: off and hot-reloaded off (with an in-flight sweep); a foreground
+    reporter killed (deleted); a stopped job (kept); framing and split
+    agreement; lifecycle races between collect and commit; and the
+    background-writer and queued-output false deletions, documented.
+  - Barriers and bounded polling, never fixed sleeps.
+  - The VT and TUI gates, plus the affected fuzz targets.
+
 ## 7. Verification
 
 - **Crate** ✅: a unit test for every D-rule and limit, plus tier-1 fuzzing.
