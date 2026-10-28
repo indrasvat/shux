@@ -12,6 +12,7 @@ VERDICT: PASS
 | Run | Result | Finding | Fix |
 |---|---|---|---|
 | `3d83b99` | FAIL | P1: `make check` red. `check-test-inventory` found 2 vanished test names. P3: the "no bare `…`" rule only treated U+0020 as a space. | `1db5659`: both old names restored beside their successors; padding and the text before `…` go by `char::is_whitespace` |
+| `1db5659` | PASS | Greptile on PR #212 (P2): a cut right zone ended short of the edge (`Lab…  `; default bar at 14 cols `… ^Sp… `). P2: trailing padding was measured on every frame, even for zones that fit. | Delta commit: a cut right zone is shifted flush to the edge; padding is measured only for a zone that does not fit. Re-verified by the implementer, not a fresh gate run: see §3 row "Delta re-verification". |
 
 ## 2. Stated DoD (issue #202)
 
@@ -32,6 +33,7 @@ VERDICT: PASS
 | L4 shux automation | PASS | `live.sh`, an outer shux pane running `session attach` under `no_leak_guard.sh`. Isolated `XDG_RUNTIME_DIR`. A right-zone script segment (truecolor, indexed, `日本`). Pane probes: truecolor `38;2;255;120;0`, indexed `38;5;45`, basic `31`, `30;42`. |
 | L5 visual | PASS | §4 |
 | L6 pixel | PASS | 24 committed `pixel-*.json`, all at exact 0/0. |
+| Delta re-verification (bot-review commit) | PASS | Sweep now asserts the right zone ends at the edge whenever painted; red on `1db5659` (`right zone off the edge`, `Lab…  `), green after. All 24 `pixel-*.json` regenerated from the delta build (`live-r2/`), 0/0 ×24; live attach 30x8 opened: `RSCRI…` flush right, left whole. `no_leak_guard.sh` exit 0 both runs; `make reap` clean. |
 | L8 DootSabha | PASS (fallback) | `council-record.md`: `dootsabha` not installed; parallel cold-context reviewers substituted, per CLAUDE.md. |
 
 ## 4. Screenshot matrix

@@ -94,6 +94,8 @@ fn zones_never_overlap_at_any_width() {
         ("", "C", "R"),
         ("LEFT ", "", "RIGHT "),
         (" ◆ main ", "", " ^Sp ?  help "),
+        ("L", "", "ab  cd"),
+        ("L", "", "a日日b"),
     ];
     for (left, centre, right) in cases {
         let (lw, cw, rw) = (cols(left), cols(centre), cols(right));
@@ -133,6 +135,11 @@ fn zones_never_overlap_at_any_width() {
                     prev_end < next_start || (touch_ok && prev_end == next_start),
                     "{ctx}: zones overlap or the centre touches a neighbour"
                 );
+            }
+
+            // The right zone ends at the edge, cut or not.
+            if let Some((_, end, _)) = zone(&row, RIGHT) {
+                assert_eq!(end, w, "{ctx}: right zone off the edge");
             }
 
             // Priority: left whole when it fits, right whole when it fits
@@ -180,6 +187,8 @@ fn a_cut_zone_never_shows_a_bare_ellipsis() {
     assert_eq!(plain(&row), "L    R", "{:?}", plain(&row));
     let row = bar("L", "ab  cd", "R").render_row(9);
     assert_eq!(plain(&row), "L ab…   R");
+    let row = bar("L", "", "ab  cd").render_row(6);
+    assert_eq!(plain(&row), "L  ab…", "a cut right zone stays flush");
     let row = bar("\u{3000}日x", "", "").render_row(3);
     assert_eq!(
         plain(&row),

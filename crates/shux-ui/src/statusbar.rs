@@ -112,10 +112,10 @@ impl StatusBar {
 }
 
 /// Paint `segs` from `start`, within `start..end`. A zone wider than that
-/// drops its trailing whitespace (ending flush at `end` when `flush_end`),
-/// or else shows the text that fits, less trailing whitespace, and an `…`;
-/// with no room for one glyph other than whitespace and the `…` it is not
-/// painted.
+/// drops its trailing whitespace, or else shows the text that fits, less
+/// trailing whitespace, and an `…`, either way ending flush at `end` when
+/// `flush_end`; with no room for one glyph other than whitespace and the `…`
+/// it is not painted.
 /// Returns the columns painted.
 fn paint_zone(
     row: &mut [RenderCell],
@@ -130,27 +130,23 @@ fn paint_zone(
     if zw == 0 {
         return None;
     }
-    let text: String = segs.iter().map(|s| s.text.as_str()).collect();
-    let cols = |t: &str| -> usize {
-        crate::chrome::text_cells(t)
-            .iter()
-            .map(|(_, w)| usize::from(*w))
-            .sum()
-    };
-    let padding = cols(&text) - cols(text.trim_end());
     let (limit, cut) = if zw <= avail {
         (end, false)
-    } else if zw == padding {
-        return None;
-    } else if zw - padding <= avail {
-        if flush_end {
-            start = end - (zw - padding);
-        }
-        (start + zw - padding, false)
-    } else if avail >= 2 {
-        (end - 1, true)
     } else {
-        return None;
+        let text: String = segs.iter().map(|s| s.text.as_str()).collect();
+        let padding = zw - StatusBar::segments_width(&[StatusSegment::plain(text.trim_end())]);
+        if zw == padding {
+            return None;
+        } else if zw - padding <= avail {
+            if flush_end {
+                start = end - (zw - padding);
+            }
+            (start + zw - padding, false)
+        } else if avail >= 2 {
+            (end - 1, true)
+        } else {
+            return None;
+        }
     };
     let mut cursor = start;
     // Where an `…` would follow the text so far, past any spaces it ends in,
@@ -185,7 +181,9 @@ fn paint_zone(
                     extended: None,
                     wide_continuation: false,
                 };
-                return Some((start, text_end + 1));
+                let shift = if flush_end { end - (text_end + 1) } else { 0 };
+                row[start..end].rotate_right(shift);
+                return Some((start + shift, text_end + 1 + shift));
             }
             let mut chars = text.chars();
             let Some(ch) = chars.next() else {

@@ -1,6 +1,6 @@
 {
   "scope": "statusbar-zone-overflow",
-  "audit": "shux-vt-solid-qa at 1db5659 (second run; first run at 3d83b99 was FAIL: make check red on check-test-inventory); VERDICT PASS",
+  "audit": "shux-vt-solid-qa at 1db5659 (second run; first run at 3d83b99 was FAIL: make check red on check-test-inventory); VERDICT PASS; delta re-verification after PR #212 Greptile findings (right-zone flush when cut, padding measured lazily): pixel metrics regenerated, 24/24 at 0/0",
   "commit_under_audit": "1db5659",
   "base": "origin/main 0ea4881",
   "issue": "#202",
