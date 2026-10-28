@@ -15,12 +15,11 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::process::{Command, Output};
 
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
+use shux_testkit::{BUDGET, poll_until};
 
 /// Isolated daemon environment: private runtime dir, private config dir, and a
 /// world-writable stand-in for `/tmp` where the attacker plants the symlink.
@@ -76,9 +75,8 @@ impl Env {
     }
 
     /// Auto-start the daemon by issuing one RPC call.
-    fn boot(&self) {
-        let _ = self
-            .shux()
+    fn boot(&self) -> Output {
+        self.shux()
             .args([
                 "--format",
                 "json",
@@ -89,7 +87,7 @@ impl Env {
                 "{}",
             ])
             .output()
-            .expect("spawn shux");
+            .expect("spawn shux")
     }
 
     fn daemon_pid(&self) -> Option<u32> {
@@ -105,13 +103,7 @@ impl Drop for Env {
     fn drop(&mut self) {
         if let Some(pid) = self.daemon_pid() {
             let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while Instant::now() < deadline {
-                if kill(Pid::from_raw(pid as i32), None).is_err() {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(50));
-            }
+            poll_until(BUDGET, || kill(Pid::from_raw(pid as i32), None).is_err());
         }
     }
 }
@@ -159,17 +151,16 @@ fn inline_starship_config_does_not_follow_planted_symlink() {
 
     env.boot();
 
-    // Wait until the daemon materialises the config somewhere (safe location on
-    // a fixed build; the victim on a vulnerable build) or a short budget lapses.
-    let deadline = Instant::now() + Duration::from_secs(8);
-    loop {
+    // Wait until the daemon has written the config somewhere: the victim on a
+    // vulnerable build, the runtime dir on a fixed one. The file is created
+    // before it is written, so wait for its contents, not its name.
+    poll_until(BUDGET, || {
         let clobbered = std::fs::read_to_string(&victim).unwrap_or_default() != victim_original;
-        let materialised = find_runtime_segment_file(&env.runtime_shux()).is_some();
-        if clobbered || materialised || Instant::now() >= deadline {
-            break;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
+        let written = find_runtime_segment_file(&env.runtime_shux())
+            .and_then(|seg| std::fs::read_to_string(seg).ok())
+            .is_some_and(|body| body.contains(INLINE_CONFIG));
+        clobbered || written
+    });
 
     // 1. The victim must be byte-for-byte untouched.
     let victim_after = std::fs::read_to_string(&victim).expect("read victim");
@@ -226,8 +217,15 @@ fn daemon_refuses_a_symlinked_runtime_dir() {
     std::fs::set_permissions(&victim_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::os::unix::fs::symlink(&victim_dir, env.runtime_shux()).unwrap();
 
-    env.boot();
-    thread::sleep(Duration::from_millis(800));
+    // The client refuses the runtime dir before it starts a daemon, so once
+    // it has failed nothing is left running that could still write there. A
+    // client that accepted the dir would have a daemon serving from it.
+    let out = env.boot();
+    assert!(
+        !out.status.success(),
+        "the client accepted a symlinked runtime dir: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // Directory mode must be untouched (not chmod-followed to 0700)...
     let mode = std::fs::metadata(&victim_dir).unwrap().permissions().mode() & 0o777;

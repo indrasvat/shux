@@ -4,96 +4,112 @@
 //!
 //! These drive the REAL `shux` binary against a REAL daemon, with stdout a
 //! real pipe — the case a terminal-attached run never exercises. Each watch
-//! runs with a 30 s long poll, so an item held until the deadline cannot land
-//! inside the 10 s the tests allow.
+//! runs with a long poll at the CLI's 30 s maximum, and every item must reach
+//! the reader before that first poll could have ended: an item held until a
+//! poll's deadline arrives after it.
 
 use std::io::Read;
 use std::process::{Child, Stdio};
 use std::sync::mpsc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 mod lens_common;
 use lens_common::*;
 
+const LONG_POLL: Duration = Duration::from_secs(30);
 const LONG_POLL_MS: &str = "30000";
-const PROMPT: Duration = Duration::from_secs(10);
 
 /// Kills the watcher if an assertion fails first, so no client outlives the test.
-struct Watcher(Child);
+struct Watcher {
+    child: Child,
+    /// No poll the watcher makes can have started before this.
+    spawned: Instant,
+    reader: Option<JoinHandle<()>>,
+}
 
 impl Drop for Watcher {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
 impl Watcher {
     fn spawn(h: &Harness, args: &[&str]) -> Self {
-        Self(
-            h.shux()
-                .args(args)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap_or_else(|e| panic!("spawn shux {args:?}: {e}")),
-        )
+        let spawned = Instant::now();
+        let child = h
+            .shux()
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|e| panic!("spawn shux {args:?}: {e}"));
+        Self {
+            child,
+            spawned,
+            reader: None,
+        }
+    }
+
+    /// The latest an item can arrive and still have beaten the long poll.
+    fn before_the_long_poll_ends(&self) -> Instant {
+        self.spawned + LONG_POLL
     }
 
     /// The watcher's stdout as chunks read on another thread, so a test waits
     /// on it with a timeout instead of blocking in `read`. Dropping the
     /// receiver closes the pipe at the next chunk.
     fn output(&mut self) -> mpsc::Receiver<Vec<u8>> {
-        let mut stdout = self.0.stdout.take().expect("stdout");
+        let mut stdout = self.child.stdout.take().expect("stdout");
         let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
+        self.reader = Some(std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
             while let Ok(n) = stdout.read(&mut buf) {
                 if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
                     break;
                 }
             }
-        });
+        }));
         rx
     }
 
-    /// Wait for the watcher to exit on its own, nudging it with `poke` so it
-    /// has something to write into the closed pipe. Returns status and stderr.
+    /// Wait for the watcher to exit on its own once its reader has gone.
+    /// `poke` makes it write: the first write lets the reader notice its
+    /// receiver is gone and close the pipe, the next lands in the closed pipe.
+    /// Returns status and stderr.
     fn exit_after_reader_closed(mut self, poke: impl Fn()) -> (std::process::ExitStatus, String) {
-        let deadline = Instant::now() + Duration::from_secs(15);
-        let status = loop {
-            if let Some(st) = self.0.try_wait().expect("try_wait") {
-                break st;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the watcher was still running 15 s after its reader closed the pipe"
-            );
-            poke();
-            std::thread::sleep(Duration::from_millis(200));
-        };
+        let reader = self.reader.take().expect("output() was not taken");
+        poke();
+        assert!(
+            shux_testkit::poll_until(BUDGET, || reader.is_finished()),
+            "the reader never saw the watcher write after its receiver was dropped"
+        );
+        poke();
+        let status = shux_testkit::poll(BUDGET, || self.child.try_wait().expect("try_wait"))
+            .expect("the watcher was still running after its reader closed the pipe");
         let mut stderr = String::new();
-        if let Some(mut e) = self.0.stderr.take() {
+        if let Some(mut e) = self.child.stderr.take() {
             let _ = e.read_to_string(&mut stderr);
         }
         (status, stderr)
     }
 }
 
-/// Collect output until it holds `needle`, failing after `PROMPT` even while
-/// output keeps arriving.
-fn read_until(rx: &mpsc::Receiver<Vec<u8>>, needle: &str, what: &str) -> String {
-    let deadline = Instant::now() + PROMPT;
+/// Collect output until it holds `needle`, failing at `by` even while output
+/// keeps arriving.
+fn read_until(rx: &mpsc::Receiver<Vec<u8>>, needle: &str, what: &str, by: Instant) -> String {
     let mut seen = String::new();
     while !seen.contains(needle) {
-        let left = deadline.saturating_duration_since(Instant::now());
+        let left = by.saturating_duration_since(Instant::now());
         match rx.recv_timeout(left) {
             Ok(chunk) if !left.is_zero() => seen.push_str(&String::from_utf8_lossy(&chunk)),
             _ => {
                 let tail = seen.len().saturating_sub(400);
                 let tail = seen.ceil_char_boundary(tail);
                 panic!(
-                    "{what}: no {needle:?} within {PROMPT:?}; last of {} bytes seen: {:?}",
+                    "{what}: no {needle:?} before the watcher's {LONG_POLL:?} long poll could \
+                     have ended; last of {} bytes seen: {:?}",
                     seen.len(),
                     &seen[tail..]
                 )
@@ -171,7 +187,7 @@ fn piped_events_watch_delivers_an_event_without_waiting_out_the_long_poll() {
     let mut w = events_watch(&h);
     let rx = w.output();
     create_session(&h, "piped-134");
-    let out = read_until(&rx, "\n", "events watch");
+    let out = read_until(&rx, "\n", "events watch", w.before_the_long_poll_ends());
     let event: serde_json::Value =
         serde_json::from_str(out.lines().next().unwrap()).expect("JSON line");
     assert_eq!(event["type"], "session.created", "{out}");
@@ -186,7 +202,7 @@ fn events_watch_ends_cleanly_when_its_reader_closes_the_pipe() {
     let mut w = events_watch(&h);
     let rx = w.output();
     create_session(&h, "first");
-    read_until(&rx, "\n", "events watch");
+    read_until(&rx, "\n", "events watch", w.before_the_long_poll_ends());
     drop(rx);
 
     let n = std::cell::Cell::new(0);
@@ -201,8 +217,8 @@ fn events_watch_ends_cleanly_when_its_reader_closes_the_pipe() {
 }
 
 /// `pane watch` streams a pane's raw output, colour intact, as it is written,
-/// and stops once its reader is gone. The pane writes twice a second, so a
-/// poll that waited for its 50-chunk page would take 25 s.
+/// and stops once its reader is gone. The pane writes once a second, so a
+/// poll that waited for its 50-chunk page would outlast the long poll.
 #[test]
 fn pane_watch_streams_promptly_and_ends_cleanly_when_its_reader_closes_the_pipe() {
     let h = Harness::new();
@@ -214,7 +230,7 @@ fn pane_watch_streams_promptly_and_ends_cleanly_when_its_reader_closes_the_pipe(
         "--",
         "sh",
         "-c",
-        "while :; do printf '\\033[38;2;255;0;128mTRUE\\033[0m \\033[38;5;208mIDX\\033[0m \\033[31mBASIC\\033[0m tick\\n'; sleep 0.5; done",
+        "while :; do printf '\\033[38;2;255;0;128mTRUE\\033[0m \\033[38;5;208mIDX\\033[0m \\033[31mBASIC\\033[0m tick\\n'; sleep 1; done",
     ]);
     assert!(
         out.status.success(),
@@ -223,7 +239,7 @@ fn pane_watch_streams_promptly_and_ends_cleanly_when_its_reader_closes_the_pipe(
     );
     let mut w = pane_watch(&h, "talker", &pane_id_of(&h, "talker"));
     let rx = w.output();
-    let seen = read_until(&rx, "tick", "pane watch");
+    let seen = read_until(&rx, "tick", "pane watch", w.before_the_long_poll_ends());
     for sgr in ["\x1b[38;2;255;0;128m", "\x1b[38;5;208m", "\x1b[31m"] {
         assert!(seen.contains(sgr), "colour {sgr:?} missing from {seen:?}");
     }
@@ -263,10 +279,11 @@ fn pane_watch_delivers_a_last_write_that_no_later_output_follows() {
     let pane = pane_id_of(&h, "quiet");
     let mut w = pane_watch(&h, "quiet", &pane);
     let rx = w.output();
-    read_until(&rx, "waiting", "pane watch before input");
+    let by = w.before_the_long_poll_ends();
+    read_until(&rx, "waiting", "pane watch before input", by);
     h.send_line_token(&pane, "ping");
     // `last-ping` is printed only by the reply; the echoed line reads `ping`.
-    let seen = read_until(&rx, "last-ping", "pane watch after its pane went quiet");
+    let seen = read_until(&rx, "last-ping", "pane watch after its pane went quiet", by);
     for sgr in ["\x1b[38;2;0;200;80m", "\x1b[38;5;33m", "\x1b[32m"] {
         assert!(seen.contains(sgr), "colour {sgr:?} missing from {seen:?}");
     }
