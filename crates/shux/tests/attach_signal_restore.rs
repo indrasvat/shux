@@ -237,7 +237,10 @@ impl AttachedClient {
                 }
                 return Some(status);
             }
-            std::thread::sleep(Duration::from_millis(25));
+            // Read as fast as a terminal does. macOS buffers far less on a PTY
+            // than Linux, and a 25 ms poll there drains the frame in flight
+            // slower than the client's 500 ms restore budget allows.
+            std::thread::sleep(Duration::from_millis(if pump { 1 } else { 25 }));
         }
         None
     }
@@ -346,10 +349,12 @@ fn assert_signal_restores_terminal(sig: Signal) {
         ("turned mouse tracking off", b"\x1b[?1000l"),
         ("showed the cursor", b"\x1b[?25h"),
     ] {
+        // The end only: CI logs cut a long line, and the end is what matters.
         assert!(
             find(tail, seq),
-            "{sig}: never {what} after the signal: {:?}",
-            String::from_utf8_lossy(tail)
+            "{sig}: never {what} after the signal; {} bytes after it, ending {:?}",
+            tail.len(),
+            String::from_utf8_lossy(&tail[tail.len().saturating_sub(600)..])
         );
     }
 
