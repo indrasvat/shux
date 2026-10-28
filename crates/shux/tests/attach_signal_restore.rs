@@ -60,7 +60,9 @@ impl Harness {
             .expect("spawn shux rpc");
         assert!(
             out.status.success(),
-            "session.create failed: {}",
+            "session.create failed ({}): stdout {:?} stderr {:?}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
     }
