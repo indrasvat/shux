@@ -138,8 +138,8 @@ fn attach_and_snapshot_draw_identical_chrome() {
     assert!(title.contains('日'), "wide title missing: {title}");
 }
 
-/// Zones that overlap a wide glyph draw the same in both paths: the half not
-/// painted over is erased, as the terminal reading attach's bytes erases it.
+/// Zones that would overlap a wide glyph draw the same in both paths, and the
+/// glyph is never left half drawn.
 #[test]
 fn overlapping_status_zones_draw_identically() {
     for left in ["ab日", "ab👩\u{200d}💻"] {
