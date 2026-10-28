@@ -6,8 +6,8 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 
-use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
-use nix::pty::{Winsize, openpty};
+use nix::fcntl::{FcntlArg, OFlag, fcntl};
+use nix::pty::{OpenptyResult, Winsize};
 use tokio::io::unix::AsyncFd;
 use tracing::{debug, info};
 
@@ -539,6 +539,41 @@ impl Drop for PtyHandle {
     }
 }
 
+/// Open a PTY pair that no child inherits: a pane's terminal held by any
+/// other process could be read from and typed into.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn open_pty(winsize: &Winsize) -> nix::Result<OpenptyResult> {
+    use nix::pty::{grantpt, posix_openpt, ptsname_r, unlockpt};
+    use nix::sys::stat::Mode;
+    // Close-on-exec from birth: a thread forking between open and `F_SETFD`
+    // would hand the pair to its child.
+    let flags = OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_CLOEXEC;
+    let master = posix_openpt(flags)?;
+    grantpt(&master)?;
+    unlockpt(&master)?;
+    let slave = nix::fcntl::open(ptsname_r(&master)?.as_str(), flags, Mode::empty())?;
+    // SAFETY: `winsize` outlives the call, and TIOCSWINSZ only reads it.
+    if unsafe { nix::libc::ioctl(slave.as_raw_fd(), nix::libc::TIOCSWINSZ, winsize) } == -1 {
+        return Err(nix::errno::Errno::last());
+    }
+    Ok(OpenptyResult {
+        master: master.into(),
+        slave,
+    })
+}
+
+/// `posix_openpt` takes no `O_CLOEXEC` here, so a fork on another thread
+/// between `openpty` and `F_SETFD` can still inherit the pair.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn open_pty(winsize: &Winsize) -> nix::Result<OpenptyResult> {
+    use nix::fcntl::FdFlag;
+    let pair = nix::pty::openpty(Some(winsize), None)?;
+    for fd in [&pair.master, &pair.slave] {
+        fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
+    }
+    Ok(pair)
+}
+
 fn nix_to_io(err: nix::Error) -> PtyError {
     PtyError::Open(std::io::Error::from(err))
 }
@@ -698,12 +733,7 @@ impl PtyHandle {
     /// `std::env::set_var`.
     pub fn spawn(config: &PtyConfig) -> Result<Self, PtyError> {
         let winsize = winsize_for(config.size);
-        let pty_pair = openpty(Some(&winsize), None).map_err(nix_to_io)?;
-        // openpty(3) opens both ends inheritable; every later pane would hold
-        // this pane's terminal, able to read and type into it.
-        for fd in [&pty_pair.master, &pty_pair.slave] {
-            fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).map_err(nix_to_io)?;
-        }
+        let pty_pair = open_pty(&winsize).map_err(nix_to_io)?;
         set_nonblocking(&pty_pair.master).map_err(PtyError::Open)?;
 
         let cmd_parts = config.resolve_command();

@@ -727,21 +727,67 @@ async fn a_pane_inherits_no_other_terminal_descriptors() {
     ))
     .unwrap();
 
-    let dir = format!("/proc/{}/fd", second.pid());
-    let mut leaked = Vec::new();
-    for entry in std::fs::read_dir(&dir).expect("read child fd table") {
-        let entry = entry.unwrap();
-        let fd: u32 = entry.file_name().to_string_lossy().parse().unwrap();
-        let target = std::fs::read_link(entry.path()).unwrap_or_default();
-        let target = target.to_string_lossy().into_owned();
-        if fd > 2 && (target == "/dev/ptmx" || target.starts_with("/dev/pts/")) {
-            leaked.push(format!("{fd} -> {target}"));
-        }
-    }
+    let leaked = terminal_descriptors_above_stdio(second.pid());
     let _ = second.kill();
     drop(first);
     assert!(
         leaked.is_empty(),
         "pane child inherited terminal descriptors: {leaked:?}"
     );
+}
+
+/// A child forked by any other thread while a pane is being opened must not
+/// inherit that pane's terminal either.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_process_forked_while_a_pane_opens_inherits_no_terminal_descriptors() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let opener = {
+        let stop = Arc::clone(&stop);
+        let runtime = tokio::runtime::Handle::current();
+        std::thread::spawn(move || {
+            let _runtime = runtime.enter();
+            while !stop.load(Ordering::Relaxed) {
+                let mut pane =
+                    PtyHandle::spawn(&PtyConfig::with_command(vec!["true".into()], test_cwd()))
+                        .unwrap();
+                let _ = pane.kill();
+            }
+        })
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let mut leaked = Vec::new();
+    while leaked.is_empty() && std::time::Instant::now() < deadline {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        leaked = terminal_descriptors_above_stdio(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    stop.store(true, Ordering::Relaxed);
+    opener.join().unwrap();
+    assert!(
+        leaked.is_empty(),
+        "a concurrently forked child inherited a pane's terminal: {leaked:?}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn terminal_descriptors_above_stdio(pid: u32) -> Vec<String> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(format!("/proc/{pid}/fd")).expect("read child fd table") {
+        let entry = entry.unwrap();
+        let fd: u32 = entry.file_name().to_string_lossy().parse().unwrap();
+        let target = std::fs::read_link(entry.path()).unwrap_or_default();
+        let target = target.to_string_lossy().into_owned();
+        if fd > 2 && (target == "/dev/ptmx" || target.starts_with("/dev/pts/")) {
+            found.push(format!("{fd} -> {target}"));
+        }
+    }
+    found
 }
