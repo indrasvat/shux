@@ -1758,7 +1758,7 @@ impl Cli {
         // The key, so every use names the endpoint the daemon binds -- not a
         // spelling relative to the cwd, or through a directory not made yet.
         if let Some(ref path) = self.socket {
-            return crate::daemon::socket_key(path);
+            return crate::daemon::socket_endpoint(path);
         }
         crate::daemon::socket_path().unwrap_or_else(|_| PathBuf::from("/tmp/shux/shux.sock"))
     }

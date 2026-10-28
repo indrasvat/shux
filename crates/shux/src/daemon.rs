@@ -119,6 +119,34 @@ pub fn socket_key(socket: &Path) -> PathBuf {
     key
 }
 
+/// The path to bind or connect at for `socket`: its [`socket_key`] when that
+/// fits a socket address, otherwise the spelling made absolute without
+/// resolving anything; `..` is kept, since after a symlink only the kernel
+/// knows where it leads. Identity -- pidfile, locks -- stays on the key; only the
+/// syscall needs a path the kernel accepts, and resolving a symlinked runtime
+/// dir (`/var` → `/private/var` on macOS) can push it past the limit.
+pub fn socket_endpoint(socket: &Path) -> PathBuf {
+    let key = socket_key(socket);
+    if nix::sys::socket::UnixAddr::new(&key).is_ok() {
+        return key;
+    }
+    let mut lexical = if socket.is_absolute() {
+        PathBuf::new()
+    } else {
+        std::env::current_dir().unwrap_or_default()
+    };
+    for part in socket.components() {
+        if part != std::path::Component::CurDir {
+            lexical.push(part);
+        }
+    }
+    if nix::sys::socket::UnixAddr::new(&lexical).is_ok() {
+        lexical
+    } else {
+        key
+    }
+}
+
 /// The socket as the user spelled it, for [`pid_file_candidates`]: the CLI
 /// passes the key everywhere else.
 static TYPED_SOCKET: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
@@ -508,6 +536,37 @@ pub async fn spawn_signal_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A long resolved directory reached by a short symlink, for the
+    /// socket-address-limit cases.
+    fn long_dir() -> (tempfile::TempDir, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("r".repeat(120));
+        std::fs::create_dir_all(real.join("sub")).unwrap();
+        (root, real)
+    }
+
+    /// The endpoint names the same socket as the spelling, `..` after a
+    /// symlink included: the kernel resolves `..` from the link's target.
+    #[test]
+    fn a_socket_endpoint_names_the_socket_it_was_given() {
+        let (root, real) = long_dir();
+        let link = root.path().join("l");
+        std::os::unix::fs::symlink(real.join("sub"), &link).unwrap();
+        let spelling = link.join("..").join("s.sock");
+        let endpoint = socket_endpoint(&spelling);
+        assert!(
+            nix::sys::socket::UnixAddr::new(&endpoint).is_ok(),
+            "{}",
+            endpoint.display()
+        );
+        assert_eq!(
+            socket_key(&endpoint),
+            socket_key(&spelling),
+            "{}",
+            endpoint.display()
+        );
+    }
     use std::sync::{Mutex, OnceLock};
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
