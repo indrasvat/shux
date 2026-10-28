@@ -70,7 +70,7 @@ frozen_at=()
 resume_frozen() {
   local pid
   for pid in "${frozen[@]:-}"; do
-    [ -n "${pid}" ] && kill -CONT "${pid}" >/dev/null 2>&1 || true
+    if [ -n "${pid}" ]; then kill -CONT "${pid}" >/dev/null 2>&1 || true; fi
   done
 }
 # Interrupted, the reap leaves what it froze running again rather than stopped for good.

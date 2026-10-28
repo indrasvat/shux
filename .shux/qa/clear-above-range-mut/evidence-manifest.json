@@ -1,0 +1,49 @@
+{
+  "scope": "clear-above-range-mut",
+  "issue": 196,
+  "pr": 205,
+  "audited_commit": "33600e9",
+  "base_commit": "16ce207d503182b8276905bc488ad17f53afd81d",
+  "diff_sha256_full": "6959de84bb9f5c5e427a52b20477bc7c2c2d30026090083a08c6a95eaa4e995c",
+  "diff_sha256_full_command": "git diff 16ce207..33600e9 | sha256sum",
+  "diff_sha256_crates": "70cc122c9561e51c4249ad863ce2b59a1a821e987553ab4ff024da7ae1a0060f",
+  "diff_sha256_crates_command": "git diff 16ce207..33600e9 -- crates/ | sha256sum",
+  "verdict": "PASS",
+  "solid_qa_report": "SOLID-QA.md",
+  "dootsabha_design": "council-substitution.md",
+  "dootsabha_implementation": "council-substitution.md",
+  "council_tool": "dootsabha not installed; parallel adversarial agents on disjoint surfaces per CLAUDE.md Tooling fallbacks, run by the implementing session",
+  "screenshots": [],
+  "screenshots_note": "No committed baseline exists for this scene; both sides are this audit's own captures, so only the metric JSON is committed. PNGs are in .shux/out/clear-above-range-mut/ (gitignored).",
+  "pixel_metrics": [
+    "pixel-ab-ed1-80x24.json",
+    "pixel-ab-ed1-120x40.json",
+    "pixel-ab-ed1-200x60.json"
+  ],
+  "pixel_thresholds": {
+    "max_pixel_diff_ratio": 0,
+    "max_mean_channel_delta": 0
+  },
+  "breakpoints": ["80x24", "120x40", "200x60"],
+  "binaries": {
+    "base_sha256": "a7ab43a787e8f4a3cda7dd4790bff2765c230dc14be614625b5db4fa9eb18583",
+    "head_sha256": "049228a51398de0f1ff360d9cb7a45ee67c6c483b3a66e3ad49bb39c4f6b8c9b",
+    "mutant_sha256": "06a44c42cb35f253c135a96a7eaeadd93c1a363bed6cc7d99e0266d29f4f911a",
+    "build": "make release; base in a git worktree at 16ce207 with its own CARGO_TARGET_DIR"
+  },
+  "colour_probes": "truecolor fg 38;2;120;220;180, indexed fg 38;5;208, basic 31-36, indexed bg 48;5;236; ED 1 issued under indexed bg 48;5;52 and truecolor bg 48;2;40;40;90, asserted as rendered pixels rgb(95,0,0) and rgb(40,40,90)",
+  "commands_run": [
+    "make test-focus PKG=shux-vt  # 683 run, 683 passed, 0 skipped",
+    "mutant range_mut(0..=end_row) + make test-focus PKG=shux-vt FILTER=clear_above  # 1 failed: test_clear_above_leaves_scrollback_alone, grid.rs:2029 left ' ' right 'X'; source restored, sha256 verified",
+    "A/B scene base vs head under .shux/scripts/no_leak_guard.sh  # text identical, pixel exact 0/0 at 3 breakpoints",
+    "negative control: base vs mutant release binary  # pixel FAIL at 3 breakpoints (ratio 0.575/0.592/0.629)",
+    "vim smoke on head at 120x40  # inspected",
+    "make test-vt-corpus  # 3/3 unit, 19/19 fixtures exact 0/0; rewritten tracked diff PNGs restored",
+    "make check-vt-qa"
+  ],
+  "real_tuis_driven": ["vim"],
+  "real_tuis_missing": ["nvim", "btop", "htop", "lazygit"],
+  "corpus_sweep": "19 fixtures (5 rich-tui raw recordings, 14 synthetic) exact vs .shux/goldens/073-vt-corpus; none contains ESC[1J",
+  "leaked_daemons": 0,
+  "scratch": ".shux/out/clear-above-range-mut/ (gitignored)"
+}
