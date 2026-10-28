@@ -1,3 +1,10 @@
+## [0.54.8](https://github.com/indrasvat/shux/compare/v0.54.7...v0.54.8) (2026-10-28)
+
+
+### Bug Fixes
+
+* **plugin:** daemon stop no longer hangs once a plugin is installed ([#225](https://github.com/indrasvat/shux/issues/225)) ([c480c8d](https://github.com/indrasvat/shux/commit/c480c8d322991a928a6bc97a46b784619658b006)), closes [#220](https://github.com/indrasvat/shux/issues/220)
+
 ## [0.54.7](https://github.com/indrasvat/shux/compare/v0.54.6...v0.54.7) (2026-10-28)
 
 

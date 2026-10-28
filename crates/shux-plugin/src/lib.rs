@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -117,15 +118,70 @@ fn plugin_group_alive(pid: Option<u32>) -> bool {
     }
 }
 
+/// Does `pgid` hold a process that is not a zombie?
+///
+/// `killpg` alone counts zombies, and the plugin's leader is deliberately
+/// left unreaped while its group is watched, so a group holding only that
+/// zombie would look alive. On Linux `/proc` tells them apart, thread by
+/// thread, since a process whose main thread exited reads as `Z` while its
+/// other threads run. Elsewhere this answers `true` and the `killpg` probe
+/// decides.
+#[cfg(target_os = "linux")]
+fn group_has_live_member(pid: Option<u32>) -> bool {
+    let Some(pgid) = pid else { return false };
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return true;
+    };
+    // (alive, pgrp) of one `stat` file; `task/` holds the main thread too.
+    let read = |stat: &std::path::Path| {
+        let stat = std::fs::read_to_string(stat).ok()?;
+        stat_state_and_pgrp(&stat).map(|(state, pgrp)| (!matches!(state, "Z" | "X" | "x"), pgrp))
+    };
+    entries.flatten().any(|entry| {
+        entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit()))
+            && read(&entry.path().join("stat")).is_some_and(|(_, pgrp)| pgrp == pgid)
+            && std::fs::read_dir(entry.path().join("task")).is_ok_and(|tasks| {
+                tasks
+                    .flatten()
+                    .any(|task| read(&task.path().join("stat")).is_some_and(|(alive, _)| alive))
+            })
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn group_has_live_member(_pid: Option<u32>) -> bool {
+    true
+}
+
+/// State and process group from a `/proc/<pid>/stat` line. `comm` may hold
+/// spaces and parentheses, so fields are read after the last `)`: state,
+/// ppid, pgrp.
+#[cfg(target_os = "linux")]
+fn stat_state_and_pgrp(stat: &str) -> Option<(&str, u32)> {
+    let (_, rest) = stat.rsplit_once(')')?;
+    let mut fields = rest.split_ascii_whitespace();
+    let state = fields.next()?;
+    let pgrp = fields.nth(1)?.parse().ok()?;
+    Some((state, pgrp))
+}
+
 /// Wait up to `budget` for a plugin's process group to empty out on its own.
 ///
 /// Polls rather than calling `Child::wait`, deliberately: `wait` reaps, a
 /// reaped pid can be recycled, and the caller is about to signal this pgid.
-/// Returns as soon as the group is empty, or when the budget runs out.
+/// Returns as soon as nothing in the group is running, or when the budget
+/// runs out.
 async fn wait_for_group_exit(pid: Option<u32>, budget: Duration) {
     let deadline = tokio::time::Instant::now() + budget;
     while tokio::time::Instant::now() < deadline {
-        if !plugin_group_alive(pid) {
+        // `/proc` scans block, so they stay off the async workers.
+        let running = tokio::task::spawn_blocking(move || {
+            plugin_group_alive(pid) && group_has_live_member(pid)
+        });
+        if !running.await.unwrap_or(false) {
             return;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -267,6 +323,8 @@ pub enum PluginError {
     Io(#[from] std::io::Error),
     #[error("protocol error: {0}")]
     Proto(String),
+    #[error("plugin host is shutting down")]
+    ShuttingDown,
 }
 
 struct Running {
@@ -277,7 +335,7 @@ struct Running {
     started_at: Instant,
     pid: Option<u32>,
     last_error: Arc<Mutex<Option<String>>>,
-    _join: JoinHandle<()>,
+    join: JoinHandle<()>,
     /// Cancellation flag for the file-watcher task (when `source.watch`
     /// is true). Set to `true` on kill/reload to stop the watcher
     /// before it triggers another reload on the now-dead plugin.
@@ -319,6 +377,17 @@ pub struct PluginManager {
     /// the test that asserts the timeout FIRES does not have to sit out the
     /// production budget to do it.
     handshake_timeout: Duration,
+    /// Set once by [`PluginManager::shutdown`]: every watcher exits and no
+    /// install registers after it.
+    stopping: Arc<AtomicBool>,
+    /// Unregistered plugins that a reload may still bring back, by name:
+    /// one whose reload is in flight, or one a failed reload left watched.
+    /// `kill` sets the flag, and a set flag stops the install, the re-arm
+    /// and the watcher alike.
+    pending: Arc<std::sync::Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    /// I/O tasks of killed plugins, which may still be in their grace.
+    /// `shutdown` waits for them too.
+    retiring: Arc<std::sync::Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl PluginManager {
@@ -339,6 +408,9 @@ impl PluginManager {
             graph: Arc::new(tokio::sync::OnceCell::new()),
             denial_hook: Arc::new(tokio::sync::OnceCell::new()),
             handshake_timeout: HANDSHAKE_TIMEOUT,
+            stopping: Arc::new(AtomicBool::new(false)),
+            pending: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            retiring: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -415,6 +487,16 @@ impl PluginManager {
     /// the plugin under the name it reports in its manifest, and
     /// starts the I/O task.
     pub async fn install(&self, source: PluginSource) -> Result<PluginInfo, PluginError> {
+        self.install_unless(source, None).await
+    }
+
+    /// [`Self::install`], refused if `killed` is set by the time the plugin
+    /// would register: a reload's install loses to a `kill` made during it.
+    async fn install_unless(
+        &self,
+        source: PluginSource,
+        killed: Option<Arc<AtomicBool>>,
+    ) -> Result<PluginInfo, PluginError> {
         let mut cmd = Command::new(&source.path);
         cmd.args(&source.args)
             .stdin(Stdio::piped())
@@ -539,6 +621,16 @@ impl PluginManager {
             )));
         }
 
+        // Hot reload: if `source.watch` is true, arm a filesystem
+        // watcher that drops + reinstalls the plugin on every save.
+        // Armed before the lock, and stopped again by the guard unless
+        // the plugin registers below.
+        let watch = WatchGuard(if source.watch {
+            arm_reload_watcher(self.clone(), manifest.name.clone(), source.clone()).await
+        } else {
+            None
+        });
+
         // Stage 2: dedup + spawn + register atomically. Held across
         // the spawn so two concurrent installs of plugins reporting
         // the same manifest name can't both pass the contains_key
@@ -546,6 +638,14 @@ impl PluginManager {
         // would orphan one of the child processes. Spawn itself is
         // non-blocking, so the lock window stays in microseconds.
         let mut inner = self.inner.lock().await;
+        if self.stopping.load(Ordering::SeqCst) {
+            start_kill_plugin_tree(&mut child);
+            return Err(PluginError::ShuttingDown);
+        }
+        if killed.is_some_and(|k| k.load(Ordering::SeqCst)) {
+            start_kill_plugin_tree(&mut child);
+            return Err(PluginError::NotFound(manifest.name.clone()));
+        }
         if inner.contains_key(&manifest.name) {
             start_kill_plugin_tree(&mut child);
             return Err(PluginError::NameConflict(manifest.name.clone()));
@@ -670,23 +770,11 @@ impl PluginManager {
             plugin_id: Some(plugin_id),
         };
 
-        // Hot reload: if `source.watch` is true, spawn a filesystem
-        // watcher that drops + reinstalls the plugin on every save.
-        // Cancellation flag lives in the Running entry so kill() and
-        // reload() can stop the watcher before triggering a respawn
-        // on a dead plugin entry.
-        let watch_cancel = if source.watch {
-            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            spawn_reload_watcher(
-                self.clone(),
-                manifest.name.clone(),
-                source.clone(),
-                cancel.clone(),
-            );
-            Some(cancel)
-        } else {
-            None
-        };
+        // The watcher's flag lives in the Running entry so kill() and
+        // reload() can stop it before it respawns a dead plugin entry.
+        // It supersedes whatever was pending for this name.
+        self.take_pending(&manifest.name);
+        let watch_cancel = watch.keep();
         let info = PluginInfo {
             watching: watch_cancel.is_some(),
             ..info
@@ -700,7 +788,7 @@ impl PluginManager {
             started_at: Instant::now(),
             pid,
             last_error,
-            _join: join,
+            join,
             watch_cancel,
             plugin_id,
         };
@@ -719,43 +807,56 @@ impl PluginManager {
     /// save; users can also call it directly via `shux plugin
     /// reload <name>` for a manual hot-reload.
     pub async fn reload(&self, name: &str) -> Result<PluginInfo, PluginError> {
-        // Pull the source out under lock; the kill below also needs
-        // the lock so we drop it first.
+        // Unregister and mark the name pending in one critical section, so
+        // a `kill` at any point after this finds something to stop.
+        let killed = Arc::new(AtomicBool::new(false));
         let source = {
-            let inner = self.inner.lock().await;
-            inner
-                .get(name)
-                .ok_or_else(|| PluginError::NotFound(name.to_string()))?
-                .source
-                .clone()
+            let mut inner = self.inner.lock().await;
+            let mut running = inner
+                .remove(name)
+                .ok_or_else(|| PluginError::NotFound(name.to_string()))?;
+            begin_stop(&mut running).await;
+            self.retire(running.join);
+            self.set_pending(name, killed.clone());
+            running.source
         };
-        self.kill(name).await?;
         // Brief delay so the child reaps cleanly before respawn.
         // Without this, `install` can race the old child's stdin
         // close, and the new child sometimes inherits a stale
         // file descriptor on macOS.
         tokio::time::sleep(Duration::from_millis(150)).await;
-        match self.install(source.clone()).await {
-            Ok(info) => Ok(info),
-            Err(e) => {
-                // Install failed (handshake error, syntax error in the
-                // edited source, …) — but if the original was being
-                // watched, restart a fresh watcher so the next save can
-                // retry. Without this, `kill()`'s cancel-flag write
-                // tears down the watcher, the registry entry is gone,
-                // and the loop is dead even though the user is still
-                // saving the file. (Codex bot review, May 2026.)
-                if source.watch {
-                    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                    spawn_reload_watcher(self.clone(), name.to_string(), source.clone(), cancel);
+        let result = self
+            .install_unless(source.clone(), Some(killed.clone()))
+            .await;
+        if result.is_err() {
+            // Install failed (handshake error, syntax error in the
+            // edited source, …) — but if the original was being
+            // watched, restart a fresh watcher so the next save can
+            // retry. Without this the registry entry is gone and the
+            // loop is dead even though the user is still saving the file.
+            let watcher = if source.watch && !killed.load(Ordering::SeqCst) {
+                arm_reload_watcher(self.clone(), name.to_string(), source).await
+            } else {
+                None
+            };
+            let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+            let still_ours = pending.get(name).is_some_and(|k| Arc::ptr_eq(k, &killed));
+            match watcher {
+                Some(cancel) if still_ours => {
+                    pending.insert(name.to_string(), cancel);
                     info!(
                         plugin = %name,
                         "install failed during reload; watcher re-armed for next save"
                     );
                 }
-                Err(e)
+                Some(cancel) => cancel.store(true, Ordering::SeqCst),
+                None if still_ours => {
+                    pending.remove(name);
+                }
+                None => {}
             }
         }
+        result
     }
 
     /// Snapshot every running plugin.
@@ -884,51 +985,140 @@ impl PluginManager {
     /// Tear down a plugin. Sends `plugin.shutdown`, triggers the
     /// kill signal, and removes the entry. The I/O task drops the
     /// child (kill_on_drop) which sends SIGKILL on macOS/Linux.
+    ///
+    /// A plugin mid-reload, or one a failed reload left unregistered but
+    /// still watched, counts as found: killing it stops the reload or the
+    /// watcher that would bring it back.
     pub async fn kill(&self, name: &str) -> Result<(), PluginError> {
         let mut inner = self.inner.lock().await;
-        let mut running = inner
-            .remove(name)
-            .ok_or_else(|| PluginError::NotFound(name.to_string()))?;
-
-        // Stop any active file watcher BEFORE the kill so a save
-        // racing with `shux plugin kill` doesn't respawn a plugin
-        // that's already been removed from the registry.
-        if let Some(cancel) = &running.watch_cancel {
-            cancel.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-
-        let shutdown = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "plugin.shutdown",
-            "params": {},
-        });
-        let _ = running.inbox_tx.send(format!("{shutdown}\n")).await;
-        if let Some(tx) = running.kill_tx.take() {
-            let _ = tx.send(());
-        }
+        let pending = self.take_pending(name);
+        let Some(mut running) = inner.remove(name) else {
+            return if pending {
+                Ok(())
+            } else {
+                Err(PluginError::NotFound(name.to_string()))
+            };
+        };
+        begin_stop(&mut running).await;
+        self.retire(running.join);
         Ok(())
+    }
+
+    /// Stop every plugin and every watcher, then wait for each plugin's I/O
+    /// task to reap its process group. Installs after this fail with
+    /// [`PluginError::ShuttingDown`].
+    ///
+    /// Owners call this before dropping the runtime: dropping the I/O tasks
+    /// instead signals only each plugin's leader, and the runtime cannot
+    /// finish dropping while a watcher thread is still parked.
+    pub async fn shutdown(&self) {
+        let mut inner = self.inner.lock().await;
+        self.stopping.store(true, Ordering::SeqCst);
+        let mut joins = Vec::with_capacity(inner.len());
+        for (_, mut running) in inner.drain() {
+            begin_stop(&mut running).await;
+            joins.push(running.join);
+        }
+        drop(inner);
+        joins.append(&mut self.retiring.lock().unwrap_or_else(|p| p.into_inner()));
+        for join in joins {
+            let _ = join.await;
+        }
+    }
+
+    /// Mark `name` pending under `killed`, stopping whatever was pending.
+    fn set_pending(&self, name: &str, killed: Arc<AtomicBool>) {
+        let previous = self
+            .pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(name.to_string(), killed);
+        if let Some(previous) = previous {
+            previous.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Stop whatever is pending for `name`; `true` if anything was.
+    fn take_pending(&self, name: &str) -> bool {
+        let killed = self
+            .pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(name);
+        killed
+            .inspect(|k| k.store(true, Ordering::SeqCst))
+            .is_some()
+    }
+
+    fn retire(&self, join: JoinHandle<()>) {
+        let mut retiring = self.retiring.lock().unwrap_or_else(|p| p.into_inner());
+        retiring.retain(|j| !j.is_finished());
+        retiring.push(join);
     }
 }
 
-/// Spawn a filesystem watcher that triggers `mgr.reload(name)` on
+/// Stops a watcher armed for an install that never registered.
+struct WatchGuard(Option<Arc<AtomicBool>>);
+
+impl WatchGuard {
+    fn keep(mut self) -> Option<Arc<AtomicBool>> {
+        self.0.take()
+    }
+}
+
+impl Drop for WatchGuard {
+    fn drop(&mut self) {
+        if let Some(cancel) = &self.0 {
+            cancel.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Stop the plugin's watcher, queue `plugin.shutdown`, and signal its I/O
+/// task, which grants the shutdown grace and then reaps the process group.
+async fn begin_stop(running: &mut Running) {
+    // Stop the file watcher BEFORE the kill so a save racing with
+    // `shux plugin kill` doesn't respawn a plugin that's already been
+    // removed from the registry.
+    if let Some(cancel) = &running.watch_cancel {
+        cancel.store(true, Ordering::SeqCst);
+    }
+    let shutdown = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "plugin.shutdown",
+        "params": {},
+    });
+    let _ = running.inbox_tx.send(format!("{shutdown}\n")).await;
+    if let Some(tx) = running.kill_tx.take() {
+        let _ = tx.send(());
+    }
+}
+
+/// Arm a filesystem watcher that triggers `mgr.reload(name)` on
 /// every save of `source.path`. Uses notify's recommended_watcher
 /// (FSEvents on macOS, inotify on Linux) wrapped to forward events
 /// onto a tokio channel so the reload runs in the right runtime.
 /// Self-debounces at 250ms so rapid saves coalesce into one respawn.
+///
+/// Returns the flag that stops it and a receiver that resolves once the
+/// watch is in place, or errors if it could not be set up. The watcher also
+/// stops when the manager shuts down or its debouncer is dropped with the
+/// runtime.
 fn spawn_reload_watcher(
     mgr: PluginManager,
     name: String,
     source: PluginSource,
-    cancel: Arc<std::sync::atomic::AtomicBool>,
-) {
+) -> (Arc<AtomicBool>, oneshot::Receiver<()>) {
     use notify::{EventKind, RecursiveMode, Watcher};
-    use std::sync::atomic::Ordering;
 
+    let cancel = Arc::new(AtomicBool::new(false));
     let path = source.path.clone();
     let (tx, mut rx) = mpsc::channel::<()>(16);
+    let (ready_tx, ready_rx) = oneshot::channel::<()>();
 
     let watcher_name = name.clone();
     let watcher_cancel = cancel.clone();
+    let stopping = mgr.stopping.clone();
     tokio::task::spawn_blocking(move || {
         let name = watcher_name;
         let cancel = watcher_cancel;
@@ -989,9 +1179,11 @@ fn spawn_reload_watcher(
             warn!(plugin = %name, error = %e, "watcher: failed to start");
             return;
         }
-        // Park until cancel — the watcher object itself holds the OS
+        let _ = ready_tx.send(());
+        // Park until stopped — the watcher object itself holds the OS
         // handle, dropping when this block exits.
-        while !cancel.load(Ordering::SeqCst) {
+        while !cancel.load(Ordering::SeqCst) && !stopping.load(Ordering::SeqCst) && !tx.is_closed()
+        {
             std::thread::sleep(Duration::from_millis(200));
         }
         drop(watcher);
@@ -1007,13 +1199,14 @@ fn spawn_reload_watcher(
     // recover. (Codex bot review, May 2026.)
     let reload_name = name.clone();
     let source_for_reinstall = source.clone();
+    let debounce_cancel = cancel.clone();
     tokio::spawn(async move {
         while rx.recv().await.is_some() {
             // Coalesce a burst of saves into one reload by draining
             // anything that arrives within the next 250ms.
             tokio::time::sleep(Duration::from_millis(250)).await;
             while let Ok(()) = rx.try_recv() {}
-            if cancel.load(Ordering::SeqCst) {
+            if debounce_cancel.load(Ordering::SeqCst) || mgr.stopping.load(Ordering::SeqCst) {
                 break;
             }
             info!(plugin = %reload_name, "watcher: file changed, reloading");
@@ -1021,7 +1214,8 @@ fn spawn_reload_watcher(
             let outcome = if registered {
                 mgr.reload(&reload_name).await
             } else {
-                mgr.install(source_for_reinstall.clone()).await
+                mgr.install_unless(source_for_reinstall.clone(), Some(debounce_cancel.clone()))
+                    .await
             };
             match outcome {
                 Ok(_) => info!(plugin = %reload_name, "watcher: reload OK"),
@@ -1034,6 +1228,21 @@ fn spawn_reload_watcher(
         }
         debug!(plugin = %reload_name, "watcher: debouncer exiting");
     });
+
+    (cancel, ready_rx)
+}
+
+/// [`spawn_reload_watcher`], resolved: the stop flag once watching, `None`
+/// if the watch could not be set up. Dropped before then, it stops the watcher.
+async fn arm_reload_watcher(
+    mgr: PluginManager,
+    name: String,
+    source: PluginSource,
+) -> Option<Arc<AtomicBool>> {
+    let (cancel, ready) = spawn_reload_watcher(mgr, name, source);
+    let guard = WatchGuard(Some(cancel));
+    ready.await.ok()?;
+    guard.keep()
 }
 
 fn parse_manifest(line: &str) -> Result<PluginManifest, PluginError> {
@@ -1056,6 +1265,46 @@ async fn relay_stderr(name: String, stderr: ChildStderr) {
     while let Ok(Some(line)) = lines.next_line().await {
         debug!(plugin = %name, "plugin stderr: {}", line);
     }
+}
+
+/// How a [`write_frame`] ended.
+enum Written {
+    Whole,
+    /// The kill signal arrived first, with `sent` bytes of the frame in the
+    /// pipe.
+    Killed {
+        sent: usize,
+    },
+}
+
+/// Write and flush one frame, unless the kill signal arrives first. A plugin
+/// that stopped reading fills the pipe, and a write that waited on it alone
+/// would never see the kill.
+async fn write_frame(
+    stdin: &mut ChildStdin,
+    frame: &[u8],
+    kill_rx: &mut oneshot::Receiver<()>,
+) -> std::io::Result<Written> {
+    let mut sent = 0;
+    let write = async {
+        while sent < frame.len() {
+            match stdin.write(&frame[sent..]).await? {
+                0 => return Err(std::io::ErrorKind::WriteZero.into()),
+                n => sent += n,
+            }
+        }
+        stdin.flush().await
+    };
+    let killed = tokio::select! {
+        biased;
+        _ = kill_rx => true,
+        written = write => { written?; false }
+    };
+    Ok(if killed {
+        Written::Killed { sent }
+    } else {
+        Written::Whole
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1089,58 +1338,27 @@ async fn run_plugin_io(
     // the whole function, which is what keeps this pid safe from reuse.
     let plugin_pgid = child.id();
 
+    let mut killed = false;
+    // The frame a kill interrupted, and how much of it was written.
+    let mut cut: Option<(String, usize)> = None;
     loop {
-        tokio::select! {
+        let (frame, what) = tokio::select! {
             biased;
 
             _ = &mut kill_rx => {
-                // Drain any frames already queued on inbox — notably the
-                // `plugin.shutdown` notification that `PluginManager::kill`
-                // pushes immediately before signaling us. The biased
-                // `select!` would otherwise jump straight to the grace
-                // wait without ever writing those bytes, force-killing
-                // plugins that expected the documented 2s graceful window.
-                while let Ok(line) = inbox_rx.try_recv() {
-                    if let Err(e) = stdin.write_all(line.as_bytes()).await {
-                        *last_error.lock().await = Some(format!("stdin write (drain): {e}"));
-                        break;
-                    }
-                }
-                let _ = stdin.flush().await;
-                debug!(plugin = %name, "kill signal received; draining grace");
-                // Grace WITHOUT reaping. `child.wait()` would be the obvious way
-                // to wait out the 2s, and it is the wrong one: `wait` calls
-                // `waitpid`, and a reaped pid goes straight back into the
-                // kernel's free pool. The group kill in the tail below would
-                // then be aimed at a number that may already belong to somebody
-                // else — and since every plugin (and every job-control shell)
-                // makes itself a group leader, "somebody else" can be a live
-                // group we have no business signalling.
-                //
-                // An UNREAPED child pins its pid, so probing the group with
-                // signal 0 keeps the pgid ours for the whole window. Same probe
-                // `shux::lens_scratch` uses for the same reason.
-                wait_for_group_exit(plugin_pgid, SHUTDOWN_GRACE).await;
+                killed = true;
                 break;
             }
 
-            line = inbox_rx.recv() => {
-                let Some(line) = line else { break };
-                if let Err(e) = stdin.write_all(line.as_bytes()).await {
-                    *last_error.lock().await = Some(format!("stdin write: {e}"));
-                    break;
-                }
-                let _ = stdin.flush().await;
-            }
+            line = inbox_rx.recv() => match line {
+                Some(line) => (line, "stdin write"),
+                None => break,
+            },
 
-            line = resp_rx.recv() => {
-                let Some(line) = line else { continue };
-                if let Err(e) = stdin.write_all(line.as_bytes()).await {
-                    *last_error.lock().await = Some(format!("stdin write (resp): {e}"));
-                    break;
-                }
-                let _ = stdin.flush().await;
-            }
+            line = resp_rx.recv() => match line {
+                Some(line) => (line, "stdin write (resp)"),
+                None => continue,
+            },
 
             ev = next_event(&mut sub, &perm_root) => {
                 let Some(ev) = ev else { continue };
@@ -1149,11 +1367,7 @@ async fn run_plugin_io(
                     "method": "event",
                     "params": ev,
                 });
-                if let Err(e) = stdin.write_all(format!("{frame}\n").as_bytes()).await {
-                    *last_error.lock().await = Some(format!("event write: {e}"));
-                    break;
-                }
-                let _ = stdin.flush().await;
+                (format!("{frame}\n"), "event write")
             }
 
             res = reader.next_line() => {
@@ -1172,6 +1386,7 @@ async fn run_plugin_io(
                             denial_hook.get().cloned(),
                             resp_tx.clone(),
                         );
+                        continue;
                     }
                     Ok(None) => {
                         debug!(plugin = %name, "plugin closed stdout; exiting io task");
@@ -1184,7 +1399,55 @@ async fn run_plugin_io(
                     }
                 }
             }
+        };
+        match write_frame(&mut stdin, frame.as_bytes(), &mut kill_rx).await {
+            Ok(Written::Whole) => {}
+            Ok(Written::Killed { sent }) => {
+                (killed, cut) = (true, Some((frame, sent)));
+                break;
+            }
+            Err(e) => {
+                *last_error.lock().await = Some(format!("{what}: {e}"));
+                break;
+            }
         }
+    }
+
+    if killed {
+        // Drain any frames already queued on inbox — notably the
+        // `plugin.shutdown` notification that `PluginManager::kill` pushes
+        // immediately before signaling us — inside the grace, so a plugin
+        // that stopped reading cannot stall the kill on a full pipe.
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
+        let drain = async {
+            // Finish the interrupted frame first: it may be `plugin.shutdown`
+            // itself, and a half-written one would swallow the next line.
+            if let Some((frame, sent)) = &cut {
+                stdin.write_all(&frame.as_bytes()[*sent..]).await?;
+            }
+            while let Ok(line) = inbox_rx.try_recv() {
+                stdin.write_all(line.as_bytes()).await?;
+            }
+            stdin.flush().await
+        };
+        if let Ok(Err(e)) = tokio::time::timeout_at(deadline, drain).await {
+            *last_error.lock().await = Some(format!("stdin write (drain): {e}"));
+        }
+        debug!(plugin = %name, "kill signal received; draining grace");
+        // Grace WITHOUT reaping. `child.wait()` would be the obvious way
+        // to wait out the 2s, and it is the wrong one: `wait` calls
+        // `waitpid`, and a reaped pid goes straight back into the
+        // kernel's free pool. The group kill in the tail below would
+        // then be aimed at a number that may already belong to somebody
+        // else — and since every plugin (and every job-control shell)
+        // makes itself a group leader, "somebody else" can be a live
+        // group we have no business signalling.
+        //
+        // An UNREAPED child pins its pid, so probing the group with
+        // signal 0 keeps the pgid ours for the whole window. Same probe
+        // `shux::lens_scratch` uses for the same reason.
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        wait_for_group_exit(plugin_pgid, remaining).await;
     }
 
     // Every exit from the loop above lands here — the graceful shutdown, a
@@ -1625,6 +1888,16 @@ fn resolve_owners(graph: &GraphHandle, targets: &Targets) -> TargetOwners {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_stat_fields_are_read_past_a_hostile_comm() {
+        use super::stat_state_and_pgrp as parse;
+        assert_eq!(parse("4242 (a) Z 1 7) S 1 777 777 0 -1"), Some(("S", 777)));
+        assert_eq!(parse("4242 (sh) Z 1 777 777 0"), Some(("Z", 777)));
+        assert_eq!(parse("garbage"), None);
+        assert_eq!(parse("1 (x) S 1"), None);
+    }
+
     use super::*;
     // Only the tests need the concrete id types now that `resolve_owners`
     // goes through the shared reference resolver.
@@ -1673,6 +1946,49 @@ mod tests {
             &created,
             tempfile::tempdir().unwrap().path()
         ));
+    }
+
+    /// An install dropped while its watcher is arming, as when the RPC
+    /// client disconnects, must not leave the watcher installing on a save.
+    #[tokio::test]
+    async fn a_watcher_dropped_while_arming_does_not_install_on_a_save() {
+        use std::future::Future;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("orphan.sh");
+        let body = r#"#!/usr/bin/env bash
+IFS= read -r _ || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":"init","result":{"name":"orphan","version":"0.1.0","subscribes":[],"provides":[],"capabilities":[]}}'
+while IFS= read -r line; do
+  case "$line" in *'"plugin.shutdown"'*) exit 0 ;; esac
+done
+"#;
+        std::fs::write(&script, body).unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let mgr = PluginManager::with_state_root(EventBus::new(), dir.path().join("state"));
+
+        let mut arming = Box::pin(arm_reload_watcher(
+            mgr.clone(),
+            "orphan".into(),
+            PluginSource::from_path(&script).with_watch(true),
+        ));
+        let polled =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(arming.as_mut().poll(cx))).await;
+        assert!(
+            polled.is_pending(),
+            "the watcher was ready on its first poll"
+        );
+        drop(arming);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        std::fs::write(&script, body).unwrap();
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        let listed = mgr.list().await;
+        mgr.shutdown().await;
+        assert!(
+            listed.is_empty(),
+            "a save installed a plugin whose install was dropped"
+        );
     }
 
     #[test]

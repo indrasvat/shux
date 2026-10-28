@@ -998,3 +998,415 @@ sleep 120
         "a cancelled install leaked the plugin's forked child"
     );
 }
+
+/// Swap `path`'s contents by rename, as editors that save atomically do, so a
+/// running bash never reads a half-rewritten script.
+fn save_script(path: &std::path::Path, body: &str) {
+    let tmp = path.with_extension("swp");
+    let _ = write_script(
+        path.parent().unwrap(),
+        tmp.file_name().unwrap().to_str().unwrap(),
+        body,
+    );
+    std::fs::rename(&tmp, path).unwrap();
+}
+
+async fn wait_until(budget: Duration, mut done: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + budget;
+    while std::time::Instant::now() < deadline {
+        if done() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    done()
+}
+
+/// A polite plugin named `name` that appends a line to `starts` each time it
+/// hands shake.
+fn counting_plugin(name: &str, starts: &std::path::Path) -> String {
+    format!(
+        r#"#!/usr/bin/env bash
+set -u
+IFS= read -r _ || exit 1
+printf '%s\n' '{{"jsonrpc":"2.0","id":"init","result":{{"name":"{name}","version":"0.1.0","subscribes":[],"provides":[],"capabilities":[]}}}}'
+echo start >> {starts}
+while IFS= read -r line; do
+  case "$line" in
+    *'"plugin.shutdown"'*) exit 0 ;;
+  esac
+done
+"#,
+        starts = starts.display()
+    )
+}
+
+fn line_count(path: &std::path::Path) -> usize {
+    std::fs::read_to_string(path)
+        .map(|s| s.lines().count())
+        .unwrap_or(0)
+}
+
+/// Wait for a save to unregister every plugin, as a reload does first.
+async fn wait_unlisted(mgr: &PluginManager) -> bool {
+    for _ in 0..400 {
+        if mgr.list().await.is_empty() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    false
+}
+
+/// A watcher re-armed after a failed reload must stop when the plugin it
+/// brought back is killed: otherwise the next save installs it again.
+#[tokio::test]
+async fn a_plugin_killed_after_recovering_from_a_bad_save_stays_killed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let starts = tmp.path().join("starts.log");
+    let good = counting_plugin("phoenix", &starts);
+    let broken = "#!/usr/bin/env bash\nexit 1\n";
+    let script = write_script(tmp.path(), "phoenix.sh", &good);
+    let start_count = || line_count(&starts);
+
+    let mgr = PluginManager::with_state_root(EventBus::new(), tmp.path().join("state"))
+        .with_handshake_timeout(Duration::from_secs(2));
+    mgr.install(PluginSource::from_path(&script).with_watch(true))
+        .await
+        .expect("install");
+    assert!(wait_until(Duration::from_secs(5), || start_count() == 1).await);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // A bad save: the reload's install fails and the watcher re-arms.
+    save_script(&script, broken);
+    assert!(
+        wait_unlisted(&mgr).await,
+        "the bad save never unregistered the plugin"
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // The fix: the re-armed watcher installs it again.
+    save_script(&script, &good);
+    assert!(
+        wait_until(Duration::from_secs(5), || start_count() == 2).await,
+        "the fixed save never brought the plugin back"
+    );
+
+    mgr.kill("phoenix").await.expect("kill");
+    save_script(&script, &good);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let listed = mgr.list().await;
+    let restarted = start_count();
+    for p in &listed {
+        let _ = mgr.kill(&p.name).await;
+    }
+    assert!(
+        listed.is_empty() && restarted == 2,
+        "a killed plugin came back on the next save: listed {:?}, {restarted} starts",
+        listed.iter().map(|p| &p.name).collect::<Vec<_>>()
+    );
+}
+
+/// `install` reports `watching` only once a save would be seen: a save
+/// straight after it returns must reload the plugin.
+#[tokio::test]
+async fn a_save_right_after_a_watched_install_reloads_the_plugin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let starts = tmp.path().join("starts.log");
+    let body = counting_plugin("eager", &starts);
+    let script = write_script(tmp.path(), "eager.sh", &body);
+    let start_count = || line_count(&starts);
+
+    let mgr = PluginManager::with_state_root(EventBus::new(), tmp.path().join("state"));
+    let info = mgr
+        .install(PluginSource::from_path(&script).with_watch(true))
+        .await
+        .expect("install");
+    assert!(info.watching);
+    save_script(&script, &body);
+    let reloaded = wait_until(Duration::from_secs(5), || start_count() == 2).await;
+    let _ = mgr.kill("eager").await;
+    assert!(reloaded, "a save made as `install` returned was never seen");
+}
+
+/// A plugin that exits on `plugin.shutdown` ends its grace at once: the
+/// leader it leaves unreaped is not a process still shutting down. Linux
+/// only: elsewhere the grace cannot tell that zombie from a live process.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn shutdown_returns_as_soon_as_a_polite_plugin_has_exited() {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = write_script(tmp.path(), "noop.sh", NOOP_PLUGIN);
+    let mgr = PluginManager::with_state_root(EventBus::new(), tmp.path().join("state"));
+    mgr.install(PluginSource::from_path(&script))
+        .await
+        .expect("install");
+
+    let started = std::time::Instant::now();
+    mgr.shutdown().await;
+    let took = started.elapsed();
+    assert!(
+        took < shux_plugin::SHUTDOWN_GRACE - Duration::from_millis(500),
+        "shutdown of a plugin that exits on request took {took:?}, the whole grace"
+    );
+}
+
+/// A plugin that stops reading its stdin fills the pipe and parks the I/O
+/// task mid-write. `kill` and `shutdown` must still reach it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_plugin_that_stopped_reading_is_still_killed_and_shut_down() {
+    let tmp = tempfile::tempdir().unwrap();
+    let marker = unique_marker("deaf");
+    let body = format!(
+        r#"#!/usr/bin/env bash
+set -u
+IFS= read -r _ || exit 1
+printf '%s\n' '{{"jsonrpc":"2.0","id":"init","result":{{"name":"deaf","version":"0.1.0","subscribes":["session.created"],"provides":[],"capabilities":[]}}}}'
+exec -a {marker} sleep 300
+"#
+    );
+    let script = write_script(tmp.path(), "deaf.sh", &body);
+    let bus = EventBus::new();
+    let mgr = PluginManager::with_state_root(bus.clone(), tmp.path().join("state"));
+
+    let flood = |bus: &EventBus| {
+        for _ in 0..2_000 {
+            bus.publish(shux_core::event::EventData::SessionCreated {
+                session_id: shux_core::model::SessionId::new(),
+                name: "x".repeat(200),
+            });
+        }
+    };
+
+    for round in ["kill", "shutdown"] {
+        mgr.install(PluginSource::from_path(&script))
+            .await
+            .expect("install");
+        flood(&bus);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        if round == "kill" {
+            mgr.kill("deaf").await.expect("kill");
+        } else {
+            let done = tokio::time::timeout(Duration::from_secs(10), mgr.shutdown()).await;
+            assert!(
+                done.is_ok(),
+                "shutdown never returned for a plugin that stopped reading"
+            );
+        }
+        assert_eq!(
+            wait_for_no_procs(&marker, Duration::from_secs(10)).await,
+            0,
+            "a plugin that stopped reading survived `{round}`"
+        );
+    }
+}
+
+/// `kill` during a reload's handshake wins over the reload, whether that
+/// handshake then fails or succeeds: the next save does not bring it back.
+#[tokio::test]
+async fn a_kill_during_a_reload_handshake_is_not_undone_by_the_next_save() {
+    let tmp = tempfile::tempdir().unwrap();
+    let starts = tmp.path().join("starts.log");
+    let good = counting_plugin("lazarus", &starts);
+    let slow_bad = "#!/usr/bin/env bash\nIFS= read -r _\nsleep 1.5\nexit 1\n".to_string();
+    let slow_good = good.replacen("|| exit 1\n", "|| exit 1\nsleep 1.5\n", 1);
+    for (handshake, slow) in [("fails", slow_bad), ("succeeds", slow_good)] {
+        let script = write_script(tmp.path(), "lazarus.sh", &good);
+        let mgr = PluginManager::with_state_root(EventBus::new(), tmp.path().join("state"));
+        mgr.install(PluginSource::from_path(&script).with_watch(true))
+            .await
+            .expect("install");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        save_script(&script, &slow);
+        assert!(wait_unlisted(&mgr).await, "the save never started a reload");
+        mgr.kill("lazarus")
+            .await
+            .expect("a plugin mid-reload is found");
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        let after_kill = mgr.list().await;
+
+        save_script(&script, &good);
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        let after_save = mgr.list().await;
+        mgr.shutdown().await;
+        assert!(
+            after_kill.is_empty() && after_save.is_empty(),
+            "a plugin killed mid-reload came back when its handshake {handshake}"
+        );
+    }
+}
+
+/// `shutdown` also waits out plugins `kill` stopped just before it: their
+/// grace may still be running when the owner drops the runtime.
+#[test]
+fn shutdown_waits_for_a_plugin_killed_just_before_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let child = unique_marker("stubborn-child");
+    let body = format!(
+        r#"#!/usr/bin/env bash
+trap '' TERM HUP
+IFS= read -r _ || exit 1
+printf '%s\n' '{{"jsonrpc":"2.0","id":"init","result":{{"name":"stubborn","version":"0.1.0","subscribes":[],"provides":[],"capabilities":[]}}}}'
+( trap '' TERM HUP; exec -a {child} sleep 45 ) &
+while IFS= read -r line; do :; done
+sleep 45
+"#
+    );
+    let script = write_script(tmp.path(), "stubborn.sh", &body);
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mgr = PluginManager::with_state_root(EventBus::new(), tmp.path().join("state"));
+        mgr.install(PluginSource::from_path(&script))
+            .await
+            .expect("install");
+        let c = child.clone();
+        assert!(
+            wait_until(Duration::from_secs(5), move || count_procs_containing(&c)
+                == 1)
+            .await
+        );
+        mgr.kill("stubborn").await.expect("kill");
+        mgr.shutdown().await;
+    });
+    drop(rt);
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while count_procs_containing(&child) > 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        count_procs_containing(&child),
+        0,
+        "a killed plugin's child outlived shutdown and the runtime"
+    );
+}
+
+/// `kill` while a re-armed watcher's install is mid-handshake wins: the
+/// plugin does not register when that handshake completes.
+#[tokio::test]
+async fn a_kill_during_a_rearmed_watchers_install_sticks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let good = r#"#!/usr/bin/env bash
+IFS= read -r _ || exit 1
+sleep 1
+printf '%s\n' '{"jsonrpc":"2.0","id":"init","result":{"name":"revenant","version":"0.1.0","subscribes":[],"provides":[],"capabilities":[]}}'
+while IFS= read -r line; do
+  case "$line" in
+    *'"plugin.shutdown"'*) exit 0 ;;
+  esac
+done
+"#;
+    let script = write_script(tmp.path(), "revenant.sh", good);
+    let mgr = PluginManager::with_state_root(EventBus::new(), tmp.path().join("state"))
+        .with_handshake_timeout(Duration::from_secs(3));
+    mgr.install(PluginSource::from_path(&script).with_watch(true))
+        .await
+        .expect("install");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    save_script(&script, "#!/usr/bin/env bash\nexit 1\n");
+    assert!(
+        wait_unlisted(&mgr).await,
+        "the bad save never unregistered the plugin"
+    );
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    save_script(&script, good);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let killed = mgr.kill("revenant").await;
+    tokio::time::sleep(Duration::from_millis(2_000)).await;
+    let listed = mgr.list().await;
+    mgr.shutdown().await;
+    assert!(
+        listed.is_empty(),
+        "kill returned {killed:?}, yet the plugin registered afterwards"
+    );
+}
+
+/// A kill that lands mid-frame must not glue `plugin.shutdown` onto the
+/// half-written frame: a line-at-a-time reader still sees it as its own line.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kill_mid_frame_still_delivers_shutdown_on_its_own_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("stdin.log");
+    // `cat` drains the pipe in large reads; a shell `read` loop takes a
+    // syscall per byte and can outlast the grace on a slow machine. No
+    // `exec`: the shell keeps stdout open, which the host reads as alive.
+    let body = format!(
+        r#"#!/usr/bin/env bash
+IFS= read -r _ || exit 1
+printf '%s\n' '{{"jsonrpc":"2.0","id":"init","result":{{"name":"torn","version":"0.1.0","subscribes":["session.created"],"provides":[],"capabilities":[]}}}}'
+sleep 1.5
+cat > {log}
+"#,
+        log = log.display()
+    );
+    let script = write_script(tmp.path(), "torn.sh", &body);
+    let bus = EventBus::new();
+    let mgr = PluginManager::with_state_root(bus.clone(), tmp.path().join("state"));
+    mgr.install(PluginSource::from_path(&script))
+        .await
+        .expect("install");
+    // Frames larger than PIPE_BUF are written in pieces, so the full pipe
+    // parks the writer part-way through one.
+    for _ in 0..40 {
+        bus.publish(shux_core::event::EventData::SessionCreated {
+            session_id: shux_core::model::SessionId::new(),
+            name: "x".repeat(10_000),
+        });
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    mgr.kill("torn").await.expect("kill");
+    let shutdown = r#"{"jsonrpc":"2.0","method":"plugin.shutdown""#;
+    let read = || std::fs::read_to_string(&log).unwrap_or_default();
+    let own_line = |s: &str| s.lines().any(|l| l.starts_with(shutdown));
+    wait_until(Duration::from_secs(5), || own_line(&read())).await;
+    mgr.shutdown().await;
+    let got = read();
+    assert!(
+        got.contains("plugin.shutdown"),
+        "plugin.shutdown never arrived"
+    );
+    assert!(
+        own_line(&got),
+        "plugin.shutdown arrived glued to a torn frame"
+    );
+}
+
+/// `plugin.shutdown` taken off the queue just as the kill signal lands is
+/// still written: a polite plugin always gets the chance to exit itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_kill_delivers_plugin_shutdown() {
+    let tmp = tempfile::tempdir().unwrap();
+    let seen = tmp.path().join("seen.log");
+    let body = format!(
+        r#"#!/usr/bin/env bash
+IFS= read -r _ || exit 1
+printf '%s\n' '{{"jsonrpc":"2.0","id":"init","result":{{"name":"heed","version":"0.1.0","subscribes":[],"provides":[],"capabilities":[]}}}}'
+while IFS= read -r line; do
+  case "$line" in *'"plugin.shutdown"'*) echo seen >> {seen}; exit 0 ;; esac
+done
+"#,
+        seen = seen.display()
+    );
+    let script = write_script(tmp.path(), "heed.sh", &body);
+    let mgr = PluginManager::with_state_root(EventBus::new(), tmp.path().join("state"));
+    let rounds = 200;
+    for _ in 0..rounds {
+        mgr.install(PluginSource::from_path(&script))
+            .await
+            .expect("install");
+        mgr.kill("heed").await.expect("kill");
+    }
+    mgr.shutdown().await;
+    assert_eq!(
+        line_count(&seen),
+        rounds,
+        "some kills never delivered plugin.shutdown"
+    );
+}
