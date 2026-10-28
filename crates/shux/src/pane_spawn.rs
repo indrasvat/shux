@@ -103,6 +103,74 @@ impl PtyInputQueue {
     }
 }
 
+/// PTY bytes staged for the next sampled `pane.output` publish: at most one
+/// chunk per [`Self::INTERVAL`], so a noisy pane cannot saturate the data
+/// plane, and staged bytes are published once the interval passes even when
+/// the pane writes nothing more.
+struct StagedOutput {
+    bytes: Vec<u8>,
+    /// Bytes were dropped past [`Self::MAX`]; published as `sampled`.
+    dropped_any: bool,
+    /// The earliest the next chunk may go out.
+    due: tokio::time::Instant,
+    /// Learned from the first read; `None` until then or with no bus.
+    bus: Option<shux_core::bus::EventBus>,
+}
+
+impl StagedOutput {
+    const INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+    const MAX: usize = 64 * 1024;
+
+    fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            dropped_any: false,
+            due: tokio::time::Instant::now(),
+            bus: None,
+        }
+    }
+
+    /// Stage `data`, dropping the oldest staged bytes past [`Self::MAX`].
+    fn stage(&mut self, data: &[u8]) {
+        let overflow = (self.bytes.len() + data.len()).saturating_sub(Self::MAX);
+        if overflow > 0 {
+            self.bytes.drain(..overflow.min(self.bytes.len()));
+            self.dropped_any = true;
+        }
+        self.bytes.extend_from_slice(data);
+    }
+
+    /// When the staged bytes are due, or `None` with nothing to publish.
+    fn due_at(&self) -> Option<tokio::time::Instant> {
+        (self.bus.is_some() && !self.bytes.is_empty()).then_some(self.due)
+    }
+
+    /// Publish the staged bytes as one chunk. They stay staged, for the next
+    /// interval, while the pane has no window or session to attribute them to.
+    fn publish(
+        &mut self,
+        graph: &shux_core::graph::GraphHandle,
+        pane_id: shux_core::model::PaneId,
+    ) {
+        use base64::Engine;
+        let Some(bus) = &self.bus else { return };
+        if self.bytes.is_empty() {
+            return;
+        }
+        self.due = tokio::time::Instant::now() + Self::INTERVAL;
+        let snap = graph.snapshot();
+        let Some(wid) = snap.panes.get(&pane_id).map(|p| p.window_id) else {
+            return;
+        };
+        let Some(sid) = snap.windows.get(&wid).map(|w| w.session_id) else {
+            return;
+        };
+        let b64 = base64::engine::general_purpose::STANDARD.encode(std::mem::take(&mut self.bytes));
+        bus.publish_pane_output(pane_id, wid, sid, b64, self.dropped_any);
+        self.dropped_any = false;
+    }
+}
+
 /// Per-pane async task that owns the PtyHandle and handles both reads and writes.
 ///
 /// Reads from the PTY and feeds VT + CommandEngine. Receives writes from the
@@ -115,7 +183,6 @@ async fn run_pane_pty_task(
     control: PtyTaskControl,
     graph: shux_core::graph::GraphHandle,
 ) {
-    use base64::Engine;
     let PtyTaskControl {
         incarnation,
         mut write_rx,
@@ -131,24 +198,12 @@ async fn run_pane_pty_task(
     // local diff we'd flood the graph + event bus.
     let mut last_osc_title: Option<String> = None;
 
-    // PR 2c — sampled pane.output data-plane publishing.
-    //
-    // Coalesce PTY chunks into a single broadcast per
-    // `output_sample_interval`. Without this rate limit a noisy pane
-    // (npm install, cargo build, tail -F) would saturate the data-plane
-    // channel and lag every subscriber. Trade-off: subscribers see at
-    // most ~10 chunks/sec/pane and `sampled=true` whenever bytes were
-    // dropped between intervals.
-    let output_sample_interval = std::time::Duration::from_millis(100);
-    let mut output_pending: Vec<u8> = Vec::new();
-    let mut output_last_published_at = std::time::Instant::now()
-        .checked_sub(output_sample_interval)
-        .unwrap_or_else(std::time::Instant::now);
-    let mut output_dropped_any = false;
+    let mut staged = StagedOutput::new();
     let mut task_exit = PtyTaskExit::Natural;
     let mut pending = PtyInputQueue::default();
 
     loop {
+        let output_due = staged.due_at();
         tokio::select! {
             biased;
 
@@ -234,56 +289,10 @@ async fn run_pane_pty_task(
                             }
                         }
 
-                        // Stage these bytes for the next sampled publish.
-                        // We cap the buffered chunk at 64KB to avoid
-                        // unbounded growth if the sampling interval
-                        // races with a huge burst of output — anything
-                        // older gets dropped (sampled=true signals that).
-                        const MAX_PENDING: usize = 64 * 1024;
-                        if output_pending.len() + data.len() > MAX_PENDING {
-                            let overflow =
-                                output_pending.len() + data.len() - MAX_PENDING;
-                            let drop = overflow.min(output_pending.len());
-                            output_pending.drain(..drop);
-                            output_dropped_any = true;
-                        }
-                        output_pending.extend_from_slice(data);
-                        // Publish if the sample interval has elapsed AND
-                        // there's a bus + at least one buffered byte.
-                        if let Some(bus) = bus_opt {
-                            let now = std::time::Instant::now();
-                            if !output_pending.is_empty()
-                                && now.duration_since(output_last_published_at)
-                                    >= output_sample_interval
-                            {
-                                // Resolve (window_id, session_id) outside
-                                // the io_state lock to avoid holding it
-                                // across the broadcast send.
-                                let snap = graph.snapshot();
-                                let pane = snap.panes.get(&pane_id);
-                                if let Some(p) = pane {
-                                    let wid = p.window_id;
-                                    let sid = snap
-                                        .windows
-                                        .get(&wid)
-                                        .map(|w| w.session_id);
-                                    if let Some(sid) = sid {
-                                        let chunk = std::mem::take(&mut output_pending);
-                                        let b64 =
-                                            base64::engine::general_purpose::STANDARD
-                                                .encode(&chunk);
-                                        bus.publish_pane_output(
-                                            pane_id,
-                                            wid,
-                                            sid,
-                                            b64,
-                                            output_dropped_any,
-                                        );
-                                        output_last_published_at = now;
-                                        output_dropped_any = false;
-                                    }
-                                }
-                            }
+                        staged.bus = bus_opt;
+                        staged.stage(data);
+                        if staged.due_at().is_some_and(|at| at <= tokio::time::Instant::now()) {
+                            staged.publish(&graph, pane_id);
                         }
                         // Wake any attach-render loops outside the lock.
                         // notify_one queues a permit that survives even if
@@ -429,7 +438,16 @@ async fn run_pane_pty_task(
                     .await;
                 }
             }
+            _ = tokio::time::sleep_until(output_due.unwrap_or_else(tokio::time::Instant::now)),
+                if output_due.is_some() =>
+            {
+                staged.publish(&graph, pane_id);
+            }
         }
+    }
+    // A program's last words, staged inside the final interval.
+    if task_exit == PtyTaskExit::Natural {
+        staged.publish(&graph, pane_id);
     }
 
     finish_pane_recorders(&io_state, pane_id, Some(incarnation)).await;
@@ -1551,5 +1569,73 @@ mod tests {
         drop(state);
         assert_child_gone(&pid_file).await;
         h.stop().await;
+    }
+
+    /// Every byte a pane writes reaches the data plane, including the last
+    /// write of a burst when nothing follows it. Each script writes `first`,
+    /// then 20 ms later a colour-probed `LAST`, so `LAST` lands inside the
+    /// sampling window that `first` opened.
+    async fn data_plane_output(script: &str) -> String {
+        use base64::Engine;
+        let h = crate::rpc::test_harness::RpcHarness::new();
+        let (_s, _w, pane) = h.seed_session("data-plane").await;
+        let mut sub = h.bus.subscribe_pane_output();
+        spawn_pane_pty_unshared(
+            pane,
+            "/tmp".into(),
+            vec!["sh".into(), "-c".into(), script.into()],
+            shux_pty::handle::PtySize::default(),
+            Vec::new(),
+            false,
+            h.io.clone(),
+            h.cancel.clone(),
+            h.graph.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        let mut seen = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !String::from_utf8_lossy(&seen).contains("LAST") {
+            match tokio::time::timeout_at(deadline, sub.recv()).await {
+                Ok(Some(shux_core::bus::PaneOutputSubscriptionEvent::Chunk(c)))
+                    if c.pane_id == pane =>
+                {
+                    seen.extend(
+                        base64::engine::general_purpose::STANDARD
+                            .decode(&c.bytes)
+                            .unwrap(),
+                    );
+                }
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+        h.stop().await;
+        String::from_utf8_lossy(&seen).into_owned()
+    }
+
+    const BURST: &str = "printf 'first\\n'; sleep 0.02; \
+        printf '\\033[38;2;255;0;128mT\\033[0m \\033[38;5;208mI\\033[0m \\033[31mB\\033[0m LAST\\n'";
+
+    fn assert_burst_delivered(seen: &str) {
+        assert!(seen.contains("first"), "{seen:?}");
+        assert!(
+            seen.contains("LAST"),
+            "the last write never reached the data plane: {seen:?}"
+        );
+        for sgr in ["\x1b[38;2;255;0;128m", "\x1b[38;5;208m", "\x1b[31m"] {
+            assert!(seen.contains(sgr), "colour {sgr:?} missing from {seen:?}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pane_that_goes_quiet_still_publishes_its_last_write() {
+        assert_burst_delivered(&data_plane_output(&format!("{BURST}; exec sleep 30")).await);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pane_that_exits_still_publishes_its_last_write() {
+        assert_burst_delivered(&data_plane_output(BURST).await);
     }
 }
