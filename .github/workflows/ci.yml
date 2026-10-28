@@ -56,11 +56,8 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - name: Install jq
         run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends jq
-      # Order matters: `make test-vt-corpus` REGENERATES
-      # `.shux/qa/073-shux-vt-corpus-regression-harness/` in this same worktree.
-      # If it ran first, CI's own harness output could land in the diff the guard
-      # reads and help satisfy the contract it is meant to enforce. Judge first,
-      # then regenerate.
+      # Order matters: judge the diff before anything in this job writes to the
+      # worktree, so no harness output can land in the diff the guard reads.
       - name: Check VT QA evidence contract
         env:
           # On a PR, compare against the branch it targets. On a push to main
@@ -70,6 +67,19 @@ jobs:
         run: make check-vt-qa
       - name: Run VT corpus pixel regression
         run: .shux/scripts/no_leak_guard.sh make test-vt-corpus
+      # The harness's scratch belongs under the gitignored .shux/out. A run that
+      # leaves anything tracked or untracked behind is a defect even when every
+      # pixel matched.
+      - name: VT corpus run left the worktree clean
+        run: |
+          changed="$(git status --porcelain --untracked-files=all)"
+          if [ -n "$changed" ]; then
+            echo "::error::make test-vt-corpus changed the worktree:"
+            echo "$changed"
+            exit 1
+          fi
+      - name: VT corpus scratch self-test
+        run: make check-vt-corpus-scratch
 
   check:
     name: Check

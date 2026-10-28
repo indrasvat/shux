@@ -5,7 +5,10 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 fixtures="${VT_CORPUS_FIXTURES:-${repo_root}/.shux/fixtures/vt-corpus}"
 goldens="${VT_CORPUS_GOLDENS:-${repo_root}/.shux/goldens/073-vt-corpus}"
 out="${VT_CORPUS_OUT:-${repo_root}/.shux/out/073-vt-corpus}"
-qa="${VT_CORPUS_QA:-${repo_root}/.shux/qa/073-shux-vt-corpus-regression-harness}"
+# Scratch by default: the diff PNGs re-encode on every run, so a tracked
+# destination would dirty a clean checkout. `make refresh-vt-corpus-evidence`
+# points this at the committed evidence on purpose.
+qa="${VT_CORPUS_QA:-${out}/qa}"
 rendered="${out}/rendered"
 
 need() {

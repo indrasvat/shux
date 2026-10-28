@@ -353,6 +353,16 @@ test-vt-corpus: test-vt-corpus-unit ## Replay committed VT corpus fixtures and v
 	@.shux/scripts/vt_corpus_check.sh
 	@echo "$(COLOR_GREEN)✓ VT corpus regression harness passed$(COLOR_RESET)"
 
+.PHONY: refresh-vt-corpus-evidence
+refresh-vt-corpus-evidence: test-vt-corpus-unit ## Re-run the VT corpus harness into the committed .shux/qa evidence (deliberate update)
+	@echo "$(COLOR_BLUE)▶ Refreshing committed VT corpus evidence...$(COLOR_RESET)"
+	@VT_CORPUS_QA="$(CURDIR)/.shux/qa/073-shux-vt-corpus-regression-harness" .shux/scripts/vt_corpus_check.sh
+	@echo "$(COLOR_GREEN)✓ VT corpus evidence refreshed; review the diff before committing$(COLOR_RESET)"
+
+.PHONY: check-vt-corpus-scratch
+check-vt-corpus-scratch: ## Prove the VT corpus harness writes scratch to .shux/out, never the tracked tree
+	@bash scripts/check-vt-corpus-scratch-selftest.sh
+
 .PHONY: test-vt-resize-reflow
 test-vt-resize-reflow: release ## Drive shux pane resize reflow automation and exact PNG return check
 	@echo "$(COLOR_BLUE)▶ Running VT resize reflow automation...$(COLOR_RESET)"
@@ -733,7 +743,7 @@ fmt: ## Format all code
 	@echo "$(COLOR_GREEN)✓ Formatting complete$(COLOR_RESET)"
 
 .PHONY: check-after-hygiene
-check-after-hygiene: lint shellcheck check-darwin test check-test-groups check-test-inventory check-ci-parity test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-lens-frozen check-no-bin-mods
+check-after-hygiene: lint shellcheck check-darwin test check-test-groups check-test-inventory check-ci-parity test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-lens-frozen check-no-bin-mods check-vt-corpus-scratch
 
 .PHONY: check
 check: hooks-check check-target-hygiene ## Run lint + test + process/QA guards (what pre-commit runs)
@@ -745,7 +755,7 @@ check: hooks-check check-target-hygiene ## Run lint + test + process/QA guards (
 	@echo ""
 
 .PHONY: ci
-ci: lint shellcheck check-darwin test check-test-groups check-test-inventory check-ci-parity test-doc test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-no-bin-mods ## Run the CI pipeline locally (lint + full test + doc tests + process/QA guards)
+ci: lint shellcheck check-darwin test check-test-groups check-test-inventory check-ci-parity test-doc test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-no-bin-mods check-vt-corpus-scratch ## Run the CI pipeline locally (lint + full test + doc tests + process/QA guards)
 	@echo ""
 	@echo "$(COLOR_GREEN)$(COLOR_BOLD)✓ CI pipeline passed!$(COLOR_RESET)"
 	@echo ""
