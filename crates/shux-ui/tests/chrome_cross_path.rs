@@ -137,3 +137,69 @@ fn attach_and_snapshot_draw_identical_chrome() {
     assert!(title.contains("◆ build"), "badge missing: {title}");
     assert!(title.contains('日'), "wide title missing: {title}");
 }
+
+/// Zones that overlap a wide glyph draw the same in both paths: the half not
+/// painted over is erased, as the terminal reading attach's bytes erases it.
+#[test]
+fn overlapping_status_zones_draw_identically() {
+    for left in ["ab日", "ab👩\u{200d}💻"] {
+        let pane = PaneId::new();
+        let layout = LayoutNode::Leaf { pane };
+        let vt = VirtualTerminal::new(4, 6);
+        let mut bar = StatusBar::new();
+        bar.left.push(StatusSegment::plain(left));
+        bar.center.push(StatusSegment::plain("XY"));
+        let vts: HashMap<PaneId, &VirtualTerminal> = HashMap::from([(pane, &vt)]);
+        let mut live = RenderCompositor::new(
+            6,
+            5,
+            Cursor::new(Vec::new()),
+            CompositorConfig {
+                show_border: false,
+                status_bar_height: 1,
+                border_style: BorderStyle::None,
+                border_colors: colors(),
+            },
+        );
+        live.render_multi_pane(MultiPaneFrame {
+            layout: &layout,
+            zoom: None,
+            focused: pane,
+            vts: &vts,
+            chrome: None,
+            status_bar: Some(&bar),
+        })
+        .unwrap();
+        let mut seen = VirtualTerminal::new(5, 6);
+        seen.process(live.inner_mut().get_ref());
+        let panes = HashMap::from([(pane, (vt.grid(), vt.cursor()))]);
+        let composed = compose(
+            &ComposeInputs {
+                layout: &layout,
+                zoom: None,
+                focused: pane,
+                panes: &panes,
+                chrome: None,
+                status_bar: Some(&bar),
+            },
+            6,
+            5,
+            BorderStyle::None,
+            colors(),
+            1,
+        );
+        let text = |g: &shux_vt::Grid| -> Vec<String> {
+            (0..6)
+                .map(|c| {
+                    let cell = &g.visible_row(4)[c];
+                    format!(
+                        "{}{}",
+                        cell.grapheme().map_or(cell.ch.to_string(), str::to_string),
+                        cell.width
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(text(seen.grid()), text(&composed.grid), "{left:?}");
+    }
+}
