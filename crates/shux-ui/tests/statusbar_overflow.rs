@@ -4,7 +4,7 @@
 //! owns every cell. Priority when the zones do not fit: left, then right, then
 //! centre; a zone that loses columns first drops its trailing spaces, then
 //! keeps a prefix of its text ending in `…`, or is dropped when not even one
-//! glyph and the `…` fit.
+//! glyph other than a space and the `…` fit.
 
 use crossterm::style::Color;
 use shux_ui::{RenderCell, StatusBar, StatusSegment};
@@ -57,14 +57,14 @@ fn plain(row: &[RenderCell]) -> String {
         .collect()
 }
 
-/// `shown` is `full`, `full` less its trailing spaces, or a non-empty prefix
-/// of it followed by `…`.
+/// `shown` is `full`, `full` less its trailing spaces, or a prefix of it with
+/// some text in it, not ending in a space, followed by `…`.
 fn is_full_or_truncated(shown: &str, full: &str) -> bool {
     shown == full
         || shown == full.trim_end_matches(' ')
         || shown
             .strip_suffix('…')
-            .is_some_and(|p| !p.is_empty() && full.starts_with(p))
+            .is_some_and(|p| !p.trim().is_empty() && !p.ends_with(' ') && full.starts_with(p))
 }
 
 #[test]
@@ -162,6 +162,24 @@ fn a_zone_short_of_room_drops_its_padding_first() {
     assert_eq!(plain(&row), "LEFTRIGHT");
     let row = bar("abc ", "", "").render_row(3);
     assert_eq!(plain(&row), "abc");
+    let row = bar("LEFT", "", "ab   ").render_row(7);
+    assert_eq!(
+        plain(&row),
+        "LEFT ab",
+        "the right zone stays flush with the edge"
+    );
+}
+
+/// A cut zone ends its text with the `…`, never a space and the `…`, and a
+/// zone with room for nothing but a space and the `…` is dropped.
+#[test]
+fn a_cut_zone_never_shows_a_bare_ellipsis() {
+    let row = bar("L", " ▶ #1/1 1 ", "R").render_row(10);
+    assert_eq!(plain(&row), "L  ▶ #1… R");
+    let row = bar("L", " ▶ #1/1 1 ", "R").render_row(6);
+    assert_eq!(plain(&row), "L    R", "{:?}", plain(&row));
+    let row = bar("L", "ab  cd", "R").render_row(9);
+    assert_eq!(plain(&row), "L ab…   R");
 }
 
 /// Bars that fit keep their exact layout: the centre stays centred.

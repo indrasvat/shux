@@ -71,7 +71,7 @@ impl StatusBar {
     /// blank column from each. When they do not fit, left wins, then right,
     /// then centre: a zone short of columns first loses its trailing spaces,
     /// then shows a prefix of its text ending in `…`, and is dropped when not
-    /// even one glyph and the `…` fit.
+    /// even one glyph other than a space and the `…` fit.
     pub fn render_row(&self, width: u16) -> Vec<RenderCell> {
         let w = width as usize;
         let blank = RenderCell {
@@ -84,7 +84,8 @@ impl StatusBar {
         };
         let mut row = vec![blank; w];
 
-        let left_end = paint_zone(&mut row, 0, w, &self.left, self.bg).map_or(0, |(_, end)| end);
+        let left_end =
+            paint_zone(&mut row, 0, w, &self.left, self.bg, false).map_or(0, |(_, end)| end);
         let rw = Self::segments_width(&self.right);
         let right_start = paint_zone(
             &mut row,
@@ -92,6 +93,7 @@ impl StatusBar {
             w,
             &self.right,
             self.bg,
+            true,
         )
         .map(|(start, _)| start);
         let after_left = left_end + usize::from(left_end > 0);
@@ -103,22 +105,24 @@ impl StatusBar {
         } else {
             after_left
         };
-        paint_zone(&mut row, start, before_right, &self.center, self.bg);
+        paint_zone(&mut row, start, before_right, &self.center, self.bg, false);
 
         row
     }
 }
 
 /// Paint `segs` from `start`, within `start..end`. A zone wider than that
-/// drops its trailing spaces, or else is cut to a prefix and an `…`; with no
-/// room for one glyph and the `…` it is not painted. Returns the columns
-/// painted.
+/// drops its trailing spaces (ending flush at `end` when `flush_end`), or
+/// else shows the text that fits, less trailing spaces, and an `…`; with no
+/// room for one glyph other than a space and the `…` it is not painted.
+/// Returns the columns painted.
 fn paint_zone(
     row: &mut [RenderCell],
-    start: usize,
+    mut start: usize,
     end: usize,
     segs: &[StatusSegment],
     fallback_bg: Option<Color>,
+    flush_end: bool,
 ) -> Option<(usize, usize)> {
     let avail = end.saturating_sub(start);
     let zw = StatusBar::segments_width(segs);
@@ -132,6 +136,9 @@ fn paint_zone(
     } else if zw == padding {
         return None;
     } else if zw - padding <= avail {
+        if flush_end {
+            start = end - (zw - padding);
+        }
         (start + zw - padding, false)
     } else if avail >= 2 {
         (end - 1, true)
@@ -139,6 +146,10 @@ fn paint_zone(
         return None;
     };
     let mut cursor = start;
+    // Where an `…` would follow the text so far, past any spaces it ends in,
+    // and the style of the glyph before it.
+    let mut text_end = start;
+    let mut text_style = (None, None, RenderAttrs::default());
     for seg in segs {
         let bg = seg.bg.or(fallback_bg);
         let attrs = RenderAttrs {
@@ -151,18 +162,23 @@ fn paint_zone(
                 if !cut {
                     return Some((start, cursor));
                 }
-                if cursor == start {
+                row[text_end..cursor].fill(RenderCell {
+                    bg: fallback_bg,
+                    ..RenderCell::default()
+                });
+                if text_end == start {
                     return None;
                 }
-                row[cursor] = RenderCell {
+                let (fg, bg, attrs) = text_style;
+                row[text_end] = RenderCell {
                     ch: '…',
-                    fg: seg.fg,
+                    fg,
                     bg,
                     attrs,
                     extended: None,
                     wide_continuation: false,
                 };
-                return Some((start, cursor + 1));
+                return Some((start, text_end + 1));
             }
             let mut chars = text.chars();
             let Some(ch) = chars.next() else {
@@ -191,6 +207,10 @@ fn paint_zone(
                 };
             }
             cursor += width;
+            if ch != ' ' {
+                text_end = cursor;
+                text_style = (seg.fg, bg, attrs);
+            }
         }
     }
     Some((start, cursor))
