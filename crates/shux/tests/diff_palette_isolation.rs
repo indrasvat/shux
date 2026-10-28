@@ -16,6 +16,22 @@ mod lens_common;
 
 use lens_common::{Harness, unique};
 
+const READY_MARKER: &str = "READY-PAL";
+const PAL_MARKER: &str = "PALMARK";
+
+/// Typed into the pane shell, so the PTY echoes it before `sh` runs it: it
+/// must not contain [`READY_MARKER`] or [`PAL_MARKER`], or the waits on them
+/// return on the echo.
+const SCRIPT: &str = concat!(
+    "exec sh -c 'stty -echo; ",
+    "printf \"\\033[2J\\033[3J\\033[H\"; ",
+    "printf \"\\033[1;1HREADY-%s\" PAL; ",
+    "while read -r t; do ",
+    "if [ \"$t\" = P ]; then ",
+    "printf \"\\033]4;1;#00ff00\\007\"; printf \"\\033[8;1HPAL%s\" MARK; ",
+    "fi; done'\n",
+);
+
 fn settle(h: &Harness, pane: &str, ctx: &str) {
     let env = h.rpc_raw(
         "pane.wait_settled",
@@ -50,20 +66,11 @@ fn diff_since_has_no_palette_field_and_osc4_does_not_inflate() {
     // emits a REAL OSC 4 SET (redefine palette index 1) then a visible sentinel
     // "PALMARK" at row 8 from the SAME write — when PALMARK is on screen the OSC 4
     // bytes are guaranteed parsed (single ordered byte stream).
-    let script = concat!(
-        "exec sh -c 'stty -echo; ",
-        "printf \"\\033[2J\\033[3J\\033[H\"; ",
-        "printf \"\\033[1;1HREADY-PAL\"; ",
-        "while read -r t; do ",
-        "if [ \"$t\" = P ]; then ",
-        "printf \"\\033]4;1;#00ff00\\007\"; printf \"\\033[8;1HPALMARK\"; ",
-        "fi; done'\n",
-    );
     h.rpc_ok(
         "pane.send_keys",
-        serde_json::json!({ "pane_id": pane_id, "text": script }),
+        serde_json::json!({ "pane_id": pane_id, "text": SCRIPT }),
     );
-    h.wait_for(&pane_id, "READY-PAL", 10_000)
+    h.wait_for(&pane_id, READY_MARKER, 10_000)
         .expect("setup sentinel");
     settle(&h, &pane_id, "settle after setup");
 
@@ -75,7 +82,7 @@ fn diff_since_has_no_palette_field_and_osc4_does_not_inflate() {
 
     // Apply the OSC 4 override + the PALMARK sentinel.
     h.send_line_token(&pane_id, "P");
-    h.wait_for(&pane_id, "PALMARK", 10_000)
+    h.wait_for(&pane_id, PAL_MARKER, 10_000)
         .expect("OSC 4 landed");
     settle(&h, &pane_id, "settle after OSC 4");
 
@@ -122,4 +129,44 @@ fn diff_since_has_no_palette_field_and_osc4_does_not_inflate() {
     );
 
     h.kill_session(&session_id);
+}
+
+/// The waits on [`READY_MARKER`] and [`PAL_MARKER`] are barriers only if the
+/// echoed [`SCRIPT`] cannot satisfy them and running it still prints both.
+#[test]
+fn the_markers_cannot_be_satisfied_by_the_echoed_script() {
+    for marker in [READY_MARKER, PAL_MARKER] {
+        assert!(
+            !SCRIPT.contains(marker),
+            "the typed script contains {marker:?} verbatim, so the wait returns on its echo"
+        );
+    }
+    let out = run_sh(SCRIPT, "P\n");
+    for marker in [READY_MARKER, PAL_MARKER] {
+        assert!(
+            out.contains(marker),
+            "running the script no longer prints {marker:?}: {out:?}"
+        );
+    }
+}
+
+fn run_sh(script: &str, stdin: &str) -> String {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn sh");
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(stdin.as_bytes())
+        .expect("write stdin");
+    let out = child.wait_with_output().expect("wait sh");
+    String::from_utf8_lossy(&out.stdout).into_owned()
 }

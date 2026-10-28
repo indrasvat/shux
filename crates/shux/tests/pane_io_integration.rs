@@ -849,6 +849,29 @@ async fn test_send_keys_nonexistent_pane() {
     stop_test_server(cancel).await;
 }
 
+/// Typed at the pane's prompt, so the PTY echoes it before the shell runs it:
+/// it must not contain `SHUX_TEST_OUTPUT`, or the capture assertion holds on
+/// the echo alone.
+const ECHO_LINE: &str = "echo SHUX_TEST_''OUTPUT\n";
+
+#[test]
+fn echo_line_output_cannot_be_satisfied_by_its_echo() {
+    assert!(
+        !ECHO_LINE.contains("SHUX_TEST_OUTPUT"),
+        "the typed line contains SHUX_TEST_OUTPUT verbatim, so capture shows it before echo runs"
+    );
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(ECHO_LINE)
+        .output()
+        .expect("spawn sh");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "SHUX_TEST_OUTPUT",
+        "running the line no longer prints the marker"
+    );
+}
+
 #[tokio::test]
 async fn test_capture_after_echo() {
     let dir = tempfile::tempdir().unwrap();
@@ -857,11 +880,10 @@ async fn test_capture_after_echo() {
     let mut stream = UnixStream::connect(&socket_path).await.unwrap();
     let (session_id, _pane_id) = create_test_session(&mut stream).await;
 
-    // Send echo command
     rpc_call(
         &mut stream,
         "pane.send_keys",
-        serde_json::json!({"session_id": session_id, "text": "echo SHUX_TEST_OUTPUT\n"}),
+        serde_json::json!({"session_id": session_id, "text": ECHO_LINE}),
     )
     .await;
 

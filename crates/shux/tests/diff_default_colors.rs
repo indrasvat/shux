@@ -21,6 +21,23 @@ mod lens_common;
 
 use lens_common::{Harness, decode_png, probe_cell_bg_img, unique};
 
+const READY_MARKER: &str = "READY-038B";
+const OSC_MARKER: &str = "OSC-DONE";
+
+/// Typed into the pane shell, so the PTY echoes it before `sh` runs it: it
+/// must not contain [`READY_MARKER`] or [`OSC_MARKER`], or the waits on them
+/// return on the echo.
+const SCRIPT: &str = concat!(
+    "exec sh -c 'stty -echo; ",
+    "printf \"\\033[2J\\033[3J\\033[H\"; ",
+    "printf \"\\033[5;3H\\033[48;2;30;120;60m\\033[38;2;255;255;0mCOLOR\\033[0m\"; ",
+    "printf \"\\033[1;1HREADY-%s\" 038B; ",
+    "while read -r t; do ",
+    "if [ \"$t\" = O ]; then ",
+    "printf \"\\033]11;#204060\\007\"; printf \"\\033[10;1HOSC-%s\" DONE; ",
+    "fi; done'\n",
+);
+
 fn settle(h: &Harness, pane: &str, ctx: &str) {
     let env = h.rpc_raw(
         "pane.wait_settled",
@@ -60,21 +77,11 @@ fn osc_default_bg_change_marks_default_cells_and_heat_uses_current_defaults() {
         "pane.set_size",
         serde_json::json!({ "pane_id": pane_id, "cols": 40, "rows": 10 }),
     );
-    let script = concat!(
-        "exec sh -c 'stty -echo; ",
-        "printf \"\\033[2J\\033[3J\\033[H\"; ",
-        "printf \"\\033[5;3H\\033[48;2;30;120;60m\\033[38;2;255;255;0mCOLOR\\033[0m\"; ",
-        "printf \"\\033[1;1HREADY-038B\"; ",
-        "while read -r t; do ",
-        "if [ \"$t\" = O ]; then ",
-        "printf \"\\033]11;#204060\\007\"; printf \"\\033[10;1HOSC-DONE\"; ",
-        "fi; done'\n",
-    );
     h.rpc_ok(
         "pane.send_keys",
-        serde_json::json!({ "pane_id": pane_id, "text": script }),
+        serde_json::json!({ "pane_id": pane_id, "text": SCRIPT }),
     );
-    h.wait_for(&pane_id, "READY-038B", 10_000)
+    h.wait_for(&pane_id, READY_MARKER, 10_000)
         .expect("setup sentinel");
     settle(&h, &pane_id, "settle after setup");
 
@@ -100,7 +107,7 @@ fn osc_default_bg_change_marks_default_cells_and_heat_uses_current_defaults() {
     // sentinel from the SAME write — when OSC-DONE is on screen the earlier
     // OSC bytes are guaranteed parsed (single ordered byte stream).
     h.send_line_token(&pane_id, "O");
-    h.wait_for(&pane_id, "OSC-DONE", 10_000)
+    h.wait_for(&pane_id, OSC_MARKER, 10_000)
         .expect("OSC landed");
     settle(&h, &pane_id, "settle after OSC 11");
 
@@ -168,4 +175,44 @@ fn osc_default_bg_change_marks_default_cells_and_heat_uses_current_defaults() {
     );
 
     h.kill_session(&session_id);
+}
+
+/// The waits on [`READY_MARKER`] and [`OSC_MARKER`] are barriers only if the
+/// echoed [`SCRIPT`] cannot satisfy them and running it still prints both.
+#[test]
+fn the_markers_cannot_be_satisfied_by_the_echoed_script() {
+    for marker in [READY_MARKER, OSC_MARKER] {
+        assert!(
+            !SCRIPT.contains(marker),
+            "the typed script contains {marker:?} verbatim, so the wait returns on its echo"
+        );
+    }
+    let out = run_sh(SCRIPT, "O\n");
+    for marker in [READY_MARKER, OSC_MARKER] {
+        assert!(
+            out.contains(marker),
+            "running the script no longer prints {marker:?}: {out:?}"
+        );
+    }
+}
+
+fn run_sh(script: &str, stdin: &str) -> String {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn sh");
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(stdin.as_bytes())
+        .expect("write stdin");
+    let out = child.wait_with_output().expect("wait sh");
+    String::from_utf8_lossy(&out.stdout).into_owned()
 }

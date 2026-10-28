@@ -32,16 +32,20 @@ fn open_pane(h: &Harness, cols: u16, rows: u16) -> (String, String) {
     (session_id, pane_id)
 }
 
+/// The line [`draw_colored`] types: truecolor fg + indexed bg, so a monochrome
+/// regression can't pass unnoticed, then `sentinel`. The PTY echoes it before
+/// the shell runs it, so it must not contain `sentinel`.
+fn colored_line(sentinel: &str) -> String {
+    let (head, tail) = sentinel.split_at(sentinel.floor_char_boundary(sentinel.len() / 2));
+    format!("printf '\\033[38;2;255;120;0m\\033[48;5;28mTRUECOLOR\\033[0m {head}''{tail}\\n'\n")
+}
+
 /// Draw a truecolor line + a sentinel and wait for it (a colour probe is mandatory in
 /// shux automation — CLAUDE.md).
 fn draw_colored(h: &Harness, pane_id: &str, sentinel: &str) {
     h.rpc_ok(
         "pane.send_keys",
-        serde_json::json!({
-            "pane_id": pane_id,
-            // truecolor fg + indexed bg so a monochrome regression can't pass unnoticed.
-            "text": format!("printf '\\033[38;2;255;120;0m\\033[48;5;28mTRUECOLOR\\033[0m {sentinel}\\n'\n"),
-        }),
+        serde_json::json!({ "pane_id": pane_id, "text": colored_line(sentinel) }),
     );
     h.wait_for(pane_id, sentinel, 10_000)
         .unwrap_or_else(|e| panic!("pane never drew {sentinel:?}: {e}"));
@@ -124,6 +128,11 @@ fn glance_cells_emits_canonical_envelope_rpc_and_cli() {
     }
 }
 
+/// Clears the screen, then draws the secret, an unmasked tail and `READYSEC`. Typed,
+/// so its echo carries the secret: the wait on `READYSEC` must not be satisfiable
+/// by that echo, or the glance can still see it.
+const SECRET_LINE: &str = "printf '\\033[2J\\033[6;1HSECRET-TOKEN-42\\033[6;20Hvisible-tail\\033[9;1HREADY''SEC\\n'\n";
+
 // ── L1 mask/redact absence (D4): --mask redacts the emitted cells AND text ──────────
 #[test]
 fn glance_cells_masks_redact_emitted_content() {
@@ -136,7 +145,7 @@ fn glance_cells_masks_redact_emitted_content() {
         "pane.send_keys",
         serde_json::json!({
             "pane_id": pane_id,
-            "text": "printf '\\033[2J\\033[6;1HSECRET-TOKEN-42\\033[6;20Hvisible-tail\\033[9;1HREADYSEC\\n'\n",
+            "text": SECRET_LINE,
         }),
     );
     h.wait_for(&pane_id, "READYSEC", 10_000).expect("sentinel");
@@ -221,4 +230,29 @@ fn glance_cells_masks_redact_emitted_content() {
     vt.process(b"SECRET-TOKEN-42 tail");
     let off = FrameEnvelope::from_terminal(&vt, &MaskSet::new().with(0, 0, 15));
     assert!(!off.to_canonical_json().contains("SECRET"));
+}
+
+/// The sentinel waits are barriers only if the echoed lines cannot satisfy them
+/// and running each line still prints its sentinel.
+#[test]
+fn sentinels_cannot_be_satisfied_by_the_echoed_lines() {
+    for (line, sentinel) in [
+        (colored_line("READY80"), "READY80"),
+        (SECRET_LINE.to_string(), "READYSEC"),
+    ] {
+        assert!(
+            !line.contains(sentinel),
+            "the typed line contains {sentinel:?} verbatim, so the wait returns on its echo: {line}"
+        );
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&line)
+            .output()
+            .expect("spawn sh");
+        let out = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.contains(sentinel),
+            "running the line no longer prints {sentinel:?}: {out:?}"
+        );
+    }
 }
