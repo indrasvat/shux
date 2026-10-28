@@ -13,8 +13,8 @@ use nix::sys::signal::Signal;
 use crossterm::{
     Command, cursor,
     event::{
-        DisableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-        PushKeyboardEnhancementFlags,
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{
@@ -28,6 +28,7 @@ pub struct TerminalGuard {
     raw_mode_enabled: bool,
     alternate_screen: bool,
     mouse_capture: bool,
+    bracketed_paste: bool,
     kitty_keyboard: bool,
     /// Cleared by the first `leave`, so a later `leave` or `Drop` writes nothing.
     active: bool,
@@ -41,6 +42,7 @@ impl TerminalGuard {
             raw_mode_enabled: false,
             alternate_screen: false,
             mouse_capture: false,
+            bracketed_paste: false,
             kitty_keyboard: false,
             active: true,
         };
@@ -61,6 +63,11 @@ impl TerminalGuard {
         // modifier-drag selection less reliable in common terminals.
         execute!(io::stdout(), EnableButtonMouseCapture)?;
         guard.mouse_capture = true;
+
+        // A terminal marks a paste only when asked; unmarked, a paste is
+        // indistinguishable from typing and its keys reach shux's bindings.
+        execute!(io::stdout(), EnableBracketedPaste)?;
+        guard.bracketed_paste = true;
 
         // Try to enable Kitty keyboard protocol for improved key detection.
         // This silently fails on terminals that do not support it.
@@ -89,6 +96,9 @@ impl TerminalGuard {
         let _ = execute!(io::stdout(), CloseInterruptedFrame);
         if self.kitty_keyboard {
             let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+        }
+        if self.bracketed_paste {
+            let _ = execute!(io::stdout(), DisableBracketedPaste);
         }
         if self.mouse_capture {
             let _ = execute!(io::stdout(), DisableMouseCapture);
@@ -210,6 +220,7 @@ fn restore_after_panic(out: &mut impl io::Write) {
     let _ = execute!(out, CloseInterruptedFrame);
     let _ = disable_raw_mode();
     let _ = execute!(out, LeaveAlternateScreen);
+    let _ = execute!(out, DisableBracketedPaste);
     let _ = execute!(out, DisableMouseCapture);
     let _ = execute!(out, cursor::SetCursorStyle::DefaultUserShape);
     let _ = execute!(out, ResetCursorColor);

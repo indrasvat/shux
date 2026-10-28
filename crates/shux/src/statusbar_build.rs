@@ -283,6 +283,25 @@ pub fn append_waiting(
     }
 }
 
+/// Clear segments, innermost first, right zone before left, until a transient
+/// notice in the centre fits whole: it is shown for a moment and says
+/// something the user has to read, so it outranks both zones for that moment.
+pub fn make_room_for_notice(bar: &mut StatusBar, cols: u16) {
+    let width = StatusBar::segments_width;
+    // StatusBar::render_row keeps a one-column gap beside each zone that has
+    // something in it.
+    let gaps =
+        |bar: &StatusBar| usize::from(width(&bar.left) > 0) + usize::from(width(&bar.right) > 0);
+    while width(&bar.left) + width(&bar.center) + width(&bar.right) + gaps(bar) > usize::from(cols)
+    {
+        if !bar.right.is_empty() {
+            bar.right.remove(0);
+        } else if bar.left.pop().is_none() {
+            return;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     fn bar(left: &str, center: &str, right: &str) -> StatusBar {
@@ -501,5 +520,37 @@ mod tests {
         // 80 cols, post-dismissal: hint gone, uptime gated at >=120 →
         // right zone is empty (calm, intentional).
         assert!(flat(&bar.right).is_empty());
+    }
+
+    #[test]
+    fn a_notice_that_fits_clears_nothing() {
+        let notice = " [pane not keeping up] ";
+        for (left, right) in [(" left ", ""), ("", " right ")] {
+            let mut b = bar(left, notice, right);
+            let cols = (left.len() + notice.len() + right.len() + 1) as u16;
+            make_room_for_notice(&mut b, cols);
+            assert_eq!(
+                (b.left.len(), b.right.len()),
+                (
+                    usize::from(!left.is_empty()),
+                    usize::from(!right.is_empty())
+                ),
+                "a bar that already fit lost a segment"
+            );
+        }
+    }
+
+    #[test]
+    fn a_notice_that_does_not_fit_clears_the_right_zone_first() {
+        let notice = " [pane not keeping up] ";
+        let mut b = bar(" left ", notice, " right ");
+        make_room_for_notice(&mut b, (6 + notice.len() + 2) as u16);
+        assert!(b.right.is_empty() && !b.left.is_empty());
+        let row: String = b
+            .render_row((6 + notice.len() + 2) as u16)
+            .iter()
+            .map(|c| c.ch)
+            .collect();
+        assert!(row.contains(notice.trim()), "{row:?}");
     }
 }
