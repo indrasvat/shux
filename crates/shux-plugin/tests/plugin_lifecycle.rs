@@ -1333,20 +1333,17 @@ done
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_kill_mid_frame_still_delivers_shutdown_on_its_own_line() {
     let tmp = tempfile::tempdir().unwrap();
-    let seen = tmp.path().join("shutdown.seen");
+    let log = tmp.path().join("stdin.log");
+    // `cat` drains the pipe in large reads; a shell `read` loop takes a
+    // syscall per byte and can outlast the grace on a slow machine.
     let body = format!(
         r#"#!/usr/bin/env bash
-set -u
 IFS= read -r _ || exit 1
 printf '%s\n' '{{"jsonrpc":"2.0","id":"init","result":{{"name":"torn","version":"0.1.0","subscribes":["session.created"],"provides":[],"capabilities":[]}}}}'
-sleep 1.5
-while IFS= read -r line; do
-  case "$line" in
-    '{{"jsonrpc":"2.0","method":"plugin.shutdown"'*) : > {seen}; exit 0 ;;
-  esac
-done
+sleep 1
+exec cat > {log}
 "#,
-        seen = seen.display()
+        log = log.display()
     );
     let script = write_script(tmp.path(), "torn.sh", &body);
     let bus = EventBus::new();
@@ -1364,9 +1361,20 @@ done
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
     mgr.kill("torn").await.expect("kill");
-    let delivered = wait_until(Duration::from_secs(5), || seen.exists()).await;
+    let shutdown = r#"{"jsonrpc":"2.0","method":"plugin.shutdown""#;
+    let read = || std::fs::read_to_string(&log).unwrap_or_default();
+    let own_line = |s: &str| s.lines().any(|l| l.starts_with(shutdown));
+    wait_until(Duration::from_secs(5), || own_line(&read())).await;
     mgr.shutdown().await;
-    assert!(delivered, "plugin.shutdown arrived glued to a torn frame");
+    let got = read();
+    assert!(
+        got.contains("plugin.shutdown"),
+        "plugin.shutdown never arrived"
+    );
+    assert!(
+        own_line(&got),
+        "plugin.shutdown arrived glued to a torn frame"
+    );
 }
 
 /// `plugin.shutdown` taken off the queue just as the kill signal lands is

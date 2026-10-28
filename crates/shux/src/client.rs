@@ -23,14 +23,24 @@ const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The git SHA of this binary, baked in at compile time.
 const CLIENT_GIT_SHA: &str = env!("SHUX_GIT_SHA");
 
-/// Maximum number of retries when waiting for the daemon to start.
-const MAX_CONNECT_RETRIES: u32 = 10;
+/// How long the client waits for the daemon it started to accept connections.
+struct ConnectBudget {
+    /// Probes before giving up on a daemon that is no longer starting.
+    retries: u32,
+    /// First backoff, doubled after each refused probe up to `max_backoff`.
+    backoff: Duration,
+    max_backoff: Duration,
+    /// Past `retries`, a daemon still starting is waited for until this long
+    /// after the spawn: a loaded machine can take longer than the backoff.
+    deadline: Duration,
+}
 
-/// Initial backoff delay between connection attempts.
-const INITIAL_BACKOFF: Duration = Duration::from_millis(50);
-
-/// Maximum backoff delay.
-const MAX_BACKOFF: Duration = Duration::from_millis(2000);
+const CONNECT_BUDGET: ConnectBudget = ConnectBudget {
+    retries: 10,
+    backoff: Duration::from_millis(50),
+    max_backoff: Duration::from_millis(2000),
+    deadline: Duration::from_secs(30),
+};
 
 /// How long a daemon gets to exit after it stops serving. It drains panes for
 /// up to 3s before it releases the instance lock.
@@ -46,8 +56,8 @@ const VERSION_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_STALE_STOPS: u32 = 8;
 
 /// How long to wait for another client to finish starting the daemon. Covers
-/// the holder's stale-daemon stops, a drain, and its full connect backoff.
-const START_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
+/// the holder's stale-daemon stops, a drain, and its full connect deadline.
+const START_LOCK_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -320,12 +330,27 @@ pub async fn ensure_daemon_running_at(socket_path: &Path) -> Result<UnixStream, 
     }
     info!("Daemon not running, starting...");
 
-    // Spawn the daemon process
-    start_daemon_process(socket_path)?;
+    let mut child = start_daemon_process(socket_path)?;
+    // The spawned process exits once it has forked the daemon, which then
+    // writes its pidfile before it binds.
+    let starting = || {
+        matches!(child.try_wait(), Ok(None))
+            || crate::daemon_boot::our_live_daemon(socket_path).is_some()
+    };
+    wait_for_daemon(socket_path, &CONNECT_BUDGET, starting).await
+}
 
-    // Retry with exponential backoff
-    let mut backoff = INITIAL_BACKOFF;
-    for attempt in 1..=MAX_CONNECT_RETRIES {
+/// Probe `socket_path` with backoff until the daemon accepts a connection.
+async fn wait_for_daemon(
+    socket_path: &Path,
+    budget: &ConnectBudget,
+    mut starting: impl FnMut() -> bool,
+) -> Result<UnixStream, ClientError> {
+    let deadline = tokio::time::Instant::now() + budget.deadline;
+    let mut backoff = budget.backoff;
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
         tokio::time::sleep(backoff).await;
 
         match probe_socket(socket_path).await {
@@ -339,13 +364,16 @@ pub async fn ensure_daemon_running_at(socket_path: &Path) -> Result<UnixStream, 
                     backoff_ms = backoff.as_millis(),
                     "Daemon not ready yet, retrying..."
                 );
-                backoff = (backoff * 2).min(MAX_BACKOFF);
+                backoff = (backoff * 2).min(budget.max_backoff);
+                if attempt >= budget.retries
+                    && (tokio::time::Instant::now() >= deadline || !starting())
+                {
+                    return Err(ClientError::ConnectionFailed(attempt));
+                }
             }
             Err(e) => return Err(ClientError::Io(e)),
         }
     }
-
-    Err(ClientError::ConnectionFailed(MAX_CONNECT_RETRIES))
 }
 
 /// Ensure the daemon is running (using default socket path) and return a connected socket.
@@ -361,7 +389,7 @@ pub async fn ensure_daemon_running() -> Result<UnixStream, ClientError> {
 /// We use re-exec rather than in-process fork+daemonize because the client
 /// may already have a tokio runtime running. The `__daemon` subcommand
 /// calls `daemonize()` before creating any runtime.
-fn start_daemon_process(socket_path: &Path) -> Result<(), ClientError> {
+fn start_daemon_process(socket_path: &Path) -> Result<std::process::Child, ClientError> {
     let exe = std::env::current_exe().map_err(ClientError::Io)?;
 
     let mut cmd = std::process::Command::new(exe);
@@ -380,9 +408,7 @@ fn start_daemon_process(socket_path: &Path) -> Result<(), ClientError> {
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
 
-    cmd.spawn().map_err(ClientError::Io)?;
-
-    Ok(())
+    cmd.spawn().map_err(ClientError::Io)
 }
 
 /// Try to connect to an existing daemon without auto-starting.
@@ -432,5 +458,56 @@ mod tests {
         });
         assert!(matches!(probe_daemon(&socket).await, Ok(Probe::Absent)));
         server.await.unwrap();
+    }
+
+    const QUICK: ConnectBudget = ConnectBudget {
+        retries: 3,
+        backoff: Duration::from_millis(10),
+        max_backoff: Duration::from_millis(20),
+        deadline: Duration::from_secs(5),
+    };
+
+    /// A daemon that binds after the retries are spent, while it is still
+    /// starting, is connected to rather than reported as failed.
+    #[tokio::test]
+    async fn a_daemon_slower_than_the_retries_is_still_waited_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("d.sock");
+        let path = socket.clone();
+        let server = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            listener.accept().await.unwrap();
+        });
+        let connected = wait_for_daemon(&socket, &QUICK, || true).await;
+        assert!(
+            connected.is_ok(),
+            "gave up on a starting daemon: {connected:?}"
+        );
+        server.await.unwrap();
+    }
+
+    /// Once nothing is starting, the retries are all the client waits.
+    #[tokio::test]
+    async fn a_daemon_that_is_not_starting_fails_after_the_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("d.sock");
+        let started = tokio::time::Instant::now();
+        let failed = wait_for_daemon(&socket, &QUICK, || false).await;
+        assert!(matches!(failed, Err(ClientError::ConnectionFailed(3))));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    /// A daemon that never binds is given up on at the deadline.
+    #[tokio::test]
+    async fn a_daemon_that_never_binds_fails_at_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("d.sock");
+        let budget = ConnectBudget {
+            deadline: Duration::from_millis(300),
+            ..QUICK
+        };
+        let failed = wait_for_daemon(&socket, &budget, || true).await;
+        assert!(matches!(failed, Err(ClientError::ConnectionFailed(_))));
     }
 }
