@@ -1482,8 +1482,11 @@ fn a_lockless_daemon_is_stopped_by_the_spelling_it_was_started_with() {
     let cwd = tempfile::tempdir().expect("temp cwd");
     let bin = PathBuf::from(env!("CARGO_BIN_EXE_shux"));
     let typed = Path::new("legacy.sock");
-    std::fs::write(cwd.path().join("__daemon"), "import time\ntime.sleep(60)\n")
-        .expect("write legacy daemon");
+    std::fs::write(
+        cwd.path().join("__daemon"),
+        "import pathlib, time\npathlib.Path('ready').touch()\ntime.sleep(60)\n",
+    )
+    .expect("write legacy daemon");
     let mut legacy = Command::new("python3")
         .arg("__daemon")
         .arg("--socket")
@@ -1493,10 +1496,9 @@ fn a_lockless_daemon_is_stopped_by_the_spelling_it_was_started_with() {
         .expect("spawn legacy daemon");
     let pid = legacy.id();
     let reaper = Reaper(vec![pid as i32]);
+    // Its own ready file, not `/proc`: macOS has none.
     let deadline = Instant::now() + Duration::from_secs(5);
-    while std::fs::read(format!("/proc/{pid}/cmdline"))
-        .map_or(true, |c| !String::from_utf8_lossy(&c).contains("--socket"))
-    {
+    while !cwd.path().join("ready").exists() {
         assert!(Instant::now() < deadline, "legacy daemon never started");
         thread::sleep(Duration::from_millis(20));
     }

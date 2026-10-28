@@ -128,6 +128,11 @@ pub fn remember_typed_socket(typed: &Path) {
     let _ = TYPED_SOCKET.set(typed.to_path_buf());
 }
 
+/// The spelling [`remember_typed_socket`] recorded, if any.
+pub fn typed_socket() -> Option<&'static Path> {
+    TYPED_SOCKET.get().map(PathBuf::as_path)
+}
+
 /// Pidfile paths to consult for `socket`, most specific first.
 ///
 /// The others are where earlier versions wrote: a hash of the socket as typed,

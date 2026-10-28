@@ -49,7 +49,9 @@ fn bind_at(path: &Path) -> io::Result<(UnixListener, (u64, u64))> {
 
 /// Whether something listens at `path`. Never blocks: a listener that stopped
 /// accepting fills its backlog, and a blocking connect would then wait on it
-/// for good. A full backlog counts as live.
+/// for good. A full backlog counts as live where the kernel says so (`EAGAIN`
+/// on Linux); BSD kernels refuse it exactly as they refuse a dead socket, so
+/// there it reads as stale.
 fn is_served(path: &Path) -> bool {
     use nix::errno::Errno;
     use nix::fcntl::{FcntlArg, OFlag, fcntl};
@@ -196,6 +198,8 @@ mod tests {
             match connect(fd.as_raw_fd(), &addr) {
                 Ok(()) => queued.push(fd),
                 Err(nix::errno::Errno::EAGAIN) => return queued,
+                #[cfg(not(target_os = "linux"))]
+                Err(nix::errno::Errno::ECONNREFUSED) if !queued.is_empty() => return queued,
                 Err(e) => panic!("connect: {e}"),
             }
             assert!(queued.len() < 100_000, "the backlog never filled");
@@ -223,11 +227,16 @@ mod tests {
         })
         .await;
         drop(held);
-        let result = probe.expect("bind blocked on a listener with a full backlog");
-        let err = result
-            .expect("probe task")
-            .expect_err("bound over a live listener");
-        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+        let result = probe
+            .expect("bind blocked on a listener with a full backlog")
+            .expect("probe task");
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            result.expect_err("bound over a live listener").kind(),
+            io::ErrorKind::AddrInUse
+        );
+        #[cfg(not(target_os = "linux"))]
+        let _ = result;
     }
 
     /// A sticky directory's owner can replace any name in it, so a rebind

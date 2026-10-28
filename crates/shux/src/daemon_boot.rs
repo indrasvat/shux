@@ -243,7 +243,30 @@ pub(crate) fn is_live_shux_daemon(pid: u32, socket: &Path) -> bool {
         return false;
     }
     // Without a way to confirm identity, refuse to claim it is ours.
-    process_argv(pid).is_some_and(|argv| argv.serves(socket))
+    process_argv(pid).is_some_and(|argv| {
+        argv.serves(socket)
+            || daemon::typed_socket().is_some_and(|typed| argv.serves_relative(pid, typed, socket))
+    })
+}
+
+/// The working directory of `pid`, which a relative `--socket` resolves against.
+#[cfg(target_os = "linux")]
+fn process_cwd(pid: u32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+/// `ps` cannot report a cwd; `lsof` can, as the `n` field of the `cwd` fd.
+#[cfg(not(target_os = "linux"))]
+fn process_cwd(pid: u32) -> Option<PathBuf> {
+    let out = std::process::Command::new("lsof")
+        .args(["-a", "-w", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix('n'))
+        .map(PathBuf::from)
+        .filter(|cwd| cwd.is_absolute())
 }
 
 impl ProcessArgv {
@@ -257,6 +280,19 @@ impl ProcessArgv {
                         || joined_serves_socket(joined, socket))
             }
         }
+    }
+
+    /// Whether `pid`, whose argv carries the relative spelling `typed` (as a
+    /// daemon an earlier build started does), serves `socket` from its own cwd.
+    /// Only the space-joined argv needs this: the exact one resolves its cwd.
+    fn serves_relative(&self, pid: u32, typed: &Path, socket: &Path) -> bool {
+        let ProcessArgv::Joined(joined) = self else {
+            return false;
+        };
+        typed.is_relative()
+            && joined.contains(" __daemon")
+            && joined_serves_socket(joined, typed)
+            && process_cwd(pid).is_some_and(|cwd| same_socket(&cwd.join(typed), socket))
     }
 }
 
@@ -1018,6 +1054,36 @@ mod tests {
         assert!(joined.serves(spelling));
         assert!(joined.serves(&key));
         assert!(!joined.serves(Path::new("/nonexistent-shux-test/y.sock")));
+    }
+
+    /// A space-joined argv with a relative `--socket` serves the socket under
+    /// its process's cwd, and no other directory's.
+    #[test]
+    fn a_joined_relative_argv_serves_the_socket_in_its_cwd() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        std::fs::create_dir(&a).expect("mkdir a");
+        std::fs::create_dir(&b).expect("mkdir b");
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .current_dir(&a)
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let typed = Path::new("rel.sock");
+        let joined = super::ProcessArgv::Joined("/opt/shux __daemon --socket rel.sock".into());
+        let here = joined.serves_relative(pid, typed, &super::daemon::socket_key(&a.join(typed)));
+        let there = joined.serves_relative(pid, typed, &super::daemon::socket_key(&b.join(typed)));
+        let other = joined.serves_relative(
+            pid,
+            Path::new("other.sock"),
+            &super::daemon::socket_key(&a.join("other.sock")),
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(here, "missed the daemon serving its own cwd's socket");
+        assert!(!there, "claimed another directory's socket");
+        assert!(!other, "claimed a spelling its argv does not carry");
     }
 
     /// A `ps` line is only ours when its owner is.
