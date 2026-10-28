@@ -29,6 +29,28 @@ use crate::snapshot::{
 };
 use crate::{lens_scratch, onboarding, pane_command, session_meta, statusbar_runner};
 
+/// Writes `bytes` to the pane's program, waiting for room with the lock
+/// released and ending an open paste first.
+async fn send_to_pane(
+    io: &Mutex<PaneIoState>,
+    pane_id: shux_core::model::PaneId,
+    bytes: Vec<u8>,
+) -> Result<(), shux_rpc::RpcError> {
+    let writer = io
+        .lock()
+        .await
+        .writers
+        .get(&pane_id)
+        .cloned()
+        .ok_or_else(|| shux_rpc::RpcError::not_found("pane PTY", &pane_id.to_string()))?;
+    let permit = writer
+        .reserve_owned()
+        .await
+        .map_err(|_| shux_rpc::RpcError::internal("PTY write channel closed"))?;
+    io.lock().await.send_outside_paste(pane_id, permit, bytes);
+    Ok(())
+}
+
 /// Register pane I/O methods (send_keys, run_command, command_status, command_cancel, capture).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn register_pane_io_methods(
@@ -197,21 +219,7 @@ pub(crate) fn register_pane_io_methods(
                     };
 
                     let len = bytes.len();
-                    let mut state = io.lock().await;
-                    let writer = state
-                        .writers
-                        .get(&pane_id)
-                        .ok_or_else(|| {
-                            shux_rpc::RpcError::not_found("pane PTY", &pane_id.to_string())
-                        })?
-                        .clone();
-                    let bytes = state.outside_paste(pane_id, bytes);
-                    drop(state);
-
-                    writer
-                        .send(bytes)
-                        .await
-                        .map_err(|_| shux_rpc::RpcError::internal("PTY write channel closed"))?;
+                    send_to_pane(&io, pane_id, bytes).await?;
 
                     Ok(serde_json::json!({
                         "pane_id": pane_id.to_string(),
@@ -267,22 +275,7 @@ pub(crate) fn register_pane_io_methods(
                     };
 
                     // Write the PTY command
-                    {
-                        let mut state = io.lock().await;
-                        let writer = state
-                            .writers
-                            .get(&pane_id)
-                            .ok_or_else(|| {
-                                shux_rpc::RpcError::not_found("pane PTY", &pane_id.to_string())
-                            })?
-                            .clone();
-                        let bytes = state.outside_paste(pane_id, pty_command.into_bytes());
-                        drop(state);
-
-                        writer.send(bytes).await.map_err(|_| {
-                            shux_rpc::RpcError::internal("PTY write channel closed")
-                        })?;
-                    }
+                    send_to_pane(&io, pane_id, pty_command.into_bytes()).await?;
 
                     if is_async {
                         return Ok(serde_json::json!({
@@ -2105,15 +2098,22 @@ mod tests {
         harness.stop().await;
     }
 
-    /// An attach client's paste left open in the pane is ended before keys
-    /// sent over RPC reach the program, or they would be read as pasted text.
+    /// An attach client's paste left open in the pane is ended before any
+    /// RPC write reaches the program, or it would be read as pasted text.
     #[tokio::test]
-    async fn send_keys_ends_a_paste_left_open() {
+    async fn rpc_writes_end_a_paste_left_open() {
         let harness = RpcHarness::new();
         let (_, _, pane_id) = harness.seed_session("paste").await;
         let mut writer_rx = harness.seed_io(pane_id, b"\x1b[?2004h").await;
-        harness.io.lock().await.open_pastes.insert(pane_id, 0);
+        let leave_open = || async {
+            let open = crate::pane_io::OpenPaste {
+                program: 0,
+                client: 0,
+            };
+            harness.io.lock().await.open_pastes.insert(pane_id, open);
+        };
 
+        leave_open().await;
         for (text, want) in [("x", b"\x1b[201~x".as_slice()), ("y", b"y".as_slice())] {
             let sent = dispatch_ok(
                 &harness.router,
@@ -2124,6 +2124,34 @@ mod tests {
             assert_eq!(sent["bytes_written"], 1);
             assert_eq!(writer_rx.recv().await.unwrap(), want, "sending {text:?}");
         }
+
+        leave_open().await;
+        let running = dispatch_ok(
+            &harness.router,
+            "pane.run_command",
+            serde_json::json!({
+                "pane_id": pane_id.to_string(),
+                "command": "printf",
+                "args": ["hi"],
+                "async": true,
+            }),
+        )
+        .await;
+        let command = writer_rx.recv().await.unwrap();
+        assert!(
+            command.starts_with(crate::pane_io::PASTE_END) && command.ends_with(b"\n"),
+            "the command went into the paste: {:?}",
+            String::from_utf8_lossy(&command)
+        );
+
+        leave_open().await;
+        dispatch_ok(
+            &harness.router,
+            "pane.command_cancel",
+            serde_json::json!({"command_id": running["command_id"]}),
+        )
+        .await;
+        assert_eq!(writer_rx.recv().await.unwrap(), b"\x1b[201~\x03");
         harness.stop().await;
     }
 

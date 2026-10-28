@@ -160,8 +160,9 @@ impl Client {
     }
 
     /// Attaches with the terminal as the client's controlling terminal and
-    /// its stdin a pipe already at end of file, as `true | shux session
-    /// create` leaves it: the client reads the terminal through `/dev/tty`.
+    /// its stdin a pipe already at end of file, as `true | nohup shux session
+    /// create` leaves it: the client reads the terminal through `/dev/tty`,
+    /// and no SIGHUP reaches it.
     #[cfg(target_os = "linux")]
     fn attach_without_stdin(h: &Harness) -> Self {
         use std::os::fd::AsRawFd;
@@ -175,7 +176,7 @@ impl Client {
             "-c",
             "sh",
             "-c",
-            &format!(r#"exec "$0" session create paste --ensure 0<&{fd} {fd}<&-"#),
+            &format!(r#"trap '' HUP; exec "$0" session create paste --ensure 0<&{fd} {fd}<&-"#),
         ]);
         command.arg(&h.bin);
         let client = Self::run(h, command);
@@ -523,6 +524,20 @@ fn a_client_without_stdin_stays_attached() {
     );
     client.type_bytes(b"abc");
     client.wait_for_text("GOT-KEYS");
+}
+
+/// The terminal a client reads through `/dev/tty` is the one it watches for
+/// a hangup, whatever its stdin is.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_client_reading_dev_tty_exits_when_it_hangs_up() {
+    let h = Harness::new();
+    pane_session(&h, "while :; do sleep 3600; done");
+    let mut client = Client::attach_without_stdin(&h);
+    assert!(
+        client.hang_up(Duration::from_secs(10)),
+        "the client still runs 10 s after its terminal hung up"
+    );
 }
 
 /// An attach client with nothing to do must not spin: a multiplexer sits

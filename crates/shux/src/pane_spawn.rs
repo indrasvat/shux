@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 
-use crate::pane_io::{PaneIoState, PaneRevision, ResizeRequest};
+use crate::pane_io::{PASTE_END, PASTE_START, PaneIoState, PaneRevision, ResizeRequest};
 use crate::pane_record::{
     PaneRecorder, finish_pane_recorders, tee_pane_recorders, tee_pane_resize_recorders,
 };
@@ -35,8 +35,9 @@ struct PtyTaskControl {
 
 /// Everything bound for the program's input, in order: terminal replies
 /// (DA1, DSR, OSC 7501 probes) and user input. Replies go between input
-/// chunks, never inside one. A reply that does not fit is dropped whole; input
-/// is never dropped — the loop stops taking more until the program reads.
+/// chunks, never inside one or inside a bracketed paste. A reply that does
+/// not fit is dropped whole; input is never dropped — the loop stops taking
+/// more until the program reads.
 #[derive(Default)]
 struct PtyInputQueue {
     replies: std::collections::VecDeque<u8>,
@@ -44,6 +45,8 @@ struct PtyInputQueue {
     /// Bytes of `input.front()` already written.
     written: usize,
     input_len: usize,
+    /// The input written so far left the program inside a bracketed paste.
+    in_paste: bool,
 }
 
 impl PtyInputQueue {
@@ -71,12 +74,13 @@ impl PtyInputQueue {
         self.input_len < Self::INPUT_CAP
     }
 
+    /// Nothing to write now: replies held for a paste's end wait for input.
     fn is_empty(&self) -> bool {
-        self.replies.is_empty() && self.input.is_empty()
+        self.input.is_empty() && (self.in_paste || self.replies.is_empty())
     }
 
     fn replying(&self) -> bool {
-        self.written == 0 && !self.replies.is_empty()
+        self.written == 0 && !self.in_paste && !self.replies.is_empty()
     }
 
     /// The bytes to write next.
@@ -97,7 +101,14 @@ impl PtyInputQueue {
         self.written += n;
         self.input_len -= n;
         if self.input.front().is_some_and(|c| c.len() == self.written) {
-            self.input.pop_front();
+            if let Some(chunk) = self.input.pop_front() {
+                let last = |marker: &[u8]| chunk.windows(marker.len()).rposition(|w| w == marker);
+                match (last(PASTE_START), last(PASTE_END)) {
+                    (Some(start), end) if end.is_none_or(|end| start > end) => self.in_paste = true,
+                    (_, Some(_)) => self.in_paste = false,
+                    _ => {}
+                }
+            }
             self.written = 0;
         }
     }
@@ -1421,6 +1432,36 @@ mod tests {
         assert!(q.push(b"\x1b[0n"));
         sent.extend(write(&mut q, usize::MAX));
         assert_eq!(sent, b"hello\x1b[0nworld", "a reply landed inside a chunk");
+    }
+
+    /// A real terminal never answers inside a paste: a reply there is read
+    /// as pasted text. It waits for the paste's end, however many chunks the
+    /// paste spans.
+    #[test]
+    fn a_reply_waits_for_the_paste_being_written_to_end() {
+        let mut q = PtyInputQueue::default();
+        q.push_input(b"k\x1b[200~a".to_vec());
+        q.push_input(b"b".to_vec());
+        q.push_input(b"c\x1b[201~".to_vec());
+        q.push_input(b"d".to_vec());
+        let mut sent = write(&mut q, 9);
+        assert!(q.push(b"\x1b[0n"));
+        sent.extend(write(&mut q, usize::MAX));
+        assert_eq!(
+            String::from_utf8_lossy(&sent),
+            "k\x1b[200~abc\x1b[201~\x1b[0nd",
+            "a reply landed inside the paste"
+        );
+
+        // A paste whose end has not come yet holds the reply, with nothing
+        // for the loop to write meanwhile.
+        q.push_input(b"\x1b[200~e".to_vec());
+        let mut sent = write(&mut q, usize::MAX);
+        assert!(q.push(b"\x1b[0n"));
+        assert!(q.is_empty(), "a held reply left the loop a write to make");
+        q.push_input(b"\x1b[201~x".to_vec());
+        sent.extend(write(&mut q, usize::MAX));
+        assert_eq!(sent, b"\x1b[200~e\x1b[201~x\x1b[0n");
     }
 
     #[test]

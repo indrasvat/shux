@@ -133,12 +133,22 @@ pub struct PaneIoState {
     /// change (a config reload) may follow it. Cleared by the next spawn.
     pub(crate) status_sealed: std::collections::HashSet<shux_core::model::PaneId>,
     /// Panes whose program a bracketed paste has started reaching and not yet
-    /// ended, with the incarnation it was opened for. Any input to the pane,
-    /// from any client or RPC, ends the paste before it reaches the program.
-    pub(crate) open_pastes: HashMap<shux_core::model::PaneId, u64>,
+    /// ended. Any input to the pane, from any client or RPC, ends the paste
+    /// before it reaches the program. Changed only together with a send to
+    /// the pane's writer, under this lock, so it matches the channel's order.
+    pub(crate) open_pastes: HashMap<shux_core::model::PaneId, OpenPaste>,
 }
 
-/// Ends a bracketed paste.
+/// A bracketed paste whose end has not reached the pane's program.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OpenPaste {
+    /// The incarnation it was opened for.
+    pub(crate) program: u64,
+    /// The attach client that opened it.
+    pub(crate) client: u64,
+}
+
+pub(crate) const PASTE_START: &[u8] = b"\x1b[200~";
 pub(crate) const PASTE_END: &[u8] = b"\x1b[201~";
 
 impl Default for PaneIoState {
@@ -207,48 +217,46 @@ impl PaneIoState {
         (program, wants)
     }
 
-    /// Whether a paste is open in the program running in `pane_id` now, and
-    /// that program is still in paste mode.
-    pub(crate) fn paste_open(&self, pane_id: shux_core::model::PaneId) -> bool {
+    /// The paste open in the program running in `pane_id` now, if that
+    /// program is still in paste mode.
+    pub(crate) fn open_paste(&self, pane_id: shux_core::model::PaneId) -> Option<OpenPaste> {
         let (program, wants) = self.paste_target(pane_id);
-        wants && self.open_pastes.get(&pane_id) == Some(&program)
+        self.open_pastes
+            .get(&pane_id)
+            .copied()
+            .filter(|open| wants && open.program == program)
     }
 
-    /// `bytes` for `pane_id`, ending an open paste first so they cannot land
-    /// inside it. The paste counts as ended from here: send what this returns.
-    pub(crate) fn outside_paste(
+    /// Sends `bytes` to `pane_id` through `permit`, ending an open paste
+    /// first so they cannot land inside it. Take the permit before this lock;
+    /// one for a writer since replaced leaves the new program's paste alone.
+    pub(crate) fn send_outside_paste(
         &mut self,
         pane_id: shux_core::model::PaneId,
+        permit: mpsc::OwnedPermit<Vec<u8>>,
         bytes: Vec<u8>,
-    ) -> Vec<u8> {
-        if self.paste_open(pane_id) {
+    ) {
+        let current = self
+            .writers
+            .get(&pane_id)
+            .is_some_and(|tx| permit.same_channel_as_sender(tx));
+        if current && self.open_paste(pane_id).is_some() {
             self.open_pastes.remove(&pane_id);
-            [PASTE_END, &bytes].concat()
+            permit.send([PASTE_END, &bytes].concat());
         } else {
-            bytes
+            permit.send(bytes);
         }
     }
 
-    /// Sends `bytes` to `pane_id` without waiting, ending an open paste
-    /// first. An open paste stays open if nothing was sent. `None` when the
+    /// [`Self::send_outside_paste`] without waiting for room. `None` when the
     /// pane has no writer.
     pub(crate) fn try_send_outside_paste(
         &mut self,
         pane_id: shux_core::model::PaneId,
         bytes: Vec<u8>,
-    ) -> Option<Result<(), mpsc::error::TrySendError<Vec<u8>>>> {
-        let tx = self.writers.get(&pane_id)?;
-        let open = self.paste_open(pane_id);
-        let bytes = if open {
-            [PASTE_END, &bytes].concat()
-        } else {
-            bytes
-        };
-        let sent = tx.try_send(bytes);
-        if open && sent.is_ok() {
-            self.open_pastes.remove(&pane_id);
-        }
-        Some(sent)
+    ) -> Option<Result<(), mpsc::error::TrySendError<mpsc::Sender<Vec<u8>>>>> {
+        let permit = self.writers.get(&pane_id)?.clone().try_reserve_owned();
+        Some(permit.map(|permit| self.send_outside_paste(pane_id, permit, bytes)))
     }
 
     /// Whether `incarnation` is still the PTY task that owns `pane_id`.

@@ -14,6 +14,7 @@
 //! end).
 
 use std::io::IsTerminal;
+use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
 use std::time::Duration;
 
@@ -162,17 +163,24 @@ pub async fn run_attach(socket_path: &Path, config: ClientConfig) -> Result<Exit
 /// bytes, so this bounds what a pane that stopped reading can pile up.
 const PASTE_CHUNK: usize = 64 * 1024;
 
-/// Whether the terminal on stdin has hung up. crossterm never reports it: it
-/// polls a hung-up terminal to the end of every timeout, and with SIGHUP
-/// ignored nothing else would end the attach. Meaningful only when stdin was a
-/// terminal at attach: otherwise crossterm reads `/dev/tty`, not stdin.
-fn terminal_hung_up() -> bool {
-    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
-    use std::os::fd::AsFd;
+/// The terminal crossterm reads: stdin when it is one, else `/dev/tty`.
+fn input_terminal() -> Option<OwnedFd> {
     let stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        stdin.as_fd().try_clone_to_owned().ok()
+    } else {
+        std::fs::File::open("/dev/tty").ok().map(OwnedFd::from)
+    }
+}
+
+/// Whether `terminal` has hung up. crossterm never reports it: it polls a
+/// hung-up terminal to the end of every timeout, and with SIGHUP ignored
+/// nothing else would end the attach.
+fn terminal_hung_up(terminal: &OwnedFd) -> bool {
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
     // POLLIN, though only the hangup is wanted: macOS reports POLLHUP only
     // on an fd polled for an event.
-    let mut fds = [PollFd::new(stdin.as_fd(), PollFlags::POLLIN)];
+    let mut fds = [PollFd::new(terminal.as_fd(), PollFlags::POLLIN)];
     poll(&mut fds, PollTimeout::ZERO).is_ok_and(|n| n > 0)
         && fds[0]
             .revents()
@@ -200,7 +208,7 @@ where
     // forward via channel.
     let (key_tx, mut key_rx) = tokio::sync::mpsc::channel::<Event>(64);
     // Decided once: a hung-up terminal can stop answering as a terminal.
-    let watch_stdin = std::io::stdin().is_terminal();
+    let terminal = input_terminal();
     std::thread::spawn(move || {
         loop {
             // Long, because the wait ends in a busy loop over its last
@@ -215,7 +223,11 @@ where
                     }
                     Err(_) => break,
                 },
-                Ok(false) if key_tx.is_closed() || (watch_stdin && terminal_hung_up()) => break,
+                Ok(false)
+                    if key_tx.is_closed() || terminal.as_ref().is_some_and(terminal_hung_up) =>
+                {
+                    break;
+                }
                 Ok(false) => continue,
                 Err(_) => break,
             }
