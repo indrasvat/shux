@@ -136,13 +136,14 @@ const PING_INTERVAL: Duration = Duration::from_secs(15);
 
 const PASTE_START: &[u8] = b"\x1b[200~";
 const PASTE_END: &[u8] = b"\x1b[201~";
+const ESC: u8 = 0x1b;
 
 /// Input as the pane should receive it, and whether a bracketed paste is open
 /// once it has. `paste` is `Some(more)` for a piece of a paste, `more` set
 /// while pieces follow; `open` says a paste has reached the pane without its
 /// end. A paste goes between the markers when the pane asked for them (mode
 /// 2004) or one is already open; a key closes a paste whose end was dropped.
-/// An end marker inside pasted text is removed, so a paste cannot end itself.
+/// ESC is removed from bracketed text, so no part of it can end the paste.
 fn frame_input(
     bytes: Vec<u8>,
     paste: Option<bool>,
@@ -163,16 +164,32 @@ fn frame_input(
     if !open {
         out.extend_from_slice(PASTE_START);
     }
-    let mut rest = &bytes[..];
-    while let Some(at) = rest.windows(PASTE_END.len()).position(|w| w == PASTE_END) {
-        out.extend_from_slice(&rest[..at]);
-        rest = &rest[at + PASTE_END.len()..];
-    }
-    out.extend_from_slice(rest);
+    out.extend(bytes.into_iter().filter(|&b| b != ESC));
     if !more {
         out.extend_from_slice(PASTE_END);
     }
     (out, more)
+}
+
+/// Ends every paste a dropped piece left open, as a held button is released:
+/// no later key from this client will. Each end waits for room in the
+/// background, at most one [`INPUT_STALL`].
+async fn close_open_pastes(
+    io_state: &Arc<Mutex<PaneIoState>>,
+    backlogs: &HashMap<PaneId, InputBacklog>,
+) {
+    let state = io_state.lock().await;
+    for pane in backlogs
+        .iter()
+        .filter(|(_, b)| b.paste_open)
+        .map(|(p, _)| p)
+    {
+        if let Some(tx) = state.writers.get(pane).cloned() {
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(INPUT_STALL, tx.send(PASTE_END.to_vec())).await;
+            });
+        }
+    }
 }
 
 fn byte_count(n: usize) -> String {
@@ -892,8 +909,9 @@ async fn run_attach_loop(
                         {
                             let mut s = render_session.lock().await;
                             if s.help_visible {
-                                let dismiss =
-                                    bytes.iter().any(|&b| b == 0x1b || b == b'q' || b == b'Q');
+                                // A paste is text, not keys: swallowed whole.
+                                let dismiss = paste.is_none()
+                                    && bytes.iter().any(|&b| b == ESC || b == b'q' || b == b'Q');
                                 if dismiss {
                                     s.help_visible = false;
                                     let pulse =
@@ -927,6 +945,9 @@ async fn run_attach_loop(
                         // self-contained terminal sequence — most
                         // terminals interpret it before any subsequent
                         // diff bytes overwrite the cursor position.
+                        if paste.is_some() && render_session.lock().await.copy_mode.is_some() {
+                            continue;
+                        }
                         let copy_action = {
                             // Snapshot the bits we need under the lock,
                             // then drop it before computing the pane
@@ -1311,6 +1332,7 @@ async fn run_attach_loop(
     // app believing a button is still held, and it stays that way for the rest
     // of the pane's life — visible next time anyone attaches.
     release_app_gesture(&io_state, &mut selection_drag).await;
+    close_open_pastes(&io_state, &input_backlogs).await;
 
     // Stop every other holder of `out_tx` first, so the final frame is the
     // last one queued: the writer drains it and ends only once the last
@@ -7240,7 +7262,118 @@ mod tests {
         // An end marker inside the text cannot end the paste.
         assert_eq!(
             frame_input(v(b"a\x1b[201~rm -rf ~\r"), Some(false), false, true),
-            (v(b"\x1b[200~arm -rf ~\r\x1b[201~"), false)
+            (v(b"\x1b[200~a[201~rm -rf ~\r\x1b[201~"), false)
         );
+    }
+
+    fn end_markers(bytes: &[u8]) -> usize {
+        bytes
+            .windows(PASTE_END.len())
+            .filter(|w| *w == PASTE_END)
+            .count()
+    }
+
+    #[test]
+    fn a_pasted_end_marker_cannot_be_rebuilt_from_what_is_left() {
+        let v = |b: &[u8]| b.to_vec();
+        let (out, _) = frame_input(
+            v(b"a\x1b[20\x1b[201~1~rm -rf ~\r"),
+            Some(false),
+            false,
+            true,
+        );
+        assert_eq!(end_markers(&out), 1, "the paste ends itself: {out:?}");
+        assert!(out.ends_with(PASTE_END));
+
+        // The client splits a paste anywhere a character ends, marker or not.
+        let (first, open) = frame_input(v(b"aa\x1b[20"), Some(true), false, true);
+        let (second, _) = frame_input(v(b"1~rm -rf ~\r"), Some(false), open, true);
+        let joined = [first, second].concat();
+        assert_eq!(end_markers(&joined), 1, "the paste ends itself: {joined:?}");
+        assert!(joined.ends_with(PASTE_END));
+    }
+
+    async fn toggle(h: &mut InputHarness, kind: ActionKind) {
+        h.send(&AttachClientFrame::Action {
+            kind,
+            args: shux_rpc::attach::ActionArgs::default(),
+        })
+        .await;
+    }
+
+    async fn key(h: &mut InputHarness, bytes: &[u8]) {
+        h.send(&AttachClientFrame::Input {
+            data: BASE64.encode(bytes),
+        })
+        .await;
+    }
+
+    async fn paste(h: &mut InputHarness, text: &[u8], more: bool) {
+        h.send(&AttachClientFrame::Paste {
+            data: BASE64.encode(text),
+            more,
+        })
+        .await;
+    }
+
+    async fn pane_input(h: &mut InputHarness, settle: Duration) -> Vec<u8> {
+        let mut got = Vec::new();
+        while let Ok(Some(chunk)) = tokio::time::timeout(settle, h.writer_rx.recv()).await {
+            got.extend_from_slice(&chunk);
+        }
+        got
+    }
+
+    /// Pasted text is not a run of keystrokes: a `q` in it must not close
+    /// the help overlay or quit copy mode and let the rest of the paste
+    /// through to the pane.
+    #[tokio::test]
+    async fn a_paste_does_not_drive_the_help_overlay_or_copy_mode() {
+        for (enter, leave) in [
+            (ActionKind::ToggleHelp, b"\x1b".as_slice()),
+            (ActionKind::EnterCopyMode, b"q".as_slice()),
+        ] {
+            let mut h = InputHarness::new(64).await;
+            toggle(&mut h, enter).await;
+            paste(&mut h, b"q", true).await;
+            paste(&mut h, b"echo half a script\r", false).await;
+            key(&mut h, b"a").await;
+            key(&mut h, leave).await;
+            key(&mut h, b"b").await;
+            let got = pane_input(&mut h, Duration::from_millis(500)).await;
+            assert_eq!(
+                String::from_utf8_lossy(&got),
+                "b",
+                "{enter:?}: a paste reached the pane past the overlay"
+            );
+            h.stop().await;
+        }
+    }
+
+    /// A paste whose end was dropped leaves the pane's program in paste mode.
+    /// Detaching must close it: no later key from this client will.
+    #[tokio::test]
+    async fn detaching_closes_a_paste_whose_end_was_dropped() {
+        let mut h = InputHarness::new(1).await;
+        let pane = h.fixture.first_pane;
+        if let Some(vt) = h.fixture.io_state.lock().await.vts.get_mut(&pane) {
+            vt.process(b"\x1b[?2004h");
+        }
+        paste(&mut h, b"a", true).await;
+        paste(&mut h, b"b", false).await;
+        h.send(&AttachClientFrame::Detach).await;
+        let detached = h
+            .frames_until(INPUT_STALL + Duration::from_secs(3), |f, _| {
+                matches!(f, AttachServerFrame::DetachAck)
+            })
+            .await;
+        assert!(detached, "detach never landed");
+        let got = pane_input(&mut h, INPUT_STALL + Duration::from_secs(1)).await;
+        assert_eq!(
+            String::from_utf8_lossy(&got),
+            "\x1b[200~a\x1b[201~",
+            "the pane was left inside a paste"
+        );
+        h.stop().await;
     }
 }

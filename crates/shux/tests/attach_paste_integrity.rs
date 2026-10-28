@@ -218,16 +218,20 @@ impl Client {
 
         // The client draws its first frame only once raw mode is on and the
         // attach is live; keys typed before that are cooked by its terminal.
+        client.wait_for_text("TRUECOLOR");
+        client.assert_colour_probes();
+        client
+    }
+
+    fn wait_for_text(&self, text: &str) {
         let deadline = Instant::now() + Duration::from_secs(20);
-        while find_cell(&client.screen(), "TRUECOLOR").is_none() {
+        while find_cell(&self.screen(), text).is_none() {
             assert!(
                 Instant::now() < deadline,
-                "the attach client never drew the pane"
+                "the attach client never drew {text:?}"
             );
             std::thread::sleep(Duration::from_millis(50));
         }
-        client.assert_colour_probes();
-        client
     }
 
     fn screen(&self) -> VirtualTerminal {
@@ -359,7 +363,7 @@ fn a_paste_into_a_program_that_asked_for_brackets_keeps_them() {
     pane_session(
         &h,
         &format!(
-            "printf '\\033[?2004h'; head -c {n} > '{got}'; : > '{done}'; \
+            "printf '\\033[?2004hARMED\\r\\n'; head -c {n} > '{got}'; : > '{done}'; \
              while :; do sleep 3600; done",
             n = want.len(),
             got = got.display(),
@@ -367,6 +371,8 @@ fn a_paste_into_a_program_that_asked_for_brackets_keeps_them() {
         ),
     );
     let mut client = Client::attach(&h);
+    // Drawn after the mode switch, so the daemon has seen it.
+    client.wait_for_text("ARMED");
     client.type_bytes(b"\x1b[200~echo a\recho b\r\x1b[201~");
     let arrived = wait_for(&done, Duration::from_secs(10));
     let received = std::fs::read(&got).unwrap_or_default();
@@ -392,7 +398,7 @@ fn a_paste_larger_than_a_frame_is_still_one_paste() {
     pane_session(
         &h,
         &format!(
-            "printf '\\033[?2004h'; head -c {n} > '{got}'; : > '{done}'; \
+            "printf '\\033[?2004hARMED\\r\\n'; head -c {n} > '{got}'; : > '{done}'; \
              while :; do sleep 3600; done",
             n = LEN + 12,
             got = got.display(),
@@ -400,6 +406,7 @@ fn a_paste_larger_than_a_frame_is_still_one_paste() {
         ),
     );
     let mut client = Client::attach(&h);
+    client.wait_for_text("ARMED");
     let text: Vec<u8> = paste_bytes().iter().copied().cycle().take(LEN).collect();
     client.type_bytes(&[b"\x1b[200~", &text[..], b"\x1b[201~"].concat());
     let arrived = wait_for(&done, Duration::from_secs(60));
