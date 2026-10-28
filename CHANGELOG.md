@@ -1,3 +1,10 @@
+## [0.54.2](https://github.com/indrasvat/shux/compare/v0.54.1...v0.54.2) (2026-10-28)
+
+
+### Bug Fixes
+
+* **ui:** draw border junctions from the lines that meet there ([#213](https://github.com/indrasvat/shux/issues/213)) ([98690ea](https://github.com/indrasvat/shux/commit/98690ea38e4ed2a058181ca2b790d0efbca0a337)), closes [#203](https://github.com/indrasvat/shux/issues/203)
+
 ## [0.54.1](https://github.com/indrasvat/shux/compare/v0.54.0...v0.54.1) (2026-10-28)
 
 
