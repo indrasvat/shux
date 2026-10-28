@@ -16,7 +16,9 @@ fn plugin_error_to_rpc(e: shux_plugin::PluginError) -> shux_rpc::RpcError {
         PluginError::HandshakeFailed(_) | PluginError::Proto(_) => {
             shux_rpc::RpcError::invalid_params(&e.to_string())
         }
-        PluginError::Io(_) => shux_rpc::RpcError::internal(&e.to_string()),
+        PluginError::Io(_) | PluginError::ShuttingDown => {
+            shux_rpc::RpcError::internal(&e.to_string())
+        }
     }
 }
 

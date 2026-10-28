@@ -116,7 +116,7 @@ pub fn run_daemon(socket_override: Option<PathBuf>) -> anyhow::Result<()> {
         // subsequent invocation did it again, each new daemon overwriting the
         // pidfile so `daemon stop` could only ever reap the last one.
         let cancel = tokens.root.clone();
-        let io_state = run_rpc_server(
+        let teardown = run_rpc_server(
             sock_path.clone(),
             rebind_gate,
             cancel.clone(),
@@ -130,10 +130,10 @@ pub fn run_daemon(socket_override: Option<PathBuf>) -> anyhow::Result<()> {
             .await;
 
         // Root cancellation is idempotent. Do it here as a final guard,
-        // then wait for pane PTY tasks to signal and reap their process
+        // then wait for pane PTY tasks and plugins to reap their process
         // groups before the runtime starts dropping tasks.
         tokens.root.cancel();
-        shutdown_all_pane_io(io_state).await;
+        teardown.drain().await;
 
         // The RPC server has already removed its own socket.
         daemon::remove_own_pid_file_for(&sock_path)?;
@@ -499,6 +499,19 @@ pub(crate) fn handle_daemon_command(
     }
 }
 
+/// What daemon shutdown drains once the state loop has returned.
+pub(crate) struct Teardown {
+    io_state: Arc<Mutex<PaneIoState>>,
+    plugins: shux_plugin::PluginManager,
+}
+
+impl Teardown {
+    /// Reap every pane and every plugin, side by side.
+    pub(crate) async fn drain(self) {
+        tokio::join!(shutdown_all_pane_io(self.io_state), self.plugins.shutdown());
+    }
+}
+
 /// Start the RPC server with a SessionGraph backing session methods.
 ///
 /// Spawns:
@@ -512,7 +525,7 @@ pub(crate) async fn run_rpc_server(
     cancel: tokio_util::sync::CancellationToken,
     lens_audit: Arc<lens_scratch::LensAuditLog>,
     unresolved_scratch: Vec<lens_scratch::RegistryRow>,
-) -> anyhow::Result<Arc<Mutex<PaneIoState>>> {
+) -> anyhow::Result<Teardown> {
     // EventBus: typed pub/sub for lifecycle events. Wired into SessionGraph
     // so every successful mutation publishes a typed event to subscribers.
     // events.watch / events.history RPC methods read from here.
@@ -812,7 +825,10 @@ pub(crate) async fn run_rpc_server(
         }
     });
 
-    Ok(shutdown_io_state)
+    Ok(Teardown {
+        io_state: shutdown_io_state,
+        plugins,
+    })
 }
 
 pub(crate) async fn shutdown_all_pane_io(io_state: Arc<Mutex<PaneIoState>>) {

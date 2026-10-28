@@ -1667,3 +1667,98 @@ fn a_rebind_does_not_follow_a_runtime_dir_replaced_by_a_symlink() {
         "the daemon wrote into a symlinked runtime dir: {planted:?}"
     );
 }
+
+/// Handshakes, starts a background child that records its pid, and on
+/// `plugin.shutdown` records that it was told before exiting.
+fn tree_plugin(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let script = dir.join("tree-plugin.sh");
+    let body = format!(
+        r#"#!/bin/sh
+IFS= read -r _ || exit 1
+printf '%s\n' '{{"jsonrpc":"2.0","id":"init","result":{{"name":"tree","version":"0.1.0","subscribes":[],"provides":[],"capabilities":[]}}}}'
+sleep 300 &
+echo $! > {grandchild}
+while IFS= read -r line; do
+  case "$line" in
+    *'"plugin.shutdown"'*) echo told > {told}; exit 0 ;;
+  esac
+done
+"#,
+        grandchild = shell_quote(&dir.join("grandchild.pid")),
+        told = shell_quote(&dir.join("shutdown.seen")),
+    );
+    std::fs::write(&script, body).expect("write plugin");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod plugin");
+    script
+}
+
+/// Installs the tree plugin and returns `(daemon pid, plugin grandchild pid)`.
+fn install_tree_plugin(h: &ShuxHarness, work: &Path, watch: bool) -> (u32, u32) {
+    let script = tree_plugin(work);
+    let mut cmd = h.shux();
+    cmd.current_dir(work).args(["plugin", "install"]);
+    if !watch {
+        cmd.arg("--no-watch");
+    }
+    let out = cmd.arg(&script).output().expect("run plugin install");
+    assert!(
+        out.status.success(),
+        "plugin install failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let grandchild = wait_for_pid_file(&work.join("grandchild.pid"));
+    let daemon = h.daemon_pid().expect("daemon pid file");
+    (daemon, grandchild)
+}
+
+fn daemon_stop(h: &ShuxHarness, work: &Path) -> Output {
+    h.shux()
+        .current_dir(work)
+        .args(["daemon", "stop"])
+        .output()
+        .expect("run daemon stop")
+}
+
+/// A hot-reload watcher must not outlive the daemon it watches for (#220).
+#[test]
+fn daemon_stop_stops_a_daemon_hosting_a_watched_plugin() {
+    let h = ShuxHarness::new();
+    let work = tempfile::tempdir().expect("work dir");
+    let (daemon, grandchild) = install_tree_plugin(&h, work.path(), true);
+
+    let stopped = daemon_stop(&h, work.path());
+    let daemon_gone = wait_for_pid_gone(daemon, Duration::from_secs(2));
+    for pid in [daemon, grandchild] {
+        let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
+    }
+    assert!(
+        stopped.status.success() && daemon_gone,
+        "`daemon stop` with a watched plugin installed: status {}, stderr:\n{}",
+        stopped.status,
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+}
+
+/// Daemon shutdown tells each plugin to shut down and reaps what it started:
+/// dropping the plugin instead signals only its leader.
+#[test]
+fn daemon_stop_shuts_plugins_down_and_reaps_what_they_started() {
+    let h = ShuxHarness::new();
+    let work = tempfile::tempdir().expect("work dir");
+    let (daemon, grandchild) = install_tree_plugin(&h, work.path(), false);
+
+    let stopped = daemon_stop(&h, work.path());
+    assert!(
+        stopped.status.success(),
+        "`daemon stop` failed: {}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    assert_pid_gone(daemon, "daemon survived `daemon stop`");
+    assert_pid_gone(grandchild, "a plugin's child outlived daemon shutdown");
+    assert!(
+        work.path().join("shutdown.seen").exists(),
+        "daemon shutdown never sent `plugin.shutdown` to the plugin"
+    );
+}
