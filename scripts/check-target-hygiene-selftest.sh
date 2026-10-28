@@ -226,6 +226,13 @@ if needs_modes "an unreadable dir under target"; then
   chmod 755 "$t/target/debug/locked"
 fi
 
+# A git worktree checked out inside the repo (where agent tools put them) is a
+# separate checkout at its own commit, with its own build dirs: not this one's.
+t="${work}/worktree"; tree "$t"; mkdir -p "$t/.claude/worktrees/agent"
+printf 'gitdir: %s/.git/worktrees/agent\n' "$t" >"$t/.claude/worktrees/agent/.git"
+printf '[workspace]\n\n[profile.dev]\ndebug = 1\n' >"$t/.claude/worktrees/agent/Cargo.toml"
+expect pass "a nested worktree's own manifest" "$t"
+
 # ── --clean ────────────────────────────────────────────────────────────────
 clean() { "${GUARD}" --clean "$@"; }
 
@@ -236,6 +243,12 @@ clean "$t" >/dev/null
 [[ -d "$t/target" && -z "$(find "$t/target" "$t/fuzz/target" "$t/.shux/out/test-inventory/target" -mindepth 1)" ]] \
   || die "--clean left artifacts in an owned build dir"
 [[ -e "$t/keep.rs" ]] || die "--clean deleted a source file"
+
+t="${work}/clean-worktree"; tree "$t"; mkdir -p "$t/wt"
+printf 'gitdir: %s/.git/worktrees/wt\n' "$t" >"$t/wt/.git"; tree "$t/wt"
+stale "$t/wt/target/debug/deps/x.rlib"
+clean "$t" >/dev/null
+[[ -e "$t/wt/target/debug/deps/x.rlib" ]] || die "--clean emptied a nested worktree's build dir"
 
 t="${work}/clean-symlink"; tree "$t"; stale "${work}/linked2/debug/deps/x.rcgu.o"
 ln -s "${work}/linked2" "$t/target"

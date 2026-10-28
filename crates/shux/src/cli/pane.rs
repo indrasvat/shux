@@ -474,8 +474,8 @@ pub async fn handle_pane_title(
 }
 
 /// Handle `shux pane watch` — long-poll `pane.output.watch` and write
-/// each chunk's bytes to stdout. Pipes cleanly into `tee log` etc.
-/// PR 2c / data-plane consumer.
+/// each chunk's bytes to stdout. Pipes cleanly into `tee log` etc., and
+/// stops when the reader closes the pipe. PR 2c / data-plane consumer.
 pub async fn handle_pane_watch(
     stream: &mut tokio::net::UnixStream,
     session_name: &str,
@@ -485,7 +485,6 @@ pub async fn handle_pane_watch(
     format: OutputFormat,
 ) -> anyhow::Result<()> {
     use base64::Engine;
-    use std::io::Write;
 
     // Validate the reference early so we fail fast on typos instead of
     // round-tripping to the daemon. `--session` is documented as validating
@@ -498,16 +497,13 @@ pub async fn handle_pane_watch(
 
     let mut next_seq: Option<u64> = None;
     let mut delivered: u64 = 0;
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
     let mut warned_sampled = false;
 
     loop {
         let mut params = serde_json::json!({
             "pane_id": pane_id,
             "timeout_ms": timeout_ms,
-            // 50 chunks per poll is plenty given the 10/s/pane source
-            // rate; smaller bounds just mean more RPC round-trips.
+            // A cap: the daemon answers as soon as it has a chunk.
             "limit": 50,
         });
         if let Some(s) = next_seq {
@@ -522,9 +518,10 @@ pub async fn handle_pane_watch(
                     .get("sampled")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                match format {
+                let reader_open = match format {
                     OutputFormat::Json => {
-                        let _ = writeln!(out, "{}", serde_json::to_string(chunk)?);
+                        let line = format!("{}\n", serde_json::to_string(chunk)?);
+                        style::print_stream(line.as_bytes())?
                     }
                     OutputFormat::Text | OutputFormat::Plain => {
                         if sampled && !warned_sampled {
@@ -536,22 +533,23 @@ pub async fn handle_pane_watch(
                         } else if !sampled {
                             warned_sampled = false;
                         }
-                        if let Ok(raw) =
-                            base64::engine::general_purpose::STANDARD.decode(bytes_b64.as_bytes())
+                        match base64::engine::general_purpose::STANDARD.decode(bytes_b64.as_bytes())
                         {
-                            let _ = out.write_all(&raw);
+                            Ok(raw) => style::print_stream(&raw)?,
+                            Err(_) => true,
                         }
                     }
+                };
+                if !reader_open {
+                    return Ok(());
                 }
                 delivered += 1;
                 if let Some(lim) = limit
                     && delivered >= lim
                 {
-                    let _ = out.flush();
                     return Ok(());
                 }
             }
-            let _ = out.flush();
         }
         if let Some(s) = resp.get("next_seq").and_then(|v| v.as_u64()) {
             next_seq = Some(s);
