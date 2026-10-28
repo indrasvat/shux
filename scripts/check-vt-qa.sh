@@ -59,6 +59,8 @@ VT_PATHS=(
     'crates/shux-ui/src/buffer.rs'
     'crates/shux-ui/src/viewport.rs'
     'crates/shux-ui/src/vt_convert.rs'
+    # Lays out every pane's border title and badge cells, and the status bar's.
+    'crates/shux-ui/src/chrome.rs'
     # `compose()` writes StatusBar::render_row() cells straight into the composed
     # grid, so this file rasterizes. The earlier "status bar is TUI-gate" split
     # was about what the bar SAYS, not how it lands in pixels.

@@ -521,7 +521,7 @@ impl<W: Write> RenderCompositor<W> {
                         self.config.border_colors.unfocused
                     };
                     let y = rect.y.saturating_sub(1);
-                    for glyph in crate::chrome::title_overlay(pane_chrome, *rect) {
+                    for glyph in crate::chrome::title_overlay(pane_chrome, *rect, &segments) {
                         let mut chars = glyph.text.chars();
                         let Some(ch) = chars.next() else {
                             continue;

@@ -119,7 +119,7 @@ pub fn compose(
                 };
                 // Overlay on the pane's top border row, NOT its first content row.
                 let y = rect.y.saturating_sub(1);
-                for glyph in crate::chrome::title_overlay(pane_chrome, *rect) {
+                for glyph in crate::chrome::title_overlay(pane_chrome, *rect, &segments) {
                     let fg = glyph.color.map(crossterm_to_vt).unwrap_or(border);
                     put_glyph(&mut grid, glyph.x, y, &glyph, fg);
                 }
@@ -396,6 +396,71 @@ mod tests {
         let row = composed.grid.visible_row(0);
         let text: String = (0..5).map(|c| row[c].ch).collect();
         assert_eq!(text, "Hello");
+    }
+
+    /// A title stops before a junction where another pane's border meets its
+    /// top border, so the divider above stays joined.
+    #[test]
+    fn compose_keeps_a_border_junction_under_a_long_title() {
+        let (a, b, below) = (PaneId::new(), PaneId::new(), PaneId::new());
+        let layout = LayoutNode::Split {
+            dir: shux_core::layout::Direction::Horizontal,
+            ratio: 0.5,
+            a: Box::new(LayoutNode::Split {
+                dir: shux_core::layout::Direction::Vertical,
+                ratio: 0.5,
+                a: Box::new(LayoutNode::Leaf { pane: a }),
+                b: Box::new(LayoutNode::Leaf { pane: b }),
+            }),
+            b: Box::new(LayoutNode::Leaf { pane: below }),
+        };
+        let vt = VirtualTerminal::new(10, 38);
+        let panes: HashMap<PaneId, (&Grid, &Cursor)> = [a, b, below]
+            .into_iter()
+            .map(|p| (p, (vt.grid(), vt.cursor())))
+            .collect();
+        let chrome = HashMap::from([(below, crate::chrome::PaneChrome::titled("x".repeat(60)))]);
+        let inputs = ComposeInputs {
+            layout: &layout,
+            zoom: None,
+            focused: below,
+            panes: &panes,
+            chrome: Some(&chrome),
+            status_bar: None,
+        };
+        let plain = ComposeInputs {
+            chrome: None,
+            ..inputs
+        };
+        let (cols, rows) = (40, 24);
+        let without = compose(
+            &plain,
+            cols,
+            rows,
+            BorderStyle::Thin,
+            BorderColors::default(),
+            0,
+        );
+        let with = compose(
+            &inputs,
+            cols,
+            rows,
+            BorderStyle::Thin,
+            BorderColors::default(),
+            0,
+        );
+        for y in 0..usize::from(rows) {
+            for x in 0..usize::from(cols) {
+                let ch = without.grid.visible_row(y)[x].ch;
+                if !matches!(ch, '─' | ' ') && "┬┴┼├┤".contains(ch) {
+                    assert_eq!(
+                        with.grid.visible_row(y)[x].ch,
+                        ch,
+                        "junction at ({x},{y}) overwritten by the title"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

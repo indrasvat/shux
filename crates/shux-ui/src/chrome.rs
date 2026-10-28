@@ -39,15 +39,29 @@ pub struct TitleGlyph {
 }
 
 /// ` ◆ title ` for the pane whose viewport is `viewport`, starting one column
-/// in from its left border. Empty when the pane is narrower than six columns,
-/// has no rows, or has neither a title nor a badge. A badge with no room for a title cell
-/// after it is drawn alone; a wide grapheme that does not fit is dropped, not
-/// split.
-pub fn title_overlay(chrome: &PaneChrome, viewport: Rect) -> Vec<TitleGlyph> {
+/// in from its left border and ending before any junction in `borders` where
+/// another pane's border meets this one. Empty when the pane is narrower than
+/// six columns, has no rows, or has neither a title nor a badge. A badge with
+/// no room for a title cell after it is drawn alone; a wide grapheme that does
+/// not fit is dropped, not split.
+pub fn title_overlay(
+    chrome: &PaneChrome,
+    viewport: Rect,
+    borders: &[crate::borders::BorderSegment],
+) -> Vec<TitleGlyph> {
     if viewport.width < 6 || viewport.height == 0 {
         return Vec::new();
     }
-    let avail = usize::from(viewport.width) - 4;
+    let x0 = viewport.x.saturating_add(1);
+    let y = viewport.y.saturating_sub(1);
+    let end = borders
+        .iter()
+        .filter(|s| s.y == y && s.x > x0 && !is_horizontal(s.ch))
+        .map(|s| s.x)
+        .fold(viewport.x + viewport.width - 1, u16::min);
+    let Some(avail) = usize::from(end - x0).checked_sub(2).filter(|&a| a > 0) else {
+        return Vec::new();
+    };
     let mut body: Vec<(String, u8, Option<Color>)> = Vec::new();
     let mut used = 0usize;
     if let Some(badge) = chrome.badge {
@@ -78,7 +92,7 @@ pub fn title_overlay(chrome: &PaneChrome, viewport: Rect) -> Vec<TitleGlyph> {
         return Vec::new();
     }
 
-    let mut x = viewport.x.saturating_add(1);
+    let mut x = x0;
     let mut out = vec![TitleGlyph {
         x,
         text: " ".to_string(),
@@ -102,6 +116,10 @@ pub fn title_overlay(chrome: &PaneChrome, viewport: Rect) -> Vec<TitleGlyph> {
         color: None,
     });
     out
+}
+
+fn is_horizontal(ch: char) -> bool {
+    matches!(ch, '─' | '━' | '═' | '-')
 }
 
 /// The title's cells exactly as the VT stores the same text — its grapheme
@@ -155,7 +173,7 @@ mod tests {
             title: "build".into(),
             badge: Some(BLOCKED),
         };
-        let glyphs = title_overlay(&chrome, viewport(40));
+        let glyphs = title_overlay(&chrome, viewport(40), &[]);
         assert_eq!(text(&glyphs), " ◆ build ");
         assert_eq!(glyphs[1].color, Some(Color::Yellow));
         assert!(glyphs[2..].iter().all(|g| g.color.is_none()));
@@ -168,7 +186,7 @@ mod tests {
             title: String::new(),
             badge: Some(BLOCKED),
         };
-        assert_eq!(text(&title_overlay(&chrome, viewport(40))), " ◆ ");
+        assert_eq!(text(&title_overlay(&chrome, viewport(40), &[])), " ◆ ");
     }
 
     #[test]
@@ -178,8 +196,8 @@ mod tests {
             badge: Some(BLOCKED),
         };
         // Six columns leave two: the badge, and no room for space + title.
-        assert_eq!(text(&title_overlay(&chrome, viewport(6))), " ◆ ");
-        assert_eq!(text(&title_overlay(&chrome, viewport(7))), " ◆ b ");
+        assert_eq!(text(&title_overlay(&chrome, viewport(6), &[])), " ◆ ");
+        assert_eq!(text(&title_overlay(&chrome, viewport(7), &[])), " ◆ b ");
     }
 
     #[test]
@@ -189,7 +207,7 @@ mod tests {
             title: "日".repeat(64),
             badge: Some(BLOCKED),
         };
-        let glyphs = title_overlay(&chrome, viewport(200));
+        let glyphs = title_overlay(&chrome, viewport(200), &[]);
         assert_eq!(glyphs.iter().filter(|g| g.text == "日").count(), 64);
         assert_eq!(
             glyphs[4].x,
@@ -208,33 +226,33 @@ mod tests {
             height: 0,
             ..viewport(40)
         };
-        assert!(title_overlay(&chrome, flat).is_empty());
+        assert!(title_overlay(&chrome, flat, &[]).is_empty());
     }
 
     #[test]
     fn a_wide_grapheme_that_does_not_fit_is_dropped_whole() {
         let chrome = PaneChrome::titled("ab日");
         // Seven columns leave three: "ab" fits, "日" would need two more.
-        let glyphs = title_overlay(&chrome, viewport(7));
+        let glyphs = title_overlay(&chrome, viewport(7), &[]);
         assert_eq!(text(&glyphs), " ab ");
     }
 
     #[test]
     fn combining_marks_stay_with_their_base() {
         let chrome = PaneChrome::titled("e\u{301}x");
-        let glyphs = title_overlay(&chrome, viewport(20));
+        let glyphs = title_overlay(&chrome, viewport(20), &[]);
         assert_eq!(glyphs[1].text, "e\u{301}");
         assert_eq!(glyphs[2].x, glyphs[1].x + 1);
     }
 
     #[test]
     fn a_zwj_sequence_or_flag_is_one_cell_kept_or_dropped_whole() {
-        let glyphs = title_overlay(&PaneChrome::titled("👩\u{200d}💻x"), viewport(20));
+        let glyphs = title_overlay(&PaneChrome::titled("👩\u{200d}💻x"), viewport(20), &[]);
         assert_eq!(glyphs[1].text, "👩\u{200d}💻", "ZWJ sequence split");
-        let glyphs = title_overlay(&PaneChrome::titled("🇮🇳x"), viewport(20));
+        let glyphs = title_overlay(&PaneChrome::titled("🇮🇳x"), viewport(20), &[]);
         assert_eq!(glyphs[1].text, "🇮🇳", "flag split");
         // Six columns leave two: the whole sequence fits or none of it does.
-        let glyphs = title_overlay(&PaneChrome::titled("a👩\u{200d}💻"), viewport(6));
+        let glyphs = title_overlay(&PaneChrome::titled("a👩\u{200d}💻"), viewport(6), &[]);
         assert_eq!(text(&glyphs), " a ");
     }
 
@@ -244,13 +262,13 @@ mod tests {
         let mut vt = shux_vt::VirtualTerminal::new(1, 20);
         vt.process(title.as_bytes());
         let stored = vt.grid().visible_row(0)[0].grapheme().unwrap().to_string();
-        let glyphs = title_overlay(&PaneChrome::titled(title), viewport(20));
+        let glyphs = title_overlay(&PaneChrome::titled(title), viewport(20), &[]);
         assert_eq!(glyphs[1].text, stored);
     }
 
     #[test]
     fn nothing_is_drawn_without_a_title_or_badge() {
-        assert!(title_overlay(&PaneChrome::default(), viewport(40)).is_empty());
-        assert!(title_overlay(&PaneChrome::titled("x"), viewport(5)).is_empty());
+        assert!(title_overlay(&PaneChrome::default(), viewport(40), &[]).is_empty());
+        assert!(title_overlay(&PaneChrome::titled("x"), viewport(5), &[]).is_empty());
     }
 }
