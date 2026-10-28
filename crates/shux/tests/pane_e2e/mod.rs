@@ -8,7 +8,6 @@
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::thread;
-use std::time::{Duration, Instant};
 
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
@@ -200,12 +199,10 @@ impl Drop for Env {
             .ok()
             .and_then(|s| s.trim().parse::<i32>().ok())
         {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while Instant::now() < deadline {
-                if kill(Pid::from_raw(pid), None).is_err() {
-                    return;
-                }
-                thread::sleep(Duration::from_millis(50));
+            if shux_testkit::poll_until(shux_testkit::BUDGET, || {
+                kill(Pid::from_raw(pid), None).is_err()
+            }) {
+                return;
             }
             let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
             // A second panic during unwinding aborts and hides the first.

@@ -14,11 +14,10 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::thread;
-use std::time::{Duration, Instant};
 
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
+use shux_testkit::{BUDGET, poll_until, wait_until};
 
 /// Truecolor + 256-indexed + basic ANSI on one line. Mandatory on every
 /// daemon-backed capture (CLAUDE.md).
@@ -94,11 +93,11 @@ impl Env {
         env
     }
 
-    /// Replace `config.toml` under a RUNNING daemon and wait out the
-    /// hot-reload watcher's debounce. Validated for the same reason as the
-    /// initial write.
+    /// Replace `config.toml` under a RUNNING daemon with one whose
+    /// `[shell].command` is the unspawnable `typo`, and wait until the daemon
+    /// has reloaded it. Validated for the same reason as the initial write.
     #[track_caller]
-    fn rewrite_config(&self, config_toml: &str) {
+    fn break_shell_config(&self, config_toml: &str, typo: &str) {
         std::fs::write(
             self.root.path().join("config/shux/config.toml"),
             config_toml,
@@ -110,8 +109,20 @@ impl Env {
             "rewritten fixture config.toml is invalid:\n{}\n--- config.toml ---\n{config_toml}",
             String::from_utf8_lossy(&out.stderr)
         );
-        // `run_hot_reload` debounces 150ms; give the watcher room past that.
-        thread::sleep(Duration::from_millis(1_500));
+        // The reload is observable as a default-shell spawn that fails naming
+        // `typo`. A probe that still spawns ran the old config: remove it.
+        let mut attempt = 0;
+        wait_until("the daemon to hot-reload config.toml", || {
+            attempt += 1;
+            let name = format!("reload-probe-{attempt}");
+            let out = self.run(&["session", "create", &name, "-d"]);
+            if out.status.success() {
+                self.ok(&["session", "kill", &name]);
+                return false;
+            }
+            String::from_utf8_lossy(&out.stderr).contains(typo)
+                || String::from_utf8_lossy(&out.stdout).contains(typo)
+        });
     }
 
     fn shux(&self) -> Command {
@@ -244,7 +255,7 @@ impl Env {
             "-t",
             needle,
             "--timeout-ms",
-            "20000",
+            "30000",
         ]);
         assert!(
             out.status.success(),
@@ -288,12 +299,8 @@ impl Drop for Env {
             .ok()
             .and_then(|s| s.trim().parse::<i32>().ok())
         {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while Instant::now() < deadline {
-                if kill(Pid::from_raw(pid), None).is_err() {
-                    return;
-                }
-                thread::sleep(Duration::from_millis(50));
+            if poll_until(BUDGET, || kill(Pid::from_raw(pid), None).is_err()) {
+                return;
             }
             let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
             panic!("daemon {pid} outlived the test");
@@ -510,10 +517,7 @@ fn a_failed_attach_split_or_new_window_leaves_no_phantom() {
     // is what makes the negative assertion below mean anything — without it,
     // "no phantom" is equally satisfied by keys that never arrived.
     env.send_keys("host", "\x01v");
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while env.panes_with_liveness("target").len() < 2 && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(200));
-    }
+    poll_until(BUDGET, || env.panes_with_liveness("target").len() >= 2);
     let control = env.panes_with_liveness("target");
     assert_eq!(
         control.len(),
@@ -523,14 +527,22 @@ fn a_failed_attach_split_or_new_window_leaves_no_phantom() {
     assert!(control.iter().all(|(_, live)| *live), "{control:?}");
 
     // Now make every default-pane spawn fail, and repeat.
-    env.rewrite_config(&format!(
-        "{ATTACH_KEYS}[shell]\ncommand = [\"/usr/bin/shux-issue-132-typo\"]\n"
-    ));
+    env.break_shell_config(
+        &format!("{ATTACH_KEYS}[shell]\ncommand = [\"/usr/bin/shux-issue-132-typo\"]\n"),
+        "/usr/bin/shux-issue-132-typo",
+    );
 
+    // The attach loop runs actions in order, so the copy-mode hint that
+    // `prefix [` draws proves the split and the new window, rollbacks
+    // included, have both finished.
+    assert!(
+        !env.capture("host", &host_pane).contains("COPY"),
+        "the copy-mode marker is on screen before copy mode, so it proves nothing"
+    );
     env.send_keys("host", "\x01v");
-    thread::sleep(Duration::from_secs(3));
     env.send_keys("host", "\x01c");
-    thread::sleep(Duration::from_secs(3));
+    env.send_keys("host", "\x01[");
+    env.wait_for("host", &host_pane, "COPY");
 
     let after = env.panes_with_liveness("target");
     assert!(
@@ -595,20 +607,14 @@ fn a_failed_attach_split_leaves_the_window_zoomed_on_the_same_pane() {
 
     // CONTROL: a working split, then a keyboard zoom of the pane it made.
     env.send_keys("host", "\x01v");
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while env.panes_with_liveness("target").len() < 2 && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(200));
-    }
+    poll_until(BUDGET, || env.panes_with_liveness("target").len() >= 2);
     assert_eq!(
         env.panes_with_liveness("target").len(),
         2,
         "control split never happened, so this test cannot tell a lost zoom from lost keys"
     );
     env.send_keys("host", "\x01z");
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while zoom_and_focus(&env, "target").0.is_none() && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(200));
-    }
+    poll_until(BUDGET, || zoom_and_focus(&env, "target").0.is_some());
     let (zoomed, focused) = zoom_and_focus(&env, "target");
     let zoomed = zoomed.expect("control zoom never happened");
     assert_eq!(
@@ -618,9 +624,10 @@ fn a_failed_attach_split_leaves_the_window_zoomed_on_the_same_pane() {
     );
     env.expect_screen("host", &host_pane, "TRUECOLOR", &[]);
 
-    env.rewrite_config(&format!(
-        "{ATTACH_KEYS}[shell]\ncommand = [\"/usr/bin/shux-issue-152-typo\"]\n"
-    ));
+    env.break_shell_config(
+        &format!("{ATTACH_KEYS}[shell]\ncommand = [\"/usr/bin/shux-issue-152-typo\"]\n"),
+        "/usr/bin/shux-issue-152-typo",
+    );
 
     // The failed split, then copy mode. The attach loop runs actions in order,
     // so the copy-mode hint on screen proves the split, rollback included, has

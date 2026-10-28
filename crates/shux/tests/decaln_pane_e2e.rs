@@ -14,8 +14,6 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::thread;
-use std::time::{Duration, Instant};
 
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
@@ -78,9 +76,14 @@ impl Env {
     /// Spawn a pane running `script` under `sh`, sized to COLS x ROWS, and
     /// return its pane id. The script is kept alive afterwards so the pane's
     /// screen is not torn down before it is captured.
+    ///
+    /// The script starts only once the pane has its size: a resize resets the
+    /// scroll region and reflows the screen, so anything drawn before it would
+    /// be tested at the wrong geometry.
     #[track_caller]
     fn pane_running(&mut self, session: &str, script: &str) -> String {
-        let body = format!("{script}\nexec sleep 900\n");
+        let sized = format!("{session}.sized");
+        let body = format!("{}\n{script}\nexec sleep 900\n", self.gate(&sized));
         let path = self.root.path().join("work").join(format!("{session}.sh"));
         std::fs::write(&path, &body).expect("write script");
 
@@ -111,6 +114,7 @@ impl Env {
             "--rows",
             &ROWS.to_string(),
         ]);
+        self.release(&sized);
         pane
     }
 
@@ -185,12 +189,10 @@ impl Drop for Env {
             .ok()
             .and_then(|s| s.trim().parse::<i32>().ok())
         {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while Instant::now() < deadline {
-                if kill(Pid::from_raw(pid), None).is_err() {
-                    return;
-                }
-                thread::sleep(Duration::from_millis(50));
+            if shux_testkit::poll_until(shux_testkit::BUDGET, || {
+                kill(Pid::from_raw(pid), None).is_err()
+            }) {
+                return;
             }
             let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
             panic!("daemon {pid} outlived the test");
@@ -246,17 +248,20 @@ fn a_real_pane_emitting_decaln_shows_a_full_screen_of_e() {
 #[test]
 fn decaln_ignores_the_scroll_region_and_the_pen_and_homes_the_cursor() {
     let mut env = Env::new();
+    let gate = env.gate("d117b");
     let pane = env.pane_running(
         "d117b",
         &format!(
             "printf '{COLOUR_PROBE}\\n'\n\
              printf '\\033[3;6r'\n\
              printf '\\033[1;38;2;255;80;80;48;5;27m'\n\
-             sleep 0.3\n\
+             {gate}\n\
              printf '\\033#8'\n\
              printf 'HOME'\n"
         ),
     );
+    env.wait_for("d117b", &pane, "TRUECOLOR");
+    env.release("d117b");
     env.wait_for("d117b", &pane, "HOME");
 
     let rows = env.glance_rows(&pane);
@@ -279,18 +284,29 @@ fn decaln_ignores_the_scroll_region_and_the_pen_and_homes_the_cursor() {
 #[test]
 fn a_retired_alternate_screen_filled_by_decaln_is_blank_for_the_next_app() {
     let mut env = Env::new();
+    let (filled, left) = (env.gate("d117c-filled"), env.gate("d117c-left"));
+    // App one: alternate screen, fill it, leave.
+    // App two: alternate screen again, draw a single marker line.
+    // Each step waits for the test to have seen the one before it, so every
+    // step reaches the VT in its own batch.
     let pane = env.pane_running(
         "d117c",
-        // App one: alternate screen, fill it, leave.
-        // App two: alternate screen again, draw a single marker line.
-        "printf '\\033[?1049h\\033#8'\n\
-         sleep 0.4\n\
-         printf '\\033[?1049l'\n\
-         sleep 0.2\n\
-         printf '\\033[?1049h'\n\
-         sleep 0.2\n\
-         printf '\\033[5;1HSECOND-APP'\n",
+        &format!(
+            "printf '{COLOUR_PROBE}\\n'\n\
+             printf '\\033[?1049h\\033#8'\n\
+             {filled}\n\
+             printf '\\033[?1049l'\n\
+             {left}\n\
+             printf '\\033[?1049h'\n\
+             printf '\\033[5;1HSECOND-APP'\n"
+        ),
     );
+    env.wait_for("d117c", &pane, "EEEEEEEEEE");
+    env.release("d117c-filled");
+    // The probe is hidden while the alternate screen is up, so seeing it again
+    // is seeing app one leave.
+    env.wait_for("d117c", &pane, "TRUECOLOR");
+    env.release("d117c-left");
     env.wait_for("d117c", &pane, "SECOND-APP");
 
     let rows = env.glance_rows(&pane);
@@ -315,18 +331,23 @@ fn a_retired_alternate_screen_filled_by_decaln_is_blank_for_the_next_app() {
 #[test]
 fn decaln_on_the_alternate_screen_does_not_reach_the_primary_one() {
     let mut env = Env::new();
+    let (drawn, filled) = (env.gate("d117d-drawn"), env.gate("d117d-filled"));
     let pane = env.pane_running(
         "d117d",
         &format!(
             "printf '{COLOUR_PROBE}\\n'\n\
              printf 'PRIMARY-CONTENT\\n'\n\
-             sleep 0.3\n\
+             {drawn}\n\
              printf '\\033[?1049h\\033#8'\n\
-             sleep 0.4\n\
+             {filled}\n\
              printf '\\033[?1049l'\n\
              printf 'ROUND-TRIP-%s\\n' DONE\n"
         ),
     );
+    env.wait_for("d117d", &pane, "PRIMARY-CONTENT");
+    env.release("d117d-drawn");
+    env.wait_for("d117d", &pane, "EEEEEEEEEE");
+    env.release("d117d-filled");
     // Printed only once the pane is back on the primary screen.
     env.wait_for("d117d", &pane, "ROUND-TRIP-DONE");
 

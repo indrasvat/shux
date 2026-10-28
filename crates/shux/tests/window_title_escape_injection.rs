@@ -20,8 +20,6 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::thread;
-use std::time::{Duration, Instant};
 
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
@@ -90,13 +88,10 @@ impl Env {
 impl Drop for Env {
     fn drop(&mut self) {
         if let Some(pid) = self.daemon_pid() {
-            let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while Instant::now() < deadline {
-                if kill(Pid::from_raw(pid as i32), None).is_err() {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(50));
+            let pid = Pid::from_raw(pid as i32);
+            let _ = kill(pid, Signal::SIGTERM);
+            if !shux_testkit::poll_until(shux_testkit::BUDGET, || kill(pid, None).is_err()) {
+                let _ = kill(pid, Signal::SIGKILL);
             }
         }
     }
