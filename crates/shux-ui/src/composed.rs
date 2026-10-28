@@ -399,65 +399,57 @@ mod tests {
     }
 
     /// A title stops before a junction where another pane's border meets its
-    /// top border, so the divider above stays joined.
+    /// top border, so the divider above stays joined — at any split ratio,
+    /// including a junction on the title's first column.
     #[test]
     fn compose_keeps_a_border_junction_under_a_long_title() {
         let (a, b, below) = (PaneId::new(), PaneId::new(), PaneId::new());
-        let layout = LayoutNode::Split {
-            dir: shux_core::layout::Direction::Horizontal,
-            ratio: 0.5,
-            a: Box::new(LayoutNode::Split {
-                dir: shux_core::layout::Direction::Vertical,
-                ratio: 0.5,
-                a: Box::new(LayoutNode::Leaf { pane: a }),
-                b: Box::new(LayoutNode::Leaf { pane: b }),
-            }),
-            b: Box::new(LayoutNode::Leaf { pane: below }),
-        };
         let vt = VirtualTerminal::new(10, 38);
         let panes: HashMap<PaneId, (&Grid, &Cursor)> = [a, b, below]
             .into_iter()
             .map(|p| (p, (vt.grid(), vt.cursor())))
             .collect();
         let chrome = HashMap::from([(below, crate::chrome::PaneChrome::titled("x".repeat(60)))]);
-        let inputs = ComposeInputs {
-            layout: &layout,
-            zoom: None,
-            focused: below,
-            panes: &panes,
-            chrome: Some(&chrome),
-            status_bar: None,
-        };
-        let plain = ComposeInputs {
-            chrome: None,
-            ..inputs
-        };
-        let (cols, rows) = (40, 24);
-        let without = compose(
-            &plain,
-            cols,
-            rows,
-            BorderStyle::Thin,
-            BorderColors::default(),
-            0,
-        );
-        let with = compose(
-            &inputs,
-            cols,
-            rows,
-            BorderStyle::Thin,
-            BorderColors::default(),
-            0,
-        );
-        for y in 0..usize::from(rows) {
-            for x in 0..usize::from(cols) {
-                let ch = without.grid.visible_row(y)[x].ch;
-                if !matches!(ch, '─' | ' ') && "┬┴┼├┤".contains(ch) {
-                    assert_eq!(
-                        with.grid.visible_row(y)[x].ch,
-                        ch,
-                        "junction at ({x},{y}) overwritten by the title"
-                    );
+        for cols in [12u16, 24, 40] {
+            for ratio in [0.05, 0.1, 0.3, 0.5, 0.9] {
+                let layout = LayoutNode::Split {
+                    dir: shux_core::layout::Direction::Horizontal,
+                    ratio: 0.5,
+                    a: Box::new(LayoutNode::Split {
+                        dir: shux_core::layout::Direction::Vertical,
+                        ratio,
+                        a: Box::new(LayoutNode::Leaf { pane: a }),
+                        b: Box::new(LayoutNode::Leaf { pane: b }),
+                    }),
+                    b: Box::new(LayoutNode::Leaf { pane: below }),
+                };
+                let inputs = ComposeInputs {
+                    layout: &layout,
+                    zoom: None,
+                    focused: below,
+                    panes: &panes,
+                    chrome: Some(&chrome),
+                    status_bar: None,
+                };
+                let plain = ComposeInputs {
+                    chrome: None,
+                    ..inputs
+                };
+                let draw = |i: &ComposeInputs<'_>| {
+                    compose(i, cols, 16, BorderStyle::Thin, BorderColors::default(), 0)
+                };
+                let (without, with) = (draw(&plain), draw(&inputs));
+                for y in 0..16 {
+                    for x in 0..usize::from(cols) {
+                        let ch = without.grid.visible_row(y)[x].ch;
+                        if "┬┴┼├┤".contains(ch) {
+                            assert_eq!(
+                                with.grid.visible_row(y)[x].ch,
+                                ch,
+                                "{cols} cols, ratio {ratio}: junction at ({x},{y}) overwritten"
+                            );
+                        }
+                    }
                 }
             }
         }

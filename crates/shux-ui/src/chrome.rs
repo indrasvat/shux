@@ -56,7 +56,7 @@ pub fn title_overlay(
     let y = viewport.y.saturating_sub(1);
     let end = borders
         .iter()
-        .filter(|s| s.y == y && s.x > x0 && !is_horizontal(s.ch))
+        .filter(|s| s.y == y && s.x >= x0 && !is_horizontal(s.ch))
         .map(|s| s.x)
         .fold(viewport.x + viewport.width - 1, u16::min);
     let Some(avail) = usize::from(end - x0).checked_sub(2).filter(|&a| a > 0) else {
