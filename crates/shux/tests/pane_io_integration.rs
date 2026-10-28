@@ -8,12 +8,11 @@ mod typed_marker;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use shux_testkit::{poll_async, wait_until_async};
 use tokio::net::UnixStream;
 use tokio::sync::{Mutex, mpsc};
-
-const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 // ══════════════════════════════════════════════════════════════
 // Shared state (mirrors main.rs PaneIoState)
@@ -599,10 +598,8 @@ async fn rpc_call_raw(
     serde_json::from_slice(&resp_buf).unwrap()
 }
 
-/// Start a test server with pane I/O methods, returning (socket_path, cancel_token).
-async fn start_test_server(
-    dir: &std::path::Path,
-) -> (PathBuf, tokio_util::sync::CancellationToken) {
+/// Start a test server with pane I/O methods.
+async fn start_test_server(dir: &std::path::Path) -> (PathBuf, TestServer) {
     let socket_path = dir.join("pane-io-test.sock");
     let cancel = tokio_util::sync::CancellationToken::new();
 
@@ -641,7 +638,7 @@ async fn start_test_server(
             cancel.clone(),
         ),
         graph_handle,
-        io_state,
+        io_state.clone(),
     )
     .build();
 
@@ -656,22 +653,32 @@ async fn start_test_server(
         let _ = server.run().await;
     });
 
-    // Wait for socket to become available
-    for _ in 0..20 {
-        if UnixStream::connect(&socket_path).await.is_ok() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    wait_until_async("the test server to accept connections", || {
+        let socket_path = socket_path.clone();
+        async move { UnixStream::connect(&socket_path).await.is_ok() }
+    })
+    .await;
 
-    (socket_path, cancel)
+    (socket_path, TestServer { cancel, io_state })
 }
 
-async fn stop_test_server(cancel: tokio_util::sync::CancellationToken) {
-    cancel.cancel();
-    // Let in-process pane tasks observe cancellation, signal their PTY process
-    // groups, and reap before the test runtime drops them.
-    tokio::time::sleep(Duration::from_millis(1700)).await;
+/// What a test needs to shut its server down without leaking pane processes.
+struct TestServer {
+    cancel: tokio_util::sync::CancellationToken,
+    io_state: Arc<Mutex<PaneIoState>>,
+}
+
+/// Cancel the server and wait for every pane task to have terminated and
+/// reaped its PTY child. A pane task drops its writer as its last act, so an
+/// empty writer map means none is left for the test runtime to abandon.
+async fn stop_test_server(server: TestServer) {
+    server.cancel.cancel();
+    let io = server.io_state;
+    wait_until_async("every pane task to reap its PTY child", || {
+        let io = io.clone();
+        async move { io.lock().await.writers.is_empty() }
+    })
+    .await;
 }
 
 /// Create a session and return (session_id, pane_id).
@@ -684,24 +691,7 @@ async fn create_test_session(stream: &mut UnixStream) -> (String, String) {
     .await;
     let session_id = result["id"].as_str().unwrap().to_string();
     let pane_id = result["pane_id"].as_str().unwrap().to_string();
-    let deadline = Instant::now() + PROBE_TIMEOUT;
-    loop {
-        let response = rpc_call_raw(
-            stream,
-            "pane.capture",
-            serde_json::json!({"session_id": session_id, "lines": 1}),
-        )
-        .await;
-        if response.get("result").is_some() {
-            break;
-        }
-        if Instant::now() >= deadline {
-            panic!("pane PTY did not become capturable: {response}");
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    // Give the login shell a moment to finish startup after the PTY is registered.
-    tokio::time::sleep(Duration::from_millis(1000)).await;
+    wait_for_shell_ready(stream, &session_id).await;
     (session_id, pane_id)
 }
 
@@ -715,51 +705,53 @@ async fn capture_text(stream: &mut UnixStream, session_id: &str, lines: usize) -
     result["text"].as_str().unwrap().to_string()
 }
 
-async fn wait_for_capture_text<F>(
-    stream: &mut UnixStream,
-    session_id: &str,
-    timeout: Duration,
-    mut predicate: F,
-) -> String
+/// The pane's text once `predicate` holds, or as it stands when the wait gives
+/// up, for the caller's assertion to report.
+async fn wait_for_capture_text<F>(stream: &mut UnixStream, session_id: &str, predicate: F) -> String
 where
-    F: FnMut(&str) -> bool,
+    F: Fn(&str) -> bool,
 {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let text = capture_text(stream, session_id, 80).await;
-        if predicate(&text) {
-            return text;
-        }
-        if Instant::now() >= deadline {
-            return text;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    let stream = &Mutex::new(stream);
+    let predicate = &predicate;
+    let found = poll_async(shux_testkit::BUDGET, || async move {
+        let text = capture_text(&mut **stream.lock().await, session_id, 80).await;
+        predicate(&text).then_some(text)
+    })
+    .await;
+    match found {
+        Some(text) => text,
+        None => capture_text(&mut **stream.lock().await, session_id, 80).await,
     }
 }
 
-async fn wait_for_shell_ready(stream: &mut UnixStream, session_id: &str) {
-    let marker_path = PathBuf::from(format!(
-        "/tmp/shux-ready-{}",
+/// Type `line` at the prompt and wait until the shell has RUN it: a file the
+/// line creates proves that, and the PTY echo of the typed line cannot.
+async fn run_at_prompt(stream: &mut UnixStream, session_id: &str, line: &str) {
+    let marker_path = std::env::temp_dir().join(format!(
+        "shux-ran-{}",
         &uuid::Uuid::new_v4().simple().to_string()[..8]
     ));
-    let marker_display = marker_path.display().to_string();
     rpc_call(
         stream,
         "pane.send_keys",
-        serde_json::json!({"session_id": session_id, "text": format!("touch {}\r\n", marker_display)}),
+        serde_json::json!({
+            "session_id": session_id,
+            "text": format!("{line}; touch {}\n", marker_path.display()),
+        }),
     )
     .await;
-
-    let deadline = Instant::now() + PROBE_TIMEOUT;
-    while !marker_path.exists() && Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    let marker = &marker_path;
+    let ran =
+        shux_testkit::poll_until_async(shux_testkit::BUDGET, || async move { marker.exists() })
+            .await;
     let text = capture_text(stream, session_id, 80).await;
-    assert!(
-        marker_path.exists(),
-        "pane shell did not become command-ready; got: {text}"
-    );
+    assert!(ran, "pane shell never ran {line:?}; screen: {text}");
     let _ = std::fs::remove_file(marker_path);
+}
+
+/// Wait until the pane's shell reads and runs what is typed at it.
+async fn wait_for_shell_ready(stream: &mut UnixStream, session_id: &str) {
+    run_at_prompt(stream, session_id, ":").await;
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -769,7 +761,7 @@ async fn wait_for_shell_ready(stream: &mut UnixStream, session_id: &str) {
 #[tokio::test]
 async fn test_send_keys_text() {
     let dir = tempfile::tempdir().unwrap();
-    let (socket_path, cancel) = start_test_server(dir.path()).await;
+    let (socket_path, server) = start_test_server(dir.path()).await;
 
     let mut stream = UnixStream::connect(&socket_path).await.unwrap();
     let (session_id, _pane_id) = create_test_session(&mut stream).await;
@@ -785,13 +777,13 @@ async fn test_send_keys_text() {
     let bytes = result["bytes_written"].as_u64().unwrap();
     assert_eq!(bytes, 11); // "echo hello\n" = 11 bytes
 
-    stop_test_server(cancel).await;
+    stop_test_server(server).await;
 }
 
 #[tokio::test]
 async fn test_send_keys_base64() {
     let dir = tempfile::tempdir().unwrap();
-    let (socket_path, cancel) = start_test_server(dir.path()).await;
+    let (socket_path, server) = start_test_server(dir.path()).await;
 
     let mut stream = UnixStream::connect(&socket_path).await.unwrap();
     let (session_id, _pane_id) = create_test_session(&mut stream).await;
@@ -809,13 +801,13 @@ async fn test_send_keys_base64() {
 
     assert_eq!(result["bytes_written"].as_u64().unwrap(), 1);
 
-    stop_test_server(cancel).await;
+    stop_test_server(server).await;
 }
 
 #[tokio::test]
 async fn test_send_keys_nonexistent_pane() {
     let dir = tempfile::tempdir().unwrap();
-    let (socket_path, cancel) = start_test_server(dir.path()).await;
+    let (socket_path, server) = start_test_server(dir.path()).await;
 
     let mut stream = UnixStream::connect(&socket_path).await.unwrap();
 
@@ -848,7 +840,7 @@ async fn test_send_keys_nonexistent_pane() {
     let response: serde_json::Value = serde_json::from_slice(&resp_buf).unwrap();
     assert!(response.get("error").is_some());
 
-    stop_test_server(cancel).await;
+    stop_test_server(server).await;
 }
 
 /// Typed at the pane's prompt, so the PTY echoes it before the shell runs it:
@@ -873,7 +865,7 @@ fn lives_line_output_cannot_be_satisfied_by_its_echo() {
 #[tokio::test]
 async fn test_capture_after_echo() {
     let dir = tempfile::tempdir().unwrap();
-    let (socket_path, cancel) = start_test_server(dir.path()).await;
+    let (socket_path, server) = start_test_server(dir.path()).await;
 
     let mut stream = UnixStream::connect(&socket_path).await.unwrap();
     let (session_id, _pane_id) = create_test_session(&mut stream).await;
@@ -885,7 +877,7 @@ async fn test_capture_after_echo() {
     )
     .await;
 
-    let text = wait_for_capture_text(&mut stream, &session_id, PROBE_TIMEOUT, |text| {
+    let text = wait_for_capture_text(&mut stream, &session_id, |text| {
         text.contains("SHUX_TEST_OUTPUT")
     })
     .await;
@@ -894,22 +886,20 @@ async fn test_capture_after_echo() {
         "captured text should contain 'SHUX_TEST_OUTPUT', got: {text}"
     );
 
-    stop_test_server(cancel).await;
+    stop_test_server(server).await;
 }
 
 #[tokio::test]
 async fn test_capture_preserves_grapheme_payloads() {
     let dir = tempfile::tempdir().unwrap();
-    let (socket_path, cancel) = start_test_server(dir.path()).await;
+    let (socket_path, server) = start_test_server(dir.path()).await;
     let script_path = dir.path().join("grapheme_probe.py");
     std::fs::write(
         &script_path,
         r#"import sys
-import time
 
 sys.stdout.write("SHUX_GRAPHEME_START e\u0301 🛠\ufe0f 👍🏽 👨\u200d💻 🇺🇸 SHUX_GRAPHEME_END\n")
 sys.stdout.flush()
-time.sleep(2)
 "#,
     )
     .unwrap();
@@ -924,7 +914,7 @@ time.sleep(2)
     )
     .await;
 
-    let text = wait_for_capture_text(&mut stream, &session_id, PROBE_TIMEOUT, |text| {
+    let text = wait_for_capture_text(&mut stream, &session_id, |text| {
         text.contains("SHUX_GRAPHEME_END")
     })
     .await;
@@ -935,22 +925,20 @@ time.sleep(2)
         );
     }
 
-    stop_test_server(cancel).await;
+    stop_test_server(server).await;
 }
 
 #[tokio::test]
 async fn test_capture_translates_dec_special_graphics() {
     let dir = tempfile::tempdir().unwrap();
-    let (socket_path, cancel) = start_test_server(dir.path()).await;
+    let (socket_path, server) = start_test_server(dir.path()).await;
     let script_path = dir.path().join("dec_graphics_probe.py");
     std::fs::write(
         &script_path,
         r#"import sys
-import time
 
 sys.stdout.write("\x1b(0lqkxmj\x1b(B ASCII-END\n")
 sys.stdout.flush()
-time.sleep(2)
 "#,
     )
     .unwrap();
@@ -965,28 +953,25 @@ time.sleep(2)
     )
     .await;
 
-    let text = wait_for_capture_text(&mut stream, &session_id, PROBE_TIMEOUT, |text| {
-        text.contains("ASCII-END")
-    })
-    .await;
+    let text =
+        wait_for_capture_text(&mut stream, &session_id, |text| text.contains("ASCII-END")).await;
     assert!(
         text.contains("┌─┐│└┘ ASCII-END"),
         "pane.capture did not translate DEC graphics, got: {text:?}"
     );
 
-    stop_test_server(cancel).await;
+    stop_test_server(server).await;
 }
 
 #[tokio::test]
 async fn test_capture_honors_mutable_tab_stops() {
     let dir = tempfile::tempdir().unwrap();
-    let (socket_path, cancel) = start_test_server(dir.path()).await;
+    let (socket_path, server) = start_test_server(dir.path()).await;
     let id = uuid::Uuid::new_v4().simple().to_string();
     let script_path = PathBuf::from(format!("/tmp/shux_tab_{}.py", &id[..8]));
     std::fs::write(
         &script_path,
         r#"import sys
-import time
 
 sys.stdout.write("default:\tA\tB\n")
 sys.stdout.write("\x1b[13G\x1bH\rcustom:\tA\tB\tC\n")
@@ -994,7 +979,6 @@ sys.stdout.write("\x1b[9G\x1b[g\rclear-current:\tA\n")
 sys.stdout.write("\x1b[3g\rclear-all:\tZ\n")
 sys.stdout.write("SHUX_TAB_END\n")
 sys.stdout.flush()
-time.sleep(2)
 "#,
     )
     .unwrap();
@@ -1016,7 +1000,7 @@ time.sleep(2)
     assert_eq!(result["state"].as_str().unwrap(), "completed");
     assert_eq!(result["exit_code"].as_i64().unwrap(), 0);
 
-    let text = wait_for_capture_text(&mut stream, &session_id, PROBE_TIMEOUT, |text| {
+    let text = wait_for_capture_text(&mut stream, &session_id, |text| {
         text.contains("SHUX_TAB_END")
     })
     .await;
@@ -1042,14 +1026,14 @@ time.sleep(2)
         "TBC clear-all did not clamp HT to the last column as expected: {text:?}"
     );
 
-    stop_test_server(cancel).await;
+    stop_test_server(server).await;
     let _ = std::fs::remove_file(script_path);
 }
 
 #[tokio::test]
 async fn test_xterm_cursor_report_probe_gets_terminal_response() {
     let dir = tempfile::tempdir().unwrap();
-    let (socket_path, cancel) = start_test_server(dir.path()).await;
+    let (socket_path, server) = start_test_server(dir.path()).await;
     let probe_path = dir.path().join("cpr_probe.py");
     std::fs::write(
         &probe_path,
@@ -1067,7 +1051,7 @@ try:
     sys.stdout.write("\x1b[5;10H\x1b[6n")
     sys.stdout.flush()
     data = b""
-    deadline = time.monotonic() + 2.0
+    deadline = time.monotonic() + 30.0
     while time.monotonic() < deadline:
         r, _, _ = select.select([fd], [], [], 0.2)
         if not r:
@@ -1084,7 +1068,6 @@ print("\nSHUX_CPR=" + repr(data), flush=True)
 
     let mut stream = UnixStream::connect(&socket_path).await.unwrap();
     let (session_id, _pane_id) = create_test_session(&mut stream).await;
-    wait_for_shell_ready(&mut stream, &session_id).await;
 
     rpc_call(
         &mut stream,
@@ -1093,12 +1076,10 @@ print("\nSHUX_CPR=" + repr(data), flush=True)
     )
     .await;
 
-    let text = wait_for_capture_text(&mut stream, &session_id, PROBE_TIMEOUT, |text| {
-        text.contains("SHUX_CPR=")
-    })
-    .await;
+    let text =
+        wait_for_capture_text(&mut stream, &session_id, |text| text.contains("SHUX_CPR=")).await;
     let got_response = text.contains("\\x1b[5;10R");
-    stop_test_server(cancel).await;
+    stop_test_server(server).await;
     assert!(
         got_response,
         "xterm CPR probe should receive a terminal response, got: {text}"
@@ -1108,7 +1089,7 @@ print("\nSHUX_CPR=" + repr(data), flush=True)
 #[tokio::test]
 async fn test_xterm_mode_and_version_probes_get_terminal_responses() {
     let dir = tempfile::tempdir().unwrap();
-    let (socket_path, cancel) = start_test_server(dir.path()).await;
+    let (socket_path, server) = start_test_server(dir.path()).await;
     let probe_path = dir.path().join("xterm_probe.py");
     std::fs::write(
         &probe_path,
@@ -1126,7 +1107,7 @@ try:
     sys.stdout.write("\x1b[?2026$p\x1b[>0q")
     sys.stdout.flush()
     data = b""
-    deadline = time.monotonic() + 2.0
+    deadline = time.monotonic() + 30.0
     while time.monotonic() < deadline:
         r, _, _ = select.select([fd], [], [], 0.2)
         if not r:
@@ -1143,7 +1124,6 @@ print("\nSHUX_XTERM_PROBES=" + repr(data), flush=True)
 
     let mut stream = UnixStream::connect(&socket_path).await.unwrap();
     let (session_id, _pane_id) = create_test_session(&mut stream).await;
-    wait_for_shell_ready(&mut stream, &session_id).await;
 
     rpc_call(
         &mut stream,
@@ -1152,7 +1132,7 @@ print("\nSHUX_XTERM_PROBES=" + repr(data), flush=True)
     )
     .await;
 
-    let text = wait_for_capture_text(&mut stream, &session_id, PROBE_TIMEOUT, |text| {
+    let text = wait_for_capture_text(&mut stream, &session_id, |text| {
         text.contains("SHUX_XTERM_PROBES=")
     })
     .await;
@@ -1165,32 +1145,49 @@ print("\nSHUX_XTERM_PROBES=" + repr(data), flush=True)
         "XTVERSION response missing, got: {text}"
     );
 
-    stop_test_server(cancel).await;
+    stop_test_server(server).await;
 }
 
+/// The probe holds its synchronized-output window open until the test has
+/// captured, and reports "ready" only once shux has answered a cursor report
+/// queued behind the hidden frame, which proves the VT has parsed that frame.
+/// Both ends are ordered, so neither how long the capture takes nor how late
+/// the PTY reader runs can decide the outcome.
 #[tokio::test]
 async fn test_synchronized_output_freezes_capture_while_active() {
     let dir = tempfile::tempdir().unwrap();
-    let (socket_path, cancel) = start_test_server(dir.path()).await;
+    let (socket_path, server) = start_test_server(dir.path()).await;
     let probe_path = dir.path().join("sync_probe.py");
     let ready_path = dir.path().join("sync_ready");
+    let release_path = dir.path().join("sync_release");
     let ready_literal = serde_json::to_string(ready_path.to_str().unwrap()).unwrap();
+    let release_literal = serde_json::to_string(release_path.to_str().unwrap()).unwrap();
     std::fs::write(
         &probe_path,
         format!(
-            r#"import pathlib
-import sys
+            r#"import os
+import pathlib
+import termios
 import time
+import tty
 
-sys.stdout.write("old")
-sys.stdout.flush()
-sys.stdout.write("\x1b[?2026h\x1b[1;1Hnew")
-sys.stdout.flush()
-pathlib.Path({ready_literal}).write_text("ready")
-time.sleep(1.0)
-sys.stdout.write("\x1b[?2026l")
-sys.stdout.flush()
-time.sleep(0.2)
+fd = 0
+saved = termios.tcgetattr(fd)
+tty.setraw(fd)
+try:
+    os.write(1, b"old")
+    os.write(1, b"\x1b[?2026h\x1b[1;1Hnew\x1b[6n")
+    reply = b""
+    while not reply.endswith(b"R"):
+        reply += os.read(fd, 64)
+    pathlib.Path({ready_literal}).write_text("ready")
+    release = pathlib.Path({release_literal})
+    deadline = time.monotonic() + 60
+    while not release.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    os.write(1, b"\x1b[?2026l")
+finally:
+    termios.tcsetattr(fd, termios.TCSADRAIN, saved)
 "#,
         ),
     )
@@ -1198,38 +1195,31 @@ time.sleep(0.2)
 
     let mut stream = UnixStream::connect(&socket_path).await.unwrap();
     let (session_id, _pane_id) = create_test_session(&mut stream).await;
+    run_at_prompt(&mut stream, &session_id, "stty -echo").await;
 
     rpc_call(
         &mut stream,
         "pane.send_keys",
-        serde_json::json!({"session_id": session_id, "text": "stty -echo\n"}),
-    )
-    .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    rpc_call(
-        &mut stream,
-        "pane.send_keys",
-        serde_json::json!({"session_id": session_id, "text": format!("python3 {}\r\n", probe_path.display())}),
+        serde_json::json!({"session_id": session_id, "text": format!("python3 {}\n", probe_path.display())}),
     )
     .await;
 
-    let deadline = Instant::now() + PROBE_TIMEOUT;
-    while !ready_path.exists() && Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(
-        ready_path.exists(),
-        "sync probe did not enter synchronized-output mode"
-    );
-
+    let ready = &ready_path;
+    let entered =
+        shux_testkit::poll_until_async(shux_testkit::BUDGET, || async move { ready.exists() })
+            .await;
     let frozen = rpc_call(
         &mut stream,
         "pane.capture",
         serde_json::json!({"session_id": session_id, "lines": 80}),
     )
     .await;
+    std::fs::write(&release_path, "go").unwrap();
     let frozen_text = frozen["text"].as_str().unwrap();
+    assert!(
+        entered,
+        "sync probe never saw its cursor report answered; screen: {frozen_text}"
+    );
     assert!(
         frozen_text.contains("old"),
         "sync frame should preserve old presentation, got: {frozen_text}"
@@ -1239,13 +1229,13 @@ time.sleep(0.2)
         "sync frame leaked pending content before reset, got: {frozen_text}"
     );
 
-    stop_test_server(cancel).await;
+    stop_test_server(server).await;
 }
 
 #[tokio::test]
 async fn test_run_command_sync_echo() {
     let dir = tempfile::tempdir().unwrap();
-    let (socket_path, cancel) = start_test_server(dir.path()).await;
+    let (socket_path, server) = start_test_server(dir.path()).await;
 
     let mut stream = UnixStream::connect(&socket_path).await.unwrap();
     let (session_id, _pane_id) = create_test_session(&mut stream).await;
@@ -1272,13 +1262,13 @@ async fn test_run_command_sync_echo() {
         "stdout should hold the line 'hello_from_shux', got: {stdout}"
     );
 
-    stop_test_server(cancel).await;
+    stop_test_server(server).await;
 }
 
 #[tokio::test]
 async fn test_run_command_sync_false() {
     let dir = tempfile::tempdir().unwrap();
-    let (socket_path, cancel) = start_test_server(dir.path()).await;
+    let (socket_path, server) = start_test_server(dir.path()).await;
 
     let mut stream = UnixStream::connect(&socket_path).await.unwrap();
     let (session_id, _pane_id) = create_test_session(&mut stream).await;
@@ -1297,35 +1287,36 @@ async fn test_run_command_sync_false() {
     assert_eq!(result["state"].as_str().unwrap(), "completed");
     assert_eq!(result["exit_code"].as_i64().unwrap(), 1);
 
-    stop_test_server(cancel).await;
+    stop_test_server(server).await;
 }
 
 #[tokio::test]
 async fn test_run_command_async_and_poll() {
     let dir = tempfile::tempdir().unwrap();
-    let (socket_path, cancel) = start_test_server(dir.path()).await;
+    let (socket_path, server) = start_test_server(dir.path()).await;
 
     let mut stream = UnixStream::connect(&socket_path).await.unwrap();
     let (session_id, _pane_id) = create_test_session(&mut stream).await;
 
-    // Start async command
+    // The command runs until the test releases it, so the first poll can only
+    // see "running" and a later one only "completed", however slow the host.
+    let release = dir.path().join("async_release");
     let result = rpc_call(
         &mut stream,
         "pane.run_command",
         serde_json::json!({
             "session_id": session_id,
-            "command": "sleep",
-            "args": ["0.5"],
-            "timeout": 10,
+            "command": "sh",
+            "args": ["-c", format!("while [ ! -e '{}' ]; do sleep 0.05; done", release.display())],
+            "timeout": 120,
             "async": true,
         }),
     )
     .await;
 
     assert_eq!(result["state"].as_str().unwrap(), "running");
-    let command_id = result["command_id"].as_str().unwrap();
+    let command_id = result["command_id"].as_str().unwrap().to_string();
 
-    // Poll status — should be running
     let status = rpc_call(
         &mut stream,
         "pane.command_status",
@@ -1334,13 +1325,33 @@ async fn test_run_command_async_and_poll() {
     .await;
     assert_eq!(status["state"].as_str().unwrap(), "running");
 
-    stop_test_server(cancel).await;
+    std::fs::write(&release, "go").unwrap();
+    let stream = &Mutex::new(&mut stream);
+    let command_id = &command_id;
+    let finished = poll_async(shux_testkit::BUDGET, || async move {
+        let status = rpc_call(
+            &mut **stream.lock().await,
+            "pane.command_status",
+            serde_json::json!({"command_id": command_id}),
+        )
+        .await;
+        (status["state"] != "running").then_some(status)
+    })
+    .await
+    .expect("the released command never left the running state");
+    assert_eq!(
+        finished["state"].as_str().unwrap(),
+        "completed",
+        "{finished}"
+    );
+
+    stop_test_server(server).await;
 }
 
 #[tokio::test]
 async fn test_run_command_cancel() {
     let dir = tempfile::tempdir().unwrap();
-    let (socket_path, cancel) = start_test_server(dir.path()).await;
+    let (socket_path, server) = start_test_server(dir.path()).await;
 
     let mut stream = UnixStream::connect(&socket_path).await.unwrap();
     let (session_id, _pane_id) = create_test_session(&mut stream).await;
@@ -1371,13 +1382,13 @@ async fn test_run_command_cancel() {
 
     assert_eq!(cancel_result["state"].as_str().unwrap(), "cancelled");
 
-    stop_test_server(cancel).await;
+    stop_test_server(server).await;
 }
 
 #[tokio::test]
 async fn test_capture_lines_default() {
     let dir = tempfile::tempdir().unwrap();
-    let (socket_path, cancel) = start_test_server(dir.path()).await;
+    let (socket_path, server) = start_test_server(dir.path()).await;
 
     let mut stream = UnixStream::connect(&socket_path).await.unwrap();
     let (session_id, _pane_id) = create_test_session(&mut stream).await;
@@ -1393,7 +1404,7 @@ async fn test_capture_lines_default() {
     assert!(result.get("text").is_some());
     assert_eq!(result["lines"].as_u64().unwrap(), 50);
 
-    stop_test_server(cancel).await;
+    stop_test_server(server).await;
 }
 
 // Codex hit this in May 2026: short-lived commands inside a shux pane
@@ -1405,21 +1416,10 @@ async fn test_capture_lines_default() {
 #[tokio::test]
 async fn test_capture_works_after_pane_process_exits() {
     let dir = tempfile::tempdir().unwrap();
-    let (socket_path, cancel) = start_test_server(dir.path()).await;
+    let (socket_path, server) = start_test_server(dir.path()).await;
 
     let mut stream = UnixStream::connect(&socket_path).await.unwrap();
     let (session_id, _pane_id) = create_test_session(&mut stream).await;
-
-    // A file the shell touches as its LAST act before `exit`. The PTY echoes
-    // whatever `send_keys` types, so the marker TEXT shows up the moment the
-    // command is entered — polling the capture for it would let this test pass
-    // before the shell ever exits. The file only appears once the shell has
-    // actually run the line.
-    let exit_marker = std::env::temp_dir().join(format!(
-        "shux-exited-{}",
-        &uuid::Uuid::new_v4().simple().to_string()[..8]
-    ));
-    let exit_marker_display = exit_marker.display().to_string();
 
     // Print a marker, then exit the shell. After this, the PTY task
     // sees EOF, reaps the child, and tears its loop down. The Pane
@@ -1429,24 +1429,32 @@ async fn test_capture_works_after_pane_process_exits() {
         "pane.send_keys",
         serde_json::json!({
             "session_id": session_id,
-            "text": format!("{LIVES_LINE}; touch {exit_marker_display}; exit 0\n"),
+            "text": format!("{LIVES_LINE}; exit 0\n"),
         }),
     )
     .await;
 
-    // Wait for the shell to have actually run its line and exited, then give
-    // the PTY task a beat to see EOF and tear down. Only after that does
+    // The pane task drops the pane's writer as its last act, after EOF, so a
+    // send_keys refused for want of one proves the teardown has happened. The
+    // PTY echo of the typed line cannot satisfy that. Only after it does
     // capture prove the VT lingers past teardown — the regression this covers.
-    let deadline = Instant::now() + PROBE_TIMEOUT;
-    while !exit_marker.exists() {
-        assert!(
-            Instant::now() < deadline,
-            "shell never reached its exit line within {PROBE_TIMEOUT:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    {
+        let stream = &Mutex::new(&mut stream);
+        let session = &session_id;
+        wait_until_async(
+            "the pane task to tear down after its shell exited",
+            || async move {
+                let response = rpc_call_raw(
+                    &mut **stream.lock().await,
+                    "pane.send_keys",
+                    serde_json::json!({"session_id": session, "text": ""}),
+                )
+                .await;
+                response.get("error").is_some()
+            },
+        )
+        .await;
     }
-    let _ = std::fs::remove_file(&exit_marker);
-    tokio::time::sleep(Duration::from_millis(500)).await;
 
     let text = capture_text(&mut stream, &session_id, 80).await;
     assert!(
@@ -1454,5 +1462,5 @@ async fn test_capture_works_after_pane_process_exits() {
         "captured text after exit should contain the marker, got: {text}"
     );
 
-    stop_test_server(cancel).await;
+    stop_test_server(server).await;
 }

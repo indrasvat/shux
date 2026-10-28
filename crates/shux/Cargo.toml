@@ -37,6 +37,7 @@ toml.workspace = true
 uuid.workspace = true
 unicode-width = "0.2"
 base64 = "0.22"
+shux-testkit = { path = "../shux-testkit" }
 image = { version = "0.25", default-features = false, features = ["png"] }
 bytes = "1"
 futures = "0.3"
