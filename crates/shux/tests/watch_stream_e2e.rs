@@ -80,21 +80,27 @@ impl Watcher {
     }
 }
 
-/// Collect output until it holds `needle`, failing after `PROMPT`.
+/// Collect output until it holds `needle`, failing after `PROMPT` even while
+/// output keeps arriving.
 fn read_until(rx: &mpsc::Receiver<Vec<u8>>, needle: &str, what: &str) -> String {
-    let started = Instant::now();
-    let mut seen = Vec::new();
-    while !String::from_utf8_lossy(&seen).contains(needle) {
-        let left = PROMPT.saturating_sub(started.elapsed());
+    let deadline = Instant::now() + PROMPT;
+    let mut seen = String::new();
+    while !seen.contains(needle) {
+        let left = deadline.saturating_duration_since(Instant::now());
         match rx.recv_timeout(left) {
-            Ok(chunk) => seen.extend_from_slice(&chunk),
-            Err(e) => panic!(
-                "{what}: no {needle:?} within {PROMPT:?} ({e}); saw {:?}",
-                String::from_utf8_lossy(&seen)
-            ),
+            Ok(chunk) if !left.is_zero() => seen.push_str(&String::from_utf8_lossy(&chunk)),
+            _ => {
+                let tail = seen.len().saturating_sub(400);
+                let tail = seen.ceil_char_boundary(tail);
+                panic!(
+                    "{what}: no {needle:?} within {PROMPT:?}; last of {} bytes seen: {:?}",
+                    seen.len(),
+                    &seen[tail..]
+                )
+            }
         }
     }
-    String::from_utf8_lossy(&seen).into_owned()
+    seen
 }
 
 /// The seq the next published event will carry.
@@ -242,9 +248,9 @@ fn pane_watch_delivers_a_last_write_that_no_later_output_follows() {
         "quiet",
         "-d",
         "--",
-        "bash",
+        "sh",
         "-c",
-        "until read -r -t 0.3 x; do echo waiting; done; sleep 0.3; \
+        "(while :; do echo waiting; sleep 0.3; done) & t=$!; read -r x; kill $t; sleep 0.3; \
          printf 'first %s\\n' \"$x\"; sleep 0.05; \
          printf '\\033[38;2;0;200;80mTRUE\\033[0m \\033[38;5;33mIDX\\033[0m \\033[32mBASIC\\033[0m last-%s\\n' \"$x\"; \
          exec sleep 300",
