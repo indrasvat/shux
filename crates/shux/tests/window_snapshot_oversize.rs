@@ -114,10 +114,15 @@ fn window_snapshot_agrees_with_pane_snapshot_when_grid_exceeds_rect() {
     let h = Harness::new();
     let (session_id, pane_id) = spawn_marker_session(&h);
 
-    // Wait for the top marker to land, THEN grow the grid far past any window
-    // layout rect. pane.set_size is synchronous: the next snapshot sees 200x60.
-    h.wait_for(&pane_id, "OVERSIZE-MARKER", 10_000)
-        .expect("pane never drew its top marker");
+    // Wait for the last bar (drawn after the marker) to land, THEN grow the
+    // grid far past any window layout rect. pane.set_size is synchronous: the
+    // next snapshot sees 200x60.
+    h.wait_for(
+        &pane_id,
+        "CCCCCCCCCCCC",
+        shux_testkit::BUDGET.as_millis() as u64,
+    )
+    .expect("pane never drew its marker and bars");
     h.rpc_ok(
         "pane.set_size",
         json!({ "pane_id": pane_id, "cols": 200, "rows": 60 }),
@@ -213,8 +218,12 @@ fn window_snapshot_shows_content_after_split_shrinks_rect() {
     let h = Harness::new();
     let (session_id, pane_id) = spawn_marker_session(&h);
 
-    h.wait_for(&pane_id, "OVERSIZE-MARKER", 10_000)
-        .expect("pane never drew its top marker");
+    h.wait_for(
+        &pane_id,
+        "CCCCCCCCCCCC",
+        shux_testkit::BUDGET.as_millis() as u64,
+    )
+    .expect("pane never drew its marker and bars");
     h.rpc_ok(
         "pane.set_size",
         json!({ "pane_id": pane_id, "cols": 200, "rows": 60 }),

@@ -33,18 +33,6 @@ const SCRIPT: &str = concat!(
     "fi; done'\n",
 );
 
-fn settle(h: &Harness, pane: &str, ctx: &str) {
-    let env = h.rpc_raw(
-        "pane.wait_settled",
-        serde_json::json!({ "pane_id": pane, "quiet_ms": 300, "timeout_ms": 5_000 }),
-    );
-    assert_eq!(
-        env.expect_result(ctx)["settled"],
-        serde_json::Value::Bool(true),
-        "{ctx}: expected settle"
-    );
-}
-
 #[test]
 fn diff_since_has_no_palette_field_and_osc4_does_not_inflate() {
     let h = Harness::new();
@@ -71,9 +59,12 @@ fn diff_since_has_no_palette_field_and_osc4_does_not_inflate() {
         "pane.send_keys",
         serde_json::json!({ "pane_id": pane_id, "text": SCRIPT }),
     );
-    h.wait_for(&pane_id, READY_MARKER, 10_000)
-        .expect("setup sentinel");
-    settle(&h, &pane_id, "settle after setup");
+    h.wait_for(
+        &pane_id,
+        READY_MARKER,
+        shux_testkit::BUDGET.as_millis() as u64,
+    )
+    .expect("setup sentinel");
 
     // Checkpoint BEFORE the OSC 4 (palette not yet overridden on the checkpoint).
     let env = h.rpc_raw("pane.checkpoint", serde_json::json!({ "pane_id": pane_id }));
@@ -83,9 +74,12 @@ fn diff_since_has_no_palette_field_and_osc4_does_not_inflate() {
 
     // Apply the OSC 4 override + the PALMARK sentinel.
     h.send_line_token(&pane_id, "P");
-    h.wait_for(&pane_id, PAL_MARKER, 10_000)
-        .expect("OSC 4 landed");
-    settle(&h, &pane_id, "settle after OSC 4");
+    h.wait_for(
+        &pane_id,
+        PAL_MARKER,
+        shux_testkit::BUDGET.as_millis() as u64,
+    )
+    .expect("OSC 4 landed");
 
     let d = h
         .rpc_raw(

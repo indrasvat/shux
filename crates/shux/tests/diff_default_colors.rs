@@ -39,18 +39,6 @@ const SCRIPT: &str = concat!(
     "fi; done'\n",
 );
 
-fn settle(h: &Harness, pane: &str, ctx: &str) {
-    let env = h.rpc_raw(
-        "pane.wait_settled",
-        serde_json::json!({ "pane_id": pane, "quiet_ms": 300, "timeout_ms": 5_000 }),
-    );
-    assert_eq!(
-        env.expect_result(ctx)["settled"],
-        serde_json::Value::Bool(true),
-        "{ctx}: expected settle"
-    );
-}
-
 #[test]
 fn osc_default_bg_change_marks_default_cells_and_heat_uses_current_defaults() {
     let h = Harness::new();
@@ -82,9 +70,12 @@ fn osc_default_bg_change_marks_default_cells_and_heat_uses_current_defaults() {
         "pane.send_keys",
         serde_json::json!({ "pane_id": pane_id, "text": SCRIPT }),
     );
-    h.wait_for(&pane_id, READY_MARKER, 10_000)
-        .expect("setup sentinel");
-    settle(&h, &pane_id, "settle after setup");
+    h.wait_for(
+        &pane_id,
+        READY_MARKER,
+        shux_testkit::BUDGET.as_millis() as u64,
+    )
+    .expect("setup sentinel");
 
     // Checkpoint (captures the pane's CURRENT defaults: none set yet).
     let env = h.rpc_raw("pane.checkpoint", serde_json::json!({ "pane_id": pane_id }));
@@ -108,9 +99,12 @@ fn osc_default_bg_change_marks_default_cells_and_heat_uses_current_defaults() {
     // sentinel from the SAME write — when OSC-DONE is on screen the earlier
     // OSC bytes are guaranteed parsed (single ordered byte stream).
     h.send_line_token(&pane_id, "O");
-    h.wait_for(&pane_id, OSC_MARKER, 10_000)
-        .expect("OSC landed");
-    settle(&h, &pane_id, "settle after OSC 11");
+    h.wait_for(
+        &pane_id,
+        OSC_MARKER,
+        shux_testkit::BUDGET.as_millis() as u64,
+    )
+    .expect("OSC landed");
 
     // LENS-R-038b (a): the bg default changed, so EVERY cell whose bg is
     // Default on both sides is marked — the whole 40×10 grid except the 5
