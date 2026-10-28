@@ -92,7 +92,7 @@ help: ## Show this help message
 	@awk 'BEGIN {FS = ":.*##"} /^(build|release|install)[a-zA-Z_-]*:.*?##/ { printf "  $(COLOR_GREEN)%-20s$(COLOR_RESET) %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 	@echo ""
 	@echo "$(COLOR_BOLD)Test:$(COLOR_RESET)"
-	@awk 'BEGIN {FS = ":.*##"} /^(test|bench)[a-zA-Z_-]*:.*?##/ { printf "  $(COLOR_GREEN)%-20s$(COLOR_RESET) %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
+	@awk 'BEGIN {FS = ":.*##"} /^(test|bench|refresh|promote|record)[a-zA-Z_-]*:.*?##/ { printf "  $(COLOR_GREEN)%-20s$(COLOR_RESET) %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 	@echo ""
 	@echo "$(COLOR_BOLD)Code Quality:$(COLOR_RESET)"
 	@awk 'BEGIN {FS = ":.*##"} /^(clippy|lint|fmt|check|ci|deny|fuzz|shellcheck)[a-zA-Z_-]*:.*?##/ { printf "  $(COLOR_GREEN)%-20s$(COLOR_RESET) %s\n", $$1, $$2 }' $(MAKEFILE_LIST)

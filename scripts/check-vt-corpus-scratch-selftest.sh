@@ -15,12 +15,15 @@
 #
 # Cases:
 #   1. default env      -> exits 0, tree clean, evidence lands in .shux/out
-#   2. VT_CORPUS_QA set -> the deliberate refresh path still writes there
+#   2. VT_CORPUS_QA set -> the deliberate refresh path still writes there, and
+#      scrubs repo paths when the root is reached through a symlink
 #   3. reintroduced bug -> qa defaulting to the tracked dir is detected
+#   4. failing harness  -> no evidence from an earlier passing run survives
 
 set -euo pipefail
 
-SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.shux/scripts/vt_corpus_check.sh"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT="${REPO}/.shux/scripts/vt_corpus_check.sh"
 [[ -f "$SCRIPT" ]] || {
     echo "✗ cannot find .shux/scripts/vt_corpus_check.sh" >&2
     exit 1
@@ -37,7 +40,11 @@ done
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
     GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_NAMESPACE \
     GIT_PREFIX GIT_QUARANTINE_PATH
-unset VT_CORPUS_FIXTURES VT_CORPUS_GOLDENS VT_CORPUS_OUT VT_CORPUS_QA
+# The caller's git config must not reach the throwaway repos either: a global
+# excludesFile can hide the files under test, a hooksPath can veto the commit.
+unset GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+unset VT_CORPUS_FIXTURES VT_CORPUS_GOLDENS VT_CORPUS_OUT VT_CORPUS_QA STUB_CARGO_FAIL
 
 scratch="$(mktemp -d "${TMPDIR:-/tmp}/shux-vt-corpus-scratch.XXXXXX")"
 scratch="$(cd "${scratch}" && pwd -P)"
@@ -60,6 +67,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 [[ -n "${out}" && -n "${goldens}" ]] || { echo "stub cargo: missing --out/--goldens" >&2; exit 2; }
+[[ -z "${STUB_CARGO_FAIL:-}" ]] || { echo "stub cargo: simulated harness failure" >&2; exit 1; }
 mkdir -p "${out}"
 printf 'actual\n' > "${out}/synthetic-probe-actual.png"
 jq -n --arg a "${out}/synthetic-probe-actual.png" \
@@ -70,7 +78,8 @@ jq -n --arg a "${out}/synthetic-probe-actual.png" \
 STUB
 
 # `uv run --script pixel_verify.py ACTUAL EXPECTED --diff PATH ...`: writes a
-# freshly "encoded" diff, as the real one does on every run.
+# freshly "encoded" diff, as the real one does on every run, and reports its
+# path so the harness's path scrubbing is exercised.
 cat > "${stubs}/uv" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -83,20 +92,21 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -n "${diff}" ]] || { echo "stub uv: missing --diff" >&2; exit 2; }
 printf 'regenerated %s\n' "$$" > "${diff}"
-printf '{"pixel_diff_ratio": 0}\n'
+jq -n --arg d "${diff}" '{diff: $d, pixel_diff_ratio: 0}'
 STUB
 chmod +x "${stubs}/cargo" "${stubs}/uv"
 
 tracked_qa_rel=".shux/qa/073-shux-vt-corpus-regression-harness"
 
-# A throwaway repo shaped like this one: the script, the gitignore that makes
-# .shux/out scratch, and committed evidence the harness must not touch.
+# A throwaway repo shaped like this one: the script, the real gitignores that
+# make .shux/out scratch, and committed evidence the harness must not touch.
 make_repo() {
     local root="$1" script="$2"
     mkdir -p "${root}/.shux/scripts" "${root}/.shux/fixtures/vt-corpus" \
         "${root}/.shux/goldens/073-vt-corpus" "${root}/${tracked_qa_rel}"
     cp "${script}" "${root}/.shux/scripts/vt_corpus_check.sh"
-    printf 'out/\n' > "${root}/.shux/.gitignore"
+    cp "${REPO}/.gitignore" "${root}/.gitignore"
+    cp "${REPO}/.shux/.gitignore" "${root}/.shux/.gitignore"
     printf 'expected\n' > "${root}/.shux/goldens/073-vt-corpus/synthetic-probe-expected.png"
     printf 'committed\n' > "${root}/${tracked_qa_rel}/synthetic-probe-diff.png"
     printf 'committed\n' > "${root}/${tracked_qa_rel}/synthetic-probe-actual.png"
@@ -110,9 +120,10 @@ make_repo() {
     fi
     git -C "${root}" add -A
     git -C "${root}" -c user.name=selftest -c user.email=selftest@invalid \
-        -c commit.gpgsign=false commit -q -m init
+        -c commit.gpgsign=false -c core.hooksPath=/dev/null commit -q -m init
 }
 
+# run_harness DIR [VAR=value...]: run from DIR, which may be a symlink to a repo.
 run_harness() {
     local root="$1"
     shift
@@ -149,17 +160,27 @@ else
     fail "a default run exited non-zero" "${repo}.log"
 fi
 
-# 2. The deliberate refresh path still rewrites the committed evidence.
+# 2. The deliberate refresh path still rewrites the committed evidence. Run it
+# the way `make refresh-vt-corpus-evidence` does from a symlinked checkout: the
+# script sees the logical root, make's CURDIR hands it the physical one, and
+# no absolute path of either kind may reach the committed JSON.
 repo="${scratch}/refresh"
 make_repo "${repo}" "${SCRIPT}"
-if run_harness "${repo}" VT_CORPUS_QA="${repo}/${tracked_qa_rel}"; then
-    if dirty "${repo}" | grep -q "${tracked_qa_rel}/synthetic-probe-diff.png"; then
-        echo "✓ VT_CORPUS_QA run: committed evidence refreshed"
+ln -s "${repo}" "${scratch}/refresh-link"
+if run_harness "${scratch}/refresh-link" VT_CORPUS_QA="${repo}/${tracked_qa_rel}"; then
+    leaked="$(grep -rlF -e "${repo}" -e "${scratch}/refresh-link" \
+        --include='*.json' "${repo}/${tracked_qa_rel}" || true)"
+    if ! dirty "${repo}" | grep -q "${tracked_qa_rel}/synthetic-probe-diff.png"; then
+        fail "VT_CORPUS_QA did not redirect evidence into ${tracked_qa_rel}" "${scratch}/refresh-link.log"
+    elif [[ ! -s "${repo}/${tracked_qa_rel}/synthetic-probe-pixel.json" ]]; then
+        fail "a VT_CORPUS_QA run wrote no pixel metric" "${scratch}/refresh-link.log"
+    elif [[ -n "${leaked}" ]]; then
+        fail "absolute repo paths reached the committed evidence:"$'\n'"${leaked}"
     else
-        fail "VT_CORPUS_QA did not redirect evidence into ${tracked_qa_rel}" "${repo}.log"
+        echo "✓ VT_CORPUS_QA run: committed evidence refreshed, paths repo-relative"
     fi
 else
-    fail "a VT_CORPUS_QA run exited non-zero" "${repo}.log"
+    fail "a VT_CORPUS_QA run exited non-zero" "${scratch}/refresh-link.log"
 fi
 
 # 3. Reintroduce the defect and prove case 1's assertion catches it.
@@ -181,8 +202,24 @@ else
     fi
 fi
 
+# 4. A failing run must not leave an earlier run's passing evidence behind.
+repo="${scratch}/stale"
+make_repo "${repo}" "${SCRIPT}"
+stale_qa="${repo}/.shux/out/073-vt-corpus/qa"
+if ! run_harness "${repo}"; then
+    fail "the passing run before the failing one exited non-zero" "${repo}.log"
+elif [[ ! -s "${stale_qa}/evidence-manifest.json" ]]; then
+    fail "the passing run before the failing one wrote no evidence" "${repo}.log"
+elif run_harness "${repo}" STUB_CARGO_FAIL=1; then
+    fail "a run whose harness failed exited 0" "${repo}.log"
+elif [[ -n "$(find "${stale_qa}" -maxdepth 1 -type f)" ]]; then
+    fail "a failed run left earlier evidence in place:"$'\n'"$(ls "${stale_qa}")"
+else
+    echo "✓ failing run: no stale evidence survives"
+fi
+
 if [[ "${failures}" -ne 0 ]]; then
     echo "✗ vt-corpus scratch self-test: ${failures} failure(s)" >&2
     exit 1
 fi
-echo "✓ vt-corpus scratch self-test passed (3 cases)"
+echo "✓ vt-corpus scratch self-test passed (4 cases)"

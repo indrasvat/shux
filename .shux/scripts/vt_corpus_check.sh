@@ -22,8 +22,8 @@ need cargo
 need jq
 need uv
 
-# shellcheck disable=SC2016  # this is a jq PROGRAM, not a shell string: `$root` is
-# a jq variable bound with --arg below. Expanding it in the shell would substitute
+# shellcheck disable=SC2016  # this is a jq PROGRAM, not a shell string: `$roots` is
+# a jq variable bound with --argjson below. Expanding it in the shell would substitute
 # an empty string and the path scrubbing would silently stop working.
 scrub_paths_filter='
 def scrub:
@@ -31,8 +31,10 @@ def scrub:
     with_entries(.value |= scrub)
   elif type == "array" then
     map(scrub)
-  elif type == "string" and startswith($root) then
-    .[($root | length):]
+  elif type == "string" then
+    . as $s
+    | ([$roots[] | select(. as $r | $s | startswith($r))] | first) as $root
+    | if $root then $s[($root | length):] else $s end
   else
     .
   end;
@@ -42,18 +44,18 @@ scrub
 scrub_json_paths() {
   local source="$1"
   local target="$2"
-  jq --arg root "${repo_root}/" "${scrub_paths_filter}" "${source}" > "${target}"
+  jq --argjson roots "${scrub_roots}" "${scrub_paths_filter}" "${source}" > "${target}"
 }
+
+# Both spellings of the root: a checkout reached through a symlink sees the
+# logical one here, while a caller (make's CURDIR) may pass physical paths.
+scrub_roots="$(jq -cn --arg l "${repo_root}/" --arg p "$(cd "${repo_root}" && pwd -P)/" '[$l, $p]')"
 
 rm -rf "${rendered}"
 mkdir -p "${rendered}" "${qa}"
 
-cargo run -p shux-raster --example vt_corpus_harness -- \
-  --mode verify \
-  --fixtures "${fixtures}" \
-  --goldens "${goldens}" \
-  --out "${rendered}"
-
+# Clear the previous run's evidence before rendering, so a failed run cannot
+# leave a passing one behind.
 find "${qa}" -maxdepth 1 -type f \( \
   -name '*-actual.png' -o \
   -name '*-diff.png' -o \
@@ -62,6 +64,12 @@ find "${qa}" -maxdepth 1 -type f \( \
   -name 'corpus-report.json' -o \
   -name 'evidence-manifest.json' \
 \) -delete
+
+cargo run -p shux-raster --example vt_corpus_harness -- \
+  --mode verify \
+  --fixtures "${fixtures}" \
+  --goldens "${goldens}" \
+  --out "${rendered}"
 
 scrub_json_paths "${rendered}/corpus-report.json" "${qa}/corpus-report.json"
 
