@@ -1,3 +1,10 @@
+## [0.54.3](https://github.com/indrasvat/shux/compare/v0.54.2...v0.54.3) (2026-10-28)
+
+
+### Bug Fixes
+
+* **vt-corpus:** write harness evidence to .shux/out, not the tracked QA dir ([#211](https://github.com/indrasvat/shux/issues/211)) ([3c0f32b](https://github.com/indrasvat/shux/commit/3c0f32bbfc5ab52075806e7817cb33862c684930))
+
 ## [0.54.2](https://github.com/indrasvat/shux/compare/v0.54.1...v0.54.2) (2026-10-28)
 
 
