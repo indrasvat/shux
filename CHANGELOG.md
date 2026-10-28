@@ -1,3 +1,10 @@
+# [0.54.0](https://github.com/indrasvat/shux/compare/v0.53.1...v0.54.0) (2026-10-28)
+
+
+### Features
+
+* **conductor:** read program status where a pane reports it; never auto-dismiss a reported block ([#210](https://github.com/indrasvat/shux/issues/210)) ([468665e](https://github.com/indrasvat/shux/commit/468665ebc2c70854ad91e6e6db8145705a8198d2))
+
 ## [0.53.1](https://github.com/indrasvat/shux/compare/v0.53.0...v0.53.1) (2026-10-28)
 
 
