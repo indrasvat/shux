@@ -392,6 +392,13 @@ fn text_plain_and_json_agree_about_every_pane() {
     ]);
     let cmd = format!("{} pane list -s {s} -w 0 --format text", env.bin_str());
     let screen = env.run_line_and_wait(&s, "viewer", &cmd);
+    let header = screen
+        .lines()
+        .find(|l| l.contains("TITLE") && l.contains("COMMAND"))
+        .unwrap_or_else(|| panic!("text arm drew no header:\n{screen}"));
+    // In characters, not bytes: the focus marker is multi-byte.
+    let char_at = |needle: &str| header[..header.find(needle).expect(needle)].chars().count();
+    let (title_start, title_end) = (char_at("TITLE"), char_at("CWD"));
 
     for pane in panes {
         let short = &pane["id"].as_str().expect("id")[..8];
@@ -405,10 +412,21 @@ fn text_plain_and_json_agree_about_every_pane() {
         assert_eq!(row[1], cwd, "plain/json disagree on cwd");
         assert_eq!(row[3], title, "plain/json disagree on title");
 
-        assert!(screen.contains(short), "text lost pane {short}:\n{screen}");
-        assert!(
-            screen.contains(title),
-            "text lost the title {title:?} of pane {short}:\n{screen}"
+        // Read the title out of its own column: the echoed command line and the
+        // COMMAND column both spell a program name, which is also its default title.
+        let text_row = screen
+            .lines()
+            .find(|l| l.contains(short))
+            .unwrap_or_else(|| panic!("text lost pane {short}:\n{screen}"));
+        let cell: String = text_row
+            .chars()
+            .skip(title_start)
+            .take(title_end - title_start)
+            .collect();
+        let cell = cell.trim();
+        assert_eq!(
+            cell, title,
+            "text lost the title of pane {short}: {text_row:?}\n{screen}"
         );
         // The command column is the one the issue is about; the argv's first
         // word must be visible in every format.

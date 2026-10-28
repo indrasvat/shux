@@ -10,6 +10,7 @@
 //! (the leak guard enforces it; the test kills its sessions).
 
 mod lens_common;
+mod typed_marker;
 use lens_common::*;
 
 use shux_vt::{FrameEnvelope, MaskSet};
@@ -32,19 +33,47 @@ fn open_pane(h: &Harness, cols: u16, rows: u16) -> (String, String) {
     (session_id, pane_id)
 }
 
+/// The line [`draw_colored`] types: truecolor fg + indexed bg, so a monochrome
+/// regression can't pass unnoticed, then `sentinel`. The PTY echoes it before
+/// the shell runs it, so it must not contain `sentinel`.
+fn colored_line(sentinel: &str) -> String {
+    assert!(
+        sentinel.len() >= 2 && sentinel.bytes().all(|b| b.is_ascii_alphanumeric()),
+        "sentinel {sentinel:?} must be two or more ASCII alphanumerics, or it cannot be split"
+    );
+    let (head, tail) = sentinel.split_at(sentinel.len() / 2);
+    let line = format!(
+        "printf '\\033[38;2;255;120;0m\\033[48;5;28mTRUECOLOR\\033[0m %s%s\\n' {head} {tail}\n"
+    );
+    assert!(
+        !line.contains(sentinel),
+        "the echo of {line:?} draws {sentinel:?}"
+    );
+    line
+}
+
 /// Draw a truecolor line + a sentinel and wait for it (a colour probe is mandatory in
 /// shux automation — CLAUDE.md).
 fn draw_colored(h: &Harness, pane_id: &str, sentinel: &str) {
     h.rpc_ok(
         "pane.send_keys",
-        serde_json::json!({
-            "pane_id": pane_id,
-            // truecolor fg + indexed bg so a monochrome regression can't pass unnoticed.
-            "text": format!("printf '\\033[38;2;255;120;0m\\033[48;5;28mTRUECOLOR\\033[0m {sentinel}\\n'\n"),
-        }),
+        serde_json::json!({ "pane_id": pane_id, "text": colored_line(sentinel) }),
     );
     h.wait_for(pane_id, sentinel, 10_000)
         .unwrap_or_else(|e| panic!("pane never drew {sentinel:?}: {e}"));
+}
+
+/// Whether any run in a `cells` envelope carries the foreground pen `rgb`. A
+/// substring search cannot answer this: the echoed line spells the SGR digits.
+fn has_fg_rgb(cells: &serde_json::Value, rgb: [u64; 3]) -> bool {
+    let want = serde_json::json!(rgb);
+    cells["rows"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|row| row["runs"].as_array().into_iter().flatten())
+        .filter_map(|run| run.get(2))
+        .any(|style| style["fg"]["rgb"] == want)
 }
 
 /// Parse + validate the `cells` field of a glance result into a canonical envelope.
@@ -83,9 +112,8 @@ fn glance_cells_emits_canonical_envelope_rpc_and_cli() {
         assert_eq!(fe.size.cols, cols, "cells cols match the pane");
         assert_eq!(fe.size.rows, rows, "cells rows match the pane");
         // The truecolor fg (255,120,0) must appear in the emitted golden (colour survives).
-        let json = fe.to_canonical_json();
         assert!(
-            json.contains("255") && json.contains("120"),
+            has_fg_rgb(&g["cells"], [255, 120, 0]),
             "the truecolor probe must be captured in the golden"
         );
         // Default response (no include_cells) must NOT carry a cells field (frozen shape).
@@ -124,6 +152,11 @@ fn glance_cells_emits_canonical_envelope_rpc_and_cli() {
     }
 }
 
+/// Clears the screen, then draws the secret, an unmasked tail and `READYSEC`. Typed,
+/// so its echo carries the secret: the wait on `READYSEC` must not be satisfiable
+/// by that echo, or the glance can still see it.
+const SECRET_LINE: &str = "printf '\\033[2J\\033[6;1HSECRET-TOKEN-42\\033[6;20Hvisible-tail\\033[9;1H%s%s\\n' READY SEC\n";
+
 // ── L1 mask/redact absence (D4): --mask redacts the emitted cells AND text ──────────
 #[test]
 fn glance_cells_masks_redact_emitted_content() {
@@ -136,7 +169,7 @@ fn glance_cells_masks_redact_emitted_content() {
         "pane.send_keys",
         serde_json::json!({
             "pane_id": pane_id,
-            "text": "printf '\\033[2J\\033[6;1HSECRET-TOKEN-42\\033[6;20Hvisible-tail\\033[9;1HREADYSEC\\n'\n",
+            "text": SECRET_LINE,
         }),
     );
     h.wait_for(&pane_id, "READYSEC", 10_000).expect("sentinel");
@@ -221,4 +254,10 @@ fn glance_cells_masks_redact_emitted_content() {
     vt.process(b"SECRET-TOKEN-42 tail");
     let off = FrameEnvelope::from_terminal(&vt, &MaskSet::new().with(0, 0, 15));
     assert!(!off.to_canonical_json().contains("SECRET"));
+}
+
+#[test]
+fn sentinels_cannot_be_satisfied_by_the_echoed_lines() {
+    typed_marker::assert_echo_cannot_satisfy(&colored_line("READY80"), "", &["READY80"]);
+    typed_marker::assert_echo_cannot_satisfy(SECRET_LINE, "", &["READYSEC"]);
 }

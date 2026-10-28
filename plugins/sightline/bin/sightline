@@ -523,13 +523,18 @@ def run_recorded_color_probe(shux_bin: str, session: str, pane_id: str | None, r
     recording_id = start.get("recording_id")
     if not isinstance(recording_id, str) or not recording_id:
         raise RuntimeError("pane.record.start did not return recording_id")
-    marker = f"SIGHTLINE_COLOR_PROBE_DONE_{time.monotonic_ns() % 1_000_000:06d}"
+    marker_tail = f"DONE_{time.monotonic_ns() % 1_000_000:06d}"
+    marker = f"SIGHTLINE_COLOR_PROBE_{marker_tail}"
     try:
+        # The pane echoes the typed line before the shell runs it, so the marker
+        # is assembled by printf and never appears in the line verbatim.
         command = (
             "printf '\\033[38;2;255;64;0mSL_TRUECOLOR\\033[0m "
             "\\033[38;5;45mSL_INDEXED\\033[0m "
-            f"\\033[31mSL_BASIC\\033[0m {marker}\\n'\r"
+            f"\\033[31mSL_BASIC\\033[0m %s_%s\\n' SIGHTLINE_COLOR_PROBE {marker_tail}\r"
         )
+        if marker in command:
+            raise RuntimeError("color probe line would satisfy its own wait through the echo")
         require_success(shux_cmd(shux_bin, ["pane", "send-keys", "--session", session, "--pane", pane_id, "--text", command]), "color probe send-keys")
         require_success(
             shux_cmd(

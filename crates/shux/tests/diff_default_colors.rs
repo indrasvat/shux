@@ -18,8 +18,26 @@
 
 #[path = "lens_common/mod.rs"]
 mod lens_common;
+mod typed_marker;
 
 use lens_common::{Harness, decode_png, probe_cell_bg_img, unique};
+
+const READY_MARKER: &str = "READY-038B";
+const OSC_MARKER: &str = "OSC-DONE";
+
+/// Typed into the pane shell, so the PTY echoes it before `sh` runs it: it
+/// must not contain [`READY_MARKER`] or [`OSC_MARKER`], or the waits on them
+/// return on the echo.
+const SCRIPT: &str = concat!(
+    "exec sh -c 'stty -echo; ",
+    "printf \"\\033[2J\\033[3J\\033[H\"; ",
+    "printf \"\\033[5;3H\\033[48;2;30;120;60m\\033[38;2;255;255;0mCOLOR\\033[0m\"; ",
+    "printf \"\\033[1;1HREADY-%s\" 038B; ",
+    "while read -r t; do ",
+    "if [ \"$t\" = O ]; then ",
+    "printf \"\\033]11;#204060\\007\"; printf \"\\033[10;1HOSC-%s\" DONE; ",
+    "fi; done'\n",
+);
 
 fn settle(h: &Harness, pane: &str, ctx: &str) {
     let env = h.rpc_raw(
@@ -60,21 +78,11 @@ fn osc_default_bg_change_marks_default_cells_and_heat_uses_current_defaults() {
         "pane.set_size",
         serde_json::json!({ "pane_id": pane_id, "cols": 40, "rows": 10 }),
     );
-    let script = concat!(
-        "exec sh -c 'stty -echo; ",
-        "printf \"\\033[2J\\033[3J\\033[H\"; ",
-        "printf \"\\033[5;3H\\033[48;2;30;120;60m\\033[38;2;255;255;0mCOLOR\\033[0m\"; ",
-        "printf \"\\033[1;1HREADY-038B\"; ",
-        "while read -r t; do ",
-        "if [ \"$t\" = O ]; then ",
-        "printf \"\\033]11;#204060\\007\"; printf \"\\033[10;1HOSC-DONE\"; ",
-        "fi; done'\n",
-    );
     h.rpc_ok(
         "pane.send_keys",
-        serde_json::json!({ "pane_id": pane_id, "text": script }),
+        serde_json::json!({ "pane_id": pane_id, "text": SCRIPT }),
     );
-    h.wait_for(&pane_id, "READY-038B", 10_000)
+    h.wait_for(&pane_id, READY_MARKER, 10_000)
         .expect("setup sentinel");
     settle(&h, &pane_id, "settle after setup");
 
@@ -100,7 +108,7 @@ fn osc_default_bg_change_marks_default_cells_and_heat_uses_current_defaults() {
     // sentinel from the SAME write — when OSC-DONE is on screen the earlier
     // OSC bytes are guaranteed parsed (single ordered byte stream).
     h.send_line_token(&pane_id, "O");
-    h.wait_for(&pane_id, "OSC-DONE", 10_000)
+    h.wait_for(&pane_id, OSC_MARKER, 10_000)
         .expect("OSC landed");
     settle(&h, &pane_id, "settle after OSC 11");
 
@@ -168,4 +176,9 @@ fn osc_default_bg_change_marks_default_cells_and_heat_uses_current_defaults() {
     );
 
     h.kill_session(&session_id);
+}
+
+#[test]
+fn the_markers_cannot_be_satisfied_by_the_echoed_script() {
+    typed_marker::assert_echo_cannot_satisfy(SCRIPT, "O\n", &[READY_MARKER, OSC_MARKER]);
 }
