@@ -18,6 +18,7 @@
 
 #[path = "lens_common/mod.rs"]
 mod lens_common;
+mod typed_marker;
 
 use lens_common::{Harness, decode_png, probe_cell_bg_img, unique};
 
@@ -177,42 +178,7 @@ fn osc_default_bg_change_marks_default_cells_and_heat_uses_current_defaults() {
     h.kill_session(&session_id);
 }
 
-/// The waits on [`READY_MARKER`] and [`OSC_MARKER`] are barriers only if the
-/// echoed [`SCRIPT`] cannot satisfy them and running it still prints both.
 #[test]
 fn the_markers_cannot_be_satisfied_by_the_echoed_script() {
-    for marker in [READY_MARKER, OSC_MARKER] {
-        assert!(
-            !SCRIPT.contains(marker),
-            "the typed script contains {marker:?} verbatim, so the wait returns on its echo"
-        );
-    }
-    let out = run_sh(SCRIPT, "O\n");
-    for marker in [READY_MARKER, OSC_MARKER] {
-        assert!(
-            out.contains(marker),
-            "running the script no longer prints {marker:?}: {out:?}"
-        );
-    }
-}
-
-fn run_sh(script: &str, stdin: &str) -> String {
-    use std::io::Write as _;
-    use std::process::{Command, Stdio};
-    let mut child = Command::new("sh")
-        .arg("-c")
-        .arg(script)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn sh");
-    child
-        .stdin
-        .take()
-        .expect("piped stdin")
-        .write_all(stdin.as_bytes())
-        .expect("write stdin");
-    let out = child.wait_with_output().expect("wait sh");
-    String::from_utf8_lossy(&out.stdout).into_owned()
+    typed_marker::assert_echo_cannot_satisfy(SCRIPT, "O\n", &[READY_MARKER, OSC_MARKER]);
 }

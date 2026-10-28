@@ -29,6 +29,7 @@
 use std::time::Duration;
 
 mod lens_common;
+mod typed_marker;
 use lens_common::*;
 
 /// A session created for one test, with every id it exposes.
@@ -74,7 +75,7 @@ const PROBE: &str = concat!(
 /// Pane B's line, typed into its shell. The PTY echoes it before the shell
 /// runs it, so it must not contain `BRAVO` or the fixture's wait for pane B's
 /// output returns on the echo.
-const PANE_B_LINE: &str = "printf 'BRA''VO\\n'\n";
+const PANE_B_LINE: &str = "printf '%s%s\\n' BRA VO\n";
 
 /// Wait for a pane to stop writing, so two captures of it can be compared.
 ///
@@ -1105,22 +1106,7 @@ fn session_attach_resolves_an_id_instead_of_creating_a_session_named_after_it() 
     h.kill_session(&f.session_id);
 }
 
-/// The fixture's wait for `BRAVO` is a barrier only if the echoed
-/// [`PANE_B_LINE`] cannot satisfy it and running the line still prints it.
 #[test]
 fn pane_b_marker_cannot_be_satisfied_by_the_echoed_line() {
-    assert!(
-        !PANE_B_LINE.contains("BRAVO"),
-        "the typed line contains BRAVO verbatim, so the wait returns on its echo"
-    );
-    let out = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(PANE_B_LINE)
-        .output()
-        .expect("spawn sh");
-    assert_eq!(
-        String::from_utf8_lossy(&out.stdout).trim(),
-        "BRAVO",
-        "running the line no longer prints the marker"
-    );
+    typed_marker::assert_echo_cannot_satisfy(PANE_B_LINE, "", &["BRAVO"]);
 }

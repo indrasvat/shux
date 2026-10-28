@@ -3,6 +3,8 @@
 //! Verifies pane.send_keys, pane.run_command, pane.command_status,
 //! pane.command_cancel, and pane.capture with real PTY processes.
 
+mod typed_marker;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -856,20 +858,16 @@ const ECHO_LINE: &str = "echo SHUX_TEST_''OUTPUT\n";
 
 #[test]
 fn echo_line_output_cannot_be_satisfied_by_its_echo() {
-    assert!(
-        !ECHO_LINE.contains("SHUX_TEST_OUTPUT"),
-        "the typed line contains SHUX_TEST_OUTPUT verbatim, so capture shows it before echo runs"
-    );
-    let out = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(ECHO_LINE)
-        .output()
-        .expect("spawn sh");
-    assert_eq!(
-        String::from_utf8_lossy(&out.stdout).trim(),
-        "SHUX_TEST_OUTPUT",
-        "running the line no longer prints the marker"
-    );
+    typed_marker::assert_echo_cannot_satisfy(ECHO_LINE, "", &["SHUX_TEST_OUTPUT"]);
+}
+
+/// Typed before the shell exits; its echo must not leave the marker behind, or
+/// the capture after exit proves nothing about the output surviving teardown.
+const LIVES_LINE: &str = "echo SHUX_LIVES_''AFTER_EXIT";
+
+#[test]
+fn lives_line_output_cannot_be_satisfied_by_its_echo() {
+    typed_marker::assert_echo_cannot_satisfy(LIVES_LINE, "", &["SHUX_LIVES_AFTER_EXIT"]);
 }
 
 #[tokio::test]
@@ -1266,10 +1264,12 @@ async fn test_run_command_sync_echo() {
 
     assert_eq!(result["state"].as_str().unwrap(), "completed");
     assert_eq!(result["exit_code"].as_i64().unwrap(), 0);
+    // `stdout` is the pane's text, which holds the echoed command line too, so
+    // only a line that is exactly the argument proves `echo` ran.
     let stdout = result["stdout"].as_str().unwrap();
     assert!(
-        stdout.contains("hello_from_shux"),
-        "stdout should contain 'hello_from_shux', got: {stdout}"
+        stdout.lines().any(|l| l.trim() == "hello_from_shux"),
+        "stdout should hold the line 'hello_from_shux', got: {stdout}"
     );
 
     stop_test_server(cancel).await;
@@ -1429,7 +1429,7 @@ async fn test_capture_works_after_pane_process_exits() {
         "pane.send_keys",
         serde_json::json!({
             "session_id": session_id,
-            "text": format!("echo SHUX_LIVES_AFTER_EXIT; touch {exit_marker_display}; exit 0\n"),
+            "text": format!("{LIVES_LINE}; touch {exit_marker_display}; exit 0\n"),
         }),
     )
     .await;
