@@ -100,6 +100,9 @@ pub enum ExitReason {
     ConnectionLost,
     /// An error occurred.
     Error(String),
+    /// A shutdown signal arrived. The terminal is already restored; the
+    /// caller re-raises it so the process dies the way it was told to.
+    Signal(i32),
 }
 
 // -- Key encoding ------------------------------------------------------------
@@ -283,6 +286,7 @@ pub async fn run_client(config: ClientConfig) -> Result<ExitReason, anyhow::Erro
         ExitReason::Error(msg) => {
             eprintln!("[error: {msg}]");
         }
+        ExitReason::Signal(_) => {}
     }
 
     let _ = (cols, rows); // suppress unused warnings until wired
@@ -562,6 +566,7 @@ mod tests {
             ExitReason::SessionEnded,
             ExitReason::ConnectionLost,
             ExitReason::Error("test".to_string()),
+            ExitReason::Signal(15),
         ];
         for reason in reasons {
             let _ = format!("{reason:?}");

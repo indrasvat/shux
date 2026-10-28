@@ -176,21 +176,44 @@ pub fn install_panic_hook() {
     }));
 }
 
-/// Set up signal handlers that trigger graceful shutdown.
-/// Returns a future that resolves when a shutdown signal is received.
-pub async fn shutdown_signal() {
-    use tokio::signal::unix::{SignalKind, signal};
+/// The signals that end a TUI client. Their default action would kill the
+/// process with the terminal still raw, so they are caught instead: the
+/// caller restores the terminal and then re-raises.
+///
+/// Install BEFORE [`TerminalGuard::enter`]. Handlers registered at the first
+/// poll of a future leave a window in which the default action still applies.
+/// Once installed, the default action is gone for the life of the process, so
+/// the caller must keep [`ShutdownSignals::recv`] in its select until exit.
+pub struct ShutdownSignals {
+    term: tokio::signal::unix::Signal,
+    int: tokio::signal::unix::Signal,
+    hup: tokio::signal::unix::Signal,
+    quit: tokio::signal::unix::Signal,
+}
 
-    let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
-    let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
+impl ShutdownSignals {
+    pub fn install() -> io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            term: signal(SignalKind::terminate())?,
+            int: signal(SignalKind::interrupt())?,
+            hup: signal(SignalKind::hangup())?,
+            quit: signal(SignalKind::quit())?,
+        })
+    }
 
-    tokio::select! {
-        _ = sigterm.recv() => {
-            tracing::info!("Received SIGTERM");
-        }
-        _ = sigint.recv() => {
-            tracing::info!("Received SIGINT");
-        }
+    /// Resolves with the raw number of the first shutdown signal received.
+    pub async fn recv(&mut self) -> i32 {
+        use tokio::signal::unix::SignalKind;
+        let kind = tokio::select! {
+            _ = self.term.recv() => SignalKind::terminate(),
+            _ = self.int.recv() => SignalKind::interrupt(),
+            _ = self.hup.recv() => SignalKind::hangup(),
+            _ = self.quit.recv() => SignalKind::quit(),
+        };
+        let signo = kind.as_raw_value();
+        tracing::info!(signo, "client: shutdown signal");
+        signo
     }
 }
 

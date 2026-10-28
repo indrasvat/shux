@@ -10,7 +10,8 @@
 //!     `Action` frames; on resize emit a `Resize` frame.
 //!
 //! The TUI is wrapped in `TerminalGuard` so raw mode + alt screen +
-//! mouse are restored on any exit (panic, error, detach, session end).
+//! mouse are restored on any exit (panic, error, signal, detach, session
+//! end).
 
 use std::path::Path;
 use std::time::Duration;
@@ -125,10 +126,14 @@ pub async fn run_attach(socket_path: &Path, config: ClientConfig) -> Result<Exit
     };
     tracing::info!(session = %session_name, %session_id, graphics, "attach: ready");
 
-    // From here on we MUST go through `guard.leave()` on any exit path (the
-    // panic hook covers panics).
+    // From here on we MUST go through `guard.leave()` on any exit path: the
+    // panic hook covers panics, `signals` covers kills.
+    let mut signals = terminal::ShutdownSignals::install().context("install signal handlers")?;
     let mut guard = TerminalGuard::enter().context("enter raw mode")?;
-    let result = run_loop(&mut framed, &config).await;
+    let result = tokio::select! {
+        r = run_loop(&mut framed, &config) => r,
+        signo = signals.recv() => Ok(ExitReason::Signal(signo)),
+    };
     guard.leave().ok();
     result
 }

@@ -722,9 +722,15 @@ async fn run_attach_loop(
     let cfg_changed = config.change_notify();
     let mut cfg_listener = Box::pin(cfg_changed.notified());
     let mut last_border_style = config.current().appearance.border_style.clone();
+    // A session destroyed from outside this client (`shux session kill`, an
+    // RPC) sends no frame here, so the liveness check below needs a clock of
+    // its own; otherwise it waits on the next keystroke or Pong.
+    let mut alive_tick = tokio::time::interval(Duration::from_millis(200));
+    alive_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     while !detached {
         tokio::select! {
             _ = cancel.cancelled() => break,
+            _ = alive_tick.tick() => {}
             () = &mut cfg_listener => {
                 cfg_listener = Box::pin(cfg_changed.notified());
                 let live = config.current().appearance.border_style.clone();
