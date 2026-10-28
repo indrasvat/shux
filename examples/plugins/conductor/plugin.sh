@@ -161,21 +161,25 @@ fire_rpc() {
     send_rpc "$method" "$params" "$(next_id)"
 }
 
-# Wait synchronously for a response with the given `id`. Any other
-# inbound frames (events, unrelated responses) are dispatched in
-# the meantime. Returns the response line on stdout. A 5s timeout
-# guards against the daemon hanging — on timeout, returns empty.
+# Wait synchronously for a response with the given `id`, leaving it in
+# AWAIT_RESULT. Any other inbound frames (events, unrelated responses)
+# are dispatched in the meantime -- so this must run in the main shell,
+# never inside $(): there an event's state changes and the RPCs it sends
+# would be lost into the substitution. A 5s timeout guards against the
+# daemon hanging.
+AWAIT_RESULT=""
 await_response() {
     local want="$1"
     local deadline_ms="$(($(epoch_ms) + 5000))"
     local line
+    AWAIT_RESULT=""
     while [ "$(epoch_ms)" -lt "$deadline_ms" ]; do
         if ! IFS= read -r -t 0.5 line; then
             continue
         fi
         case "$line" in
             *"\"id\":$want,"*|*"\"id\":$want}"*)
-                printf '%s' "$line"
+                AWAIT_RESULT="$line"
                 return 0
                 ;;
             *)
@@ -242,6 +246,8 @@ declare -A LAST_TITLE_SET   # pane_id -> last title we wrote (dedup)
 declare -A WINDOW_OF        # pane_id -> window_id (v0.3 — for window-level aggregation)
 declare -A SESSION_OF       # pane_id -> session_id (v0.3 — for notification context)
 declare -A WINDOW_INFLIGHT  # window_id -> count of agent panes whose state is NOT idle
+declare -A REPORTED         # pane_id -> 1 once its program reported status:
+                            # never auto-dismissed again, whatever happens
 declare -A WINDOW_NOTIFIED  # window_id -> 1 if we already fired the "all settled" notification
                             # for this batch (cleared when any pane in the window leaves idle)
 
@@ -308,6 +314,8 @@ handle_pane_exited() {
         unset 'LAST_HASH[$pane_id]'
         unset 'LAST_CHANGE_AT[$pane_id]'
         unset 'LAST_STATE[$pane_id]'
+        unset 'REPORTED[$pane_id]'
+        unset 'STATUS_DENIED_AT[$pane_id]'
         unset 'LAST_TITLE_SET[$pane_id]'
         unset 'WINDOW_OF[$pane_id]'
         unset 'SESSION_OF[$pane_id]'
@@ -335,9 +343,10 @@ capture_pane() {
     local id resp err_code
     id=$(next_id)
     send_rpc "pane.capture" "$params" "$id"
-    if ! resp=$(await_response "$id"); then
+    if ! await_response "$id"; then
         return 1
     fi
+    resp="$AWAIT_RESULT"
     err_code=$(printf '%s' "$resp" | jqr '.error.code // empty')
     if [ -n "$err_code" ]; then
         if [ "$err_code" = "-32004" ]; then
@@ -350,37 +359,39 @@ capture_pane() {
 
 # pane.status: sets LAST_STATUS_SEEN (true when the pane's program
 # reports, with the feature on) and LAST_STATUS_STATE (its summary
-# state, empty when nothing is active). Without the grant, conductor
-# scrapes and asks again every STATUS_RETRY_MS, so a later grant
-# takes effect without a restart.
+# state, empty when nothing is active). Returns 1 when no answer came
+# (denied, error, timeout). A denied pane is asked again after
+# STATUS_RETRY_MS, so a later grant takes effect without a restart;
+# grants can be per pane, so so is the wait.
 LAST_STATUS_SEEN=""
 LAST_STATUS_STATE=""
-STATUS_DENIED_AT=0
 STATUS_RETRY_MS=30000
+declare -A STATUS_DENIED_AT  # pane_id -> epoch ms of its last denial
 status_pane() {
     local pane_id="$1"
     LAST_STATUS_SEEN=""
     LAST_STATUS_STATE=""
-    if [ "$STATUS_DENIED_AT" -gt 0 ] \
-        && [ "$(($(epoch_ms) - STATUS_DENIED_AT))" -lt "$STATUS_RETRY_MS" ]; then
+    local denied="${STATUS_DENIED_AT[$pane_id]:-0}"
+    if [ "$denied" -gt 0 ] && [ "$(($(epoch_ms) - denied))" -lt "$STATUS_RETRY_MS" ]; then
         return 1
     fi
     local params id resp err_code
     params=$(jq -cn --arg p "$pane_id" '{pane_id: $p}')
     id=$(next_id)
     send_rpc "pane.status" "$params" "$id"
-    if ! resp=$(await_response "$id"); then
+    if ! await_response "$id"; then
         return 1
     fi
+    resp="$AWAIT_RESULT"
     err_code=$(printf '%s' "$resp" | jqr '.error.code // empty')
     if [ -n "$err_code" ]; then
         if [ "$err_code" = "-32004" ]; then
-            STATUS_DENIED_AT=$(epoch_ms)
+            STATUS_DENIED_AT[$pane_id]=$(epoch_ms)
             maybe_log_permission_hint
         fi
         return 1
     fi
-    STATUS_DENIED_AT=0
+    unset 'STATUS_DENIED_AT[$pane_id]'
     LAST_STATUS_SEEN=$(printf '%s' "$resp" | jqr '(.result.enabled and .result.seen) // false')
     LAST_STATUS_STATE=$(printf '%s' "$resp" | jqr '.result.summary.state // empty')
 }
@@ -450,10 +461,11 @@ snapshot_pane_settled() {
     params=$(jq -cn --arg p "$pane_id" '{pane_id: $p}')
     id=$(next_id)
     send_rpc "pane.snapshot" "$params" "$id"
-    if ! resp=$(await_response "$id"); then
+    if ! await_response "$id"; then
         echo "conductor: pane.snapshot timed out for $pane_id" >&2
         return 1
     fi
+    resp="$AWAIT_RESULT"
     err_code=$(printf '%s' "$resp" | jqr '.error.code // empty')
     if [ -n "$err_code" ]; then
         if [ "$err_code" = "-32004" ]; then maybe_log_permission_hint; fi
@@ -584,9 +596,22 @@ poll_tick() {
         agent="${TRACKED[$pane_id]}"
         state="${LAST_STATE[$pane_id]:-ready}"
         reported=0
-        if status_pane "$pane_id" && [ "$LAST_STATUS_SEEN" = "true" ]; then
-            reported=1
+        if status_pane "$pane_id"; then
+            if [ "$LAST_STATUS_SEEN" = "true" ]; then
+                reported=1
+                REPORTED[$pane_id]=1
+            fi
+        elif [ "${REPORTED[$pane_id]:-0}" = "1" ]; then
+            # No answer for a pane that reports: keep what it last said
+            # rather than guess from its screen.
+            continue
+        fi
+        if [ "$reported" = "1" ]; then
             new_state=$(state_for_status "$LAST_STATUS_STATE")
+            # The screen goes unread meanwhile: a fallback later starts a
+            # fresh settle interval rather than trusting this one.
+            LAST_HASH[$pane_id]=""
+            LAST_CHANGE_AT[$pane_id]=$now
         else
             capture_pane "$pane_id" || continue
             text="$LAST_CAPTURE_TEXT"
@@ -602,8 +627,9 @@ poll_tick() {
                 new_state="idle"
             fi
             # Auto-dismiss only what the screen alone suggests: a program
-            # that reports its own state is never answered for.
-            if [ "$new_state" = "stuck" ] && [ "$AUTO_DISMISS" = "1" ]; then
+            # that has ever reported its own state is never answered for.
+            if [ "$new_state" = "stuck" ] && [ "$AUTO_DISMISS" = "1" ] \
+                && [ "${REPORTED[$pane_id]:-0}" != "1" ]; then
                 send_enter "$pane_id"
             fi
         fi

@@ -86,7 +86,7 @@ echo "reporting agent, pane.status granted:"
 if wait_until 'grep -q "is waiting for you" "$LOG"' 20; then ok=0; else ok=1; fi
 check "a reported block notifies" "$ok"
 sleep 1.5
-if [ ! -s "${WORK}/claude.stdin" ]; then ok=0; else ok=1; fi
+if [ -e "${WORK}/claude.stdin" ] && [ ! -s "${WORK}/claude.stdin" ]; then ok=0; else ok=1; fi
 check "the trust-prompt text was not auto-dismissed" "$ok"
 if [ "$(title_of rep)" = claude ]; then ok=0; else ok=1; fi
 check "the reporting pane's title carries no conductor marker ($(title_of rep))" "$ok"
@@ -98,6 +98,8 @@ echo "reporting agent, pane.status revoked:"
 "$SHUX" session create rep2 -d -- "${WORK}/bin/claude" "${WORK}/claude2.stdin" >/dev/null
 if wait_until '[ -s "${WORK}/claude2.stdin" ]' 10; then ok=0; else ok=1; fi
 check "without the grant it falls back to scraping" "$ok"
+if [ -e "${WORK}/claude.stdin" ] && [ ! -s "${WORK}/claude.stdin" ]; then ok=0; else ok=1; fi
+check "a pane that once reported is still never auto-dismissed" "$ok"
 
 if [ "$fail" -ne 0 ]; then
   echo "--- conductor log ---"
