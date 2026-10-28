@@ -983,18 +983,14 @@ async fn start_test_server(
         auth_token: None,
     };
 
-    let server = shux_rpc::Server::new(config, router, cancel.clone());
-
+    // Bound before this returns, so every caller can connect at once.
+    let server = shux_rpc::Server::new(config, router, cancel.clone())
+        .bind()
+        .await
+        .expect("bind test server");
     tokio::spawn(async move {
-        let _ = server.run().await;
+        let _ = server.serve().await;
     });
-
-    for _ in 0..20 {
-        if UnixStream::connect(&socket_path).await.is_ok() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
 
     (socket_path, cancel)
 }
@@ -1172,7 +1168,9 @@ async fn test_m0_session_kill() {
     cancel.cancel();
 }
 
-#[tokio::test]
+// Paused clock: the sleep below elapses only once every task, the server's
+// connection task included, has handled the disconnect and gone idle.
+#[tokio::test(start_paused = true)]
 async fn test_m0_detach_reattach() {
     let dir = tempfile::tempdir().unwrap();
     let (socket_path, cancel) = start_test_server(dir.path()).await;
@@ -1191,6 +1189,10 @@ async fn test_m0_detach_reattach() {
         // stream dropped here
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "on a paused clock this is the fence for the disconnect being handled"
+    )]
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // "Reattach" — the session should still exist
@@ -1312,20 +1314,23 @@ async fn test_m0_pty_spawn_echo() {
     let mut output = Vec::new();
     let mut buf = [0u8; 4096];
 
-    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+    // To EOF, which a slow child reaches late but always reaches; a read
+    // error is reported, not taken for EOF.
+    let read = tokio::time::timeout(shux_testkit::BUDGET, async {
         loop {
             match handle.read(&mut buf).await {
-                Ok(0) => break,
+                Ok(0) => return Ok(()),
                 Ok(n) => output.extend_from_slice(&buf[..n]),
-                Err(_) => break,
+                Err(e) => return Err(e),
             }
         }
     })
     .await;
 
+    let text = String::from_utf8_lossy(&output);
     assert!(
-        String::from_utf8_lossy(&output).contains("SHUX_M0_PTY"),
-        "echo output should contain marker"
+        matches!(read, Ok(Ok(()))) && text.contains("SHUX_M0_PTY"),
+        "echo output should contain marker ({read:?}): {text:?}"
     );
 }
 
@@ -1814,7 +1819,6 @@ async fn test_013_session_list_sorted_by_creation() {
             serde_json::json!({"name": name}),
         )
         .await;
-        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
     let resp = rpc_raw(&socket_path, "session.list", serde_json::json!({})).await;

@@ -454,9 +454,11 @@ fn an_unbindable_socket_leaves_no_daemon_behind() {
         );
     }
 
-    // Let any daemon that got as far as daemonizing finish; counting too early
-    // would pass for the wrong reason.
-    std::thread::sleep(std::time::Duration::from_millis(2000));
+    // Every client has exited, and each daemon lineage it spawned shows in
+    // `/proc` from the spawn until its last process exits: the parent forks
+    // before it leaves, and so does the intermediate. So once the count is
+    // back, nothing more can appear; a leak keeps it up until the budget ends.
+    shux_testkit::poll_until(shux_testkit::BUDGET, || count() == before);
     let after = count();
     assert_eq!(
         after,

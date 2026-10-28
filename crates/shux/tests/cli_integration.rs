@@ -2,7 +2,6 @@
 //! and test the full CLI→UDS→RPC→SessionGraph→response pipeline.
 
 use std::path::PathBuf;
-use std::time::Duration;
 
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
@@ -307,19 +306,14 @@ async fn start_test_server(
         auth_token: None,
     };
 
-    let server = shux_rpc::Server::new(config, router, cancel.clone());
-
+    // Bound before this returns, so every caller can connect at once.
+    let server = shux_rpc::Server::new(config, router, cancel.clone())
+        .bind()
+        .await
+        .expect("bind test server");
     tokio::spawn(async move {
-        let _ = server.run().await;
+        let _ = server.serve().await;
     });
-
-    // Wait for server to be ready
-    for _ in 0..20 {
-        if UnixStream::connect(&socket_path).await.is_ok() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
 
     (socket_path, cancel)
 }

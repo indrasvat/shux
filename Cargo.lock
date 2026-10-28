@@ -1244,6 +1244,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shux-program-status",
+ "shux-testkit",
  "tempfile",
  "thiserror",
  "tokio",
@@ -1290,6 +1291,7 @@ version = "0.54.9"
 dependencies = [
  "nix",
  "serde",
+ "shux-testkit",
  "thiserror",
  "tokio",
  "tokio-util",
@@ -1322,6 +1324,7 @@ dependencies = [
  "nix",
  "serde",
  "serde_json",
+ "shux-testkit",
  "tempfile",
  "tokio",
  "tokio-util",

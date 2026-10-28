@@ -174,6 +174,10 @@ async fn stop_stale_daemon(socket: &Path) -> Result<(), ClientError> {
             if tokio::time::Instant::now() >= deadline {
                 return Err(ClientError::StaleDaemonAlive(pid));
             }
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "another process's exit has no event to wait on; poll its identity"
+            )]
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         return Ok(());
@@ -182,6 +186,10 @@ async fn stop_stale_daemon(socket: &Path) -> Result<(), ClientError> {
         if probe_socket(socket).await.is_err() {
             return Ok(());
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "poll interval while an unidentified server lets go of the socket"
+        )]
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     Err(ClientError::StaleDaemonUnidentified(socket.to_path_buf()))
@@ -286,6 +294,10 @@ async fn claim_socket(socket: &Path) -> Result<Option<UnixStream>, ClientError> 
         if tokio::time::Instant::now() >= deadline {
             return Err(ClientError::DaemonNotServing(holder(socket)));
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "poll interval while a departing daemon still owns the socket"
+        )]
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
@@ -305,6 +317,10 @@ async fn acquire_start_lock(socket: &Path) -> Result<std::fs::File, ClientError>
         if tokio::time::Instant::now() >= deadline {
             return Err(ClientError::StartLockTimeout(path));
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "polled, not blocking, so a wedged lock holder costs a bounded wait"
+        )]
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
@@ -361,6 +377,10 @@ async fn wait_for_daemon(
     let mut attempt = 0;
     loop {
         attempt += 1;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "connect backoff while the spawned daemon starts"
+        )]
         tokio::time::sleep(backoff).await;
 
         match probe_socket(socket_path).await {
@@ -486,18 +506,19 @@ mod tests {
     async fn a_daemon_slower_than_the_retries_is_still_waited_for() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("d.sock");
-        let path = socket.clone();
-        let server = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            let listener = tokio::net::UnixListener::bind(&path).unwrap();
-            listener.accept().await.unwrap();
-        });
-        let connected = wait_for_daemon(&socket, &QUICK, || true).await;
+        // `starting` is asked only once the retries are spent, so binding
+        // there orders the bind after them without racing a clock.
+        let mut daemon = None;
+        let connected = wait_for_daemon(&socket, &QUICK, || {
+            daemon.get_or_insert_with(|| std::os::unix::net::UnixListener::bind(&socket).unwrap());
+            true
+        })
+        .await;
+        assert!(daemon.is_some(), "the retries were never spent");
         assert!(
             connected.is_ok(),
             "gave up on a starting daemon: {connected:?}"
         );
-        server.await.unwrap();
     }
 
     /// Once nothing is starting, the retries are all the client waits.
@@ -505,10 +526,8 @@ mod tests {
     async fn a_daemon_that_is_not_starting_fails_after_the_retries() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("d.sock");
-        let started = tokio::time::Instant::now();
         let failed = wait_for_daemon(&socket, &QUICK, || false).await;
         assert!(matches!(failed, Err(ClientError::ConnectionFailed(3))));
-        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     /// A daemon that never binds is given up on at the deadline.
