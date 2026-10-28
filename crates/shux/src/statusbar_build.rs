@@ -283,6 +283,21 @@ pub fn append_waiting(
     }
 }
 
+/// Clear segments, innermost first, right zone before left, until a transient
+/// notice in the centre fits whole: it is shown for a moment and says
+/// something the user has to read, so it outranks both zones for that moment.
+pub fn make_room_for_notice(bar: &mut StatusBar, cols: u16) {
+    let width = StatusBar::segments_width;
+    // StatusBar::render_row keeps a one-column gap either side of the centre.
+    while width(&bar.left) + width(&bar.center) + width(&bar.right) + 2 > usize::from(cols) {
+        if !bar.right.is_empty() {
+            bar.right.remove(0);
+        } else if bar.left.pop().is_none() {
+            return;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     fn bar(left: &str, center: &str, right: &str) -> StatusBar {

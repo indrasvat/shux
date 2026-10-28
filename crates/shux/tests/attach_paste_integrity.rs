@@ -42,6 +42,7 @@ impl Harness {
     fn rpc(&self, method: &str, params: serde_json::Value) -> serde_json::Value {
         let out = Command::new(&self.bin)
             .env("XDG_RUNTIME_DIR", self.runtime_dir())
+            .env_remove("SHUX_SOCKET")
             .env("SHELL", "/bin/sh")
             .args([
                 "--format",
@@ -79,6 +80,16 @@ impl Drop for Harness {
             }
             panic!("daemon {pid} survived SIGTERM");
         }
+    }
+}
+
+/// Reaped on every exit path, a failed assert included.
+struct KillOnDrop(std::process::Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
 }
 
@@ -144,8 +155,9 @@ fn a_large_paste_through_a_real_attach_client_arrives_whole() {
     let pty = nix::pty::openpty(Some(&size), None).expect("openpty");
     let slave: OwnedFd = pty.slave;
     let dup = |fd: &OwnedFd| Stdio::from(fd.try_clone().expect("dup slave"));
-    let mut client = Command::new(&h.bin)
+    let client = Command::new(&h.bin)
         .env("XDG_RUNTIME_DIR", h.runtime_dir())
+        .env_remove("SHUX_SOCKET")
         .env("TERM", "xterm-256color")
         .env("COLORTERM", "truecolor")
         .args(["session", "attach", "paste"])
@@ -154,6 +166,7 @@ fn a_large_paste_through_a_real_attach_client_arrives_whole() {
         .stderr(dup(&slave))
         .spawn()
         .expect("spawn attach client");
+    let client = KillOnDrop(client);
     drop(slave);
 
     // Drain the client's screen for as long as it runs: a terminal nobody
@@ -237,8 +250,7 @@ fn a_large_paste_through_a_real_attach_client_arrives_whole() {
     let received = std::fs::read(&got).unwrap_or_default();
 
     stop.store(true, Ordering::Relaxed);
-    let _ = client.kill();
-    let _ = client.wait();
+    drop(client);
     let _ = drain.join();
 
     assert!(
