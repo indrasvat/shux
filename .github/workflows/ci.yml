@@ -374,4 +374,4 @@ jobs:
       - name: Print toolchain
         run: rustc +beta --version && cargo +beta clippy --version
       - name: Clippy (beta)
-        run: cargo +beta clippy --workspace --all-targets -- -D warnings
+        run: make clippy-beta

@@ -1231,8 +1231,8 @@ impl Grid {
     pub fn clear_above(&mut self, end_row: usize, bg: Color) {
         self.bump_mutations();
         let sb = self.scrollback_len();
-        for i in sb..=(sb + end_row) {
-            self.raw[i].reset(bg);
+        for row in self.raw.range_mut(sb..=sb + end_row) {
+            row.reset(bg);
         }
         self.dirty
             .mark_rows(0, end_row.saturating_add(1), self.rows, self.cols);
@@ -2011,6 +2011,29 @@ mod tests {
         assert_eq!(grid.visible_row(0)[0].ch, ' ');
         assert_eq!(grid.visible_row(1)[0].ch, ' ');
         assert_eq!(grid.visible_row(2)[0].ch, 'C');
+    }
+
+    #[test]
+    fn test_clear_above_leaves_scrollback_alone() {
+        let mut grid = Grid::new(3, 10, GridConfig::default());
+        for ch in ['X', 'Y'] {
+            grid.visible_row_mut(0)[0].ch = ch;
+            grid.scroll_up(0, 2);
+        }
+        assert_eq!(grid.scrollback_len(), 2);
+        grid.visible_row_mut(0)[0].ch = 'A';
+        grid.visible_row_mut(1)[0].ch = 'B';
+        grid.visible_row_mut(2)[0].ch = 'C';
+        let bg = Color::Rgb(1, 2, 3);
+        grid.clear_above(1, bg);
+        assert_eq!(grid.scrollback_row(0).unwrap()[0].ch, 'X');
+        assert_eq!(grid.scrollback_row(1).unwrap()[0].ch, 'Y');
+        for row in 0..2 {
+            assert_eq!(grid.visible_row(row)[0].ch, ' ');
+            assert_eq!(grid.visible_row(row)[0].style.bg, bg);
+        }
+        assert_eq!(grid.visible_row(2)[0].ch, 'C');
+        assert_ne!(grid.visible_row(2)[0].style.bg, bg);
     }
 
     #[test]

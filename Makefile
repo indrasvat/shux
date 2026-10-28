@@ -707,6 +707,12 @@ clippy: ## Run clippy linter
 	@cargo clippy --workspace --all-targets -- -D warnings
 	@echo "$(COLOR_GREEN)✓ Clippy passed$(COLOR_RESET)"
 
+.PHONY: clippy-beta
+clippy-beta: ## Run clippy on the beta toolchain, as CI's advisory job does (needs: rustup toolchain install beta -c clippy)
+	@echo "$(COLOR_BLUE)▶ Running clippy (+beta)...$(COLOR_RESET)"
+	@cargo +beta clippy --workspace --all-targets -- -D warnings
+	@echo "$(COLOR_GREEN)✓ Clippy (beta) passed$(COLOR_RESET)"
+
 .PHONY: fmt-check
 fmt-check: ## Check formatting (no changes)
 	@echo "$(COLOR_BLUE)▶ Checking formatting...$(COLOR_RESET)"
