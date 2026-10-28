@@ -1229,14 +1229,16 @@ fn spawn_reload_watcher(
 }
 
 /// [`spawn_reload_watcher`], resolved: the stop flag once watching, `None`
-/// if the watch could not be set up.
+/// if the watch could not be set up. Dropped before then, it stops the watcher.
 async fn arm_reload_watcher(
     mgr: PluginManager,
     name: String,
     source: PluginSource,
 ) -> Option<Arc<AtomicBool>> {
     let (cancel, ready) = spawn_reload_watcher(mgr, name, source);
-    ready.await.ok().map(|()| cancel)
+    let guard = WatchGuard(Some(cancel));
+    ready.await.ok()?;
+    guard.keep()
 }
 
 fn parse_manifest(line: &str) -> Result<PluginManifest, PluginError> {
@@ -1938,6 +1940,49 @@ mod tests {
             &created,
             tempfile::tempdir().unwrap().path()
         ));
+    }
+
+    /// An install dropped while its watcher is arming, as when the RPC
+    /// client disconnects, must not leave the watcher installing on a save.
+    #[tokio::test]
+    async fn a_watcher_dropped_while_arming_does_not_install_on_a_save() {
+        use std::future::Future;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("orphan.sh");
+        let body = r#"#!/usr/bin/env bash
+IFS= read -r _ || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":"init","result":{"name":"orphan","version":"0.1.0","subscribes":[],"provides":[],"capabilities":[]}}'
+while IFS= read -r line; do
+  case "$line" in *'"plugin.shutdown"'*) exit 0 ;; esac
+done
+"#;
+        std::fs::write(&script, body).unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let mgr = PluginManager::with_state_root(EventBus::new(), dir.path().join("state"));
+
+        let mut arming = Box::pin(arm_reload_watcher(
+            mgr.clone(),
+            "orphan".into(),
+            PluginSource::from_path(&script).with_watch(true),
+        ));
+        let polled =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(arming.as_mut().poll(cx))).await;
+        assert!(
+            polled.is_pending(),
+            "the watcher was ready on its first poll"
+        );
+        drop(arming);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        std::fs::write(&script, body).unwrap();
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        let listed = mgr.list().await;
+        mgr.shutdown().await;
+        assert!(
+            listed.is_empty(),
+            "a save installed a plugin whose install was dropped"
+        );
     }
 
     #[test]
