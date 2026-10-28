@@ -1,3 +1,10 @@
+## [0.54.1](https://github.com/indrasvat/shux/compare/v0.54.0...v0.54.1) (2026-10-28)
+
+
+### Bug Fixes
+
+* **ui:** status-bar zones never paint over one another when the bar is narrow ([#212](https://github.com/indrasvat/shux/issues/212)) ([39c8c26](https://github.com/indrasvat/shux/commit/39c8c26e9850c2c29b8a49260731911a9c3c72db)), closes [#202](https://github.com/indrasvat/shux/issues/202)
+
 # [0.54.0](https://github.com/indrasvat/shux/compare/v0.53.1...v0.54.0) (2026-10-28)
 
 
