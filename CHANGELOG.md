@@ -1,3 +1,15 @@
+# [0.53.0](https://github.com/indrasvat/shux/compare/v0.52.2...v0.53.0) (2026-10-28)
+
+
+### Bug Fixes
+
+* **vt:** clear beta clippy's needless_range_loop in Grid::clear_above ([#205](https://github.com/indrasvat/shux/issues/205)) ([503506a](https://github.com/indrasvat/shux/commit/503506aebbf4b47898e7d51a78d808e4dff46a56)), closes [#196](https://github.com/indrasvat/shux/issues/196)
+
+
+### Features
+
+* **ui:** program-status badges in pane borders and a "waiting" status-bar segment ([#207](https://github.com/indrasvat/shux/issues/207)) ([adb57e4](https://github.com/indrasvat/shux/commit/adb57e4782ef43d5254d19c56afe75fabfaae7d5))
+
 ## [0.52.2](https://github.com/indrasvat/shux/compare/v0.52.1...v0.52.2) (2026-10-28)
 
 
