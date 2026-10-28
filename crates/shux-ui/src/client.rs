@@ -136,6 +136,7 @@ pub fn encode_key_event(key: KeyEvent) -> Vec<u8> {
         KeyCode::Enter | KeyCode::Backspace | KeyCode::Tab | KeyCode::Esc => {
             let byte = match key.code {
                 KeyCode::Enter => b'\r',
+                KeyCode::Backspace if key.modifiers.contains(KeyModifiers::CONTROL) => 0x08,
                 KeyCode::Backspace => 0x7f,
                 KeyCode::Tab => b'\t',
                 _ => 0x1b,
@@ -146,6 +147,7 @@ pub fn encode_key_event(key: KeyEvent) -> Vec<u8> {
                 vec![byte]
             }
         }
+        KeyCode::BackTab if key.modifiers.contains(KeyModifiers::ALT) => b"\x1b\x1b[Z".to_vec(),
         KeyCode::BackTab => b"\x1b[Z".to_vec(),
         KeyCode::Up => csi_final(b'A', key.modifiers),
         KeyCode::Down => csi_final(b'B', key.modifiers),
@@ -161,15 +163,12 @@ pub fn encode_key_event(key: KeyEvent) -> Vec<u8> {
             let last = b"PQRS"[usize::from(n - 1)];
             match modifier_param(key.modifiers) {
                 None => vec![0x1b, b'O', last],
-                Some(m) => format!("\x1b[1;{m}{}", char::from(last)).into_bytes(),
+                Some(_) => csi_final(last, key.modifiers),
             }
         }
-        KeyCode::F(n) => match n {
-            5 => csi_tilde(15, key.modifiers),
-            6..=10 => csi_tilde(u16::from(n) + 11, key.modifiers),
-            11 | 12 => csi_tilde(u16::from(n) + 12, key.modifiers),
-            _ => Vec::new(),
-        },
+        KeyCode::F(5) => csi_tilde(15, key.modifiers),
+        KeyCode::F(n @ 6..=10) => csi_tilde(u16::from(n) + 11, key.modifiers),
+        KeyCode::F(n @ 11..=12) => csi_tilde(u16::from(n) + 12, key.modifiers),
         _ => Vec::new(),
     }
 }
@@ -350,8 +349,9 @@ mod tests {
             (KeyCode::PageUp, alt, b"\x1b[5;3~"),
             (KeyCode::F(1), shift, b"\x1b[1;2P"),
             (KeyCode::F(5), ctrl, b"\x1b[15;5~"),
-            (KeyCode::Left, KeyModifiers::NONE, b"\x1b[D"),
-            (KeyCode::F(1), KeyModifiers::NONE, b"\x1bOP"),
+            (KeyCode::Backspace, ctrl, b"\x08"),
+            (KeyCode::BackTab, alt | shift, b"\x1b\x1b[Z"),
+            (KeyCode::F(1), ctrl | alt, b"\x1b[1;7P"),
         ];
         for &(code, mods, want) in cases {
             assert_eq!(

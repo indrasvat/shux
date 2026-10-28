@@ -343,6 +343,40 @@ fn a_bracketed_paste_reaches_the_pane() {
     assert_eq!(received, b"hello world");
 }
 
+/// A pane program that asked for bracketed paste (mode 2004, as bash's
+/// readline and vim do) gets the paste between the markers: without them a
+/// pasted newline runs the line instead of landing in the edit buffer.
+#[test]
+fn a_paste_into_a_program_that_asked_for_brackets_keeps_them() {
+    let h = Harness::new();
+    let (got, done) = (h.work.path().join("got"), h.work.path().join("done"));
+    let want: &[u8] = b"\x1b[200~echo a\recho b\r\x1b[201~";
+    pane_session(
+        &h,
+        &format!(
+            "printf '\\033[?2004h'; head -c {n} > '{got}'; : > '{done}'; \
+             while :; do sleep 3600; done",
+            n = want.len(),
+            got = got.display(),
+            done = done.display(),
+        ),
+    );
+    let mut client = Client::attach(&h);
+    client.type_bytes(b"\x1b[200~echo a\recho b\r\x1b[201~");
+    let arrived = wait_for(&done, Duration::from_secs(10));
+    let received = std::fs::read(&got).unwrap_or_default();
+    drop(client);
+    assert!(
+        arrived,
+        "the pane's program got {:?} of a bracketed paste",
+        String::from_utf8_lossy(&received)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&received),
+        String::from_utf8_lossy(want)
+    );
+}
+
 /// An attach client with nothing to do must not spin: a multiplexer sits
 /// attached and idle for hours.
 #[cfg(target_os = "linux")]

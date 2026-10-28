@@ -134,6 +134,27 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often the daemon pings the client to detect dead peers.
 const PING_INTERVAL: Duration = Duration::from_secs(15);
 
+/// A paste as the pane's program asked to receive it: between the
+/// bracketed-paste markers when it turned mode 2004 on. An end marker inside
+/// the text is removed, so a paste cannot end itself early.
+fn as_pasted(text: Vec<u8>, bracketed: bool) -> Vec<u8> {
+    const START: &[u8] = b"\x1b[200~";
+    const END: &[u8] = b"\x1b[201~";
+    if !bracketed {
+        return text;
+    }
+    let mut out = Vec::with_capacity(text.len() + START.len() + END.len());
+    out.extend_from_slice(START);
+    let mut rest = &text[..];
+    while let Some(at) = rest.windows(END.len()).position(|w| w == END) {
+        out.extend_from_slice(&rest[..at]);
+        rest = &rest[at + END.len()..];
+    }
+    out.extend_from_slice(rest);
+    out.extend_from_slice(END);
+    out
+}
+
 fn byte_count(n: usize) -> String {
     match n {
         n if n < 1 << 10 => format!("{n} B"),
@@ -831,7 +852,12 @@ async fn run_attach_loop(
                     }
                 };
                 match parsed {
-                    AttachClientFrame::Input { data } => {
+                    frame @ (AttachClientFrame::Input { .. } | AttachClientFrame::Paste { .. }) => {
+                        let (data, paste) = match frame {
+                            AttachClientFrame::Paste { data } => (data, true),
+                            AttachClientFrame::Input { data } => (data, false),
+                            _ => continue,
+                        };
                         let bytes = match BASE64.decode(data.as_bytes()) {
                             Ok(b) => b,
                             Err(_) => continue,
@@ -978,9 +1004,18 @@ async fn run_attach_loop(
                         let target = render_session.lock().await.active_pane_id;
                         // Clone the writer Sender out of the map and drop the
                         // PaneIoState mutex BEFORE touching the channel.
-                        let writer = {
+                        let (writer, bracketed) = {
                             let state = io_state.lock().await;
-                            state.writers.get(&target).cloned()
+                            let bracketed = state
+                                .vts
+                                .get(&target)
+                                .is_some_and(|vt| vt.modes().bracketed_paste);
+                            (state.writers.get(&target).cloned(), bracketed)
+                        };
+                        let bytes = if paste {
+                            as_pasted(bytes, bracketed)
+                        } else {
+                            bytes
                         };
                         if let Some(tx) = writer {
                             let len = bytes.len();
@@ -7144,5 +7179,15 @@ mod tests {
         assert_eq!(byte_count(1024), "1.0 KiB");
         assert_eq!(byte_count((1 << 20) - 1), "1024.0 KiB");
         assert_eq!(byte_count(3 << 19), "1.5 MiB");
+    }
+
+    #[test]
+    fn a_paste_is_bracketed_only_when_asked_and_cannot_end_itself() {
+        assert_eq!(as_pasted(b"ls\r".to_vec(), false), b"ls\r");
+        assert_eq!(as_pasted(b"ls\r".to_vec(), true), b"\x1b[200~ls\r\x1b[201~");
+        assert_eq!(
+            as_pasted(b"a\x1b[201~rm -rf ~\r".to_vec(), true),
+            b"\x1b[200~arm -rf ~\r\x1b[201~"
+        );
     }
 }

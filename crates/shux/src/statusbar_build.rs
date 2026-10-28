@@ -291,7 +291,7 @@ pub fn make_room_for_notice(bar: &mut StatusBar, cols: u16) {
     // StatusBar::render_row keeps a one-column gap beside each zone that has
     // something in it.
     let gaps =
-        |bar: &StatusBar| usize::from(!bar.left.is_empty()) + usize::from(!bar.right.is_empty());
+        |bar: &StatusBar| usize::from(width(&bar.left) > 0) + usize::from(width(&bar.right) > 0);
     while width(&bar.left) + width(&bar.center) + width(&bar.right) + gaps(bar) > usize::from(cols)
     {
         if !bar.right.is_empty() {

@@ -157,9 +157,9 @@ pub async fn run_attach(socket_path: &Path, config: ClientConfig) -> Result<Exit
     }
 }
 
-/// Bytes of a bracketed paste per input frame: one key's frame overhead,
-/// amortised, and far under the frame size limit once base64-encoded.
-const PASTE_CHUNK: usize = 64 * 1024;
+/// Bytes of a paste per frame: well under the frame size limit once
+/// base64-encoded. Each frame reaches the pane as a paste of its own.
+const PASTE_CHUNK: usize = 4 * 1024 * 1024;
 
 async fn run_loop<S>(
     framed: &mut Framed<S, tokio_util::codec::LengthDelimitedCodec>,
@@ -347,11 +347,9 @@ where
                         let bytes = serde_json::to_vec(&frame)?;
                         sink.send(Bytes::from(bytes)).await.ok();
                     }
-                    // A terminal left in bracketed-paste mode wraps every paste;
-                    // the pane gets the text as if it had been typed.
                     Event::Paste(text) => {
                         for chunk in text.as_bytes().chunks(PASTE_CHUNK) {
-                            let frame = AttachClientFrame::Input {
+                            let frame = AttachClientFrame::Paste {
                                 data: BASE64.encode(chunk),
                             };
                             sink.send(Bytes::from(serde_json::to_vec(&frame)?)).await.ok();
