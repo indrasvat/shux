@@ -1,0 +1,15 @@
+{
+  "scope": "vt-ignored-seq-and-del",
+  "issue": "#126, #127",
+  "commit_under_audit": "23ffecf",
+  "base": "9037784",
+  "solid_qa_report": "SOLID-QA.md",
+  "dootsabha_design": "council-record.md",
+  "dootsabha_implementation": "council-record.md",
+  "screenshots": [],
+  "pixel_metrics": [
+    "pixel-scene-80x24.json",
+    "pixel-scene-120x40.json",
+    "pixel-scene-200x60.json"
+  ]
+}

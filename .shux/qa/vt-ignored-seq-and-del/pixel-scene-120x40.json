@@ -1,0 +1,16 @@
+{
+  "actual": ".shux/out/vt-ignored-seq-and-del/qa-head/scene-120x40-actual.png",
+  "changed_pixels": 0,
+  "diff": ".shux/out/vt-ignored-seq-and-del/qa-head/scene-120x40-diff.png",
+  "expected": ".shux/out/vt-ignored-seq-and-del/qa-head/scene-120x40-expected.png",
+  "max_mean_channel_delta": 0.0,
+  "max_pixel_diff_ratio": 0.0,
+  "mean_rgba_channel_delta": 0.0,
+  "pixel_diff_ratio": 0.0,
+  "size": [
+    1080,
+    760
+  ],
+  "status": "pass",
+  "total_pixels": 820800
+}

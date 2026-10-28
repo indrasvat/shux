@@ -16,7 +16,7 @@ members = [
 exclude = [".shux/fixtures/lens/t/demo-app"]
 
 [workspace.package]
-version = "0.54.4"
+version = "0.54.7"
 edition = "2024"
 rust-version = "1.93"
 license = "MIT"

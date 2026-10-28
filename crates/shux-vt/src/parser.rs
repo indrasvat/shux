@@ -583,10 +583,14 @@ impl<'a> VtHandler<'a> {
     }
 
     /// Write a character at the current cursor position, advancing the cursor.
+    ///
+    /// A scalar with no `unicode-width` width (DEL) is not a glyph: it leaves
+    /// no cell, no cursor movement and no REP source.
     fn write_char(&mut self, ch: char) {
-        let width = unicode_width::UnicodeWidthChar::width(ch)
-            .unwrap_or(1)
-            .min(2);
+        let Some(width) = unicode_width::UnicodeWidthChar::width(ch) else {
+            return;
+        };
+        let width = width.min(2);
         if width == 0 {
             self.append_zero_width_scalar(ch);
             return;
@@ -1232,6 +1236,13 @@ impl<'a> VtHandler<'a> {
 
 impl<'a> vte::Perform for VtHandler<'a> {
     fn print(&mut self, ch: char) {
+        // vte executes a UTF-8 C1 control decoded in one read but prints one
+        // whose bytes were split across reads. Both must land in `execute`, or
+        // what the screen shows depends on how the PTY chunked its output.
+        if let Ok(c1 @ 0x80..=0x9f) = u8::try_from(u32::from(ch)) {
+            self.execute(c1);
+            return;
+        }
         self.write_char(self.translate_printable(ch));
     }
 
@@ -1268,7 +1279,7 @@ impl<'a> vte::Perform for VtHandler<'a> {
         &mut self,
         params: &vte::Params,
         intermediates: &[u8],
-        _ignore: bool,
+        ignore: bool,
         action: char,
     ) {
         // A control sequence ends the grapheme cluster under construction: a
@@ -1283,6 +1294,15 @@ impl<'a> vte::Perform for VtHandler<'a> {
         let continues_the_cluster = intermediates.is_empty() && (action == 'm' || action == 'b');
         if !continues_the_cluster {
             self.clear_active_grapheme_cell();
+        }
+        // `vte` sets `ignore` when the sequence overflowed its parameter or
+        // intermediate storage; what it hands over is truncated, so the
+        // sequence is discarded rather than executed with what survived. The
+        // cluster decision above reads only the final byte and intermediates,
+        // so a discarded sequence affects the cluster as its valid form does.
+        if ignore {
+            trace!(action = %action, "overflowed CSI sequence discarded");
+            return;
         }
         let params_groups: Vec<Vec<u16>> =
             params.iter().map(|subparam| subparam.to_vec()).collect();
@@ -1715,8 +1735,12 @@ impl<'a> vte::Perform for VtHandler<'a> {
         }
     }
 
-    fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
+    fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
         self.clear_active_grapheme_cell();
+        if ignore {
+            trace!(byte, "overflowed ESC sequence discarded");
+            return;
+        }
         match (byte, intermediates) {
             // DECSC -- Save Cursor (ESC 7).
             (b'7', []) => self.save_cursor_state(),
@@ -1920,6 +1944,12 @@ impl<'a> vte::Perform for VtHandler<'a> {
                     if uri_bytes.is_empty() {
                         self.set_cursor_hyperlink(None);
                     } else if let Ok(uri) = String::from_utf8(uri_bytes) {
+                        // Attach replays the URI verbatim to the operator's
+                        // terminal, and no valid URI contains a control.
+                        if uri.chars().any(char::is_control) {
+                            trace!("OSC 8 hyperlink with a control character discarded");
+                            return;
+                        }
                         self.set_cursor_hyperlink(Some(uri));
                     }
                 }
@@ -1930,7 +1960,14 @@ impl<'a> vte::Perform for VtHandler<'a> {
         }
     }
 
-    fn hook(&mut self, _params: &vte::Params, intermediates: &[u8], _ignore: bool, action: char) {
+    fn hook(&mut self, _params: &vte::Params, intermediates: &[u8], ignore: bool, action: char) {
+        // With no DCS in progress, `put` drops the payload and `unhook` answers
+        // nothing.
+        if ignore {
+            trace!(action = %action, "overflowed DCS sequence discarded");
+            *self.dcs_state = None;
+            return;
+        }
         *self.dcs_state = Some(DcsState {
             intermediates: intermediates.to_vec(),
             action,
@@ -2528,6 +2565,13 @@ mod tests {
         }
 
         fn process(&mut self, bytes: &[u8]) {
+            self.with_handler(|handler, parser| parser.advance(handler, bytes));
+        }
+
+        /// Run `f` against a handler wired to this terminal's state, for tests
+        /// that call a `vte::Perform` method with arguments vte cannot be made
+        /// to produce from bytes.
+        fn with_handler<R>(&mut self, f: impl FnOnce(&mut VtHandler<'_>, &mut VtParser) -> R) -> R {
             let mut palette_overridden = false;
             let mut handler = VtHandler {
                 grid: Presented::new(&mut self.grid, &mut self.frozen_grid, &self.sync_armed),
@@ -2556,8 +2600,20 @@ mod tests {
                 reuse_retired_grids: true,
                 program_status: &mut None,
             };
-            self.parser.advance(&mut handler, bytes);
+            f(&mut handler, &mut self.parser)
         }
+    }
+
+    /// vte truncates an overflowed ESC to two intermediates, and every ESC shux
+    /// handles takes at most one, so bytes alone cannot show the guard working.
+    /// Calling the handler with a matching single intermediate can.
+    #[test]
+    fn esc_dispatch_flagged_ignore_is_discarded() {
+        let mut t = TestTerminal::new(3, 5);
+        t.with_handler(|h, _| vte::Perform::esc_dispatch(h, b"#", true, b'8'));
+        assert_eq!(t.grid.visible_row(0)[0].ch, ' ', "ignored DECALN filled");
+        t.with_handler(|h, _| vte::Perform::esc_dispatch(h, b"#", false, b'8'));
+        assert_eq!(t.grid.visible_row(0)[0].ch, 'E');
     }
 
     #[test]

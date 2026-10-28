@@ -341,7 +341,7 @@ async fn a_large_client_still_receives_frames_when_its_pane_holds_a_picture() {
     // screen.
     let h = Harness::new();
     let tmp = tempfile::tempdir().expect("payload dir");
-    h.rpc(
+    let created = h.rpc(
         "session.create",
         serde_json::json!({
             "name": "img-big",
@@ -351,7 +351,22 @@ async fn a_large_client_still_receives_frames_when_its_pane_holds_a_picture() {
     );
     // The pane has to have CONSUMED the payload before the attach: the frame
     // that overflows is the one carrying a full screen of cells plus a picture.
-    tokio::time::sleep(Duration::from_secs(4)).await;
+    // An attach made mid-payload streams every intermediate screen instead.
+    let pane = created["result"]["pane_id"]
+        .as_str()
+        .expect("session.create returns a pane_id")
+        .to_string();
+    let consumed_by = std::time::Instant::now() + Duration::from_secs(120);
+    while !h.rpc("pane.capture", serde_json::json!({ "pane_id": pane }))["result"]["text"]
+        .as_str()
+        .is_some_and(|t| t.contains("TRUECOLOR"))
+    {
+        assert!(
+            std::time::Instant::now() < consumed_by,
+            "the pane never drew the probe the payload ends with"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 
     let sock = h.runtime_dir().join("shux").join("attach.sock");
     let stream = UnixStream::connect(&sock).await.expect("connect attach");
