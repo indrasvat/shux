@@ -1,3 +1,10 @@
+## [0.54.7](https://github.com/indrasvat/shux/compare/v0.54.6...v0.54.7) (2026-10-28)
+
+
+### Bug Fixes
+
+* **vt:** discard overflowed control sequences and drop width-less scalars ([#222](https://github.com/indrasvat/shux/issues/222)) ([5d9ad72](https://github.com/indrasvat/shux/commit/5d9ad724390adaf0ca3e4e6784eb938236652e47))
+
 ## [0.54.6](https://github.com/indrasvat/shux/compare/v0.54.5...v0.54.6) (2026-10-28)
 
 
