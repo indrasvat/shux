@@ -114,6 +114,18 @@ impl Env {
         pane
     }
 
+    /// A shell line that blocks until `release(name)`, so a pane cannot move
+    /// past a screen before the test has seen it.
+    fn gate(&self, name: &str) -> String {
+        let go = self.root.path().join("work").join(format!("{name}.go"));
+        format!("while [ ! -e '{}' ]; do sleep 0.05; done", go.display())
+    }
+
+    fn release(&self, name: &str) {
+        let go = self.root.path().join("work").join(format!("{name}.go"));
+        std::fs::write(go, b"").expect("write gate file");
+    }
+
     fn wait_for(&self, session: &str, pane: &str, needle: &str) {
         // 60s, not 20s. This is a DEADLINE for reporting failure, not an
         // assertion — the screen content is checked immediately after, so a
@@ -205,14 +217,16 @@ fn assert_all_rows_are_pattern(rows: &[String], what: &str) {
 #[test]
 fn a_real_pane_emitting_decaln_shows_a_full_screen_of_e() {
     let mut env = Env::new();
+    let gate = env.gate("d117a");
     let pane = env.pane_running(
         "d117a",
-        &format!("printf '{COLOUR_PROBE}\\n'\nsleep 0.3\nprintf '\\033#8'"),
+        &format!("printf '{COLOUR_PROBE}\\n'\n{gate}\nprintf '\\033#8'"),
     );
 
     // The probe proves the pane really drew colour before the fill; the fill
     // then covers it, which is exactly what DECALN is supposed to do.
     env.wait_for("d117a", &pane, "TRUECOLOR");
+    env.release("d117a");
     env.wait_for("d117a", &pane, "EEEEEEEEEE");
 
     let rows = env.glance_rows(&pane);
@@ -309,12 +323,12 @@ fn decaln_on_the_alternate_screen_does_not_reach_the_primary_one() {
              sleep 0.3\n\
              printf '\\033[?1049h\\033#8'\n\
              sleep 0.4\n\
-             printf '\\033[?1049l'\n"
+             printf '\\033[?1049l'\n\
+             printf 'ROUND-TRIP-%s\\n' DONE\n"
         ),
     );
-    env.wait_for("d117d", &pane, "PRIMARY-CONTENT");
-    // Give the alternate-screen round trip time to complete before capturing.
-    thread::sleep(Duration::from_millis(1500));
+    // Printed only once the pane is back on the primary screen.
+    env.wait_for("d117d", &pane, "ROUND-TRIP-DONE");
 
     let captured = env.capture("d117d", &pane);
     assert!(
