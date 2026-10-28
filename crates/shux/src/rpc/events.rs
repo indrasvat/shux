@@ -70,6 +70,22 @@ impl EventScope {
     }
 }
 
+/// How long a long poll's next receive may block: until the deadline while it
+/// has nothing to return, not at all once it has something. `None` once the
+/// deadline has passed.
+fn next_wait(deadline: tokio::time::Instant, have_any: bool) -> Option<std::time::Duration> {
+    deadline
+        .checked_duration_since(tokio::time::Instant::now())
+        .filter(|d| !d.is_zero())
+        .map(|d| {
+            if have_any {
+                std::time::Duration::ZERO
+            } else {
+                d
+            }
+        })
+}
+
 /// The `filter` list both the policy and the handlers act on. One parser,
 /// so the tier is always decided on what the subscription will deliver.
 fn event_filters(params: Option<&serde_json::Value>) -> Vec<String> {
@@ -94,7 +110,7 @@ fn event_filters(params: Option<&serde_json::Value>) -> Vec<String> {
 ///      requirement).
 ///   2. Snapshots history from `from_seq` SECOND.
 ///   3. Drains the subscription with `timeout_ms` until either a matching
-///      event arrives or the deadline lapses.
+///      event arrives or the deadline lapses, then takes only what is queued.
 ///   4. Returns history + tail, deduped by `seq` (the overlap between the
 ///      two streams is real — an event published in step 2 might appear in
 ///      both the history snapshot and the subscription receiver buffer).
@@ -141,6 +157,9 @@ pub(crate) fn register_events_methods(
                     // 1. Subscribe FIRST so any publish during step 2 lands in the
                     //    receiver buffer, not the void.
                     let mut sub = bus.subscribe_filtered(filters.clone());
+                    // Every event from here on reaches `sub`, so this is where an
+                    // empty result resumes.
+                    let head = bus.current_seq();
 
                     // 2. Snapshot history from from_seq.
                     let (history, gap) = match from_seq {
@@ -163,20 +182,17 @@ pub(crate) fn register_events_methods(
                         history.into_iter().filter(|e| scope.admits(e)).collect();
                     let mut lagged = false;
 
-                    // 3. Tail: drain up to (max_events - history_len) events from
-                    //    the subscription with timeout. If from_seq was None and
-                    //    we have no history, block until at least one event or
-                    //    timeout. If we already have history, just opportunistically
-                    //    grab anything queued without blocking past the deadline.
+                    // 3. Tail: block until the first admitted event or the
+                    //    deadline. Once anything is collected, take only what is
+                    //    already queued and return; a caller that wants more
+                    //    calls again with `next_seq`.
                     let deadline =
                         tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
                     while collected.len() < max_events {
-                        let now = tokio::time::Instant::now();
-                        if now >= deadline {
+                        let Some(wait) = next_wait(deadline, !collected.is_empty()) else {
                             break;
-                        }
-                        let remaining = deadline - now;
-                        match tokio::time::timeout(remaining, sub.recv()).await {
+                        };
+                        match tokio::time::timeout(wait, sub.recv()).await {
                             Ok(Some(shux_core::bus::SubscriptionEvent::Event(e))) => {
                                 if scope.admits(&e) {
                                     collected.push(e)
@@ -189,7 +205,7 @@ pub(crate) fn register_events_methods(
                                 break;
                             }
                             Ok(None) => break, // bus shut down
-                            Err(_) => break,   // deadline reached
+                            Err(_) => break,   // deadline reached, or nothing queued
                         }
                     }
 
@@ -207,7 +223,7 @@ pub(crate) fn register_events_methods(
                         .last()
                         .map(|e| e.meta.seq + 1)
                         .or(from_seq)
-                        .unwrap_or_else(|| bus.current_seq());
+                        .unwrap_or(head);
 
                     let events: Vec<serde_json::Value> =
                         collected.iter().map(event_to_json).collect();
@@ -294,6 +310,7 @@ pub(crate) fn register_events_methods(
                     // subscribe-first invariant from events.watch
                     // applies even more strictly here.
                     let mut sub = bus.subscribe_pane_output();
+                    let head = bus.current_data_seq();
 
                     let mut collected: Vec<shux_core::bus::PaneOutputEvent> = Vec::new();
                     let mut lagged = false;
@@ -301,12 +318,10 @@ pub(crate) fn register_events_methods(
                         tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
 
                     while collected.len() < limit {
-                        let now = tokio::time::Instant::now();
-                        if now >= deadline {
+                        let Some(wait) = next_wait(deadline, !collected.is_empty()) else {
                             break;
-                        }
-                        let remaining = deadline - now;
-                        match tokio::time::timeout(remaining, sub.recv()).await {
+                        };
+                        match tokio::time::timeout(wait, sub.recv()).await {
                             Ok(Some(shux_core::bus::PaneOutputSubscriptionEvent::Chunk(c))) => {
                                 if c.pane_id != pane_id {
                                     continue; // not for this subscriber
@@ -331,7 +346,7 @@ pub(crate) fn register_events_methods(
                         .last()
                         .map(|c| c.seq + 1)
                         .or(from_seq)
-                        .unwrap_or_else(|| bus.current_data_seq());
+                        .unwrap_or(head);
 
                     let chunks: Vec<serde_json::Value> = collected
                         .into_iter()
@@ -564,6 +579,211 @@ mod tests {
         .await;
         assert_eq!(missing_pane.code, shux_rpc::ErrorCode::InvalidParams.code());
 
+        harness.stop().await;
+    }
+
+    fn plugin_tick(harness: &RpcHarness) -> u64 {
+        harness
+            .bus
+            .publish(shux_core::event::EventData::PluginEvent {
+                plugin_id: "t".to_string(),
+                event_type: "tick".to_string(),
+                data: serde_json::json!({}),
+            })
+    }
+
+    async fn timed_watch(
+        harness: &RpcHarness,
+        params: serde_json::Value,
+    ) -> (serde_json::Value, Duration) {
+        let started = std::time::Instant::now();
+        let result = dispatch_ok(&harness.router, "events.watch", params).await;
+        (result, started.elapsed())
+    }
+
+    /// History already in hand is returned at once, not after `timeout_ms`.
+    #[tokio::test]
+    async fn watch_with_history_returns_without_waiting_for_the_deadline() {
+        let harness = RpcHarness::new();
+        let first = plugin_tick(&harness);
+        plugin_tick(&harness);
+        plugin_tick(&harness);
+        let (watched, elapsed) = timed_watch(
+            &harness,
+            serde_json::json!({"from_seq": first, "filter": ["plugin.t."], "timeout_ms": 5_000}),
+        )
+        .await;
+        assert_eq!(watched["events"].as_array().unwrap().len(), 3, "{watched}");
+        assert_eq!(watched["next_seq"], first + 3);
+        assert!(
+            elapsed < Duration::from_millis(2_000),
+            "waited {elapsed:?} with 3 events of history already collected"
+        );
+        harness.stop().await;
+    }
+
+    /// With nothing to return the call still long-polls for the full timeout.
+    #[tokio::test]
+    async fn watch_without_history_waits_for_the_deadline() {
+        let harness = RpcHarness::new();
+        let next = plugin_tick(&harness) + 1;
+        let (watched, elapsed) = timed_watch(
+            &harness,
+            serde_json::json!({"from_seq": next, "filter": ["plugin.t."], "timeout_ms": 400}),
+        )
+        .await;
+        assert_eq!(watched["events"].as_array().unwrap().len(), 0, "{watched}");
+        assert_eq!(watched["next_seq"], next);
+        assert!(
+            elapsed >= Duration::from_millis(350),
+            "returned after {elapsed:?}, before the 400 ms deadline, with nothing to return"
+        );
+        harness.stop().await;
+    }
+
+    /// The first live event ends the long poll.
+    #[tokio::test]
+    async fn watch_returns_the_first_live_event_without_waiting_for_the_deadline() {
+        let harness = RpcHarness::new();
+        let router = harness.router.clone();
+        let watch = tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let result = router
+                .dispatch(
+                    "events.watch",
+                    Some(serde_json::json!({"filter": ["plugin.t."], "timeout_ms": 5_000})),
+                )
+                .await
+                .unwrap();
+            (result, started.elapsed())
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let seq = plugin_tick(&harness);
+        let (watched, elapsed) = watch.await.unwrap();
+        assert_eq!(watched["events"][0]["seq"], seq, "{watched}");
+        assert!(
+            elapsed < Duration::from_millis(2_000),
+            "held a live event for {elapsed:?} waiting for more"
+        );
+        harness.stop().await;
+    }
+
+    /// `pane.output.watch` hands back the first chunk it gets rather than
+    /// holding it for `limit` chunks or the deadline.
+    #[tokio::test]
+    async fn pane_output_watch_returns_the_first_chunk_without_waiting_for_the_deadline() {
+        let harness = RpcHarness::new();
+        let (session_id, window_id, pane_id) = harness.seed_session("chunks").await;
+        let router = harness.router.clone();
+        let pane = pane_id.to_string();
+        let watch = tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let result = router
+                .dispatch(
+                    "pane.output.watch",
+                    Some(serde_json::json!({"pane_id": pane, "timeout_ms": 5_000, "limit": 50})),
+                )
+                .await
+                .unwrap();
+            (result, started.elapsed())
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let seq = harness.bus.publish_pane_output(
+            pane_id,
+            window_id,
+            session_id,
+            "aGk=".to_string(),
+            false,
+        );
+        let (watched, elapsed) = watch.await.unwrap();
+        assert_eq!(watched["chunks"][0]["seq"], seq, "{watched}");
+        assert!(
+            elapsed < Duration::from_millis(2_000),
+            "held a chunk for {elapsed:?} waiting for more"
+        );
+        harness.stop().await;
+    }
+
+    /// Paging with `from_seq = next_seq` while three threads publish at once
+    /// delivers every event exactly once and never one below `from_seq`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn paging_under_concurrent_publishers_loses_and_duplicates_nothing() {
+        const PER: u64 = 2_500;
+        let harness = RpcHarness::new();
+        let start = harness.bus.current_seq();
+        let publishers: Vec<_> = (0..3)
+            .map(|t| {
+                let bus = harness.bus.clone();
+                std::thread::spawn(move || {
+                    for i in 0..PER {
+                        bus.publish(shux_core::event::EventData::PluginEvent {
+                            plugin_id: "t".to_string(),
+                            event_type: "tick".to_string(),
+                            data: serde_json::json!({ "t": t, "i": i }),
+                        });
+                    }
+                })
+            })
+            .collect();
+        // Other watchers snapshot history concurrently, as real pagers do.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let readers: Vec<_> = (0..2)
+            .map(|_| {
+                let (bus, stop) = (harness.bus.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        std::hint::black_box(bus.events_from_seq(start));
+                    }
+                })
+            })
+            .collect();
+        let (mut seq, mut seen, mut below, mut idle) = (start, Vec::new(), Vec::new(), 0);
+        loop {
+            let r = dispatch_ok(
+                &harness.router,
+                "events.watch",
+                serde_json::json!({"from_seq": seq, "filter": ["plugin.t."], "timeout_ms": 50}),
+            )
+            .await;
+            let events = r["events"].as_array().unwrap();
+            for e in events {
+                let s = e["seq"].as_u64().unwrap();
+                if s < seq {
+                    below.push((s, seq));
+                }
+                seen.push(s);
+            }
+            seq = r["next_seq"].as_u64().unwrap();
+            if !events.is_empty() {
+                idle = 0;
+            } else if publishers.iter().all(|p| p.is_finished()) {
+                idle += 1;
+                if idle >= 2 {
+                    break;
+                }
+            }
+        }
+        for p in publishers {
+            p.join().unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for r in readers {
+            r.join().unwrap();
+        }
+        let mut unique = seen.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        let missing: Vec<u64> = (start..start + 3 * PER)
+            .filter(|s| unique.binary_search(s).is_err())
+            .collect();
+        assert!(
+            missing.is_empty() && unique.len() == seen.len() && below.is_empty(),
+            "lost {} {:?}, duplicated {}, below from_seq {:?}",
+            missing.len(),
+            &missing[..missing.len().min(8)],
+            seen.len() - unique.len(),
+            &below[..below.len().min(8)],
+        );
         harness.stop().await;
     }
 }

@@ -225,7 +225,7 @@ pub async fn handle_apply(
             println!(
                 "\n{}",
                 style::muted(&format!(
-                    "Streaming events for the new session (resume from seq {} +1)…",
+                    "Streaming every event from seq {} +1 (all sessions)…",
                     last_seq
                 ))
             );

@@ -14,7 +14,8 @@ use super::rpc::*;
 ///      Codex+Gemini review — clients must know the stream dropped events).
 ///   5. If `gap > 0` on the first call (resumption from too-old `from_seq`),
 ///      prints `[GAP n]` to stderr.
-///   6. Stops when `--limit N` events have been printed, or on Ctrl+C.
+///   6. Stops when `--limit N` events have been printed, when the reader
+///      closes stdout, or on Ctrl+C.
 pub async fn handle_events_watch(
     stream: &mut tokio::net::UnixStream,
     filter: Vec<String>,
@@ -22,6 +23,7 @@ pub async fn handle_events_watch(
     timeout_ms: u64,
     limit: Option<u64>,
 ) -> anyhow::Result<()> {
+    let timeout_ms = timeout_ms.clamp(100, 30_000);
     let mut next_seq = from_seq;
     let mut printed: u64 = 0;
     let mut first_call = true;
@@ -74,7 +76,10 @@ pub async fn handle_events_watch(
 
         if let Some(events) = result.get("events").and_then(|v| v.as_array()) {
             for ev in events {
-                println!("{}", serde_json::to_string(ev)?);
+                let line = format!("{}\n", serde_json::to_string(ev)?);
+                if !style::print_stream(line.as_bytes())? {
+                    return Ok(());
+                }
                 printed += 1;
                 if let Some(n) = limit
                     && printed >= n
@@ -242,5 +247,24 @@ mod tests {
             .find(|r| r["method"] == "state.apply")
             .unwrap();
         assert_eq!(apply["params"]["ops"][0]["op"], "create_session");
+    }
+
+    /// `--timeout-ms` is clamped to 100..=30000, as its help says.
+    #[tokio::test]
+    async fn events_watch_clamps_its_long_poll_timeout() {
+        for (asked, sent) in [(0, 100), (99, 100), (5_000, 5_000), (60_000, 30_000)] {
+            let event = serde_json::json!({"seq": 1, "type": "session.created", "data": {}});
+            let (mut client, requests, task) = spawn_rpc_script(vec![
+                serde_json::json!({"events": [event], "next_seq": 2, "gap": 0, "lagged": false}),
+            ]);
+            handle_events_watch(&mut client, vec![], Some(1), asked, Some(1))
+                .await
+                .unwrap();
+            let requests = finish_rpc_script(client, task, requests).await;
+            assert_eq!(
+                requests[0]["params"]["timeout_ms"], sent,
+                "--timeout-ms {asked}"
+            );
+        }
     }
 }

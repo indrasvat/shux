@@ -29,6 +29,7 @@
 use std::time::Duration;
 
 mod lens_common;
+mod typed_marker;
 use lens_common::*;
 
 /// A session created for one test, with every id it exposes.
@@ -70,6 +71,11 @@ const PROBE: &str = concat!(
     "\\033[31mBASIC\\033[0m\\n'; ",
     "sleep 300"
 );
+
+/// Pane B's line, typed into its shell. The PTY echoes it before the shell
+/// runs it, so it must not contain `BRAVO` or the fixture's wait for pane B's
+/// output returns on the echo.
+const PANE_B_LINE: &str = "printf '%s%s\\n' BRA VO\n";
 
 /// Wait for a pane to stop writing, so two captures of it can be compared.
 ///
@@ -140,7 +146,7 @@ fn fixture(h: &Harness, tag: &str) -> Fixed {
         .to_string();
     h.rpc_ok(
         "pane.send_keys",
-        serde_json::json!({ "pane_id": pane_b, "text": "printf 'BRAVO\\n'\n" }),
+        serde_json::json!({ "pane_id": pane_b, "text": PANE_B_LINE }),
     );
     h.wait_for(&pane_b, "BRAVO", 60_000)
         .expect("pane B never printed its marker");
@@ -1098,4 +1104,9 @@ fn session_attach_resolves_an_id_instead_of_creating_a_session_named_after_it() 
     // the resolver directly.
 
     h.kill_session(&f.session_id);
+}
+
+#[test]
+fn pane_b_marker_cannot_be_satisfied_by_the_echoed_line() {
+    typed_marker::assert_echo_cannot_satisfy(PANE_B_LINE, "", &["BRAVO"]);
 }

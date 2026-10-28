@@ -9,7 +9,7 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
 
 use tokio::sync::broadcast;
@@ -100,9 +100,10 @@ struct EventBusInner {
     /// chunks (PR 2c). Deliberately NOT mirrored to history — see
     /// `PR2c-DESIGN.md` for the secret-leak / DoS rationale.
     data_plane: broadcast::Sender<PaneOutputEvent>,
-    /// Monotonically increasing data-plane sequence counter. Separate
-    /// from control plane so subscribers gap-detect each independently.
-    data_seq_counter: AtomicU64,
+    /// Next data-plane seq, separate from the control plane so subscribers
+    /// gap-detect each independently. Held across the send so chunks reach
+    /// subscribers in seq order.
+    data_seq: Mutex<u64>,
 
     /// Configuration (kept for introspection).
     #[allow(dead_code)]
@@ -203,7 +204,7 @@ impl EventBus {
                 seq_counter: AtomicU64::new(1), // Start at 1 so 0 means "no events seen".
                 history: RwLock::new(EventHistory::new(config.history_capacity)),
                 data_plane,
-                data_seq_counter: AtomicU64::new(1),
+                data_seq: Mutex::new(1),
                 config,
             }),
         }
@@ -223,11 +224,15 @@ impl EventBus {
     /// transaction (e.g. a `state.apply` call). Subscribers can group events
     /// by correlation_id to attribute a burst to a specific apply.
     pub fn publish_with_correlation(&self, data: EventData, correlation_id: Option<String>) -> u64 {
-        let seq = self.inner.seq_counter.fetch_add(1, Ordering::Relaxed);
         // Use the full (namespaced) form so PluginEvent variants land
         // under `plugin.<id>.<type>` and can be filtered per-plugin.
         let event_type = data.full_event_type();
 
+        // Seq assignment, the history push and the broadcast happen under one
+        // lock, so every reader sees seqs in order: whoever has seen seq N can
+        // already see every lower one.
+        let mut history = self.inner.history.write().expect("history lock poisoned");
+        let seq = self.inner.seq_counter.fetch_add(1, Ordering::Relaxed);
         let event = Event {
             meta: EventMetadata {
                 seq,
@@ -238,22 +243,11 @@ impl EventBus {
             data,
         };
 
-        // Record in history.
-        {
-            let mut history = self.inner.history.write().expect("history lock poisoned");
-            history.push(event.clone());
-        }
-
-        // Broadcast to subscribers. If no receivers, that's fine.
-        match self.inner.sender.send(event) {
-            Ok(n) => {
-                debug!(seq, receivers = n, "event published");
-            }
-            Err(_) => {
-                // No active receivers. Event is still in history.
-                debug!(seq, "event published (no receivers)");
-            }
-        }
+        history.push(event.clone());
+        let sent = self.inner.sender.send(event);
+        drop(history);
+        // No receivers is fine: the event is still in history.
+        debug!(seq, receivers = sent.unwrap_or(0), "event published");
 
         seq
     }
@@ -304,7 +298,11 @@ impl EventBus {
     }
 
     /// Get the current sequence number (the next event will get this value).
+    ///
+    /// Read under the history lock, so every lower seq is already in history
+    /// and broadcast.
     pub fn current_seq(&self) -> u64 {
+        let _history = self.inner.history.read().expect("history lock poisoned");
         self.inner.seq_counter.load(Ordering::Relaxed)
     }
 
@@ -322,7 +320,9 @@ impl EventBus {
         bytes_b64: String,
         sampled: bool,
     ) -> u64 {
-        let seq = self.inner.data_seq_counter.fetch_add(1, Ordering::Relaxed);
+        let mut next = self.inner.data_seq.lock().expect("data seq lock poisoned");
+        let seq = *next;
+        *next += 1;
         let event = PaneOutputEvent {
             seq,
             pane_id,
@@ -349,7 +349,7 @@ impl EventBus {
 
     /// Current data-plane sequence number.
     pub fn current_data_seq(&self) -> u64 {
-        self.inner.data_seq_counter.load(Ordering::Relaxed)
+        *self.inner.data_seq.lock().expect("data seq lock poisoned")
     }
 
     /// Get the number of active subscribers.
@@ -367,7 +367,10 @@ impl Default for EventBus {
 impl fmt::Debug for EventBus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EventBus")
-            .field("current_seq", &self.current_seq())
+            .field(
+                "current_seq",
+                &self.inner.seq_counter.load(Ordering::Relaxed),
+            )
             .field("subscriber_count", &self.subscriber_count())
             .finish()
     }
@@ -1091,5 +1094,98 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    /// Seqs reach history and subscribers in order however many threads
+    /// publish at once. A reader that has seen seq N relies on every lower seq
+    /// already being visible; `events.watch` paging loses events otherwise.
+    #[test]
+    fn concurrent_publishers_deliver_seqs_in_order() {
+        const THREADS: usize = 4;
+        const PER: usize = 5_000;
+        let bus = EventBus::with_config(EventBusConfig {
+            broadcast_capacity: THREADS * PER,
+            history_capacity: THREADS * PER,
+            ..EventBusConfig::default()
+        });
+        let mut sub = bus.subscribe();
+        let publishers: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let bus = bus.clone();
+                std::thread::spawn(move || {
+                    for i in 0..PER {
+                        bus.publish(session_created(&format!("{t}-{i}")));
+                    }
+                })
+            })
+            .collect();
+        for p in publishers {
+            p.join().unwrap();
+        }
+        let history: Vec<u64> = bus
+            .history(THREADS * PER)
+            .iter()
+            .map(|e| e.meta.seq)
+            .collect();
+        let inversions = history.windows(2).filter(|w| w[0] >= w[1]).count();
+        assert_eq!(inversions, 0, "history out of seq order");
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let received: Vec<u64> = rt.block_on(async {
+            let mut out = Vec::with_capacity(THREADS * PER);
+            while out.len() < THREADS * PER {
+                match sub.recv().await {
+                    Some(SubscriptionEvent::Event(e)) => out.push(e.meta.seq),
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+            out
+        });
+        let inversions = received.windows(2).filter(|w| w[0] >= w[1]).count();
+        assert_eq!(inversions, 0, "subscriber saw seqs out of order");
+    }
+
+    /// The data plane has no history, so a chunk that reaches subscribers
+    /// after a higher seq is dropped by any reader resuming past it.
+    #[test]
+    fn concurrent_pane_output_publishers_deliver_seqs_in_order() {
+        const THREADS: usize = 4;
+        const PER: usize = 5_000;
+        let bus = EventBus::with_config(EventBusConfig {
+            data_plane_capacity: THREADS * PER,
+            ..EventBusConfig::default()
+        });
+        let mut sub = bus.subscribe_pane_output();
+        let publishers: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let bus = bus.clone();
+                std::thread::spawn(move || {
+                    let (p, w, s) = (PaneId::new(), WindowId::new(), SessionId::new());
+                    for _ in 0..PER {
+                        bus.publish_pane_output(p, w, s, String::new(), false);
+                    }
+                })
+            })
+            .collect();
+        for p in publishers {
+            p.join().unwrap();
+        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let received: Vec<u64> = rt.block_on(async {
+            let mut out = Vec::with_capacity(THREADS * PER);
+            while out.len() < THREADS * PER {
+                match sub.recv().await {
+                    Some(PaneOutputSubscriptionEvent::Chunk(c)) => out.push(c.seq),
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+            out
+        });
+        let inversions = received.windows(2).filter(|w| w[0] >= w[1]).count();
+        assert_eq!(inversions, 0, "subscriber saw data-plane seqs out of order");
     }
 }

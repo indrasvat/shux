@@ -185,8 +185,8 @@ pub enum StateCommand {
         #[arg(long)]
         dry_run: bool,
 
-        /// After a successful apply, open `events watch` filtered to
-        /// the new session and stream lifecycle events until Ctrl+C.
+        /// After a successful apply, stream every event that follows it
+        /// (all sessions, unfiltered) until Ctrl+C.
         #[arg(long)]
         watch: bool,
     },
@@ -2523,5 +2523,21 @@ mod tests {
             }
             _ => panic!("expected Pane Record command"),
         }
+    }
+
+    /// `state apply --watch` streams every event; its help must not promise a
+    /// per-session filter it does not apply.
+    #[test]
+    fn state_apply_watch_help_does_not_promise_a_session_filter() {
+        use clap::CommandFactory;
+        let mut cmd = Cli::command();
+        let help = cmd
+            .find_subcommand_mut("state")
+            .and_then(|c| c.find_subcommand_mut("apply"))
+            .expect("state apply")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("unfiltered"), "{help}");
+        assert!(!help.contains("filtered to"), "{help}");
     }
 }

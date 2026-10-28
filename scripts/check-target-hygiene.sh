@@ -76,8 +76,11 @@ def load_toml(path):
 def workspace_roots():
     roots = []
     for dirpath, dirnames, filenames in os.walk(root, onerror=on_walk_error):
+        # A nested `.git` is another checkout (an agent's worktree): its own
+        # commit, its own build dirs, its own guard.
         dirnames[:] = sorted(d for d in dirnames
-                             if d not in SKIP_DIRS and os.path.join(dirpath, d) != SCRATCH)
+                             if d not in SKIP_DIRS and os.path.join(dirpath, d) != SCRATCH
+                             and not os.path.lexists(os.path.join(dirpath, d, ".git")))
         if "Cargo.toml" in filenames:
             path = os.path.join(dirpath, "Cargo.toml")
             manifest = load_toml(path)
