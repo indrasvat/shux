@@ -1,3 +1,10 @@
+## [0.54.5](https://github.com/indrasvat/shux/compare/v0.54.4...v0.54.5) (2026-10-28)
+
+
+### Bug Fixes
+
+* **attach:** restore the terminal when the client is killed or its session is ([#219](https://github.com/indrasvat/shux/issues/219)) ([dfa65f1](https://github.com/indrasvat/shux/commit/dfa65f168b1c8f4f9d6cc195a93c9c828427f9ee)), closes [#186](https://github.com/indrasvat/shux/issues/186)
+
 ## [0.54.4](https://github.com/indrasvat/shux/compare/v0.54.3...v0.54.4) (2026-10-28)
 
 
