@@ -105,6 +105,9 @@ impl TerminalGuard {
         let _ = execute!(io::stdout(), cursor::SetCursorStyle::DefaultUserShape);
         let _ = execute!(io::stdout(), ResetCursorColor);
         let _ = execute!(io::stdout(), cursor::Show);
+        // macOS discards a terminal's unread output when its session leader
+        // exits, so the restore must be taken before this process can go.
+        let _ = nix::sys::termios::tcdrain(io::stdout());
 
         Ok(())
     }
