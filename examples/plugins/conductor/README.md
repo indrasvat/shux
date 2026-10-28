@@ -1,4 +1,4 @@
-# shux-conductor v0.3
+# shux-conductor v0.4
 
 Coding-agent watchdog for shux. One bash plugin (~440 lines) that
 turns shux into a live agent dashboard:
@@ -18,6 +18,14 @@ turns shux into a live agent dashboard:
    notification` (macOS) or `notify-send` (Linux) the moment a
    window's last in-flight agent pane goes idle. Re-arms on the
    next state change.
+4. **Program status first** (v0.4) — an agent that reports its own
+   state over OSC 7501 (Claude Code does) is read through
+   `pane.status` and never scraped. Its reported state drives
+   conductor, shux draws its border badge, and a reported `blocked`
+   sends a "waiting for you" notification. It is **never
+   auto-dismissed**, whatever its screen shows: auto-dismiss only
+   answers prompts that the screen alone suggests, on panes whose
+   program does not report.
 
 Currently recognises four agent commands by basename: `claude`,
 `codex`, `opencode`, `gemini`. For each pane spawned with one of
@@ -35,7 +43,8 @@ Markers are picked from JetBrains Mono Regular's geometric-shapes
 block so they render cleanly in `pane.snapshot` PNGs.
 
 The pane's border title is set to `<agent> · <marker>` and updated
-only when the state changes.
+only when the state changes. For a pane whose program reports its
+status, the title is just `<agent>`: shux's own badge shows the state.
 
 ## Install
 
@@ -44,6 +53,7 @@ shux plugin install ./examples/plugins/conductor/plugin.sh
 
 # v0.20+ default-deny permission model — conductor doesn't own
 # the user's agent panes, so each method needs an explicit grant.
+shux plugin grant conductor pane.status      # v0.4: reported state
 shux plugin grant conductor pane.capture     # poll the visible text
 shux plugin grant conductor pane.set_title   # update the border
 shux plugin grant conductor pane.send_keys   # auto-dismiss stuck prompts
@@ -118,14 +128,14 @@ Reproducer scripts: `.shux/scripts/conductor_v0.1_shoot.sh`,
 `.shux/scripts/conductor_v0.2_shoot.sh`,
 `.shux/scripts/conductor_v0.3_shoot.sh`.
 
-## Out of scope for v0.1–v0.3
+## Out of scope for v0.1–v0.4
 
-- **Worktree-per-pane** (v0.4) — needs design work on "cd a running
+- **Worktree-per-pane** (v0.5) — needs design work on "cd a running
   pane". A subprocess that's already exec'd into the agent can't
   have its CWD changed externally; needs either an interception
   hook in the spawn path or a CLI helper that wraps the spawn. Not
   a plain plugin concern.
-- **ACP fast-path** (v0.5+) — replaces the regex polling with
+- **ACP fast-path** (v0.6+) — replaces the regex polling with
   structured agent events for opencode / gemini (native ACP
   support) and claude / codex (npm adapter shims). Different
   architecture: spawn agent's ACP server as a child of conductor,

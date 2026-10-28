@@ -282,6 +282,8 @@ Need a snapshot of the session's
 active window?                     → session.snapshot (shux session snapshot)
 Need plain text of the screen?     → pane.capture    (shux pane capture)
 Need to block until text appears?  → pane.wait_for   (shux pane wait-for --text|--regex)
+Need to know when an agent in a
+pane is blocked on you or done?    → pane.wait_status (shux pane wait-status <PANE> --state blocked,done)
 Need live sampled PTY output?      → pane.output.watch (sealed data-plane, sampled)
 Need a byte-exact transcript?      → shux pane record --to FILE (lossless recorder)
 Need repeatable TUI QA evidence?   → Sightline verifier; read references/sightline.md
