@@ -9,23 +9,29 @@ fn test_cwd() -> PathBuf {
     std::env::temp_dir()
 }
 
+/// Read the PTY to EOF. A read error or a stuck read fails the test with what
+/// was read so far, rather than handing a truncated capture to the caller.
 async fn read_pty_to_exit(handle: &mut PtyHandle) -> String {
     let mut output = Vec::new();
     let mut buf = [0u8; 4096];
 
-    let result = tokio::time::timeout(Duration::from_secs(5), async {
+    let result = tokio::time::timeout(shux_testkit::BUDGET, async {
         loop {
             match handle.read(&mut buf).await {
-                Ok(0) => break,
+                Ok(0) => return Ok(()),
                 Ok(n) => output.extend_from_slice(&buf[..n]),
-                Err(_) => break,
+                Err(e) => return Err(e),
             }
         }
     })
     .await;
 
-    assert!(result.is_ok(), "Read timed out");
-    String::from_utf8_lossy(&output).into_owned()
+    let text = String::from_utf8_lossy(&output).into_owned();
+    match result {
+        Ok(Ok(())) => text,
+        Ok(Err(e)) => panic!("PTY read failed before EOF ({e}); read so far: {text:?}"),
+        Err(_) => panic!("PTY never reached EOF; read so far: {text:?}"),
+    }
 }
 
 #[tokio::test]
@@ -33,23 +39,7 @@ async fn test_spawn_echo() {
     let config = PtyConfig::with_command(vec!["echo".into(), "hello shux".into()], test_cwd());
 
     let mut handle = PtyHandle::spawn(&config).unwrap();
-    let mut output = Vec::new();
-    let mut buf = [0u8; 4096];
-
-    let result = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match handle.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => output.extend_from_slice(&buf[..n]),
-                Err(_) => break,
-            }
-        }
-    })
-    .await;
-
-    assert!(result.is_ok(), "Read timed out");
-
-    let output_str = String::from_utf8_lossy(&output);
+    let output_str = read_pty_to_exit(&mut handle).await;
     assert!(
         output_str.contains("hello shux"),
         "Expected 'hello shux' in output, got: {output_str}"
@@ -87,7 +77,7 @@ async fn test_colored_startup_burst_reads_without_timeout_stall() {
     let mut handle = PtyHandle::spawn(&config).unwrap();
     let mut buf = [0u8; 8192];
 
-    let result = tokio::time::timeout(Duration::from_millis(500), async {
+    let result = tokio::time::timeout(shux_testkit::BUDGET, async {
         let mut output = Vec::new();
         while output.len() < 1024 {
             let n = handle.read(&mut buf).await.unwrap();
@@ -157,34 +147,7 @@ async fn test_write_and_read() {
     handle.write(b"hello from test\n").await.unwrap();
     handle.flush().await.unwrap();
 
-    let mut buf = [0u8; 4096];
-    let mut output = Vec::new();
-
-    let result = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match handle.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    output.extend_from_slice(&buf[..n]);
-                    let s = String::from_utf8_lossy(&output);
-                    if s.contains("hello from test") {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    })
-    .await;
-
-    assert!(result.is_ok(), "Read timed out");
-
-    let output_str = String::from_utf8_lossy(&output);
-    assert!(
-        output_str.contains("hello from test"),
-        "Expected echoed input, got: {output_str}"
-    );
-
+    read_pty_until(&mut handle, "hello from test").await;
     handle.kill().ok();
 }
 
@@ -225,20 +188,9 @@ async fn test_pty_event_output() {
     let (event_tx, mut event_rx) = mpsc::channel(32);
     let shutdown = tokio_util::sync::CancellationToken::new();
 
-    // Use bash -c with a small sleep after the echo. With a bare `echo`,
-    // the child exits in ~1ms — fast enough on Linux/CI runners that the
-    // master-side read can race with EOF and miss the output entirely.
-    // The sleep keeps the slave open long enough for the kernel to flush
-    // the writes through to the master before the child reaps. Same
-    // pattern is used by tmux / iTerm2 PTY tests for the same reason.
-    let config = PtyConfig::with_command(
-        vec![
-            "bash".into(),
-            "-c".into(),
-            "echo event test; sleep 0.1".into(),
-        ],
-        test_cwd(),
-    );
+    // A bare `echo` that exits at once: the handle keeps the slave open
+    // until the output is drained, so the child need not linger for it.
+    let config = PtyConfig::with_command(vec!["echo".into(), "event test".into()], test_cwd());
     let handle = PtyHandle::spawn(&config).unwrap();
 
     let shutdown_clone = shutdown.clone();
@@ -249,7 +201,7 @@ async fn test_pty_event_output() {
     let mut got_output = false;
     let mut got_exit = false;
 
-    let result = tokio::time::timeout(Duration::from_secs(5), async {
+    let result = tokio::time::timeout(shux_testkit::BUDGET, async {
         while let Some(event) = event_rx.recv().await {
             match event {
                 PtyEvent::Output { pane_id: pid, data } => {
@@ -289,7 +241,7 @@ async fn test_pty_event_output() {
 /// to the OS while the group is still running.
 ///
 /// A zombie answers `kill(pid, 0)`; a reaped pid does not.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn the_read_loop_leaves_the_child_reapable_for_teardown() {
     use nix::sys::signal::{Signal, killpg};
     use nix::unistd::Pid;
@@ -303,10 +255,13 @@ async fn the_read_loop_leaves_the_child_reapable_for_teardown() {
     let mut handle = PtyHandle::spawn(&config).unwrap();
     let pid = Pid::from_raw(handle.pid() as i32);
 
-    // Long enough for several exit polls; the read cannot return, because the
-    // descendant is holding the tty open and writing nothing.
+    // The exit polls only mean something once there is an exit to see.
+    shux_testkit::wait_until("the pane's leader to exit", || is_zombie(handle.pid()));
+    // The clock is paused, so this second is fifty exit polls, each run
+    // against the zombie. The read cannot return: the descendant holds the
+    // tty open and writes nothing.
     let mut buf = [0u8; 1024];
-    let _ = tokio::time::timeout(Duration::from_millis(400), handle.read(&mut buf)).await;
+    let _ = tokio::time::timeout(Duration::from_secs(1), handle.read(&mut buf)).await;
 
     let still_waitable = nix::sys::signal::kill(pid, None).is_ok();
 
@@ -320,6 +275,18 @@ async fn the_read_loop_leaves_the_child_reapable_for_teardown() {
         "the read loop reaped the child, so teardown lost its handle on a \
          process group that is still alive"
     );
+}
+
+/// Whether `pid` has exited and is waiting to be reaped.
+fn is_zombie(pid: u32) -> bool {
+    std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .is_ok_and(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .trim_start()
+                .starts_with('Z')
+        })
 }
 
 /// A pane child must not inherit the *outer* terminal's identity: a pane still
@@ -584,21 +551,20 @@ async fn winsize_declares_pixel_geometry_to_the_child_at_spawn_and_on_resize() {
         "python3 or python is required: nothing else asserts a child reads \
          non-zero pixels out of TIOCGWINSZ",
     );
-    // Prints winsize, then polls until the cell geometry changes and prints
-    // again. Polling, not sleeping: a fixed sleep races the parent's ioctl.
+    // Prints winsize, then waits for the SIGWINCH the resize sends and prints
+    // again. SIGWINCH is blocked before SPAWN is printed, so a resize that
+    // lands before the wait stays pending instead of being lost.
     let program = r#"
-import fcntl, struct, sys, termios, time
+import fcntl, signal, struct, sys, termios
 def ws():
     return struct.unpack("HHHH", fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, b"\0" * 8))
+signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGWINCH])
 r, c, x, y = ws()
 print("SPAWN %d %d %d %d" % (c, r, x, y), flush=True)
 r2, c2, x2, y2 = r, c, x, y
-deadline = time.time() + 10
-while time.time() < deadline:
+while (c2, r2) == (c, r):
+    signal.sigwait([signal.SIGWINCH])
     r2, c2, x2, y2 = ws()
-    if (c2, r2) != (c, r):
-        break
-    time.sleep(0.02)
 print("RESIZED %d %d %d %d" % (c2, r2, x2, y2), flush=True)
 "#;
     let mut config = PtyConfig::with_command(
@@ -653,7 +619,7 @@ print("RESIZED %d %d %d %d" % (c2, r2, x2, y2), flush=True)
 async fn read_pty_until(handle: &mut PtyHandle, needle: &str) -> String {
     let mut output = Vec::new();
     let mut buf = [0u8; 4096];
-    let got = tokio::time::timeout(Duration::from_secs(20), async {
+    let got = tokio::time::timeout(shux_testkit::BUDGET, async {
         loop {
             match handle.read(&mut buf).await {
                 Ok(0) => return false,
@@ -699,14 +665,9 @@ async fn dropping_a_live_handle_kills_and_reaps_its_child() {
     let handle = PtyHandle::spawn(&config).unwrap();
     let pid = nix::unistd::Pid::from_raw(handle.pid() as i32);
     drop(handle);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while nix::sys::signal::kill(pid, None).is_ok() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the child outlived its dropped handle"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
+    shux_testkit::wait_until("the dropped handle's child to be reaped", || {
+        nix::sys::signal::kill(pid, None).is_err()
+    });
 }
 
 /// A pane's process must hold its own terminal on 0-2 and nothing else of the
@@ -721,13 +682,20 @@ async fn a_pane_inherits_no_other_terminal_descriptors() {
         test_cwd(),
     ))
     .unwrap();
+    // The marker is printed by the running shell, so its exec, and with it
+    // every close-on-exec, is done when it arrives.
     let mut second = PtyHandle::spawn(&PtyConfig::with_command(
-        vec!["sleep".into(), "30".into()],
+        vec![
+            "sh".into(),
+            "-c".into(),
+            "echo FDS_SETTLED; sleep 30".into(),
+        ],
         test_cwd(),
     ))
     .unwrap();
+    read_pty_until(&mut second, "FDS_SETTLED").await;
 
-    let leaked = terminal_descriptors_above_stdio(second.pid());
+    let leaked = terminal_descriptors(second.pid());
     let _ = second.kill();
     drop(first);
     assert!(
@@ -741,6 +709,7 @@ async fn a_pane_inherits_no_other_terminal_descriptors() {
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_process_forked_while_a_pane_opens_inherits_no_terminal_descriptors() {
+    use std::io::{Read, Write};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -774,11 +743,21 @@ async fn a_process_forked_while_a_pane_opens_inherits_no_terminal_descriptors() 
         if !leaked.is_empty() || std::time::Instant::now() >= deadline {
             break;
         }
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
+        let mut child = std::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        leaked = terminal_descriptors_above_stdio(child.id());
+        // A byte back from `cat` proves its exec, close-on-exec included, is done.
+        let mut echoed = [0u8; 1];
+        child.stdin.as_mut().unwrap().write_all(b"x").unwrap();
+        child
+            .stdout
+            .as_mut()
+            .unwrap()
+            .read_exact(&mut echoed)
+            .unwrap();
+        leaked = terminal_descriptors(child.id());
         let _ = child.kill();
         let _ = child.wait();
     }
@@ -790,23 +769,11 @@ async fn a_process_forked_while_a_pane_opens_inherits_no_terminal_descriptors() 
     );
 }
 
-/// The terminal descriptors a child still holds once its exec has finished.
-/// The kernel wakes a spawning parent before it runs close-on-exec, so a
-/// first look can see descriptors that are about to close; an inherited one
-/// is still there a moment later.
+/// The terminal descriptors above stdio that `pid` holds. Only meaningful once
+/// its exec has finished: the kernel wakes a spawning parent before it has run
+/// every close-on-exec, so an earlier look sees descriptors about to close.
 #[cfg(target_os = "linux")]
-fn terminal_descriptors_above_stdio(pid: u32) -> Vec<String> {
-    let first = terminal_descriptors_now(pid);
-    if first.is_empty() {
-        return first;
-    }
-    std::thread::sleep(Duration::from_millis(50));
-    let later = terminal_descriptors_now(pid);
-    first.into_iter().filter(|fd| later.contains(fd)).collect()
-}
-
-#[cfg(target_os = "linux")]
-fn terminal_descriptors_now(pid: u32) -> Vec<String> {
+fn terminal_descriptors(pid: u32) -> Vec<String> {
     let mut found = Vec::new();
     for entry in std::fs::read_dir(format!("/proc/{pid}/fd")).expect("read child fd table") {
         let entry = entry.unwrap();
