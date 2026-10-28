@@ -134,9 +134,18 @@ pub fn compose(
             let row = bar_top + row_offset;
             if row_offset + 1 == status_bar_height {
                 let cells = bar.render_row(cols);
-                for (col, rcell) in cells.into_iter().enumerate() {
-                    let (fg, bg, flags) = render_attrs_to_vt(&rcell);
+                for (col, rcell) in cells.iter().enumerate() {
+                    let (fg, bg, flags) = render_attrs_to_vt(rcell);
                     put_cell(&mut grid, col as u16, row, rcell.ch, fg, bg, flags);
+                    let mut vt_row = grid.visible_row_mut(row as usize);
+                    if rcell.wide_continuation {
+                        vt_row[col].width = 0;
+                    } else {
+                        if cells.get(col + 1).is_some_and(|c| c.wide_continuation) {
+                            vt_row[col].width = 2;
+                        }
+                        vt_row[col].extended = rcell.extended.clone();
+                    }
                 }
             } else {
                 for col in 0..cols {

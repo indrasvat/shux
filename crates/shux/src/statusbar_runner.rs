@@ -415,8 +415,11 @@ fn fallback_bytes(seg: &SegmentDef) -> Vec<u8> {
 /// VirtualTerminal so we recover ANSI fg/bg/bold/etc. without hand-
 /// rolling an SGR parser. The trailing newline / CR that prompts
 /// usually emit is stripped.
-pub async fn populate_bar(bar: &mut StatusBar, config: &ConfigHandle, cache: &SegmentCache) {
-    let cfg = config.current();
+pub async fn populate_bar(
+    bar: &mut StatusBar,
+    cfg: &shux_core::config::Config,
+    cache: &SegmentCache,
+) {
     if cfg.statusbar.segment.is_empty() {
         return;
     }

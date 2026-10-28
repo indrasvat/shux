@@ -7,7 +7,6 @@
 //! immediately.
 
 use crossterm::style::Color;
-use unicode_width::UnicodeWidthStr;
 
 use crate::buffer::{RenderAttrs, RenderCell};
 
@@ -55,9 +54,11 @@ impl StatusBar {
     }
 
     /// Compute the width (in display columns) of a list of segments.
-    fn segments_width(segs: &[StatusSegment]) -> usize {
+    /// Columns `segs` take when painted.
+    pub fn segments_width(segs: &[StatusSegment]) -> usize {
         segs.iter()
-            .map(|s| UnicodeWidthStr::width(s.text.as_str()))
+            .flat_map(|s| crate::chrome::text_cells(&s.text))
+            .map(|(_, w)| usize::from(w))
             .sum()
     }
 
@@ -118,26 +119,42 @@ fn paint_segments(
     let mut cursor = start;
     for seg in segs {
         let bg = seg.bg.or(fallback_bg);
-        for ch in seg.text.chars() {
-            if cursor >= row.len() {
+        let attrs = RenderAttrs {
+            bold: seg.bold,
+            ..Default::default()
+        };
+        for (text, width) in crate::chrome::text_cells(&seg.text) {
+            let width = usize::from(width);
+            if cursor + width > row.len() {
                 return;
             }
-            // Ignore chars that would produce 0 or 2 column width: we
-            // approximate width 1; the segments are always ASCII-ish in
-            // practice (icons + identifiers).
-            let cell = RenderCell {
+            let mut chars = text.chars();
+            let Some(ch) = chars.next() else {
+                continue;
+            };
+            let extended = chars.next().map(|_| {
+                std::sync::Arc::new(shux_vt::ExtendedAttrs {
+                    grapheme: Some(text.clone()),
+                    ..Default::default()
+                })
+            });
+            row[cursor] = RenderCell {
                 ch,
                 fg: seg.fg,
                 bg,
-                attrs: RenderAttrs {
-                    bold: seg.bold,
-                    ..Default::default()
-                },
-                extended: None,
+                attrs,
+                extended,
                 wide_continuation: false,
             };
-            row[cursor] = cell;
-            cursor += 1;
+            if width == 2 {
+                row[cursor + 1] = RenderCell {
+                    ch: ' ',
+                    bg,
+                    wide_continuation: true,
+                    ..RenderCell::default()
+                };
+            }
+            cursor += width;
         }
     }
 }

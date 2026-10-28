@@ -64,7 +64,7 @@ fn attach_and_snapshot_draw_identical_chrome() {
         (right, PaneChrome::titled("日本 e\u{301}")),
     ]);
     let mut bar = StatusBar::new();
-    bar.left.push(StatusSegment::plain("session"));
+    bar.left.push(StatusSegment::plain("session 日本 e\u{301}"));
     bar.right.push(StatusSegment::styled(
         "◆ 1 waiting ",
         Color::Rgb {

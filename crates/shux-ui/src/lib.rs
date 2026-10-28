@@ -28,7 +28,7 @@ pub mod vt_convert;
 // Re-export commonly used types.
 pub use borders::{BorderChars, BorderColors, BorderSegment, BorderStyle, compute_borders};
 pub use buffer::{DirtyCell, FrameBuffer, RenderAttrs, RenderCell};
-pub use chrome::{PaneChrome, StatusBadge, TitleGlyph, title_overlay};
+pub use chrome::{PaneChrome, StatusBadge, TitleGlyph, text_cells, title_overlay};
 pub use client::{ClientConfig, ExitReason};
 pub use composed::{ComposeInputs, ComposedFrame, compose};
 pub use compositor::{

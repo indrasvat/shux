@@ -273,11 +273,7 @@ pub fn append_waiting(
         Color::Rgb { r, g, b },
         true,
     );
-    let width = |segs: &[StatusSegment]| -> usize {
-        segs.iter()
-            .map(|s| unicode_width::UnicodeWidthStr::width(s.text.as_str()))
-            .sum()
-    };
+    let width = StatusBar::segments_width;
     let (lw, cw, rw) = (width(&bar.left), width(&bar.center), width(&bar.right));
     // StatusBar::render_row keeps a one-column gap either side of the centre.
     let gaps = if cw > 0 { 2 } else { 1 };
@@ -308,6 +304,18 @@ mod tests {
         append_waiting(&mut b, 2, &Theme::DEFAULT, false, 40);
         assert_eq!(b.right[0].text, "◆ 2 waiting ");
         assert_eq!(b.right[1].text, "right");
+    }
+
+    #[test]
+    fn waiting_never_paints_over_a_segment_with_combining_marks() {
+        let accented = format!("e{}", "\u{301}".repeat(10));
+        let mut b = bar(&accented, "", "");
+        append_waiting(&mut b, 1, &Theme::DEFAULT, false, 20);
+        let row = b.render_row(20);
+        assert_eq!(row[0].display_text(), accented, "the segment's cell");
+        let text: String = row.iter().map(|c| c.ch).collect();
+        assert!(text.ends_with("◆ 1 waiting "), "{text}");
+        assert_eq!(text.chars().nth(1), Some(' '), "{text}");
     }
 
     #[test]

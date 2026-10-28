@@ -64,7 +64,7 @@ pub fn title_overlay(chrome: &PaneChrome, viewport: Rect) -> Vec<TitleGlyph> {
     let separator = usize::from(chrome.badge.is_some());
     let mut title = Vec::new();
     let mut title_used = 0usize;
-    for (text, w) in graphemes(&chrome.title) {
+    for (text, w) in text_cells(&chrome.title) {
         if used + separator + title_used + usize::from(w) > avail {
             break;
         }
@@ -107,20 +107,27 @@ pub fn title_overlay(chrome: &PaneChrome, viewport: Rect) -> Vec<TitleGlyph> {
     out
 }
 
-/// Cells as the VT makes them: a zero-width scalar joins the cell before it.
-fn graphemes(s: &str) -> Vec<(String, u8)> {
-    let mut out: Vec<(String, u8)> = Vec::new();
-    for c in s.chars() {
-        match c.width().unwrap_or(0) {
-            0 => {
-                if let Some((text, _)) = out.last_mut() {
-                    text.push(c);
-                }
-            }
-            w => out.push((c.to_string(), w.min(2) as u8)),
-        }
-    }
-    out
+/// The title's cells exactly as the VT stores the same text — its grapheme
+/// joins (combining marks, ZWJ sequences, flags), widths and scalar cap —
+/// so a title draws the way that text would in a pane.
+pub fn text_cells(s: &str) -> Vec<(String, u8)> {
+    let text: String = s.chars().filter(|c| !c.is_control()).collect();
+    // Autowrap off: anything past the last column stays on the one row.
+    let mut vt = shux_vt::VirtualTerminal::new(1, 2 * MAX_TITLE_COLUMNS + 2);
+    vt.process(b"\x1b[?7l");
+    vt.process(text.as_bytes());
+    let end = vt.cursor().col.min(2 * MAX_TITLE_COLUMNS);
+    let row = vt.grid().visible_row(0);
+    (0..end)
+        .map(|col| &row[col])
+        .filter(|cell| cell.width > 0)
+        .map(|cell| {
+            let text = cell
+                .grapheme()
+                .map_or_else(|| cell.ch.to_string(), str::to_string);
+            (text, cell.width.min(2))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -206,6 +213,27 @@ mod tests {
         let glyphs = title_overlay(&chrome, viewport(20));
         assert_eq!(glyphs[1].text, "e\u{301}");
         assert_eq!(glyphs[2].x, glyphs[1].x + 1);
+    }
+
+    #[test]
+    fn a_zwj_sequence_or_flag_is_one_cell_kept_or_dropped_whole() {
+        let glyphs = title_overlay(&PaneChrome::titled("👩\u{200d}💻x"), viewport(20));
+        assert_eq!(glyphs[1].text, "👩\u{200d}💻", "ZWJ sequence split");
+        let glyphs = title_overlay(&PaneChrome::titled("🇮🇳x"), viewport(20));
+        assert_eq!(glyphs[1].text, "🇮🇳", "flag split");
+        // Six columns leave two: the whole sequence fits or none of it does.
+        let glyphs = title_overlay(&PaneChrome::titled("a👩\u{200d}💻"), viewport(6));
+        assert_eq!(text(&glyphs), " a ");
+    }
+
+    #[test]
+    fn a_grapheme_keeps_no_more_scalars_than_the_vt_does() {
+        let title = format!("e{}", "\u{301}".repeat(40));
+        let mut vt = shux_vt::VirtualTerminal::new(1, 20);
+        vt.process(title.as_bytes());
+        let stored = vt.grid().visible_row(0)[0].grapheme().unwrap().to_string();
+        let glyphs = title_overlay(&PaneChrome::titled(title), viewport(20));
+        assert_eq!(glyphs[1].text, stored);
     }
 
     #[test]

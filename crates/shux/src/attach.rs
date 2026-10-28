@@ -1398,7 +1398,7 @@ async fn run_render_loop(
             last_action: last_action_ref,
         };
         let mut bar = build_status_bar_shared(&snap, &live_theme, &render_ctx);
-        populate_bar(&mut bar, &config, &segments).await;
+        populate_bar(&mut bar, &live_cfg, &segments).await;
         crate::statusbar_build::append_waiting(
             &mut bar,
             crate::pane_chrome::waiting_count(&snap, attached.session_id, &live_cfg.program_status),
