@@ -1083,8 +1083,8 @@ mod tests {
             Some("dev"),
             None,
             None,
-            120,
-            36,
+            None,
+            None,
             OutputFormat::Json,
         )
         .await
@@ -1094,8 +1094,8 @@ mod tests {
             Some("dev"),
             Some("main"),
             None,
-            80,
-            24,
+            Some(80),
+            Some(24),
             OutputFormat::Json,
         )
         .await

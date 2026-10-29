@@ -37,6 +37,22 @@ pid_cwd() {
   printf '%s' "${cwd}"
 }
 
+# True when PATH is inside this checkout and not inside a checkout nested in it,
+# such as an agent's git worktree under `.claude/worktrees/`: that one's
+# processes are its own runs', and reaping them kills a concurrent suite.
+path_in_checkout() {
+  local path="$1" dir
+  case "${path}" in
+    "${REPO_ROOT}" | "${REPO_ROOT}"/*) ;;
+    *) return 1 ;;
+  esac
+  dir="${path}"
+  while [ "${dir}" != "${REPO_ROOT}" ]; do
+    [ ! -e "${dir}/.git" ] || return 1
+    dir="${dir%/*}"
+  done
+}
+
 # True when PID's working directory is inside this repository.
 #
 # FAILS CLOSED. If the cwd cannot be determined at all — no `/proc`, no `lsof` — the pid is
@@ -59,10 +75,7 @@ pid_cwd_in_repo() {
     # and probing. Not ours to report.
     return 1
   fi
-  case "${cwd}" in
-    "${REPO_ROOT}" | "${REPO_ROOT}"/*) return 0 ;;
-    *) return 1 ;;
-  esac
+  path_in_checkout "${cwd}"
 }
 
 # Leaked shux DAEMONS belonging to this repository.
@@ -89,7 +102,7 @@ shux_daemon_pids() {
         *) continue ;;
       esac
       case "${args%% __daemon*}" in
-        "${REPO_ROOT}"/*/shux | "${REPO_ROOT}"/shux) printf '%s\n' "${pid}" ;;
+        */shux) if path_in_checkout "${args%% __daemon*}"; then printf '%s\n' "${pid}"; fi ;;
       esac
     done
 }

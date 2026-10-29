@@ -95,6 +95,23 @@ fn copy_overlay_needs_repaint(
     next.is_some() && (base_emitted || copy_overlay_needs_base_redraw(last, next))
 }
 
+/// What a sheet drawn over the frame (help, welcome toast, copy menu) looked
+/// like. The terminal keeps it until bytes land under it, so it is sent again
+/// only when it changed or the frame beneath it sent something.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SheetStamp {
+    cols: u16,
+    rows: u16,
+    theme: Theme,
+    label: String,
+}
+
+fn sheet_due(last: &mut Option<SheetStamp>, next: SheetStamp, base_emitted: bool) -> bool {
+    let due = base_emitted || last.as_ref() != Some(&next);
+    *last = Some(next);
+    due
+}
+
 /// Status-bar rows reserved at the bottom of the client screen.
 const STATUS_BAR_ROWS: u16 = 1;
 
@@ -613,10 +630,15 @@ struct AttachedSession {
     /// kill, copy). None at attach start. Cleared either by the render
     /// loop or by another action overwriting it.
     last_action: Option<(String, std::time::Instant)>,
-    /// True until the welcome toast has been rendered for its full
-    /// dwell (~3s). Render loop flips this to false; we then persist
-    /// `welcome_toast_seen: true` via the OnboardingHandle so the next
-    /// attach skips the toast.
+    /// Why the last action failed, for the status bar. Cleared by the next
+    /// action or keystroke, so it stays up until the user has moved on.
+    action_error: Option<String>,
+    /// The prefix the client reported with `AttachClientFrame::Prefix`.
+    /// Hints name it; `None` means the daemon config's prefix.
+    client_prefix: Option<String>,
+    /// True until the welcome toast has been up for its dwell (~3s) or a
+    /// key or action ends it, as the toast promises. Either way
+    /// `welcome_toast_seen: true` is persisted so the next attach skips it.
     show_welcome_toast: bool,
 }
 
@@ -650,6 +672,8 @@ async fn resolve_or_create_session(
             mouse_selection: None,
             copy_menu: None,
             last_action: None,
+            client_prefix: None,
+            action_error: None,
             // Whether the toast actually renders is decided at attach
             // time by reading the onboarding state file; this stays
             // true here so the render loop can flip it off after dwell.
@@ -726,6 +750,8 @@ async fn resolve_or_create_session(
         mouse_selection: None,
         copy_menu: None,
         last_action: None,
+        client_prefix: None,
+        action_error: None,
         show_welcome_toast: true,
     })
 }
@@ -901,6 +927,7 @@ async fn run_attach_loop(
             render_cancel,
             hello.graphics,
             fallback_tick(),
+            WELCOME_TOAST_DWELL,
         )
         .await;
     });
@@ -1009,6 +1036,13 @@ async fn run_attach_loop(
                         // not reach the shell behind the overlay.
                         {
                             let mut s = render_session.lock().await;
+                            let toast_dismissed = std::mem::take(&mut s.show_welcome_toast);
+                            if s.action_error.take().is_some() || toast_dismissed {
+                                io_state.lock().await.render_pulse.bump();
+                            }
+                            if toast_dismissed {
+                                onboarding.mark_welcome_toast_seen().await;
+                            }
                             if s.help_visible {
                                 // A paste is text, not keys: swallowed whole.
                                 let dismiss = paste.is_none()
@@ -1219,6 +1253,9 @@ async fn run_attach_loop(
                         // can dismiss. Cheap idempotent write; first call
                         // persists, subsequent ones short-circuit.
                         onboarding.mark_prefix_discovered().await;
+                        if std::mem::take(&mut render_session.lock().await.show_welcome_toast) {
+                            onboarding.mark_welcome_toast_seen().await;
+                        }
 
                         let action_result = handle_action(
                             kind,
@@ -1232,8 +1269,12 @@ async fn run_attach_loop(
                         )
                         .await;
                         if let Err(e) = &action_result {
-                            warn!(?kind, error = %e, "attach: action failed");
+                            warn!(?kind, error = %format!("{e:#}"), "attach: action failed");
                         }
+                        render_session.lock().await.action_error = action_result
+                            .as_ref()
+                            .err()
+                            .map(|e| action_failure_notice(kind, e));
 
                         // Transient command-feedback overlay in the status
                         // bar's center zone. Resolves the "did my keystroke
@@ -1401,6 +1442,11 @@ async fn run_attach_loop(
                         // hint dismisses forever.
                         onboarding.mark_prefix_discovered().await;
                     }
+                    AttachClientFrame::Prefix { prefix } => {
+                        render_session.lock().await.client_prefix = Some(prefix);
+                        let pulse = io_state.lock().await.render_pulse.clone();
+                        pulse.bump();
+                    }
                     AttachClientFrame::Pong => {}
                 }
             }
@@ -1482,6 +1528,7 @@ async fn run_render_loop(
     cancel: CancellationToken,
     graphics: bool,
     tick_period: Duration,
+    toast_dwell: Duration,
 ) {
     // Before anything else: a receiver starts at the current generation.
     let mut pulse = io_state.lock().await.render_pulse.subscribe();
@@ -1525,9 +1572,13 @@ async fn run_render_loop(
     let mut last_border_style = initial.appearance.border_style.clone();
     let mut last_theme = initial_theme;
     let mut last_help_visible = false;
+    let mut toast_drawn = false;
     let mut last_overlay_visible = false;
     let mut last_copy_overlay: Option<CopyOverlayStamp> = None;
     let mut last_copy_menu: Option<CopyContextMenu> = None;
+    let mut menu_sheet: Option<SheetStamp> = None;
+    let mut help_sheet: Option<SheetStamp> = None;
+    let mut toast_sheet: Option<SheetStamp> = None;
 
     loop {
         // A bump landed while the last frame was being drawn: output is
@@ -1681,9 +1732,21 @@ async fn run_render_loop(
             nerd_fonts,
             &live_theme,
         );
-        let prefix_label = prefix_display(&live_cfg.keys.prefix);
+        let prefix_label = prefix_display(
+            attached
+                .client_prefix
+                .as_deref()
+                .unwrap_or(&live_cfg.keys.prefix),
+        );
         let session_meta = meta_cache.get(attached.session_id).await;
         let onboarding_state = onboarding.current().await;
+        let toast_up = !onboarding_state.welcome_toast_seen && attached.show_welcome_toast;
+        // A key ends the toast between frames, here or on another client;
+        // its cells changed in no VT grid, so only a full redraw clears them.
+        if toast_drawn && !toast_up {
+            compositor.force_redraw();
+            toast_drawn = false;
+        }
         let daemon_uptime = daemon_start.elapsed();
         let last_action_ref = attached.last_action.as_ref().map(|(s, i)| (s.as_str(), *i));
         let render_ctx = StatusBarCtx {
@@ -1699,6 +1762,7 @@ async fn run_render_loop(
             client_cols: cols,
             copy_mode_active: attached.copy_mode.is_some(),
             last_action: last_action_ref,
+            action_error: attached.action_error.as_deref(),
         };
         let mut bar = build_status_bar_shared(&snap, &live_theme, &render_ctx);
         populate_bar(&mut bar, &live_cfg, &segments).await;
@@ -1709,8 +1773,9 @@ async fn run_render_loop(
             nerd_fonts,
             cols,
         );
-        if last_action_ref
-            .is_some_and(|(_, at)| at.elapsed() < crate::statusbar_build::ACTION_FEEDBACK_DWELL)
+        if attached.action_error.is_some()
+            || last_action_ref
+                .is_some_and(|(_, at)| at.elapsed() < crate::statusbar_build::ACTION_FEEDBACK_DWELL)
         {
             crate::statusbar_build::make_room_for_notice(&mut bar, cols);
         }
@@ -1729,9 +1794,16 @@ async fn run_render_loop(
             chrome: Some(&pane_chrome),
             status_bar: Some(&bar),
         };
+        compositor.set_cursor_hidden(
+            attached.help_visible
+                || copy_overlay
+                    .as_ref()
+                    .is_some_and(|o| matches!(o.kind, CopyOverlayKind::Modal)),
+        );
         // Reset the buffer first so we only ship the new frame's bytes.
         compositor.inner_mut().clear();
         let _ = compositor.render_multi_pane(frame);
+        let frame_end = compositor.inner().len();
 
         // Copy-mode overlay layer: a cursor block + selection
         // highlight + status hint, scoped to the focused pane's
@@ -1797,15 +1869,27 @@ async fn run_render_loop(
         }
         last_copy_overlay = copy_overlay;
 
+        let sheet = |label: String| SheetStamp {
+            cols,
+            rows,
+            theme: live_theme,
+            label,
+        };
         if let Some(menu) = attached.copy_menu {
-            shux_ui::copy_mode::render_copy_menu_into(
-                compositor.inner_mut(),
-                menu.col,
-                menu.row,
-                cols,
-                rows,
-                &live_theme,
-            );
+            // A different menu forced a full redraw above.
+            let base_emitted = !compositor.inner().is_empty();
+            if sheet_due(&mut menu_sheet, sheet(String::new()), base_emitted) {
+                shux_ui::copy_mode::render_copy_menu_into(
+                    compositor.inner_mut(),
+                    menu.col,
+                    menu.row,
+                    cols,
+                    rows,
+                    &live_theme,
+                );
+            }
+        } else {
+            menu_sheet = None;
         }
         last_copy_menu = attached.copy_menu;
 
@@ -1816,38 +1900,59 @@ async fn run_render_loop(
         // compositor's diff would skip those positions because they
         // didn't change in the VT grid.
         if attached.help_visible {
-            shux_ui::render_help_overlay_into(compositor.inner_mut(), cols, rows, &live_theme);
-        }
-
-        // Welcome toast (first-attach onboarding). Only fires when the
-        // user has never seen it (per the onboarding state file).
-        // Dwells WELCOME_TOAST_DWELL after first render, then auto-
-        // dismisses and marks seen on disk so the next attach is clean.
-        if !onboarding_state.welcome_toast_seen && attached.show_welcome_toast {
-            let elapsed = welcome_toast_started
-                .get_or_insert_with(std::time::Instant::now)
-                .elapsed();
-            if elapsed < WELCOME_TOAST_DWELL {
-                render_welcome_toast(
+            let base_emitted = !compositor.inner().is_empty();
+            if sheet_due(&mut help_sheet, sheet(prefix_label.clone()), base_emitted) {
+                shux_ui::render_help_overlay_into(
                     compositor.inner_mut(),
                     cols,
                     rows,
                     &live_theme,
                     &prefix_label,
-                    nerd_fonts,
                 );
+            }
+        } else {
+            help_sheet = None;
+        }
+
+        // Welcome toast (first-attach onboarding). Only fires when the
+        // user has never seen it (per the onboarding state file).
+        // Dwells `toast_dwell` after first render, then auto-
+        // dismisses and marks seen on disk so the next attach is clean.
+        let mut toast_expired = false;
+        if toast_up {
+            let elapsed = welcome_toast_started
+                .get_or_insert_with(std::time::Instant::now)
+                .elapsed();
+            if elapsed < toast_dwell {
+                let stamp = sheet(format!("{prefix_label} {nerd_fonts}"));
+                if sheet_due(&mut toast_sheet, stamp, !compositor.inner().is_empty()) {
+                    render_welcome_toast(
+                        compositor.inner_mut(),
+                        cols,
+                        rows,
+                        &live_theme,
+                        &prefix_label,
+                        nerd_fonts,
+                    );
+                }
+                toast_drawn = true;
             } else {
                 // One-shot persist + flag-flip.
                 let onb = onboarding.clone();
                 tokio::spawn(async move {
                     onb.mark_welcome_toast_seen().await;
                 });
-                {
-                    let mut s = session.lock().await;
-                    s.show_welcome_toast = false;
-                }
+                toast_expired = true;
                 compositor.force_redraw();
+                toast_drawn = false;
+                toast_sheet = None;
             }
+        } else {
+            toast_sheet = None;
+        }
+
+        if compositor.inner().len() > frame_end {
+            let _ = compositor.restore_cursor();
         }
 
         // Take the bytes out (drain) and send them.
@@ -1855,6 +1960,11 @@ async fn run_render_loop(
         // Re-establish capacity for next frame.
         compositor.inner_mut().reserve(64 * 1024);
         drop(state);
+        // Only once `io_state` is released: the input task takes the session
+        // before `io_state`, so holding both the other way round deadlocks.
+        if toast_expired {
+            session.lock().await.show_welcome_toast = false;
+        }
 
         if !bytes.is_empty() {
             // Split rather than send whole: base64 inflates by 4/3 and the codec
@@ -1895,6 +2005,17 @@ const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 /// auto-dismissing. Tuned for "long enough to read, short enough to
 /// not get in the way".
 const WELCOME_TOAST_DWELL: Duration = Duration::from_secs(3);
+
+/// The status-bar line for a failed action: `"<verb> failed: <reason>"`.
+fn action_failure_notice(kind: ActionKind, e: &anyhow::Error) -> String {
+    let verb = match kind {
+        ActionKind::SplitVertical | ActionKind::SplitHorizontal | ActionKind::SplitSmart => "split",
+        ActionKind::NewWindow => "new window",
+        ActionKind::ToggleZoom => "zoom",
+        _ => "action",
+    };
+    format!("{verb} failed: {e}")
+}
 
 // build_status_bar + StatusBarCtx + helpers (action_feedback_label,
 // prefix_display, format_uptime) all live in `crate::statusbar_build`
@@ -3531,8 +3652,7 @@ async fn split(
         0.5,
         Vec::new(),
     )
-    .await
-    .map_err(|e| anyhow::anyhow!("split failed: {e}"))?;
+    .await?;
 
     // A PTY that never started is not a pane: left in the graph it is focused,
     // drawn, and answers "pane VT not found" to every later verb. A default
@@ -3551,10 +3671,10 @@ async fn split(
     .await
     {
         crate::pane_spawn::undo_split(graph, new_pane, prior).await;
-        return Err(anyhow::anyhow!(
-            "{}",
-            crate::pane_spawn::spawn_failure_message(&e)
-        ));
+        return Err(
+            anyhow::anyhow!("{}", crate::pane_spawn::spawn_failure_message(&e))
+                .context(crate::pane_spawn::spawn_failure_notice(&e)),
+        );
     }
     Ok(())
 }
@@ -3620,10 +3740,7 @@ async fn focus_relative(
 }
 
 async fn zoom(graph: &GraphHandle, attached: &AttachedSession) -> anyhow::Result<()> {
-    let _ = graph
-        .zoom_pane(attached.active_pane_id, None)
-        .await
-        .map_err(|e| anyhow::anyhow!("zoom failed: {e}"))?;
+    let _ = graph.zoom_pane(attached.active_pane_id, None).await?;
     Ok(())
 }
 
@@ -3784,10 +3901,10 @@ async fn new_window(
     .await
     {
         crate::pane_spawn::undo_window_create(graph, created).await;
-        return Err(anyhow::anyhow!(
-            "{}",
-            crate::pane_spawn::spawn_failure_message(&e)
-        ));
+        return Err(
+            anyhow::anyhow!("{}", crate::pane_spawn::spawn_failure_message(&e))
+                .context(crate::pane_spawn::spawn_failure_notice(&e)),
+        );
     }
 
     // Focus the new window.
@@ -4203,6 +4320,106 @@ mod tests {
         task.abort();
     }
 
+    /// An open help sheet over a frame that did not change sends nothing: the
+    /// terminal still shows it, and redrawing it on every wake streams the
+    /// whole sheet at the tick rate for as long as it is open.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_open_help_sheet_is_not_resent_over_an_unchanged_frame() {
+        let fixture = attach_fixture().await;
+        let onboarding = crate::onboarding::OnboardingHandle::from_state_for_test(
+            crate::onboarding::OnboardingState {
+                prefix_discovered: true,
+                welcome_toast_seen: true,
+            },
+        );
+        let pulse = fixture.io_state.lock().await.render_pulse.clone();
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = fixture.cancel.child_token();
+        let mut attached = fixture.attached.clone();
+        attached.help_visible = true;
+        // Past the seconds tier, so the uptime segment holds still.
+        let daemon_start = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(61))
+            .expect("monotonic clock past 61 s");
+        let render = tokio::spawn(run_render_loop(
+            fixture.graph.clone(),
+            fixture.io_state.clone(),
+            test_config(),
+            SegmentCache::new(),
+            crate::session_meta::SessionMetaCache::new(),
+            onboarding.clone(),
+            daemon_start,
+            Arc::new(Mutex::new(attached)),
+            Arc::new(Mutex::new((100, 40))),
+            tx,
+            cancel.clone(),
+            false,
+            Duration::from_secs(3600),
+            WELCOME_TOAST_DWELL,
+        ));
+
+        let mut screen = shux_vt::VirtualTerminal::new(40, 100);
+        let deadline = tokio::time::Instant::now() + shux_testkit::BUDGET;
+        while !screen.capture_text(None).contains("keybindings") {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(AttachServerFrame::Render { data })) => {
+                    screen.process(&BASE64.decode(data).expect("render base64"));
+                }
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => panic!("the help sheet was never drawn"),
+            }
+        }
+
+        // Stop the next frame after it holds `io_state`: it has read every
+        // input it draws from, all unchanged.
+        let held = onboarding.hold_for_test().await;
+        pulse.bump();
+        let io_state = fixture.io_state.clone();
+        shux_testkit::wait_until_async("the idle frame to hold io_state", || {
+            let io_state = io_state.clone();
+            async move { io_state.try_lock().is_err() }
+        })
+        .await;
+        while let Ok(frame) = rx.try_recv() {
+            if let AttachServerFrame::Render { data } = frame {
+                screen.process(&BASE64.decode(data).expect("render base64"));
+            }
+        }
+        // A change for the frame after it, so its bytes mark where the idle
+        // frame's would have ended.
+        fixture
+            .graph
+            .rename_window(fixture.first_window, format!("MA{}RK", ""), None)
+            .await
+            .expect("rename window");
+        pulse.bump();
+        drop(held);
+
+        let mut idle_frames = 0;
+        let drew = loop {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(AttachServerFrame::Render { data })) => {
+                    screen.process(&BASE64.decode(data).expect("render base64"));
+                    if screen.capture_text(None).contains("MARK") {
+                        break true;
+                    }
+                    idle_frames += 1;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break false,
+            }
+        };
+        assert!(drew, "the change after the idle frame was never drawn");
+        assert_eq!(
+            idle_frames, 0,
+            "a frame that changed nothing resent the help sheet"
+        );
+
+        cancel.cancel();
+        render.await.expect("render loop");
+        fixture.stop();
+    }
+
     /// A bump that lands while a frame is being drawn is drawn next, even with
     /// no tick to fall back on: the loop's receiver outlives the iteration.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4232,6 +4449,7 @@ mod tests {
             cancel.clone(),
             false,
             Duration::from_secs(3600),
+            WELCOME_TOAST_DWELL,
         ));
 
         // The prelude follows the subscription, so from here the only
@@ -4270,6 +4488,78 @@ mod tests {
             }
         };
         assert!(drew, "a bump that landed mid-frame was never drawn");
+
+        cancel.cancel();
+        render.await.expect("render loop");
+        fixture.stop();
+    }
+
+    /// The frame that ends the welcome toast writes the session only after it
+    /// releases `io_state`. The input task takes the session and then
+    /// `io_state` when a key dismisses the toast, so a frame that held
+    /// `io_state` while waiting for the session froze every pane.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_frame_that_ends_the_welcome_toast_never_waits_for_the_session_holding_io_state() {
+        let fixture = attach_fixture().await;
+        let onboarding = crate::onboarding::OnboardingHandle::from_state_for_test(
+            crate::onboarding::OnboardingState {
+                prefix_discovered: true,
+                welcome_toast_seen: false,
+            },
+        );
+        let held = onboarding.hold_for_test().await;
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = fixture.cancel.child_token();
+        let mut attached = fixture.attached.clone();
+        attached.show_welcome_toast = true;
+        let session = Arc::new(Mutex::new(attached));
+        let render = tokio::spawn(run_render_loop(
+            fixture.graph.clone(),
+            fixture.io_state.clone(),
+            test_config(),
+            SegmentCache::new(),
+            crate::session_meta::SessionMetaCache::new(),
+            onboarding.clone(),
+            std::time::Instant::now(),
+            session.clone(),
+            Arc::new(Mutex::new((100, 24))),
+            tx,
+            cancel.clone(),
+            false,
+            Duration::from_secs(3600),
+            Duration::ZERO,
+        ));
+
+        tokio::time::timeout(shux_testkit::BUDGET, rx.recv())
+            .await
+            .expect("prelude timeout")
+            .expect("prelude");
+        let io_state = fixture.io_state.clone();
+        shux_testkit::wait_until_async("the first frame to hold io_state", || {
+            let io_state = io_state.clone();
+            async move { io_state.try_lock().is_err() }
+        })
+        .await;
+        // Where a key's dismissal would be: holding the session, about to
+        // want `io_state`.
+        let guard = session
+            .try_lock()
+            .expect("the frame holds the session while it holds io_state");
+        drop(held);
+        shux_testkit::wait_until_async(
+            "the toast-ending frame to release io_state while the session is held",
+            || {
+                let io_state = io_state.clone();
+                async move { io_state.try_lock().is_ok() }
+            },
+        )
+        .await;
+        drop(guard);
+        shux_testkit::wait_until_async("the toast to end in the session", || {
+            let session = session.clone();
+            async move { !session.lock().await.show_welcome_toast }
+        })
+        .await;
 
         cancel.cancel();
         render.await.expect("render loop");
@@ -4346,6 +4636,8 @@ mod tests {
             mouse_selection: None,
             copy_menu: None,
             last_action: None,
+            client_prefix: None,
+            action_error: None,
             show_welcome_toast: true,
         };
 
@@ -4563,6 +4855,32 @@ mod tests {
             }
         }
 
+        fixture.stop();
+    }
+
+    #[tokio::test]
+    async fn a_failed_split_or_zoom_says_failed_once() {
+        let fixture = attach_fixture().await;
+        let mut gone = fixture.attached.clone();
+        gone.active_pane_id = PaneId::new();
+        let session = Arc::new(Mutex::new(gone));
+        let client_size = Arc::new(Mutex::new((100, 30)));
+        for kind in [ActionKind::SplitVertical, ActionKind::ToggleZoom] {
+            let e = handle_action(
+                kind,
+                Default::default(),
+                &fixture.graph,
+                &fixture.io_state,
+                &session,
+                &client_size,
+                &test_config(),
+                &fixture.cancel,
+            )
+            .await
+            .expect_err("acting on a pane that is gone");
+            let notice = action_failure_notice(kind, &e);
+            assert_eq!(notice.matches("failed").count(), 1, "{notice:?}");
+        }
         fixture.stop();
     }
 
@@ -5353,6 +5671,54 @@ mod tests {
         let _ = tokio::time::timeout(shux_testkit::BUDGET, server).await;
         assert!(writer_rx.try_recv().is_err());
         fixture.stop();
+    }
+
+    /// The welcome toast says any key dismisses it. A keystroke the pane
+    /// receives and a prefix action both end it, and the dismissal is
+    /// persisted so the next attach does not show it again.
+    #[tokio::test]
+    async fn a_keystroke_or_an_action_dismisses_the_welcome_toast() {
+        for first in [
+            AttachClientFrame::Input {
+                data: BASE64.encode(b"ls\n"),
+            },
+            AttachClientFrame::Action {
+                kind: ActionKind::Redraw,
+                args: Default::default(),
+            },
+        ] {
+            let fixture = attach_fixture().await;
+            let (mut writer_rx, _resize_rx, _) =
+                seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+            let onboarding = crate::onboarding::OnboardingHandle::from_state_for_test(
+                crate::onboarding::OnboardingState {
+                    prefix_discovered: true,
+                    welcome_toast_seen: false,
+                },
+            );
+            let mut client = Client::attach_onboarded(&fixture, 90, onboarding.clone()).await;
+
+            client.send(&first).await;
+            // Frames are handled in order, so the pane receiving this proves
+            // the first one was handled.
+            client.key(b"x").await;
+            loop {
+                let written = tokio::time::timeout(shux_testkit::BUDGET, writer_rx.recv())
+                    .await
+                    .expect("writer timeout")
+                    .expect("writer bytes");
+                if written.ends_with(b"x") {
+                    break;
+                }
+            }
+            assert!(
+                onboarding.current().await.welcome_toast_seen,
+                "{first:?} left the welcome toast up"
+            );
+
+            client.stop().await;
+            fixture.stop();
+        }
     }
 
     /// Seed a pane whose VT has real scrollback (more lines than fit), plus any
@@ -7156,6 +7522,14 @@ mod tests {
                     welcome_toast_seen: true,
                 },
             );
+            Self::attach_onboarded(fixture, cols, onboarding).await
+        }
+
+        async fn attach_onboarded(
+            fixture: &AttachFixture,
+            cols: u16,
+            onboarding: crate::onboarding::OnboardingHandle,
+        ) -> Self {
             let (server_stream, client_stream) = tokio::io::duplex(1 << 20);
             let cancel = fixture.cancel.child_token();
             let server = tokio::spawn(handle_attach_connection(

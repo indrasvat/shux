@@ -325,12 +325,14 @@ pub enum SessionCommand {
         /// Output PNG path. If omitted, base64 is printed to stdout.
         #[arg(short, long)]
         output: Option<std::path::PathBuf>,
-        /// Snapshot grid width in cells (4..=1000). Default: 120.
-        #[arg(long, default_value_t = 120)]
-        cols: u16,
-        /// Snapshot grid height in cells (2..=1000). Default: 36.
-        #[arg(long, default_value_t = 36)]
-        rows: u16,
+        /// Snapshot grid width in cells (4..=1000). Default: the window's
+        /// current width, so the outline fits its panes.
+        #[arg(long)]
+        cols: Option<u16>,
+        /// Snapshot grid height in cells (2..=1000). Default: the window's
+        /// current height.
+        #[arg(long)]
+        rows: Option<u16>,
     },
 
     /// Save a live session as a reusable workspace template.
@@ -764,12 +766,14 @@ pub enum WindowCommand {
         /// Output PNG path. If omitted, base64 is printed to stdout.
         #[arg(short, long)]
         output: Option<std::path::PathBuf>,
-        /// Snapshot grid width in cells (4..=1000). Default: 120.
-        #[arg(long, default_value_t = 120)]
-        cols: u16,
-        /// Snapshot grid height in cells (2..=1000). Default: 36.
-        #[arg(long, default_value_t = 36)]
-        rows: u16,
+        /// Snapshot grid width in cells (4..=1000). Default: the window's
+        /// current width, so the outline fits its panes.
+        #[arg(long)]
+        cols: Option<u16>,
+        /// Snapshot grid height in cells (2..=1000). Default: the window's
+        /// current height.
+        #[arg(long)]
+        rows: Option<u16>,
     },
 }
 

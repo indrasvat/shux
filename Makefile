@@ -437,6 +437,7 @@ test-conductor: build ## Conductor reads program status where a pane reports it,
 .PHONY: test-shux-leak-guard
 test-shux-leak-guard: release ## Verify shux automation leak guard catches and kills orphan daemons
 	@echo "$(COLOR_BLUE)▶ Running shux leak-guard self-test...$(COLOR_RESET)"
+	@.shux/scripts/proc_scope_selftest.sh
 	@.shux/scripts/leak_guard_selftest.sh
 	@echo "$(COLOR_GREEN)✓ Shux leak-guard self-test passed$(COLOR_RESET)"
 

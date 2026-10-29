@@ -28,6 +28,9 @@ pub struct ComposedFrame {
     /// Focused-pane cursor in `(row, col)` grid coordinates, or `None`
     /// when the focused pane's VT has the cursor hidden / out of bounds.
     pub cursor: Option<(usize, usize)>,
+    /// The panes' rects and the status bar's, for
+    /// `Rasterizer::render_regions`.
+    pub regions: Vec<CellRect>,
     pub cols: u16,
     pub rows: u16,
 }
@@ -127,8 +130,10 @@ pub fn compose(
         }
     }
 
+    let mut regions: Vec<CellRect> = pane_rects.iter().map(|(_, r)| cell_rect(*r)).collect();
     if let Some(bar) = inputs.status_bar {
         let bar_top = rows.saturating_sub(status_bar_height);
+        regions.push(cell_rect(Rect::new(0, bar_top, cols, status_bar_height)));
         for row_offset in 0..status_bar_height {
             let row = bar_top + row_offset;
             if row_offset + 1 == status_bar_height {
@@ -189,8 +194,18 @@ pub fn compose(
         grid,
         placements,
         cursor,
+        regions,
         cols,
         rows,
+    }
+}
+
+fn cell_rect(r: Rect) -> CellRect {
+    CellRect {
+        col: r.x.into(),
+        row: r.y.into(),
+        cols: r.width.into(),
+        rows: r.height.into(),
     }
 }
 

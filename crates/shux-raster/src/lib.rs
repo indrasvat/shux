@@ -90,12 +90,62 @@ pub const DEFAULT_FALLBACK_FONT_SPECS: &[&str] = &[
 ];
 
 #[derive(Clone, Copy)]
-struct GlyphDrawContext {
+struct GlyphDrawContext<'a> {
     x: u32,
     y: u32,
     cell_pixels_w: u32,
     fg: Rgb,
     style: CellStyle,
+    clip: Option<InkClip<'a>>,
+}
+
+/// The clip region each cell of a composed frame belongs to, for
+/// [`Rasterizer::render_regions`].
+struct InkRegions {
+    cols: usize,
+    cell_w: u32,
+    cell_h: u32,
+    ids: Vec<usize>,
+}
+
+impl InkRegions {
+    fn new(regions: &[shux_vt::CellRect], cols: usize, rows: usize, cell: (u32, u32)) -> Self {
+        let mut ids = vec![0; cols * rows];
+        for (i, r) in regions.iter().enumerate() {
+            for row in r.row..(r.row + r.rows).min(rows) {
+                for col in r.col..(r.col + r.cols).min(cols) {
+                    ids[row * cols + col] = i + 1;
+                }
+            }
+        }
+        Self {
+            cols,
+            cell_w: cell.0,
+            cell_h: cell.1,
+            ids,
+        }
+    }
+
+    fn clip_for(&self, row: usize, col: usize) -> InkClip<'_> {
+        InkClip {
+            regions: self,
+            id: self.ids.get(row * self.cols + col).copied().unwrap_or(0),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct InkClip<'a> {
+    regions: &'a InkRegions,
+    id: usize,
+}
+
+impl InkClip<'_> {
+    fn allows(self, px: u32, py: u32) -> bool {
+        let r = self.regions;
+        let (col, row) = ((px / r.cell_w) as usize, (py / r.cell_h) as usize);
+        col < r.cols && r.ids.get(row * r.cols + col) == Some(&self.id)
+    }
 }
 
 /// Resolve a builtin font token to embedded bytes.
@@ -331,6 +381,29 @@ impl Rasterizer {
 
     /// Render the visible grid to an RGBA image.
     pub fn render(&self, grid: &Grid, opts: &RasterOptions) -> RgbaImage {
+        self.render_inner(grid, opts, None)
+    }
+
+    /// Render a composed frame whose cells are split into `regions` (panes,
+    /// status bar): a glyph inks only pixels of its own region, so each pane
+    /// draws exactly as it does rendered alone. Cells in no region (borders)
+    /// share one region.
+    pub fn render_regions(
+        &self,
+        grid: &Grid,
+        opts: &RasterOptions,
+        regions: &[shux_vt::CellRect],
+    ) -> RgbaImage {
+        let map = InkRegions::new(regions, grid.cols(), grid.rows(), self.cell_size());
+        self.render_inner(grid, opts, Some(&map))
+    }
+
+    fn render_inner(
+        &self,
+        grid: &Grid,
+        opts: &RasterOptions,
+        regions: Option<&InkRegions>,
+    ) -> RgbaImage {
         let cols = grid.cols() as u32;
         let rows = grid.rows() as u32;
         let w = cols * self.cell_w;
@@ -372,7 +445,8 @@ impl Rasterizer {
                 let cursor_color = cursor_block_cell
                     .filter(|(cr, cc, _)| *cr == r && *cc == c)
                     .map(|(_, _, color)| color);
-                self.draw_cell(&mut img, r, c, cell, opts, cursor_color);
+                let clip = regions.map(|m| m.clip_for(r, c));
+                self.draw_cell(&mut img, r, c, cell, opts, cursor_color, clip);
             }
         }
 
@@ -509,6 +583,10 @@ impl Rasterizer {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one cell's position, content and paint, all of it needed"
+    )]
     fn draw_cell(
         &self,
         img: &mut RgbaImage,
@@ -517,6 +595,7 @@ impl Rasterizer {
         cell: &Cell,
         opts: &RasterOptions,
         cursor_block_color: Option<Rgb>,
+        clip: Option<InkClip<'_>>,
     ) {
         let x = col as u32 * self.cell_w;
         let y = row as u32 * self.cell_h;
@@ -558,6 +637,7 @@ impl Rasterizer {
                 cell_pixels_w,
                 fg,
                 style,
+                clip,
             };
             if cell.has_grapheme_payload() {
                 let scalars = text.chars().filter(|ch| *ch != '\0' && *ch != '\u{200d}');
@@ -599,7 +679,7 @@ impl Rasterizer {
         &self,
         img: &mut RgbaImage,
         ch: char,
-        ctx: GlyphDrawContext,
+        ctx: GlyphDrawContext<'_>,
         after_base: bool,
     ) {
         if ch == ' ' || ch == '\0' {
@@ -635,6 +715,7 @@ impl Rasterizer {
             glyph_y,
             metrics.width as u32,
             metrics.height as u32,
+            ctx.clip,
             &bitmap,
             ctx.fg,
         );
@@ -645,6 +726,7 @@ impl Rasterizer {
                 glyph_y,
                 metrics.width as u32,
                 metrics.height as u32,
+                ctx.clip,
                 &bitmap,
                 ctx.fg,
             );
@@ -787,7 +869,21 @@ fn set_pixel_rgb(img: &mut RgbaImage, x: u32, y: u32, rgb: Rgb) {
     }
 }
 
-fn blit_glyph(img: &mut RgbaImage, x: i32, y: i32, w: u32, h: u32, alpha: &[u8], fg: Rgb) {
+/// `clip`, when set, limits ink to the region of the glyph's own cell.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a blit's geometry, all of it needed"
+)]
+fn blit_glyph(
+    img: &mut RgbaImage,
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    clip: Option<InkClip<'_>>,
+    alpha: &[u8],
+    fg: Rgb,
+) {
     for j in 0..h {
         for i in 0..w {
             let idx = (j * w + i) as usize;
@@ -804,7 +900,7 @@ fn blit_glyph(img: &mut RgbaImage, x: i32, y: i32, w: u32, h: u32, alpha: &[u8],
                 continue;
             }
             let (px, py) = (px as u32, py as u32);
-            if px >= img.width() || py >= img.height() {
+            if px >= img.width() || py >= img.height() || clip.is_some_and(|c| !c.allows(px, py)) {
                 continue;
             }
             let dst = img.get_pixel_mut(px, py);
@@ -985,6 +1081,55 @@ mod tests {
         let (w, h) = r.cell_size();
         assert!((6..=20).contains(&w), "cell width out of range: {w}");
         assert!((12..=32).contains(&h), "cell height out of range: {h}");
+    }
+
+    /// A glyph taller than the font's ascent inks only its own region, not
+    /// the row above it.
+    #[test]
+    fn a_glyph_inks_only_its_own_region() {
+        let r = Rasterizer::new(14.0).unwrap();
+        let (_, ch) = r.cell_size();
+        let middle = [shux_vt::CellRect {
+            col: 0,
+            row: 1,
+            cols: 8,
+            rows: 1,
+        }];
+        for glyph in ["\u{e0a0}", "\u{2502}", "±", "ÅÉ", "gjpq", "|", "()[]{}"] {
+            let mut vt = VirtualTerminal::new(3, 8);
+            vt.process(
+                format!("\x1b[41m        \r\n\x1b[0m{glyph}\r\n\x1b[41m        ").as_bytes(),
+            );
+            let img = r.render_regions(vt.grid(), &RasterOptions::default(), &middle);
+            let red = *img.get_pixel(0, 0);
+            let bg = *img.get_pixel(img.width() - 1, ch);
+            assert!(
+                (ch..2 * ch).any(|y| (0..img.width()).any(|x| *img.get_pixel(x, y) != bg)),
+                "{glyph:?} drew nothing"
+            );
+            for x in 0..img.width() {
+                assert_eq!(
+                    *img.get_pixel(x, ch - 1),
+                    red,
+                    "{glyph:?} inked the region above at ({x}, {})",
+                    ch - 1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn box_drawing_ink_joins_the_row_above_without_regions() {
+        let r = Rasterizer::new(14.0).unwrap();
+        let (_, ch) = r.cell_size();
+        let mut vt = VirtualTerminal::new(2, 1);
+        vt.process("\r\n\u{2502}".as_bytes());
+        let img = r.render(vt.grid(), &RasterOptions::default());
+        let bg = *img.get_pixel(0, 0);
+        assert!(
+            (0..img.width()).any(|x| *img.get_pixel(x, ch - 1) != bg),
+            "a vertical line no longer reaches the row above, so stacked lines gap"
+        );
     }
 
     #[test]

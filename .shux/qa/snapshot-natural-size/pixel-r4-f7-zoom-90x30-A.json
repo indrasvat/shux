@@ -1,0 +1,1 @@
+{"actual":"out/head/zoom-90x30-crop-A.png","changed_pixels":0,"diff":"out/head/zoom-90x30-diff-A.png","expected":"out/head/zoom-90x30-pane-A.png","max_mean_channel_delta":0.0,"max_pixel_diff_ratio":0.0,"mean_rgba_channel_delta":0.0,"pixel_diff_ratio":0.0,"size":[810,551],"status":"pass","total_pixels":446310}

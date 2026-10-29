@@ -188,17 +188,34 @@ mod tests {
 
         assert_eq!(
             parse_snapshot_dims(&serde_json::json!({"cols": 80, "rows": 24})).unwrap(),
-            (80, 24)
+            (Some(80), Some(24))
         );
         assert_eq!(
             parse_snapshot_dims(&serde_json::json!({})).unwrap(),
-            (120, 36)
+            (None, None)
         );
         assert_eq!(
             parse_snapshot_dims(&serde_json::json!({"cols": 3, "rows": 24}))
                 .unwrap_err()
                 .code,
             shux_rpc::ErrorCode::InvalidParams.code()
+        );
+        // Not a size at all: refused, never read as "use the default".
+        for bad in [
+            serde_json::json!({"cols": "80"}),
+            serde_json::json!({"cols": -5}),
+            serde_json::json!({"cols": 80.5}),
+            serde_json::json!({"rows": true}),
+        ] {
+            assert_eq!(
+                parse_snapshot_dims(&bad).map_err(|e| e.code),
+                Err(shux_rpc::ErrorCode::InvalidParams.code()),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            parse_snapshot_dims(&serde_json::json!({"cols": null})).unwrap(),
+            (None, None)
         );
         assert_eq!(
             parse_expected_version(&serde_json::json!({})).unwrap(),

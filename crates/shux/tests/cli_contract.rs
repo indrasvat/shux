@@ -166,6 +166,38 @@ fn session_attach_refuses_without_a_terminal_instead_of_hanging() {
     );
 }
 
+/// `session create` attaches unless `-d` is given, so it owes the same refusal
+/// as `session attach` — and it must refuse BEFORE creating, or a script that
+/// forgot `-d` is left holding a session it was told failed.
+#[test]
+fn session_create_refuses_to_attach_without_a_terminal_and_creates_nothing() {
+    let env = Env::new();
+    let stderr = env.fails(&["session", "create", "notty"]);
+
+    assert!(
+        stderr.to_lowercase().contains("terminal") && stderr.contains("--detached"),
+        "the refusal must say why and name the flag that avoids it:\n---\n{stderr}\n---"
+    );
+    assert!(
+        !stderr.contains("enter raw mode") && !stderr.contains("\x1b["),
+        "the guard must fire before the terminal is touched:\n---\n{stderr}\n---"
+    );
+    let names: Vec<String> = env.json(&["session", "list"])["sessions"]
+        .as_array()
+        .expect("session array")
+        .iter()
+        .map(|s| s["name"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(
+        !names.iter().any(|n| n == "notty"),
+        "a refused `session create` still created the session: {names:?}"
+    );
+
+    // `-d` never needed a terminal.
+    env.ok(&["session", "create", "notty", "-d", "--cmd", PARK]);
+    let _ = env.run(&["session", "kill", "notty"]);
+}
+
 #[test]
 fn a_failing_command_prints_no_backtrace_by_default() {
     let env = Env::new();

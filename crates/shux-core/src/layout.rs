@@ -190,6 +190,82 @@ impl LayoutNode {
         }
     }
 
+    /// This layout with every split's ratio taken from the panes' own sizes,
+    /// and the smallest viewport (capped at `max` per axis) at which
+    /// [`Self::compute_rects`] gives every pane at least `size_of(pane)`.
+    /// Along a split the panes then fit exactly; across it the smaller side
+    /// keeps the slack, which no tiling can avoid. `None` when `size_of`
+    /// knows nothing about some pane.
+    pub fn fitted(
+        &self,
+        size_of: &impl Fn(PaneId) -> Option<(u16, u16)>,
+        max: u16,
+    ) -> Option<(LayoutNode, (u16, u16))> {
+        let (tree, (mut w, mut h)) = self.reratioed(size_of)?;
+        let deficit = |w: u16, h: u16, axis: fn(&Rect, (u16, u16)) -> u16| {
+            tree.compute_rects(Rect::new(0, 0, w, h))
+                .iter()
+                .filter_map(|(pane, rect)| size_of(*pane).map(|size| axis(rect, size)))
+                .max()
+                .unwrap_or(0)
+        };
+        // A clamped ratio can still leave a pane short. Widths depend only on
+        // the viewport's width and heights only on its height, so each axis
+        // grows on its own. A pane gains at most one cell per cell the
+        // viewport gains, so growing by the largest shortfall never passes
+        // the smallest viewport that fits.
+        loop {
+            let short = deficit(w, h, |r, (cols, _)| cols.saturating_sub(r.width));
+            if short == 0 || w >= max {
+                break;
+            }
+            w = w.saturating_add(short).min(max);
+        }
+        loop {
+            let short = deficit(w, h, |r, (_, rows)| rows.saturating_sub(r.height));
+            if short == 0 || h >= max {
+                break;
+            }
+            h = h.saturating_add(short).min(max);
+        }
+        let size = (w.min(max), h.min(max));
+        Some((tree, size))
+    }
+
+    /// This tree with each split's ratio taken from its sides' sizes, and
+    /// those sizes added along each split, a separator between: the lower
+    /// bound [`Self::fitted`] grows from.
+    fn reratioed(
+        &self,
+        size_of: &impl Fn(PaneId) -> Option<(u16, u16)>,
+    ) -> Option<(LayoutNode, (u16, u16))> {
+        match self {
+            Self::Leaf { pane } => Some((self.clone(), size_of(*pane)?)),
+            Self::Split { dir, a, b, .. } => {
+                let (a, (aw, ah)) = a.reratioed(size_of)?;
+                let (b, (bw, bh)) = b.reratioed(size_of)?;
+                let ((x, y), size) = match dir {
+                    Direction::Vertical => (
+                        (aw, bw),
+                        (
+                            aw.saturating_add(SEPARATOR_SIZE).saturating_add(bw),
+                            ah.max(bh),
+                        ),
+                    ),
+                    Direction::Horizontal => (
+                        (ah, bh),
+                        (
+                            aw.max(bw),
+                            ah.saturating_add(SEPARATOR_SIZE).saturating_add(bh),
+                        ),
+                    ),
+                };
+                let ratio = f32::from(x) / f32::from(x.saturating_add(y).max(1));
+                Some((LayoutNode::split(*dir, ratio, a, b), size))
+            }
+        }
+    }
+
     /// Compute the position and size of each pane given the available viewport.
     pub fn compute_rects(&self, viewport: Rect) -> Vec<(PaneId, Rect)> {
         let mut result = Vec::new();
@@ -568,6 +644,129 @@ mod tests {
             ),
         );
         assert_eq!(layout.pane_ids(), vec![p(1), p(2), p(3)]);
+    }
+
+    #[test]
+    fn fitted_is_the_viewport_compute_rects_inverts() {
+        let layout = LayoutNode::split(
+            Direction::Vertical,
+            0.5,
+            LayoutNode::leaf(p(1)),
+            LayoutNode::split(
+                Direction::Horizontal,
+                0.5,
+                LayoutNode::leaf(p(2)),
+                LayoutNode::leaf(p(3)),
+            ),
+        );
+        let sizes = |pane: PaneId| {
+            [(p(1), (80, 24)), (p(2), (80, 12)), (p(3), (80, 11))]
+                .into_iter()
+                .find(|(id, _)| *id == pane)
+                .map(|(_, size)| size)
+        };
+        let (tree, (w, h)) = layout.fitted(&sizes, 1000).expect("every pane sized");
+        assert_eq!((w, h), (161, 24));
+        for (pane, rect) in tree.compute_rects(Rect::new(0, 0, w, h)) {
+            assert_eq!(Some((rect.width, rect.height)), sizes(pane), "{pane:?}");
+        }
+        assert!(
+            layout
+                .fitted(&|pane| (pane != p(3)).then_some((1, 1)), 1000)
+                .is_none()
+        );
+    }
+
+    /// Grids that were never sized from the layout (a detached session's
+    /// panes all start 80x24, whatever the split ratios say) still fit
+    /// exactly along their splits: nothing cropped, no dead band.
+    #[test]
+    fn fitted_frames_grids_that_ignore_the_ratios_exactly() {
+        let chain = LayoutNode::split(
+            Direction::Vertical,
+            0.5,
+            LayoutNode::leaf(p(1)),
+            LayoutNode::split(
+                Direction::Vertical,
+                0.5,
+                LayoutNode::leaf(p(2)),
+                LayoutNode::leaf(p(3)),
+            ),
+        );
+        let skewed = LayoutNode::split(
+            Direction::Horizontal,
+            0.3,
+            LayoutNode::leaf(p(1)),
+            LayoutNode::leaf(p(2)),
+        );
+        let sizes = |_: PaneId| Some((80, 24));
+        for layout in [chain, skewed] {
+            let (tree, (w, h)) = layout.fitted(&sizes, 1000).expect("every pane sized");
+            for (pane, rect) in tree.compute_rects(Rect::new(0, 0, w, h)) {
+                assert_eq!(
+                    (rect.width, rect.height),
+                    (80, 24),
+                    "{pane:?} of a {w}x{h} viewport"
+                );
+            }
+        }
+    }
+
+    /// A ratio the clamp will not allow still leaves no pane short.
+    #[test]
+    fn fitted_crops_no_pane_past_the_ratio_clamp() {
+        let layout = LayoutNode::split(
+            Direction::Vertical,
+            0.5,
+            LayoutNode::leaf(p(1)),
+            LayoutNode::leaf(p(2)),
+        );
+        let sizes = |pane: PaneId| Some(if pane == p(1) { (4, 2) } else { (200, 2) });
+        let (tree, (w, h)) = layout.fitted(&sizes, 1000).expect("every pane sized");
+        for (pane, rect) in tree.compute_rects(Rect::new(0, 0, w, h)) {
+            let (cols, rows) = sizes(pane).expect("sized");
+            assert!(
+                rect.width >= cols && rect.height >= rows,
+                "{pane:?}: {rect:?}"
+            );
+        }
+    }
+
+    /// Clamped ratios compound down a chain; the fit still lands on the
+    /// smallest viewport that holds every pane, in a handful of passes
+    /// rather than one per cell of growth.
+    #[test]
+    fn fitted_reaches_the_smallest_fit_in_few_passes() {
+        let mut layout = LayoutNode::leaf(p(0));
+        for i in 1..=10 {
+            layout = LayoutNode::split(Direction::Vertical, 0.5, layout, LayoutNode::leaf(p(i)));
+        }
+        let size = |pane: PaneId| Some(if pane == p(0) { (2000, 2) } else { (1, 2) });
+        let fits = |tree: &LayoutNode, w: u16| {
+            tree.compute_rects(Rect::new(0, 0, w, 2))
+                .iter()
+                .all(|(pane, rect)| size(*pane).is_some_and(|(cols, _)| rect.width >= cols))
+        };
+        let lookups = std::cell::Cell::new(0usize);
+        let counted = |pane: PaneId| {
+            lookups.set(lookups.get() + 1);
+            size(pane)
+        };
+
+        let (tree, (w, _)) = layout.fitted(&counted, u16::MAX).expect("every pane sized");
+        let (_, (lower, _)) = layout.reratioed(&size).expect("every pane sized");
+        let smallest = (lower..=u16::MAX)
+            .find(|&w| fits(&tree, w))
+            .expect("some width fits");
+        assert_eq!(
+            w, smallest,
+            "fitted is not the smallest width that holds every pane"
+        );
+        assert!(
+            lookups.get() <= 20 * 11,
+            "{} pane-size lookups to fit 11 panes",
+            lookups.get()
+        );
     }
 
     // ── Ratio clamping ────────────────────────────────────────

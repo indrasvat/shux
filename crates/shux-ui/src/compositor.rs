@@ -155,6 +155,8 @@ pub struct RenderCompositor<W: Write> {
     /// position so cursor-only movement can still emit just `MoveTo`.
     terminal_cursor_visual: Option<CursorVisual>,
     cursor_state_known: bool,
+    /// Keep the terminal cursor hidden whatever the focused pane says.
+    cursor_hidden: bool,
     images: crate::kitty_emit::KittyEmitter,
 }
 
@@ -169,6 +171,7 @@ impl<W: Write> RenderCompositor<W> {
             terminal_cursor: None,
             terminal_cursor_visual: None,
             cursor_state_known: false,
+            cursor_hidden: false,
             images: crate::kitty_emit::KittyEmitter::default(),
         }
     }
@@ -341,6 +344,22 @@ impl<W: Write> RenderCompositor<W> {
     /// its terminal can draw them.
     pub fn set_graphics(&mut self, enabled: bool) {
         self.images.set_enabled(enabled);
+    }
+
+    /// Hide the terminal cursor from the next frame on, for an overlay that
+    /// draws its own (copy mode) or covers the focused pane (help).
+    pub fn set_cursor_hidden(&mut self, hidden: bool) {
+        self.cursor_hidden = hidden;
+    }
+
+    /// Put a showing terminal cursor back where the last frame left it.
+    /// Bytes written after a frame (an overlay) move it, and the next frame
+    /// only moves it when the pane's cursor moved.
+    pub fn restore_cursor(&mut self) -> io::Result<()> {
+        match self.terminal_cursor {
+            Some((x, y)) => self.backend.set_cursor(x, y),
+            None => Ok(()),
+        }
     }
 
     /// Force a full redraw on the next render pass. Call this after
@@ -644,6 +663,7 @@ impl<W: Write> RenderCompositor<W> {
             } else {
                 None
             };
+        let target_cursor = target_cursor.filter(|_| !self.cursor_hidden);
         self.render_dirty_and_cursor(&dirty, target_cursor)?;
         // Pictures go out AFTER the cells: a terminal that treats an image as a
         // cell attachment erases the slice under any later text write.

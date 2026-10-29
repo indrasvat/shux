@@ -75,6 +75,9 @@ pub struct ClientConfig {
     pub prefix_key: KeyEvent,
     /// User keybinding overrides from `[keybindings]`.
     pub keybindings: std::collections::HashMap<String, String>,
+    /// The live config `prefix` and `keybindings` were read from. When set,
+    /// the attach loop rebuilds its bindings whenever it reloads.
+    pub live_config: Option<shux_core::config::ConfigHandle>,
 }
 
 impl Default for ClientConfig {
@@ -85,6 +88,7 @@ impl Default for ClientConfig {
             prefix: "ctrl-space".to_string(),
             prefix_key: KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL),
             keybindings: std::collections::HashMap::new(),
+            live_config: None,
         }
     }
 }

@@ -422,15 +422,19 @@ pub async fn handle_snapshot(
     session: Option<&str>,
     window: Option<&str>,
     output: Option<std::path::PathBuf>,
-    cols: u16,
-    rows: u16,
+    cols: Option<u16>,
+    rows: Option<u16>,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
     use base64::Engine;
 
     let mut params = serde_json::Map::new();
-    params.insert("cols".into(), serde_json::Value::from(cols));
-    params.insert("rows".into(), serde_json::Value::from(rows));
+    if let Some(cols) = cols {
+        params.insert("cols".into(), serde_json::Value::from(cols));
+    }
+    if let Some(rows) = rows {
+        params.insert("rows".into(), serde_json::Value::from(rows));
+    }
 
     let method = match (session, window) {
         (Some(s), Some(w)) => {

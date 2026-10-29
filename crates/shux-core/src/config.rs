@@ -246,7 +246,7 @@ fn default_interval_ms() -> u64 {
 }
 
 /// A live, hot-reloadable handle to the current config. Cheap to clone.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ConfigHandle {
     inner: Arc<ArcSwap<Config>>,
     notify: Arc<Notify>,

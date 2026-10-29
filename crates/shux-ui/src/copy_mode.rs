@@ -778,6 +778,9 @@ fn write_style(buf: &mut Vec<u8>, cell: &shux_vt::Cell) {
     if flags.contains(CellFlags::INVERSE) {
         let _ = write!(buf, "\x1b[7m");
     }
+    if flags.contains(CellFlags::HIDDEN) {
+        let _ = write!(buf, "\x1b[8m");
+    }
     if flags.contains(CellFlags::STRIKETHROUGH) {
         let _ = write!(buf, "\x1b[9m");
     }
@@ -869,23 +872,6 @@ fn render_copy_overlay_inner(
 
     render_selection_overlay_inner(buf, pane, vt, state, theme);
 
-    // Cursor block — high-contrast inversion of the selection
-    // palette so it stays visible whether or not it sits inside a
-    // selection run. Selection draws fg=accent on bg=status_bg; the
-    // cursor uses fg=status_bg on bg=status_fg (white-ish text bg),
-    // which pops against both the selection band and bare pane
-    // content.
-    let (cx, cy) = state.cursor;
-    if cx < pane.width && cy < pane.height {
-        cursor_block(
-            buf,
-            pane.x + cx,
-            pane.y + cy,
-            theme.status_bg,
-            theme.status_fg,
-        );
-    }
-
     // Status-line hint at the bottom row of the pane: shows current
     // mode and dismiss/yank shortcuts. The text width changes with
     // selection state (`v select` disappears once an anchor is set),
@@ -916,6 +902,24 @@ fn render_copy_overlay_inner(
         truncated,
         " ".repeat(pad),
     );
+
+    // Cursor block, after the hint so it shows on the hint's row too: the
+    // selection palette inverted (fg=status_bg on bg=status_fg), so it stays
+    // visible inside a selection run and over bare pane content.
+    let (cx, cy) = state.cursor;
+    if cx < pane.width && cy < pane.height {
+        let (col, glyph) = vt
+            .and_then(|vt| cursor_glyph(vt, pane, state))
+            .unwrap_or((cx, " ".to_string()));
+        cursor_block(
+            buf,
+            pane.x + col,
+            pane.y + cy,
+            &glyph,
+            theme.status_bg,
+            theme.status_fg,
+        );
+    }
 }
 
 fn render_selection_overlay_inner(
@@ -1061,7 +1065,7 @@ fn selection_text_run(
         let text = row_ref
             .get(col as usize)
             .filter(|cell| !cell.is_wide_continuation())
-            .map(|cell| cell.display_text().into_owned())
+            .map(shown_text)
             .unwrap_or_else(|| " ".to_string());
         let _ = write!(
             buf,
@@ -1108,10 +1112,42 @@ fn highlight_run(
     );
 }
 
-fn cursor_block(buf: &mut Vec<u8>, x: u16, y: u16, fg: Rgb, bg: Rgb) {
+/// The pane column the cursor block starts at, and the glyph it shows. On the
+/// right half of a wide character that is the character's own cell, so the
+/// block covers the whole glyph instead of splitting it.
+fn cursor_glyph(vt: &VirtualTerminal, pane: Rect, state: &CopyModeState) -> Option<(u16, String)> {
+    let (cx, cy) = state.cursor;
+    let row = row_for_view(vt, pane.height, state.scroll_offset, cy)?;
+    let mut col = cx;
+    let mut cell = row.get(col as usize)?;
+    if cell.is_wide_continuation() {
+        col = col.checked_sub(1)?;
+        cell = row.get(col as usize)?;
+    }
+    // A wide glyph with no room for its right half would spill past the pane.
+    if cell.is_wide() && col + 1 >= pane.width {
+        return None;
+    }
+    Some((col, shown_text(cell)))
+}
+
+/// What an overlay that recolours `cell` may show of it: concealed (SGR 8)
+/// text becomes blanks of the same width, an empty cell a blank.
+fn shown_text(cell: &shux_vt::Cell) -> String {
+    let text = cell.display_text();
+    if cell.style.flags.contains(CellFlags::HIDDEN) {
+        " ".repeat(if cell.is_wide() { 2 } else { 1 })
+    } else if text.is_empty() {
+        " ".into()
+    } else {
+        text.into_owned()
+    }
+}
+
+fn cursor_block(buf: &mut Vec<u8>, x: u16, y: u16, glyph: &str, fg: Rgb, bg: Rgb) {
     let _ = write!(
         buf,
-        "\x1b[{};{}H{}{} \x1b[0m",
+        "\x1b[{};{}H{}{}{glyph}\x1b[0m",
         y + 1,
         x + 1,
         sgr_bg(bg),
@@ -1488,6 +1524,133 @@ mod tests {
             rendered.contains("\x1b[38;2;30;32;48m"),
             "selection should use dark foreground on accent background"
         );
+    }
+
+    /// Draw the overlay into a fresh VT and read back the cell at `(col, row)`.
+    fn overlay_cell(
+        vt: &VirtualTerminal,
+        pane: Rect,
+        state: &CopyModeState,
+        col: u16,
+        row: u16,
+    ) -> shux_vt::Cell {
+        let mut buf = Vec::new();
+        render_copy_overlay_with_vt_into(&mut buf, pane, vt, state, &Theme::DEFAULT);
+        let mut screen = VirtualTerminal::new(pane.height as usize, pane.width as usize);
+        screen.process(&buf);
+        row_for_view(&screen, pane.height, 0, row)
+            .and_then(|r| r.get(col as usize).cloned())
+            .expect("cell on screen")
+    }
+
+    fn cursor_colours(cell: &shux_vt::Cell) {
+        let (bg, fg) = (Theme::DEFAULT.status_bg, Theme::DEFAULT.status_fg);
+        assert_eq!(
+            (cell.style.fg, cell.style.bg),
+            (Color::Rgb(bg.r, bg.g, bg.b), Color::Rgb(fg.r, fg.g, fg.b)),
+            "the cursor cell is not in the cursor colours"
+        );
+    }
+
+    #[test]
+    fn the_copy_cursor_shows_the_glyph_under_it() {
+        let vt = vt_with(
+            3,
+            20,
+            "\x1b[38;2;120;220;180mTRUECOLOR\x1b[0m \x1b[38;5;208mINDEXED\x1b[0m \x1b[34mBASIC\x1b[0m",
+        );
+        let pane = Rect::new(0, 0, 20, 3);
+        let state = CopyModeState {
+            cursor: (0, 0),
+            ..Default::default()
+        };
+        let cell = overlay_cell(&vt, pane, &state, 0, 0);
+        assert_eq!(
+            cell.display_text(),
+            "T",
+            "the cursor blanked the glyph under it"
+        );
+        cursor_colours(&cell);
+    }
+
+    #[test]
+    fn the_copy_cursor_covers_a_wide_glyph_from_either_half() {
+        let vt = vt_with(3, 20, "a漢b");
+        let pane = Rect::new(0, 0, 20, 3);
+        for col in [1, 2] {
+            let state = CopyModeState {
+                cursor: (col, 0),
+                ..Default::default()
+            };
+            let cell = overlay_cell(&vt, pane, &state, 1, 0);
+            assert_eq!(
+                cell.display_text(),
+                "漢",
+                "cursor at col {col} split or blanked the wide glyph"
+            );
+            assert!(cell.is_wide());
+            cursor_colours(&cell);
+        }
+    }
+
+    /// Concealed text (SGR 8) stays concealed under the copy cursor, narrow
+    /// and wide, and inside a selection.
+    #[test]
+    fn copy_mode_keeps_concealed_text_concealed() {
+        let vt = vt_with(3, 20, "\x1b[8mSECRET\u{6f22}\x1b[0m");
+        let pane = Rect::new(0, 0, 20, 3);
+        for (cursor, block) in [(0, 0), (6, 6), (7, 6)] {
+            let state = CopyModeState {
+                cursor: (cursor, 0),
+                ..Default::default()
+            };
+            let cell = overlay_cell(&vt, pane, &state, block, 0);
+            assert!(
+                cell.display_text().trim().is_empty(),
+                "the copy cursor at col {cursor} showed concealed {:?}",
+                cell.display_text()
+            );
+            cursor_colours(&cell);
+        }
+
+        let state = CopyModeState {
+            cursor: (5, 0),
+            anchor: Some((0, 0)),
+            ..Default::default()
+        };
+        let cell = overlay_cell(&vt, pane, &state, 2, 0);
+        assert!(
+            cell.display_text().trim().is_empty(),
+            "the selection showed concealed {:?}",
+            cell.display_text()
+        );
+
+        let mut buf = Vec::new();
+        render_copy_view_into(&mut buf, pane, &vt, &CopyModeState::default());
+        let mut screen = VirtualTerminal::new(pane.height as usize, pane.width as usize);
+        screen.process(&buf);
+        let cell = row_for_view(&screen, pane.height, 0, 0)
+            .and_then(|r| r.get(2).cloned())
+            .expect("cell on screen");
+        assert!(
+            cell.style.flags.contains(CellFlags::HIDDEN),
+            "the copy view drew concealed {:?} unconcealed",
+            cell.display_text()
+        );
+    }
+
+    /// The hint bar sits on the pane's last row, which the cursor can reach.
+    #[test]
+    fn the_copy_cursor_shows_over_the_hint_bar() {
+        let vt = vt_with(3, 20, "one\r\ntwo\r\nXYZ");
+        let pane = Rect::new(0, 0, 20, 3);
+        let state = CopyModeState {
+            cursor: (2, 2),
+            ..Default::default()
+        };
+        let cell = overlay_cell(&vt, pane, &state, 2, 2);
+        assert_eq!(cell.display_text(), "Z", "the hint bar covered the cursor");
+        cursor_colours(&cell);
     }
 
     #[test]

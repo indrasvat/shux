@@ -148,19 +148,21 @@ const SECTIONS: &[Section] = &[
     },
 ];
 
-/// Default prefix label. Updated when the keybinding system supports
-/// configurable prefixes.
-const PREFIX_LABEL: &str = "Ctrl+Space";
-
 /// Append ANSI bytes that draw a centered rounded box with the cheat
-/// sheet over `cols × rows`. Caller is responsible for forcing a full
-/// redraw on the next frame so the cells UNDER the overlay come back
-/// when the user dismisses it.
+/// sheet over `cols × rows`, naming `prefix_label` as the prefix. Caller
+/// is responsible for forcing a full redraw on the next frame so the cells
+/// UNDER the overlay come back when the user dismisses it.
 ///
 /// The function never panics on small terminals — if the box would
-/// not fit, it falls back to a single-line "Help: prefix + ? to view"
+/// not fit, it falls back to a single-line "<prefix> + ? for help"
 /// hint at the top so users still get a discoverability cue.
-pub fn render_help_overlay_into(buf: &mut Vec<u8>, cols: u16, rows: u16, theme: &Theme) {
+pub fn render_help_overlay_into(
+    buf: &mut Vec<u8>,
+    cols: u16,
+    rows: u16,
+    theme: &Theme,
+    prefix_label: &str,
+) {
     let cols = cols as usize;
     let rows = rows as usize;
     if cols < 8 || rows < 4 {
@@ -174,7 +176,7 @@ pub fn render_help_overlay_into(buf: &mut Vec<u8>, cols: u16, rows: u16, theme: 
         .map(|s| display_width(s))
         .max()
         .unwrap_or(0);
-    let title = format!(" shux — keybindings (prefix = {PREFIX_LABEL}) ");
+    let title = format!(" shux — keybindings (prefix = {prefix_label}) ");
     let title_w = display_width(&title);
     let inner_w = inner_w.max(title_w).max(40);
 
@@ -185,7 +187,7 @@ pub fn render_help_overlay_into(buf: &mut Vec<u8>, cols: u16, rows: u16, theme: 
 
     // If it doesn't fit, render a single-line hint instead.
     if box_w + 2 > cols || box_h + 2 > rows {
-        write_hint_line(buf, cols, theme);
+        write_hint_line(buf, cols, theme, prefix_label);
         return;
     }
 
@@ -313,8 +315,8 @@ fn build_body_lines() -> Vec<String> {
     out
 }
 
-fn write_hint_line(buf: &mut Vec<u8>, cols: usize, theme: &Theme) {
-    let hint = format!(" {PREFIX_LABEL} + ?  for help ");
+fn write_hint_line(buf: &mut Vec<u8>, cols: usize, theme: &Theme, prefix_label: &str) {
+    let hint = format!(" {prefix_label} + ?  for help ");
     let hint_w = display_width(&hint);
     if hint_w + 2 > cols {
         return;
@@ -353,7 +355,7 @@ mod tests {
         const MIN_ROWS: u16 = 37;
         let render = |rows: u16| {
             let mut buf = Vec::new();
-            render_help_overlay_into(&mut buf, 120, rows, &Theme::DEFAULT);
+            render_help_overlay_into(&mut buf, 120, rows, &Theme::DEFAULT, "^Sp");
             String::from_utf8_lossy(&buf).into_owned()
         };
         // A row from the LAST section -- proves the whole table rendered.
@@ -374,7 +376,7 @@ mod tests {
         // 100×40 is comfortably larger than the box: 4 sections + the
         // copy-mode block grow the body to ~22 lines, plus title and
         // chrome.
-        render_help_overlay_into(&mut buf, 100, 40, &Theme::DEFAULT);
+        render_help_overlay_into(&mut buf, 100, 40, &Theme::DEFAULT, "^Sp");
         let s = String::from_utf8_lossy(&buf);
         assert!(s.contains("Pane focus"), "missing 'Pane focus' section");
         assert!(s.contains("Copy mode"), "missing 'Copy mode' section");
@@ -385,7 +387,7 @@ mod tests {
     #[test]
     fn falls_back_to_hint_for_tiny_terminal() {
         let mut buf = Vec::new();
-        render_help_overlay_into(&mut buf, 30, 5, &Theme::DEFAULT);
+        render_help_overlay_into(&mut buf, 30, 5, &Theme::DEFAULT, "^Sp");
         let s = String::from_utf8_lossy(&buf);
         // Tiny: should only emit the single-line hint, no section title.
         assert!(!s.contains("Pane focus"));
@@ -393,9 +395,31 @@ mod tests {
     }
 
     #[test]
+    fn the_overlay_and_its_fallback_name_the_prefix_they_are_given() {
+        let render = |cols, rows| {
+            let mut buf = Vec::new();
+            render_help_overlay_into(&mut buf, cols, rows, &Theme::DEFAULT, "^B");
+            String::from_utf8_lossy(&buf).into_owned()
+        };
+        let full = render(120, 40);
+        assert!(
+            full.contains("keybindings (prefix = ^B)"),
+            "title: {full:?}"
+        );
+        let hint = render(30, 5);
+        assert!(
+            hint.contains(" ^B + ?  for help "),
+            "fallback hint: {hint:?}"
+        );
+        for s in [full, hint] {
+            assert!(!s.contains("Ctrl+Space"), "a default prefix is still named");
+        }
+    }
+
+    #[test]
     fn produces_no_output_when_terminal_too_small() {
         let mut buf = Vec::new();
-        render_help_overlay_into(&mut buf, 4, 2, &Theme::DEFAULT);
+        render_help_overlay_into(&mut buf, 4, 2, &Theme::DEFAULT, "^Sp");
         assert!(buf.is_empty());
     }
 
