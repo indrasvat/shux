@@ -149,12 +149,12 @@ const SECTIONS: &[Section] = &[
 ];
 
 /// Append ANSI bytes that draw a centered rounded box with the cheat
-/// sheet over `cols × rows`, naming `prefix_label` as the prefix. Caller is responsible for forcing a full
-/// redraw on the next frame so the cells UNDER the overlay come back
-/// when the user dismisses it.
+/// sheet over `cols × rows`, naming `prefix_label` as the prefix. Caller
+/// is responsible for forcing a full redraw on the next frame so the cells
+/// UNDER the overlay come back when the user dismisses it.
 ///
 /// The function never panics on small terminals — if the box would
-/// not fit, it falls back to a single-line "Help: prefix + ? to view"
+/// not fit, it falls back to a single-line "<prefix> + ? for help"
 /// hint at the top so users still get a discoverability cue.
 pub fn render_help_overlay_into(
     buf: &mut Vec<u8>,

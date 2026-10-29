@@ -1538,14 +1538,13 @@ mod tests {
             .expect("cell on screen")
     }
 
-    fn cursor_colours(cell: &shux_vt::Cell) -> (Color, Color) {
+    fn cursor_colours(cell: &shux_vt::Cell) {
         let (bg, fg) = (Theme::DEFAULT.status_bg, Theme::DEFAULT.status_fg);
         assert_eq!(
             (cell.style.fg, cell.style.bg),
             (Color::Rgb(bg.r, bg.g, bg.b), Color::Rgb(fg.r, fg.g, fg.b)),
             "the cursor cell is not in the cursor colours"
         );
-        (cell.style.fg, cell.style.bg)
     }
 
     #[test]

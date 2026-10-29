@@ -182,8 +182,7 @@ impl Drop for Env {
 
 /// The help overlay names the prefix the client is using, and follows it when
 /// a hot-reload changes it. The last step presses the NEW prefix: a label that
-/// moved while the client kept the old key would name a key that does nothing,
-/// which is the bug this replaces.
+/// moved while the client kept the old key would name a key that does nothing.
 #[test]
 fn the_help_overlay_names_the_configured_prefix_through_a_reload() {
     let env = Env::attached(&keys_config("ctrl-a"));
@@ -208,8 +207,8 @@ fn the_help_overlay_names_the_configured_prefix_through_a_reload() {
 }
 
 /// The copy-mode cursor shows the character under it, in the cursor colours,
-/// narrow and wide alike. Before the fix it drew a literal space, so the probe
-/// read `RUECOLOR` with the cursor on its `T`.
+/// narrow and wide alike: with the cursor on its `T`, the probe still reads
+/// `TRUECOLOR`.
 #[test]
 fn the_copy_mode_cursor_keeps_the_character_under_it() {
     let env = Env::attached(&keys_config("ctrl-a"));

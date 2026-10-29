@@ -126,6 +126,8 @@ pub(crate) fn preview_for_log(s: &str, n: usize) -> String {
 /// Default snapshot grid when the window's own size can't be worked out.
 const FALLBACK_DIMS: (u16, u16) = (120, 36);
 
+const STATUS_BAR_ROWS: u16 = 1;
+
 /// Parse optional `cols` / `rows` from snapshot params. Same range guard as
 /// `pane.set_size`. An absent dimension is `None`: `snapshot_window` fills it
 /// from the window's real size.
@@ -148,14 +150,13 @@ pub(crate) fn parse_snapshot_dims(
     Ok((cols.map(|c| c as u16), rows.map(|r| r as u16)))
 }
 
-/// The frame a window's panes fill exactly at their current grid sizes: the
+/// The frame that fits the window's panes at their current grid sizes: the
 /// outline ring and status bar around the layout's natural size. A frame any
 /// bigger draws the outline around space no pane has.
 fn natural_frame_dims(
     layout: &shux_core::layout::WindowLayout,
     pane_data: &[PaneSnapshotData],
     border_style: shux_ui::BorderStyle,
-    status_rows: u16,
 ) -> Option<(u16, u16)> {
     let size_of = |pane| {
         pane_data
@@ -166,18 +167,18 @@ fn natural_frame_dims(
     let (cols, rows) = match &layout.zoom {
         Some(zoom) => size_of(zoom.zoomed_pane)?,
         None => {
-            let (w, h) = layout.tree.natural_size(&size_of)?;
             let ring = if border_style == shux_ui::BorderStyle::None {
                 0
             } else {
                 2
             };
+            let (w, h) = layout.tree.natural_size(&size_of, 1000 - ring)?;
             (w.saturating_add(ring), h.saturating_add(ring))
         }
     };
     Some((
         cols.clamp(4, 1000),
-        rows.saturating_add(status_rows).clamp(2, 1000),
+        rows.saturating_add(STATUS_BAR_ROWS).clamp(2, 1000),
     ))
 }
 
@@ -266,9 +267,8 @@ pub(crate) async fn snapshot_window(
     // Compose with the user's outline style: `compose` derives the pane viewport
     // from it, so a hardcoded style crops panes under `border_style = "none"`.
     let border_style = shux_ui::BorderStyle::parse(&cfg.appearance.border_style);
-    const STATUS_BAR_ROWS: u16 = 1;
-    let natural = natural_frame_dims(&window.layout, &pane_data, border_style, STATUS_BAR_ROWS)
-        .unwrap_or(FALLBACK_DIMS);
+    let natural =
+        natural_frame_dims(&window.layout, &pane_data, border_style).unwrap_or(FALLBACK_DIMS);
     let (cols, rows) = (cols.unwrap_or(natural.0), rows.unwrap_or(natural.1));
 
     let (cw, ch) = rasterizer.cell_size();

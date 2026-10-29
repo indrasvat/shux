@@ -2,10 +2,7 @@
 //! panes really are, unless the caller asks for another size.
 //!
 //! The pane outline is drawn around the layout rect, so a frame wider than the
-//! panes draws a box with dead space inside it: an 80-column pane came back
-//! framed at 120 columns, with the text wrapped at column 80 and a blank band to
-//! the right that no terminal ever showed. `pane snapshot` renders the grid at
-//! its own size, so the two disagreed about the same pane.
+//! panes draws a box with dead space inside it that no terminal ever showed.
 //!
 //! Daemon-backed and black-box. Every pane prints the three colour bars
 //! (truecolor + indexed + basic) so a monochrome regression cannot pass.
@@ -91,7 +88,7 @@ fn a_snapshot_without_dims_frames_the_pane_at_its_real_size() {
         assert_bars(&img, cw, ch, 1, 1, method);
     }
 
-    // The CLI is what people type, and it used to send 120x36 itself.
+    // The CLI is what people type; it must not send dims of its own.
     let dir = tempfile::tempdir().expect("tempdir");
     let out_png = dir.path().join("session.png");
     let out = h.cli(&[

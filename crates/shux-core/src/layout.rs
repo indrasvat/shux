@@ -190,19 +190,41 @@ impl LayoutNode {
         }
     }
 
-    /// The smallest viewport `(width, height)` that holds every pane at
-    /// `size_of(pane)`: side by side the widths add up with a separator
-    /// between them and the taller pane sets the height, and stacked the
-    /// reverse. `None` when `size_of` knows nothing about some pane.
+    /// The smallest viewport `(width, height)` whose [`Self::compute_rects`]
+    /// gives every pane at least `size_of(pane)`, capped at `max` per axis.
+    /// Grids sized from this layout fill it exactly; grids that ignore the
+    /// ratios get the slack instead of being cropped. `None` when `size_of`
+    /// knows nothing about some pane.
     pub fn natural_size(
         &self,
         size_of: &impl Fn(PaneId) -> Option<(u16, u16)>,
+        max: u16,
     ) -> Option<(u16, u16)> {
+        let (mut w, mut h) = self.summed_size(size_of)?;
+        let short = |w: u16, h: u16, axis: fn(&Rect, (u16, u16)) -> bool| {
+            self.compute_rects(Rect::new(0, 0, w, h))
+                .iter()
+                .any(|(pane, rect)| size_of(*pane).is_some_and(|size| axis(rect, size)))
+        };
+        // Widths depend only on the viewport's width and heights only on its
+        // height, so each axis grows on its own.
+        while w < max && short(w, h, |r, (cols, _)| r.width < cols) {
+            w += 1;
+        }
+        while h < max && short(w, h, |r, (_, rows)| r.height < rows) {
+            h += 1;
+        }
+        Some((w.min(max), h.min(max)))
+    }
+
+    /// Sizes added along each split, a separator between: the lower bound
+    /// [`Self::natural_size`] grows from.
+    fn summed_size(&self, size_of: &impl Fn(PaneId) -> Option<(u16, u16)>) -> Option<(u16, u16)> {
         match self {
             Self::Leaf { pane } => size_of(*pane),
             Self::Split { dir, a, b, .. } => {
-                let (aw, ah) = a.natural_size(size_of)?;
-                let (bw, bh) = b.natural_size(size_of)?;
+                let (aw, ah) = a.summed_size(size_of)?;
+                let (bw, bh) = b.summed_size(size_of)?;
                 Some(match dir {
                     Direction::Vertical => (
                         aw.saturating_add(SEPARATOR_SIZE).saturating_add(bw),
@@ -616,15 +638,49 @@ mod tests {
                 .find(|(id, _)| *id == pane)
                 .map(|(_, size)| size)
         };
-        let (w, h) = layout.natural_size(&sizes).expect("every pane sized");
+        let (w, h) = layout.natural_size(&sizes, 1000).expect("every pane sized");
         assert_eq!((w, h), (161, 24));
         for (pane, rect) in layout.compute_rects(Rect::new(0, 0, w, h)) {
             assert_eq!(Some((rect.width, rect.height)), sizes(pane), "{pane:?}");
         }
         assert_eq!(
-            layout.natural_size(&|pane| (pane != p(3)).then_some((1, 1))),
+            layout.natural_size(&|pane| (pane != p(3)).then_some((1, 1)), 1000),
             None
         );
+    }
+
+    /// Grids that were never sized from the layout (a detached session's
+    /// panes all start 80x24, whatever the split ratios say) still each get a
+    /// rect at least their size: nothing is cropped.
+    #[test]
+    fn natural_size_crops_no_pane_whose_grid_ignores_the_ratios() {
+        let nested = LayoutNode::split(
+            Direction::Vertical,
+            0.5,
+            LayoutNode::leaf(p(1)),
+            LayoutNode::split(
+                Direction::Vertical,
+                0.5,
+                LayoutNode::leaf(p(2)),
+                LayoutNode::leaf(p(3)),
+            ),
+        );
+        let skewed = LayoutNode::split(
+            Direction::Horizontal,
+            0.3,
+            LayoutNode::leaf(p(1)),
+            LayoutNode::leaf(p(2)),
+        );
+        let sizes = |_: PaneId| Some((80, 24));
+        for layout in [nested, skewed] {
+            let (w, h) = layout.natural_size(&sizes, 1000).expect("every pane sized");
+            for (pane, rect) in layout.compute_rects(Rect::new(0, 0, w, h)) {
+                assert!(
+                    rect.width >= 80 && rect.height >= 24,
+                    "{pane:?} gets {rect:?} of a {w}x{h} viewport, cropping its 80x24 grid"
+                );
+            }
+        }
     }
 
     // ── Ratio clamping ────────────────────────────────────────

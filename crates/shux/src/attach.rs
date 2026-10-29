@@ -1234,7 +1234,7 @@ async fn run_attach_loop(
                         render_session.lock().await.action_error = action_result
                             .as_ref()
                             .err()
-                            .map(|e| format!("{} failed: {e}", action_verb(kind)));
+                            .map(|e| action_failure_notice(kind, e));
 
                         // Transient command-feedback overlay in the status
                         // bar's center zone. Resolves the "did my keystroke
@@ -1892,13 +1892,15 @@ const RENDER_PART_BYTES: usize = 8 * 1024 * 1024;
 /// not get in the way".
 const WELCOME_TOAST_DWELL: Duration = Duration::from_secs(3);
 
-/// What the status bar calls an action when it fails: `"<verb> failed: …"`.
-fn action_verb(kind: ActionKind) -> &'static str {
-    match kind {
+/// The status-bar line for a failed action: `"<verb> failed: <reason>"`.
+fn action_failure_notice(kind: ActionKind, e: &anyhow::Error) -> String {
+    let verb = match kind {
         ActionKind::SplitVertical | ActionKind::SplitHorizontal | ActionKind::SplitSmart => "split",
         ActionKind::NewWindow => "new window",
+        ActionKind::ToggleZoom => "zoom",
         _ => "action",
-    }
+    };
+    format!("{verb} failed: {e}")
 }
 
 // build_status_bar + StatusBarCtx + helpers (action_feedback_label,
@@ -3534,7 +3536,7 @@ async fn split(
     let new_pane = graph
         .split_pane(attached.active_pane_id, direction, 0.5)
         .await
-        .map_err(|e| anyhow::anyhow!("split failed: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // A PTY that never started is not a pane: left in the graph it is focused,
     // drawn, and answers "pane VT not found" to every later verb. A default
@@ -3625,7 +3627,7 @@ async fn zoom(graph: &GraphHandle, attached: &AttachedSession) -> anyhow::Result
     let _ = graph
         .zoom_pane(attached.active_pane_id, None)
         .await
-        .map_err(|e| anyhow::anyhow!("zoom failed: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(())
 }
 
@@ -4495,6 +4497,32 @@ mod tests {
             }
         }
 
+        fixture.stop();
+    }
+
+    #[tokio::test]
+    async fn a_failed_split_or_zoom_says_failed_once() {
+        let fixture = attach_fixture().await;
+        let mut gone = fixture.attached.clone();
+        gone.active_pane_id = PaneId::new();
+        let session = Arc::new(Mutex::new(gone));
+        let client_size = Arc::new(Mutex::new((100, 30)));
+        for kind in [ActionKind::SplitVertical, ActionKind::ToggleZoom] {
+            let e = handle_action(
+                kind,
+                Default::default(),
+                &fixture.graph,
+                &fixture.io_state,
+                &session,
+                &client_size,
+                &test_config(),
+                &fixture.cancel,
+            )
+            .await
+            .expect_err("acting on a pane that is gone");
+            let notice = action_failure_notice(kind, &e);
+            assert_eq!(notice.matches("failed").count(), 1, "{notice:?}");
+        }
         fixture.stop();
     }
 
