@@ -64,29 +64,33 @@ pub async fn handle_version(
     use crate::client::{DaemonAnswer, VERSION_CHECK_TIMEOUT};
 
     let cli = (env!("CARGO_PKG_VERSION"), env!("SHUX_GIT_SHA"));
-    let answer = crate::client::ask_daemon_version(socket_path).await;
-    // Whether the next command that needs the daemon replaces it.
-    let mismatch = match &answer {
-        DaemonAnswer::Answered(dv) => Some(!dv.is_current()),
-        DaemonAnswer::Unreadable => Some(true),
-        _ => None,
-    };
-    // `None`: no daemon. `Err`: one is there but did not say which build.
-    let daemon = match &answer {
-        DaemonAnswer::Absent => None,
-        DaemonAnswer::Answered(dv) => Some(Ok(dv)),
-        DaemonAnswer::Unreadable => Some(Err((
-            "unreadable",
-            "it answered without a version".to_string(),
-        ))),
-        DaemonAnswer::Unresponsive => Some(Err((
-            "unresponsive",
-            format!(
-                "it did not answer within {}s",
-                VERSION_CHECK_TIMEOUT.as_secs()
-            ),
-        ))),
-        DaemonAnswer::Unreachable(e) => Some(Err(("unreachable", e.to_string()))),
+    // `daemon`: `None` when no daemon serves the socket, `Err` when one is
+    // there but did not say which build. `mismatch`: whether the next command
+    // that needs the daemon replaces it.
+    let (daemon, mismatch) = match crate::client::ask_daemon_version(socket_path).await {
+        DaemonAnswer::Absent => (None, None),
+        DaemonAnswer::Answered(dv) => {
+            let stale = !dv.is_current();
+            (Some(Ok(dv)), Some(stale))
+        }
+        DaemonAnswer::Unreadable => (
+            Some(Err((
+                "unreadable",
+                "it answered without a version".to_string(),
+            ))),
+            Some(true),
+        ),
+        DaemonAnswer::Unresponsive => (
+            Some(Err((
+                "unresponsive",
+                format!(
+                    "it did not answer within {}s",
+                    VERSION_CHECK_TIMEOUT.as_secs()
+                ),
+            ))),
+            None,
+        ),
+        DaemonAnswer::Unreachable(e) => (Some(Err(("unreachable", e.to_string()))), None),
     };
 
     match format {
@@ -127,25 +131,23 @@ pub async fn handle_version(
             crate::style::print_version_plain(cli, status, found, mismatch);
         }
         OutputFormat::Text => {
-            let replaced = |why: &str| {
-                format!("{why}; the next shux command restarts it, ending its sessions")
-            };
+            crate::style::print_version(
+                cli.0,
+                Some(cli.1),
+                daemon.is_none().then_some("daemon not running"),
+            );
             match &daemon {
-                None => {
-                    crate::style::print_version(cli.0, Some(cli.1), Some("daemon not running"));
-                }
+                None => {}
                 Some(Ok(dv)) => {
-                    crate::style::print_version(cli.0, Some(cli.1), None);
-                    let note = (mismatch == Some(true)).then(|| replaced("differs from this CLI"));
-                    crate::style::print_daemon_version(
-                        Some((&dv.version, &dv.git_sha)),
-                        note.as_deref(),
+                    let note = (mismatch == Some(true)).then_some(
+                        "differs from this CLI; the next shux command restarts it, \
+                         ending its sessions",
                     );
+                    crate::style::print_daemon_version(Some((&dv.version, &dv.git_sha)), note);
                 }
                 Some(Err((_, error))) => {
-                    crate::style::print_version(cli.0, Some(cli.1), None);
                     let note = if mismatch == Some(true) {
-                        replaced(error)
+                        format!("{error}; the next shux command tries to replace it")
                     } else {
                         error.clone()
                     };

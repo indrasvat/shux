@@ -9,3 +9,7 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+    ignore:
+      # Pinned to its stable/beta branch, which has no version Dependabot can
+      # track; its tags need a `toolchain` input these steps do not pass.
+      - dependency-name: dtolnay/rust-toolchain

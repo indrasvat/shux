@@ -15,7 +15,9 @@
 
 use std::sync::Arc;
 
-use tokio::sync::mpsc::error::{SendError, TryRecvError, TrySendError};
+#[cfg(test)]
+use tokio::sync::mpsc::error::TryRecvError;
+use tokio::sync::mpsc::error::{SendError, TrySendError};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 /// Unwritten bytes that may wait for one pane's program.
@@ -40,7 +42,7 @@ impl PaneInput {
     pub(crate) fn wrote(&mut self, n: usize) {
         if let Some(budget) = &mut self.budget {
             let held = budget.num_permits();
-            let n = n.min(held.saturating_sub(CHUNK_COST.min(held)));
+            let n = n.min(held.saturating_sub(CHUNK_COST));
             drop(budget.split(n));
         }
     }
@@ -100,7 +102,6 @@ pub struct PaneWriter {
 /// The PTY task's side of a pane's input channel.
 pub struct PaneInputRx {
     rx: mpsc::Receiver<PaneInput>,
-    budgets: [Arc<Semaphore>; 2],
 }
 
 /// Room for one chunk: a slot in the channel and its bytes' budget.
@@ -119,13 +120,12 @@ pub fn channel() -> (PaneWriter, PaneInputRx) {
 pub fn channel_with(slots: usize, budget: usize) -> (PaneWriter, PaneInputRx) {
     let (tx, rx) = mpsc::channel(slots);
     let (budget, control) = (Budget::new(budget), Budget::new(CONTROL_BUDGET));
-    let budgets = [budget.permits.clone(), control.permits.clone()];
     let writer = PaneWriter {
         tx,
         budget,
         control,
     };
-    (writer, PaneInputRx { rx, budgets })
+    (writer, PaneInputRx { rx })
 }
 
 impl PaneWriter {
@@ -175,6 +175,7 @@ impl PaneWriter {
         Ok(InputPermit { slot, budget })
     }
 
+    #[cfg(test)]
     pub async fn send(&self, bytes: Vec<u8>) -> Result<(), SendError<Vec<u8>>> {
         match self.reserve(bytes.len()).await {
             Ok(permit) => {
@@ -185,6 +186,7 @@ impl PaneWriter {
         }
     }
 
+    #[cfg(test)]
     pub fn try_send(&self, bytes: Vec<u8>) -> Result<(), TrySendError<Vec<u8>>> {
         match self.try_reserve(bytes.len()) {
             Ok(permit) => {
@@ -218,21 +220,14 @@ impl PaneInputRx {
     }
 
     /// The next chunk's bytes, giving its budget back.
+    #[cfg(test)]
     pub async fn recv(&mut self) -> Option<Vec<u8>> {
         self.rx.recv().await.map(|input| input.bytes)
     }
 
+    #[cfg(test)]
     pub fn try_recv(&mut self) -> Result<Vec<u8>, TryRecvError> {
         self.rx.try_recv().map(|input| input.bytes)
-    }
-}
-
-impl Drop for PaneInputRx {
-    /// Senders waiting for room learn at once that none will come.
-    fn drop(&mut self) {
-        for budget in &self.budgets {
-            budget.close();
-        }
     }
 }
 

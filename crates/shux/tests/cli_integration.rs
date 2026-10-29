@@ -300,13 +300,22 @@ async fn start_test_server(
     ))
     .build();
 
+    serve(&socket_path, router, &cancel).await;
+    (socket_path, cancel)
+}
+
+/// Serves `router` on `socket_path` until `cancel`, bound before this returns
+/// so every caller can connect at once.
+async fn serve(
+    socket_path: &std::path::Path,
+    router: shux_rpc::Router,
+    cancel: &tokio_util::sync::CancellationToken,
+) {
     let config = shux_rpc::ServerConfig {
-        socket_path: socket_path.clone(),
+        socket_path: socket_path.to_path_buf(),
         tcp_addr: String::new(),
         auth_token: None,
     };
-
-    // Bound before this returns, so every caller can connect at once.
     let server = shux_rpc::Server::new(config, router, cancel.clone())
         .bind()
         .await
@@ -314,8 +323,6 @@ async fn start_test_server(
     tokio::spawn(async move {
         let _ = server.serve().await;
     });
-
-    (socket_path, cancel)
 }
 
 /// Helper: send a raw JSON-RPC request and get response via the framed codec.
@@ -496,28 +503,22 @@ async fn start_versioned_server(
             },
         )
         .build();
-    let config = shux_rpc::ServerConfig {
-        socket_path: socket_path.clone(),
-        tcp_addr: String::new(),
-        auth_token: None,
-    };
-    let server = shux_rpc::Server::new(config, router, cancel.clone())
-        .bind()
-        .await
-        .expect("bind test server");
-    tokio::spawn(async move {
-        let _ = server.serve().await;
-    });
+    serve(&socket_path, router, &cancel).await;
     (socket_path, cancel)
 }
 
-async fn shux_version(socket: &std::path::Path, json: bool) -> (String, std::process::ExitStatus) {
-    let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_shux"));
-    if json {
-        cmd.args(["--format", "json"]);
-    }
-    let run = cmd
-        .args(["--socket", socket.to_str().unwrap(), "version"])
+async fn shux_version(
+    socket: &std::path::Path,
+    format: &str,
+) -> (String, std::process::ExitStatus) {
+    let run = tokio::process::Command::new(env!("CARGO_BIN_EXE_shux"))
+        .args([
+            "--format",
+            format,
+            "--socket",
+            socket.to_str().unwrap(),
+            "version",
+        ])
         .kill_on_drop(true)
         .output();
     let output = tokio::time::timeout(shux_testkit::BUDGET, run)
@@ -537,7 +538,7 @@ async fn version_names_the_cli_and_a_daemon_of_another_version() {
     let dir = tempfile::tempdir().unwrap();
     let (socket, cancel) = start_versioned_server(dir.path(), "0.0.1", "b623470").await;
 
-    let (stdout, status) = shux_version(&socket, true).await;
+    let (stdout, status) = shux_version(&socket, "json").await;
     assert!(status.success(), "{stdout}");
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(
@@ -552,7 +553,7 @@ async fn version_names_the_cli_and_a_daemon_of_another_version() {
     assert_eq!(parsed["daemon"]["status"], "running", "{parsed}");
     assert_eq!(parsed["mismatch"], true, "{parsed}");
 
-    let (stdout, status) = shux_version(&socket, false).await;
+    let (stdout, status) = shux_version(&socket, "text").await;
     assert!(status.success(), "{stdout}");
     let lines: Vec<&str> = stdout.lines().collect();
     assert!(
@@ -563,6 +564,18 @@ async fn version_names_the_cli_and_a_daemon_of_another_version() {
         stdout.contains("daemon 0.0.1 (b623470)") && stdout.contains("differs"),
         "daemon shown and flagged: {stdout}"
     );
+
+    let (stdout, status) = shux_version(&socket, "plain").await;
+    assert!(status.success(), "{stdout}");
+    assert_eq!(
+        stdout,
+        format!(
+            "cli\t{}\t{}\ndaemon\trunning\t0.0.1\tb623470\tmismatch\n",
+            env!("CARGO_PKG_VERSION"),
+            env!("SHUX_GIT_SHA")
+        ),
+        "plain names the same builds and mismatch as JSON and text"
+    );
     cancel.cancel();
 }
 
@@ -572,7 +585,7 @@ async fn version_flags_a_daemon_built_from_another_commit() {
     let dir = tempfile::tempdir().unwrap();
     let (socket, cancel) =
         start_versioned_server(dir.path(), env!("CARGO_PKG_VERSION"), "0000000").await;
-    let (stdout, _) = shux_version(&socket, true).await;
+    let (stdout, _) = shux_version(&socket, "json").await;
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(parsed["mismatch"], true, "{parsed}");
     cancel.cancel();
@@ -584,7 +597,7 @@ async fn version_reports_a_matching_daemon_as_matching() {
     let dir = tempfile::tempdir().unwrap();
     let (socket, cancel) =
         start_versioned_server(dir.path(), env!("CARGO_PKG_VERSION"), env!("SHUX_GIT_SHA")).await;
-    let (stdout, _) = shux_version(&socket, true).await;
+    let (stdout, _) = shux_version(&socket, "json").await;
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(
         parsed["daemon"]["version"],
@@ -592,8 +605,31 @@ async fn version_reports_a_matching_daemon_as_matching() {
         "{parsed}"
     );
     assert_eq!(parsed["mismatch"], false, "{parsed}");
-    let (stdout, _) = shux_version(&socket, false).await;
+    let (stdout, _) = shux_version(&socket, "text").await;
     assert!(!stdout.contains("differs"), "{stdout}");
+    cancel.cancel();
+}
+
+/// A server that will not say its version may not be a shux daemon at all,
+/// and the client refuses to stop one it cannot identify: `version` must not
+/// promise a restart.
+#[tokio::test]
+async fn version_promises_no_restart_of_a_server_without_a_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("v.sock");
+    let cancel = tokio_util::sync::CancellationToken::new();
+    serve(&socket, shux_rpc::Router::builder().build(), &cancel).await;
+
+    let (stdout, _) = shux_version(&socket, "json").await;
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(parsed["daemon"]["status"], "unreadable", "{parsed}");
+    assert_eq!(parsed["mismatch"], true, "{parsed}");
+
+    let (stdout, _) = shux_version(&socket, "text").await;
+    assert!(
+        stdout.contains("without a version") && !stdout.contains("restarts it"),
+        "{stdout}"
+    );
     cancel.cancel();
 }
 
@@ -609,7 +645,7 @@ async fn version_does_not_hang_on_a_daemon_that_never_answers() {
             conns.push(conn);
         }
     });
-    let (stdout, status) = shux_version(&socket, true).await;
+    let (stdout, status) = shux_version(&socket, "json").await;
     assert!(status.success(), "{stdout}");
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(

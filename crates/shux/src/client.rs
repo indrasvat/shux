@@ -111,7 +111,7 @@ async fn probe_socket(socket_path: &Path) -> Result<UnixStream, io::Error> {
 }
 
 /// Version info returned by the daemon's `system.version` RPC call.
-pub struct DaemonVersion {
+pub(crate) struct DaemonVersion {
     pub version: String,
     pub git_sha: String,
 }
@@ -125,7 +125,7 @@ impl DaemonVersion {
 }
 
 /// What the daemon serving a socket said when asked which build it is.
-pub enum DaemonAnswer {
+pub(crate) enum DaemonAnswer {
     /// Nothing is listening.
     Absent,
     Answered(DaemonVersion),
@@ -139,7 +139,7 @@ pub enum DaemonAnswer {
 }
 
 /// Asks the daemon serving `socket_path` which build it is. Never starts one.
-pub async fn ask_daemon_version(socket_path: &Path) -> DaemonAnswer {
+pub(crate) async fn ask_daemon_version(socket_path: &Path) -> DaemonAnswer {
     let mut stream = match probe_socket(socket_path).await {
         Ok(stream) => stream,
         Err(e) if is_connection_refused_or_not_found(&e) => return DaemonAnswer::Absent,
