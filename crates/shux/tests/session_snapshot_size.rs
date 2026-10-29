@@ -147,6 +147,45 @@ fn a_snapshot_without_dims_fits_every_pane_of_a_split() {
     assert_bars(&img, cw, ch, 1 + PANE_COLS + 1, 1, "right pane");
 }
 
+/// Splitting the right pane again leaves ratios of 1/2 and 1/2 over three
+/// 80-column grids: drawn at those ratios the first pane gets half the frame
+/// and the other two crowd into the rest.
+#[test]
+fn a_snapshot_without_dims_fits_a_chain_of_splits_without_a_dead_band() {
+    let h = Harness::new();
+    let (session_id, first) = spawn(&h);
+    let mut target = first;
+    for _ in 0..2 {
+        let split = h.rpc_ok(
+            "pane.split",
+            json!({
+                "pane_id": target,
+                "direction": "vertical",
+                "command": ["sh", "-c", SCRIPT],
+            }),
+        );
+        target = split["pane"]["id"]
+            .as_str()
+            .expect("new pane id")
+            .to_string();
+        h.wait_for(&target, "BARS-DONE", shux_testkit::BUDGET_MS)
+            .expect("split pane never drew its bars");
+    }
+
+    let (img, cw, ch) = decode(&h.rpc_ok("session.snapshot", json!({ "session_id": session_id })));
+    assert_eq!(
+        (img.width(), img.height()),
+        frame_px(PANE_COLS * 3 + 2, PANE_ROWS, cw, ch),
+        "three {PANE_COLS}-column panes were not framed at their size"
+    );
+    for (i, col) in [1, 2 + PANE_COLS, 3 + 2 * PANE_COLS]
+        .into_iter()
+        .enumerate()
+    {
+        assert_bars(&img, cw, ch, col, 1, &format!("pane {i}"));
+    }
+}
+
 #[test]
 fn explicit_dims_still_win() {
     let h = Harness::new();
@@ -157,4 +196,42 @@ fn explicit_dims_still_win() {
     ));
     assert_eq!((img.width(), img.height()), (120 * cw, 36 * ch));
     assert_bars(&img, cw, ch, 1, 1, "explicit 120x36");
+}
+
+/// A window wider than the explicit-dims limit is still drawn whole when no
+/// dims are given; only the pixel cap bounds it.
+#[test]
+fn a_wide_window_is_not_clipped_to_the_explicit_dims_limit() {
+    let h = Harness::new();
+    let (session_id, pane_id) = spawn(&h);
+    h.rpc_ok(
+        "pane.set_size",
+        json!({ "pane_id": pane_id, "cols": 1000, "rows": 30 }),
+    );
+    let (img, cw, ch) = decode(&h.rpc_ok("session.snapshot", json!({ "session_id": session_id })));
+    assert_eq!(
+        (img.width(), img.height()),
+        frame_px(1000, 30, cw, ch),
+        "a 1000-column pane was framed narrower than itself"
+    );
+}
+
+/// The cap refusal for a default-sized snapshot says how to get a smaller one.
+#[test]
+fn a_window_over_the_pixel_cap_names_the_dims_that_get_under_it() {
+    let h = Harness::new();
+    let (session_id, pane_id) = spawn(&h);
+    h.rpc_ok(
+        "pane.set_size",
+        json!({ "pane_id": pane_id, "cols": 600, "rows": 400 }),
+    );
+    let err = h
+        .rpc_raw("session.snapshot", json!({ "session_id": session_id }))
+        .error
+        .expect("a snapshot over the pixel cap is refused");
+    let err = format!("{} {}", err.message, err.data.unwrap_or_default());
+    assert!(
+        err.contains("cap") && err.contains("--cols"),
+        "cap error does not say how to shrink the frame: {err}"
+    );
 }
