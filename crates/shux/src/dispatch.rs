@@ -117,7 +117,7 @@ pub(crate) async fn run_attach(
                     eprintln!("[attach error: {msg}]");
                 }
                 shux_ui::ExitReason::Signal(signo) => {
-                    drop(hold_logs);
+                    hold_logs.release_within(std::time::Duration::from_millis(200));
                     die_by_signal(signo)
                 }
             }

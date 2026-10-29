@@ -52,6 +52,20 @@ pub fn hold() -> HoldGuard {
     HoldGuard(())
 }
 
+impl HoldGuard {
+    /// Writes the held logs before the process dies, waiting at most `limit`
+    /// for a stderr that has stopped reading. A write still blocked then is
+    /// left to die with the process.
+    pub fn release_within(self, limit: std::time::Duration) {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(self);
+            let _ = done_tx.send(());
+        });
+        let _ = done_rx.recv_timeout(limit);
+    }
+}
+
 impl Drop for HoldGuard {
     fn drop(&mut self) {
         let held = HELD.lock().unwrap_or_else(PoisonError::into_inner).take();
@@ -95,5 +109,41 @@ mod tests {
         );
         drop(guard);
         assert_eq!(held_bytes(), None);
+    }
+
+    /// A signal exit must not wait on a terminal that stopped reading: with
+    /// stderr a full pipe nobody drains, releasing still returns.
+    #[test]
+    fn releasing_before_a_signal_exit_never_blocks_on_stderr() {
+        use std::os::fd::AsFd;
+        let (read, write) = nix::unistd::pipe().expect("pipe");
+        let flags = nix::fcntl::fcntl(&write, nix::fcntl::FcntlArg::F_GETFL).expect("getfl");
+        let nonblocking =
+            nix::fcntl::OFlag::from_bits_truncate(flags) | nix::fcntl::OFlag::O_NONBLOCK;
+        nix::fcntl::fcntl(&write, nix::fcntl::FcntlArg::F_SETFL(nonblocking)).expect("setfl");
+        while nix::unistd::write(&write, &[0u8; 4096]).is_ok() {}
+        nix::fcntl::fcntl(
+            &write,
+            nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::from_bits_truncate(flags)),
+        )
+        .expect("restore blocking");
+        // nextest runs each test in its own process, so taking over fd 2 here
+        // reaches no other test.
+        let saved = nix::unistd::dup(std::io::stderr().as_fd()).expect("dup stderr");
+        nix::unistd::dup2_stderr(&write).expect("dup2 onto stderr");
+
+        let guard = hold();
+        ClientLogWriter
+            .write_all(b"held line\n")
+            .expect("held write");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            guard.release_within(std::time::Duration::from_millis(200));
+            let _ = done_tx.send(());
+        });
+        let released = done_rx.recv_timeout(shux_testkit::BUDGET).is_ok();
+        nix::unistd::dup2_stderr(&saved).expect("restore stderr");
+        drop(read);
+        assert!(released, "releasing the held logs blocked on a full stderr");
     }
 }
