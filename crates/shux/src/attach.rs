@@ -1723,6 +1723,12 @@ async fn run_render_loop(
             chrome: Some(&pane_chrome),
             status_bar: Some(&bar),
         };
+        compositor.set_cursor_hidden(
+            attached.help_visible
+                || copy_overlay
+                    .as_ref()
+                    .is_some_and(|o| matches!(o.kind, CopyOverlayKind::Modal)),
+        );
         // Reset the buffer first so we only ship the new frame's bytes.
         compositor.inner_mut().clear();
         let _ = compositor.render_multi_pane(frame);

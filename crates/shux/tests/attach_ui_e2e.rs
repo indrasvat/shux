@@ -157,6 +157,22 @@ impl Env {
         );
     }
 
+    /// Whether the host pane's terminal cursor is showing.
+    fn cursor_visible(&self) -> bool {
+        let v: serde_json::Value = serde_json::from_str(&self.ok(&[
+            "--format",
+            "json",
+            "pane",
+            "capture",
+            "-s",
+            "host",
+            "-p",
+            &self.host_pane,
+        ]))
+        .expect("capture json");
+        v["cursor"]["visible"].as_bool().expect("cursor.visible")
+    }
+
     /// The host screen row holding `needle`.
     #[track_caller]
     fn row_with(&self, needle: &str) -> String {
@@ -247,6 +263,38 @@ fn the_attached_client_logs_after_the_terminal_is_restored() {
     env.wait_for("[detached from session 'target']");
     wait_until("the held logs to be written", || {
         read_log().contains("config hot-reload: watching")
+    });
+}
+
+/// Copy mode draws its own cursor and the help overlay covers the pane, so
+/// the terminal's cursor stays hidden under both: left showing, it sits
+/// wherever the overlay's last write ended, a second block beside the copy
+/// cursor or at the edge of the help box.
+#[test]
+fn copy_mode_and_the_help_overlay_hide_the_terminal_cursor() {
+    let env = Env::attached(&keys_config("ctrl-a"));
+    wait_until("the shell's cursor to show", || env.cursor_visible());
+
+    env.send_keys("\x01[");
+    env.wait_for("PgUp/PgDn");
+    assert!(
+        !env.cursor_visible(),
+        "copy mode left the terminal cursor showing"
+    );
+    env.send_keys("q");
+    wait_until("the cursor to come back after copy mode", || {
+        env.cursor_visible()
+    });
+
+    env.send_keys("\x01?");
+    env.wait_for("keybindings (prefix = ^A)");
+    assert!(
+        !env.cursor_visible(),
+        "the help overlay left the terminal cursor showing"
+    );
+    env.send_keys("\x01?");
+    wait_until("the cursor to come back after help", || {
+        env.cursor_visible()
     });
 }
 
