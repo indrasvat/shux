@@ -1339,8 +1339,11 @@ mod tests {
         for (mode, owed) in [(r"\033[?2004l", false), (r"\033[?2004l\033[?2004h", true)] {
             let h = crate::rpc::test_harness::RpcHarness::new();
             let (_s, _w, pane) = h.seed_session("replies").await;
+            // The program asks for its cursor only after reading the
+            // paste's start, then prints MARK, so the reply's fate is decided
+            // before MARK shows. A held reply comes out behind the paste's end.
             let script = format!(
-                r#"stty raw -echo; printf '\033[?2004h'; sleep 1; printf '{mode}\033[6n'; if IFS= read -r -t 3 -d R _; then echo GOT-REPLY; else echo NO-REPLY; fi; sleep 30"#
+                r#"stty raw -echo; printf '\033[?2004h'; printf 'REA%sDY' ''; IFS= read -r -d '~' _; printf '{mode}\033[6nMA%sRK' ''; IFS= read -r -d R x; case $x in *201~*) echo HELD-REPLY;; *) echo GOT-REPLY;; esac; sleep 30"#
             );
             spawn_pane_pty_unshared(
                 pane,
@@ -1356,7 +1359,14 @@ mod tests {
             )
             .await
             .unwrap();
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let io = &h.io;
+            let screen_shows = |needle: &'static str| {
+                shux_testkit::wait_for_async(needle, move || async move {
+                    let text = io.lock().await.vts[&pane].capture_text(None);
+                    text.contains(needle).then_some(text)
+                })
+            };
+            screen_shows("READY").await;
             let writer = {
                 let mut state = h.io.lock().await;
                 let program = state.incarnations[&pane];
@@ -1371,19 +1381,15 @@ mod tests {
                 state.writers[&pane].clone()
             };
             writer.send(PASTE_START.to_vec()).await.unwrap();
-
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
-            let text = loop {
-                let text = h.io.lock().await.vts[&pane].capture_text(None);
-                if text.contains("-REPLY") || tokio::time::Instant::now() > deadline {
-                    break text;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            };
-            let expected = if owed { "NO-REPLY" } else { "GOT-REPLY" };
-            assert!(text.contains(expected), "{mode}: {}", text.trim());
+            screen_shows("MARK").await;
             let open = h.io.lock().await.open_paste(pane);
             assert_eq!(open.is_some(), owed, "{mode}: owed an end");
+            if owed {
+                writer.send(PASTE_END.to_vec()).await.unwrap();
+            }
+            let text = screen_shows("-REPLY").await;
+            let expected = if owed { "HELD-REPLY" } else { "GOT-REPLY" };
+            assert!(text.contains(expected), "{mode}: {}", text.trim());
             h.stop().await;
         }
     }
