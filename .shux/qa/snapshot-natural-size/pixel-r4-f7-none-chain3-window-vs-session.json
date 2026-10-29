@@ -1,0 +1,1 @@
+{"actual":"out/head/none-chain3-window.png","changed_pixels":0,"diff":null,"expected":"out/head/none-chain3-session.png","max_mean_channel_delta":0.0,"max_pixel_diff_ratio":0.0,"mean_rgba_channel_delta":0.0,"pixel_diff_ratio":0.0,"size":[2178,475],"status":"pass","total_pixels":1034550}

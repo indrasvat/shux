@@ -1,0 +1,1 @@
+{"actual":"out/head/rounded-single-crop-A.png","changed_pixels":0,"diff":"out/head/rounded-single-diff-A.png","expected":"out/head/rounded-single-pane-A.png","max_mean_channel_delta":0.0,"max_pixel_diff_ratio":0.0,"mean_rgba_channel_delta":0.0,"pixel_diff_ratio":0.0,"size":[720,456],"status":"pass","total_pixels":328320}
