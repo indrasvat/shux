@@ -1543,7 +1543,7 @@ async fn reap_scratch(
         let mut state = io_state.lock().await;
         let pulse = state.teardown_panes(&[claim.pane_id], true);
         drop(state);
-        pulse.notify_one();
+        pulse.bump();
     }
 
     // 4. Audit (LENS-R-052).
@@ -1678,7 +1678,7 @@ pub async fn on_session_killed(
         let mut state = io_state.lock().await;
         let pulse = state.teardown_panes(&[claim.pane_id], true);
         drop(state);
-        pulse.notify_one();
+        pulse.bump();
     }
     registry.audit.append(json!({
         "ts": iso_now(),
@@ -1964,7 +1964,7 @@ async fn spawn_scratch_core(
         let mut state = io_state.lock().await;
         let pulse = state.teardown_panes(&[pane_id], true);
         drop(state);
-        pulse.notify_one();
+        pulse.bump();
         return Err(shux_rpc::RpcError::internal(
             "scratch spawn lost its process id",
         ));

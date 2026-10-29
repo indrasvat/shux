@@ -74,6 +74,12 @@ impl OnboardingHandle {
         }
     }
 
+    /// Blocks every reader, a render loop mid-frame included, until dropped.
+    #[cfg(test)]
+    pub async fn hold_for_test(&self) -> tokio::sync::RwLockWriteGuard<'_, OnboardingState> {
+        self.inner.write().await
+    }
+
     /// Mark the prefix as discovered and persist. Subsequent attaches
     /// will see the hint dismissed.
     pub async fn mark_prefix_discovered(&self) {

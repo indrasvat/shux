@@ -375,6 +375,17 @@ pub enum GraphCommand {
             Result<crate::apply::BatchResult, crate::apply::BatchError>,
         >,
     },
+    /// See [`GraphHandle::atomically`].
+    Atomically(Transaction),
+}
+
+/// Work the graph task runs between two commands.
+pub struct Transaction(Box<dyn FnOnce(&SessionGraph) + Send>);
+
+impl std::fmt::Debug for Transaction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Transaction")
+    }
 }
 
 /// One program-status publication for a pane, as its terminal produced it.
@@ -432,7 +443,8 @@ impl SessionGraph {
         (graph, state)
     }
 
-    fn current(&self) -> Arc<SessionGraphSnapshot> {
+    /// The committed state, as a transaction sees it between its own writes.
+    pub fn current(&self) -> Arc<SessionGraphSnapshot> {
         self.state.load_full()
     }
 
@@ -2473,6 +2485,7 @@ pub async fn run_graph_loop(
                     Some(GraphCommand::ApplyBatch { ops, reply }) => {
                         let _ = reply.send(graph.apply_batch(ops));
                     }
+                    Some(GraphCommand::Atomically(Transaction(work))) => work(&graph),
                     None => {
                         debug!("All graph command senders dropped, shutting down graph loop");
                         break;
@@ -3045,6 +3058,23 @@ impl GraphHandle {
             .await
             .map_err(|_| GraphError::Shutdown)?;
         rx.await.map_err(|_| GraphError::Shutdown)?
+    }
+
+    /// Runs `f` on the graph task: no other command lands between its reads
+    /// and its writes. Each write still commits and publishes on its own.
+    pub async fn atomically<R: Send + 'static>(
+        &self,
+        f: impl FnOnce(&SessionGraph) -> R + Send + 'static,
+    ) -> Result<R, GraphError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let work = Transaction(Box::new(move |graph| {
+            let _ = tx.send(f(graph));
+        }));
+        self.cmd_tx
+            .send(GraphCommand::Atomically(work))
+            .await
+            .map_err(|_| GraphError::Shutdown)?;
+        rx.await.map_err(|_| GraphError::Shutdown)
     }
 
     /// Apply a batch of operations atomically through the single-writer task.
