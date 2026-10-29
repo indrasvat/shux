@@ -48,7 +48,7 @@ pub(crate) const STALE_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long a daemon gets to answer the version handshake. One that does not is
 /// stopped or wedged: it is reported, never replaced.
-const VERSION_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const VERSION_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How many stale daemons one client stops before giving up: each stop ends an
 /// identified process, so only clients of another build racing to start their
@@ -111,9 +111,45 @@ async fn probe_socket(socket_path: &Path) -> Result<UnixStream, io::Error> {
 }
 
 /// Version info returned by the daemon's `system.version` RPC call.
-struct DaemonVersion {
-    version: String,
-    git_sha: String,
+pub struct DaemonVersion {
+    pub version: String,
+    pub git_sha: String,
+}
+
+impl DaemonVersion {
+    /// Whether the daemon is this very build: any other is replaced by the
+    /// next command that needs it.
+    pub fn is_current(&self) -> bool {
+        self.version == CLIENT_VERSION && self.git_sha == CLIENT_GIT_SHA
+    }
+}
+
+/// What the daemon serving a socket said when asked which build it is.
+pub enum DaemonAnswer {
+    /// Nothing is listening.
+    Absent,
+    Answered(DaemonVersion),
+    /// It answered without saying which build it is.
+    Unreadable,
+    /// It accepted the connection and did not answer within
+    /// [`VERSION_CHECK_TIMEOUT`].
+    Unresponsive,
+    /// Connecting failed, and not because nothing is listening.
+    Unreachable(io::Error),
+}
+
+/// Asks the daemon serving `socket_path` which build it is. Never starts one.
+pub async fn ask_daemon_version(socket_path: &Path) -> DaemonAnswer {
+    let mut stream = match probe_socket(socket_path).await {
+        Ok(stream) => stream,
+        Err(e) if is_connection_refused_or_not_found(&e) => return DaemonAnswer::Absent,
+        Err(e) => return DaemonAnswer::Unreachable(e),
+    };
+    match tokio::time::timeout(VERSION_CHECK_TIMEOUT, check_daemon_version(&mut stream)).await {
+        Err(_) => DaemonAnswer::Unresponsive,
+        Ok(None) => DaemonAnswer::Unreadable,
+        Ok(Some(dv)) => DaemonAnswer::Answered(dv),
+    }
 }
 
 /// Check the daemon's version via `system.version` RPC call.
@@ -214,25 +250,17 @@ enum Probe {
 }
 
 async fn probe_daemon(socket_path: &Path) -> Result<Probe, ClientError> {
-    let mut stream = match probe_socket(socket_path).await {
-        Ok(stream) => stream,
-        Err(e) if is_connection_refused_or_not_found(&e) => return Ok(Probe::Absent),
-        Err(e) => return Err(ClientError::Io(e)),
-    };
-    let Ok(answer) =
-        tokio::time::timeout(VERSION_CHECK_TIMEOUT, check_daemon_version(&mut stream)).await
-    else {
-        return Ok(Probe::Unresponsive);
-    };
-    match answer {
-        Some(dv) if dv.version == CLIENT_VERSION && dv.git_sha == CLIENT_GIT_SHA => {
+    match ask_daemon_version(socket_path).await {
+        DaemonAnswer::Absent => Ok(Probe::Absent),
+        DaemonAnswer::Unreachable(e) => Err(ClientError::Io(e)),
+        DaemonAnswer::Unresponsive => Ok(Probe::Unresponsive),
+        DaemonAnswer::Answered(dv) if dv.is_current() => {
             debug!(
                 version = CLIENT_VERSION,
                 git_sha = CLIENT_GIT_SHA,
                 "Daemon version matches"
             );
             // Need a fresh connection since we consumed the first one for version check
-            drop(stream);
             match probe_socket(socket_path).await {
                 Ok(stream) => Ok(Probe::Current(stream)),
                 // It stopped serving in between.
@@ -240,7 +268,7 @@ async fn probe_daemon(socket_path: &Path) -> Result<Probe, ClientError> {
                 Err(e) => Err(ClientError::Io(e)),
             }
         }
-        Some(dv) => {
+        DaemonAnswer::Answered(dv) => {
             warn!(
                 daemon_version = dv.version,
                 daemon_sha = dv.git_sha,
@@ -250,7 +278,7 @@ async fn probe_daemon(socket_path: &Path) -> Result<Probe, ClientError> {
             );
             Ok(Probe::Stale)
         }
-        None => {
+        DaemonAnswer::Unreadable => {
             warn!("Could not check daemon version — restarting daemon");
             Ok(Probe::Stale)
         }

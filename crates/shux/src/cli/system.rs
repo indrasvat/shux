@@ -55,34 +55,104 @@ pub async fn handle_api(
     }
 }
 
-/// Handle the `shux version` command.
+/// Handle the `shux version` command: this CLI's build, and the daemon's
+/// beside it when one serves `socket_path`. Never starts a daemon.
 pub async fn handle_version(
-    stream: &mut tokio::net::UnixStream,
+    socket_path: &std::path::Path,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
-    let result = rpc_call(
-        stream,
-        "system.version",
-        serde_json::Value::Object(Default::default()),
-    )
-    .await?;
+    use crate::client::{DaemonAnswer, VERSION_CHECK_TIMEOUT};
+
+    let cli = (env!("CARGO_PKG_VERSION"), env!("SHUX_GIT_SHA"));
+    let answer = crate::client::ask_daemon_version(socket_path).await;
+    // Whether the next command that needs the daemon replaces it.
+    let mismatch = match &answer {
+        DaemonAnswer::Answered(dv) => Some(!dv.is_current()),
+        DaemonAnswer::Unreadable => Some(true),
+        _ => None,
+    };
+    // `None`: no daemon. `Err`: one is there but did not say which build.
+    let daemon = match &answer {
+        DaemonAnswer::Absent => None,
+        DaemonAnswer::Answered(dv) => Some(Ok(dv)),
+        DaemonAnswer::Unreadable => Some(Err((
+            "unreadable",
+            "it answered without a version".to_string(),
+        ))),
+        DaemonAnswer::Unresponsive => Some(Err((
+            "unresponsive",
+            format!(
+                "it did not answer within {}s",
+                VERSION_CHECK_TIMEOUT.as_secs()
+            ),
+        ))),
+        DaemonAnswer::Unreachable(e) => Some(Err(("unreachable", e.to_string()))),
+    };
 
     match format {
         OutputFormat::Json => {
+            let daemon = match &daemon {
+                None => serde_json::Value::Null,
+                Some(Ok(dv)) => serde_json::json!({
+                    "status": "running",
+                    "version": dv.version,
+                    "git_sha": dv.git_sha,
+                }),
+                Some(Err((status, error))) => serde_json::json!({
+                    "status": status,
+                    "version": null,
+                    "git_sha": null,
+                    "error": error,
+                }),
+            };
+            let envelope = serde_json::json!({
+                "name": "shux",
+                "version": cli.0,
+                "git_sha": cli.1,
+                "cli": {"version": cli.0, "git_sha": cli.1},
+                "daemon": daemon,
+                "mismatch": mismatch,
+            });
             println!(
                 "{}",
-                crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+                crate::style::json_safe(&serde_json::to_string_pretty(&envelope)?)
             );
         }
-        OutputFormat::Text | OutputFormat::Plain => {
-            let version = result
-                .get("version")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            let git_sha = result.get("git_sha").and_then(|v| v.as_str());
-            crate::style::print_version(version, git_sha, None);
+        OutputFormat::Plain => {
+            let (status, found) = match &daemon {
+                None => ("not-running", None),
+                Some(Ok(dv)) => ("running", Some((dv.version.as_str(), dv.git_sha.as_str()))),
+                Some(Err((status, _))) => (*status, None),
+            };
+            crate::style::print_version_plain(cli, status, found, mismatch);
+        }
+        OutputFormat::Text => {
+            let replaced = |why: &str| {
+                format!("{why}; the next shux command restarts it, ending its sessions")
+            };
+            match &daemon {
+                None => {
+                    crate::style::print_version(cli.0, Some(cli.1), Some("daemon not running"));
+                }
+                Some(Ok(dv)) => {
+                    crate::style::print_version(cli.0, Some(cli.1), None);
+                    let note = (mismatch == Some(true)).then(|| replaced("differs from this CLI"));
+                    crate::style::print_daemon_version(
+                        Some((&dv.version, &dv.git_sha)),
+                        note.as_deref(),
+                    );
+                }
+                Some(Err((_, error))) => {
+                    crate::style::print_version(cli.0, Some(cli.1), None);
+                    let note = if mismatch == Some(true) {
+                        replaced(error)
+                    } else {
+                        error.clone()
+                    };
+                    crate::style::print_daemon_version(None, Some(&note));
+                }
+            }
         }
     }
-
     Ok(())
 }

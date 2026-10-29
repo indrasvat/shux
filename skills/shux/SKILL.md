@@ -88,8 +88,10 @@ shux session kill demo
 
 Almost every CLI verb maps 1:1 to an RPC method — RPC dots become CLI spaces
 (`session.create` ↔ `shux session create`). The exception is the `system.*`
-namespace: the RPC is `system.version`, but the CLI verb is `shux version`
-(there is no `shux system`). Drop to the raw form with
+namespace: there is no `shux system`, and `shux version` is not a wrapper of
+`system.version`: it reports this CLI's build and, beside it, the running
+daemon's (`daemon: null` when none runs, `mismatch: true` when they differ) and
+never starts a daemon. Drop to the raw form with
 `shux rpc call <method> --params @file` whenever you'd rather write the payload
 in JSON directly, or when a method has no CLI wrapper. `--params -` reads stdin.
 
@@ -235,8 +237,8 @@ Full scenario grammar, step table, tiers, settle modes, and the bless guard rail
 
 Almost every CLI verb maps 1:1 to an RPC method — RPC dots become CLI spaces
 (`session.create` ↔ `shux session create`, `pane.send_keys` ↔
-`shux pane send-keys`); `system.version` is the exception, reachable as
-`shux version`. All RPCs accept JSON in, return JSON out, on stdin/stdout.
+`shux pane send-keys`); `system.version` has no CLI wrapper (`shux version`
+reports the CLI's build and the daemon's side by side). All RPCs accept JSON in, return JSON out, on stdin/stdout.
 `references/api.md` lists the full request/response shape per method.
 
 | Category | Methods                                                                          |
@@ -248,7 +250,7 @@ Almost every CLI verb maps 1:1 to an RPC method — RPC dots become CLI spaces
 | Window snap | `window.snapshot` · `session.snapshot` (composed multi-pane PNG)            |
 | Lens (verify loop) | `lens.run` · `pane.wait_settled` · `pane.glance` · `pane.checkpoint` · `pane.diff_since` — [references/lens.md](references/lens.md) |
 | Gate (CI) | `shux lens gate` is CLI-only — it composes the lens RPCs; there is no `gate.*` method — [references/gate.md](references/gate.md) |
-| State    | `state.apply` (atomic batch) · `events.history` · `system.version` (CLI: `shux version`) |
+| State    | `state.apply` (atomic batch) · `events.history` · `system.version` (daemon only; `shux version` shows CLI + daemon) |
 
 Every entity carries a `version` field. Pass `expected_version` on
 mutating RPCs to get optimistic-concurrency rejection (error code

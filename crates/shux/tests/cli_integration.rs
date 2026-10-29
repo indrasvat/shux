@@ -479,6 +479,150 @@ async fn test_cli_version_json_against_server() {
     cancel.cancel();
 }
 
+/// A daemon that answers `system.version` as `version` / `git_sha`, and
+/// nothing else.
+async fn start_versioned_server(
+    dir: &std::path::Path,
+    version: &'static str,
+    git_sha: &'static str,
+) -> (PathBuf, tokio_util::sync::CancellationToken) {
+    let socket_path = dir.join("v.sock");
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let router = shux_rpc::Router::builder()
+        .register(
+            "system.version",
+            move |_: Option<serde_json::Value>| async move {
+                Ok(serde_json::json!({"version": version, "git_sha": git_sha, "name": "shux"}))
+            },
+        )
+        .build();
+    let config = shux_rpc::ServerConfig {
+        socket_path: socket_path.clone(),
+        tcp_addr: String::new(),
+        auth_token: None,
+    };
+    let server = shux_rpc::Server::new(config, router, cancel.clone())
+        .bind()
+        .await
+        .expect("bind test server");
+    tokio::spawn(async move {
+        let _ = server.serve().await;
+    });
+    (socket_path, cancel)
+}
+
+async fn shux_version(socket: &std::path::Path, json: bool) -> (String, std::process::ExitStatus) {
+    let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_shux"));
+    if json {
+        cmd.args(["--format", "json"]);
+    }
+    let run = cmd
+        .args(["--socket", socket.to_str().unwrap(), "version"])
+        .kill_on_drop(true)
+        .output();
+    let output = tokio::time::timeout(shux_testkit::BUDGET, run)
+        .await
+        .expect("shux version never returned")
+        .unwrap();
+    (
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        output.status,
+    )
+}
+
+/// After an upgrade the old daemon keeps running: `shux version` must say
+/// which version is the CLI and which the daemon, and that they differ (#200).
+#[tokio::test]
+async fn version_names_the_cli_and_a_daemon_of_another_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket, cancel) = start_versioned_server(dir.path(), "0.0.1", "b623470").await;
+
+    let (stdout, status) = shux_version(&socket, true).await;
+    assert!(status.success(), "{stdout}");
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(
+        parsed["cli"]["version"],
+        env!("CARGO_PKG_VERSION"),
+        "{parsed}"
+    );
+    assert_eq!(parsed["cli"]["git_sha"], env!("SHUX_GIT_SHA"), "{parsed}");
+    assert_eq!(parsed["version"], env!("CARGO_PKG_VERSION"), "{parsed}");
+    assert_eq!(parsed["daemon"]["version"], "0.0.1", "{parsed}");
+    assert_eq!(parsed["daemon"]["git_sha"], "b623470", "{parsed}");
+    assert_eq!(parsed["daemon"]["status"], "running", "{parsed}");
+    assert_eq!(parsed["mismatch"], true, "{parsed}");
+
+    let (stdout, status) = shux_version(&socket, false).await;
+    assert!(status.success(), "{stdout}");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert!(
+        lines[0].contains(env!("CARGO_PKG_VERSION")) && !lines[0].contains("0.0.1"),
+        "first line is the CLI's: {stdout}"
+    );
+    assert!(
+        stdout.contains("daemon 0.0.1 (b623470)") && stdout.contains("differs"),
+        "daemon shown and flagged: {stdout}"
+    );
+    cancel.cancel();
+}
+
+/// The same version from another commit is another build.
+#[tokio::test]
+async fn version_flags_a_daemon_built_from_another_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket, cancel) =
+        start_versioned_server(dir.path(), env!("CARGO_PKG_VERSION"), "0000000").await;
+    let (stdout, _) = shux_version(&socket, true).await;
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(parsed["mismatch"], true, "{parsed}");
+    cancel.cancel();
+}
+
+/// A daemon of this very build matches.
+#[tokio::test]
+async fn version_reports_a_matching_daemon_as_matching() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket, cancel) =
+        start_versioned_server(dir.path(), env!("CARGO_PKG_VERSION"), env!("SHUX_GIT_SHA")).await;
+    let (stdout, _) = shux_version(&socket, true).await;
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(
+        parsed["daemon"]["version"],
+        env!("CARGO_PKG_VERSION"),
+        "{parsed}"
+    );
+    assert_eq!(parsed["mismatch"], false, "{parsed}");
+    let (stdout, _) = shux_version(&socket, false).await;
+    assert!(!stdout.contains("differs"), "{stdout}");
+    cancel.cancel();
+}
+
+/// A socket that accepts and never answers is reported, not waited on forever.
+#[tokio::test]
+async fn version_does_not_hang_on_a_daemon_that_never_answers() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("mute.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let held = tokio::spawn(async move {
+        let mut conns = Vec::new();
+        while let Ok((conn, _)) = listener.accept().await {
+            conns.push(conn);
+        }
+    });
+    let (stdout, status) = shux_version(&socket, true).await;
+    assert!(status.success(), "{stdout}");
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(
+        parsed["cli"]["version"],
+        env!("CARGO_PKG_VERSION"),
+        "{parsed}"
+    );
+    assert_eq!(parsed["daemon"]["status"], "unresponsive", "{parsed}");
+    assert!(parsed["daemon"]["error"].is_string(), "{parsed}");
+    assert!(parsed["mismatch"].is_null(), "{parsed}");
+    held.abort();
+}
+
 #[tokio::test]
 async fn test_cli_ls_against_server() {
     let dir = tempfile::tempdir().unwrap();
@@ -1084,5 +1228,12 @@ fn test_cli_version_json_without_daemon() {
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success());
-    assert!(stdout.contains("version"));
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(
+        parsed["cli"]["version"],
+        env!("CARGO_PKG_VERSION"),
+        "{parsed}"
+    );
+    assert!(parsed["daemon"].is_null(), "{parsed}");
+    assert!(parsed["mismatch"].is_null(), "{parsed}");
 }
