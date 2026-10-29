@@ -574,6 +574,8 @@ fn a_borderless_window_snapshot_draws_the_pane_as_its_pane_snapshot_does() {
 
     let mut vt = VirtualTerminal::new(rect.height as usize, rect.width as usize);
     probe_text(&mut vt);
+    // Stacked lines inside the pane join across rows on both paths.
+    vt.process("\u{2502}\r\n\u{2502}\r\n".as_bytes());
     let grid = vt.grid().clone_visible();
     let cursor = vt.cursor().clone();
     let panes: HashMap<PaneId, (&Grid, &Cursor)> = HashMap::from([(pane, (&grid, &cursor))]);

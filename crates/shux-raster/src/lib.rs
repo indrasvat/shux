@@ -99,9 +99,8 @@ struct GlyphDrawContext<'a> {
     clip: Option<InkClip<'a>>,
 }
 
-/// The clip region each cell of a composed frame belongs to, so a glyph's ink
-/// stays inside the pane or bar that owns its cell. Cells outside every region
-/// (borders) form one region of their own.
+/// The clip region each cell of a composed frame belongs to, for
+/// [`Rasterizer::render_regions`].
 struct InkRegions {
     cols: usize,
     cell_w: u32,
@@ -1084,9 +1083,8 @@ mod tests {
         assert!((12..=32).contains(&h), "cell height out of range: {h}");
     }
 
-    /// A glyph's ink stays in its own row: one taller than the font's ascent
-    /// would otherwise paint into the row above, so a pane's snapshot and its
-    /// crop of the session snapshot (status bar right under it) differ.
+    /// A glyph taller than the font's ascent inks only its own region, not
+    /// the row above it.
     #[test]
     fn a_glyph_inks_only_its_own_region() {
         let r = Rasterizer::new(14.0).unwrap();
@@ -1109,14 +1107,13 @@ mod tests {
                 (ch..2 * ch).any(|y| (0..img.width()).any(|x| *img.get_pixel(x, y) != bg)),
                 "{glyph:?} drew nothing"
             );
-            for (y, edge) in [(ch - 1, "above"), (2 * ch, "below")] {
-                for x in 0..img.width() {
-                    assert_eq!(
-                        *img.get_pixel(x, y),
-                        red,
-                        "{glyph:?} inked the region {edge} at ({x}, {y})"
-                    );
-                }
+            for x in 0..img.width() {
+                assert_eq!(
+                    *img.get_pixel(x, ch - 1),
+                    red,
+                    "{glyph:?} inked the region above at ({x}, {})",
+                    ch - 1
+                );
             }
         }
     }

@@ -134,8 +134,6 @@ mod tests {
         assert_eq!(held_bytes(), None);
     }
 
-    /// A signal exit must not wait on a terminal that stopped reading: with
-    /// stderr a full pipe nobody drains, releasing still returns.
     /// Runs `release` with fd 2 on a pipe nobody reads, already full, and
     /// reports whether it returned.
     fn returns_with_a_full_stderr(release: impl FnOnce(HoldGuard) + Send + 'static) -> bool {

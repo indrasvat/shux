@@ -1877,11 +1877,8 @@ async fn run_render_loop(
         };
         if let Some(menu) = attached.copy_menu {
             // A different menu forced a full redraw above.
-            if sheet_due(
-                &mut menu_sheet,
-                sheet(String::new()),
-                !compositor.inner().is_empty(),
-            ) {
+            let base_emitted = !compositor.inner().is_empty();
+            if sheet_due(&mut menu_sheet, sheet(String::new()), base_emitted) {
                 shux_ui::copy_mode::render_copy_menu_into(
                     compositor.inner_mut(),
                     menu.col,
@@ -1903,11 +1900,8 @@ async fn run_render_loop(
         // compositor's diff would skip those positions because they
         // didn't change in the VT grid.
         if attached.help_visible {
-            if sheet_due(
-                &mut help_sheet,
-                sheet(prefix_label.clone()),
-                !compositor.inner().is_empty(),
-            ) {
+            let base_emitted = !compositor.inner().is_empty();
+            if sheet_due(&mut help_sheet, sheet(prefix_label.clone()), base_emitted) {
                 shux_ui::render_help_overlay_into(
                     compositor.inner_mut(),
                     cols,
