@@ -7,7 +7,7 @@
 # (`./path`) are this repository's own code and need no pin; `docker://` images
 # must be pinned by `@sha256:` digest.
 #
-# Scans every workflow and composite action under .github/. Finding no files to
+# Scans every workflow, and every composite action in the tree. Finding no files to
 # scan is an error, not a pass.
 
 set -euo pipefail
@@ -15,9 +15,12 @@ set -euo pipefail
 root="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 cd "$root"
 
-mapfile -t files < <(find .github -type f \( -name '*.yml' -o -name '*.yaml' \) \
-    \( -path '.github/workflows/*' -o -name 'action.yml' -o -name 'action.yaml' \) \
-    2>/dev/null | sort)
+# Workflows, and composite actions wherever they live: `uses: ./tools/x` runs
+# tools/x/action.yml, and its own `uses:` lines need pins just the same.
+mapfile -t files < <(find . \( -name .git -o -name target -o -name node_modules \
+    -o -path ./.claude/worktrees \) -prune -o \
+    \( -type f -o -type l \) \( -path './.github/workflows/*.yml' -o -path './.github/workflows/*.yaml' \
+    -o -name 'action.yml' -o -name 'action.yaml' \) -print | sed 's|^\./||' | sort)
 if [[ ${#files[@]} -eq 0 ]]; then
     echo "✗ no workflows or actions under ${root}/.github — this guard would check nothing" >&2
     exit 2
@@ -29,12 +32,28 @@ for f in "${files[@]}"; do
     n=0
     while IFS= read -r line || [[ -n "$line" ]]; do
         n=$((n + 1))
-        # `uses:` as a mapping key, optionally a list item: `- uses: x` / `uses: x`.
-        [[ "$line" =~ ^[[:space:]]*(-[[:space:]]+)?uses:[[:space:]]*(.*)$ ]] || continue
+        line="${line%$'\r'}"
+        # The one shape read: `uses:` as a block key, optionally a list item.
+        if ! [[ "$line" =~ ^[[:space:]]*(-[[:space:]]+)?uses:[[:space:]]*(.*)$ ]]; then
+            # Anything else YAML would also read as a `uses` key -- a flow
+            # mapping, a quoted or explicit key, a space before the colon, other
+            # case -- is refused rather than skipped. Comment lines are not code.
+            [[ "$line" =~ ^[[:space:]]*# ]] && continue
+            lower="${line,,}"
+            [[ "$lower" =~ (^|[^a-z0-9_-])[\"\']?uses[\"\']?[[:space:]]*:([[:space:]]|$) ||
+                "$lower" =~ \?[[:space:]]+[\"\']?uses ]] || continue
+            echo "  ${f}:${n}: \`uses\` in a shape this guard does not read; write \`- uses: owner/repo@<sha>\`" >&2
+            bad=1
+            continue
+        fi
         ref="${BASH_REMATCH[2]}"
-        # A YAML comment needs whitespace before the `#`.
-        ref="$(sed -E 's/[[:space:]]+#.*$//; s/[[:space:]]+$//' <<<"$ref")"
-        ref="${ref#\"}"; ref="${ref%\"}"; ref="${ref#\'}"; ref="${ref%\'}"
+        if [[ "$ref" =~ ^\"([^\"]*)\" || "$ref" =~ ^\'([^\']*)\' ]]; then
+            # Quoted: the value is all of it, ` #` included.
+            ref="${BASH_REMATCH[1]}"
+        else
+            # A YAML comment needs whitespace before the `#`.
+            ref="$(sed -E 's/[[:space:]]+#.*$//; s/[[:space:]]+$//' <<<"$ref")"
+        fi
         scanned=$((scanned + 1))
         case "$ref" in
             ./*) continue ;;

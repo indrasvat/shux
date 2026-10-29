@@ -53,6 +53,25 @@ printf '%s\n' 'runs:' '  using: composite' '  steps:' '    - uses: actions/cache
     >"$work/.github/actions/x/action.yml"
 expect 1 "a composite action's unpinned step is flagged"
 rm -rf "$work/.github/actions"
+mkdir -p "$work/tools/x"
+printf '%s\n' 'runs:' '  using: composite' '  steps:' '    - uses: actions/cache@v4' \
+    >"$work/tools/x/action.yml"
+expect 1 "a composite action outside .github is scanned"
+rm -rf "$work/tools"
+
+# YAML shapes GitHub Actions parses as a `uses:` key, none of them `- uses: x`.
+for shape in '      - {uses: actions/checkout@v4}' \
+    '      - {name: co, uses: actions/checkout@v4}' \
+    '      - uses : actions/checkout@v4' \
+    '      - "uses": actions/checkout@v4' \
+    "      - 'uses': actions/checkout@v4" \
+    '      - Uses: actions/checkout@v4' \
+    '      - ? uses'; do
+    workflow "      - uses: actions/checkout@${sha}" "$shape"
+    expect 1 "non-canonical shape is flagged: ${shape#"${shape%%[! ]*}"}"
+done
+workflow "      - uses: \"actions/checkout@${sha} #v4\""
+expect 1 "a quoted value is read whole, ' #' included"
 
 workflow "      - uses: actions/checkout@${sha} # v4.4.0" \
     "      - uses: 'actions/cache/restore@${sha}'" \

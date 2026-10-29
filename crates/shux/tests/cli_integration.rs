@@ -627,7 +627,9 @@ async fn version_promises_no_restart_of_a_server_without_a_version() {
 
     let (stdout, _) = shux_version(&socket, "text").await;
     assert!(
-        stdout.contains("without a version") && !stdout.contains("restarts it"),
+        stdout.contains("did not say which build")
+            && stdout.contains("refuse to run")
+            && !stdout.contains("restarts it"),
         "{stdout}"
     );
     cancel.cancel();

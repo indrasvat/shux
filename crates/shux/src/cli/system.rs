@@ -76,7 +76,7 @@ pub async fn handle_version(
         DaemonAnswer::Unreadable => (
             Some(Err((
                 "unreadable",
-                "it answered without a version".to_string(),
+                "it did not say which build it is".to_string(),
             ))),
             Some(true),
         ),
@@ -136,18 +136,27 @@ pub async fn handle_version(
                 Some(cli.1),
                 daemon.is_none().then_some("daemon not running"),
             );
+            // Only a shux daemon process is stopped and replaced; anything else
+            // on the socket makes the next command refuse instead.
+            let next = if crate::daemon_boot::our_live_daemon(socket_path).is_some() {
+                "the next shux command restarts it, ending its sessions"
+            } else {
+                "no shux daemon process serves this socket, so shux commands \
+                 refuse to run until whatever serves it is stopped"
+            };
             match &daemon {
                 None => {}
                 Some(Ok(dv)) => {
-                    let note = (mismatch == Some(true)).then_some(
-                        "differs from this CLI; the next shux command restarts it, \
-                         ending its sessions",
+                    let note =
+                        (mismatch == Some(true)).then(|| format!("differs from this CLI; {next}"));
+                    crate::style::print_daemon_version(
+                        Some((&dv.version, &dv.git_sha)),
+                        note.as_deref(),
                     );
-                    crate::style::print_daemon_version(Some((&dv.version, &dv.git_sha)), note);
                 }
                 Some(Err((_, error))) => {
                     let note = if mismatch == Some(true) {
-                        format!("{error}; the next shux command tries to replace it")
+                        format!("{error}; {next}")
                     } else {
                         error.clone()
                     };
