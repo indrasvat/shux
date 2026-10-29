@@ -126,7 +126,11 @@ fn window_png(
     let frame = composed(s, &panes);
     let rast = shux_raster::Rasterizer::new(font).expect("rasterizer");
     let (cw, ch) = rast.cell_size();
-    let mut img = rast.render(&frame.grid, &shux_raster::RasterOptions::default());
+    let mut img = rast.render_regions(
+        &frame.grid,
+        &shux_raster::RasterOptions::default(),
+        &frame.regions,
+    );
     rast.composite_composed(&mut img, &frame.placements);
     (img, cw, ch)
 }
@@ -549,4 +553,64 @@ fn the_decode_budget_refuses_past_its_ceiling_identically_on_both_paths() {
              -- the budget is charged but never refuses"
         );
     }
+}
+
+/// Cross-path consistency with no outline between a pane and the status bar
+/// (`border_style = "none"`): the bar's branch and line glyphs reach above
+/// their cell, and that ink must not land in the pane, which `pane snapshot`
+/// draws without it.
+#[test]
+fn a_borderless_window_snapshot_draws_the_pane_as_its_pane_snapshot_does() {
+    let pane = PaneId::from_uuid(Uuid::from_u128(1));
+    let layout = LayoutNode::leaf(pane);
+    let style = BorderStyle::parse("none");
+    let content = Rect::new(0, 0, COLS, ROWS - STATUS_BAR_ROWS);
+    let rect = layout.compute_rects(pane_viewport(content, style, false))[0].1;
+    assert_eq!(
+        rect.y + rect.height,
+        ROWS - STATUS_BAR_ROWS,
+        "setup: the pane must touch the status bar"
+    );
+
+    let mut vt = VirtualTerminal::new(rect.height as usize, rect.width as usize);
+    probe_text(&mut vt);
+    let grid = vt.grid().clone_visible();
+    let cursor = vt.cursor().clone();
+    let panes: HashMap<PaneId, (&Grid, &Cursor)> = HashMap::from([(pane, (&grid, &cursor))]);
+    let mut bar = shux_ui::StatusBar::new();
+    bar.left.push(shux_ui::StatusSegment::plain(
+        "\u{e0a0} main \u{2502}\u{2502} \u{256d}\u{2500}",
+    ));
+    let frame = compose(
+        &ComposeInputs {
+            layout: &layout,
+            zoom: None,
+            focused: pane,
+            panes: &panes,
+            chrome: None,
+            status_bar: Some(&bar),
+        },
+        COLS,
+        ROWS,
+        style,
+        BorderColors::default(),
+        STATUS_BAR_ROWS,
+    );
+
+    let r = shux_raster::Rasterizer::new(14.0).expect("rasterizer");
+    let (cw, ch) = r.cell_size();
+    let opts = shux_raster::RasterOptions::default();
+    let pane_img = r.render(&grid, &opts);
+    let win_img = r.render_regions(&frame.grid, &opts, &frame.regions);
+    assert_probes_survived(&win_img, "borderless pane");
+
+    let (x0, y0) = (u32::from(rect.x) * cw, u32::from(rect.y) * ch);
+    let differing = (0..pane_img.height())
+        .flat_map(|y| (0..pane_img.width()).map(move |x| (x, y)))
+        .filter(|&(x, y)| pane_img.get_pixel(x, y) != win_img.get_pixel(x0 + x, y0 + y))
+        .count();
+    assert_eq!(
+        differing, 0,
+        "the pane's crop of the window snapshot differs from its pane snapshot"
+    );
 }
