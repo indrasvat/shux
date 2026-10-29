@@ -8,7 +8,6 @@
 //! marker live here rather than beside the RPC method that writes them.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -139,33 +138,22 @@ pub struct PaneIoState {
     pub(crate) open_pastes: HashMap<shux_core::model::PaneId, OpenPaste>,
 }
 
-/// A generation counter every attach render loop watches. Unlike
-/// `Notify::notify_one`, a bump wakes every subscriber, and one that lands
-/// while a loop is rendering leaves that loop's receiver marked changed, so its
-/// next wait returns at once. Bumps that land together coalesce into one frame.
-#[derive(Clone, Debug)]
-pub struct RenderPulse(Arc<watch::Sender<u64>>);
+/// A generation counter every attach render loop watches. A bump wakes every
+/// subscriber; one that lands while a loop renders leaves that loop's receiver
+/// marked changed, so its next wait returns at once. Bumps that land together
+/// coalesce into one frame.
+#[derive(Clone, Debug, Default)]
+pub struct RenderPulse(watch::Sender<u64>);
 
 impl RenderPulse {
-    pub fn new() -> Self {
-        Self(Arc::new(watch::Sender::new(0)))
-    }
-
     pub fn bump(&self) {
         self.0.send_modify(|g| *g = g.wrapping_add(1));
     }
 
-    /// Subscribe once per render loop, before its first wait: a receiver
-    /// starts at the current generation, so one made after a bump never sees
-    /// that bump.
+    /// Once per render loop, before its first wait: a receiver starts at the
+    /// current generation.
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.0.subscribe()
-    }
-}
-
-impl Default for RenderPulse {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -203,7 +191,7 @@ impl PaneIoState {
             checkpoints: HashMap::new(),
             invalidations: HashMap::new(),
             cmd_engine: shux_pty::CommandEngine::new(),
-            render_pulse: RenderPulse::new(),
+            render_pulse: RenderPulse::default(),
             event_bus: None,
             recorders: HashMap::new(),
             pty_pids: HashMap::new(),
@@ -521,7 +509,7 @@ mod tests {
 
     #[test]
     fn one_bump_reaches_every_subscriber() {
-        let pulse = RenderPulse::new();
+        let pulse = RenderPulse::default();
         let receivers: Vec<_> = (0..3).map(|_| pulse.subscribe()).collect();
         assert!(receivers.iter().all(|rx| !rx.has_changed().unwrap()));
         pulse.bump();
@@ -532,7 +520,7 @@ mod tests {
 
     #[test]
     fn a_bump_while_not_waiting_is_kept_and_bumps_coalesce() {
-        let pulse = RenderPulse::new();
+        let pulse = RenderPulse::default();
         let mut rx = pulse.subscribe();
         // Two bumps while the loop renders: one wake, then nothing pending.
         pulse.bump();

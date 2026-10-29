@@ -27,6 +27,8 @@ struct Harness {
     bin: PathBuf,
     runtime: tempfile::TempDir,
     work: tempfile::TempDir,
+    /// Empty: a config saved meanwhile would wake every render loop.
+    config: tempfile::TempDir,
 }
 
 impl Harness {
@@ -35,6 +37,7 @@ impl Harness {
             bin: PathBuf::from(env!("CARGO_BIN_EXE_shux")),
             runtime: tempfile::tempdir().expect("temp runtime dir"),
             work: tempfile::tempdir().expect("temp work dir"),
+            config: tempfile::tempdir().expect("temp config dir"),
         }
     }
 
@@ -48,7 +51,8 @@ impl Harness {
             .env("XDG_RUNTIME_DIR", self.runtime_dir())
             .env_remove("SHUX_SOCKET")
             .env("SHELL", "/bin/sh")
-            .env("SHUX_ATTACH_FALLBACK_TICK_MS", NO_TICK_MS)
+            .env("XDG_CONFIG_HOME", self.config.path())
+            .env(shux::attach::FALLBACK_TICK_ENV, NO_TICK_MS)
             .args([
                 "--format",
                 "json",
@@ -88,12 +92,26 @@ impl Drop for Harness {
 const PROBES: &str = "printf '\\033[38;2;120;220;180mTRUE%sCOLOR\\033[0m \\033[38;5;208mINDE%sXED\\033[0m \\033[34mBA%sSIC\\033[0m\\n' '' '' ''";
 
 /// Prints the probes and `READY`, waits for the FIFO, prints `MARK` in one
-/// write, then waits on the FIFO again so nothing follows it.
+/// write, then waits on its terminal, where nothing is typed, so nothing
+/// follows it and the pane never exits.
 fn workload(fifo: &Path) -> String {
     let fifo = fifo.display();
-    format!(
-        "{PROBES}; printf 'REA%sDY\\n' ''; read x < '{fifo}'; printf 'MA%sRK\\n' ''; read y < '{fifo}'"
-    )
+    format!("{PROBES}; printf 'REA%sDY\\n' ''; read x < '{fifo}'; printf 'MA%sRK\\n' ''; read y")
+}
+
+/// Releases the pane's program. Non-blocking, so a program that died before
+/// opening the FIFO fails the wait instead of hanging the test.
+fn release(fifo: &Path) {
+    use nix::fcntl::{OFlag, open};
+    let fd = shux_testkit::wait_for("the pane's program to open the fifo", || {
+        open(
+            fifo,
+            OFlag::O_WRONLY | OFlag::O_NONBLOCK,
+            nix::sys::stat::Mode::empty(),
+        )
+        .ok()
+    });
+    nix::unistd::write(&fd, b"go\n").expect("write the fifo");
 }
 
 struct Client {
@@ -209,11 +227,7 @@ async fn one_output_chunk_redraws_every_attached_client() {
         clients.push(client);
     }
 
-    let writer = fifo.clone();
-    tokio::task::spawn_blocking(move || std::fs::write(writer, b"go\n"))
-        .await
-        .expect("join fifo writer")
-        .expect("release the pane through the fifo");
+    release(&fifo);
 
     let drew = futures::future::join_all(clients.iter_mut().map(|c| c.draws("MARK"))).await;
     let missed: Vec<usize> = (0..drew.len()).filter(|&i| !drew[i]).collect();

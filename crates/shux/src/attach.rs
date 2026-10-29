@@ -900,6 +900,7 @@ async fn run_attach_loop(
             render_tx,
             render_cancel,
             hello.graphics,
+            fallback_tick(),
         )
         .await;
     });
@@ -1480,7 +1481,10 @@ async fn run_render_loop(
     out_tx: mpsc::Sender<AttachServerFrame>,
     cancel: CancellationToken,
     graphics: bool,
+    tick_period: Duration,
 ) {
+    // Before anything else: a receiver starts at the current generation.
+    let mut pulse = io_state.lock().await.render_pulse.subscribe();
     let (mut cols, mut rows) = *client_size.lock().await;
     let initial = config.current();
     let initial_theme = shux_core::theme::Theme::resolve(&initial.theme);
@@ -1503,12 +1507,9 @@ async fn run_render_loop(
 
     // Fallback tick lets us update clocks etc. even when nothing else
     // happens. The pulse covers the data-driven case.
-    let mut tick = tokio::time::interval(fallback_tick());
+    let mut tick = tokio::time::interval(tick_period);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    // Subscribed once, before the first render: a bump that lands while
-    // this loop renders leaves the receiver changed, so it is never missed.
-    let mut pulse = io_state.lock().await.render_pulse.subscribe();
+    let mut last_frame: Option<tokio::time::Instant> = None;
 
     // Welcome toast: lazily-initialised first-render instant. Stays
     // None until the first render iteration where we actually start
@@ -1529,12 +1530,29 @@ async fn run_render_loop(
     let mut last_copy_menu: Option<CopyContextMenu> = None;
 
     loop {
+        // A bump landed while the last frame was being drawn: output is
+        // arriving faster than this loop renders.
+        let behind = pulse.has_changed().unwrap_or(false);
         tokio::select! {
             _ = cancel.cancelled() => break,
             changed = pulse.changed() => {
-                // The sender lives in `PaneIoState`, which outlives this loop.
+                // Unreachable while `PaneIoState` lives; never spin on it.
                 if changed.is_err() {
                     break;
+                }
+                // Every loop wakes on every pane's output, so a flood would
+                // have each one composite under the `io_state` lock as fast
+                // as it can. Bumps that land meanwhile coalesce.
+                if behind
+                    && let Some(next) = last_frame.map(|at| at + MIN_FRAME_INTERVAL)
+                    && next > tokio::time::Instant::now()
+                {
+                    #[expect(clippy::disallowed_methods, reason = "paces frames; never synchronises a test")]
+                    let pace = tokio::time::sleep_until(next);
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        _ = pace => {}
+                    }
                 }
             }
             _ = &mut cfg_listener => {
@@ -1545,6 +1563,8 @@ async fn run_render_loop(
             }
             _ = tick.tick() => {}
         }
+
+        last_frame = Some(tokio::time::Instant::now());
 
         // Resize from authoritative client_size, NOT from VT grid (which
         // would create a self-feeding shrink loop in split mode).
@@ -1866,6 +1886,10 @@ async fn run_render_loop(
 /// ~10.7 MiB, comfortably inside the codec's 16 MiB frame cap with room for the
 /// JSON envelope.
 const RENDER_PART_BYTES: usize = 8 * 1024 * 1024;
+
+/// The shortest gap between two frames of one client while output arrives
+/// faster than it renders. Output after an idle wait draws at once.
+const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 /// How long the first-attach welcome toast stays on screen before
 /// auto-dismissing. Tuned for "long enough to read, short enough to
@@ -4175,6 +4199,79 @@ mod tests {
 
         cancel.cancel();
         task.abort();
+    }
+
+    /// A bump that lands while a frame is being drawn is drawn next, even with
+    /// no tick to fall back on: the loop's receiver outlives the iteration.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_bump_during_a_frame_is_drawn_by_the_next_one() {
+        let fixture = attach_fixture().await;
+        let onboarding = crate::onboarding::OnboardingHandle::from_state_for_test(
+            crate::onboarding::OnboardingState {
+                prefix_discovered: true,
+                welcome_toast_seen: true,
+            },
+        );
+        let held = onboarding.hold_for_test().await;
+        let pulse = fixture.io_state.lock().await.render_pulse.clone();
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = fixture.cancel.child_token();
+        let render = tokio::spawn(run_render_loop(
+            fixture.graph.clone(),
+            fixture.io_state.clone(),
+            test_config(),
+            SegmentCache::new(),
+            crate::session_meta::SessionMetaCache::new(),
+            onboarding.clone(),
+            std::time::Instant::now(),
+            Arc::new(Mutex::new(fixture.attached.clone())),
+            Arc::new(Mutex::new((100, 24))),
+            tx,
+            cancel.clone(),
+            false,
+            Duration::from_secs(3600),
+        ));
+
+        // The prelude follows the subscription, so from here the only
+        // `io_state` holder is the first frame, stuck reading `onboarding`
+        // after it took the graph snapshot.
+        tokio::time::timeout(shux_testkit::BUDGET, rx.recv())
+            .await
+            .expect("prelude timeout")
+            .expect("prelude");
+        let io_state = fixture.io_state.clone();
+        shux_testkit::wait_until_async("the first frame to hold io_state", || {
+            let io_state = io_state.clone();
+            async move { io_state.try_lock().is_err() }
+        })
+        .await;
+        fixture
+            .graph
+            .rename_window(fixture.first_window, format!("MA{}RK", ""), None)
+            .await
+            .expect("rename window");
+        pulse.bump();
+        drop(held);
+
+        let mut screen = shux_vt::VirtualTerminal::new(24, 100);
+        let deadline = tokio::time::Instant::now() + shux_testkit::BUDGET;
+        let drew = loop {
+            if screen.capture_text(None).contains("MARK") {
+                break true;
+            }
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(AttachServerFrame::Render { data })) => {
+                    screen.process(&BASE64.decode(data).expect("render base64"));
+                }
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break false,
+            }
+        };
+        assert!(drew, "a bump that landed mid-frame was never drawn");
+
+        cancel.cancel();
+        render.await.expect("render loop");
+        fixture.stop();
     }
 
     async fn attach_fixture() -> AttachFixture {
