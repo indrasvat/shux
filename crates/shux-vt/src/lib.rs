@@ -2136,6 +2136,25 @@ mod tests {
         assert_eq!(compact_capture(&vt), "frame");
     }
 
+    /// Output inside an open window must not extend its deadline: a TUI that
+    /// streams while holding the window is released on time, not at the cap.
+    #[test]
+    fn output_inside_a_window_does_not_extend_its_deadline() {
+        let clock = test_clock::Frozen::new();
+        let mut vt = VirtualTerminal::new(3, 10);
+        vt.process(b"\x1b[?2026h");
+        let step_ms = 10;
+        for elapsed in (step_ms..=SYNC_UPDATE_TIMEOUT_MS).step_by(step_ms as usize) {
+            clock.advance_ms(step_ms);
+            vt.process(b"x");
+            assert_eq!(
+                vt.modes().synchronized_output,
+                elapsed < SYNC_UPDATE_TIMEOUT_MS,
+                "streamed into for {elapsed} ms; the deadline is {SYNC_UPDATE_TIMEOUT_MS} ms"
+            );
+        }
+    }
+
     fn row_text(vt: &VirtualTerminal, abs: usize) -> String {
         vt.presented_row(abs)
             .map(|row| {
