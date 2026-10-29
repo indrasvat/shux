@@ -553,11 +553,13 @@ async fn winsize_declares_pixel_geometry_to_the_child_at_spawn_and_on_resize() {
     );
     // Prints winsize, then waits for the SIGWINCH the resize sends and prints
     // again. SIGWINCH is blocked before SPAWN is printed, so a resize that
-    // lands before the wait stays pending instead of being lost.
+    // lands before the wait stays pending instead of being lost. It needs a
+    // handler too: macOS discards a default-ignored signal even while blocked.
     let program = r#"
 import fcntl, signal, struct, sys, termios
 def ws():
     return struct.unpack("HHHH", fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, b"\0" * 8))
+signal.signal(signal.SIGWINCH, lambda *a: None)
 signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGWINCH])
 r, c, x, y = ws()
 print("SPAWN %d %d %d %d" % (c, r, x, y), flush=True)
