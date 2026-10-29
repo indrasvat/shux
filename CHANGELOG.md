@@ -1,3 +1,10 @@
+## [0.54.11](https://github.com/indrasvat/shux/compare/v0.54.10...v0.54.11) (2026-10-29)
+
+
+### Bug Fixes
+
+* **attach:** one pane output chunk redraws every attached client ([#229](https://github.com/indrasvat/shux/issues/229)) ([e94968b](https://github.com/indrasvat/shux/commit/e94968beb86cc0f5b7f5565f941a84523e1f4ff6))
+
 ## [0.54.10](https://github.com/indrasvat/shux/compare/v0.54.9...v0.54.10) (2026-10-28)
 
 
