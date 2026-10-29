@@ -8,7 +8,8 @@
 # cheap enough to run after every edit as a Claude Code hook:
 #
 # - in `crates/*/tests/`, a qualified sleep call or a sleep import on a code
-#   line, unless the statement carrying it has
+#   line, unless the item or statement carrying it (a fn, a `select!`, a
+#   statement holding a closure) has
 #   `#[expect(clippy::disallowed_methods, ...)]`;
 # - in any `crates/` source, an attribute (inner, outer or inside `cfg_attr`)
 #   that allows `clippy::disallowed_methods` or a group holding it, expects
@@ -48,10 +49,6 @@ scan() {
     awk -v path="$1" -v tests="$2" -v q="'" '
         BEGIN { charlit = "^" q "(\\\\[^" q "]+|[^\\\\" q "])" q }
         function ident(ch) { return ch ~ /[A-Za-z0-9_]/ }
-        function ends_statement(s) {
-            sub(/[ \t]+$/, "", s)
-            return s ~ /[;}]$/
-        }
         # Code with comments removed and literals emptied. The lexer state
         # carries across lines: block comments nest, strings span lines.
         function strip(line,    out, i, n, c, two, rest, h) {
@@ -100,6 +97,27 @@ scan() {
             orig[NR] = $0
             code[NR] = strip($0)
         }
+        # Mark the lines of the item or statement the attribute at line n,
+        # column p sits on: up to a `;` or `,` at its own depth, or the `}`
+        # that closes its body.
+        function cover(n, p,    k, i, line, ch, sq, depth, inside) {
+            sq = 0; depth = 0; inside = 1
+            for (k = n; k <= NR && k <= n + 400; k++) {
+                covered[k] = 1; line = code[k]
+                for (i = (k == n) ? p : 1; i <= length(line); i++) {
+                    ch = substr(line, i, 1)
+                    if (inside) {
+                        if (ch == "[") sq++
+                        else if (ch == "]" && --sq == 0) inside = 0
+                        continue
+                    }
+                    if (index("([{", ch)) depth++
+                    else if (index(")]}", ch)) {
+                        if (--depth < 0 || (depth == 0 && ch == "}")) return
+                    } else if (depth == 0 && (ch == ";" || ch == ",")) return
+                }
+            }
+        }
         END {
             for (n = 1; n <= NR; n++) {
                 c = code[n]
@@ -111,29 +129,23 @@ scan() {
                         a = a " " code[k]; open += gsub(/\[/, "[", code[k]) - gsub(/\]/, "]", code[k])
                     }
                     if (waiver(a)) { printf "%s:%d: waiver: %s\n", path, n, orig[n]; continue }
+                    if (a ~ /^#[ \t]*\[/ && a ~ /expect[ \t]*\(/ && a ~ /clippy::disallowed_methods/) cover(n, p)
                 }
-                if (!tests) continue
+                if (!tests || covered[n]) continue
                 call = c ~ /(^|[^A-Za-z0-9_:])(::)?((std::)?thread|(tokio::)?time)::sleep(_until)?[ \t]*\(/
                 imp = c ~ /^[ \t]*(pub[^ ]* +)?use +(::)?(std::thread|tokio::time)::(.*[^A-Za-z0-9_])?sleep(_until)?([^A-Za-z0-9_]|$)/
-                if (!call && !imp) continue
-                # The statement carrying it, or an attribute above it, names the lint.
-                allowed = c ~ /clippy::disallowed_methods/
-                for (k = n - 1; !allowed && k >= 1 && k >= n - 12; k--) {
-                    if (code[k] ~ /clippy::disallowed_methods/) { allowed = 1; break }
-                    if (ends_statement(code[k])) break
-                }
-                if (!allowed) printf "%s:%d: %s\n", path, n, orig[n]
+                if (call || imp) printf "%s:%d: %s\n", path, n, orig[n]
             }
         }
     ' "$1"
 }
 
-# Prints `path:line: text` for a Cargo.toml `[lints.clippy]` table that
-# relaxes the ban or a group holding it.
+# Prints `path:line: text` for a Cargo.toml `[lints.clippy]` entry that allows
+# or expects the ban or a group holding it.
 scan_manifest() {
     awk -v path="$1" '
         /^[ \t]*\[/ { t = $0; gsub(/[ \t]/, "", t); clippy = (t == "[lints.clippy]" || t == "[workspace.lints.clippy]") }
-        clippy && /^[ \t]*"?(disallowed[-_]methods|style|all)"?[ \t]*=/ && !/"(deny|forbid)"/ {
+        clippy && /^[ \t]*"?(disallowed[-_]methods|style|all)"?[ \t]*=/ && /"(allow|expect)"/ {
             printf "%s:%d: waiver: %s\n", path, NR, $0
         }
     ' "$1"

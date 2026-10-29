@@ -69,6 +69,19 @@ expect 0 "an annotation on the same line passes" bash "$guard"
 case_file 'fn t() {' '    #[expect(clippy::disallowed_methods, reason = "x")]' '    h.spawn(move || {' \
     '        std::thread::sleep(d);' '    });' '}'
 expect 0 "an annotated statement holding a closure passes" bash "$guard"
+case_file '#[expect(clippy::disallowed_methods, reason = "x")]' 'async fn t() {' '    let a = 1;' \
+    '    tokio::time::sleep(d).await;' '}'
+expect 0 "an annotated fn covers its whole body" bash "$guard"
+case_file 'async fn t() {' '    #[expect(clippy::disallowed_methods, reason = "x")]' '    tokio::select! {' \
+    '        _ = rx.recv() => {}' '        _ = tokio::time::sleep(d) => {}' '    }' '}'
+expect 0 "an annotated select! covers its arms" bash "$guard"
+case_file 'fn t() {' '    #[expect(clippy::disallowed_methods, reason = "x")]' \
+    '    let h = std::thread::spawn(move || {' '        let a = 1;' '        std::thread::sleep(d);' \
+    '    });' '}'
+expect 0 "an annotated statement covers every line of its closure" bash "$guard"
+case_file '#[expect(clippy::disallowed_methods, reason = "x")]' 'fn t() {' '    std::thread::sleep(d);' \
+    '}' 'fn u() {' '    std::thread::sleep(d);' '}'
+expect 1 "an annotated fn does not cover the next one" bash "$guard"
 case_file 'fn t() {' '    #[expect(clippy::unwrap_used, reason = "not clippy::disallowed_methods")]' \
     '    std::thread::sleep(d);' '}'
 expect 1 "a reason that names the lint is not an annotation" bash "$guard"
@@ -102,8 +115,11 @@ expect 0 "an attribute or comment inside a multi-line string is inert" bash "$gu
 src_file 'fn f() {}'
 printf '%s\n' '[lints.clippy]' 'disallowed_methods = "allow"' >"$work/crates/k/Cargo.toml"
 expect 1 "a Cargo.toml lint table relaxing the ban is flagged" bash "$guard"
-printf '%s\n' '[lints.clippy]' 'all = { level = "warn", priority = -1 }' >"$work/crates/k/Cargo.toml"
+printf '%s\n' '[workspace.lints.clippy]' 'all = { level = "allow", priority = -1 }' >"$work/crates/k/Cargo.toml"
 expect 1 "a Cargo.toml lint table relaxing a group holding it is flagged" bash "$guard"
+printf '%s\n' '[workspace.lints.clippy]' 'all = { level = "warn", priority = -1 }' 'style = "warn"' \
+    >"$work/crates/k/Cargo.toml"
+expect 0 "a Cargo.toml lint table that warns relaxes nothing under -D warnings" bash "$guard"
 printf '%s\n' '[lints.clippy]' 'disallowed_methods = "deny"' >"$work/crates/k/Cargo.toml"
 expect 0 "a Cargo.toml lint table that keeps the ban passes" bash "$guard"
 rm "$work/crates/k/Cargo.toml"
