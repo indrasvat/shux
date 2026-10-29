@@ -24,7 +24,11 @@ if ((load > 0)); then
     hog=$!
     trap 'kill "$hog" 2>/dev/null; wait "$hog" 2>/dev/null || true' EXIT
 fi
+# A hog that died leaves the run unloaded, which proves nothing about load.
+hogs_alive() { ((load == 0)) || kill -0 "$hog" 2>/dev/null; }
 
 echo "▶ $count run(s) of '$filter' with $load CPU hog(s), -j $jobs"
+hogs_alive || { echo "test-stress: stress-ng exited before the run started" >&2; exit 1; }
 "$root/.shux/scripts/no_leak_guard.sh" cargo nextest run -j "$jobs" --status-level fail \
     --workspace -E "$filter" --stress-count "$count"
+hogs_alive || { echo "test-stress: stress-ng exited during the run, so it was not loaded throughout" >&2; exit 1; }

@@ -97,6 +97,10 @@ jobs:
         run: make clippy
       - name: No raw sleeps in tests
         run: make check-test-sleeps
+      - name: Clippy (macOS cfg)
+        # Linux clippy never sees cfg(target_os = "macos") code, so a sleep or
+        # any other lint there would otherwise reach only the macOS test job.
+        run: make check-darwin
       # The guards, leak checks and evidence harnesses are all shell. A defect
       # there does not fail loudly the way a test does — it makes a guard quietly
       # stop guarding, which is the failure mode this repo can least afford.

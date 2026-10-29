@@ -17,9 +17,11 @@ lanes="$(cargo metadata --no-deps --format-version 1 --color never |
     jq -r '.packages[] | .name as $pkg | .targets[]
         | select(.kind == ["test"] and .test == false) | "\($pkg) \(.name)"')"
 
+# crates/shux declares the lens lane `test = false`, so an empty list means the
+# query broke, not that there is nothing to lint.
 if [[ -z "$lanes" ]]; then
-    echo "✓ no test = false targets to lint"
-    exit 0
+    echo "clippy-lanes: found no test = false targets; the metadata query is broken" >&2
+    exit 1
 fi
 
 count=0

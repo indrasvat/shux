@@ -154,14 +154,14 @@ check-ci-parity: nextest-ready ## Run the cargo-output parsers under CI's enviro
 	@bash scripts/check-ci-parity.sh
 
 .PHONY: check-darwin
-check-darwin: ## Type-check the workspace for macOS — catches cfg-gated APIs a Linux build never sees
+check-darwin: ## Clippy the workspace for macOS — catches cfg-gated code a Linux build never sees
 	@# Needs the -Dwarnings above: dead cfg-gated items are warnings, so without
 	@# it this printed the defect and reported success.
 	@echo "$(COLOR_BLUE)▶ Cross-checking aarch64-apple-darwin...$(COLOR_RESET)"
 	@rustup target list --installed | grep -qx aarch64-apple-darwin \
 	  || rustup target add aarch64-apple-darwin
-	@cargo check --workspace --all-targets --target aarch64-apple-darwin --color never
-	@echo "$(COLOR_GREEN)✓ macOS type-check passed$(COLOR_RESET)"
+	@CLIPPY_CONF_DIR="$(CURDIR)" cargo clippy --workspace --all-targets --target aarch64-apple-darwin --color never -- -D warnings
+	@echo "$(COLOR_GREEN)✓ macOS clippy passed$(COLOR_RESET)"
 
 .PHONY: check-test-groups
 check-test-groups: nextest-ready ## Assert every nextest test-group still matches the tests it bounds
@@ -722,8 +722,10 @@ check-lens-frozen: ## Enforce the lens frozen-path test-integrity trailer (§16.
 .PHONY: clippy
 clippy: ## Run clippy linter
 	@echo "$(COLOR_BLUE)▶ Running clippy...$(COLOR_RESET)"
-	@cargo clippy --workspace --all-targets -- -D warnings
-	@bash scripts/clippy-lanes.sh
+	@# CLIPPY_CONF_DIR: clippy reads the NEAREST clippy.toml and does not merge,
+	@# so a crate-local one would silently drop the root's sleep ban.
+	@CLIPPY_CONF_DIR="$(CURDIR)" cargo clippy --workspace --all-targets -- -D warnings
+	@CLIPPY_CONF_DIR="$(CURDIR)" bash scripts/clippy-lanes.sh
 	@echo "$(COLOR_GREEN)✓ Clippy passed$(COLOR_RESET)"
 
 .PHONY: clippy-beta
@@ -748,7 +750,7 @@ fmt: ## Format all code
 	@echo "$(COLOR_GREEN)✓ Formatting complete$(COLOR_RESET)"
 
 .PHONY: check-after-hygiene
-check-after-hygiene: lint shellcheck check-darwin test check-test-groups check-test-inventory check-ci-parity test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-lens-frozen check-no-bin-mods check-vt-corpus-scratch
+check-after-hygiene: lint shellcheck check-test-sleeps check-darwin test check-test-groups check-test-inventory check-ci-parity test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-lens-frozen check-no-bin-mods check-vt-corpus-scratch
 
 .PHONY: check
 check: hooks-check check-target-hygiene ## Run lint + test + process/QA guards (what pre-commit runs)
@@ -760,7 +762,7 @@ check: hooks-check check-target-hygiene ## Run lint + test + process/QA guards (
 	@echo ""
 
 .PHONY: ci
-ci: lint shellcheck check-darwin test check-test-groups check-test-inventory check-ci-parity test-doc test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-no-bin-mods check-vt-corpus-scratch ## Run the CI pipeline locally (lint + full test + doc tests + process/QA guards)
+ci: lint shellcheck check-test-sleeps check-darwin test check-test-groups check-test-inventory check-ci-parity test-doc test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-no-bin-mods check-vt-corpus-scratch ## Run the CI pipeline locally (lint + full test + doc tests + process/QA guards)
 	@echo ""
 	@echo "$(COLOR_GREEN)$(COLOR_BOLD)✓ CI pipeline passed!$(COLOR_RESET)"
 	@echo ""
@@ -806,7 +808,7 @@ check-vt-qa: ## Require SOLID QA evidence from any diff that touches VT renderin
 	@bash scripts/check-vt-fixtures.sh
 
 .PHONY: check-test-sleeps
-check-test-sleeps: ## No raw sleeps in crates/*/tests (the hook's check; clippy covers the rest)
+check-test-sleeps: ## No raw sleeps in crates/*/tests, no waivers of the sleep ban (the hook's check; clippy covers the rest)
 	@bash scripts/check-test-sleeps-selftest.sh
 	@bash scripts/check-test-sleeps.sh
 

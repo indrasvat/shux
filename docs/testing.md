@@ -14,9 +14,8 @@ Add `shux-testkit = { path = "../shux-testkit" }` to the crate's
 |---|---|
 | `wait_until(what, \|\| cond)` | Wait for a condition; panics naming `what` after `BUDGET` (30s). |
 | `wait_for(what, \|\| Option<T>)` | Same, returning the value the probe found. |
-| `wait_for_within(budget, what, probe)` | When the test is about a specific bound. |
 | `poll(budget, probe)` / `poll_until(budget, cond)` | Returns `None`/`false` on timeout, for a caller that must clean up first. |
-| `*_async` variants | In async tests. They yield between probes, so they are safe on a current-thread runtime whose other tasks make the condition true. Never block an async test with a sync helper. |
+| `*_async` variants | In async tests. They yield between probes, so they are safe on a current-thread runtime whose other tasks make the condition true. Never block an async test with a sync helper. Their poll interval is a tokio sleep, so under a paused clock that is held (auto-advance off) they never wake: wait on the blocking pool with a sync helper instead. |
 
 Probes start at a 1 ms interval and back off to 25 ms, so a fast machine
 finishes as soon as the condition holds.
@@ -51,14 +50,20 @@ deadline is ordered by the monotonic clock.
 
 - `clippy.toml` disallows `std::thread::sleep`, `tokio::time::sleep` and
   `tokio::time::sleep_until` everywhere. `make clippy` (CI's Clippy step) also
-  lints the `test = false` lens lane, which `--all-targets` skips.
-- `.claude/settings.json` runs `scripts/check-test-sleeps.sh` after every edit
-  of a file under `crates/*/tests/`, so an agent hears about a raw sleep at
-  write time. `make check-test-sleeps` runs its self-test and scans the tree.
+  lints the `test = false` lens lane, which `--all-targets` skips, and pins
+  `CLIPPY_CONF_DIR` to the root: clippy reads the nearest `clippy.toml` and
+  does not merge, so a crate-local one would drop the ban. `make check-darwin`
+  runs the same lints over macOS-only code.
+- `scripts/check-test-sleeps.sh` flags a raw sleep in `crates/*/tests/`, and an
+  `allow` (or crate-wide `expect`) of `clippy::disallowed_methods` anywhere in
+  `crates/`. `.claude/settings.json` runs it after every edit, so an agent hears
+  about it at write time; `make check-test-sleeps` runs its self-test and scans
+  the tree, in `make check` and in CI.
 
-Neither catches `recv_timeout(SHORT)`, `timeout(SHORT, ..)` used to assert
-absence, or a fixture script's `sleep 1; echo ready`. Those are the same defect;
-review for them.
+None of these catch a sleep in disguise: `recv_timeout(SHORT)`,
+`timeout(SHORT, ..)` or `!poll_until(SHORT, ..)` used to assert absence,
+`park_timeout`, a busy loop on `Instant::now()`, or a fixture script's
+`sleep 1; echo ready`. Those are the same defect; review for them.
 
 ## Proving a de-flake
 
