@@ -1076,9 +1076,9 @@ pub(crate) fn spawn_failure_message(e: &shux_pty::PtyError) -> String {
     format!("{e} — {}", spawn_failure_hint(e))
 }
 
-/// The status-bar line for a pane the attach UI could not start. Its split
-/// and new window run the default command, so a spawn error names the
-/// configured `[shell].command` when there is one.
+/// The status-bar line for a pane the attach UI could not start: the cause
+/// first, since the bar cuts from the right, then the configured
+/// `[shell].command` its split and new window ran, when there is one.
 pub(crate) fn spawn_failure_notice(e: &shux_pty::PtyError) -> String {
     spawn_failure_notice_for(e, &daemon_shell_config())
 }
@@ -1093,8 +1093,8 @@ fn spawn_failure_notice_for(
     let detail = io.to_string();
     let cause = detail.split(" (os error").next().unwrap_or(&detail);
     match configured_shell_argv(shell) {
-        Some(argv) => format!("[shell].command `{}`: {cause}", argv[0]),
-        None => format!("could not start the shell: {cause}"),
+        Some(argv) => format!("{cause} ([shell].command `{}`)", argv[0]),
+        None => format!("{cause} (starting the shell)"),
     }
 }
 
@@ -1204,17 +1204,34 @@ mod tests {
         let enoent = || shux_pty::PtyError::Spawn(std::io::Error::from_raw_os_error(2));
         assert_eq!(
             spawn_failure_notice_for(&enoent(), &shell_cfg(&["/usr/bin/typo", "-l"], &[])),
-            "[shell].command `/usr/bin/typo`: No such file or directory"
+            "No such file or directory ([shell].command `/usr/bin/typo`)"
         );
         assert_eq!(
             spawn_failure_notice_for(&enoent(), &shell_cfg(&[], &[])),
-            "could not start the shell: No such file or directory"
+            "No such file or directory (starting the shell)"
         );
         // Not a spawn error: no program to blame.
         let open = shux_pty::PtyError::Open(std::io::Error::other("out of ptys"));
         assert_eq!(
             spawn_failure_notice_for(&open, &shell_cfg(&["/usr/bin/typo"], &[])),
             "failed to open PTY: out of ptys"
+        );
+    }
+
+    /// The status bar cuts a notice from the right, so on a 40-column
+    /// client a long path must not push the reason off the end.
+    #[test]
+    fn a_long_program_path_leaves_the_reason_on_a_narrow_bar() {
+        let path = format!("/opt/{}/zsh-custom-build", "nested/".repeat(14));
+        let enoent = shux_pty::PtyError::Spawn(std::io::Error::from_raw_os_error(2));
+        let notice = format!(
+            "split failed: {}",
+            spawn_failure_notice_for(&enoent, &shell_cfg(&[&path], &[]))
+        );
+        let visible: String = notice.chars().take(39).collect();
+        assert!(
+            visible.contains("No such file or directory"),
+            "a 40-column bar shows {visible:?}"
         );
     }
 

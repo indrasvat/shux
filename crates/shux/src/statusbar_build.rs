@@ -539,11 +539,11 @@ mod tests {
         let onb = OnboardingState::default();
         let mut c = ctx(sid, "project", wid, pid, &meta, &onb, 120);
         c.last_action = Some(("pane split", Instant::now()));
-        c.action_error = Some("split failed: [shell].command `x`: No such file or directory");
+        c.action_error = Some("split failed: No such file or directory ([shell].command `x`)");
         let bar = build(&snap, &Theme::DEFAULT, &c);
         assert_eq!(
             flat(&bar.center),
-            " split failed: [shell].command `x`: No such file or directory "
+            " split failed: No such file or directory ([shell].command `x`) "
         );
         let e = Theme::DEFAULT.status_error;
         assert_eq!(
