@@ -778,6 +778,9 @@ fn write_style(buf: &mut Vec<u8>, cell: &shux_vt::Cell) {
     if flags.contains(CellFlags::INVERSE) {
         let _ = write!(buf, "\x1b[7m");
     }
+    if flags.contains(CellFlags::HIDDEN) {
+        let _ = write!(buf, "\x1b[8m");
+    }
     if flags.contains(CellFlags::STRIKETHROUGH) {
         let _ = write!(buf, "\x1b[9m");
     }
@@ -1062,7 +1065,7 @@ fn selection_text_run(
         let text = row_ref
             .get(col as usize)
             .filter(|cell| !cell.is_wide_continuation())
-            .map(|cell| cell.display_text().into_owned())
+            .map(shown_text)
             .unwrap_or_else(|| " ".to_string());
         let _ = write!(
             buf,
@@ -1125,15 +1128,20 @@ fn cursor_glyph(vt: &VirtualTerminal, pane: Rect, state: &CopyModeState) -> Opti
     if cell.is_wide() && col + 1 >= pane.width {
         return None;
     }
+    Some((col, shown_text(cell)))
+}
+
+/// What an overlay that recolours `cell` may show of it: concealed (SGR 8)
+/// text becomes blanks of the same width, an empty cell a blank.
+fn shown_text(cell: &shux_vt::Cell) -> String {
     let text = cell.display_text();
-    Some((
-        col,
-        if text.is_empty() {
-            " ".into()
-        } else {
-            text.into_owned()
-        },
-    ))
+    if cell.style.flags.contains(CellFlags::HIDDEN) {
+        " ".repeat(if cell.is_wide() { 2 } else { 1 })
+    } else if text.is_empty() {
+        " ".into()
+    } else {
+        text.into_owned()
+    }
 }
 
 fn cursor_block(buf: &mut Vec<u8>, x: u16, y: u16, glyph: &str, fg: Rgb, bg: Rgb) {
@@ -1583,6 +1591,52 @@ mod tests {
             assert!(cell.is_wide());
             cursor_colours(&cell);
         }
+    }
+
+    /// Concealed text (SGR 8) stays concealed under the copy cursor, narrow
+    /// and wide, and inside a selection.
+    #[test]
+    fn copy_mode_keeps_concealed_text_concealed() {
+        let vt = vt_with(3, 20, "\x1b[8mSECRET\u{6f22}\x1b[0m");
+        let pane = Rect::new(0, 0, 20, 3);
+        for (cursor, block) in [(0, 0), (6, 6), (7, 6)] {
+            let state = CopyModeState {
+                cursor: (cursor, 0),
+                ..Default::default()
+            };
+            let cell = overlay_cell(&vt, pane, &state, block, 0);
+            assert!(
+                cell.display_text().trim().is_empty(),
+                "the copy cursor at col {cursor} showed concealed {:?}",
+                cell.display_text()
+            );
+            cursor_colours(&cell);
+        }
+
+        let state = CopyModeState {
+            cursor: (5, 0),
+            anchor: Some((0, 0)),
+            ..Default::default()
+        };
+        let cell = overlay_cell(&vt, pane, &state, 2, 0);
+        assert!(
+            cell.display_text().trim().is_empty(),
+            "the selection showed concealed {:?}",
+            cell.display_text()
+        );
+
+        let mut buf = Vec::new();
+        render_copy_view_into(&mut buf, pane, &vt, &CopyModeState::default());
+        let mut screen = VirtualTerminal::new(pane.height as usize, pane.width as usize);
+        screen.process(&buf);
+        let cell = row_for_view(&screen, pane.height, 0, 0)
+            .and_then(|r| r.get(2).cloned())
+            .expect("cell on screen");
+        assert!(
+            cell.style.flags.contains(CellFlags::HIDDEN),
+            "the copy view drew concealed {:?} unconcealed",
+            cell.display_text()
+        );
     }
 
     /// The hint bar sits on the pane's last row, which the cursor can reach.
