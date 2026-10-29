@@ -282,10 +282,10 @@ pub(crate) async fn snapshot_window(
     let (fitted_tree, natural) =
         natural_frame(&window.layout, &pane_data, border_style).unwrap_or((None, FALLBACK_DIMS));
     let defaulted = cols.is_none() || rows.is_none();
-    // Explicit dims show the live layout's proportions; the window's own size
-    // shows every pane whole, which the live ratios cannot promise for grids
-    // never sized from them.
-    let fitted_tree = fitted_tree.filter(|_| cols.is_none() && rows.is_none());
+    // An axis left to default must hold every pane whole, which the live
+    // ratios cannot promise for grids never sized from them. Explicit dims on
+    // both axes show the live layout's proportions.
+    let fitted_tree = fitted_tree.filter(|_| defaulted);
     let (cols, rows) = (cols.unwrap_or(natural.0), rows.unwrap_or(natural.1));
 
     let (cw, ch) = rasterizer.cell_size();

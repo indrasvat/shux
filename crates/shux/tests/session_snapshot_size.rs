@@ -186,6 +186,47 @@ fn a_snapshot_without_dims_fits_a_chain_of_splits_without_a_dead_band() {
     }
 }
 
+/// Giving one axis leaves the other at the window's own size, which must
+/// still hold every pane whole along it.
+#[test]
+fn a_snapshot_with_one_dim_still_fits_the_other_axis_of_a_chain() {
+    let h = Harness::new();
+    let (session_id, first) = spawn(&h);
+    let mut target = first;
+    for _ in 0..2 {
+        let split = h.rpc_ok(
+            "pane.split",
+            json!({
+                "pane_id": target,
+                "direction": "vertical",
+                "command": ["sh", "-c", SCRIPT],
+            }),
+        );
+        target = split["pane"]["id"]
+            .as_str()
+            .expect("new pane id")
+            .to_string();
+        h.wait_for(&target, "BARS-DONE", shux_testkit::BUDGET_MS)
+            .expect("split pane never drew its bars");
+    }
+
+    let (img, cw, ch) = decode(&h.rpc_ok(
+        "session.snapshot",
+        json!({ "session_id": session_id, "rows": 40 }),
+    ));
+    assert_eq!(
+        img.width(),
+        frame_px(PANE_COLS * 3 + 2, PANE_ROWS, cw, ch).0,
+        "--rows alone changed the window's width"
+    );
+    for (i, col) in [1, 2 + PANE_COLS, 3 + 2 * PANE_COLS]
+        .into_iter()
+        .enumerate()
+    {
+        assert_bars(&img, cw, ch, col, 1, &format!("pane {i}"));
+    }
+}
+
 #[test]
 fn explicit_dims_still_win() {
     let h = Harness::new();
