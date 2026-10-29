@@ -511,10 +511,12 @@ fn preserve_corrupt_registry_with(
         };
         match link(path, &corrupt) {
             Ok(()) => {
-                return match std::fs::remove_file(path) {
-                    Err(e) if e.kind() != ErrorKind::NotFound => Err(e),
-                    _ => Ok(corrupt),
-                };
+                if let Err(e) = std::fs::remove_file(path)
+                    && e.kind() != ErrorKind::NotFound
+                {
+                    tracing::warn!(error = %e, "scratch-registry: corrupt original not removed");
+                }
+                return Ok(corrupt);
             }
             Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
             // No hard link here: rename onto a name seen free. The daemon's
@@ -840,7 +842,7 @@ impl ScratchRegistry {
                     ),
                     Err(re) => tracing::error!(
                         error = %e,
-                        rename_error = %re,
+                        preserve_error = %re,
                         "scratch-registry: unreadable, and could not preserve the corrupt file"
                     ),
                 }
@@ -2240,6 +2242,24 @@ mod tests {
             std::fs::remove_file(a)
         };
         let kept = preserve_corrupt_registry_with(&path, SystemTime::now(), link_then_vanish)
+            .expect("evidence was linked aside but reported as not preserved");
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), "{evidence");
+    }
+
+    /// Evidence linked aside is preserved even when the original cannot then be
+    /// removed; the next startup only preserves it again.
+    #[test]
+    fn evidence_linked_but_original_kept_is_reported_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scratch-registry.json");
+        std::fs::write(&path, "{evidence").unwrap();
+        // A directory in the original's place makes its removal fail.
+        let link_then_block = |a: &Path, b: &Path| {
+            std::fs::hard_link(a, b)?;
+            std::fs::remove_file(a)?;
+            std::fs::create_dir(a)
+        };
+        let kept = preserve_corrupt_registry_with(&path, SystemTime::now(), link_then_block)
             .expect("evidence was linked aside but reported as not preserved");
         assert_eq!(std::fs::read_to_string(&kept).unwrap(), "{evidence");
     }
