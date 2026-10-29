@@ -159,6 +159,11 @@ impl Env {
 
     /// Whether the host pane's terminal cursor is showing.
     fn cursor_visible(&self) -> bool {
+        self.cursor().2
+    }
+
+    /// The host pane's terminal cursor: `(row, col, visible)`.
+    fn cursor(&self) -> (u64, u64, bool) {
         let v: serde_json::Value = serde_json::from_str(&self.ok(&[
             "--format",
             "json",
@@ -170,7 +175,12 @@ impl Env {
             &self.host_pane,
         ]))
         .expect("capture json");
-        v["cursor"]["visible"].as_bool().expect("cursor.visible")
+        let c = &v["cursor"];
+        (
+            c["row"].as_u64().expect("cursor.row"),
+            c["col"].as_u64().expect("cursor.col"),
+            c["visible"].as_bool().expect("cursor.visible"),
+        )
     }
 
     /// The host screen row holding `needle`.
@@ -296,6 +306,32 @@ fn copy_mode_and_the_help_overlay_hide_the_terminal_cursor() {
     wait_until("the cursor to come back after help", || {
         env.cursor_visible()
     });
+}
+
+/// The selection overlay and its menu are written after the frame too, and
+/// must leave the terminal cursor on the pane's cursor, not where their last
+/// write ended.
+#[test]
+fn a_mouse_selection_leaves_the_terminal_cursor_on_the_pane_cursor() {
+    let env = Env::attached(&keys_config("ctrl-a"));
+    wait_until("the pane's cursor to show", || env.cursor_visible());
+    let parked = env.cursor();
+
+    env.send_keys("\x1b[<0;3;2M\x1b[<32;8;2M\x1b[<0;8;2m");
+    env.wait_for("copied selection");
+    assert_eq!(
+        env.cursor(),
+        parked,
+        "the selection moved the terminal cursor"
+    );
+
+    env.send_keys("\x1b[<2;5;2M\x1b[<2;5;2m");
+    env.wait_for("Copy");
+    assert_eq!(
+        env.cursor(),
+        parked,
+        "the selection menu moved the terminal cursor"
+    );
 }
 
 /// The copy-mode cursor shows the character under it, in the cursor colours,

@@ -347,11 +347,19 @@ impl<W: Write> RenderCompositor<W> {
     }
 
     /// Hide the terminal cursor from the next frame on, for an overlay that
-    /// draws its own (copy mode) or covers the focused pane (help). Bytes
-    /// written after a frame move the cursor, so one left showing ends up
-    /// wherever the overlay's last write did.
+    /// draws its own (copy mode) or covers the focused pane (help).
     pub fn set_cursor_hidden(&mut self, hidden: bool) {
         self.cursor_hidden = hidden;
+    }
+
+    /// Put a showing terminal cursor back where the last frame left it.
+    /// Bytes written after a frame (an overlay) move it, and the next frame
+    /// only moves it when the pane's cursor moved.
+    pub fn restore_cursor(&mut self) -> io::Result<()> {
+        match self.terminal_cursor {
+            Some((x, y)) => self.backend.set_cursor(x, y),
+            None => Ok(()),
+        }
     }
 
     /// Force a full redraw on the next render pass. Call this after

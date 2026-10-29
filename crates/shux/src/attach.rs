@@ -1732,6 +1732,7 @@ async fn run_render_loop(
         // Reset the buffer first so we only ship the new frame's bytes.
         compositor.inner_mut().clear();
         let _ = compositor.render_multi_pane(frame);
+        let frame_end = compositor.inner().len();
 
         // Copy-mode overlay layer: a cursor block + selection
         // highlight + status hint, scoped to the focused pane's
@@ -1854,6 +1855,10 @@ async fn run_render_loop(
                 }
                 compositor.force_redraw();
             }
+        }
+
+        if compositor.inner().len() > frame_end {
+            let _ = compositor.restore_cursor();
         }
 
         // Take the bytes out (drain) and send them.
@@ -3541,8 +3546,7 @@ async fn split(
 
     let new_pane = graph
         .split_pane(attached.active_pane_id, direction, 0.5)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
 
     // A PTY that never started is not a pane: left in the graph it is focused,
     // drawn, and answers "pane VT not found" to every later verb. A default
@@ -3630,10 +3634,7 @@ async fn focus_relative(
 }
 
 async fn zoom(graph: &GraphHandle, attached: &AttachedSession) -> anyhow::Result<()> {
-    let _ = graph
-        .zoom_pane(attached.active_pane_id, None)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let _ = graph.zoom_pane(attached.active_pane_id, None).await?;
     Ok(())
 }
 
