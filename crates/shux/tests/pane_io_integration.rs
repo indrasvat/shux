@@ -693,6 +693,36 @@ async fn create_test_session(stream: &mut UnixStream) -> (String, String) {
     (session_id, pane_id)
 }
 
+/// [`rpc_call_raw`] bounded by `budget`, for a wait's probe: `poll_async`
+/// checks its budget only between probes, so a daemon that never answers
+/// would otherwise hold the wait open past it.
+async fn rpc_within(
+    budget: Duration,
+    stream: &mut UnixStream,
+    method: &str,
+    params: serde_json::Value,
+) -> serde_json::Value {
+    tokio::time::timeout(budget, rpc_call_raw(stream, method, params))
+        .await
+        .unwrap_or_else(|_| panic!("no reply to {method} within {budget:?}"))
+}
+
+/// [`rpc_within`] the wait budget, failing on an RPC error like [`rpc_call`].
+async fn probe_rpc(
+    stream: &mut UnixStream,
+    method: &str,
+    params: serde_json::Value,
+) -> serde_json::Value {
+    let response = rpc_within(shux_testkit::BUDGET, stream, method, params).await;
+    if let Some(error) = response.get("error") {
+        panic!("RPC error: {error}");
+    }
+    response
+        .get("result")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null)
+}
+
 async fn capture_text(stream: &mut UnixStream, session_id: &str, lines: usize) -> String {
     let result = rpc_call(
         stream,
@@ -712,7 +742,13 @@ where
     let stream = &Mutex::new(stream);
     let predicate = &predicate;
     let found = poll_async(shux_testkit::BUDGET, || async move {
-        let text = capture_text(&mut **stream.lock().await, session_id, 80).await;
+        let result = probe_rpc(
+            &mut **stream.lock().await,
+            "pane.capture",
+            serde_json::json!({"session_id": session_id, "lines": 80}),
+        )
+        .await;
+        let text = result["text"].as_str().unwrap().to_string();
         predicate(&text).then_some(text)
     })
     .await;
@@ -1327,7 +1363,7 @@ async fn test_run_command_async_and_poll() {
     let stream = &Mutex::new(&mut stream);
     let command_id = &command_id;
     let finished = poll_async(shux_testkit::BUDGET, || async move {
-        let status = rpc_call(
+        let status = probe_rpc(
             &mut **stream.lock().await,
             "pane.command_status",
             serde_json::json!({"command_id": command_id}),
@@ -1442,7 +1478,8 @@ async fn test_capture_works_after_pane_process_exits() {
         wait_until_async(
             "the pane task to tear down after its shell exited",
             || async move {
-                let response = rpc_call_raw(
+                let response = rpc_within(
+                    shux_testkit::BUDGET,
                     &mut **stream.lock().await,
                     "pane.send_keys",
                     serde_json::json!({"session_id": session, "text": ""}),
@@ -1461,4 +1498,17 @@ async fn test_capture_works_after_pane_process_exits() {
     );
 
     stop_test_server(server).await;
+}
+
+#[tokio::test]
+#[should_panic(expected = "no reply to pane.capture within")]
+async fn a_probe_rpc_to_a_silent_daemon_fails_within_its_budget() {
+    let (mut ours, _silent) = UnixStream::pair().unwrap();
+    rpc_within(
+        Duration::from_millis(50),
+        &mut ours,
+        "pane.capture",
+        serde_json::json!({}),
+    )
+    .await;
 }
