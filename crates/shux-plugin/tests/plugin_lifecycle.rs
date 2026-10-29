@@ -302,6 +302,7 @@ async fn install_rejects_garbage_manifest() {
         r#"#!/usr/bin/env bash
 IFS= read -r _ || exit 1
 ( exec -a {child} sleep 45 ) &
+until ps -o args= -p $! | grep -q '^{child} '; do :; done
 printf 'not json at all\n'
 IFS= read -r _
 "#
@@ -1392,7 +1393,7 @@ IFS= read -r -n 1 _
 : > {parked}
 IFS= read -r _ < {held}
 cat <&0 > {log} &
-until grep -q '^{{"jsonrpc":"2.0","method":"plugin.shutdown"' {log}; do sleep 0.05; done
+until grep -q '"method":"plugin.shutdown"' {log}; do sleep 0.05; done
 kill $!
 "#,
         parked = parked.display(),

@@ -898,6 +898,10 @@ fn a_client_does_not_take_the_socket_of_a_server_it_cannot_stop() {
 
 /// `daemon stop` must not unlink files once its daemon has exited: a client that
 /// arrived during the stop may already have started the successor they belong to.
+///
+/// Linux only: ordering the successor inside the stop needs the stop's SIGTERM
+/// to be seen pending, which only `/proc` shows.
+#[cfg(target_os = "linux")]
 #[test]
 fn daemon_stop_leaves_the_successors_files_alone() {
     let h = ShuxHarness::new();
@@ -915,14 +919,28 @@ fn daemon_stop_leaves_the_successors_files_alone() {
     let old = h.daemon_pid().expect("daemon pidfile");
     reaper.0.push(old as i32);
 
+    // Order the successor before `daemon stop` can notice the exit: hold the
+    // old daemon stopped until the stop's SIGTERM is pending on it, then
+    // freeze the stop, and only let it look again once the successor exists.
+    let old_pid = Pid::from_raw(old as i32);
+    kill(old_pid, Signal::SIGSTOP).expect("freeze the old daemon");
     let stop = h
         .shux()
         .args(["daemon", "stop"])
         .stdout(std::process::Stdio::null())
         .spawn()
         .expect("spawn daemon stop");
-    // The client comes once the daemon has exited and before `daemon stop` has
-    // noticed: a fixed head start could land before the stop had even begun.
+    let stop_pid = Pid::from_raw(stop.id() as i32);
+    shux_testkit::wait_until("daemon stop to send its SIGTERM", || {
+        std::fs::read_to_string(format!("/proc/{old}/status")).is_ok_and(|st| {
+            st.lines()
+                .filter_map(|l| l.strip_prefix("ShdPnd:"))
+                .filter_map(|v| u64::from_str_radix(v.trim(), 16).ok())
+                .any(|mask| mask & (1 << (Signal::SIGTERM as u64 - 1)) != 0)
+        })
+    });
+    kill(stop_pid, Signal::SIGSTOP).expect("freeze daemon stop");
+    kill(old_pid, Signal::SIGCONT).expect("let the old daemon exit");
     assert!(
         wait_for_pid_gone(old),
         "daemon stop never ended the old daemon"
@@ -939,6 +957,7 @@ fn daemon_stop_leaves_the_successors_files_alone() {
     let successor = h.daemon_pid().expect("successor pidfile");
     reaper.0.push(successor as i32);
     let socket_id = socket_identity(&socket).expect("successor socket");
+    kill(stop_pid, Signal::SIGCONT).expect("let daemon stop look again");
     stop.wait_with_output().expect("wait for daemon stop");
     assert_pid_gone(old, "the stopped daemon");
 
@@ -971,6 +990,7 @@ fn daemon_stop_leaves_the_successors_files_alone() {
 }
 
 /// Device and inode of the file at `path`, if there is one.
+#[cfg(target_os = "linux")]
 fn socket_identity(path: &Path) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
     std::fs::symlink_metadata(path)
