@@ -255,13 +255,7 @@ fn toggling_always_moves_the_generation_forward() {
     );
 }
 
-/// CPU time the calling thread has used. Unlike the wall clock, it does not
-/// advance while the thread is descheduled, so load elsewhere cannot skew a ratio.
-fn thread_cpu_ns() -> u128 {
-    let t = nix::time::clock_gettime(nix::time::ClockId::CLOCK_THREAD_CPUTIME_ID)
-        .expect("CLOCK_THREAD_CPUTIME_ID is supported on every target shux builds for");
-    t.tv_sec() as u128 * 1_000_000_000 + t.tv_nsec() as u128
-}
+use shux_testkit::thread_cpu_ns;
 
 /// One `process()` call over output dense with OSC strings (hyperlinks) must
 /// cost linear time, status on or off: the scanner runs either way.

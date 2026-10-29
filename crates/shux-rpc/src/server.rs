@@ -911,7 +911,7 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server_handle).await;
     }
 
-    fn spawn_builtin_server(
+    async fn spawn_builtin_server(
         socket_path: &std::path::Path,
     ) -> (
         tokio_util::sync::CancellationToken,
@@ -925,8 +925,9 @@ mod tests {
             auth_token: None,
         };
         let server = Server::new(config, router, cancel.clone());
+        let bound = server.bind().await.unwrap();
         let handle = tokio::spawn(async move {
-            server.run().await.unwrap();
+            bound.serve().await.unwrap();
         });
         (cancel, handle)
     }
@@ -936,11 +937,11 @@ mod tests {
     async fn an_unlinked_socket_is_rebound() {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("test.sock");
-        let (cancel, handle) = spawn_builtin_server(&socket_path);
-        drop(connect_with_retries(&socket_path).await);
+        let (cancel, handle) = spawn_builtin_server(&socket_path).await;
+        drop(UnixStream::connect(&socket_path).await.unwrap());
 
         std::fs::remove_file(&socket_path).unwrap();
-        drop(connect_with_retries(&socket_path).await);
+        drop(wait_for_rebind(&socket_path).await);
 
         cancel.cancel();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
@@ -951,8 +952,8 @@ mod tests {
     async fn shutdown_leaves_a_socket_bound_in_its_place() {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("test.sock");
-        let (cancel, handle) = spawn_builtin_server(&socket_path);
-        drop(connect_with_retries(&socket_path).await);
+        let (cancel, handle) = spawn_builtin_server(&socket_path).await;
+        drop(UnixStream::connect(&socket_path).await.unwrap());
 
         // A rename replaces the path atomically, so the server never sees it missing.
         let staged = dir.path().join("other.sock");
@@ -971,9 +972,9 @@ mod tests {
         drop(other);
     }
 
-    /// Connect to a UDS server once it has bound `path`.
-    async fn connect_with_retries(path: &std::path::Path) -> UnixStream {
-        shux_testkit::wait_for_async("the server to bind its socket", || async {
+    /// Connect once the server has bound `path` again.
+    async fn wait_for_rebind(path: &std::path::Path) -> UnixStream {
+        shux_testkit::wait_for_async("the server to rebind its socket", || async {
             UnixStream::connect(path).await.ok()
         })
         .await
@@ -1054,11 +1055,12 @@ mod tests {
             router,
             cancel.clone(),
         );
+        let bound = server.bind().await.unwrap();
         let server_handle = tokio::spawn(async move {
-            server.run().await.unwrap();
+            bound.serve().await.unwrap();
         });
 
-        let stream = connect_with_retries(&socket_path).await;
+        let stream = UnixStream::connect(&socket_path).await.unwrap();
         let mut framed = Framed::new(stream, create_codec());
         framed
             .send(frame_bytes(&serde_json::json!({
@@ -1087,7 +1089,7 @@ mod tests {
         assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
 
         // Server stays healthy: a fresh connection serves normal requests.
-        let stream2 = connect_with_retries(&socket_path).await;
+        let stream2 = UnixStream::connect(&socket_path).await.unwrap();
         let mut framed2 = Framed::new(stream2, create_codec());
         framed2
             .send(frame_bytes(&serde_json::json!({
@@ -1120,11 +1122,12 @@ mod tests {
             router,
             cancel.clone(),
         );
+        let bound = server.bind().await.unwrap();
         let server_handle = tokio::spawn(async move {
-            server.run().await.unwrap();
+            bound.serve().await.unwrap();
         });
 
-        let stream = connect_with_retries(&socket_path).await;
+        let stream = UnixStream::connect(&socket_path).await.unwrap();
         let mut framed = Framed::new(stream, create_codec());
 
         // Pipeline both requests up front, then read both responses.
@@ -1171,12 +1174,13 @@ mod tests {
             router,
             cancel.clone(),
         );
+        let bound = server.bind().await.unwrap();
         let server_handle = tokio::spawn(async move {
-            server.run().await.unwrap();
+            bound.serve().await.unwrap();
         });
 
         // Conn A: park a hanging request.
-        let stream_a = connect_with_retries(&socket_path).await;
+        let stream_a = UnixStream::connect(&socket_path).await.unwrap();
         let mut framed_a = Framed::new(stream_a, create_codec());
         framed_a
             .send(frame_bytes(&serde_json::json!({
@@ -1189,7 +1193,7 @@ mod tests {
             .expect("hang handler never entered");
 
         // Conn B: normal request completes WHILE A's request is in flight.
-        let stream_b = connect_with_retries(&socket_path).await;
+        let stream_b = UnixStream::connect(&socket_path).await.unwrap();
         let mut framed_b = Framed::new(stream_b, create_codec());
         framed_b
             .send(frame_bytes(&serde_json::json!({
@@ -1246,11 +1250,12 @@ mod tests {
             router,
             cancel.clone(),
         );
+        let bound = server.bind().await.unwrap();
         let server_handle = tokio::spawn(async move {
-            server.run().await.unwrap();
+            bound.serve().await.unwrap();
         });
 
-        let stream = connect_with_retries(&socket_path).await;
+        let stream = UnixStream::connect(&socket_path).await.unwrap();
         let mut framed = Framed::new(stream, create_codec());
         framed
             .send(frame_bytes(&serde_json::json!({
@@ -1306,11 +1311,12 @@ mod tests {
             router,
             cancel.clone(),
         );
+        let bound = server.bind().await.unwrap();
         let server_handle = tokio::spawn(async move {
-            server.run().await.unwrap();
+            bound.serve().await.unwrap();
         });
 
-        let stream = connect_with_retries(&socket_path).await;
+        let stream = UnixStream::connect(&socket_path).await.unwrap();
         let mut framed = Framed::new(stream, create_codec());
         framed
             .send(frame_bytes(&serde_json::json!({
@@ -1381,14 +1387,15 @@ mod tests {
             router,
             cancel.clone(),
         );
+        let bound = server.bind().await.unwrap();
         let server_handle = tokio::spawn(async move {
-            server.run().await.unwrap();
+            bound.serve().await.unwrap();
         });
 
         // Run several iterations: the old bug was a race (EOF vs dequeue), so
         // a single pass could false-green.
         for iteration in 0..10 {
-            let stream = connect_with_retries(&socket_path).await;
+            let stream = UnixStream::connect(&socket_path).await.unwrap();
             let (read_half, write_half) = stream.into_split();
             let mut framed_w = tokio_util::codec::FramedWrite::new(write_half, create_codec());
             let mut framed_r = tokio_util::codec::FramedRead::new(read_half, create_codec());
@@ -1464,11 +1471,12 @@ mod tests {
             router,
             cancel.clone(),
         );
+        let bound = server.bind().await.unwrap();
         let server_handle = tokio::spawn(async move {
-            server.run().await.unwrap();
+            bound.serve().await.unwrap();
         });
 
-        let stream = connect_with_retries(&socket_path).await;
+        let stream = UnixStream::connect(&socket_path).await.unwrap();
         let (read_half, write_half) = stream.into_split();
         let mut framed_w = tokio_util::codec::FramedWrite::new(write_half, create_codec());
         let mut framed_r = tokio_util::codec::FramedRead::new(read_half, create_codec());
@@ -1581,11 +1589,12 @@ mod tests {
             router,
             cancel.clone(),
         );
+        let bound = server.bind().await.unwrap();
         let server_handle = tokio::spawn(async move {
-            server.run().await.unwrap();
+            bound.serve().await.unwrap();
         });
 
-        let stream = connect_with_retries(&socket_path).await;
+        let stream = UnixStream::connect(&socket_path).await.unwrap();
         let mut framed = Framed::new(stream, create_codec());
         framed
             .send(frame_bytes(&serde_json::json!({
@@ -1644,11 +1653,12 @@ mod tests {
             router,
             cancel.clone(),
         );
+        let bound = server.bind().await.unwrap();
         let server_handle = tokio::spawn(async move {
-            server.run().await.unwrap();
+            bound.serve().await.unwrap();
         });
 
-        let stream = connect_with_retries(&socket_path).await;
+        let stream = UnixStream::connect(&socket_path).await.unwrap();
         let mut framed = Framed::new(stream, create_codec());
         framed
             .send(frame_bytes(&serde_json::json!({
@@ -1852,12 +1862,13 @@ mod tests {
             router,
             cancel.clone(),
         );
+        let bound = server.bind().await.unwrap();
         let server_handle = tokio::spawn(async move {
-            server.run().await.unwrap();
+            bound.serve().await.unwrap();
         });
 
         for iteration in 0..25 {
-            let mut stream = connect_with_retries(&socket_path).await;
+            let mut stream = UnixStream::connect(&socket_path).await.unwrap();
             // Raw oversized frame: a 4-byte BE length prefix past the codec
             // cap plus a little payload — the decoder rejects it from the
             // length field alone (InvalidData).
@@ -1875,7 +1886,7 @@ mod tests {
             let response_frame = tokio::time::timeout(shux_testkit::BUDGET, framed.next())
                 .await
                 .unwrap_or_else(|_| {
-                    panic!("iteration {iteration}: no frame-error response within 5s")
+                    panic!("iteration {iteration}: no frame-error response within the budget")
                 })
                 .unwrap_or_else(|| {
                     panic!(

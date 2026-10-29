@@ -45,7 +45,7 @@ fn oversized_pane_heat_diff_rejected_before_render() {
     // F1 draws `⚠` last; its `दृश्यते` sentinel lands two rows before the end,
     // so a checkpoint taken on it can miss rows the zero-delta diff below
     // would then count.
-    h.wait_for(&pane_id, "⚠", shux_testkit::BUDGET.as_millis() as u64)
+    h.wait_for(&pane_id, "⚠", shux_testkit::BUDGET_MS)
         .expect("F1 drawn in full");
 
     // Checkpoint at the oversized size (cell-level storage — no raster).

@@ -326,29 +326,13 @@ async fn wait_for_file(path: &Path) -> String {
     shux_testkit::wait_for_async(&what, || async { std::fs::read_to_string(path).ok() }).await
 }
 
-/// A FIFO for [`call_one_method_plugin`] to wait at before its call.
-fn gate(dir: &Path, name: &str) -> PathBuf {
-    let path = dir.join(name);
-    nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
-    path
-}
+use shux_testkit::gate;
 
-/// Let the plugin waiting at `gate` make its call.
+/// Let the plugin waiting at `gate` make its call: [`shux_testkit::open_gate`]
+/// on the blocking pool.
 async fn open_gate(gate: &Path) {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     let gate = gate.to_owned();
-    tokio::task::spawn_blocking(move || {
-        // Non-blocking: the open succeeds only once the plugin is at the gate.
-        let mut fifo = shux_testkit::wait_for("the plugin to wait at the gate", || {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits())
-                .open(&gate)
-                .ok()
-        });
-        fifo.write_all(b"go\n").expect("open the gate");
-    })
-    .await
-    .expect("the gate opener panicked");
+    tokio::task::spawn_blocking(move || shux_testkit::open_gate(&gate))
+        .await
+        .expect("the gate opener panicked");
 }

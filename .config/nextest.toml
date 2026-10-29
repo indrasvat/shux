@@ -157,7 +157,9 @@ filter = '''
 '''
 test-group = 'daemon-pty'
 
-# Tests whose assertion is a wall-clock measurement.
+# Tests whose assertion is a cost measurement. They time thread CPU, which
+# preemption cannot inflate, but cores shared through SMT and a contended cache
+# still slow the measured arm, so they keep the machine to themselves.
 #
 # Deliberately enumerated one by one rather than matched by a `_cost_` name
 # pattern: most of the other `*_cost_*` tests in `shux-vt` count allocations,

@@ -2341,15 +2341,13 @@ mod tests {
             harness.router.clone(),
             server_cancel.clone(),
         );
+        let bound = server.bind().await.unwrap();
         let server_task = tokio::spawn(async move {
-            server.run().await.unwrap();
+            bound.serve().await.unwrap();
         });
 
-        // Connect once the server has bound, then park a waiter.
-        let stream = shux_testkit::wait_for_async("the settle-drop server to bind", || async {
-            tokio::net::UnixStream::connect(&socket_path).await.ok()
-        })
-        .await;
+        // Connect, then park a waiter.
+        let stream = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
         let mut framed = tokio_util::codec::Framed::new(stream, shux_rpc::create_codec());
         let request = serde_json::json!({
             "jsonrpc": "2.0",

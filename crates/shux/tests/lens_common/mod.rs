@@ -24,7 +24,7 @@ pub use shux_testkit::BUDGET;
 
 /// [`BUDGET`] for a server-side `timeout_ms`: how long an event wait may run
 /// before the test fails.
-pub const BUDGET_MS: u64 = BUDGET.as_millis() as u64;
+pub use shux_testkit::BUDGET_MS;
 
 /// One JSON-RPC error `{code,message,data}` as surfaced by `shux rpc call`.
 #[derive(Debug, Clone)]
@@ -546,10 +546,7 @@ impl Drop for Harness {
         if let Ok(txt) = std::fs::read_to_string(&pid_path)
             && let Ok(pid) = txt.trim().parse::<i32>()
         {
-            use nix::sys::signal::{Signal, kill};
-            use nix::unistd::Pid;
-            let _ = kill(Pid::from_raw(pid), Signal::SIGTERM);
-            shux_testkit::poll_until(BUDGET, || kill(Pid::from_raw(pid), None).is_err());
+            shux_testkit::terminate(pid);
         }
     }
 }

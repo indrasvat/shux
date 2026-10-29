@@ -67,12 +67,8 @@ fn diff_exact_while_concurrent_readers_render_same_pane() {
     // `A-PRESSED`, then only moves the cursor, so the whole word on screen
     // means all 10 cells have landed and no more will.
     h.send_raw(&f.pane_id, "a");
-    h.wait_for(
-        &f.pane_id,
-        "A-PRESSED",
-        shux_testkit::BUDGET.as_millis() as u64,
-    )
-    .expect("pane must draw `a` despite concurrent readers");
+    h.wait_for(&f.pane_id, "A-PRESSED", shux_testkit::BUDGET_MS)
+        .expect("pane must draw `a` despite concurrent readers");
 
     // The diff must still be exact — concurrent render reads never corrupt it.
     let env = h.rpc_raw(

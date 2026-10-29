@@ -74,12 +74,8 @@ fn window_and_session_snapshot_draw_a_panes_inline_image() {
     // The picture must actually be held before any of this means anything.
     // The VT stores it as it parses the APC, before the marker printed after
     // it, so the marker on screen means the picture is held.
-    h.wait_for(
-        &pane_id,
-        "IMAGE-HELD",
-        shux_testkit::BUDGET.as_millis() as u64,
-    )
-    .expect("the pane never got past drawing its picture");
+    h.wait_for(&pane_id, "IMAGE-HELD", shux_testkit::BUDGET_MS)
+        .expect("the pane never got past drawing its picture");
     let pane = decode(&h.rpc_ok("pane.snapshot", json!({ "pane_id": pane_id })));
     let pane_px = magenta_px(&pane);
     assert!(

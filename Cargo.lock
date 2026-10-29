@@ -1335,6 +1335,7 @@ dependencies = [
 name = "shux-testkit"
 version = "0.54.9"
 dependencies = [
+ "nix",
  "tokio",
 ]
 
@@ -1368,12 +1369,12 @@ version = "0.54.9"
 dependencies = [
  "base64",
  "memchr",
- "nix",
  "proptest",
  "serde",
  "serde_json",
  "sha2",
  "shux-program-status",
+ "shux-testkit",
  "thiserror",
  "tracing",
  "unicode-width",

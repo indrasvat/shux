@@ -21,9 +21,6 @@
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
-use nix::sys::signal::{Signal, kill};
-use nix::unistd::Pid;
-
 /// The reported payload: ESC ] 0 ; … BEL retitles the operator's terminal.
 const OSC_PAYLOAD: &str = "\u{1b}]0;PWNED\u{7}deploy";
 /// What survives `sanitize_title`: control bytes gone, OSC syntax inert text.
@@ -88,11 +85,7 @@ impl Env {
 impl Drop for Env {
     fn drop(&mut self) {
         if let Some(pid) = self.daemon_pid() {
-            let pid = Pid::from_raw(pid as i32);
-            let _ = kill(pid, Signal::SIGTERM);
-            if !shux_testkit::poll_until(shux_testkit::BUDGET, || kill(pid, None).is_err()) {
-                let _ = kill(pid, Signal::SIGKILL);
-            }
+            shux_testkit::terminate(pid as i32);
         }
     }
 }

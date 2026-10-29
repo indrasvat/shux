@@ -83,8 +83,7 @@ impl ShuxHarness {
 
     fn terminate_daemon(&self) {
         if let Some(pid) = self.daemon_pid() {
-            let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
-            wait_for_pid_gone(pid);
+            shux_testkit::terminate(pid as i32);
         }
     }
 }

@@ -89,8 +89,7 @@ impl Drop for Harness {
             .and_then(|s| s.trim().parse().ok());
         // By pidfile, never by an argv substring.
         if let Some(pid) = pid {
-            let _ = kill(Pid::from_raw(pid), Signal::SIGTERM);
-            if poll_until(BUDGET, || kill(Pid::from_raw(pid), None).is_err()) {
+            if shux_testkit::terminate(pid) {
                 return;
             }
             if !std::thread::panicking() {

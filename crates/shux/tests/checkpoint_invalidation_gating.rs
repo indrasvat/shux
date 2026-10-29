@@ -47,7 +47,7 @@ fn checkpoint(h: &Harness, pane: &str, ctx: &str) -> u64 {
 /// wait on stillness instead (`pane.wait_settled`) holds for a pane that has
 /// not STARTED writing, and its quiet window is a guess at how fast the host is.
 fn wait_for_a_drawn(h: &Harness, pane: &str, ctx: &str) {
-    h.wait_for(pane, "A-PRESSED", BUDGET.as_millis() as u64)
+    h.wait_for(pane, "A-PRESSED", shux_testkit::BUDGET_MS)
         .unwrap_or_else(|e| panic!("{ctx}: the pane never drew `a`: {e}"));
 }
 

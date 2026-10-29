@@ -10,6 +10,7 @@
 //! `tokio::time::sleep` and `tokio::time::sleep_until` everywhere else.
 
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// How long a wait may take before the test fails.
@@ -18,6 +19,9 @@ use std::time::{Duration, Instant};
 /// slowest condition in the suite (a daemon booting under 12-way contention on
 /// a macOS runner) settles in a few seconds. nextest terminates a test at 120s.
 pub const BUDGET: Duration = Duration::from_secs(30);
+
+/// [`BUDGET`] in milliseconds, for RPC `timeout_ms` parameters.
+pub const BUDGET_MS: u64 = BUDGET.as_millis() as u64;
 
 const FIRST_INTERVAL: Duration = Duration::from_millis(1);
 const MAX_INTERVAL: Duration = Duration::from_millis(25);
@@ -62,9 +66,8 @@ pub fn wait_for<T>(what: &str, probe: impl FnMut() -> Option<T>) -> T {
     wait_for_within(BUDGET, what, probe)
 }
 
-/// [`wait_for`] with a budget other than [`BUDGET`].
 #[track_caller]
-pub fn wait_for_within<T>(budget: Duration, what: &str, probe: impl FnMut() -> Option<T>) -> T {
+fn wait_for_within<T>(budget: Duration, what: &str, probe: impl FnMut() -> Option<T>) -> T {
     let started = Instant::now();
     match poll(budget, probe) {
         Some(found) => found,
@@ -80,6 +83,9 @@ pub fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
 
 /// Async [`poll`]. Yields to the runtime between probes, so it is safe on a
 /// current-thread runtime whose other tasks must run for the condition to hold.
+///
+/// The interval is a tokio sleep: under a paused clock with auto-advance held
+/// off it never wakes. Wait on the blocking pool with [`poll`] there.
 pub async fn poll_async<T, F, Fut>(budget: Duration, mut probe: F) -> Option<T>
 where
     F: FnMut() -> Fut,
@@ -149,6 +155,55 @@ where
         let fut = cond();
         async move { fut.await.then_some(()) }
     })
+}
+
+/// SIGTERM `pid` and wait for it to exit; SIGKILL it if it outlasts
+/// [`BUDGET`]. Returns whether it exited on SIGTERM, so a teardown can still
+/// fail the test without leaking the process.
+pub fn terminate(pid: i32) -> bool {
+    use nix::sys::signal::{Signal, kill};
+    let pid = nix::unistd::Pid::from_raw(pid);
+    let gone = || kill(pid, None).is_err();
+    let _ = kill(pid, Signal::SIGTERM);
+    if poll_until(BUDGET, gone) {
+        return true;
+    }
+    let _ = kill(pid, Signal::SIGKILL);
+    poll_until(BUDGET, gone);
+    false
+}
+
+/// A FIFO for a child to wait at (`read -r _ < gate`) until [`open_gate`].
+pub fn gate(dir: &Path, name: &str) -> PathBuf {
+    let path = dir.join(name);
+    nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
+    path
+}
+
+/// Let one child waiting at `gate` through. The open is non-blocking, so it
+/// succeeds only once a reader is at the gate, and a gate nobody reaches fails
+/// the wait instead of hanging the test.
+#[track_caller]
+pub fn open_gate(gate: &Path) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut fifo = wait_for("a reader to wait at the gate", || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits())
+            .open(gate)
+            .ok()
+    });
+    fifo.write_all(b"go\n").expect("open the gate");
+}
+
+/// CPU time the calling thread has used. Unlike the wall clock it does not
+/// advance while the thread is descheduled, so load elsewhere cannot skew a
+/// cost ratio.
+pub fn thread_cpu_ns() -> u128 {
+    let t = nix::time::clock_gettime(nix::time::ClockId::CLOCK_THREAD_CPUTIME_ID)
+        .expect("CLOCK_THREAD_CPUTIME_ID is supported on every target shux builds for");
+    t.tv_sec() as u128 * 1_000_000_000 + t.tv_nsec() as u128
 }
 
 #[cfg(test)]

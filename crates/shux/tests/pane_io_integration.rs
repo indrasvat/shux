@@ -648,16 +648,14 @@ async fn start_test_server(dir: &std::path::Path) -> (PathBuf, TestServer) {
         auth_token: None,
     };
 
-    let server = shux_rpc::Server::new(config, router, cancel.clone());
+    // Bound before it returns, so a test connects without waiting.
+    let bound = shux_rpc::Server::new(config, router, cancel.clone())
+        .bind()
+        .await
+        .expect("bind the test server");
     tokio::spawn(async move {
-        let _ = server.run().await;
+        let _ = bound.serve().await;
     });
-
-    wait_until_async("the test server to accept connections", || {
-        let socket_path = socket_path.clone();
-        async move { UnixStream::connect(&socket_path).await.is_ok() }
-    })
-    .await;
 
     (socket_path, TestServer { cancel, io_state })
 }

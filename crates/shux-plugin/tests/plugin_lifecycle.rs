@@ -64,32 +64,14 @@ async fn wait_for_lines(path: &Path, lines: usize) -> String {
     .await
 }
 
-/// A FIFO for a plugin to wait at (`read -r _ < gate`) until [`open_gate`].
-fn gate(dir: &Path, name: &str) -> PathBuf {
-    let path = dir.join(name);
-    nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
-    path
-}
+use shux_testkit::gate;
 
-/// Let one plugin waiting at `gate` through.
+/// [`shux_testkit::open_gate`] on the blocking pool. Safe under a paused clock.
 async fn open_gate(gate: &Path) {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     let gate = gate.to_owned();
-    tokio::task::spawn_blocking(move || {
-        // Non-blocking: the open succeeds only once a plugin is at the gate,
-        // so a gate nobody reaches fails the wait instead of hanging the test.
-        let mut fifo = shux_testkit::wait_for("a plugin to wait at the gate", || {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits())
-                .open(&gate)
-                .ok()
-        });
-        fifo.write_all(b"go\n").expect("open the gate");
-    })
-    .await
-    .expect("the gate opener panicked");
+    tokio::task::spawn_blocking(move || shux_testkit::open_gate(&gate))
+        .await
+        .expect("the gate opener panicked");
 }
 
 /// Wait on the blocking pool for `path` to exist. Safe under a paused clock.

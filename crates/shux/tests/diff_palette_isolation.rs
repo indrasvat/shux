@@ -59,12 +59,8 @@ fn diff_since_has_no_palette_field_and_osc4_does_not_inflate() {
         "pane.send_keys",
         serde_json::json!({ "pane_id": pane_id, "text": SCRIPT }),
     );
-    h.wait_for(
-        &pane_id,
-        READY_MARKER,
-        shux_testkit::BUDGET.as_millis() as u64,
-    )
-    .expect("setup sentinel");
+    h.wait_for(&pane_id, READY_MARKER, shux_testkit::BUDGET_MS)
+        .expect("setup sentinel");
 
     // Checkpoint BEFORE the OSC 4 (palette not yet overridden on the checkpoint).
     let env = h.rpc_raw("pane.checkpoint", serde_json::json!({ "pane_id": pane_id }));
@@ -74,12 +70,8 @@ fn diff_since_has_no_palette_field_and_osc4_does_not_inflate() {
 
     // Apply the OSC 4 override + the PALMARK sentinel.
     h.send_line_token(&pane_id, "P");
-    h.wait_for(
-        &pane_id,
-        PAL_MARKER,
-        shux_testkit::BUDGET.as_millis() as u64,
-    )
-    .expect("OSC 4 landed");
+    h.wait_for(&pane_id, PAL_MARKER, shux_testkit::BUDGET_MS)
+        .expect("OSC 4 landed");
 
     let d = h
         .rpc_raw(

@@ -13,8 +13,6 @@ use std::time::Duration;
 use base64::Engine as _;
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
-use nix::sys::signal::{Signal, kill};
-use nix::unistd::Pid;
 use shux_rpc::attach::{ATTACH_PROTOCOL_VERSION, AttachHello, AttachReady, AttachServerFrame};
 use shux_testkit::BUDGET;
 use tokio::net::UnixStream;
@@ -74,13 +72,11 @@ impl Drop for Harness {
             .and_then(|s| s.trim().parse().ok());
         // By pidfile, never by an argv substring: this process's own command
         // line matches any needle broad enough to find the daemon.
-        if let Some(pid) = pid {
-            let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
-            let gone =
-                shux_testkit::poll_until(BUDGET, || kill(Pid::from_raw(pid as i32), None).is_err());
-            if !gone && !std::thread::panicking() {
-                panic!("daemon {pid} survived SIGTERM");
-            }
+        if let Some(pid) = pid
+            && !shux_testkit::terminate(pid as i32)
+            && !std::thread::panicking()
+        {
+            panic!("daemon {pid} survived SIGTERM");
         }
     }
 }
@@ -365,11 +361,13 @@ async fn a_large_client_still_receives_frames_when_its_pane_holds_a_picture() {
         .to_string();
     // Several megabytes through a PTY and the VT parser of a debug build: far
     // slower than any other wait here, so it gets its own failure bound.
-    let consumed = shux_testkit::poll_until(Duration::from_secs(100), || {
-        h.rpc("pane.capture", serde_json::json!({ "pane_id": pane }))["result"]["text"]
+    let consumed = shux_testkit::poll_until_async(Duration::from_secs(100), || {
+        let drawn = h.rpc("pane.capture", serde_json::json!({ "pane_id": pane }))["result"]["text"]
             .as_str()
-            .is_some_and(|t| t.contains("TRUECOLOR"))
-    });
+            .is_some_and(|t| t.contains("TRUECOLOR"));
+        async move { drawn }
+    })
+    .await;
     assert!(
         consumed,
         "the pane never drew the probe the payload ends with"

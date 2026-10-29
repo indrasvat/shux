@@ -70,12 +70,8 @@ fn osc_default_bg_change_marks_default_cells_and_heat_uses_current_defaults() {
         "pane.send_keys",
         serde_json::json!({ "pane_id": pane_id, "text": SCRIPT }),
     );
-    h.wait_for(
-        &pane_id,
-        READY_MARKER,
-        shux_testkit::BUDGET.as_millis() as u64,
-    )
-    .expect("setup sentinel");
+    h.wait_for(&pane_id, READY_MARKER, shux_testkit::BUDGET_MS)
+        .expect("setup sentinel");
 
     // Checkpoint (captures the pane's CURRENT defaults: none set yet).
     let env = h.rpc_raw("pane.checkpoint", serde_json::json!({ "pane_id": pane_id }));
@@ -99,12 +95,8 @@ fn osc_default_bg_change_marks_default_cells_and_heat_uses_current_defaults() {
     // sentinel from the SAME write — when OSC-DONE is on screen the earlier
     // OSC bytes are guaranteed parsed (single ordered byte stream).
     h.send_line_token(&pane_id, "O");
-    h.wait_for(
-        &pane_id,
-        OSC_MARKER,
-        shux_testkit::BUDGET.as_millis() as u64,
-    )
-    .expect("OSC landed");
+    h.wait_for(&pane_id, OSC_MARKER, shux_testkit::BUDGET_MS)
+        .expect("OSC landed");
 
     // LENS-R-038b (a): the bg default changed, so EVERY cell whose bg is
     // Default on both sides is marked — the whole 40×10 grid except the 5

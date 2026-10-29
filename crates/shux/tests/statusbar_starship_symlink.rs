@@ -17,8 +17,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use nix::sys::signal::{Signal, kill};
-use nix::unistd::Pid;
 use shux_testkit::{BUDGET, poll_until};
 
 /// Isolated daemon environment: private runtime dir, private config dir, and a
@@ -102,8 +100,7 @@ impl Env {
 impl Drop for Env {
     fn drop(&mut self) {
         if let Some(pid) = self.daemon_pid() {
-            let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
-            poll_until(BUDGET, || kill(Pid::from_raw(pid as i32), None).is_err());
+            shux_testkit::terminate(pid as i32);
         }
     }
 }
