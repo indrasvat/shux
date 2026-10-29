@@ -190,6 +190,33 @@ impl LayoutNode {
         }
     }
 
+    /// The smallest viewport `(width, height)` that holds every pane at
+    /// `size_of(pane)`: side by side the widths add up with a separator
+    /// between them and the taller pane sets the height, and stacked the
+    /// reverse. `None` when `size_of` knows nothing about some pane.
+    pub fn natural_size(
+        &self,
+        size_of: &impl Fn(PaneId) -> Option<(u16, u16)>,
+    ) -> Option<(u16, u16)> {
+        match self {
+            Self::Leaf { pane } => size_of(*pane),
+            Self::Split { dir, a, b, .. } => {
+                let (aw, ah) = a.natural_size(size_of)?;
+                let (bw, bh) = b.natural_size(size_of)?;
+                Some(match dir {
+                    Direction::Vertical => (
+                        aw.saturating_add(SEPARATOR_SIZE).saturating_add(bw),
+                        ah.max(bh),
+                    ),
+                    Direction::Horizontal => (
+                        aw.max(bw),
+                        ah.saturating_add(SEPARATOR_SIZE).saturating_add(bh),
+                    ),
+                })
+            }
+        }
+    }
+
     /// Compute the position and size of each pane given the available viewport.
     pub fn compute_rects(&self, viewport: Rect) -> Vec<(PaneId, Rect)> {
         let mut result = Vec::new();
@@ -568,6 +595,36 @@ mod tests {
             ),
         );
         assert_eq!(layout.pane_ids(), vec![p(1), p(2), p(3)]);
+    }
+
+    #[test]
+    fn natural_size_is_the_viewport_compute_rects_inverts() {
+        let layout = LayoutNode::split(
+            Direction::Vertical,
+            0.5,
+            LayoutNode::leaf(p(1)),
+            LayoutNode::split(
+                Direction::Horizontal,
+                0.5,
+                LayoutNode::leaf(p(2)),
+                LayoutNode::leaf(p(3)),
+            ),
+        );
+        let sizes = |pane: PaneId| {
+            [(p(1), (80, 24)), (p(2), (80, 12)), (p(3), (80, 11))]
+                .into_iter()
+                .find(|(id, _)| *id == pane)
+                .map(|(_, size)| size)
+        };
+        let (w, h) = layout.natural_size(&sizes).expect("every pane sized");
+        assert_eq!((w, h), (161, 24));
+        for (pane, rect) in layout.compute_rects(Rect::new(0, 0, w, h)) {
+            assert_eq!(Some((rect.width, rect.height)), sizes(pane), "{pane:?}");
+        }
+        assert_eq!(
+            layout.natural_size(&|pane| (pane != p(3)).then_some((1, 1))),
+            None
+        );
     }
 
     // ── Ratio clamping ────────────────────────────────────────

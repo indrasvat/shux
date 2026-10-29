@@ -71,6 +71,7 @@ pub(crate) async fn build_snapshot_status_bar(
         client_cols: cols,
         copy_mode_active: false,
         last_action: None,
+        action_error: None,
     };
     // Bridge the cold-start race the attach path doesn't suffer from:
     // when a snapshot fires right after daemon start or a config reload,
@@ -122,20 +123,62 @@ pub(crate) fn preview_for_log(s: &str, n: usize) -> String {
     s.trim_start().to_string()
 }
 
-/// Parse optional `cols` / `rows` from snapshot params. Defaults: 120x36.
-/// Same range guard as `pane.set_size`.
+/// Default snapshot grid when the window's own size can't be worked out.
+const FALLBACK_DIMS: (u16, u16) = (120, 36);
+
+/// Parse optional `cols` / `rows` from snapshot params. Same range guard as
+/// `pane.set_size`. An absent dimension is `None`: `snapshot_window` fills it
+/// from the window's real size.
 pub(crate) fn parse_snapshot_dims(
     params: &serde_json::Value,
-) -> Result<(u16, u16), shux_rpc::RpcError> {
-    let cols = params.get("cols").and_then(|v| v.as_u64()).unwrap_or(120);
-    let rows = params.get("rows").and_then(|v| v.as_u64()).unwrap_or(36);
-    if !(4..=1000).contains(&cols) || !(2..=1000).contains(&rows) {
+) -> Result<(Option<u16>, Option<u16>), shux_rpc::RpcError> {
+    let cols = params.get("cols").and_then(|v| v.as_u64());
+    let rows = params.get("rows").and_then(|v| v.as_u64());
+    let cols_ok = cols.is_none_or(|c| (4..=1000).contains(&c));
+    let rows_ok = rows.is_none_or(|r| (2..=1000).contains(&r));
+    if !cols_ok || !rows_ok {
+        let show = |v: Option<u64>| v.map_or_else(|| "default".to_string(), |v| v.to_string());
         return Err(shux_rpc::RpcError::invalid_params(&format!(
-            "rows/cols out of range (got rows={rows} cols={cols}; \
-             valid: 4..=1000 cols, 2..=1000 rows)"
+            "rows/cols out of range (got rows={} cols={}; \
+             valid: 4..=1000 cols, 2..=1000 rows)",
+            show(rows),
+            show(cols)
         )));
     }
-    Ok((cols as u16, rows as u16))
+    Ok((cols.map(|c| c as u16), rows.map(|r| r as u16)))
+}
+
+/// The frame a window's panes fill exactly at their current grid sizes: the
+/// outline ring and status bar around the layout's natural size. A frame any
+/// bigger draws the outline around space no pane has.
+fn natural_frame_dims(
+    layout: &shux_core::layout::WindowLayout,
+    pane_data: &[PaneSnapshotData],
+    border_style: shux_ui::BorderStyle,
+    status_rows: u16,
+) -> Option<(u16, u16)> {
+    let size_of = |pane| {
+        pane_data
+            .iter()
+            .find(|(pid, ..)| *pid == pane)
+            .map(|(_, grid, ..)| (grid.cols() as u16, grid.rows() as u16))
+    };
+    let (cols, rows) = match &layout.zoom {
+        Some(zoom) => size_of(zoom.zoomed_pane)?,
+        None => {
+            let (w, h) = layout.tree.natural_size(&size_of)?;
+            let ring = if border_style == shux_ui::BorderStyle::None {
+                0
+            } else {
+                2
+            };
+            (w.saturating_add(ring), h.saturating_add(ring))
+        }
+    };
+    Some((
+        cols.clamp(4, 1000),
+        rows.saturating_add(status_rows).clamp(2, 1000),
+    ))
 }
 
 /// One pane's render-clone payload, captured under the pane-IO lock:
@@ -163,8 +206,8 @@ pub(crate) async fn snapshot_window(
     snap: &shux_core::graph::SessionGraphSnapshot,
     io: &Arc<Mutex<PaneIoState>>,
     window_id: shux_core::model::WindowId,
-    cols: u16,
-    rows: u16,
+    cols: Option<u16>,
+    rows: Option<u16>,
     rasterizer: Arc<shux_raster::Rasterizer>,
     config: &shux_core::config::ConfigHandle,
     meta_cache: &session_meta::SessionMetaCache,
@@ -176,18 +219,6 @@ pub(crate) async fn snapshot_window(
     // second tuple element; pass `&[]` when revisions aren't needed.
     revision_panes: &[shux_core::model::PaneId],
 ) -> Result<(serde_json::Value, PaneRevisions), shux_rpc::RpcError> {
-    let (cw, ch) = rasterizer.cell_size();
-    let pixel_count = (cols as u64)
-        .saturating_mul(cw as u64)
-        .saturating_mul(rows as u64)
-        .saturating_mul(ch as u64);
-    const MAX_PIXELS: u64 = 16_000_000;
-    if pixel_count > MAX_PIXELS {
-        return Err(shux_rpc::RpcError::invalid_params(&format!(
-            "snapshot would be {pixel_count} pixels — exceeds cap of {MAX_PIXELS}"
-        )));
-    }
-
     let window = snap
         .windows
         .get(&window_id)
@@ -232,6 +263,26 @@ pub(crate) async fn snapshot_window(
         (pane_data, revisions)
     };
 
+    // Compose with the user's outline style: `compose` derives the pane viewport
+    // from it, so a hardcoded style crops panes under `border_style = "none"`.
+    let border_style = shux_ui::BorderStyle::parse(&cfg.appearance.border_style);
+    const STATUS_BAR_ROWS: u16 = 1;
+    let natural = natural_frame_dims(&window.layout, &pane_data, border_style, STATUS_BAR_ROWS)
+        .unwrap_or(FALLBACK_DIMS);
+    let (cols, rows) = (cols.unwrap_or(natural.0), rows.unwrap_or(natural.1));
+
+    let (cw, ch) = rasterizer.cell_size();
+    let pixel_count = (cols as u64)
+        .saturating_mul(cw as u64)
+        .saturating_mul(rows as u64)
+        .saturating_mul(ch as u64);
+    const MAX_PIXELS: u64 = 16_000_000;
+    if pixel_count > MAX_PIXELS {
+        return Err(shux_rpc::RpcError::invalid_params(&format!(
+            "snapshot would be {pixel_count} pixels — exceeds cap of {MAX_PIXELS}"
+        )));
+    }
+
     let focused = window.active_pane;
     let layout_tree = window.layout.tree.clone();
     let zoom_state = window.layout.zoom.clone();
@@ -253,12 +304,6 @@ pub(crate) async fn snapshot_window(
         segments,
     )
     .await;
-    const STATUS_BAR_ROWS: u16 = 1;
-
-    // Compose with the user's outline style: `compose` derives the pane viewport
-    // from it, so a hardcoded style crops panes under `border_style = "none"`.
-    // Read here, before `spawn_blocking` takes the closure.
-    let border_style = shux_ui::BorderStyle::parse(&cfg.appearance.border_style);
     let border_colors = shux_ui::BorderColors::from_theme(&theme);
 
     let (img, png_buf) = tokio::task::spawn_blocking(move || {

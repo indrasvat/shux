@@ -188,11 +188,11 @@ mod tests {
 
         assert_eq!(
             parse_snapshot_dims(&serde_json::json!({"cols": 80, "rows": 24})).unwrap(),
-            (80, 24)
+            (Some(80), Some(24))
         );
         assert_eq!(
             parse_snapshot_dims(&serde_json::json!({})).unwrap(),
-            (120, 36)
+            (None, None)
         );
         assert_eq!(
             parse_snapshot_dims(&serde_json::json!({"cols": 3, "rows": 24}))
