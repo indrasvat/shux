@@ -122,7 +122,10 @@ struct Client {
 impl Client {
     async fn attach(h: &Harness, session: &str) -> Self {
         let sock = h.runtime_dir().join("shux").join("attach.sock");
-        let stream = UnixStream::connect(&sock).await.expect("connect attach");
+        let stream = tokio::time::timeout(BUDGET, UnixStream::connect(&sock))
+            .await
+            .expect("connect timed out")
+            .expect("connect attach");
         let mut framed = Framed::new(stream, shux_rpc::create_codec());
         let hello = AttachHello {
             protocol: ATTACH_PROTOCOL_VERSION,
@@ -136,7 +139,11 @@ impl Client {
             .send(Bytes::from(serde_json::to_vec(&hello).expect("hello json")))
             .await
             .expect("send hello");
-        let ready = framed.next().await.expect("ready").expect("ready bytes");
+        let ready = tokio::time::timeout(BUDGET, framed.next())
+            .await
+            .expect("the daemon never answered the attach hello")
+            .expect("ready")
+            .expect("ready bytes");
         match serde_json::from_slice::<AttachReady>(&ready).expect("parse ready") {
             AttachReady::Ok { .. } => {}
             AttachReady::Error { code, message } => panic!("attach denied: {code}: {message}"),
