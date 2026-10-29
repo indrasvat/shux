@@ -45,15 +45,15 @@ jobs:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
           # The evidence contract is gated on what the diff touches, so the
           # guard needs the base branch present to diff against. A shallow
           # clone has no merge base and the guard fails loud rather than open.
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: astral-sh/setup-uv@v6
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec  # stable branch
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6.8.0
       - name: Install jq
         run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends jq
       # Order matters: judge the diff before anything in this job writes to the
@@ -86,17 +86,19 @@ jobs:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec  # stable branch
         with:
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
       - name: Format check
         run: cargo fmt --all -- --check
       - name: Clippy
         run: make clippy
       - name: No raw sleeps in tests
         run: make check-test-sleeps
+      - name: Actions pinned to commits
+        run: make check-action-pins
       - name: Clippy (macOS cfg)
         # Linux clippy never sees cfg(target_os = "macos") code, so a sleep or
         # any other lint there would otherwise reach only the macOS test job.
@@ -114,7 +116,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
           # Full history so BASE..HEAD range mode can inspect every commit and
           # its first parent — a shallow clone would blind the guard.
@@ -140,15 +142,17 @@ jobs:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
           # `check-test-inventory` builds the merge-base in a worktree, so it
           # needs the history to find one. A shallow clone would make it fail
           # closed, which is correct but useless.
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@nextest
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec  # stable branch
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32  # v2.88.0
+        with:
+          tool: nextest
 
       # The merge-base test list, published by main's own CI run (step at the
       # end of this job). Exact key, no `restore-keys`: a prefix fallback could
@@ -177,7 +181,7 @@ jobs:
 
       - name: Restore test-inventory baseline
         if: github.event_name == 'pull_request'
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
         with:
           path: .shux/out/test-inventory
           key: test-inventory-v1-${{ steps.mergebase.outputs.disc }}-${{ steps.mergebase.outputs.sha }}
@@ -211,7 +215,7 @@ jobs:
 
       - name: Save test-inventory baseline
         if: github.event_name == 'push'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
         with:
           path: .shux/out/test-inventory
           key: test-inventory-v1-${{ steps.mergebase.outputs.disc }}-${{ steps.mergebase.outputs.sha }}
@@ -227,9 +231,9 @@ jobs:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec  # stable branch
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
       - name: Install jq + file
         run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends jq file
       # Build shux unoptimized — smoke/integration scripts verify behavior,
@@ -265,7 +269,7 @@ jobs:
     if: github.event_name != 'schedule'
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
       # Pin Rust to per-job temp dirs (RUNNER_TEMP is set by the runner)
       # and install rustup-init there. Sidesteps the broken Homebrew rustup
       # at /opt/homebrew/bin AND any stale ~/.rustup state. We promote
@@ -283,9 +287,11 @@ jobs:
             -fsSL https://sh.rustup.rs \
             | sh -s -- -y --profile minimal --default-toolchain none --no-modify-path
           echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@nextest
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec  # stable branch
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32  # v2.88.0
+        with:
+          tool: nextest
       - name: Unit tests (nextest + doc)
         run: |
           make test
@@ -320,13 +326,17 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec  # stable branch
         with:
           components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@cargo-llvm-cov
-      - uses: taiki-e/install-action@nextest
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32  # v2.88.0
+        with:
+          tool: cargo-llvm-cov
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32  # v2.88.0
+        with:
+          tool: nextest
 
       # Instrumented builds run several times slower than the uninstrumented
       # ones the `slow-timeout` in .config/nextest.toml was sized against, so
@@ -339,7 +349,7 @@ jobs:
         run: .shux/scripts/no_leak_guard.sh cargo llvm-cov nextest --workspace --lcov --output-path lcov.info
 
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v7
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5  # v7.1.1
         with:
           files: lcov.info
           fail_ci_if_error: ${{ !(github.event_name == 'pull_request' && (github.event.pull_request.head.repo.fork || github.actor == 'dependabot[bot]')) }}
@@ -352,7 +362,7 @@ jobs:
         run: cargo llvm-cov report --lcov --summary-only --output-path coverage-summary.txt
 
       - name: Upload coverage artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: coverage-artifacts
           path: |
@@ -366,8 +376,8 @@ jobs:
     name: Deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25  # v2.1.1
 
   # Beta-toolchain clippy — forward-looking lint pass. `continue-on-error`
   # alone makes it non-blocking, so it runs EVERYWHERE, PRs included.
@@ -380,11 +390,11 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@beta
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: dtolnay/rust-toolchain@cfd9b706ae130cd7002f711c4a0614be17a387e5  # beta branch
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           key: lint-beta
       - name: Print toolchain
