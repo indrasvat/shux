@@ -43,6 +43,7 @@ use shux_rpc::attach::{
 use shux_rpc::create_codec;
 use shux_ui::{BorderStyle, CompositorConfig, MultiPaneFrame, RenderCompositor};
 
+use crate::pane_input::{InputPermit, PaneWriter};
 use crate::pane_io::{OpenPaste, PASTE_END, PASTE_START, PaneIoState};
 use crate::statusbar_runner::{SegmentCache, populate_bar};
 
@@ -197,7 +198,7 @@ fn frame_input(
 fn send_input(
     state: &mut PaneIoState,
     pane: PaneId,
-    permit: mpsc::OwnedPermit<Vec<u8>>,
+    permit: InputPermit,
     bytes: Vec<u8>,
     paste: Option<(bool, u64)>,
     client: u64,
@@ -255,15 +256,15 @@ async fn close_open_pastes(io_state: &Arc<Mutex<PaneIoState>>, client: u64) {
         let Some(tx) = state.writers.get(&pane).cloned() else {
             continue;
         };
-        match tx.try_reserve_owned() {
+        match tx.try_reserve_control(PASTE_END.len()) {
             Ok(permit) => {
                 state.open_pastes.remove(&pane);
                 permit.send(PASTE_END.to_vec());
             }
-            Err(mpsc::error::TrySendError::Full(tx)) => {
+            Err(mpsc::error::TrySendError::Full(())) => {
                 let io_state = io_state.clone();
                 tokio::spawn(async move {
-                    let Ok(permit) = tx.reserve_owned().await else {
+                    let Ok(permit) = tx.reserve(PASTE_END.len()).await else {
                         return;
                     };
                     let mut state = io_state.lock().await;
@@ -303,7 +304,7 @@ static NEXT_CLIENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// Room for one chunk of input bound for a pane, and how long the attach
 /// loop waited for it.
 enum Room {
-    Ready(mpsc::OwnedPermit<Vec<u8>>, Duration),
+    Ready(InputPermit, Duration),
     /// The pane had no room within the wait it was allowed.
     Full(Duration),
     /// The pane is gone, or the attach is ending.
@@ -318,13 +319,15 @@ struct InputBacklog {
     dropped: usize,
 }
 
-/// Room in a pane's input channel, waiting at most `budget` for it.
+/// Room for `len` bytes in a pane's input channel, waiting at most `budget`
+/// for it.
 async fn reserve_input(
-    tx: &mpsc::Sender<Vec<u8>>,
+    tx: &PaneWriter,
+    len: usize,
     budget: Duration,
     cancel: &CancellationToken,
 ) -> Room {
-    match tx.clone().try_reserve_owned() {
+    match tx.try_reserve(len) {
         Ok(permit) => return Room::Ready(permit, Duration::ZERO),
         Err(mpsc::error::TrySendError::Closed(_)) => return Room::Closed,
         Err(mpsc::error::TrySendError::Full(_)) if budget.is_zero() => {
@@ -335,7 +338,7 @@ async fn reserve_input(
     let started = tokio::time::Instant::now();
     tokio::select! {
         _ = cancel.cancelled() => Room::Closed,
-        reserved = tokio::time::timeout(budget, tx.clone().reserve_owned()) => match reserved {
+        reserved = tokio::time::timeout(budget, tx.reserve(len)) => match reserved {
             Ok(Ok(permit)) => Room::Ready(permit, started.elapsed()),
             Ok(Err(_)) => Room::Closed,
             Err(_) => Room::Full(started.elapsed()),
@@ -1169,7 +1172,7 @@ async fn run_attach_loop(
                         if let Some(tx) = writer {
                             let backlog = input_backlogs.entry(target).or_default();
                             let budget = INPUT_STALL.saturating_sub(backlog.waited);
-                            match reserve_input(&tx, budget, &cancel).await {
+                            match reserve_input(&tx, bytes.len(), budget, &cancel).await {
                                 // Room the moment it was asked for: caught up.
                                 Room::Ready(permit, waited) => {
                                     backlog.waited = if waited.is_zero() {
@@ -4368,11 +4371,11 @@ mod tests {
         io_state: &Arc<Mutex<PaneIoState>>,
         pane_id: PaneId,
     ) -> (
-        mpsc::Receiver<Vec<u8>>,
+        crate::pane_input::PaneInputRx,
         mpsc::Receiver<crate::pane_io::ResizeRequest>,
         CancellationToken,
     ) {
-        let (writer_tx, writer_rx) = mpsc::channel(8);
+        let (writer_tx, writer_rx) = crate::pane_input::channel_with(8, crate::pane_input::BUDGET);
         let (resize_tx, resize_rx) = mpsc::channel(8);
         let shutdown = CancellationToken::new();
         let mut vt = shux_vt::VirtualTerminal::new(6, 40);
@@ -5362,8 +5365,8 @@ mod tests {
         io_state: &Arc<Mutex<PaneIoState>>,
         pane_id: PaneId,
         setup: &[u8],
-    ) -> mpsc::Receiver<Vec<u8>> {
-        let (writer_tx, writer_rx) = mpsc::channel(64);
+    ) -> crate::pane_input::PaneInputRx {
+        let (writer_tx, writer_rx) = crate::pane_input::channel_with(64, crate::pane_input::BUDGET);
         let (resize_tx, _resize_rx) = mpsc::channel(8);
         let shutdown = CancellationToken::new();
         let mut vt = shux_vt::VirtualTerminal::new(28, 49);
@@ -5379,7 +5382,7 @@ mod tests {
         writer_rx
     }
 
-    async fn recv_bytes(rx: &mut mpsc::Receiver<Vec<u8>>) -> Vec<u8> {
+    async fn recv_bytes(rx: &mut crate::pane_input::PaneInputRx) -> Vec<u8> {
         tokio::time::timeout(shux_testkit::BUDGET, rx.recv())
             .await
             .expect("pane write timeout")
@@ -5809,13 +5812,13 @@ mod tests {
 
     /// Nothing arrived on the pane's writer. `handle_app_mouse` writes with
     /// `try_send` before it returns, so nothing can arrive late.
-    async fn assert_no_bytes(rx: &mut mpsc::Receiver<Vec<u8>>, why: &str) {
+    async fn assert_no_bytes(rx: &mut crate::pane_input::PaneInputRx, why: &str) {
         if let Ok(bytes) = rx.try_recv() {
             panic!("{why}: app received {:?}", String::from_utf8_lossy(&bytes));
         }
     }
 
-    async fn recv_text(rx: &mut mpsc::Receiver<Vec<u8>>) -> String {
+    async fn recv_text(rx: &mut crate::pane_input::PaneInputRx) -> String {
         String::from_utf8_lossy(&recv_bytes(rx).await).into_owned()
     }
 
@@ -6305,7 +6308,7 @@ mod tests {
         let mut h = AppMouseHarness::new().await;
         // A writer with no receiver: `try_send` fails exactly as it does when a
         // pane is backpressured.
-        let (writer_tx, writer_rx) = mpsc::channel(1);
+        let (writer_tx, writer_rx) = crate::pane_input::channel_with(1, crate::pane_input::BUDGET);
         drop(writer_rx);
         {
             let mut st = h.fixture.io_state.lock().await;
@@ -7076,7 +7079,7 @@ mod tests {
     /// at all means everything in flight has landed.
     struct InputHarness {
         fixture: AttachFixture,
-        writer_rx: mpsc::Receiver<Vec<u8>>,
+        writer_rx: crate::pane_input::PaneInputRx,
         client: Client,
     }
 
@@ -7104,7 +7107,8 @@ mod tests {
             tokio::time::advance(Duration::ZERO).await;
             let fixture = attach_fixture().await;
             let _ = seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
-            let (writer_tx, writer_rx) = mpsc::channel(capacity);
+            let (writer_tx, writer_rx) =
+                crate::pane_input::channel_with(capacity, crate::pane_input::BUDGET);
             fixture
                 .io_state
                 .lock()
@@ -7314,7 +7318,7 @@ mod tests {
         let mut h = InputHarness::new(8).await;
         let paste: Vec<u8> = (0..2000u32).map(|i| b'a' + (i % 26) as u8).collect();
 
-        let mut rx = std::mem::replace(&mut h.writer_rx, mpsc::channel(1).1);
+        let mut rx = std::mem::replace(&mut h.writer_rx, crate::pane_input::channel_with(1, 1).1);
         let want = paste.len();
         let reader = tokio::spawn(async move {
             let mut got = Vec::with_capacity(want);
@@ -7395,7 +7399,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_pane_that_reads_too_slowly_cannot_hold_detach_behind_a_paste() {
         let mut h = InputHarness::new(1).await;
-        let mut rx = std::mem::replace(&mut h.writer_rx, mpsc::channel(1).1);
+        let mut rx = std::mem::replace(&mut h.writer_rx, crate::pane_input::channel_with(1, 1).1);
         let reader = tokio::spawn(async move {
             while rx.recv().await.is_some() {
                 #[expect(
@@ -7424,7 +7428,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn two_stuck_panes_each_cost_one_wait() {
         let mut h = InputHarness::new(1).await;
-        let (second_tx, _second_rx) = mpsc::channel(1);
+        let (second_tx, _second_rx) = crate::pane_input::channel_with(1, crate::pane_input::BUDGET);
         h.fixture
             .io_state
             .lock()

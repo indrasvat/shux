@@ -1,0 +1,324 @@
+//! A pane's input channel, bounded in bytes as well as in chunks.
+//!
+//! A chunk holds its share of the pane's byte budget from the moment a sender
+//! reserves room for it until the PTY task has written it, so a program that
+//! stops reading holds every sender back once [`BUDGET`] unwritten bytes wait
+//! for it, in the channel or in the PTY task. The daemon then holds at most the
+//! budget, the written part of the chunk being written, and one decoded chunk
+//! per sender still waiting for room.
+//!
+//! Waiting reservations take room in order, so a large one is not starved by
+//! small ones; while one waits, [`PaneWriter::try_reserve`] finds no room. Small
+//! input that must not wait behind them (a mouse event, a Ctrl-C, a paste's
+//! end) takes its room from a separate, smaller budget with
+//! [`PaneWriter::try_reserve_control`].
+
+use std::sync::Arc;
+
+use tokio::sync::mpsc::error::{SendError, TryRecvError, TrySendError};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+
+/// Unwritten bytes that may wait for one pane's program.
+pub const BUDGET: usize = 16 << 20;
+/// Unwritten bytes of control input that may wait beside [`BUDGET`].
+pub const CONTROL_BUDGET: usize = 64 << 10;
+/// What a chunk costs on top of its bytes until it is written: roughly its
+/// allocation, so a flood of one-byte chunks is bounded too, with room for the
+/// paste markers framing may add after room was reserved.
+const CHUNK_COST: usize = 64;
+const SLOTS: usize = 256;
+
+/// One chunk of input, holding its unwritten bytes' share of the budget.
+pub struct PaneInput {
+    pub(crate) bytes: Vec<u8>,
+    budget: Option<OwnedSemaphorePermit>,
+}
+
+impl PaneInput {
+    /// `n` more bytes of this chunk were written: their budget goes back, all
+    /// but the chunk's own cost, which goes back when the chunk is dropped.
+    pub(crate) fn wrote(&mut self, n: usize) {
+        if let Some(budget) = &mut self.budget {
+            let held = budget.num_permits();
+            let n = n.min(held.saturating_sub(CHUNK_COST.min(held)));
+            drop(budget.split(n));
+        }
+    }
+}
+
+#[cfg(test)]
+impl From<Vec<u8>> for PaneInput {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            budget: None,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct Budget {
+    permits: Arc<Semaphore>,
+    limit: usize,
+}
+
+impl Budget {
+    fn new(limit: usize) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(limit)),
+            limit,
+        }
+    }
+
+    /// A chunk larger than the whole budget takes all of it, so it goes once
+    /// nothing else waits instead of never.
+    fn cost(&self, len: usize) -> u32 {
+        let cost = len.saturating_add(CHUNK_COST).min(self.limit);
+        // Every budget here is far below u32::MAX.
+        u32::try_from(cost).unwrap_or(u32::MAX)
+    }
+
+    fn try_take(&self, len: usize) -> Result<OwnedSemaphorePermit, TrySendError<()>> {
+        self.permits
+            .clone()
+            .try_acquire_many_owned(self.cost(len))
+            .map_err(|e| match e {
+                tokio::sync::TryAcquireError::Closed => TrySendError::Closed(()),
+                tokio::sync::TryAcquireError::NoPermits => TrySendError::Full(()),
+            })
+    }
+}
+
+/// The sending side of a pane's input channel.
+#[derive(Clone)]
+pub struct PaneWriter {
+    tx: mpsc::Sender<PaneInput>,
+    budget: Budget,
+    control: Budget,
+}
+
+/// The PTY task's side of a pane's input channel.
+pub struct PaneInputRx {
+    rx: mpsc::Receiver<PaneInput>,
+    budgets: [Arc<Semaphore>; 2],
+}
+
+/// Room for one chunk: a slot in the channel and its bytes' budget.
+pub struct InputPermit {
+    slot: mpsc::OwnedPermit<PaneInput>,
+    budget: OwnedSemaphorePermit,
+}
+
+/// A pane's input channel with the default bounds.
+pub fn channel() -> (PaneWriter, PaneInputRx) {
+    channel_with(SLOTS, BUDGET)
+}
+
+/// A pane's input channel holding at most `slots` chunks and `budget`
+/// unwritten bytes.
+pub fn channel_with(slots: usize, budget: usize) -> (PaneWriter, PaneInputRx) {
+    let (tx, rx) = mpsc::channel(slots);
+    let (budget, control) = (Budget::new(budget), Budget::new(CONTROL_BUDGET));
+    let budgets = [budget.permits.clone(), control.permits.clone()];
+    let writer = PaneWriter {
+        tx,
+        budget,
+        control,
+    };
+    (writer, PaneInputRx { rx, budgets })
+}
+
+impl PaneWriter {
+    /// Room for a chunk of `len` bytes, waiting for it. Fails once the pane
+    /// is gone.
+    pub async fn reserve(&self, len: usize) -> Result<InputPermit, SendError<()>> {
+        let budget = tokio::select! {
+            biased;
+            () = self.tx.closed() => return Err(SendError(())),
+            budget = self.budget.permits.clone().acquire_many_owned(self.budget.cost(len)) => {
+                budget.map_err(|_| SendError(()))?
+            }
+        };
+        let slot = self
+            .tx
+            .clone()
+            .reserve_owned()
+            .await
+            .map_err(|_| SendError(()))?;
+        Ok(InputPermit { slot, budget })
+    }
+
+    /// [`Self::reserve`] without waiting.
+    pub fn try_reserve(&self, len: usize) -> Result<InputPermit, TrySendError<()>> {
+        self.try_reserve_from(&self.budget, len)
+    }
+
+    /// Room for small input that must not wait behind input still waiting for
+    /// room, from its own budget.
+    pub fn try_reserve_control(&self, len: usize) -> Result<InputPermit, TrySendError<()>> {
+        self.try_reserve_from(&self.control, len)
+    }
+
+    fn try_reserve_from(
+        &self,
+        budget: &Budget,
+        len: usize,
+    ) -> Result<InputPermit, TrySendError<()>> {
+        if self.tx.is_closed() {
+            return Err(TrySendError::Closed(()));
+        }
+        let budget = budget.try_take(len)?;
+        let slot = self.tx.clone().try_reserve_owned().map_err(|e| match e {
+            TrySendError::Full(_) => TrySendError::Full(()),
+            TrySendError::Closed(_) => TrySendError::Closed(()),
+        })?;
+        Ok(InputPermit { slot, budget })
+    }
+
+    pub async fn send(&self, bytes: Vec<u8>) -> Result<(), SendError<Vec<u8>>> {
+        match self.reserve(bytes.len()).await {
+            Ok(permit) => {
+                permit.send(bytes);
+                Ok(())
+            }
+            Err(_) => Err(SendError(bytes)),
+        }
+    }
+
+    pub fn try_send(&self, bytes: Vec<u8>) -> Result<(), TrySendError<Vec<u8>>> {
+        match self.try_reserve(bytes.len()) {
+            Ok(permit) => {
+                permit.send(bytes);
+                Ok(())
+            }
+            Err(TrySendError::Full(())) => Err(TrySendError::Full(bytes)),
+            Err(TrySendError::Closed(())) => Err(TrySendError::Closed(bytes)),
+        }
+    }
+}
+
+impl InputPermit {
+    pub fn send(self, bytes: Vec<u8>) {
+        self.slot.send(PaneInput {
+            bytes,
+            budget: Some(self.budget),
+        });
+    }
+
+    /// Whether this is room in `writer`'s channel.
+    pub fn is_for(&self, writer: &PaneWriter) -> bool {
+        self.slot.same_channel_as_sender(&writer.tx)
+    }
+}
+
+impl PaneInputRx {
+    /// The next chunk, holding its budget until it is written.
+    pub async fn recv_input(&mut self) -> Option<PaneInput> {
+        self.rx.recv().await
+    }
+
+    /// The next chunk's bytes, giving its budget back.
+    pub async fn recv(&mut self) -> Option<Vec<u8>> {
+        self.rx.recv().await.map(|input| input.bytes)
+    }
+
+    pub fn try_recv(&mut self) -> Result<Vec<u8>, TryRecvError> {
+        self.rx.try_recv().map(|input| input.bytes)
+    }
+}
+
+impl Drop for PaneInputRx {
+    /// Senders waiting for room learn at once that none will come.
+    fn drop(&mut self) {
+        for budget in &self.budgets {
+            budget.close();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_chunk_holds_its_budget_until_written() {
+        let (tx, mut rx) = channel_with(8, 1000);
+        tx.try_send(vec![0; 400]).unwrap();
+        tx.try_send(vec![0; 400]).unwrap();
+        assert!(matches!(
+            tx.try_send(vec![0; 400]),
+            Err(TrySendError::Full(_))
+        ));
+
+        let mut first = rx.recv_input().await.unwrap();
+        assert!(
+            matches!(tx.try_send(vec![0; 400]), Err(TrySendError::Full(_))),
+            "received is not written"
+        );
+        first.wrote(300);
+        tx.try_send(vec![0; 200]).unwrap();
+        first.wrote(100);
+        drop(first);
+        tx.try_send(vec![0; 200]).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_chunk_larger_than_the_budget_goes_once_nothing_else_waits() {
+        let (tx, mut rx) = channel_with(8, 1000);
+        tx.try_send(vec![1; 10]).unwrap();
+        let big = tokio::spawn({
+            let tx = tx.clone();
+            async move { tx.send(vec![2; 5000]).await }
+        });
+        let small = rx.recv_input().await.unwrap();
+        assert_eq!(small.bytes, vec![1; 10]);
+        drop(small);
+        big.await.unwrap().unwrap();
+        assert_eq!(rx.recv().await.unwrap().len(), 5000);
+    }
+
+    #[tokio::test]
+    async fn waiting_input_keeps_its_place() {
+        let (tx, mut rx) = channel_with(8, 1000);
+        let held = {
+            tx.try_send(vec![0; 900]).unwrap();
+            rx.recv_input().await.unwrap()
+        };
+        let big = tokio::spawn({
+            let tx = tx.clone();
+            async move { tx.send(vec![1; 500]).await }
+        });
+        shux_testkit::wait_until_async("the large send waits", || {
+            let tx = tx.clone();
+            async move {
+                tokio::task::yield_now().await;
+                tx.budget.permits.available_permits() == 0
+            }
+        })
+        .await;
+        assert!(
+            matches!(tx.try_send(vec![2; 1]), Err(TrySendError::Full(_))),
+            "small input jumped a waiting send"
+        );
+        tx.try_reserve_control(1).unwrap().send(vec![3]);
+        assert_eq!(rx.recv().await.unwrap(), vec![3], "control input waited");
+        drop(held);
+        big.await.unwrap().unwrap();
+        assert_eq!(rx.recv().await.unwrap(), vec![1; 500]);
+    }
+
+    #[tokio::test]
+    async fn a_waiting_sender_fails_once_the_pane_is_gone() {
+        let (tx, mut rx) = channel_with(8, 1000);
+        tx.try_send(vec![0; 900]).unwrap();
+        let held = rx.recv_input().await.unwrap();
+        let waiting = tokio::spawn({
+            let tx = tx.clone();
+            async move { tx.send(vec![1; 500]).await }
+        });
+        drop(rx);
+        assert!(waiting.await.unwrap().is_err());
+        assert!(matches!(tx.try_send(vec![1]), Err(TrySendError::Closed(_))));
+        drop(held);
+    }
+}

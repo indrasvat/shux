@@ -172,8 +172,8 @@ impl RpcHarness {
         &self,
         pane_id: shux_core::model::PaneId,
         text: &[u8],
-    ) -> mpsc::Receiver<Vec<u8>> {
-        let (write_tx, write_rx) = mpsc::channel(16);
+    ) -> crate::pane_input::PaneInputRx {
+        let (write_tx, write_rx) = crate::pane_input::channel_with(16, crate::pane_input::BUDGET);
         let (resize_tx, mut resize_rx) = mpsc::channel::<ResizeRequest>(8);
         let io = self.io.clone();
         tokio::spawn(async move {

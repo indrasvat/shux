@@ -43,7 +43,7 @@ async fn send_to_pane(
         .cloned()
         .ok_or_else(|| shux_rpc::RpcError::not_found("pane PTY", &pane_id.to_string()))?;
     let permit = writer
-        .reserve_owned()
+        .reserve(bytes.len())
         .await
         .map_err(|_| shux_rpc::RpcError::internal("PTY write channel closed"))?;
     io.lock().await.send_outside_paste(pane_id, permit, bytes);
