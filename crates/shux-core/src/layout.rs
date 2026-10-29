@@ -202,19 +202,31 @@ impl LayoutNode {
         max: u16,
     ) -> Option<(LayoutNode, (u16, u16))> {
         let (tree, (mut w, mut h)) = self.reratioed(size_of)?;
-        let short = |w: u16, h: u16, axis: fn(&Rect, (u16, u16)) -> bool| {
+        let deficit = |w: u16, h: u16, axis: fn(&Rect, (u16, u16)) -> u16| {
             tree.compute_rects(Rect::new(0, 0, w, h))
                 .iter()
-                .any(|(pane, rect)| size_of(*pane).is_some_and(|size| axis(rect, size)))
+                .filter_map(|(pane, rect)| size_of(*pane).map(|size| axis(rect, size)))
+                .max()
+                .unwrap_or(0)
         };
         // A clamped ratio can still leave a pane short. Widths depend only on
         // the viewport's width and heights only on its height, so each axis
-        // grows on its own.
-        while w < max && short(w, h, |r, (cols, _)| r.width < cols) {
-            w += 1;
+        // grows on its own. A pane gains at most one cell per cell the
+        // viewport gains, so growing by the largest shortfall never passes
+        // the smallest viewport that fits.
+        loop {
+            let short = deficit(w, h, |r, (cols, _)| cols.saturating_sub(r.width));
+            if short == 0 || w >= max {
+                break;
+            }
+            w = w.saturating_add(short).min(max);
         }
-        while h < max && short(w, h, |r, (_, rows)| r.height < rows) {
-            h += 1;
+        loop {
+            let short = deficit(w, h, |r, (_, rows)| rows.saturating_sub(r.height));
+            if short == 0 || h >= max {
+                break;
+            }
+            h = h.saturating_add(short).min(max);
         }
         let size = (w.min(max), h.min(max));
         Some((tree, size))
@@ -718,6 +730,43 @@ mod tests {
                 "{pane:?}: {rect:?}"
             );
         }
+    }
+
+    /// Clamped ratios compound down a chain; the fit still lands on the
+    /// smallest viewport that holds every pane, in a handful of passes
+    /// rather than one per cell of growth.
+    #[test]
+    fn fitted_reaches_the_smallest_fit_in_few_passes() {
+        let mut layout = LayoutNode::leaf(p(0));
+        for i in 1..=10 {
+            layout = LayoutNode::split(Direction::Vertical, 0.5, layout, LayoutNode::leaf(p(i)));
+        }
+        let size = |pane: PaneId| Some(if pane == p(0) { (2000, 2) } else { (1, 2) });
+        let fits = |tree: &LayoutNode, w: u16| {
+            tree.compute_rects(Rect::new(0, 0, w, 2))
+                .iter()
+                .all(|(pane, rect)| size(*pane).is_some_and(|(cols, _)| rect.width >= cols))
+        };
+        let lookups = std::cell::Cell::new(0usize);
+        let counted = |pane: PaneId| {
+            lookups.set(lookups.get() + 1);
+            size(pane)
+        };
+
+        let (tree, (w, _)) = layout.fitted(&counted, u16::MAX).expect("every pane sized");
+        let (_, (lower, _)) = layout.reratioed(&size).expect("every pane sized");
+        let smallest = (lower..=u16::MAX)
+            .find(|&w| fits(&tree, w))
+            .expect("some width fits");
+        assert_eq!(
+            w, smallest,
+            "fitted is not the smallest width that holds every pane"
+        );
+        assert!(
+            lookups.get() <= 20 * 11,
+            "{} pane-size lookups to fit 11 panes",
+            lookups.get()
+        );
     }
 
     // ── Ratio clamping ────────────────────────────────────────
