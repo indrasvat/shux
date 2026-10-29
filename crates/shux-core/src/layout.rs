@@ -201,8 +201,7 @@ impl LayoutNode {
         size_of: &impl Fn(PaneId) -> Option<(u16, u16)>,
         max: u16,
     ) -> Option<(LayoutNode, (u16, u16))> {
-        let tree = self.reratioed(size_of)?;
-        let (mut w, mut h) = tree.summed_size(size_of)?;
+        let (tree, (mut w, mut h)) = self.reratioed(size_of)?;
         let short = |w: u16, h: u16, axis: fn(&Rect, (u16, u16)) -> bool| {
             tree.compute_rects(Rect::new(0, 0, w, h))
                 .iter()
@@ -221,45 +220,36 @@ impl LayoutNode {
         Some((tree, size))
     }
 
-    fn reratioed(&self, size_of: &impl Fn(PaneId) -> Option<(u16, u16)>) -> Option<LayoutNode> {
+    /// This tree with each split's ratio taken from its sides' sizes, and
+    /// those sizes added along each split, a separator between: the lower
+    /// bound [`Self::fitted`] grows from.
+    fn reratioed(
+        &self,
+        size_of: &impl Fn(PaneId) -> Option<(u16, u16)>,
+    ) -> Option<(LayoutNode, (u16, u16))> {
         match self {
-            Self::Leaf { pane } => size_of(*pane).map(|_| self.clone()),
+            Self::Leaf { pane } => Some((self.clone(), size_of(*pane)?)),
             Self::Split { dir, a, b, .. } => {
-                let (aw, ah) = a.summed_size(size_of)?;
-                let (bw, bh) = b.summed_size(size_of)?;
-                let (x, y) = match dir {
-                    Direction::Vertical => (aw, bw),
-                    Direction::Horizontal => (ah, bh),
-                };
-                let ratio = f32::from(x) / f32::from(x.saturating_add(y).max(1));
-                Some(LayoutNode::split(
-                    *dir,
-                    ratio,
-                    a.reratioed(size_of)?,
-                    b.reratioed(size_of)?,
-                ))
-            }
-        }
-    }
-
-    /// Sizes added along each split, a separator between: the lower bound
-    /// [`Self::fitted`] grows from.
-    fn summed_size(&self, size_of: &impl Fn(PaneId) -> Option<(u16, u16)>) -> Option<(u16, u16)> {
-        match self {
-            Self::Leaf { pane } => size_of(*pane),
-            Self::Split { dir, a, b, .. } => {
-                let (aw, ah) = a.summed_size(size_of)?;
-                let (bw, bh) = b.summed_size(size_of)?;
-                Some(match dir {
+                let (a, (aw, ah)) = a.reratioed(size_of)?;
+                let (b, (bw, bh)) = b.reratioed(size_of)?;
+                let ((x, y), size) = match dir {
                     Direction::Vertical => (
-                        aw.saturating_add(SEPARATOR_SIZE).saturating_add(bw),
-                        ah.max(bh),
+                        (aw, bw),
+                        (
+                            aw.saturating_add(SEPARATOR_SIZE).saturating_add(bw),
+                            ah.max(bh),
+                        ),
                     ),
                     Direction::Horizontal => (
-                        aw.max(bw),
-                        ah.saturating_add(SEPARATOR_SIZE).saturating_add(bh),
+                        (ah, bh),
+                        (
+                            aw.max(bw),
+                            ah.saturating_add(SEPARATOR_SIZE).saturating_add(bh),
+                        ),
                     ),
-                })
+                };
+                let ratio = f32::from(x) / f32::from(x.saturating_add(y).max(1));
+                Some((LayoutNode::split(*dir, ratio, a, b), size))
             }
         }
     }

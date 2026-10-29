@@ -68,6 +68,40 @@ fn assert_bars(img: &image::RgbaImage, cw: u32, ch: u32, col: u32, row: u32, wha
     }
 }
 
+/// Three panes side by side, split right then right again, so the live
+/// ratios are 1/2 and 1/2 over three 80-column grids. Returns the session id.
+fn spawn_chain(h: &Harness) -> String {
+    let (session_id, mut target) = spawn(h);
+    for _ in 0..2 {
+        let split = h.rpc_ok(
+            "pane.split",
+            json!({
+                "pane_id": target,
+                "direction": "vertical",
+                "command": ["sh", "-c", SCRIPT],
+            }),
+        );
+        target = split["pane"]["id"]
+            .as_str()
+            .expect("new pane id")
+            .to_string();
+        h.wait_for(&target, "BARS-DONE", shux_testkit::BUDGET_MS)
+            .expect("split pane never drew its bars");
+    }
+    session_id
+}
+
+/// Each pane of [`spawn_chain`] whole, one separator column between them.
+#[track_caller]
+fn assert_chain_bars(img: &image::RgbaImage, cw: u32, ch: u32) {
+    for (i, col) in [1, 2 + PANE_COLS, 3 + 2 * PANE_COLS]
+        .into_iter()
+        .enumerate()
+    {
+        assert_bars(img, cw, ch, col, 1, &format!("pane {i}"));
+    }
+}
+
 /// Outline + one status row around `cols x rows` of panes.
 fn frame_px(cols: u32, rows: u32, cw: u32, ch: u32) -> (u32, u32) {
     ((cols + 2) * cw, (rows + 2 + 1) * ch)
@@ -147,30 +181,12 @@ fn a_snapshot_without_dims_fits_every_pane_of_a_split() {
     assert_bars(&img, cw, ch, 1 + PANE_COLS + 1, 1, "right pane");
 }
 
-/// Splitting the right pane again leaves ratios of 1/2 and 1/2 over three
-/// 80-column grids: drawn at those ratios the first pane gets half the frame
+/// Drawn at the live ratios the first pane of the chain gets half the frame
 /// and the other two crowd into the rest.
 #[test]
 fn a_snapshot_without_dims_fits_a_chain_of_splits_without_a_dead_band() {
     let h = Harness::new();
-    let (session_id, first) = spawn(&h);
-    let mut target = first;
-    for _ in 0..2 {
-        let split = h.rpc_ok(
-            "pane.split",
-            json!({
-                "pane_id": target,
-                "direction": "vertical",
-                "command": ["sh", "-c", SCRIPT],
-            }),
-        );
-        target = split["pane"]["id"]
-            .as_str()
-            .expect("new pane id")
-            .to_string();
-        h.wait_for(&target, "BARS-DONE", shux_testkit::BUDGET_MS)
-            .expect("split pane never drew its bars");
-    }
+    let session_id = spawn_chain(&h);
 
     let (img, cw, ch) = decode(&h.rpc_ok("session.snapshot", json!({ "session_id": session_id })));
     assert_eq!(
@@ -178,12 +194,7 @@ fn a_snapshot_without_dims_fits_a_chain_of_splits_without_a_dead_band() {
         frame_px(PANE_COLS * 3 + 2, PANE_ROWS, cw, ch),
         "three {PANE_COLS}-column panes were not framed at their size"
     );
-    for (i, col) in [1, 2 + PANE_COLS, 3 + 2 * PANE_COLS]
-        .into_iter()
-        .enumerate()
-    {
-        assert_bars(&img, cw, ch, col, 1, &format!("pane {i}"));
-    }
+    assert_chain_bars(&img, cw, ch);
 }
 
 /// Giving one axis leaves the other at the window's own size, which must
@@ -191,24 +202,7 @@ fn a_snapshot_without_dims_fits_a_chain_of_splits_without_a_dead_band() {
 #[test]
 fn a_snapshot_with_one_dim_still_fits_the_other_axis_of_a_chain() {
     let h = Harness::new();
-    let (session_id, first) = spawn(&h);
-    let mut target = first;
-    for _ in 0..2 {
-        let split = h.rpc_ok(
-            "pane.split",
-            json!({
-                "pane_id": target,
-                "direction": "vertical",
-                "command": ["sh", "-c", SCRIPT],
-            }),
-        );
-        target = split["pane"]["id"]
-            .as_str()
-            .expect("new pane id")
-            .to_string();
-        h.wait_for(&target, "BARS-DONE", shux_testkit::BUDGET_MS)
-            .expect("split pane never drew its bars");
-    }
+    let session_id = spawn_chain(&h);
 
     let (img, cw, ch) = decode(&h.rpc_ok(
         "session.snapshot",
@@ -219,12 +213,7 @@ fn a_snapshot_with_one_dim_still_fits_the_other_axis_of_a_chain() {
         frame_px(PANE_COLS * 3 + 2, PANE_ROWS, cw, ch).0,
         "--rows alone changed the window's width"
     );
-    for (i, col) in [1, 2 + PANE_COLS, 3 + 2 * PANE_COLS]
-        .into_iter()
-        .enumerate()
-    {
-        assert_bars(&img, cw, ch, col, 1, &format!("pane {i}"));
-    }
+    assert_chain_bars(&img, cw, ch);
 }
 
 #[test]

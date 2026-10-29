@@ -1019,6 +1019,11 @@ mod tests {
             );
             let img = r.render(vt.grid(), &RasterOptions::default());
             let red = *img.get_pixel(0, 0);
+            let bg = *img.get_pixel(img.width() - 1, ch);
+            assert!(
+                (ch..2 * ch).any(|y| (0..img.width()).any(|x| *img.get_pixel(x, y) != bg)),
+                "{glyph:?} drew nothing"
+            );
             for (y, edge) in [(ch - 1, "above"), (2 * ch, "below")] {
                 for x in 0..img.width() {
                     assert_eq!(

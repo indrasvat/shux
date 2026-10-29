@@ -210,7 +210,6 @@ where
     let mut last_size = TerminalGuard::size().unwrap_or((80, 24));
     let mut bindings = KeybindingRegistry::with_overrides(&config.prefix, &config.keybindings)
         .map_err(|e| anyhow::anyhow!("invalid keybinding config: {e:?}"))?;
-    // Armed before the first read of the keys, as the daemon's listener is.
     let reload = config
         .live_config
         .as_ref()
@@ -453,8 +452,6 @@ where
     }
 }
 
-/// Tell the daemon which prefix this client uses. Best effort, like input:
-/// a dead connection shows up as the stream ending.
 /// The bindings for the live config's keys when they differ from `keys`,
 /// which then take them. Keys that do not build a registry keep the
 /// bindings that work.
@@ -478,6 +475,8 @@ fn rebind(
     }
 }
 
+/// Tell the daemon which prefix this client uses. Best effort, like input:
+/// a dead connection shows up as the stream ending.
 async fn send_prefix<SinkT>(sink: &mut SinkT, prefix: &str)
 where
     SinkT: futures::Sink<Bytes> + Unpin,

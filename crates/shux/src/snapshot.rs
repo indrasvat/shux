@@ -159,15 +159,14 @@ pub(crate) fn parse_snapshot_dims(
 
 /// The frame that fits the window's panes at their current grid sizes: the
 /// outline ring and status bar around [`LayoutNode::fitted`]'s viewport, with
-/// the fitted tree to compose at it (`None` when zoomed, where the real tree
-/// is shown). A frame any bigger draws the outline around space no pane has.
+/// the fitted tree to compose at it. A frame any bigger draws the outline around space no pane has.
 ///
 /// [`LayoutNode::fitted`]: shux_core::layout::LayoutNode::fitted
 fn natural_frame(
     layout: &shux_core::layout::WindowLayout,
     pane_data: &[PaneSnapshotData],
     border_style: shux_ui::BorderStyle,
-) -> Option<(Option<shux_core::layout::LayoutNode>, (u16, u16))> {
+) -> Option<(shux_core::layout::LayoutNode, (u16, u16))> {
     let size_of = |pane| {
         pane_data
             .iter()
@@ -175,7 +174,7 @@ fn natural_frame(
             .map(|(_, grid, ..)| (grid.cols() as u16, grid.rows() as u16))
     };
     let (tree, (cols, rows)) = match &layout.zoom {
-        Some(zoom) => (None, size_of(zoom.zoomed_pane)?),
+        Some(zoom) => (layout.tree.clone(), size_of(zoom.zoomed_pane)?),
         None => {
             let ring = if border_style == shux_ui::BorderStyle::None {
                 0
@@ -183,7 +182,7 @@ fn natural_frame(
                 2
             };
             let (tree, (w, h)) = layout.tree.fitted(&size_of, u16::MAX - ring)?;
-            (Some(tree), (w.saturating_add(ring), h.saturating_add(ring)))
+            (tree, (w.saturating_add(ring), h.saturating_add(ring)))
         }
     };
     // No upper clamp: a frame narrower than the panes crops them, and the
@@ -279,13 +278,9 @@ pub(crate) async fn snapshot_window(
     // Compose with the user's outline style: `compose` derives the pane viewport
     // from it, so a hardcoded style crops panes under `border_style = "none"`.
     let border_style = shux_ui::BorderStyle::parse(&cfg.appearance.border_style);
-    let (fitted_tree, natural) =
-        natural_frame(&window.layout, &pane_data, border_style).unwrap_or((None, FALLBACK_DIMS));
+    let (fitted_tree, natural) = natural_frame(&window.layout, &pane_data, border_style)
+        .unwrap_or_else(|| (window.layout.tree.clone(), FALLBACK_DIMS));
     let defaulted = cols.is_none() || rows.is_none();
-    // An axis left to default must hold every pane whole, which the live
-    // ratios cannot promise for grids never sized from them. Explicit dims on
-    // both axes show the live layout's proportions.
-    let fitted_tree = fitted_tree.filter(|_| defaulted);
     let (cols, rows) = (cols.unwrap_or(natural.0), rows.unwrap_or(natural.1));
 
     let (cw, ch) = rasterizer.cell_size();
@@ -307,7 +302,14 @@ pub(crate) async fn snapshot_window(
     }
 
     let focused = window.active_pane;
-    let layout_tree = fitted_tree.unwrap_or_else(|| window.layout.tree.clone());
+    // An axis left to default must hold every pane whole, which the live
+    // ratios cannot promise for grids never sized from them. Explicit dims on
+    // both axes show the live layout's proportions.
+    let layout_tree = if defaulted {
+        fitted_tree
+    } else {
+        window.layout.tree.clone()
+    };
     let zoom_state = window.layout.zoom.clone();
 
     // Build the same status bar `shux attach` would render so the snapshot
