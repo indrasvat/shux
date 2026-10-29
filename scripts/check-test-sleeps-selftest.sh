@@ -86,6 +86,35 @@ printf '%s\n' '#![expect(clippy::disallowed_methods, reason = "x")]' >"$work/cra
 expect 1 "a crate-wide expect of the ban is flagged" bash "$guard"
 printf '%s\n' '#![allow(clippy::style)]' >"$work/crates/k/src/lib.rs"
 expect 1 "allow of a lint group holding the ban is flagged" bash "$guard"
+src_file() { printf '%s\n' "$@" >"$work/crates/k/src/lib.rs"; }
+src_file '#![cfg_attr(test, allow(clippy::disallowed_methods))]'
+expect 1 "an allow inside cfg_attr is flagged" bash "$guard"
+src_file 'fn f() {' '    #[allow(' '        clippy::disallowed_methods' '    )]' '    std::thread::sleep(d);' '}'
+expect 1 "an allow spread over lines is flagged" bash "$guard"
+src_file '#![expect(clippy::style, reason = "x")]'
+expect 1 "a crate-wide expect of a group holding the ban is flagged" bash "$guard"
+src_file '/* banner **/' '#[allow(clippy::disallowed_methods)]' 'fn f() {}'
+expect 1 "a block comment closed by a run of stars ends there" bash "$guard"
+src_file '#[allow(clippy::allow_attributes_without_reason)]' 'fn f() {}'
+expect 0 "a lint whose name starts with all is not a waiver" bash "$guard"
+src_file 'fn f() {' '    let s = "a /* b";' '    let t = "' '  #[allow(clippy::disallowed_methods)] /*' '";' '}'
+expect 0 "an attribute or comment inside a multi-line string is inert" bash "$guard"
+src_file 'fn f() {}'
+printf '%s\n' '[lints.clippy]' 'disallowed_methods = "allow"' >"$work/crates/k/Cargo.toml"
+expect 1 "a Cargo.toml lint table relaxing the ban is flagged" bash "$guard"
+printf '%s\n' '[lints.clippy]' 'all = { level = "warn", priority = -1 }' >"$work/crates/k/Cargo.toml"
+expect 1 "a Cargo.toml lint table relaxing a group holding it is flagged" bash "$guard"
+printf '%s\n' '[lints.clippy]' 'disallowed_methods = "deny"' >"$work/crates/k/Cargo.toml"
+expect 0 "a Cargo.toml lint table that keeps the ban passes" bash "$guard"
+rm "$work/crates/k/Cargo.toml"
+case_file 'fn t() {' "    let q = '\"'; std::thread::sleep(d); let p = '\"';" '}'
+expect 1 "a char literal holding a quote does not hide a sleep" bash "$guard"
+case_file 'fn t() {' '    let r = r#"a "//" b"#; std::thread::sleep(d);' '}'
+expect 1 "a raw string holding a quote does not hide a sleep" bash "$guard"
+case_file 'fn t<'"'"'a>(x: &'"'"'a str) {' '    std::thread::sleep(d);' '}'
+expect 1 "a lifetime is not a char literal" bash "$guard"
+case_file 'fn t() {' '    let r = r#"std::thread::sleep(d)"#;' '}'
+expect 0 "a sleep inside a raw string passes" bash "$guard"
 printf '%s\n' 'fn f() {}' >"$work/crates/k/src/lib.rs"
 case_file 'fn t() {' '    std::thread::sleep(d);' '}'
 

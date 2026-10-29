@@ -10,16 +10,18 @@
 # - in `crates/*/tests/`, a qualified sleep call or a sleep import on a code
 #   line, unless the statement carrying it has
 #   `#[expect(clippy::disallowed_methods, ...)]`;
-# - in any `crates/` source, `allow(...)` of `clippy::disallowed_methods` or of
-#   a group containing it, or an inner `#![expect(...)]` of it: the ban is
-#   waived per statement, with `expect`, so a stale waiver fails the build.
+# - in any `crates/` source, an attribute (inner, outer or inside `cfg_attr`)
+#   that allows `clippy::disallowed_methods` or a group holding it, expects
+#   such a group, or expects the lint crate-wide; and a `[lints.clippy]` table
+#   in a Cargo.toml that relaxes either. The ban is waived per statement, with
+#   `expect`, so a stale waiver fails the build.
 #
-# Comments, string literals and helpers whose names merely contain "sleep" are
-# never flagged.
+# Comments, string, raw-string and char literals, and helpers whose names
+# merely contain "sleep" are never flagged.
 #
 # Usage:
-#   check-test-sleeps.sh FILE...   scan these files (non-crate paths are skipped)
-#   check-test-sleeps.sh           scan every crates/**/*.rs
+#   check-test-sleeps.sh FILE...   scan these files (other paths are skipped)
+#   check-test-sleeps.sh           scan every crates/**/*.rs and Cargo.toml
 #   check-test-sleeps.sh --hook    read a Claude Code hook payload on stdin;
 #                                  exit 2 with the findings on stderr
 #
@@ -38,39 +40,77 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # Matched on the path's tail, so a worktree or symlinked checkout is covered.
 in_crates() { [[ "$1" == *.rs && "/$1" == */crates/*/* ]]; }
+is_manifest() { [[ "$1" == */Cargo.toml ]]; }
 is_test_file() { [[ "$1" == *.rs && "/$1" == */crates/*/tests/* ]]; }
 
 # Prints `path:line: text` for every finding in "$1"; $2 is 1 for a test file.
 scan() {
-    awk -v path="$1" -v tests="$2" '
+    awk -v path="$1" -v tests="$2" -v q="'" '
+        BEGIN { charlit = "^" q "(\\\\[^" q "]+|[^\\\\" q "])" q }
+        function ident(ch) { return ch ~ /[A-Za-z0-9_]/ }
         function ends_statement(s) {
             sub(/[ \t]+$/, "", s)
             return s ~ /[;}]$/
         }
+        # Code with comments removed and literals emptied. The lexer state
+        # carries across lines: block comments nest, strings span lines.
+        function strip(line,    out, i, n, c, two, rest, h) {
+            out = ""; n = length(line)
+            for (i = 1; i <= n; i++) {
+                c = substr(line, i, 1); two = substr(line, i, 2)
+                if (st == "block") {
+                    if (two == "/*") { depth++; i++ }
+                    else if (two == "*/") { i++; if (--depth == 0) st = "" }
+                    continue
+                }
+                if (st == "str") {
+                    if (c == "\\") i++
+                    else if (c == "\"") { st = ""; out = out "\"" }
+                    continue
+                }
+                if (st == "raw") {
+                    if (c == "\"" && substr(line, i + 1, hashes) == closer) { i += hashes; st = ""; out = out "\"" }
+                    continue
+                }
+                if (two == "//") break
+                if (two == "/*") { st = "block"; depth = 1; i++; continue }
+                if (c == "\"") { st = "str"; out = out "\""; continue }
+                if (c == "r" && !(i > 1 && ident(substr(line, i - 1, 1)) && \
+                        !(substr(line, i - 1, 1) == "b" && (i == 2 || !ident(substr(line, i - 2, 1)))))) {
+                    rest = substr(line, i + 1)
+                    if (match(rest, /^#*"/)) {
+                        hashes = RLENGTH - 1; closer = substr(rest, 1, hashes)
+                        st = "raw"; out = out "\""; i += RLENGTH; continue
+                    }
+                }
+                if (c == q && match(substr(line, i), charlit)) { out = out q q; i += RLENGTH - 1; continue }
+                out = out c
+            }
+            return out
+        }
+        # An attribute that waives the ban: allow of it or of a group holding
+        # it, an expect of a group, or a crate-wide expect of it.
+        function waiver(a) {
+            if (a !~ /(allow|expect)[ \t]*\(/) return 0
+            if (a ~ /allow[ \t]*\(.*clippy::(disallowed_methods|style|all)([^A-Za-z0-9_]|$)/) return 1
+            if (a ~ /expect[ \t]*\(.*clippy::(style|all)([^A-Za-z0-9_]|$)/) return 1
+            return a ~ /^#!/ && a ~ /clippy::disallowed_methods/
+        }
         {
             orig[NR] = $0
-            # String literals emptied first, so a "/*" or "//" in one is inert.
-            s = $0
-            gsub(/"([^"\\]|\\.)*"/, "\"\"", s)
-            # Block comments may span lines and need no leading `*`.
-            if (in_block) {
-                if (s !~ /\*\//) { code[NR] = ""; next }
-                sub(/^([^*]|\*[^\/])*\*\//, "", s); in_block = 0
-            }
-            while (s ~ /\/\*/) {
-                if (s ~ /\/\*([^*]|\*[^\/])*\*\//) { sub(/\/\*([^*]|\*[^\/])*\*\//, "", s); continue }
-                sub(/\/\*.*$/, "", s); in_block = 1
-            }
-            sub(/\/\/.*/, "", s)
-            code[NR] = s
+            code[NR] = strip($0)
         }
         END {
             for (n = 1; n <= NR; n++) {
                 c = code[n]
-                if (c ~ /#!?\[[ \t]*allow\(.*clippy::(disallowed_methods|style|all)/ \
-                 || c ~ /#![ \t]*\[[ \t]*expect\(.*clippy::disallowed_methods/) {
-                    printf "%s:%d: waiver: %s\n", path, n, orig[n]
-                    continue
+                # Collect a whole attribute, however many lines it spans.
+                p = index(c, "#")
+                if (p && substr(c, p) ~ /^#!?[ \t]*\[/) {
+                    a = substr(c, p); open = gsub(/\[/, "[", a) - gsub(/\]/, "]", a)
+                    for (k = n + 1; open > 0 && k <= NR && k <= n + 20; k++) {
+                        a = a " " code[k]; open += gsub(/\[/, "[", code[k]) - gsub(/\]/, "]", code[k])
+                    }
+                    if (waiver(a)) { printf "%s:%d: waiver: %s\n", path, n, orig[n]; continue }
                 }
                 if (!tests) continue
                 call = c ~ /(^|[^A-Za-z0-9_:])(::)?((std::)?thread|(tokio::)?time)::sleep(_until)?[ \t]*\(/
@@ -84,6 +124,17 @@ scan() {
                 }
                 if (!allowed) printf "%s:%d: %s\n", path, n, orig[n]
             }
+        }
+    ' "$1"
+}
+
+# Prints `path:line: text` for a Cargo.toml `[lints.clippy]` table that
+# relaxes the ban or a group holding it.
+scan_manifest() {
+    awk -v path="$1" '
+        /^[ \t]*\[/ { t = $0; gsub(/[ \t]/, "", t); clippy = (t == "[lints.clippy]" || t == "[workspace.lints.clippy]") }
+        clippy && /^[ \t]*"?(disallowed[-_]methods|style|all)"?[ \t]*=/ && !/"(deny|forbid)"/ {
+            printf "%s:%d: waiver: %s\n", path, NR, $0
         }
     ' "$1"
 }
@@ -106,14 +157,21 @@ else
         echo "check-test-sleeps: found no sources under $root/crates" >&2
         exit 1
     fi
+    while IFS= read -r -d '' f; do files+=("$f"); done \
+        < <(find "$root" -maxdepth 3 -name Cargo.toml -not -path '*/target*' -print0)
 fi
 
 findings=""
 scanned=0
 for f in "${files[@]}"; do
     [[ "$f" == /* ]] || f="$PWD/$f"
-    in_crates "$f" || continue
     [[ -f "$f" ]] || continue
+    if is_manifest "$f"; then
+        scanned=$((scanned + 1))
+        findings+="$(scan_manifest "$f")"$'\n'
+        continue
+    fi
+    in_crates "$f" || continue
     scanned=$((scanned + 1))
     tests=0
     is_test_file "$f" && tests=1

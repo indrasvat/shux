@@ -54,9 +54,12 @@ deadline is ordered by the monotonic clock.
   `CLIPPY_CONF_DIR` to the root: clippy reads the nearest `clippy.toml` and
   does not merge, so a crate-local one would drop the ban. `make check-darwin`
   runs the same lints over macOS-only code.
-- `scripts/check-test-sleeps.sh` flags a raw sleep in `crates/*/tests/`, and an
-  `allow` (or crate-wide `expect`) of `clippy::disallowed_methods` anywhere in
-  `crates/`. `.claude/settings.json` runs it after every edit, so an agent hears
+- `scripts/check-test-sleeps.sh` flags a raw sleep in `crates/*/tests/`, and
+  any attribute or `[lints.clippy]` entry that waives `clippy::disallowed_methods`
+  or a group holding it, except the per-statement `expect`, anywhere in
+  `crates/` or a `Cargo.toml`. It is textual: a waiver built by a macro, or a
+  sleep reached through an alias, gets past it and not past clippy.
+  `.claude/settings.json` runs it after every edit, so an agent hears
   about it at write time; `make check-test-sleeps` runs its self-test and scans
   the tree, in `make check` and in CI.
 
