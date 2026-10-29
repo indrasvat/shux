@@ -95,6 +95,23 @@ fn copy_overlay_needs_repaint(
     next.is_some() && (base_emitted || copy_overlay_needs_base_redraw(last, next))
 }
 
+/// What a sheet drawn over the frame (help, welcome toast, copy menu) looked
+/// like. The terminal keeps it until bytes land under it, so it is sent again
+/// only when it changed or the frame beneath it sent something.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SheetStamp {
+    cols: u16,
+    rows: u16,
+    theme: Theme,
+    label: String,
+}
+
+fn sheet_due(last: &mut Option<SheetStamp>, next: SheetStamp, base_emitted: bool) -> bool {
+    let due = base_emitted || last.as_ref() != Some(&next);
+    *last = Some(next);
+    due
+}
+
 /// Status-bar rows reserved at the bottom of the client screen.
 const STATUS_BAR_ROWS: u16 = 1;
 
@@ -1557,6 +1574,9 @@ async fn run_render_loop(
     let mut last_overlay_visible = false;
     let mut last_copy_overlay: Option<CopyOverlayStamp> = None;
     let mut last_copy_menu: Option<CopyContextMenu> = None;
+    let mut menu_sheet: Option<SheetStamp> = None;
+    let mut help_sheet: Option<SheetStamp> = None;
+    let mut toast_sheet: Option<SheetStamp> = None;
 
     loop {
         // A bump landed while the last frame was being drawn: output is
@@ -1847,15 +1867,27 @@ async fn run_render_loop(
         }
         last_copy_overlay = copy_overlay;
 
+        let sheet = |label: String| SheetStamp {
+            cols,
+            rows,
+            theme: live_theme,
+            label,
+        };
         if let Some(menu) = attached.copy_menu {
-            shux_ui::copy_mode::render_copy_menu_into(
-                compositor.inner_mut(),
-                menu.col,
-                menu.row,
-                cols,
-                rows,
-                &live_theme,
-            );
+            // A different menu forced a full redraw above.
+            let base_emitted = !compositor.inner().is_empty();
+            if sheet_due(&mut menu_sheet, sheet(String::new()), base_emitted) {
+                shux_ui::copy_mode::render_copy_menu_into(
+                    compositor.inner_mut(),
+                    menu.col,
+                    menu.row,
+                    cols,
+                    rows,
+                    &live_theme,
+                );
+            }
+        } else {
+            menu_sheet = None;
         }
         last_copy_menu = attached.copy_menu;
 
@@ -1866,13 +1898,18 @@ async fn run_render_loop(
         // compositor's diff would skip those positions because they
         // didn't change in the VT grid.
         if attached.help_visible {
-            shux_ui::render_help_overlay_into(
-                compositor.inner_mut(),
-                cols,
-                rows,
-                &live_theme,
-                &prefix_label,
-            );
+            let base_emitted = !compositor.inner().is_empty();
+            if sheet_due(&mut help_sheet, sheet(prefix_label.clone()), base_emitted) {
+                shux_ui::render_help_overlay_into(
+                    compositor.inner_mut(),
+                    cols,
+                    rows,
+                    &live_theme,
+                    &prefix_label,
+                );
+            }
+        } else {
+            help_sheet = None;
         }
 
         // Welcome toast (first-attach onboarding). Only fires when the
@@ -1884,14 +1921,18 @@ async fn run_render_loop(
                 .get_or_insert_with(std::time::Instant::now)
                 .elapsed();
             if elapsed < WELCOME_TOAST_DWELL {
-                render_welcome_toast(
-                    compositor.inner_mut(),
-                    cols,
-                    rows,
-                    &live_theme,
-                    &prefix_label,
-                    nerd_fonts,
-                );
+                let base_emitted = !compositor.inner().is_empty();
+                let stamp = sheet(format!("{prefix_label} {nerd_fonts}"));
+                if sheet_due(&mut toast_sheet, stamp, base_emitted) {
+                    render_welcome_toast(
+                        compositor.inner_mut(),
+                        cols,
+                        rows,
+                        &live_theme,
+                        &prefix_label,
+                        nerd_fonts,
+                    );
+                }
                 toast_drawn = true;
             } else {
                 // One-shot persist + flag-flip.
@@ -1905,7 +1946,10 @@ async fn run_render_loop(
                 }
                 compositor.force_redraw();
                 toast_drawn = false;
+                toast_sheet = None;
             }
+        } else {
+            toast_sheet = None;
         }
 
         if compositor.inner().len() > frame_end {
@@ -4270,6 +4314,105 @@ mod tests {
 
         cancel.cancel();
         task.abort();
+    }
+
+    /// An open help sheet over a frame that did not change sends nothing: the
+    /// terminal still shows it, and redrawing it on every wake streams the
+    /// whole sheet at the tick rate for as long as it is open.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_open_help_sheet_is_not_resent_over_an_unchanged_frame() {
+        let fixture = attach_fixture().await;
+        let onboarding = crate::onboarding::OnboardingHandle::from_state_for_test(
+            crate::onboarding::OnboardingState {
+                prefix_discovered: true,
+                welcome_toast_seen: true,
+            },
+        );
+        let pulse = fixture.io_state.lock().await.render_pulse.clone();
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = fixture.cancel.child_token();
+        let mut attached = fixture.attached.clone();
+        attached.help_visible = true;
+        // Past the seconds tier, so the uptime segment holds still.
+        let daemon_start = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(61))
+            .expect("monotonic clock past 61 s");
+        let render = tokio::spawn(run_render_loop(
+            fixture.graph.clone(),
+            fixture.io_state.clone(),
+            test_config(),
+            SegmentCache::new(),
+            crate::session_meta::SessionMetaCache::new(),
+            onboarding.clone(),
+            daemon_start,
+            Arc::new(Mutex::new(attached)),
+            Arc::new(Mutex::new((100, 40))),
+            tx,
+            cancel.clone(),
+            false,
+            Duration::from_secs(3600),
+        ));
+
+        let mut screen = shux_vt::VirtualTerminal::new(40, 100);
+        let deadline = tokio::time::Instant::now() + shux_testkit::BUDGET;
+        while !screen.capture_text(None).contains("keybindings") {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(AttachServerFrame::Render { data })) => {
+                    screen.process(&BASE64.decode(data).expect("render base64"));
+                }
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => panic!("the help sheet was never drawn"),
+            }
+        }
+
+        // Stop the next frame after it holds `io_state`: it has read every
+        // input it draws from, all unchanged.
+        let held = onboarding.hold_for_test().await;
+        pulse.bump();
+        let io_state = fixture.io_state.clone();
+        shux_testkit::wait_until_async("the idle frame to hold io_state", || {
+            let io_state = io_state.clone();
+            async move { io_state.try_lock().is_err() }
+        })
+        .await;
+        while let Ok(frame) = rx.try_recv() {
+            if let AttachServerFrame::Render { data } = frame {
+                screen.process(&BASE64.decode(data).expect("render base64"));
+            }
+        }
+        // A change for the frame after it, so its bytes mark where the idle
+        // frame's would have ended.
+        fixture
+            .graph
+            .rename_window(fixture.first_window, format!("MA{}RK", ""), None)
+            .await
+            .expect("rename window");
+        pulse.bump();
+        drop(held);
+
+        let mut idle_frames = 0;
+        let drew = loop {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(AttachServerFrame::Render { data })) => {
+                    screen.process(&BASE64.decode(data).expect("render base64"));
+                    if screen.capture_text(None).contains("MARK") {
+                        break true;
+                    }
+                    idle_frames += 1;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break false,
+            }
+        };
+        assert!(drew, "the change after the idle frame was never drawn");
+        assert_eq!(
+            idle_frames, 0,
+            "a frame that changed nothing resent the help sheet"
+        );
+
+        cancel.cancel();
+        render.await.expect("render loop");
+        fixture.stop();
     }
 
     /// A bump that lands while a frame is being drawn is drawn next, even with
