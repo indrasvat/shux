@@ -33,6 +33,12 @@ impl Env {
     /// A target session running the probe, and a 100x40 host pane with the
     /// attach client running in it, attached and drawing.
     fn attached(config_toml: &str) -> Self {
+        Self::attached_with(config_toml, "", "")
+    }
+
+    /// [`Self::attached`], with `env_vars` before the client's command line
+    /// and `redirect` after it, `{root}` in it naming the test's root.
+    fn attached_with(config_toml: &str, env_vars: &str, redirect: &str) -> Self {
         let root = tempfile::tempdir().expect("temp root");
         for sub in ["runtime", "config/shux", "work"] {
             std::fs::create_dir_all(root.path().join(sub)).expect("mkdir");
@@ -52,9 +58,10 @@ impl Env {
 
         let bin = env.bin.display().to_string();
         let root = env.root.path().display().to_string();
+        let redirect = redirect.replace("{root}", &root);
         env.send_keys(&format!(
-            "XDG_RUNTIME_DIR={root}/runtime XDG_CONFIG_HOME={root}/config \
-             {bin} session attach target\n"
+            "XDG_RUNTIME_DIR={root}/runtime XDG_CONFIG_HOME={root}/config {env_vars} \
+             {bin} session attach target {redirect}\n"
         ));
         // Only the attached UI draws the pane count; the shell's echo of the
         // command line cannot contain it.
@@ -203,6 +210,43 @@ fn the_help_overlay_names_the_configured_prefix_through_a_reload() {
     env.send_keys("\x02?");
     wait_until("the new prefix to close the help overlay", || {
         !env.screen().contains("keybindings (prefix")
+    });
+}
+
+/// The client's logs never land on the terminal its UI is drawing on: they
+/// are held while attached and written once the terminal is restored.
+///
+/// The watcher logs `watching` before it reads any change, so by the time
+/// the reloaded prefix is on screen that line has been written, wherever
+/// the client writes it.
+#[test]
+fn the_attached_client_logs_after_the_terminal_is_restored() {
+    let env = Env::attached_with(
+        &keys_config("ctrl-a"),
+        "RUST_LOG=info",
+        "2>{root}/client.err",
+    );
+    let log = env.root.path().join("client.err");
+    let read_log = || std::fs::read_to_string(&log).unwrap_or_default();
+
+    env.send_keys("\x01?");
+    env.wait_for("keybindings (prefix = ^A)");
+    env.write_config(&keys_config("ctrl-b"));
+    env.wait_for("keybindings (prefix = ^B)");
+    assert_eq!(
+        read_log(),
+        "",
+        "the client logged onto the attached terminal"
+    );
+
+    env.send_keys("\x02?");
+    wait_until("the help overlay to close", || {
+        !env.screen().contains("keybindings (prefix")
+    });
+    env.send_keys("\x02d");
+    env.wait_for("[detached from session 'target']");
+    wait_until("the held logs to be written", || {
+        read_log().contains("config hot-reload: watching")
     });
 }
 

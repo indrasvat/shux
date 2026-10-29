@@ -24,7 +24,7 @@ pub fn run_client(args: Cli) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
-        .with_writer(std::io::stderr)
+        .with_writer(|| crate::client_log::ClientLogWriter)
         .init();
 
     let rt = tokio::runtime::Runtime::new()?;
@@ -88,6 +88,8 @@ pub(crate) async fn run_attach(
         stop_reload.clone(),
     ));
     let _stop_reload = stop_reload.drop_guard();
+    // Dropped after the outcome line, so held logs follow it.
+    let hold_logs = crate::client_log::hold();
     let cfg = shux_ui::ClientConfig {
         socket_path: attach_path.to_string_lossy().to_string(),
         session_name: session_name.clone(),
@@ -114,7 +116,10 @@ pub(crate) async fn run_attach(
                 shux_ui::ExitReason::Error(msg) => {
                     eprintln!("[attach error: {msg}]");
                 }
-                shux_ui::ExitReason::Signal(signo) => die_by_signal(signo),
+                shux_ui::ExitReason::Signal(signo) => {
+                    drop(hold_logs);
+                    die_by_signal(signo)
+                }
             }
             Ok(())
         }

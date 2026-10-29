@@ -218,6 +218,11 @@ where
         .unwrap_or_default();
     let mut reload_listener = Box::pin(reload.notified());
     let mut keys = (config.prefix.clone(), config.keybindings.clone());
+    // `keys` was read before the listener existed; a save in between is
+    // caught here, and every later one wakes the listener.
+    if let Some(next) = rebind(config.live_config.as_ref(), &mut keys) {
+        bindings = next;
+    }
     send_prefix(&mut sink, &keys.0).await;
 
     // Spawn input reader: poll crossterm events on a blocking thread,
@@ -259,23 +264,12 @@ where
         tokio::select! {
             () = &mut reload_listener => {
                 reload_listener = Box::pin(reload.notified());
-                let Some(live) = config.live_config.as_ref().map(|c| c.current()) else {
-                    continue;
-                };
-                if (&live.keys.prefix, &live.keybindings) == (&keys.0, &keys.1) {
-                    continue;
-                }
-                // A reload that does not parse keeps the bindings that work.
-                match KeybindingRegistry::with_overrides(&live.keys.prefix, &live.keybindings) {
-                    Ok(next) => {
-                        bindings = next;
-                        let prefix_changed = live.keys.prefix != keys.0;
-                        keys = (live.keys.prefix.clone(), live.keybindings.clone());
-                        if prefix_changed {
-                            send_prefix(&mut sink, &keys.0).await;
-                        }
+                let prefix = keys.0.clone();
+                if let Some(next) = rebind(config.live_config.as_ref(), &mut keys) {
+                    bindings = next;
+                    if keys.0 != prefix {
+                        send_prefix(&mut sink, &keys.0).await;
                     }
-                    Err(e) => tracing::warn!(error = ?e, "client: reloaded keybindings rejected"),
                 }
             }
 
@@ -461,6 +455,29 @@ where
 
 /// Tell the daemon which prefix this client uses. Best effort, like input:
 /// a dead connection shows up as the stream ending.
+/// The bindings for the live config's keys when they differ from `keys`,
+/// which then take them. Keys that do not build a registry keep the
+/// bindings that work.
+fn rebind(
+    live: Option<&shux_core::config::ConfigHandle>,
+    keys: &mut (String, std::collections::HashMap<String, String>),
+) -> Option<KeybindingRegistry> {
+    let live = live?.current();
+    if (&live.keys.prefix, &live.keybindings) == (&keys.0, &keys.1) {
+        return None;
+    }
+    match KeybindingRegistry::with_overrides(&live.keys.prefix, &live.keybindings) {
+        Ok(next) => {
+            *keys = (live.keys.prefix.clone(), live.keybindings.clone());
+            Some(next)
+        }
+        Err(e) => {
+            tracing::warn!(error = ?e, "client: reloaded keybindings rejected");
+            None
+        }
+    }
+}
+
 async fn send_prefix<SinkT>(sink: &mut SinkT, prefix: &str)
 where
     SinkT: futures::Sink<Bytes> + Unpin,

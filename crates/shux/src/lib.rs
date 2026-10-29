@@ -24,6 +24,7 @@
 pub mod attach;
 pub mod cli;
 pub mod client;
+pub mod client_log;
 pub mod config_validate;
 pub mod daemon;
 pub mod daemon_boot;
