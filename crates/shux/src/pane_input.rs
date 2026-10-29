@@ -4,14 +4,12 @@
 //! reserves room for it until the PTY task has written it, so a program that
 //! stops reading holds every sender back once [`BUDGET`] unwritten bytes wait
 //! for it, in the channel or in the PTY task. The daemon then holds at most the
-//! budget, the written part of the chunk being written, and one decoded chunk
-//! per sender still waiting for room.
+//! budget for the pane, plus each waiting sender's own chunk: the budget bounds
+//! what waits for the program, not how many senders wait.
 //!
 //! Waiting reservations take room in order, so a large one is not starved by
 //! small ones; while one waits, [`PaneWriter::try_reserve`] finds no room. Small
-//! input that must not wait behind them (a mouse event, a Ctrl-C, a paste's
-//! end) takes its room from a separate, smaller budget with
-//! [`PaneWriter::try_reserve_control`].
+//! input that must not wait behind them takes room by [`Lane`].
 
 use std::sync::Arc;
 
@@ -91,6 +89,19 @@ impl Budget {
     }
 }
 
+/// Where a try-send looks for room once the main budget has none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lane {
+    /// Nowhere: input that is worth dropping, such as motion or a wheel tick.
+    Main,
+    /// A separate, smaller budget, such as for a press.
+    Control,
+    /// That budget, then a slot with no budget at all: input that must arrive
+    /// and is bounded by something else, such as the release of a delivered
+    /// press or a cancelled command's Ctrl-C.
+    Urgent,
+}
+
 /// The sending side of a pane's input channel.
 #[derive(Clone)]
 pub struct PaneWriter {
@@ -153,10 +164,26 @@ impl PaneWriter {
         self.try_reserve_from(&self.budget, len)
     }
 
-    /// Room for small input that must not wait behind input still waiting for
-    /// room, from its own budget.
-    pub fn try_reserve_control(&self, len: usize) -> Result<InputPermit, TrySendError<()>> {
-        self.try_reserve_from(&self.control, len)
+    /// [`Self::try_reserve`], then wherever `lane` allows: for small input
+    /// that must not wait behind input still waiting for room.
+    pub fn try_reserve_in(&self, len: usize, lane: Lane) -> Result<InputPermit, TrySendError<()>> {
+        let full =
+            |r: &Result<InputPermit, TrySendError<()>>| matches!(r, Err(TrySendError::Full(())));
+        let main = self.try_reserve(len);
+        if lane == Lane::Main || !full(&main) {
+            return main;
+        }
+        let control = self.try_reserve_from(&self.control, len);
+        if lane == Lane::Control || !full(&control) {
+            return control;
+        }
+        let budget = self
+            .control
+            .permits
+            .clone()
+            .try_acquire_many_owned(0)
+            .map_err(|_| TrySendError::Closed(()))?;
+        self.try_slot(budget)
     }
 
     fn try_reserve_from(
@@ -167,7 +194,10 @@ impl PaneWriter {
         if self.tx.is_closed() {
             return Err(TrySendError::Closed(()));
         }
-        let budget = budget.try_take(len)?;
+        self.try_slot(budget.try_take(len)?)
+    }
+
+    fn try_slot(&self, budget: OwnedSemaphorePermit) -> Result<InputPermit, TrySendError<()>> {
         let slot = self.tx.clone().try_reserve_owned().map_err(|e| match e {
             TrySendError::Full(_) => TrySendError::Full(()),
             TrySendError::Closed(_) => TrySendError::Closed(()),
@@ -295,11 +325,31 @@ mod tests {
             matches!(tx.try_send(vec![2; 1]), Err(TrySendError::Full(_))),
             "small input jumped a waiting send"
         );
-        tx.try_reserve_control(1).unwrap().send(vec![3]);
+        tx.try_reserve_in(1, Lane::Control).unwrap().send(vec![3]);
         assert_eq!(rx.recv().await.unwrap(), vec![3], "control input waited");
         drop(held);
         big.await.unwrap().unwrap();
         assert_eq!(rx.recv().await.unwrap(), vec![1; 500]);
+    }
+
+    #[tokio::test]
+    async fn each_lane_looks_only_as_far_as_it_may() {
+        let (tx, _rx) = channel_with(4096, 1000);
+        tx.try_send(vec![0; 900]).unwrap();
+        assert!(matches!(
+            tx.try_reserve_in(100, Lane::Main),
+            Err(TrySendError::Full(()))
+        ));
+        while let Ok(permit) = tx.try_reserve_in(100, Lane::Control) {
+            permit.send(vec![1; 100]);
+        }
+        assert!(matches!(
+            tx.try_reserve_in(100, Lane::Control),
+            Err(TrySendError::Full(()))
+        ));
+        tx.try_reserve_in(100, Lane::Urgent)
+            .expect("urgent input finds a slot with both budgets spent")
+            .send(vec![2; 100]);
     }
 
     #[tokio::test]

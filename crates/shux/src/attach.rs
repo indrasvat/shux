@@ -43,7 +43,7 @@ use shux_rpc::attach::{
 use shux_rpc::create_codec;
 use shux_ui::{BorderStyle, CompositorConfig, MultiPaneFrame, RenderCompositor};
 
-use crate::pane_input::{InputPermit, PaneWriter};
+use crate::pane_input::{InputPermit, Lane, PaneWriter};
 use crate::pane_io::{OpenPaste, PASTE_END, PASTE_START, PaneIoState};
 use crate::statusbar_runner::{SegmentCache, populate_bar};
 
@@ -256,7 +256,7 @@ async fn close_open_pastes(io_state: &Arc<Mutex<PaneIoState>>, client: u64) {
         let Some(tx) = state.writers.get(&pane).cloned() else {
             continue;
         };
-        match tx.try_reserve_control(PASTE_END.len()) {
+        match tx.try_reserve_in(PASTE_END.len(), crate::pane_input::Lane::Urgent) {
             Ok(permit) => {
                 state.open_pastes.remove(&pane);
                 permit.send(PASTE_END.to_vec());
@@ -2718,7 +2718,7 @@ async fn release_app_gesture(io_state: &Arc<Mutex<PaneIoState>>, gesture: &mut S
             continue;
         };
         if let Some(bytes) = encode_mouse_report(cb, true, sgr, last.0, last.1) {
-            forward_bytes_to_pane(io_state, pane_id, bytes).await;
+            forward_bytes_to_pane(io_state, pane_id, bytes, Lane::Urgent).await;
         }
     }
 }
@@ -2902,7 +2902,14 @@ async fn handle_app_mouse(
         }
     }
 
-    if !forward_bytes_to_pane(io_state, pane_id, bytes).await {
+    // A release must reach an app that saw its press; motion is worth
+    // dropping.
+    let lane = match action {
+        ButtonAction::Press => Lane::Control,
+        ButtonAction::Release => Lane::Urgent,
+        ButtonAction::Drag => Lane::Main,
+    };
+    if !forward_bytes_to_pane(io_state, pane_id, bytes, lane).await {
         // Dropped on the floor. Opening a gesture now would hand the app a
         // release with no press behind it.
         return Ok(AppMouse::Consumed { redraw });
@@ -3031,8 +3038,8 @@ fn wheel_arrow_seq(up: bool, app_cursor: bool) -> &'static [u8] {
     }
 }
 
-/// Send bytes to a pane's PTY writer without waiting: dropped when the pane
-/// is backpressured. A mouse report is worth less than a held attach loop.
+/// Send bytes to a pane's PTY writer without waiting: dropped when `lane`
+/// has no room. A mouse report is worth less than a held attach loop.
 ///
 /// Returns whether the bytes were actually queued. Button forwarding needs to
 /// know: a press that was dropped must not open a gesture, or the release that
@@ -3041,8 +3048,13 @@ async fn forward_bytes_to_pane(
     io_state: &Arc<Mutex<PaneIoState>>,
     pane_id: PaneId,
     bytes: Vec<u8>,
+    lane: Lane,
 ) -> bool {
-    match io_state.lock().await.try_send_outside_paste(pane_id, bytes) {
+    match io_state
+        .lock()
+        .await
+        .try_send_outside_paste(pane_id, bytes, lane)
+    {
         None => false,
         Some(Ok(())) => true,
         Some(Err(e)) => {
@@ -3129,7 +3141,7 @@ async fn handle_wheel(
             // app's coordinate mode; sending nothing beats sending a tick
             // aimed at a cell the user never touched.
             if let Some(bytes) = encode_mouse_wheel(up, sgr, local_col, local_row) {
-                forward_bytes_to_pane(io_state, pane_id, bytes).await;
+                forward_bytes_to_pane(io_state, pane_id, bytes, Lane::Main).await;
             }
         }
         WheelRouting::ArrowKeys => {
@@ -3138,7 +3150,7 @@ async fn handle_wheel(
             for _ in 0..3 {
                 bytes.extend_from_slice(seq);
             }
-            forward_bytes_to_pane(io_state, pane_id, bytes).await;
+            forward_bytes_to_pane(io_state, pane_id, bytes, Lane::Main).await;
         }
         WheelRouting::Scrollback => {
             // This tier is only reached while copy mode is INACTIVE (an active
@@ -7936,5 +7948,67 @@ mod tests {
             "the pane was left inside a paste"
         );
         h.stop().await;
+    }
+
+    /// Drives a press, a long drag and a release into a pane whose app has
+    /// stopped reading, with `fill` bytes already queued for it, and returns
+    /// the mouse reports the app would read.
+    async fn drag_over_a_stalled_app(fill: usize) -> Vec<String> {
+        let mut h = AppMouseHarness::new().await;
+        // Slots to spare: only the byte budgets may hold the reports back.
+        let (writer_tx, mut wr) = crate::pane_input::channel_with(8192, crate::pane_input::BUDGET);
+        let mut queued = 0;
+        while queued < fill && writer_tx.try_send(vec![b'x'; 1 << 20]).is_ok() {
+            queued += 1 << 20;
+        }
+        let mut vt = shux_vt::VirtualTerminal::new(28, 49);
+        vt.process(b"\x1b[?1002h\x1b[?1006h");
+        {
+            let mut state = h.fixture.io_state.lock().await;
+            state.writers.insert(h.fixture.first_pane, writer_tx);
+            state.vts.insert(h.fixture.first_pane, vt);
+        }
+        h.send(MouseKind::Down, ProtoMouseButton::Left, 10, 5).await;
+        for i in 0..3000u16 {
+            h.send(MouseKind::Drag, ProtoMouseButton::Left, 10 + i % 30, 5)
+                .await;
+        }
+        h.send(MouseKind::Up, ProtoMouseButton::Left, 12, 5).await;
+        let mut got = Vec::new();
+        while let Ok(bytes) = wr.try_recv() {
+            if !bytes.starts_with(b"x") {
+                got.push(String::from_utf8_lossy(&bytes).into_owned());
+            }
+        }
+        h.fixture.stop();
+        got
+    }
+
+    /// A drag held over an app that has stopped reading must not use up the
+    /// room its release needs: an app given the press and the drags but not
+    /// the release sits button-held once it reads again.
+    #[tokio::test]
+    async fn a_long_drag_over_an_app_that_stopped_reading_still_delivers_its_release() {
+        let got = drag_over_a_stalled_app(0).await;
+        assert_eq!(got.first().map(String::as_str), Some("\x1b[<0;10;5M"));
+        assert_eq!(
+            got.last().map(String::as_str),
+            Some("\x1b[<0;12;5m"),
+            "the app got the press and {} reports but no release",
+            got.len().saturating_sub(1)
+        );
+    }
+
+    /// The same once the pane's whole budget is already taken by other input.
+    #[tokio::test]
+    async fn a_drag_over_a_full_pane_still_delivers_its_release() {
+        let got = drag_over_a_stalled_app(crate::pane_input::BUDGET).await;
+        assert_eq!(got.first().map(String::as_str), Some("\x1b[<0;10;5M"));
+        assert_eq!(
+            got.last().map(String::as_str),
+            Some("\x1b[<0;12;5m"),
+            "the app got the press and {} reports but no release",
+            got.len().saturating_sub(1)
+        );
     }
 }

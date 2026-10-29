@@ -276,14 +276,18 @@ impl PaneIoState {
         }
     }
 
-    /// [`Self::send_outside_paste`] without waiting for room, as control input.
-    /// `None` when the pane has no writer.
+    /// [`Self::send_outside_paste`] without waiting for room, taking it from
+    /// `lane`. `None` when the pane has no writer.
     pub(crate) fn try_send_outside_paste(
         &mut self,
         pane_id: shux_core::model::PaneId,
         bytes: Vec<u8>,
+        lane: crate::pane_input::Lane,
     ) -> Option<Result<(), mpsc::error::TrySendError<()>>> {
-        let permit = self.writers.get(&pane_id)?.try_reserve_control(bytes.len());
+        let permit = self
+            .writers
+            .get(&pane_id)?
+            .try_reserve_in(bytes.len(), lane);
         Some(permit.map(|permit| self.send_outside_paste(pane_id, permit, bytes)))
     }
 

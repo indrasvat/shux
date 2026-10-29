@@ -217,6 +217,8 @@ pub(crate) fn register_pane_io_methods(
                         ));
                     };
 
+                    // Not held while waiting for room: it is a second copy.
+                    drop(params);
                     let len = bytes.len();
                     send_to_pane(&io, pane_id, bytes).await?;
 
@@ -273,7 +275,7 @@ pub(crate) fn register_pane_io_methods(
                         )
                     };
 
-                    // Write the PTY command
+                    drop(params);
                     send_to_pane(&io, pane_id, pty_command.into_bytes()).await?;
 
                     if is_async {
@@ -374,7 +376,11 @@ pub(crate) fn register_pane_io_methods(
                     // Ctrl-C, without waiting: a pane whose input is backed
                     // up must not hold this lock.
                     let pane_id = shux_core::model::PaneId::from_uuid(pane_uuid);
-                    if let Some(Err(_)) = state.try_send_outside_paste(pane_id, vec![0x03]) {
+                    if let Some(Err(_)) = state.try_send_outside_paste(
+                        pane_id,
+                        vec![0x03],
+                        crate::pane_input::Lane::Urgent,
+                    ) {
                         tracing::warn!(%pane_id, "pane input is backed up; Ctrl-C not delivered");
                     }
                     drop(state);
