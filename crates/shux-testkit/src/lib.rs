@@ -226,6 +226,15 @@ pub fn open_gate(gate: &Path) {
     fifo.write_all(b"go\n").expect("open the gate");
 }
 
+/// [`open_gate`] on the blocking pool, so it also works under a paused clock
+/// whose auto-advance is held off.
+pub async fn open_gate_async(gate: &Path) {
+    let gate = gate.to_owned();
+    tokio::task::spawn_blocking(move || open_gate(&gate))
+        .await
+        .expect("the gate opener panicked");
+}
+
 /// CPU time the calling thread has used. Unlike the wall clock it does not
 /// advance while the thread is descheduled, so load elsewhere cannot skew a
 /// cost ratio.

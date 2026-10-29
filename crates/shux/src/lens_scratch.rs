@@ -2208,8 +2208,6 @@ mod tests {
         );
     }
 
-    /// Two corrupt startups in the same millisecond, or a clock stepped back
-    /// onto one already used, must still keep both files.
     /// Where link(2) is refused (no hard links on the filesystem, or a
     /// registry another uid owns under protected_hardlinks) the evidence is
     /// still moved aside, never left for the next persist to overwrite.
@@ -2258,6 +2256,8 @@ mod tests {
         }
     }
 
+    /// Two corrupt startups in the same millisecond, or a clock stepped back
+    /// onto one already used, must still keep both files.
     #[test]
     fn corrupt_evidence_is_never_overwritten_by_a_same_millisecond_startup() {
         let dir = tmpdir();

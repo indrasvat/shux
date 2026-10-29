@@ -20,11 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Duration;
 
-pub use shux_testkit::BUDGET;
-
-/// [`BUDGET`] for a server-side `timeout_ms`: how long an event wait may run
-/// before the test fails.
-pub use shux_testkit::BUDGET_MS;
+pub use shux_testkit::{BUDGET, BUDGET_MS};
 
 /// One JSON-RPC error `{code,message,data}` as surfaced by `shux rpc call`.
 #[derive(Debug, Clone)]

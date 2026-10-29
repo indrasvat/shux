@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use shux_core::bus::EventBus;
 use shux_plugin::{PluginManager, PluginSource};
 use shux_rpc::{Policy, Router, Sensitivity};
+use shux_testkit::{gate, open_gate_async};
 
 fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
     let path = dir.join(name);
@@ -95,7 +96,7 @@ async fn plugins_forbidden_method_is_denied_even_with_grant() {
         .unwrap();
 
     // Wait for the plugin to issue + read the response
-    open_gate(&held).await;
+    open_gate_async(&held).await;
     let resp = wait_for_file(&sentinel).await;
     let v: Value = serde_json::from_str(&resp).unwrap();
     let err = v.get("error").expect("expected error response");
@@ -128,7 +129,7 @@ async fn unowned_owned_mutation_denied_then_allowed_via_grant() {
     let info = mgr.install(source).await.unwrap();
 
     // First call: no grant, no ownership → deny.
-    open_gate(&held).await;
+    open_gate_async(&held).await;
     let resp = wait_for_file(&sentinel).await;
     let v: Value = serde_json::from_str(&resp).unwrap();
     let err = v.get("error").expect("first call must be denied");
@@ -161,7 +162,7 @@ async fn unowned_owned_mutation_denied_then_allowed_via_grant() {
     .await
     .unwrap();
 
-    open_gate(&held2).await;
+    open_gate_async(&held2).await;
     let resp2 = wait_for_file(&sentinel2).await;
     let v2: Value = serde_json::from_str(&resp2).unwrap();
     assert!(
@@ -194,7 +195,7 @@ async fn audit_log_records_allow_and_deny() {
     let info = mgr.install(source).await.unwrap();
 
     // The audit entry is written before the response is sent.
-    open_gate(&held).await;
+    open_gate_async(&held).await;
     let _ = wait_for_file(&sentinel).await;
 
     let path = mgr.audit_path(&info.name).await.unwrap();
@@ -229,7 +230,7 @@ async fn plugin_self_namespace_events_publish_audited_but_allowed() {
     source.args = vec![sentinel.display().to_string(), held.display().to_string()];
     let info = mgr.install(source).await.unwrap();
 
-    open_gate(&held).await;
+    open_gate_async(&held).await;
     let resp = wait_for_file(&sentinel).await;
     let v: Value = serde_json::from_str(&resp).unwrap();
     assert!(v.get("result").is_some(), "{v:?}");
@@ -324,15 +325,4 @@ done
 async fn wait_for_file(path: &Path) -> String {
     let what = format!("the sentinel at {}", path.display());
     shux_testkit::wait_for_async(&what, || async { std::fs::read_to_string(path).ok() }).await
-}
-
-use shux_testkit::gate;
-
-/// Let the plugin waiting at `gate` make its call: [`shux_testkit::open_gate`]
-/// on the blocking pool.
-async fn open_gate(gate: &Path) {
-    let gate = gate.to_owned();
-    tokio::task::spawn_blocking(move || shux_testkit::open_gate(&gate))
-        .await
-        .expect("the gate opener panicked");
 }

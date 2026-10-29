@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use shux_core::bus::EventBus;
 use shux_plugin::{HANDSHAKE_TIMEOUT, PluginManager, PluginSource};
-use shux_testkit::{BUDGET, wait_for_async, wait_until_async};
+use shux_testkit::{BUDGET, gate, open_gate_async, wait_for_async, wait_until_async};
 
 /// How many processes on this machine have `needle` in their argv.
 ///
@@ -62,16 +62,6 @@ async fn wait_for_lines(path: &Path, lines: usize) -> String {
             .filter(|s| s.ends_with('\n') && s.lines().count() >= lines)
     })
     .await
-}
-
-use shux_testkit::gate;
-
-/// [`shux_testkit::open_gate`] on the blocking pool. Safe under a paused clock.
-async fn open_gate(gate: &Path) {
-    let gate = gate.to_owned();
-    tokio::task::spawn_blocking(move || shux_testkit::open_gate(&gate))
-        .await
-        .expect("the gate opener panicked");
 }
 
 /// Wait on the blocking pool for `path` to exist. Safe under a paused clock.
@@ -935,7 +925,7 @@ done
     // The plugin has read `plugin.init`, so its budget is running.
     wait_for_path(&ready).await;
     tokio::time::advance(Duration::from_secs(8)).await;
-    open_gate(&held).await;
+    open_gate_async(&held).await;
     let info = within_budget(install)
         .await
         .expect("a plugin that is merely slow must not be mistaken for a broken one");
@@ -1261,7 +1251,7 @@ async fn a_kill_during_a_reload_handshake_is_not_undone_by_the_next_save() {
         mgr.kill("lazarus")
             .await
             .expect("a plugin mid-reload is found");
-        open_gate(&held).await;
+        open_gate_async(&held).await;
         wait_watchers_stopped(
             &mgr,
             "every watcher to stop after the kill (a live one would bring the plugin back)",
@@ -1352,7 +1342,7 @@ done
         let source = PluginSource::from_path(&script).with_watch(true);
         async move { mgr.install(source).await }
     });
-    open_gate(&held).await;
+    open_gate_async(&held).await;
     install.await.unwrap().expect("install");
 
     save_script(&script, "#!/usr/bin/env bash\nexit 1\n");
@@ -1368,7 +1358,7 @@ done
     })
     .await;
     let killed = mgr.kill("revenant").await;
-    open_gate(&held).await;
+    open_gate_async(&held).await;
     wait_watchers_stopped(
         &mgr,
         "every watcher to stop after the kill (a live one would bring the plugin back)",
@@ -1424,7 +1414,7 @@ kill $!
     // The kill is signalled before the plugin reads another byte, and the
     // frame write polls the kill first, so the frame is cut, not finished.
     mgr.kill("torn").await.expect("kill");
-    open_gate(&held).await;
+    open_gate_async(&held).await;
     assert!(
         tokio::time::timeout(BUDGET, mgr.shutdown()).await.is_ok(),
         "the plugin never exited after reading plugin.shutdown"

@@ -2346,7 +2346,6 @@ mod tests {
             bound.serve().await.unwrap();
         });
 
-        // Connect, then park a waiter.
         let stream = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
         let mut framed = tokio_util::codec::Framed::new(stream, shux_rpc::create_codec());
         let request = serde_json::json!({

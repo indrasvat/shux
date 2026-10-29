@@ -491,18 +491,12 @@ mod tests {
     fn sessions_list_in_creation_order_whatever_the_wall_clock_says() {
         use shux_core::model::{Session, WindowId};
         let t = std::time::SystemTime::now();
-        let stepped_back = |i: u64| t - std::time::Duration::from_secs(i);
-        let same_instant = |_: u64| t;
-        let clocks: [(&str, &dyn Fn(u64) -> std::time::SystemTime); 2] = [
-            ("stepped back", &stepped_back),
-            ("same instant", &same_instant),
-        ];
-        for (name, stamp) in clocks {
+        for (name, step) in [("stepped back", 1), ("same instant", 0)] {
             let mut snap = shux_core::graph::SessionGraphSnapshot::default();
             let names: Vec<String> = (0..16).map(|i| format!("s{i}")).collect();
             for (i, n) in names.iter().enumerate() {
                 let mut s = Session::new(n.clone(), WindowId::new());
-                s.created_at = stamp(i as u64);
+                s.created_at = t - std::time::Duration::from_secs(i as u64 * step);
                 snap.sessions.insert(s.id, s);
             }
             let listed: Vec<&str> = super::by_creation(&snap)

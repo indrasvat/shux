@@ -14,9 +14,7 @@
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
-use nix::sys::signal::{Signal, kill};
-use nix::unistd::Pid;
-use shux_testkit::{BUDGET, poll, poll_until};
+use shux_testkit::{BUDGET, poll};
 
 /// Truecolor + 256-indexed + basic ANSI on one line. Mandatory on every
 /// daemon-backed capture (CLAUDE.md).
@@ -274,11 +272,10 @@ impl Drop for Env {
         if let Some(pid) = std::fs::read_to_string(&pidfile)
             .ok()
             .and_then(|s| s.trim().parse::<i32>().ok())
+            && !shux_testkit::terminate(pid)
+            // A second panic during unwinding aborts and hides the first.
+            && !std::thread::panicking()
         {
-            if poll_until(BUDGET, || kill(Pid::from_raw(pid), None).is_err()) {
-                return;
-            }
-            let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
             panic!("daemon {pid} outlived the test");
         }
     }

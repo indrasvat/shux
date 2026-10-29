@@ -877,12 +877,7 @@ mod tests {
         };
 
         let server = Server::new(config, router, cancel.clone());
-        let bound = server.bind().await.unwrap();
-
-        // Run server in background.
-        let server_handle = tokio::spawn(async move {
-            bound.serve().await.unwrap();
-        });
+        let server_handle = serve(server).await;
 
         // Connect a client.
         let stream = UnixStream::connect(&socket_path).await.unwrap();
@@ -925,10 +920,7 @@ mod tests {
             auth_token: None,
         };
         let server = Server::new(config, router, cancel.clone());
-        let bound = server.bind().await.unwrap();
-        let handle = tokio::spawn(async move {
-            bound.serve().await.unwrap();
-        });
+        let handle = serve(server).await;
         (cancel, handle)
     }
 
@@ -941,7 +933,10 @@ mod tests {
         drop(UnixStream::connect(&socket_path).await.unwrap());
 
         std::fs::remove_file(&socket_path).unwrap();
-        drop(wait_for_rebind(&socket_path).await);
+        shux_testkit::wait_for_async("the server to rebind its socket", || async {
+            UnixStream::connect(&socket_path).await.ok()
+        })
+        .await;
 
         cancel.cancel();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
@@ -961,7 +956,7 @@ mod tests {
         std::fs::rename(&staged, &socket_path).unwrap();
 
         cancel.cancel();
-        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+        tokio::time::timeout(shux_testkit::BUDGET, handle)
             .await
             .expect("server stops")
             .unwrap();
@@ -972,12 +967,12 @@ mod tests {
         drop(other);
     }
 
-    /// Connect once the server has bound `path` again.
-    async fn wait_for_rebind(path: &std::path::Path) -> UnixStream {
-        shux_testkit::wait_for_async("the server to rebind its socket", || async {
-            UnixStream::connect(path).await.ok()
+    /// Bind `server` and serve it in the background; clients may connect at once.
+    async fn serve(server: Server) -> tokio::task::JoinHandle<()> {
+        let bound = server.bind().await.unwrap();
+        tokio::spawn(async move {
+            bound.serve().await.unwrap();
         })
-        .await
     }
 
     /// Drop guard for the hang handler: proves the in-flight future was
@@ -1055,10 +1050,7 @@ mod tests {
             router,
             cancel.clone(),
         );
-        let bound = server.bind().await.unwrap();
-        let server_handle = tokio::spawn(async move {
-            bound.serve().await.unwrap();
-        });
+        let server_handle = serve(server).await;
 
         let stream = UnixStream::connect(&socket_path).await.unwrap();
         let mut framed = Framed::new(stream, create_codec());
@@ -1122,10 +1114,7 @@ mod tests {
             router,
             cancel.clone(),
         );
-        let bound = server.bind().await.unwrap();
-        let server_handle = tokio::spawn(async move {
-            bound.serve().await.unwrap();
-        });
+        let server_handle = serve(server).await;
 
         let stream = UnixStream::connect(&socket_path).await.unwrap();
         let mut framed = Framed::new(stream, create_codec());
@@ -1174,10 +1163,7 @@ mod tests {
             router,
             cancel.clone(),
         );
-        let bound = server.bind().await.unwrap();
-        let server_handle = tokio::spawn(async move {
-            bound.serve().await.unwrap();
-        });
+        let server_handle = serve(server).await;
 
         // Conn A: park a hanging request.
         let stream_a = UnixStream::connect(&socket_path).await.unwrap();
@@ -1250,10 +1236,7 @@ mod tests {
             router,
             cancel.clone(),
         );
-        let bound = server.bind().await.unwrap();
-        let server_handle = tokio::spawn(async move {
-            bound.serve().await.unwrap();
-        });
+        let server_handle = serve(server).await;
 
         let stream = UnixStream::connect(&socket_path).await.unwrap();
         let mut framed = Framed::new(stream, create_codec());
@@ -1311,10 +1294,7 @@ mod tests {
             router,
             cancel.clone(),
         );
-        let bound = server.bind().await.unwrap();
-        let server_handle = tokio::spawn(async move {
-            bound.serve().await.unwrap();
-        });
+        let server_handle = serve(server).await;
 
         let stream = UnixStream::connect(&socket_path).await.unwrap();
         let mut framed = Framed::new(stream, create_codec());
@@ -1387,10 +1367,7 @@ mod tests {
             router,
             cancel.clone(),
         );
-        let bound = server.bind().await.unwrap();
-        let server_handle = tokio::spawn(async move {
-            bound.serve().await.unwrap();
-        });
+        let server_handle = serve(server).await;
 
         // Run several iterations: the old bug was a race (EOF vs dequeue), so
         // a single pass could false-green.
@@ -1471,10 +1448,7 @@ mod tests {
             router,
             cancel.clone(),
         );
-        let bound = server.bind().await.unwrap();
-        let server_handle = tokio::spawn(async move {
-            bound.serve().await.unwrap();
-        });
+        let server_handle = serve(server).await;
 
         let stream = UnixStream::connect(&socket_path).await.unwrap();
         let (read_half, write_half) = stream.into_split();
@@ -1589,10 +1563,7 @@ mod tests {
             router,
             cancel.clone(),
         );
-        let bound = server.bind().await.unwrap();
-        let server_handle = tokio::spawn(async move {
-            bound.serve().await.unwrap();
-        });
+        let server_handle = serve(server).await;
 
         let stream = UnixStream::connect(&socket_path).await.unwrap();
         let mut framed = Framed::new(stream, create_codec());
@@ -1653,10 +1624,7 @@ mod tests {
             router,
             cancel.clone(),
         );
-        let bound = server.bind().await.unwrap();
-        let server_handle = tokio::spawn(async move {
-            bound.serve().await.unwrap();
-        });
+        let server_handle = serve(server).await;
 
         let stream = UnixStream::connect(&socket_path).await.unwrap();
         let mut framed = Framed::new(stream, create_codec());
@@ -1862,10 +1830,7 @@ mod tests {
             router,
             cancel.clone(),
         );
-        let bound = server.bind().await.unwrap();
-        let server_handle = tokio::spawn(async move {
-            bound.serve().await.unwrap();
-        });
+        let server_handle = serve(server).await;
 
         for iteration in 0..25 {
             let mut stream = UnixStream::connect(&socket_path).await.unwrap();

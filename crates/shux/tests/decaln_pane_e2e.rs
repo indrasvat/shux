@@ -15,9 +15,6 @@
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
-use nix::sys::signal::{Signal, kill};
-use nix::unistd::Pid;
-
 const COLS: usize = 40;
 const ROWS: usize = 10;
 
@@ -188,13 +185,10 @@ impl Drop for Env {
         if let Some(pid) = std::fs::read_to_string(&pidfile)
             .ok()
             .and_then(|s| s.trim().parse::<i32>().ok())
+            && !shux_testkit::terminate(pid)
+            // A second panic during unwinding aborts and hides the first.
+            && !std::thread::panicking()
         {
-            if shux_testkit::poll_until(shux_testkit::BUDGET, || {
-                kill(Pid::from_raw(pid), None).is_err()
-            }) {
-                return;
-            }
-            let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
             panic!("daemon {pid} outlived the test");
         }
     }

@@ -88,13 +88,11 @@ impl Drop for Harness {
             .ok()
             .and_then(|s| s.trim().parse().ok());
         // By pidfile, never by an argv substring.
-        if let Some(pid) = pid {
-            if shux_testkit::terminate(pid) {
-                return;
-            }
-            if !std::thread::panicking() {
-                panic!("daemon {pid} survived SIGTERM");
-            }
+        if let Some(pid) = pid
+            && !shux_testkit::terminate(pid)
+            && !std::thread::panicking()
+        {
+            panic!("daemon {pid} survived SIGTERM");
         }
     }
 }
