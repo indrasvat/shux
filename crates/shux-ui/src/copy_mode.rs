@@ -869,27 +869,6 @@ fn render_copy_overlay_inner(
 
     render_selection_overlay_inner(buf, pane, vt, state, theme);
 
-    // Cursor block — high-contrast inversion of the selection
-    // palette so it stays visible whether or not it sits inside a
-    // selection run. Selection draws fg=accent on bg=status_bg; the
-    // cursor uses fg=status_bg on bg=status_fg (white-ish text bg),
-    // which pops against both the selection band and bare pane
-    // content.
-    let (cx, cy) = state.cursor;
-    if cx < pane.width && cy < pane.height {
-        let (col, glyph) = vt
-            .and_then(|vt| cursor_glyph(vt, pane, state))
-            .unwrap_or((cx, " ".to_string()));
-        cursor_block(
-            buf,
-            pane.x + col,
-            pane.y + cy,
-            &glyph,
-            theme.status_bg,
-            theme.status_fg,
-        );
-    }
-
     // Status-line hint at the bottom row of the pane: shows current
     // mode and dismiss/yank shortcuts. The text width changes with
     // selection state (`v select` disappears once an anchor is set),
@@ -920,6 +899,24 @@ fn render_copy_overlay_inner(
         truncated,
         " ".repeat(pad),
     );
+
+    // Cursor block, after the hint so it shows on the hint's row too: the
+    // selection palette inverted (fg=status_bg on bg=status_fg), so it stays
+    // visible inside a selection run and over bare pane content.
+    let (cx, cy) = state.cursor;
+    if cx < pane.width && cy < pane.height {
+        let (col, glyph) = vt
+            .and_then(|vt| cursor_glyph(vt, pane, state))
+            .unwrap_or((cx, " ".to_string()));
+        cursor_block(
+            buf,
+            pane.x + col,
+            pane.y + cy,
+            &glyph,
+            theme.status_bg,
+            theme.status_fg,
+        );
+    }
 }
 
 fn render_selection_overlay_inner(
@@ -1586,6 +1583,20 @@ mod tests {
             assert!(cell.is_wide());
             cursor_colours(&cell);
         }
+    }
+
+    /// The hint bar sits on the pane's last row, which the cursor can reach.
+    #[test]
+    fn the_copy_cursor_shows_over_the_hint_bar() {
+        let vt = vt_with(3, 20, "one\r\ntwo\r\nXYZ");
+        let pane = Rect::new(0, 0, 20, 3);
+        let state = CopyModeState {
+            cursor: (2, 2),
+            ..Default::default()
+        };
+        let cell = overlay_cell(&vt, pane, &state, 2, 2);
+        assert_eq!(cell.display_text(), "Z", "the hint bar covered the cursor");
+        cursor_colours(&cell);
     }
 
     #[test]
