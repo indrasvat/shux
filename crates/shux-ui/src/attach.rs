@@ -13,6 +13,8 @@
 //! mouse are restored on any exit (panic, error, signal, detach, session
 //! end).
 
+use std::io::IsTerminal;
+use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
 use std::time::Duration;
 
@@ -157,6 +159,34 @@ pub async fn run_attach(socket_path: &Path, config: ClientConfig) -> Result<Exit
     }
 }
 
+/// Bytes of a paste per frame. A pane's input channel counts frames, not
+/// bytes, so this bounds what a pane that stopped reading can pile up.
+const PASTE_CHUNK: usize = 64 * 1024;
+
+/// The terminal crossterm reads: stdin when it is one, else `/dev/tty`.
+fn input_terminal() -> Option<OwnedFd> {
+    let stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        stdin.as_fd().try_clone_to_owned().ok()
+    } else {
+        std::fs::File::open("/dev/tty").ok().map(OwnedFd::from)
+    }
+}
+
+/// Whether `terminal` has hung up. crossterm never reports it: it polls a
+/// hung-up terminal to the end of every timeout, and with SIGHUP ignored
+/// nothing else would end the attach.
+fn terminal_hung_up(terminal: &OwnedFd) -> bool {
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    // POLLIN, though only the hangup is wanted: macOS reports POLLHUP only
+    // on an fd polled for an event.
+    let mut fds = [PollFd::new(terminal.as_fd(), PollFlags::POLLIN)];
+    poll(&mut fds, PollTimeout::ZERO).is_ok_and(|n| n > 0)
+        && fds[0]
+            .revents()
+            .is_some_and(|r| r.intersects(PollFlags::POLLHUP | PollFlags::POLLERR))
+}
+
 async fn run_loop<S>(
     framed: &mut Framed<S, tokio_util::codec::LengthDelimitedCodec>,
     config: &ClientConfig,
@@ -177,9 +207,14 @@ where
     // Spawn input reader: poll crossterm events on a blocking thread,
     // forward via channel.
     let (key_tx, mut key_rx) = tokio::sync::mpsc::channel::<Event>(64);
+    // Decided once: a hung-up terminal can stop answering as a terminal.
+    let terminal = input_terminal();
     std::thread::spawn(move || {
         loop {
-            match crossterm::event::poll(Duration::from_millis(50)) {
+            // Long, because the wait ends in a busy loop over its last
+            // fraction of a millisecond; the timeout only bounds how long
+            // this thread outlives the attach.
+            match crossterm::event::poll(Duration::from_secs(1)) {
                 Ok(true) => match crossterm::event::read() {
                     Ok(ev) => {
                         if key_tx.blocking_send(ev).is_err() {
@@ -188,6 +223,11 @@ where
                     }
                     Err(_) => break,
                 },
+                Ok(false)
+                    if key_tx.is_closed() || terminal.as_ref().is_some_and(terminal_hung_up) =>
+                {
+                    break;
+                }
                 Ok(false) => continue,
                 Err(_) => break,
             }
@@ -344,9 +384,26 @@ where
                         let bytes = serde_json::to_vec(&frame)?;
                         sink.send(Bytes::from(bytes)).await.ok();
                     }
-                    Event::Paste(_) | Event::FocusGained | Event::FocusLost => {
-                        // Ignore for now.
+                    Event::Paste(text) => {
+                        let mut rest = text.as_str();
+                        loop {
+                            let mut at = rest.len().min(PASTE_CHUNK);
+                            while !rest.is_char_boundary(at) {
+                                at -= 1;
+                            }
+                            let (piece, tail) = rest.split_at(at);
+                            rest = tail;
+                            let frame = AttachClientFrame::Paste {
+                                data: BASE64.encode(piece),
+                                more: !rest.is_empty(),
+                            };
+                            sink.send(Bytes::from(serde_json::to_vec(&frame)?)).await.ok();
+                            if rest.is_empty() {
+                                break;
+                            }
+                        }
                     }
+                    Event::FocusGained | Event::FocusLost => {}
                 }
             }
 

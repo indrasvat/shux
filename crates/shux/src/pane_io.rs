@@ -132,7 +132,27 @@ pub struct PaneIoState {
     /// Panes whose process exited: their final status is sent and no later
     /// change (a config reload) may follow it. Cleared by the next spawn.
     pub(crate) status_sealed: std::collections::HashSet<shux_core::model::PaneId>,
+    /// Panes whose program a bracketed paste has started reaching and not yet
+    /// ended. Any other input to the pane, from any client or RPC, ends the
+    /// paste before it reaches the program. Changed only together with a send
+    /// to the pane's writer, under this lock, so it follows the channel's
+    /// order: take room in the channel first, then this lock.
+    pub(crate) open_pastes: HashMap<shux_core::model::PaneId, OpenPaste>,
 }
+
+/// A bracketed paste whose end has not reached the pane's program.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OpenPaste {
+    /// The incarnation it was opened for.
+    pub(crate) program: u64,
+    /// The attach client that opened it.
+    pub(crate) client: u64,
+    /// Which of that client's pastes it is.
+    pub(crate) paste: u64,
+}
+
+pub(crate) const PASTE_START: &[u8] = b"\x1b[200~";
+pub(crate) const PASTE_END: &[u8] = b"\x1b[201~";
 
 impl Default for PaneIoState {
     fn default() -> Self {
@@ -161,6 +181,7 @@ impl PaneIoState {
             status: HashMap::new(),
             program_status_enabled: true,
             status_sealed: Default::default(),
+            open_pastes: HashMap::new(),
         }
     }
 
@@ -186,6 +207,66 @@ impl PaneIoState {
                 let _ = rx.await;
             })
         }));
+    }
+
+    /// The PTY task that owns `pane_id` now, and whether its program asked
+    /// for bracketed paste.
+    pub(crate) fn paste_target(&self, pane_id: shux_core::model::PaneId) -> (u64, bool) {
+        let program = self.incarnations.get(&pane_id).copied().unwrap_or_default();
+        let wants = self
+            .vts
+            .get(&pane_id)
+            .is_some_and(|vt| vt.modes().bracketed_paste);
+        (program, wants)
+    }
+
+    /// The paste open in the program running in `pane_id` now, if that
+    /// program is still in paste mode.
+    pub(crate) fn open_paste(&self, pane_id: shux_core::model::PaneId) -> Option<OpenPaste> {
+        let (program, wants) = self.paste_target(pane_id);
+        self.open_pastes
+            .get(&pane_id)
+            .copied()
+            .filter(|open| wants && open.program == program)
+    }
+
+    /// Whether `permit` is room in the writer `pane_id` has now, not in one
+    /// since replaced.
+    pub(crate) fn is_current_writer(
+        &self,
+        pane_id: shux_core::model::PaneId,
+        permit: &mpsc::OwnedPermit<Vec<u8>>,
+    ) -> bool {
+        self.writers
+            .get(&pane_id)
+            .is_some_and(|tx| permit.same_channel_as_sender(tx))
+    }
+
+    /// Sends `bytes` to `pane_id` through `permit`, ending an open paste
+    /// first so they cannot land inside it.
+    pub(crate) fn send_outside_paste(
+        &mut self,
+        pane_id: shux_core::model::PaneId,
+        permit: mpsc::OwnedPermit<Vec<u8>>,
+        bytes: Vec<u8>,
+    ) {
+        if self.is_current_writer(pane_id, &permit) && self.open_paste(pane_id).is_some() {
+            self.open_pastes.remove(&pane_id);
+            permit.send([PASTE_END, &bytes].concat());
+        } else {
+            permit.send(bytes);
+        }
+    }
+
+    /// [`Self::send_outside_paste`] without waiting for room. `None` when the
+    /// pane has no writer.
+    pub(crate) fn try_send_outside_paste(
+        &mut self,
+        pane_id: shux_core::model::PaneId,
+        bytes: Vec<u8>,
+    ) -> Option<Result<(), mpsc::error::TrySendError<mpsc::Sender<Vec<u8>>>>> {
+        let permit = self.writers.get(&pane_id)?.clone().try_reserve_owned();
+        Some(permit.map(|permit| self.send_outside_paste(pane_id, permit, bytes)))
     }
 
     /// Whether `incarnation` is still the PTY task that owns `pane_id`.
@@ -221,6 +302,7 @@ impl PaneIoState {
                     self.teardown_waiters.push(channel.stop());
                 }
                 self.status_sealed.remove(pane_id);
+                self.open_pastes.remove(pane_id);
             }
         }
         (self.render_pulse.clone(), done)

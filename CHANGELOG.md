@@ -1,3 +1,10 @@
+## [0.54.10](https://github.com/indrasvat/shux/compare/v0.54.9...v0.54.10) (2026-10-28)
+
+
+### Bug Fixes
+
+* **attach:** a large paste reaches the pane whole, or the user is told ([#223](https://github.com/indrasvat/shux/issues/223)) ([29a73d5](https://github.com/indrasvat/shux/commit/29a73d51f9de724f914070a009deeca1109b9c59)), closes [#197](https://github.com/indrasvat/shux/issues/197) [#197](https://github.com/indrasvat/shux/issues/197)
+
 ## [0.54.9](https://github.com/indrasvat/shux/compare/v0.54.8...v0.54.9) (2026-10-28)
 
 

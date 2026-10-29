@@ -44,7 +44,7 @@ use shux_rpc::attach::{
 use shux_rpc::create_codec;
 use shux_ui::{BorderStyle, CompositorConfig, MultiPaneFrame, RenderCompositor};
 
-use crate::pane_io::PaneIoState;
+use crate::pane_io::{OpenPaste, PASTE_END, PASTE_START, PaneIoState};
 use crate::statusbar_runner::{SegmentCache, populate_bar};
 
 /// Client-screen dimensions (cols, rows) tracked per attached client.
@@ -133,6 +133,201 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How often the daemon pings the client to detect dead peers.
 const PING_INTERVAL: Duration = Duration::from_secs(15);
+
+const ESC: u8 = 0x1b;
+
+/// A pane's open paste, as one piece of input sees it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Open {
+    Closed,
+    /// Open, and not the paste this piece belongs to.
+    Other,
+    /// Open, and this piece is its next.
+    Continued,
+}
+
+/// Input as the pane should receive it, and whether a bracketed paste is open
+/// once it has. `paste` is `Some(more)` for a piece of a paste, `more` set
+/// while pieces follow. Anything but the next piece of an open paste ends it
+/// first. A paste goes between the markers when the pane asked for them
+/// (mode 2004) as it began. ESC is removed from bracketed text, so no part of it can end
+/// the paste.
+fn frame_input(
+    bytes: Vec<u8>,
+    paste: Option<bool>,
+    open: Open,
+    wants_brackets: bool,
+) -> (Vec<u8>, bool) {
+    let continues = open == Open::Continued;
+    let mut out = Vec::with_capacity(bytes.len() + PASTE_START.len() + 2 * PASTE_END.len());
+    if open != Open::Closed && !continues {
+        out.extend_from_slice(PASTE_END);
+    }
+    let Some(more) = paste.filter(|_| continues || wants_brackets) else {
+        out.extend(bytes);
+        return (out, false);
+    };
+    if !continues {
+        out.extend_from_slice(PASTE_START);
+    }
+    out.extend(bytes.into_iter().filter(|&b| b != ESC));
+    if !more {
+        out.extend_from_slice(PASTE_END);
+    }
+    (out, more)
+}
+
+/// Frames `bytes` against the pane's paste state as it stands under this
+/// lock, sends them through `permit` and records the paste they leave open.
+/// `paste` names the paste a piece belongs to.
+fn send_input(
+    state: &mut PaneIoState,
+    pane: PaneId,
+    permit: mpsc::OwnedPermit<Vec<u8>>,
+    bytes: Vec<u8>,
+    paste: Option<(bool, u64)>,
+    client: u64,
+) {
+    if !state.is_current_writer(pane, &permit) {
+        permit.send(bytes);
+        return;
+    }
+    let (program, wants_brackets) = state.paste_target(pane);
+    // The next piece of a paste continues it whatever mode the program shows
+    // now; anything else ends it only for a program still in paste mode.
+    let continued = state.open_pastes.get(&pane).is_some_and(|open| {
+        open.program == program
+            && paste.is_some_and(|(_, id)| (open.client, open.paste) == (client, id))
+    });
+    let open = match state.open_paste(pane) {
+        _ if continued => Open::Continued,
+        None => Open::Closed,
+        Some(_) => Open::Other,
+    };
+    let (bytes, open_after) = frame_input(bytes, paste.map(|(more, _)| more), open, wants_brackets);
+    permit.send(bytes);
+    match paste {
+        Some((_, paste)) if open_after => {
+            let open = OpenPaste {
+                program,
+                client,
+                paste,
+            };
+            state.open_pastes.insert(pane, open);
+        }
+        _ => {
+            state.open_pastes.remove(&pane);
+        }
+    }
+}
+
+/// Ends every paste this client left open, as a held button is released: no
+/// later key from this client will. An end with no room waits in the
+/// background until the pane reads again or closes, and is not sent if other
+/// input ended the paste first.
+async fn close_open_pastes(io_state: &Arc<Mutex<PaneIoState>>, client: u64) {
+    let mut state = io_state.lock().await;
+    let mine: Vec<PaneId> = state
+        .open_pastes
+        .keys()
+        .copied()
+        .filter(|&pane| {
+            state
+                .open_paste(pane)
+                .is_some_and(|open| open.client == client)
+        })
+        .collect();
+    for pane in mine {
+        let Some(tx) = state.writers.get(&pane).cloned() else {
+            continue;
+        };
+        match tx.try_reserve_owned() {
+            Ok(permit) => {
+                state.open_pastes.remove(&pane);
+                permit.send(PASTE_END.to_vec());
+            }
+            Err(mpsc::error::TrySendError::Full(tx)) => {
+                let io_state = io_state.clone();
+                tokio::spawn(async move {
+                    let Ok(permit) = tx.reserve_owned().await else {
+                        return;
+                    };
+                    let mut state = io_state.lock().await;
+                    if state.is_current_writer(pane, &permit)
+                        && state
+                            .open_paste(pane)
+                            .is_some_and(|open| open.client == client)
+                    {
+                        state.open_pastes.remove(&pane);
+                        permit.send(PASTE_END.to_vec());
+                    }
+                });
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
+        }
+    }
+}
+
+fn byte_count(n: usize) -> String {
+    match n {
+        n if n < 1 << 10 => format!("{n} B"),
+        n if n < 1 << 20 => format!("{:.1} KiB", n as f64 / f64::from(1u32 << 10)),
+        n => format!("{:.1} MiB", n as f64 / f64::from(1u32 << 20)),
+    }
+}
+
+/// How long, in total, input may wait on a pane that is not keeping up
+/// before input for it is dropped. The total resets each time the pane has
+/// room the moment input arrives, so one slow or stuck pane holds the attach
+/// loop (and with it detach and pane switching) for at most this long at a
+/// time.
+const INPUT_STALL: Duration = Duration::from_secs(1);
+
+/// Names each attach connection, for the pastes it leaves open.
+static NEXT_CLIENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Room for one chunk of input bound for a pane, and how long the attach
+/// loop waited for it.
+enum Room {
+    Ready(mpsc::OwnedPermit<Vec<u8>>, Duration),
+    /// The pane had no room within the wait it was allowed.
+    Full(Duration),
+    /// The pane is gone, or the attach is ending.
+    Closed,
+}
+
+/// One pane's share of [`INPUT_STALL`] spent since it last kept up, and the
+/// input dropped for it over the whole attach.
+#[derive(Default)]
+struct InputBacklog {
+    waited: Duration,
+    dropped: usize,
+}
+
+/// Room in a pane's input channel, waiting at most `budget` for it.
+async fn reserve_input(
+    tx: &mpsc::Sender<Vec<u8>>,
+    budget: Duration,
+    cancel: &CancellationToken,
+) -> Room {
+    match tx.clone().try_reserve_owned() {
+        Ok(permit) => return Room::Ready(permit, Duration::ZERO),
+        Err(mpsc::error::TrySendError::Closed(_)) => return Room::Closed,
+        Err(mpsc::error::TrySendError::Full(_)) if budget.is_zero() => {
+            return Room::Full(Duration::ZERO);
+        }
+        Err(mpsc::error::TrySendError::Full(_)) => {}
+    }
+    let started = tokio::time::Instant::now();
+    tokio::select! {
+        _ = cancel.cancelled() => Room::Closed,
+        reserved = tokio::time::timeout(budget, tx.clone().reserve_owned()) => match reserved {
+            Ok(Ok(permit)) => Room::Ready(permit, started.elapsed()),
+            Ok(Err(_)) => Room::Closed,
+            Err(_) => Room::Full(started.elapsed()),
+        },
+    }
+}
 
 /// Run the attach UDS listener. Each accepted connection spawns an
 /// independent attach session task. Runs until `cancel` fires.
@@ -732,6 +927,11 @@ async fn run_attach_loop(
     alive_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Sent at teardown, once nothing else can queue a frame behind it.
     let mut final_frame = None;
+    let mut input_backlogs: HashMap<PaneId, InputBacklog> = HashMap::new();
+    let client_id = NEXT_CLIENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // The paste whose pieces are arriving with its pane, and how many this
+    // client has sent.
+    let (mut pasting, mut pastes): (Option<(u64, PaneId)>, u64) = (None, 0);
     while !detached {
         tokio::select! {
             _ = cancel.cancelled() => break,
@@ -771,7 +971,12 @@ async fn run_attach_loop(
                     }
                 };
                 match parsed {
-                    AttachClientFrame::Input { data } => {
+                    frame @ (AttachClientFrame::Input { .. } | AttachClientFrame::Paste { .. }) => {
+                        let (data, paste) = match frame {
+                            AttachClientFrame::Paste { data, more } => (data, Some(more)),
+                            AttachClientFrame::Input { data } => (data, None),
+                            _ => continue,
+                        };
                         let bytes = match BASE64.decode(data.as_bytes()) {
                             Ok(b) => b,
                             Err(_) => continue,
@@ -784,14 +989,18 @@ async fn run_attach_loop(
                         {
                             let mut s = render_session.lock().await;
                             if s.help_visible {
-                                let dismiss =
-                                    bytes.iter().any(|&b| b == 0x1b || b == b'q' || b == b'Q');
+                                // A paste is text, not keys: swallowed whole.
+                                let dismiss = paste.is_none()
+                                    && bytes.iter().any(|&b| b == ESC || b == b'q' || b == b'Q');
                                 if dismiss {
                                     s.help_visible = false;
                                     let pulse =
                                         io_state.lock().await.render_pulse.clone();
                                     pulse.notify_one();
                                 }
+                                continue;
+                            }
+                            if paste.is_some() && s.copy_mode.is_some() {
                                 continue;
                             }
                         }
@@ -915,22 +1124,61 @@ async fn run_attach_loop(
                             }
                             continue;
                         }
-                        let target = render_session.lock().await.active_pane_id;
-                        // Clone the writer Sender out of the map and drop the
-                        // PaneIoState mutex BEFORE touching the channel.
-                        let writer = {
-                            let state = io_state.lock().await;
-                            state.writers.get(&target).cloned()
+                        let active = render_session.lock().await.active_pane_id;
+                        // Pieces of one paste share an id and go to the pane
+                        // the paste began in, wherever focus has moved since.
+                        let (paste, target) = match paste {
+                            Some(more) => {
+                                let (id, pane) = *pasting.get_or_insert_with(|| {
+                                    pastes += 1;
+                                    (pastes, active)
+                                });
+                                if !more {
+                                    pasting = None;
+                                }
+                                (Some((more, id)), pane)
+                            }
+                            None => {
+                                pasting = None;
+                                (None, active)
+                            }
                         };
+                        // Room first, with the PaneIoState mutex released.
+                        let writer = io_state.lock().await.writers.get(&target).cloned();
                         if let Some(tx) = writer {
-                            // Use try_send rather than send().await: if the
-                            // pane's PTY writer is backpressured (e.g., the
-                            // child stopped reading), blocking the whole
-                            // attach loop would freeze the user out -- they
-                            // wouldn't be able to detach or switch panes.
-                            // Dropping the keystroke is the lesser evil.
-                            if let Err(e) = tx.try_send(bytes) {
-                                tracing::warn!(error = %e, "input dropped (pane backpressured)");
+                            let backlog = input_backlogs.entry(target).or_default();
+                            let budget = INPUT_STALL.saturating_sub(backlog.waited);
+                            match reserve_input(&tx, budget, &cancel).await {
+                                // Room the moment it was asked for: caught up.
+                                Room::Ready(permit, waited) => {
+                                    backlog.waited = if waited.is_zero() {
+                                        Duration::ZERO
+                                    } else {
+                                        backlog.waited + waited
+                                    };
+                                    let mut state = io_state.lock().await;
+                                    send_input(&mut state, target, permit, bytes, paste, client_id);
+                                }
+                                Room::Closed => {
+                                    input_backlogs.remove(&target);
+                                }
+                                Room::Full(waited) => {
+                                    backlog.waited += waited;
+                                    // The drop that used up the wait: once per stall.
+                                    if !budget.is_zero() {
+                                        warn!(pane = %target, "input dropped: pane not keeping up");
+                                    }
+                                    backlog.dropped += bytes.len();
+                                    let dropped = backlog.dropped;
+                                    // Refreshed on every drop, so the notice
+                                    // stays up for as long as input is lost.
+                                    render_session.lock().await.last_action = Some((
+                                        format!("pane not keeping up: {} of input dropped", byte_count(dropped)),
+                                        std::time::Instant::now(),
+                                    ));
+                                    let pulse = io_state.lock().await.render_pulse.clone();
+                                    pulse.notify_one();
+                                }
                             }
                         }
                     }
@@ -1171,6 +1419,7 @@ async fn run_attach_loop(
     // go away when the client does. Detaching mid-drag without this leaves the
     // app believing a button is still held, and it stays that way for the rest
     // of the pane's life — visible next time anyone attaches.
+    close_open_pastes(&io_state, client_id).await;
     release_app_gesture(&io_state, &mut selection_drag).await;
 
     // Stop every other holder of `out_tx` first, so the final frame is the
@@ -1420,6 +1669,11 @@ async fn run_render_loop(
             nerd_fonts,
             cols,
         );
+        if last_action_ref
+            .is_some_and(|(_, at)| at.elapsed() < crate::statusbar_build::ACTION_FEEDBACK_DWELL)
+        {
+            crate::statusbar_build::make_room_for_notice(&mut bar, cols);
+        }
 
         // Welcome-toast lifecycle: if it's still showing and the
         // first-render-tick has passed, mark seen on the daemon side.
@@ -2730,8 +2984,8 @@ fn wheel_arrow_seq(up: bool, app_cursor: bool) -> &'static [u8] {
     }
 }
 
-/// Send bytes to a pane's PTY writer using the same non-blocking path as
-/// keystrokes (drop on backpressure rather than freeze the attach loop).
+/// Send bytes to a pane's PTY writer without waiting: dropped when the pane
+/// is backpressured. A mouse report is worth less than a held attach loop.
 ///
 /// Returns whether the bytes were actually queued. Button forwarding needs to
 /// know: a press that was dropped must not open a gesture, or the release that
@@ -2741,19 +2995,13 @@ async fn forward_bytes_to_pane(
     pane_id: PaneId,
     bytes: Vec<u8>,
 ) -> bool {
-    let writer = {
-        let state = io_state.lock().await;
-        state.writers.get(&pane_id).cloned()
-    };
-    match writer {
+    match io_state.lock().await.try_send_outside_paste(pane_id, bytes) {
         None => false,
-        Some(tx) => match tx.try_send(bytes) {
-            Ok(()) => true,
-            Err(e) => {
-                tracing::warn!(error = %e, "mouse forward dropped (pane backpressured)");
-                false
-            }
-        },
+        Some(Ok(())) => true,
+        Some(Err(e)) => {
+            tracing::warn!(error = %e, "mouse forward dropped (pane backpressured)");
+            false
+        }
     }
 }
 
@@ -6696,5 +6944,888 @@ mod tests {
         );
         drop(s);
         fixture.stop();
+    }
+
+    /// The real attach connection, with a pane whose input channel the test
+    /// owns: the test decides how fast the "program" reads.
+    struct InputHarness {
+        fixture: AttachFixture,
+        framed: Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+        writer_rx: mpsc::Receiver<Vec<u8>>,
+        /// The client's screen so far. Kept across waits: later render
+        /// frames redraw only what changed.
+        screen: shux_vt::VirtualTerminal,
+        server_cancel: CancellationToken,
+        server: tokio::task::JoinHandle<anyhow::Result<()>>,
+    }
+
+    impl InputHarness {
+        async fn new(capacity: usize) -> Self {
+            Self::sized(capacity, 90).await
+        }
+
+        async fn sized(capacity: usize, cols: u16) -> Self {
+            let fixture = attach_fixture().await;
+            let _ = seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+            let (writer_tx, writer_rx) = mpsc::channel(capacity);
+            fixture
+                .io_state
+                .lock()
+                .await
+                .writers
+                .insert(fixture.first_pane, writer_tx);
+            let (framed, server_cancel, server) = Self::connect(&fixture, cols).await;
+            Self {
+                fixture,
+                framed,
+                writer_rx,
+                screen: shux_vt::VirtualTerminal::new(24, usize::from(cols)),
+                server_cancel,
+                server,
+            }
+        }
+
+        /// A client attached to the fixture's session, past the handshake.
+        async fn connect(
+            fixture: &AttachFixture,
+            cols: u16,
+        ) -> (
+            Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+            CancellationToken,
+            tokio::task::JoinHandle<anyhow::Result<()>>,
+        ) {
+            let onboarding = crate::onboarding::OnboardingHandle::from_state_for_test(
+                crate::onboarding::OnboardingState {
+                    prefix_discovered: true,
+                    welcome_toast_seen: true,
+                },
+            );
+            let (server_stream, client_stream) = UnixStream::pair().expect("unix pair");
+            let server_cancel = fixture.cancel.child_token();
+            let server = tokio::spawn(handle_attach_connection(
+                server_stream,
+                fixture.graph.clone(),
+                fixture.io_state.clone(),
+                test_config(),
+                SegmentCache::new(),
+                crate::session_meta::SessionMetaCache::new(),
+                onboarding,
+                std::time::Instant::now(),
+                server_cancel.clone(),
+            ));
+            let mut framed = Framed::new(client_stream, create_codec());
+            let hello = AttachHello {
+                protocol: ATTACH_PROTOCOL_VERSION,
+                session_name: Some(fixture.attached.name.clone()),
+                cols,
+                rows: 24,
+                client_version: "input-test".to_string(),
+                graphics: false,
+            };
+            framed
+                .send(Bytes::from(serde_json::to_vec(&hello).expect("hello json")))
+                .await
+                .expect("send hello");
+            let ready = tokio::time::timeout(Duration::from_secs(2), framed.next())
+                .await
+                .expect("ready timeout")
+                .expect("ready frame")
+                .expect("ready bytes");
+            assert!(matches!(
+                serde_json::from_slice::<AttachReady>(&ready).expect("ready json"),
+                AttachReady::Ok { .. }
+            ));
+            (framed, server_cancel, server)
+        }
+
+        async fn send(&mut self, frame: &AttachClientFrame) {
+            self.framed
+                .send(Bytes::from(serde_json::to_vec(frame).expect("frame json")))
+                .await
+                .expect("send frame");
+        }
+
+        /// Server frames until `pred` matches one, or `budget` runs out.
+        /// `pred` also sees the client's screen: render frames position every
+        /// cell, so their raw bytes never hold a word contiguously.
+        async fn frames_until(
+            &mut self,
+            budget: Duration,
+            mut pred: impl FnMut(&AttachServerFrame, &str) -> bool,
+        ) -> bool {
+            let deadline = tokio::time::Instant::now() + budget;
+            while let Ok(Some(Ok(buf))) =
+                tokio::time::timeout_at(deadline, self.framed.next()).await
+            {
+                let frame: AttachServerFrame = serde_json::from_slice(&buf).expect("server frame");
+                if let AttachServerFrame::Render { data } = &frame {
+                    self.screen
+                        .process(&BASE64.decode(data.as_bytes()).expect("render base64"));
+                }
+                let grid = self.screen.grid();
+                let text: String = (0..grid.rows())
+                    .flat_map(|r| {
+                        let row = grid.visible_row(r);
+                        (0..row.len()).map(|c| row[c].ch).chain(['\n'])
+                    })
+                    .collect();
+                if pred(&frame, &text) {
+                    return true;
+                }
+            }
+            false
+        }
+
+        async fn stop(self) {
+            drop(self.framed);
+            self.server_cancel.cancel();
+            let _ = tokio::time::timeout(Duration::from_secs(2), self.server).await;
+            self.fixture.stop();
+        }
+    }
+
+    /// Issue #197: a paste is one Input frame per key, far more frames than a
+    /// pane's channel holds. A pane that is reading, only slower than the
+    /// frames arrive, must receive every byte in order.
+    #[tokio::test]
+    async fn a_paste_into_a_pane_that_reads_slowly_arrives_whole() {
+        let mut h = InputHarness::new(8).await;
+        let paste: Vec<u8> = (0..2000u32).map(|i| b'a' + (i % 26) as u8).collect();
+
+        let mut rx = std::mem::replace(&mut h.writer_rx, mpsc::channel(1).1);
+        let want = paste.len();
+        let reader = tokio::spawn(async move {
+            let mut got = Vec::with_capacity(want);
+            while got.len() < want {
+                match tokio::time::timeout(Duration::from_secs(10), rx.recv()).await {
+                    Ok(Some(chunk)) => got.extend_from_slice(&chunk),
+                    _ => break,
+                }
+                // A program that reads a burst, then is busy drawing it.
+                if got.len() % 16 == 0 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
+            got
+        });
+        for &b in &paste {
+            h.send(&AttachClientFrame::Input {
+                data: BASE64.encode([b]),
+            })
+            .await;
+        }
+        let got = reader.await.expect("reader");
+        assert_eq!(
+            got.len(),
+            paste.len(),
+            "{} of {} pasted bytes reached the pane",
+            got.len(),
+            paste.len()
+        );
+        assert!(got == paste, "the paste arrived reordered");
+        h.stop().await;
+    }
+
+    /// The other half of #197: a pane that stops reading altogether must not
+    /// freeze the attach. Input it cannot take is dropped only after a bounded
+    /// wait, the user is told on the status bar, and detach still works.
+    #[tokio::test]
+    async fn a_pane_that_stops_reading_drops_input_visibly_and_detach_still_works() {
+        // Narrow enough that the notice only fits with the right zone gone.
+        let mut h = InputHarness::sized(1, 56).await;
+        for _ in 0..50 {
+            h.send(&AttachClientFrame::Input {
+                data: BASE64.encode(b"x"),
+            })
+            .await;
+        }
+        let mut screen = String::new();
+        let told = h
+            .frames_until(INPUT_STALL + Duration::from_secs(3), |_, text| {
+                if text.contains("[p") {
+                    screen = text.lines().last().unwrap_or_default().to_string();
+                }
+                text.contains("[pane not keeping up: 49 B of input dropped]")
+            })
+            .await;
+        assert!(told, "the user was not told input was dropped: {screen:?}");
+
+        let started = tokio::time::Instant::now();
+        h.send(&AttachClientFrame::Detach).await;
+        let detached = h
+            .frames_until(INPUT_STALL + Duration::from_secs(3), |f, _| {
+                matches!(f, AttachServerFrame::DetachAck)
+            })
+            .await;
+        assert!(
+            detached,
+            "a stuck pane froze the attach: detach never landed"
+        );
+        assert!(
+            started.elapsed() < INPUT_STALL + Duration::from_secs(2),
+            "detach waited {:?} behind a pane that is not reading",
+            started.elapsed()
+        );
+        // The one byte the stuck pane's channel had room for.
+        assert_eq!(h.writer_rx.try_recv().ok(), Some(b"x".to_vec()));
+        h.stop().await;
+    }
+
+    /// A pane that reads, but slower than one frame per [`INPUT_STALL`],
+    /// never stalls outright. It must still not hold the attach for longer
+    /// than one budget: the wait is a total, not a per-key allowance.
+    #[tokio::test]
+    async fn a_pane_that_reads_too_slowly_cannot_hold_detach_behind_a_paste() {
+        let mut h = InputHarness::new(1).await;
+        let mut rx = std::mem::replace(&mut h.writer_rx, mpsc::channel(1).1);
+        let reader = tokio::spawn(async move {
+            while rx.recv().await.is_some() {
+                tokio::time::sleep(INPUT_STALL * 9 / 10).await;
+            }
+        });
+        for _ in 0..10 {
+            h.send(&AttachClientFrame::Input {
+                data: BASE64.encode(b"x"),
+            })
+            .await;
+        }
+        let started = tokio::time::Instant::now();
+        h.send(&AttachClientFrame::Detach).await;
+        let detached = h
+            .frames_until(Duration::from_secs(15), |f, _| {
+                matches!(f, AttachServerFrame::DetachAck)
+            })
+            .await;
+        assert!(detached, "detach never landed");
+        assert!(
+            started.elapsed() < INPUT_STALL + Duration::from_millis(700),
+            "detach waited {:?} behind a pane that keeps falling behind",
+            started.elapsed()
+        );
+        reader.abort();
+        h.stop().await;
+    }
+
+    /// Two stuck panes, typed into in turn: each costs one wait, not one per
+    /// focus change.
+    #[tokio::test]
+    async fn two_stuck_panes_each_cost_one_wait() {
+        let mut h = InputHarness::new(1).await;
+        let (second_tx, _second_rx) = mpsc::channel(1);
+        h.fixture
+            .io_state
+            .lock()
+            .await
+            .writers
+            .insert(h.fixture.second_pane, second_tx);
+        let started = tokio::time::Instant::now();
+        for _ in 0..6 {
+            for _ in 0..2 {
+                h.send(&AttachClientFrame::Input {
+                    data: BASE64.encode(b"a"),
+                })
+                .await;
+            }
+            h.send(&AttachClientFrame::Action {
+                kind: ActionKind::FocusNext,
+                args: Default::default(),
+            })
+            .await;
+        }
+        h.send(&AttachClientFrame::Detach).await;
+        let detached = h
+            .frames_until(Duration::from_secs(15), |f, _| {
+                matches!(f, AttachServerFrame::DetachAck)
+            })
+            .await;
+        assert!(detached, "detach never landed");
+        assert!(
+            started.elapsed() < INPUT_STALL * 2 + Duration::from_millis(800),
+            "six focus changes between two stuck panes took {:?}",
+            started.elapsed()
+        );
+        h.stop().await;
+    }
+
+    /// The notice counts every byte lost to a pane, even when one gets
+    /// through in between.
+    #[tokio::test]
+    async fn the_drop_notice_counts_every_lost_byte() {
+        let mut h = InputHarness::new(1).await;
+        for _ in 0..5 {
+            h.send(&AttachClientFrame::Input {
+                data: BASE64.encode(b"a"),
+            })
+            .await;
+        }
+        assert!(
+            h.frames_until(INPUT_STALL * 3, |_, t| t.contains("4 B of input dropped"))
+                .await,
+            "the first four drops were not reported"
+        );
+        assert_eq!(h.writer_rx.try_recv().ok(), Some(b"a".to_vec()));
+        for _ in 0..3 {
+            h.send(&AttachClientFrame::Input {
+                data: BASE64.encode(b"b"),
+            })
+            .await;
+        }
+        assert!(
+            h.frames_until(INPUT_STALL * 3, |_, t| t.contains("6 B of input dropped"))
+                .await,
+            "drops after a byte got through restarted the count"
+        );
+        h.stop().await;
+    }
+
+    #[test]
+    fn dropped_input_is_counted_in_units_a_reader_takes_in() {
+        assert_eq!(byte_count(1023), "1023 B");
+        assert_eq!(byte_count(1024), "1.0 KiB");
+        assert_eq!(byte_count((1 << 20) - 1), "1024.0 KiB");
+        assert_eq!(byte_count(3 << 19), "1.5 MiB");
+    }
+
+    #[test]
+    fn a_paste_is_bracketed_once_only_when_asked_and_cannot_end_itself() {
+        let v = |b: &[u8]| b.to_vec();
+        // Not asked for: as typed.
+        assert_eq!(
+            frame_input(v(b"ls\r"), Some(false), Open::Closed, false),
+            (v(b"ls\r"), false)
+        );
+        // One piece.
+        assert_eq!(
+            frame_input(v(b"ls\r"), Some(false), Open::Closed, true),
+            (v(b"\x1b[200~ls\r\x1b[201~"), false)
+        );
+        // Pieces: markers once around the whole paste.
+        assert_eq!(
+            frame_input(v(b"a"), Some(true), Open::Closed, true),
+            (v(b"\x1b[200~a"), true)
+        );
+        assert_eq!(
+            frame_input(v(b"b"), Some(true), Open::Continued, true),
+            (v(b"b"), true)
+        );
+        assert_eq!(
+            frame_input(v(b"c"), Some(false), Open::Continued, true),
+            (v(b"c\x1b[201~"), false)
+        );
+        // Framed as it began, with the program out of paste mode since.
+        assert_eq!(
+            frame_input(v(b"c"), Some(false), Open::Continued, false),
+            (v(b"c\x1b[201~"), false)
+        );
+        // The end was dropped: the next key, or another paste, closes it first.
+        assert_eq!(
+            frame_input(v(b"x"), None, Open::Other, true),
+            (v(b"\x1b[201~x"), false)
+        );
+        assert_eq!(
+            frame_input(v(b"z"), Some(false), Open::Other, true),
+            (v(b"\x1b[201~\x1b[200~z\x1b[201~"), false)
+        );
+        assert_eq!(
+            frame_input(v(b"x"), None, Open::Closed, true),
+            (v(b"x"), false)
+        );
+        // An end marker inside the text cannot end the paste.
+        assert_eq!(
+            frame_input(v(b"a\x1b[201~rm -rf ~\r"), Some(false), Open::Closed, true),
+            (v(b"\x1b[200~a[201~rm -rf ~\r\x1b[201~"), false)
+        );
+    }
+
+    fn end_markers(bytes: &[u8]) -> usize {
+        bytes
+            .windows(PASTE_END.len())
+            .filter(|w| *w == PASTE_END)
+            .count()
+    }
+
+    #[test]
+    fn a_pasted_end_marker_cannot_be_rebuilt_from_what_is_left() {
+        let v = |b: &[u8]| b.to_vec();
+        let (out, _) = frame_input(
+            v(b"a\x1b[20\x1b[201~1~rm -rf ~\r"),
+            Some(false),
+            Open::Closed,
+            true,
+        );
+        assert_eq!(end_markers(&out), 1, "the paste ends itself: {out:?}");
+        assert!(out.ends_with(PASTE_END));
+
+        // The client splits a paste anywhere a character ends, marker or not.
+        let (first, _) = frame_input(v(b"aa\x1b[20"), Some(true), Open::Closed, true);
+        let (second, _) = frame_input(v(b"1~rm -rf ~\r"), Some(false), Open::Continued, true);
+        let joined = [first, second].concat();
+        assert_eq!(end_markers(&joined), 1, "the paste ends itself: {joined:?}");
+        assert!(joined.ends_with(PASTE_END));
+    }
+
+    async fn key(h: &mut InputHarness, bytes: &[u8]) {
+        h.send(&AttachClientFrame::Input {
+            data: BASE64.encode(bytes),
+        })
+        .await;
+    }
+
+    async fn paste(h: &mut InputHarness, text: &[u8], more: bool) {
+        h.send(&AttachClientFrame::Paste {
+            data: BASE64.encode(text),
+            more,
+        })
+        .await;
+    }
+
+    async fn pane_input(h: &mut InputHarness, settle: Duration) -> Vec<u8> {
+        let mut got = Vec::new();
+        while let Ok(Some(chunk)) = tokio::time::timeout(settle, h.writer_rx.recv()).await {
+            got.extend_from_slice(&chunk);
+        }
+        got
+    }
+
+    /// A second client attached to the same pane.
+    struct Peer {
+        framed: Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+        cancel: CancellationToken,
+        server: tokio::task::JoinHandle<anyhow::Result<()>>,
+    }
+
+    impl Peer {
+        async fn attach(h: &InputHarness) -> Self {
+            let (framed, cancel, server) = InputHarness::connect(&h.fixture, 90).await;
+            Self {
+                framed,
+                cancel,
+                server,
+            }
+        }
+
+        async fn send(&mut self, frame: &AttachClientFrame) {
+            self.framed
+                .send(Bytes::from(serde_json::to_vec(frame).expect("frame json")))
+                .await
+                .expect("send frame");
+        }
+
+        async fn key(&mut self, bytes: &[u8]) {
+            self.send(&AttachClientFrame::Input {
+                data: BASE64.encode(bytes),
+            })
+            .await;
+        }
+
+        async fn paste(&mut self, text: &[u8], more: bool) {
+            self.send(&AttachClientFrame::Paste {
+                data: BASE64.encode(text),
+                more,
+            })
+            .await;
+        }
+
+        async fn stop(self) {
+            drop(self.framed);
+            self.cancel.cancel();
+            let _ = tokio::time::timeout(Duration::from_secs(2), self.server).await;
+        }
+    }
+
+    /// Feeds `bytes` to the pane's VT, as its program would print them.
+    async fn set_modes(h: &InputHarness, bytes: &[u8]) {
+        let pane = h.fixture.first_pane;
+        if let Some(vt) = h.fixture.io_state.lock().await.vts.get_mut(&pane) {
+            vt.process(bytes);
+        }
+    }
+
+    async fn press(h: &mut InputHarness) {
+        h.send(&AttachClientFrame::Mouse {
+            kind: MouseKind::Down,
+            button: ProtoMouseButton::Left,
+            col: 3,
+            row: 2,
+            shift: false,
+            alt: false,
+            ctrl: false,
+        })
+        .await;
+    }
+
+    /// Pasted text is not a run of keystrokes: a `q` in it must not close
+    /// the help overlay or quit copy mode and let the rest of the paste
+    /// through to the pane.
+    #[tokio::test]
+    async fn a_paste_does_not_drive_the_help_overlay_or_copy_mode() {
+        for (enter, leave) in [
+            (ActionKind::ToggleHelp, b"\x1b".as_slice()),
+            (ActionKind::EnterCopyMode, b"q".as_slice()),
+        ] {
+            let mut h = InputHarness::new(64).await;
+            h.send(&AttachClientFrame::Action {
+                kind: enter,
+                args: shux_rpc::attach::ActionArgs::default(),
+            })
+            .await;
+            paste(&mut h, b"q", true).await;
+            paste(&mut h, b"echo half a script\r", false).await;
+            key(&mut h, b"a").await;
+            key(&mut h, leave).await;
+            key(&mut h, b"b").await;
+            let got = pane_input(&mut h, Duration::from_millis(500)).await;
+            assert_eq!(
+                String::from_utf8_lossy(&got),
+                "b",
+                "{enter:?}: a paste reached the pane past the overlay"
+            );
+            h.stop().await;
+        }
+    }
+
+    /// The pane's program after a paste whose end was dropped: left paste
+    /// mode, or replaced by a respawn.
+    async fn leave_the_paste(h: &mut InputHarness, respawn: bool) {
+        let pane = h.fixture.first_pane;
+        let mut state = h.fixture.io_state.lock().await;
+        if respawn {
+            state.incarnations.insert(pane, u64::MAX);
+        } else if let Some(vt) = state.vts.get_mut(&pane) {
+            vt.process(b"\x1b[?2004l");
+        }
+    }
+
+    async fn paste_with_dropped_end(h: &mut InputHarness) {
+        set_modes(h, b"\x1b[?2004h").await;
+        paste(h, b"a", true).await;
+        paste(h, b"b", false).await;
+        // Past the wait the end piece is dropped after.
+        tokio::time::sleep(INPUT_STALL + Duration::from_millis(200)).await;
+    }
+
+    /// An open paste belongs to the program it was pasted into: a program
+    /// that is no longer in it must not read its end as input.
+    #[tokio::test]
+    async fn a_dropped_paste_end_reaches_only_the_program_still_in_it() {
+        for respawn in [false, true] {
+            let mut h = InputHarness::new(1).await;
+            paste_with_dropped_end(&mut h).await;
+            leave_the_paste(&mut h, respawn).await;
+            h.send(&AttachClientFrame::Detach).await;
+            let detached = h
+                .frames_until(INPUT_STALL + Duration::from_secs(3), |f, _| {
+                    matches!(f, AttachServerFrame::DetachAck)
+                })
+                .await;
+            assert!(detached, "detach never landed");
+            let got = pane_input(&mut h, Duration::from_millis(500)).await;
+            assert_eq!(
+                String::from_utf8_lossy(&got),
+                "\x1b[200~a",
+                "respawn {respawn}: detach ended a paste the program had left"
+            );
+            h.stop().await;
+
+            let mut h = InputHarness::new(1).await;
+            paste_with_dropped_end(&mut h).await;
+            assert_eq!(
+                pane_input(&mut h, Duration::from_millis(200)).await,
+                b"\x1b[200~a"
+            );
+            leave_the_paste(&mut h, respawn).await;
+            key(&mut h, b"x").await;
+            let got = pane_input(&mut h, Duration::from_millis(500)).await;
+            assert_eq!(
+                String::from_utf8_lossy(&got),
+                "x",
+                "respawn {respawn}: a key ended a paste the program had left"
+            );
+            h.stop().await;
+        }
+    }
+
+    /// A paste is the pane's, not the client's: a key from another client
+    /// attached to the same pane ends it before reaching the program.
+    #[tokio::test]
+    async fn another_clients_key_ends_a_paste_left_open() {
+        let mut h = InputHarness::new(1).await;
+        paste_with_dropped_end(&mut h).await;
+        assert_eq!(
+            pane_input(&mut h, Duration::from_millis(200)).await,
+            b"\x1b[200~a"
+        );
+        let mut other = Peer::attach(&h).await;
+        other.key(b"x").await;
+        let got = pane_input(&mut h, Duration::from_millis(500)).await;
+        assert_eq!(
+            String::from_utf8_lossy(&got),
+            "\x1b[201~x",
+            "another client's key went into the paste"
+        );
+        other.stop().await;
+        h.stop().await;
+    }
+
+    /// Two writers waiting on a full pane end its open paste once between
+    /// them: the second one queued finds it already ended.
+    #[tokio::test]
+    async fn waiting_writers_end_an_open_paste_once() {
+        let mut h = InputHarness::new(1).await;
+        paste_with_dropped_end(&mut h).await;
+        let mut b = Peer::attach(&h).await;
+        let mut c = Peer::attach(&h).await;
+        b.key(b"x").await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        c.key(b"y").await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let got = pane_input(&mut h, Duration::from_millis(500)).await;
+        assert_eq!(
+            String::from_utf8_lossy(&got),
+            "\x1b[200~a\x1b[201~xy",
+            "the paste was ended twice"
+        );
+        b.stop().await;
+        c.stop().await;
+        h.stop().await;
+    }
+
+    /// A key that waits behind a paste still waiting on a full pane lands
+    /// after the paste's start, so it ends the paste first.
+    #[tokio::test]
+    async fn a_key_queued_behind_a_paste_ends_it() {
+        let mut h = InputHarness::new(1).await;
+        set_modes(&h, b"\x1b[?2004h").await;
+        key(&mut h, b"k").await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        paste(&mut h, b"a", true).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut other = Peer::attach(&h).await;
+        other.key(b"y").await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let got = pane_input(&mut h, Duration::from_millis(500)).await;
+        assert_eq!(
+            String::from_utf8_lossy(&got),
+            "k\x1b[200~a\x1b[201~y",
+            "a key landed inside the paste"
+        );
+        other.stop().await;
+        h.stop().await;
+    }
+
+    /// A new paste is its own paste, never the tail of one whose end was
+    /// dropped, whichever client sends it.
+    #[tokio::test]
+    async fn a_new_paste_does_not_join_one_left_open() {
+        for other_client in [false, true] {
+            let mut h = InputHarness::new(1).await;
+            paste_with_dropped_end(&mut h).await;
+            assert_eq!(
+                pane_input(&mut h, Duration::from_millis(200)).await,
+                b"\x1b[200~a"
+            );
+            let mut other = Peer::attach(&h).await;
+            if other_client {
+                other.paste(b"z", false).await;
+            } else {
+                paste(&mut h, b"z", false).await;
+            }
+            let got = pane_input(&mut h, Duration::from_millis(500)).await;
+            assert_eq!(
+                String::from_utf8_lossy(&got),
+                "\x1b[201~\x1b[200~z\x1b[201~",
+                "other client {other_client}: the paste joined the open one"
+            );
+            other.stop().await;
+            h.stop().await;
+        }
+    }
+
+    /// A paste whose first piece was dropped is still a new paste: its later
+    /// pieces do not continue the one an earlier paste left open.
+    #[tokio::test]
+    async fn a_paste_whose_start_was_dropped_does_not_join_one_left_open() {
+        let mut h = InputHarness::new(1).await;
+        paste_with_dropped_end(&mut h).await;
+        paste(&mut h, b"p1", true).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            pane_input(&mut h, Duration::from_millis(200)).await,
+            b"\x1b[200~a"
+        );
+        paste(&mut h, b"p2", false).await;
+        let got = pane_input(&mut h, Duration::from_millis(500)).await;
+        assert_eq!(
+            String::from_utf8_lossy(&got),
+            "\x1b[201~\x1b[200~p2\x1b[201~",
+            "the paste joined the open one"
+        );
+        h.stop().await;
+    }
+
+    /// A paste is framed as the program asked when it began: a mode change
+    /// seen while its pieces arrive may be from before the program read its
+    /// start, so the rest stays between the markers of one paste.
+    #[tokio::test]
+    async fn a_paste_keeps_the_framing_it_began_with() {
+        for change in [b"\x1b[?2004l".as_slice(), b"\x1b[?2004l\x1b[?2004h"] {
+            let mut h = InputHarness::new(8).await;
+            set_modes(&h, b"\x1b[?2004h").await;
+            paste(&mut h, b"p1", true).await;
+            assert_eq!(
+                pane_input(&mut h, Duration::from_millis(200)).await,
+                b"\x1b[200~p1"
+            );
+            set_modes(&h, change).await;
+            paste(&mut h, b"p2\r", false).await;
+            let got = pane_input(&mut h, Duration::from_millis(500)).await;
+            assert_eq!(
+                String::from_utf8_lossy(&got),
+                "p2\r\x1b[201~",
+                "{}: the paste was split",
+                String::from_utf8_lossy(change).escape_debug()
+            );
+            h.stop().await;
+        }
+    }
+
+    /// The rest of a paste goes where the paste began, not to a pane focused
+    /// while it was arriving, which would run it as typed lines.
+    #[tokio::test]
+    async fn a_paste_stays_with_the_pane_it_began_in() {
+        let mut h = InputHarness::new(8).await;
+        set_modes(&h, b"\x1b[?2004h").await;
+        let (mut second_rx, _resize, _shutdown) =
+            seed_io_for_pane(&h.fixture.io_state, h.fixture.second_pane).await;
+        paste(&mut h, b"p1", true).await;
+        h.send(&AttachClientFrame::Action {
+            kind: ActionKind::FocusNext,
+            args: shux_rpc::attach::ActionArgs::default(),
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        paste(&mut h, b"p2\r", false).await;
+        let got = pane_input(&mut h, Duration::from_millis(500)).await;
+        assert_eq!(
+            String::from_utf8_lossy(&got),
+            "\x1b[200~p1p2\r\x1b[201~",
+            "the paste did not finish where it began"
+        );
+        let stray = tokio::time::timeout(Duration::from_millis(200), second_rx.recv()).await;
+        assert!(
+            !matches!(stray, Ok(Some(_))),
+            "the newly focused pane got part of the paste: {stray:?}"
+        );
+        h.stop().await;
+    }
+
+    /// Detaching ends only the paste this client left open: one another
+    /// client opened since stays open until that client goes.
+    #[tokio::test]
+    async fn detaching_leaves_another_clients_open_paste() {
+        let mut h = InputHarness::new(1).await;
+        paste_with_dropped_end(&mut h).await;
+        let mut other = Peer::attach(&h).await;
+        other.key(b"x").await;
+        assert_eq!(h.writer_rx.recv().await.unwrap(), b"\x1b[200~a");
+        other.paste(b"p", true).await;
+        assert_eq!(h.writer_rx.recv().await.unwrap(), b"\x1b[201~x");
+        // Its end is dropped behind the start, which the pane leaves unread.
+        other.paste(b"q", false).await;
+        tokio::time::sleep(INPUT_STALL + Duration::from_millis(200)).await;
+        h.send(&AttachClientFrame::Detach).await;
+        let detached = h
+            .frames_until(INPUT_STALL + Duration::from_secs(3), |f, _| {
+                matches!(f, AttachServerFrame::DetachAck)
+            })
+            .await;
+        assert!(detached, "detach never landed");
+        let got = pane_input(&mut h, Duration::from_millis(500)).await;
+        assert_eq!(
+            String::from_utf8_lossy(&got),
+            "\x1b[200~p",
+            "detach ended another client's paste"
+        );
+        other.stop().await;
+        h.stop().await;
+    }
+
+    /// A mouse report forwarded to the program is not pasted text: an open
+    /// paste ends before it.
+    #[tokio::test]
+    async fn a_forwarded_click_ends_a_paste_left_open() {
+        let mut h = InputHarness::new(1).await;
+        paste_with_dropped_end(&mut h).await;
+        assert_eq!(
+            pane_input(&mut h, Duration::from_millis(200)).await,
+            b"\x1b[200~a"
+        );
+        set_modes(&h, b"\x1b[?1002h\x1b[?1006h").await;
+        press(&mut h).await;
+        let got = pane_input(&mut h, Duration::from_millis(500)).await;
+        assert_eq!(
+            String::from_utf8_lossy(&got),
+            "\x1b[201~\x1b[<0;3;2M",
+            "the click went into the paste"
+        );
+        h.stop().await;
+    }
+
+    /// A held button released on detach is a mouse report, not pasted text:
+    /// the open paste ends before it, or the program reads it as text and
+    /// keeps the button down.
+    #[tokio::test]
+    async fn detaching_ends_an_open_paste_before_releasing_a_held_button() {
+        let mut h = InputHarness::new(2).await;
+        set_modes(&h, b"\x1b[?2004h\x1b[?1002h\x1b[?1006h").await;
+        press(&mut h).await;
+        let press = pane_input(&mut h, Duration::from_millis(300)).await;
+        assert!(
+            press.ends_with(b"M"),
+            "the press never reached the app: {press:?}"
+        );
+        paste(&mut h, b"a", true).await;
+        paste(&mut h, b"b", true).await;
+        paste(&mut h, b"c", false).await;
+        tokio::time::sleep(INPUT_STALL + Duration::from_millis(200)).await;
+        assert_eq!(
+            pane_input(&mut h, Duration::from_millis(200)).await,
+            b"\x1b[200~ab"
+        );
+
+        h.send(&AttachClientFrame::Detach).await;
+        let got = pane_input(&mut h, Duration::from_millis(500)).await;
+        assert!(
+            got.starts_with(PASTE_END) && got.ends_with(b"m"),
+            "the release went into the paste: {:?}",
+            String::from_utf8_lossy(&got)
+        );
+        h.stop().await;
+    }
+
+    /// A paste whose end was dropped leaves the pane's program in paste mode.
+    /// Detaching must close it: no later key from this client will.
+    #[tokio::test]
+    async fn detaching_closes_a_paste_whose_end_was_dropped() {
+        let mut h = InputHarness::new(1).await;
+        set_modes(&h, b"\x1b[?2004h").await;
+        paste(&mut h, b"a", true).await;
+        paste(&mut h, b"b", false).await;
+        h.send(&AttachClientFrame::Detach).await;
+        let detached = h
+            .frames_until(INPUT_STALL + Duration::from_secs(3), |f, _| {
+                matches!(f, AttachServerFrame::DetachAck)
+            })
+            .await;
+        assert!(detached, "detach never landed");
+        // The program reads again only long after the client has gone.
+        tokio::time::sleep(INPUT_STALL * 3).await;
+        let got = pane_input(&mut h, Duration::from_millis(500)).await;
+        assert_eq!(
+            String::from_utf8_lossy(&got),
+            "\x1b[200~a\x1b[201~",
+            "the pane was left inside a paste"
+        );
+        h.stop().await;
     }
 }
