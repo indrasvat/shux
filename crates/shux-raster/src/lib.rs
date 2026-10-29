@@ -629,12 +629,14 @@ impl Rasterizer {
             let gy = ctx.y as i32 + (self.cell_h as i32 - m.height as i32).max(0) / 2;
             (m, bmp, gx, gy)
         };
+        let rows = ctx.y..ctx.y + self.cell_h;
         blit_glyph(
             img,
             glyph_x,
             glyph_y,
             metrics.width as u32,
             metrics.height as u32,
+            rows.clone(),
             &bitmap,
             ctx.fg,
         );
@@ -645,6 +647,7 @@ impl Rasterizer {
                 glyph_y,
                 metrics.width as u32,
                 metrics.height as u32,
+                rows,
                 &bitmap,
                 ctx.fg,
             );
@@ -787,7 +790,22 @@ fn set_pixel_rgb(img: &mut RgbaImage, x: u32, y: u32, rgb: Rgb) {
     }
 }
 
-fn blit_glyph(img: &mut RgbaImage, x: i32, y: i32, w: u32, h: u32, alpha: &[u8], fg: Rgb) {
+/// `rows` is the pixel rows the glyph's cell spans: ink past them would
+/// paint a neighbouring row.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a blit's geometry, all of it needed"
+)]
+fn blit_glyph(
+    img: &mut RgbaImage,
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    rows: std::ops::Range<u32>,
+    alpha: &[u8],
+    fg: Rgb,
+) {
     for j in 0..h {
         for i in 0..w {
             let idx = (j * w + i) as usize;
@@ -804,7 +822,7 @@ fn blit_glyph(img: &mut RgbaImage, x: i32, y: i32, w: u32, h: u32, alpha: &[u8],
                 continue;
             }
             let (px, py) = (px as u32, py as u32);
-            if px >= img.width() || py >= img.height() {
+            if px >= img.width() || py >= img.height() || !rows.contains(&py) {
                 continue;
             }
             let dst = img.get_pixel_mut(px, py);
@@ -985,6 +1003,32 @@ mod tests {
         let (w, h) = r.cell_size();
         assert!((6..=20).contains(&w), "cell width out of range: {w}");
         assert!((12..=32).contains(&h), "cell height out of range: {h}");
+    }
+
+    /// A glyph's ink stays in its own row: one taller than the font's ascent
+    /// would otherwise paint into the row above, so a pane's snapshot and its
+    /// crop of the session snapshot (status bar right under it) differ.
+    #[test]
+    fn a_glyph_never_inks_the_row_above_or_below() {
+        let r = Rasterizer::new(14.0).unwrap();
+        let (_, ch) = r.cell_size();
+        for glyph in ["\u{e0a0}", "±", "ÅÉ", "gjpq", "|", "()[]{}"] {
+            let mut vt = VirtualTerminal::new(3, 8);
+            vt.process(
+                format!("\x1b[41m        \r\n\x1b[0m{glyph}\r\n\x1b[41m        ").as_bytes(),
+            );
+            let img = r.render(vt.grid(), &RasterOptions::default());
+            let red = *img.get_pixel(0, 0);
+            for (y, edge) in [(ch - 1, "above"), (2 * ch, "below")] {
+                for x in 0..img.width() {
+                    assert_eq!(
+                        *img.get_pixel(x, y),
+                        red,
+                        "{glyph:?} inked the row {edge} at ({x}, {y})"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
