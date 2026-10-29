@@ -40,7 +40,7 @@ impl Env {
     /// and `redirect` after it, `{root}` in it naming the test's root.
     fn attached_with(config_toml: &str, env_vars: &str, redirect: &str) -> Self {
         let root = tempfile::tempdir().expect("temp root");
-        for sub in ["runtime", "config/shux", "work"] {
+        for sub in ["runtime", "config/shux", "state", "work"] {
             std::fs::create_dir_all(root.path().join(sub)).expect("mkdir");
         }
         let mut env = Self {
@@ -92,6 +92,7 @@ impl Env {
         let mut cmd = Command::new(&self.bin);
         cmd.env("XDG_RUNTIME_DIR", self.root.path().join("runtime"))
             .env("XDG_CONFIG_HOME", self.root.path().join("config"))
+            .env("XDG_STATE_HOME", self.root.path().join("state"))
             .env_remove("SHUX_SOCKET")
             .env("NO_COLOR", "1")
             .env("SHELL", "/bin/sh")
