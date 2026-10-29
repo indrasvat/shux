@@ -1076,6 +1076,28 @@ pub(crate) fn spawn_failure_message(e: &shux_pty::PtyError) -> String {
     format!("{e} — {}", spawn_failure_hint(e))
 }
 
+/// The status-bar line for a pane the attach UI could not start. Its split
+/// and new window run the default command, so a spawn error names the
+/// configured `[shell].command` when there is one.
+pub(crate) fn spawn_failure_notice(e: &shux_pty::PtyError) -> String {
+    spawn_failure_notice_for(e, &daemon_shell_config())
+}
+
+fn spawn_failure_notice_for(
+    e: &shux_pty::PtyError,
+    shell: &shux_core::config::ShellConfig,
+) -> String {
+    let shux_pty::PtyError::Spawn(io) = e else {
+        return e.to_string();
+    };
+    let detail = io.to_string();
+    let cause = detail.split(" (os error").next().unwrap_or(&detail);
+    match configured_shell_argv(shell) {
+        Some(argv) => format!("[shell].command `{}`: {cause}", argv[0]),
+        None => format!("could not start the shell: {cause}"),
+    }
+}
+
 fn spawn_failure_hint(e: &shux_pty::PtyError) -> String {
     spawn_failure_hint_for(&e.to_string(), &daemon_shell_config())
 }
@@ -1174,6 +1196,25 @@ mod tests {
         assert_eq!(
             configured_shell_argv(&cfg),
             Some(owned(&["/bin/sh", "", "-l"]))
+        );
+    }
+
+    #[test]
+    fn the_status_bar_notice_names_the_program_and_drops_the_errno() {
+        let enoent = || shux_pty::PtyError::Spawn(std::io::Error::from_raw_os_error(2));
+        assert_eq!(
+            spawn_failure_notice_for(&enoent(), &shell_cfg(&["/usr/bin/typo", "-l"], &[])),
+            "[shell].command `/usr/bin/typo`: No such file or directory"
+        );
+        assert_eq!(
+            spawn_failure_notice_for(&enoent(), &shell_cfg(&[], &[])),
+            "could not start the shell: No such file or directory"
+        );
+        // Not a spawn error: no program to blame.
+        let open = shux_pty::PtyError::Open(std::io::Error::other("out of ptys"));
+        assert_eq!(
+            spawn_failure_notice_for(&open, &shell_cfg(&["/usr/bin/typo"], &[])),
+            "failed to open PTY: out of ptys"
         );
     }
 

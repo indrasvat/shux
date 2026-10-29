@@ -20,6 +20,7 @@
 //! - `Resize { cols, rows }` — the host terminal was resized.
 //! - `Action { kind, args }` — handled keybinding, dispatched server-side.
 //! - `Detach` — client requested detach; server stops streaming and closes.
+//! - `Prefix { prefix }` — the prefix key the client resolves bindings with.
 
 use serde::{Deserialize, Serialize};
 
@@ -130,6 +131,11 @@ pub enum AttachClientFrame {
     /// even though the user clearly found the prefix. Sent at most
     /// once per attach.
     PrefixTapped,
+    /// The prefix this client resolves keybindings with, in `[keys].prefix`
+    /// notation. Sent when streaming starts and again whenever the client's
+    /// config reload changes it, so the hints the daemon draws name the key
+    /// that actually works. A daemon that has none uses its own config's.
+    Prefix { prefix: String },
     /// Heartbeat reply.
     Pong,
 }

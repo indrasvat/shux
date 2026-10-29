@@ -877,10 +877,14 @@ fn render_copy_overlay_inner(
     // content.
     let (cx, cy) = state.cursor;
     if cx < pane.width && cy < pane.height {
+        let (col, glyph) = vt
+            .and_then(|vt| cursor_glyph(vt, pane, state))
+            .unwrap_or((cx, " ".to_string()));
         cursor_block(
             buf,
-            pane.x + cx,
+            pane.x + col,
             pane.y + cy,
+            &glyph,
             theme.status_bg,
             theme.status_fg,
         );
@@ -1108,10 +1112,37 @@ fn highlight_run(
     );
 }
 
-fn cursor_block(buf: &mut Vec<u8>, x: u16, y: u16, fg: Rgb, bg: Rgb) {
+/// The pane column the cursor block starts at, and the glyph it shows. On the
+/// right half of a wide character that is the character's own cell, so the
+/// block covers the whole glyph instead of splitting it.
+fn cursor_glyph(vt: &VirtualTerminal, pane: Rect, state: &CopyModeState) -> Option<(u16, String)> {
+    let (cx, cy) = state.cursor;
+    let row = row_for_view(vt, pane.height, state.scroll_offset, cy)?;
+    let mut col = cx;
+    let mut cell = row.get(col as usize)?;
+    if cell.is_wide_continuation() {
+        col = col.checked_sub(1)?;
+        cell = row.get(col as usize)?;
+    }
+    // A wide glyph with no room for its right half would spill past the pane.
+    if cell.is_wide() && col + 1 >= pane.width {
+        return None;
+    }
+    let text = cell.display_text();
+    Some((
+        col,
+        if text.is_empty() {
+            " ".into()
+        } else {
+            text.into_owned()
+        },
+    ))
+}
+
+fn cursor_block(buf: &mut Vec<u8>, x: u16, y: u16, glyph: &str, fg: Rgb, bg: Rgb) {
     let _ = write!(
         buf,
-        "\x1b[{};{}H{}{} \x1b[0m",
+        "\x1b[{};{}H{}{}{glyph}\x1b[0m",
         y + 1,
         x + 1,
         sgr_bg(bg),
@@ -1488,6 +1519,74 @@ mod tests {
             rendered.contains("\x1b[38;2;30;32;48m"),
             "selection should use dark foreground on accent background"
         );
+    }
+
+    /// Draw the overlay into a fresh VT and read back the cell at `(col, row)`.
+    fn overlay_cell(
+        vt: &VirtualTerminal,
+        pane: Rect,
+        state: &CopyModeState,
+        col: u16,
+        row: u16,
+    ) -> shux_vt::Cell {
+        let mut buf = Vec::new();
+        render_copy_overlay_with_vt_into(&mut buf, pane, vt, state, &Theme::DEFAULT);
+        let mut screen = VirtualTerminal::new(pane.height as usize, pane.width as usize);
+        screen.process(&buf);
+        row_for_view(&screen, pane.height, 0, row)
+            .and_then(|r| r.get(col as usize).cloned())
+            .expect("cell on screen")
+    }
+
+    fn cursor_colours(cell: &shux_vt::Cell) -> (Color, Color) {
+        let (bg, fg) = (Theme::DEFAULT.status_bg, Theme::DEFAULT.status_fg);
+        assert_eq!(
+            (cell.style.fg, cell.style.bg),
+            (Color::Rgb(bg.r, bg.g, bg.b), Color::Rgb(fg.r, fg.g, fg.b)),
+            "the cursor cell is not in the cursor colours"
+        );
+        (cell.style.fg, cell.style.bg)
+    }
+
+    #[test]
+    fn the_copy_cursor_shows_the_glyph_under_it() {
+        let vt = vt_with(
+            3,
+            20,
+            "\x1b[38;2;120;220;180mTRUECOLOR\x1b[0m \x1b[38;5;208mINDEXED\x1b[0m \x1b[34mBASIC\x1b[0m",
+        );
+        let pane = Rect::new(0, 0, 20, 3);
+        let state = CopyModeState {
+            cursor: (0, 0),
+            ..Default::default()
+        };
+        let cell = overlay_cell(&vt, pane, &state, 0, 0);
+        assert_eq!(
+            cell.display_text(),
+            "T",
+            "the cursor blanked the glyph under it"
+        );
+        cursor_colours(&cell);
+    }
+
+    #[test]
+    fn the_copy_cursor_covers_a_wide_glyph_from_either_half() {
+        let vt = vt_with(3, 20, "a漢b");
+        let pane = Rect::new(0, 0, 20, 3);
+        for col in [1, 2] {
+            let state = CopyModeState {
+                cursor: (col, 0),
+                ..Default::default()
+            };
+            let cell = overlay_cell(&vt, pane, &state, 1, 0);
+            assert_eq!(
+                cell.display_text(),
+                "漢",
+                "cursor at col {col} split or blanked the wide glyph"
+            );
+            assert!(cell.is_wide());
+            cursor_colours(&cell);
+        }
     }
 
     #[test]

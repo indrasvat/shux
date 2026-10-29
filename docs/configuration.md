@@ -203,6 +203,10 @@ that). On change:
    `appearance.font_fallbacks` changes, and status-bar runner tears
    down the old segments and respawns with the new list.
 
+Each attached client watches the same file for `[keys]` and `[keybindings]`,
+so a new prefix works in a running attach. A change that does not parse keeps
+the client's previous bindings.
+
 Edits land in <250ms. No restart, no re-attach.
 
 ## Debugging config issues

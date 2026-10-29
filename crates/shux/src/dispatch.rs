@@ -78,9 +78,16 @@ pub(crate) async fn run_attach(
     session_name: String,
 ) -> anyhow::Result<()> {
     let attach_path = daemon::attach_socket_path_for(jsonrpc_socket)?;
-    let cfg_snapshot =
-        shux_core::config::ConfigHandle::load_or_default(&shux_core::config::default_config_path())
-            .current();
+    let cfg_path = shux_core::config::default_config_path();
+    let live_config = shux_core::config::ConfigHandle::load_or_default(&cfg_path);
+    let cfg_snapshot = live_config.current();
+    let stop_reload = tokio_util::sync::CancellationToken::new();
+    tokio::spawn(shux_core::config::run_hot_reload(
+        cfg_path,
+        live_config.clone(),
+        stop_reload.clone(),
+    ));
+    let _stop_reload = stop_reload.drop_guard();
     let cfg = shux_ui::ClientConfig {
         socket_path: attach_path.to_string_lossy().to_string(),
         session_name: session_name.clone(),
@@ -90,6 +97,7 @@ pub(crate) async fn run_attach(
             crossterm::event::KeyModifiers::CONTROL,
         ),
         keybindings: cfg_snapshot.keybindings.clone(),
+        live_config: Some(live_config),
     };
     match shux_ui::attach::run_attach(&attach_path, cfg).await {
         Ok(reason) => {
@@ -201,6 +209,15 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
                 cmd,
                 argv,
             } => {
+                // Before creating: a refusal that left the session behind would
+                // report failure for something that half happened.
+                if !detached && !shux_ui::attach::terminal_available() {
+                    anyhow::bail!(
+                        "`session create` attaches, so it needs a terminal to draw on \
+                         and read keys from. Run it from a terminal, or pass \
+                         `--detached` (`-d`) to create the session without attaching."
+                    );
+                }
                 let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
                 let resolved = name.or(session);
                 let session_name = resolved.clone().unwrap_or_else(default_session_name);

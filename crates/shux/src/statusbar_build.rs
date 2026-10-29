@@ -51,6 +51,9 @@ pub struct StatusBarCtx<'a> {
     /// Most-recent action label + when it fired. Transient overlay.
     /// `None` for the snapshot path (which has no input history).
     pub last_action: Option<(&'a str, Instant)>,
+    /// Why the last action failed. Shown in place of the centre zone, in
+    /// the error colour, until the caller clears it.
+    pub action_error: Option<&'a str>,
 }
 
 /// Human-readable label for an action's transient feedback overlay.
@@ -213,7 +216,14 @@ pub fn build(snap: &SessionGraphSnapshot, theme: &Theme, ctx: &StatusBarCtx<'_>)
                 false,
             ));
 
-            if let Some((label, at)) = ctx.last_action
+            if let Some(error) = ctx.action_error {
+                bar.center.clear();
+                bar.center.push(StatusSegment::styled(
+                    format!(" {error} "),
+                    to_color(theme.status_error),
+                    true,
+                ));
+            } else if let Some((label, at)) = ctx.last_action
                 && at.elapsed() < ACTION_FEEDBACK_DWELL
             {
                 bar.center.clear();
@@ -440,6 +450,7 @@ mod tests {
             client_cols: cols,
             copy_mode_active: false,
             last_action: None,
+            action_error: None,
         }
     }
 
@@ -520,6 +531,29 @@ mod tests {
         // 80 cols, post-dismissal: hint gone, uptime gated at >=120 →
         // right zone is empty (calm, intentional).
         assert!(flat(&bar.right).is_empty());
+    }
+
+    #[test]
+    fn a_failed_action_replaces_the_centre_in_the_error_colour() {
+        let (snap, sid, wid, pid, meta) = fixture();
+        let onb = OnboardingState::default();
+        let mut c = ctx(sid, "project", wid, pid, &meta, &onb, 120);
+        c.last_action = Some(("pane split", Instant::now()));
+        c.action_error = Some("split failed: [shell].command `x`: No such file or directory");
+        let bar = build(&snap, &Theme::DEFAULT, &c);
+        assert_eq!(
+            flat(&bar.center),
+            " split failed: [shell].command `x`: No such file or directory "
+        );
+        let e = Theme::DEFAULT.status_error;
+        assert_eq!(
+            bar.center[0].fg,
+            Some(Color::Rgb {
+                r: e.r,
+                g: e.g,
+                b: e.b
+            })
+        );
     }
 
     #[test]

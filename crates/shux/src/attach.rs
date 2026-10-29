@@ -598,6 +598,12 @@ struct AttachedSession {
     /// kill, copy). None at attach start. Cleared either by the render
     /// loop or by another action overwriting it.
     last_action: Option<(String, std::time::Instant)>,
+    /// Why the last action failed, for the status bar. Cleared by the next
+    /// action or keystroke, so it stays up until the user has moved on.
+    action_error: Option<String>,
+    /// The prefix the client reported with `AttachClientFrame::Prefix`.
+    /// Hints name it; `None` means the daemon config's prefix.
+    client_prefix: Option<String>,
     /// True until the welcome toast has been rendered for its full
     /// dwell (~3s). Render loop flips this to false; we then persist
     /// `welcome_toast_seen: true` via the OnboardingHandle so the next
@@ -635,6 +641,8 @@ async fn resolve_or_create_session(
             mouse_selection: None,
             copy_menu: None,
             last_action: None,
+            client_prefix: None,
+            action_error: None,
             // Whether the toast actually renders is decided at attach
             // time by reading the onboarding state file; this stays
             // true here so the render loop can flip it off after dwell.
@@ -711,6 +719,8 @@ async fn resolve_or_create_session(
         mouse_selection: None,
         copy_menu: None,
         last_action: None,
+        client_prefix: None,
+        action_error: None,
         show_welcome_toast: true,
     })
 }
@@ -993,6 +1003,9 @@ async fn run_attach_loop(
                         // not reach the shell behind the overlay.
                         {
                             let mut s = render_session.lock().await;
+                            if s.action_error.take().is_some() {
+                                io_state.lock().await.render_pulse.notify_one();
+                            }
                             if s.help_visible {
                                 // A paste is text, not keys: swallowed whole.
                                 let dismiss = paste.is_none()
@@ -1216,8 +1229,12 @@ async fn run_attach_loop(
                         )
                         .await;
                         if let Err(e) = &action_result {
-                            warn!(?kind, error = %e, "attach: action failed");
+                            warn!(?kind, error = %format!("{e:#}"), "attach: action failed");
                         }
+                        render_session.lock().await.action_error = action_result
+                            .as_ref()
+                            .err()
+                            .map(|e| format!("{} failed: {e}", action_verb(kind)));
 
                         // Transient command-feedback overlay in the status
                         // bar's center zone. Resolves the "did my keystroke
@@ -1384,6 +1401,11 @@ async fn run_attach_loop(
                         // Action (Ctrl+Space → Escape, etc). The OOTB
                         // hint dismisses forever.
                         onboarding.mark_prefix_discovered().await;
+                    }
+                    AttachClientFrame::Prefix { prefix } => {
+                        render_session.lock().await.client_prefix = Some(prefix);
+                        let pulse = io_state.lock().await.render_pulse.clone();
+                        pulse.notify_one();
                     }
                     AttachClientFrame::Pong => {}
                 }
@@ -1646,7 +1668,12 @@ async fn run_render_loop(
             nerd_fonts,
             &live_theme,
         );
-        let prefix_label = prefix_display(&live_cfg.keys.prefix);
+        let prefix_label = prefix_display(
+            attached
+                .client_prefix
+                .as_deref()
+                .unwrap_or(&live_cfg.keys.prefix),
+        );
         let session_meta = meta_cache.get(attached.session_id).await;
         let onboarding_state = onboarding.current().await;
         let daemon_uptime = daemon_start.elapsed();
@@ -1664,6 +1691,7 @@ async fn run_render_loop(
             client_cols: cols,
             copy_mode_active: attached.copy_mode.is_some(),
             last_action: last_action_ref,
+            action_error: attached.action_error.as_deref(),
         };
         let mut bar = build_status_bar_shared(&snap, &live_theme, &render_ctx);
         populate_bar(&mut bar, &live_cfg, &segments).await;
@@ -1674,8 +1702,9 @@ async fn run_render_loop(
             nerd_fonts,
             cols,
         );
-        if last_action_ref
-            .is_some_and(|(_, at)| at.elapsed() < crate::statusbar_build::ACTION_FEEDBACK_DWELL)
+        if attached.action_error.is_some()
+            || last_action_ref
+                .is_some_and(|(_, at)| at.elapsed() < crate::statusbar_build::ACTION_FEEDBACK_DWELL)
         {
             crate::statusbar_build::make_room_for_notice(&mut bar, cols);
         }
@@ -1781,7 +1810,13 @@ async fn run_render_loop(
         // compositor's diff would skip those positions because they
         // didn't change in the VT grid.
         if attached.help_visible {
-            shux_ui::render_help_overlay_into(compositor.inner_mut(), cols, rows, &live_theme);
+            shux_ui::render_help_overlay_into(
+                compositor.inner_mut(),
+                cols,
+                rows,
+                &live_theme,
+                &prefix_label,
+            );
         }
 
         // Welcome toast (first-attach onboarding). Only fires when the
@@ -1856,6 +1891,15 @@ const RENDER_PART_BYTES: usize = 8 * 1024 * 1024;
 /// auto-dismissing. Tuned for "long enough to read, short enough to
 /// not get in the way".
 const WELCOME_TOAST_DWELL: Duration = Duration::from_secs(3);
+
+/// What the status bar calls an action when it fails: `"<verb> failed: …"`.
+fn action_verb(kind: ActionKind) -> &'static str {
+    match kind {
+        ActionKind::SplitVertical | ActionKind::SplitHorizontal | ActionKind::SplitSmart => "split",
+        ActionKind::NewWindow => "new window",
+        _ => "action",
+    }
+}
 
 // build_status_bar + StatusBarCtx + helpers (action_feedback_label,
 // prefix_display, format_uptime) all live in `crate::statusbar_build`
@@ -3509,10 +3553,10 @@ async fn split(
     .await
     {
         crate::pane_spawn::undo_split(graph, new_pane, prior).await;
-        return Err(anyhow::anyhow!(
-            "{}",
-            crate::pane_spawn::spawn_failure_message(&e)
-        ));
+        return Err(
+            anyhow::anyhow!("{}", crate::pane_spawn::spawn_failure_message(&e))
+                .context(crate::pane_spawn::spawn_failure_notice(&e)),
+        );
     }
     Ok(())
 }
@@ -3743,10 +3787,10 @@ async fn new_window(
     .await
     {
         let _ = graph.destroy_window(window_id, None).await;
-        return Err(anyhow::anyhow!(
-            "{}",
-            crate::pane_spawn::spawn_failure_message(&e)
-        ));
+        return Err(
+            anyhow::anyhow!("{}", crate::pane_spawn::spawn_failure_message(&e))
+                .context(crate::pane_spawn::spawn_failure_notice(&e)),
+        );
     }
 
     // Focus the new window.
@@ -4232,6 +4276,8 @@ mod tests {
             mouse_selection: None,
             copy_menu: None,
             last_action: None,
+            client_prefix: None,
+            action_error: None,
             show_welcome_toast: true,
         };
 

@@ -163,6 +163,13 @@ pub async fn run_attach(socket_path: &Path, config: ClientConfig) -> Result<Exit
 /// bytes, so this bounds what a pane that stopped reading can pile up.
 const PASTE_CHUNK: usize = 64 * 1024;
 
+/// Whether an attach could run here: it draws on stdout and reads keys from
+/// [`input_terminal`]. Raw mode goes through `/dev/tty` whatever stdio is, so
+/// without this an attach with nowhere to draw grabs the terminal anyway.
+pub fn terminal_available() -> bool {
+    std::io::stdout().is_terminal() && input_terminal().is_some()
+}
+
 /// The terminal crossterm reads: stdin when it is one, else `/dev/tty`.
 fn input_terminal() -> Option<OwnedFd> {
     let stdin = std::io::stdin();
@@ -201,8 +208,17 @@ where
     // One-shot — no need to spam the wire on every prefix-arm.
     let mut prefix_announced = false;
     let mut last_size = TerminalGuard::size().unwrap_or((80, 24));
-    let bindings = KeybindingRegistry::with_overrides(&config.prefix, &config.keybindings)
+    let mut bindings = KeybindingRegistry::with_overrides(&config.prefix, &config.keybindings)
         .map_err(|e| anyhow::anyhow!("invalid keybinding config: {e:?}"))?;
+    // Armed before the first read of the keys, as the daemon's listener is.
+    let reload = config
+        .live_config
+        .as_ref()
+        .map(|c| c.change_notify())
+        .unwrap_or_default();
+    let mut reload_listener = Box::pin(reload.notified());
+    let mut keys = (config.prefix.clone(), config.keybindings.clone());
+    send_prefix(&mut sink, &keys.0).await;
 
     // Spawn input reader: poll crossterm events on a blocking thread,
     // forward via channel.
@@ -241,6 +257,28 @@ where
         )]
         let resize_check = tokio::time::sleep(Duration::from_secs(5));
         tokio::select! {
+            () = &mut reload_listener => {
+                reload_listener = Box::pin(reload.notified());
+                let Some(live) = config.live_config.as_ref().map(|c| c.current()) else {
+                    continue;
+                };
+                if (&live.keys.prefix, &live.keybindings) == (&keys.0, &keys.1) {
+                    continue;
+                }
+                // A reload that does not parse keeps the bindings that work.
+                match KeybindingRegistry::with_overrides(&live.keys.prefix, &live.keybindings) {
+                    Ok(next) => {
+                        bindings = next;
+                        let prefix_changed = live.keys.prefix != keys.0;
+                        keys = (live.keys.prefix.clone(), live.keybindings.clone());
+                        if prefix_changed {
+                            send_prefix(&mut sink, &keys.0).await;
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = ?e, "client: reloaded keybindings rejected"),
+                }
+            }
+
             // Server -> terminal.
             frame = stream.next() => {
                 let buf = match frame {
@@ -418,6 +456,20 @@ where
                     }
             }
         }
+    }
+}
+
+/// Tell the daemon which prefix this client uses. Best effort, like input:
+/// a dead connection shows up as the stream ending.
+async fn send_prefix<SinkT>(sink: &mut SinkT, prefix: &str)
+where
+    SinkT: futures::Sink<Bytes> + Unpin,
+{
+    let frame = AttachClientFrame::Prefix {
+        prefix: prefix.to_string(),
+    };
+    if let Ok(bytes) = serde_json::to_vec(&frame) {
+        sink.send(Bytes::from(bytes)).await.ok();
     }
 }
 

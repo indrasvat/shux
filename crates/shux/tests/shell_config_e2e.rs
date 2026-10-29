@@ -553,6 +553,44 @@ fn a_failed_attach_split_or_new_window_leaves_no_phantom() {
     );
 }
 
+/// A keyboard split or new window that fails says why, on the attached screen
+/// (issue #224). The rollback above leaves nothing behind, which is right, and
+/// without a message it is also indistinguishable from a key that never
+/// arrived: the error went to a tracing sink the daemon does not have.
+#[test]
+fn a_failed_attach_split_or_new_window_tells_the_user_why() {
+    let typo = "/usr/bin/shux-issue-224-typo";
+    let mut env = Env::new(&format!("{ATTACH_KEYS}[shell]\ncommand = []\n"), "/bin/sh");
+    let host_pane = env.session_with_argv("host", &["/bin/sh"]);
+    env.session_with_argv("target", &["sleep", "900"]);
+
+    let bin = env.bin.display().to_string();
+    let root = env.root.path().display().to_string();
+    env.send_keys(
+        "host",
+        &format!(
+            "XDG_RUNTIME_DIR={root}/runtime XDG_CONFIG_HOME={root}/config \
+             {bin} session attach target\n"
+        ),
+    );
+    env.wait_for("host", &host_pane, "1 pane");
+    env.break_shell_config(
+        &format!("{ATTACH_KEYS}[shell]\ncommand = [\"{typo}\"]\n"),
+        typo,
+    );
+
+    env.send_keys("host", "\x01v");
+    env.wait_for("host", &host_pane, "split failed");
+    let screen = env.capture("host", &host_pane);
+    assert!(
+        screen.contains("[shell].command"),
+        "the message must point at the setting that broke the spawn:\n{screen}"
+    );
+
+    env.send_keys("host", "\x01c");
+    env.wait_for("host", &host_pane, "new window failed");
+}
+
 /// `(zoomed pane, focused pane)` in the session's active window.
 fn zoom_and_focus(env: &Env, session: &str) -> (Option<String>, Option<String>) {
     let v: serde_json::Value =
