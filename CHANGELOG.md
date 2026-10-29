@@ -1,3 +1,10 @@
+## [0.54.12](https://github.com/indrasvat/shux/compare/v0.54.11...v0.54.12) (2026-10-29)
+
+
+### Bug Fixes
+
+* **attach:** failed-action notice, live prefix in help, glyph under copy cursor; natural-size snapshots ([#230](https://github.com/indrasvat/shux/issues/230)) ([c50bc68](https://github.com/indrasvat/shux/commit/c50bc68f202f62f9d6a4d4336f1897f424495df4))
+
 ## [0.54.11](https://github.com/indrasvat/shux/compare/v0.54.10...v0.54.11) (2026-10-29)
 
 
