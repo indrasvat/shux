@@ -36,6 +36,7 @@ pub mod lens_scratch;
 pub mod onboarding;
 pub mod pane_chrome;
 pub mod pane_command;
+pub mod pane_input;
 pub mod pane_io;
 pub mod pane_record;
 pub mod pane_spawn;

@@ -11,6 +11,7 @@ use std::collections::HashMap;
 
 use tokio::sync::{mpsc, oneshot, watch};
 
+use crate::pane_input::{InputPermit, PaneWriter};
 use crate::pane_record::PaneRecorder;
 
 /// A pane-resize message sent through `PaneIoState::resizers`.
@@ -62,7 +63,7 @@ pub(crate) struct PaneCheckpoint {
 /// Each pane gets a write channel; the read loop is a separate tokio task.
 pub struct PaneIoState {
     /// Per-pane write channels: send bytes to the pane's PTY read/write task.
-    pub writers: HashMap<shux_core::model::PaneId, mpsc::Sender<Vec<u8>>>,
+    pub writers: HashMap<shux_core::model::PaneId, PaneWriter>,
     /// Per-pane resize channels: send `ResizeRequest` to trigger
     /// TIOCSWINSZ + VT resize. Use `ResizeRequest { ack: None }` for
     /// fire-and-forget; `ack: Some(tx)` for synchronous RPCs that must
@@ -252,11 +253,11 @@ impl PaneIoState {
     pub(crate) fn is_current_writer(
         &self,
         pane_id: shux_core::model::PaneId,
-        permit: &mpsc::OwnedPermit<Vec<u8>>,
+        permit: &InputPermit,
     ) -> bool {
         self.writers
             .get(&pane_id)
-            .is_some_and(|tx| permit.same_channel_as_sender(tx))
+            .is_some_and(|tx| permit.is_for(tx))
     }
 
     /// Sends `bytes` to `pane_id` through `permit`, ending an open paste
@@ -264,7 +265,7 @@ impl PaneIoState {
     pub(crate) fn send_outside_paste(
         &mut self,
         pane_id: shux_core::model::PaneId,
-        permit: mpsc::OwnedPermit<Vec<u8>>,
+        permit: InputPermit,
         bytes: Vec<u8>,
     ) {
         if self.is_current_writer(pane_id, &permit) && self.open_paste(pane_id).is_some() {
@@ -275,14 +276,18 @@ impl PaneIoState {
         }
     }
 
-    /// [`Self::send_outside_paste`] without waiting for room. `None` when the
-    /// pane has no writer.
+    /// [`Self::send_outside_paste`] without waiting for room, taking it from
+    /// `lane`. `None` when the pane has no writer.
     pub(crate) fn try_send_outside_paste(
         &mut self,
         pane_id: shux_core::model::PaneId,
         bytes: Vec<u8>,
-    ) -> Option<Result<(), mpsc::error::TrySendError<mpsc::Sender<Vec<u8>>>>> {
-        let permit = self.writers.get(&pane_id)?.clone().try_reserve_owned();
+        lane: crate::pane_input::Lane,
+    ) -> Option<Result<(), mpsc::error::TrySendError<()>>> {
+        let permit = self
+            .writers
+            .get(&pane_id)?
+            .try_reserve_in(bytes.len(), lane);
         Some(permit.map(|permit| self.send_outside_paste(pane_id, permit, bytes)))
     }
 

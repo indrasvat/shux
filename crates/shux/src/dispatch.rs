@@ -3,7 +3,7 @@
 //! `dispatch` is where "CLI == API" (PRD §4.3) is actually true — every arm
 //! resolves its arguments and hands off to a `cli::handle_*` function.
 
-use crate::cli::{Cli, Command, OutputFormat, PaneCommand, WindowCommand};
+use crate::cli::{Cli, Command, PaneCommand, WindowCommand};
 use tracing_subscriber::EnvFilter;
 
 use crate::daemon_boot::handle_daemon_command;
@@ -946,31 +946,7 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
             handle_daemon_command(command, args.format, &socket_path)
         }
 
-        Some(Command::Version) => {
-            // Quick probe — don't auto-start daemon just for version
-            match client::try_connect(&socket_path).await {
-                Ok(mut stream) => cli::handle_version(&mut stream, args.format).await,
-                Err(_) => {
-                    match args.format {
-                        OutputFormat::Json => {
-                            println!(
-                                "{{\"version\": \"{}\", \"git_sha\": \"{}\"}}",
-                                env!("CARGO_PKG_VERSION"),
-                                env!("SHUX_GIT_SHA"),
-                            );
-                        }
-                        OutputFormat::Text | OutputFormat::Plain => {
-                            style::print_version(
-                                env!("CARGO_PKG_VERSION"),
-                                Some(env!("SHUX_GIT_SHA")),
-                                Some("daemon not running"),
-                            );
-                        }
-                    }
-                    Ok(())
-                }
-            }
-        }
+        Some(Command::Version) => cli::handle_version(&socket_path, args.format).await,
 
         Some(Command::Config { command: cfg_cmd }) => match cfg_cmd {
             cli::ConfigCommand::Init { force } => cli::handle_config_init(force),

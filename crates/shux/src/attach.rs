@@ -43,6 +43,7 @@ use shux_rpc::attach::{
 use shux_rpc::create_codec;
 use shux_ui::{BorderStyle, CompositorConfig, MultiPaneFrame, RenderCompositor};
 
+use crate::pane_input::{InputPermit, Lane, PaneWriter};
 use crate::pane_io::{OpenPaste, PASTE_END, PASTE_START, PaneIoState};
 use crate::statusbar_runner::{SegmentCache, populate_bar};
 
@@ -214,7 +215,7 @@ fn frame_input(
 fn send_input(
     state: &mut PaneIoState,
     pane: PaneId,
-    permit: mpsc::OwnedPermit<Vec<u8>>,
+    permit: InputPermit,
     bytes: Vec<u8>,
     paste: Option<(bool, u64)>,
     client: u64,
@@ -253,9 +254,7 @@ fn send_input(
 }
 
 /// Ends every paste this client left open, as a held button is released: no
-/// later key from this client will. An end with no room waits in the
-/// background until the pane reads again or closes, and is not sent if other
-/// input ended the paste first.
+/// later key from this client will.
 async fn close_open_pastes(io_state: &Arc<Mutex<PaneIoState>>, client: u64) {
     let mut state = io_state.lock().await;
     let mine: Vec<PaneId> = state
@@ -272,29 +271,10 @@ async fn close_open_pastes(io_state: &Arc<Mutex<PaneIoState>>, client: u64) {
         let Some(tx) = state.writers.get(&pane).cloned() else {
             continue;
         };
-        match tx.try_reserve_owned() {
-            Ok(permit) => {
-                state.open_pastes.remove(&pane);
-                permit.send(PASTE_END.to_vec());
-            }
-            Err(mpsc::error::TrySendError::Full(tx)) => {
-                let io_state = io_state.clone();
-                tokio::spawn(async move {
-                    let Ok(permit) = tx.reserve_owned().await else {
-                        return;
-                    };
-                    let mut state = io_state.lock().await;
-                    if state.is_current_writer(pane, &permit)
-                        && state
-                            .open_paste(pane)
-                            .is_some_and(|open| open.client == client)
-                    {
-                        state.open_pastes.remove(&pane);
-                        permit.send(PASTE_END.to_vec());
-                    }
-                });
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {}
+        // Urgent input fails only once the pane is gone.
+        if let Ok(permit) = tx.try_reserve_in(PASTE_END.len(), crate::pane_input::Lane::Urgent) {
+            state.open_pastes.remove(&pane);
+            permit.send(PASTE_END.to_vec());
         }
     }
 }
@@ -320,7 +300,7 @@ static NEXT_CLIENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// Room for one chunk of input bound for a pane, and how long the attach
 /// loop waited for it.
 enum Room {
-    Ready(mpsc::OwnedPermit<Vec<u8>>, Duration),
+    Ready(InputPermit, Duration),
     /// The pane had no room within the wait it was allowed.
     Full(Duration),
     /// The pane is gone, or the attach is ending.
@@ -335,13 +315,15 @@ struct InputBacklog {
     dropped: usize,
 }
 
-/// Room in a pane's input channel, waiting at most `budget` for it.
+/// Room for `len` bytes in a pane's input channel, waiting at most `budget`
+/// for it.
 async fn reserve_input(
-    tx: &mpsc::Sender<Vec<u8>>,
+    tx: &PaneWriter,
+    len: usize,
     budget: Duration,
     cancel: &CancellationToken,
 ) -> Room {
-    match tx.clone().try_reserve_owned() {
+    match tx.try_reserve(len) {
         Ok(permit) => return Room::Ready(permit, Duration::ZERO),
         Err(mpsc::error::TrySendError::Closed(_)) => return Room::Closed,
         Err(mpsc::error::TrySendError::Full(_)) if budget.is_zero() => {
@@ -352,7 +334,7 @@ async fn reserve_input(
     let started = tokio::time::Instant::now();
     tokio::select! {
         _ = cancel.cancelled() => Room::Closed,
-        reserved = tokio::time::timeout(budget, tx.clone().reserve_owned()) => match reserved {
+        reserved = tokio::time::timeout(budget, tx.reserve(len)) => match reserved {
             Ok(Ok(permit)) => Room::Ready(permit, started.elapsed()),
             Ok(Err(_)) => Room::Closed,
             Err(_) => Room::Full(started.elapsed()),
@@ -1203,7 +1185,7 @@ async fn run_attach_loop(
                         if let Some(tx) = writer {
                             let backlog = input_backlogs.entry(target).or_default();
                             let budget = INPUT_STALL.saturating_sub(backlog.waited);
-                            match reserve_input(&tx, budget, &cancel).await {
+                            match reserve_input(&tx, bytes.len(), budget, &cancel).await {
                                 // Room the moment it was asked for: caught up.
                                 Room::Ready(permit, waited) => {
                                     backlog.waited = if waited.is_zero() {
@@ -2836,7 +2818,7 @@ async fn release_app_gesture(io_state: &Arc<Mutex<PaneIoState>>, gesture: &mut S
             continue;
         };
         if let Some(bytes) = encode_mouse_report(cb, true, sgr, last.0, last.1) {
-            forward_bytes_to_pane(io_state, pane_id, bytes).await;
+            forward_bytes_to_pane(io_state, pane_id, bytes, Lane::Urgent).await;
         }
     }
 }
@@ -3020,7 +3002,14 @@ async fn handle_app_mouse(
         }
     }
 
-    if !forward_bytes_to_pane(io_state, pane_id, bytes).await {
+    // A release must reach an app that saw its press; motion is worth
+    // dropping.
+    let lane = match action {
+        ButtonAction::Press => Lane::Control,
+        ButtonAction::Release => Lane::Urgent,
+        ButtonAction::Drag => Lane::Main,
+    };
+    if !forward_bytes_to_pane(io_state, pane_id, bytes, lane).await {
         // Dropped on the floor. Opening a gesture now would hand the app a
         // release with no press behind it.
         return Ok(AppMouse::Consumed { redraw });
@@ -3149,8 +3138,8 @@ fn wheel_arrow_seq(up: bool, app_cursor: bool) -> &'static [u8] {
     }
 }
 
-/// Send bytes to a pane's PTY writer without waiting: dropped when the pane
-/// is backpressured. A mouse report is worth less than a held attach loop.
+/// Send bytes to a pane's PTY writer without waiting: dropped when `lane`
+/// has no room. A mouse report is worth less than a held attach loop.
 ///
 /// Returns whether the bytes were actually queued. Button forwarding needs to
 /// know: a press that was dropped must not open a gesture, or the release that
@@ -3159,8 +3148,13 @@ async fn forward_bytes_to_pane(
     io_state: &Arc<Mutex<PaneIoState>>,
     pane_id: PaneId,
     bytes: Vec<u8>,
+    lane: Lane,
 ) -> bool {
-    match io_state.lock().await.try_send_outside_paste(pane_id, bytes) {
+    match io_state
+        .lock()
+        .await
+        .try_send_outside_paste(pane_id, bytes, lane)
+    {
         None => false,
         Some(Ok(())) => true,
         Some(Err(e)) => {
@@ -3247,7 +3241,7 @@ async fn handle_wheel(
             // app's coordinate mode; sending nothing beats sending a tick
             // aimed at a cell the user never touched.
             if let Some(bytes) = encode_mouse_wheel(up, sgr, local_col, local_row) {
-                forward_bytes_to_pane(io_state, pane_id, bytes).await;
+                forward_bytes_to_pane(io_state, pane_id, bytes, Lane::Main).await;
             }
         }
         WheelRouting::ArrowKeys => {
@@ -3256,7 +3250,7 @@ async fn handle_wheel(
             for _ in 0..3 {
                 bytes.extend_from_slice(seq);
             }
-            forward_bytes_to_pane(io_state, pane_id, bytes).await;
+            forward_bytes_to_pane(io_state, pane_id, bytes, Lane::Main).await;
         }
         WheelRouting::Scrollback => {
             // This tier is only reached while copy mode is INACTIVE (an active
@@ -4660,11 +4654,11 @@ mod tests {
         io_state: &Arc<Mutex<PaneIoState>>,
         pane_id: PaneId,
     ) -> (
-        mpsc::Receiver<Vec<u8>>,
+        crate::pane_input::PaneInputRx,
         mpsc::Receiver<crate::pane_io::ResizeRequest>,
         CancellationToken,
     ) {
-        let (writer_tx, writer_rx) = mpsc::channel(8);
+        let (writer_tx, writer_rx) = crate::pane_input::channel_with(8, crate::pane_input::BUDGET);
         let (resize_tx, resize_rx) = mpsc::channel(8);
         let shutdown = CancellationToken::new();
         let mut vt = shux_vt::VirtualTerminal::new(6, 40);
@@ -5728,8 +5722,8 @@ mod tests {
         io_state: &Arc<Mutex<PaneIoState>>,
         pane_id: PaneId,
         setup: &[u8],
-    ) -> mpsc::Receiver<Vec<u8>> {
-        let (writer_tx, writer_rx) = mpsc::channel(64);
+    ) -> crate::pane_input::PaneInputRx {
+        let (writer_tx, writer_rx) = crate::pane_input::channel_with(64, crate::pane_input::BUDGET);
         let (resize_tx, _resize_rx) = mpsc::channel(8);
         let shutdown = CancellationToken::new();
         let mut vt = shux_vt::VirtualTerminal::new(28, 49);
@@ -5745,7 +5739,7 @@ mod tests {
         writer_rx
     }
 
-    async fn recv_bytes(rx: &mut mpsc::Receiver<Vec<u8>>) -> Vec<u8> {
+    async fn recv_bytes(rx: &mut crate::pane_input::PaneInputRx) -> Vec<u8> {
         tokio::time::timeout(shux_testkit::BUDGET, rx.recv())
             .await
             .expect("pane write timeout")
@@ -6175,13 +6169,13 @@ mod tests {
 
     /// Nothing arrived on the pane's writer. `handle_app_mouse` writes with
     /// `try_send` before it returns, so nothing can arrive late.
-    async fn assert_no_bytes(rx: &mut mpsc::Receiver<Vec<u8>>, why: &str) {
+    async fn assert_no_bytes(rx: &mut crate::pane_input::PaneInputRx, why: &str) {
         if let Ok(bytes) = rx.try_recv() {
             panic!("{why}: app received {:?}", String::from_utf8_lossy(&bytes));
         }
     }
 
-    async fn recv_text(rx: &mut mpsc::Receiver<Vec<u8>>) -> String {
+    async fn recv_text(rx: &mut crate::pane_input::PaneInputRx) -> String {
         String::from_utf8_lossy(&recv_bytes(rx).await).into_owned()
     }
 
@@ -6671,7 +6665,7 @@ mod tests {
         let mut h = AppMouseHarness::new().await;
         // A writer with no receiver: `try_send` fails exactly as it does when a
         // pane is backpressured.
-        let (writer_tx, writer_rx) = mpsc::channel(1);
+        let (writer_tx, writer_rx) = crate::pane_input::channel_with(1, crate::pane_input::BUDGET);
         drop(writer_rx);
         {
             let mut st = h.fixture.io_state.lock().await;
@@ -7442,7 +7436,7 @@ mod tests {
     /// at all means everything in flight has landed.
     struct InputHarness {
         fixture: AttachFixture,
-        writer_rx: mpsc::Receiver<Vec<u8>>,
+        writer_rx: crate::pane_input::PaneInputRx,
         client: Client,
     }
 
@@ -7470,7 +7464,8 @@ mod tests {
             tokio::time::advance(Duration::ZERO).await;
             let fixture = attach_fixture().await;
             let _ = seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
-            let (writer_tx, writer_rx) = mpsc::channel(capacity);
+            let (writer_tx, writer_rx) =
+                crate::pane_input::channel_with(capacity, crate::pane_input::BUDGET);
             fixture
                 .io_state
                 .lock()
@@ -7688,7 +7683,7 @@ mod tests {
         let mut h = InputHarness::new(8).await;
         let paste: Vec<u8> = (0..2000u32).map(|i| b'a' + (i % 26) as u8).collect();
 
-        let mut rx = std::mem::replace(&mut h.writer_rx, mpsc::channel(1).1);
+        let mut rx = std::mem::replace(&mut h.writer_rx, crate::pane_input::channel_with(1, 1).1);
         let want = paste.len();
         let reader = tokio::spawn(async move {
             let mut got = Vec::with_capacity(want);
@@ -7769,7 +7764,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_pane_that_reads_too_slowly_cannot_hold_detach_behind_a_paste() {
         let mut h = InputHarness::new(1).await;
-        let mut rx = std::mem::replace(&mut h.writer_rx, mpsc::channel(1).1);
+        let mut rx = std::mem::replace(&mut h.writer_rx, crate::pane_input::channel_with(1, 1).1);
         let reader = tokio::spawn(async move {
             while rx.recv().await.is_some() {
                 #[expect(
@@ -7798,7 +7793,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn two_stuck_panes_each_cost_one_wait() {
         let mut h = InputHarness::new(1).await;
-        let (second_tx, _second_rx) = mpsc::channel(1);
+        let (second_tx, _second_rx) = crate::pane_input::channel_with(1, crate::pane_input::BUDGET);
         h.fixture
             .io_state
             .lock()
@@ -8306,5 +8301,75 @@ mod tests {
             "the pane was left inside a paste"
         );
         h.stop().await;
+    }
+
+    /// Drives a press, a long drag and a release through `channel` into a
+    /// pane whose app has stopped reading, and returns the mouse reports the
+    /// app would read. With `full`, every budget is spent first: the main one
+    /// before the press, the control lane after it.
+    async fn drag_over_a_stalled_app(
+        (writer_tx, mut wr): (PaneWriter, crate::pane_input::PaneInputRx),
+        full: bool,
+    ) -> Vec<String> {
+        let mut h = AppMouseHarness::new().await;
+        let mut size = 1 << 20;
+        while full && size > 0 {
+            if writer_tx.try_send(vec![b'x'; size]).is_err() {
+                size /= 2;
+            }
+        }
+        let mut vt = shux_vt::VirtualTerminal::new(28, 49);
+        vt.process(b"\x1b[?1002h\x1b[?1006h");
+        {
+            let mut state = h.fixture.io_state.lock().await;
+            state
+                .writers
+                .insert(h.fixture.first_pane, writer_tx.clone());
+            state.vts.insert(h.fixture.first_pane, vt);
+        }
+        h.send(MouseKind::Down, ProtoMouseButton::Left, 10, 5).await;
+        while full && let Ok(permit) = writer_tx.try_reserve_in(1, Lane::Control) {
+            permit.send(b"x".to_vec());
+        }
+        for i in 0..3000u16 {
+            h.send(MouseKind::Drag, ProtoMouseButton::Left, 10 + i % 30, 5)
+                .await;
+        }
+        h.send(MouseKind::Up, ProtoMouseButton::Left, 12, 5).await;
+        let mut got = Vec::new();
+        while let Ok(bytes) = wr.try_recv() {
+            if !bytes.starts_with(b"x") {
+                got.push(String::from_utf8_lossy(&bytes).into_owned());
+            }
+        }
+        h.fixture.stop();
+        got
+    }
+
+    /// A drag held over an app that has stopped reading must not use up the
+    /// room its release needs, whether the channel's slots or its budgets run
+    /// out first: an app given the press and the drags but not the release
+    /// sits button-held once it reads again.
+    #[tokio::test]
+    async fn a_long_drag_over_an_app_that_stopped_reading_still_delivers_its_release() {
+        let spare_slots = || crate::pane_input::channel_with(8192, crate::pane_input::BUDGET);
+        for (case, channel, full) in [
+            ("slots to spare", spare_slots(), false),
+            ("budgets spent", spare_slots(), true),
+            ("production slots", crate::pane_input::channel(), false),
+        ] {
+            let got = drag_over_a_stalled_app(channel, full).await;
+            assert_eq!(
+                got.first().map(String::as_str),
+                Some("\x1b[<0;10;5M"),
+                "{case}: the press was dropped"
+            );
+            assert_eq!(
+                got.last().map(String::as_str),
+                Some("\x1b[<0;12;5m"),
+                "{case}: the app got the press and {} reports but no release",
+                got.len().saturating_sub(1)
+            );
+        }
     }
 }

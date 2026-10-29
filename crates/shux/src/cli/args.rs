@@ -131,7 +131,11 @@ pub enum Command {
         command: RpcCommand,
     },
 
-    /// Print version information
+    /// Print this CLI's version and the running daemon's, flagging a mismatch
+    ///
+    /// Never starts or replaces a daemon. `--format json` gives `cli`,
+    /// `daemon` (null when none runs) and `mismatch`; `--format plain` gives
+    /// tab-separated `cli` and `daemon` lines.
     Version,
 
     /// The background daemon that owns every session, pane, and PTY.

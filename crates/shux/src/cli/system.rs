@@ -55,34 +55,117 @@ pub async fn handle_api(
     }
 }
 
-/// Handle the `shux version` command.
+/// Handle the `shux version` command: this CLI's build, and the daemon's
+/// beside it when one serves `socket_path`. Never starts a daemon.
 pub async fn handle_version(
-    stream: &mut tokio::net::UnixStream,
+    socket_path: &std::path::Path,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
-    let result = rpc_call(
-        stream,
-        "system.version",
-        serde_json::Value::Object(Default::default()),
-    )
-    .await?;
+    use crate::client::{DaemonAnswer, VERSION_CHECK_TIMEOUT};
+
+    let cli = (env!("CARGO_PKG_VERSION"), env!("SHUX_GIT_SHA"));
+    // `daemon`: `None` when no daemon serves the socket, `Err` when one is
+    // there but did not say which build. `mismatch`: whether it is not this
+    // build, as far as it said.
+    let (daemon, mismatch) = match crate::client::ask_daemon_version(socket_path).await {
+        DaemonAnswer::Absent => (None, None),
+        DaemonAnswer::Answered(dv) => {
+            let stale = !dv.is_current();
+            (Some(Ok(dv)), Some(stale))
+        }
+        DaemonAnswer::Unreadable => (
+            Some(Err((
+                "unreadable",
+                "it did not say which build it is".to_string(),
+            ))),
+            Some(true),
+        ),
+        DaemonAnswer::Unresponsive => (
+            Some(Err((
+                "unresponsive",
+                format!(
+                    "it did not answer within {}s",
+                    VERSION_CHECK_TIMEOUT.as_secs()
+                ),
+            ))),
+            None,
+        ),
+        DaemonAnswer::Unreachable(e) => (Some(Err(("unreachable", e.to_string()))), None),
+    };
 
     match format {
         OutputFormat::Json => {
+            let daemon = match &daemon {
+                None => serde_json::Value::Null,
+                Some(Ok(dv)) => serde_json::json!({
+                    "status": "running",
+                    "version": dv.version,
+                    "git_sha": dv.git_sha,
+                }),
+                Some(Err((status, error))) => serde_json::json!({
+                    "status": status,
+                    "version": null,
+                    "git_sha": null,
+                    "error": error,
+                }),
+            };
+            let envelope = serde_json::json!({
+                "name": "shux",
+                "version": cli.0,
+                "git_sha": cli.1,
+                "cli": {"version": cli.0, "git_sha": cli.1},
+                "daemon": daemon,
+                "mismatch": mismatch,
+            });
             println!(
                 "{}",
-                crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+                crate::style::json_safe(&serde_json::to_string_pretty(&envelope)?)
             );
         }
-        OutputFormat::Text | OutputFormat::Plain => {
-            let version = result
-                .get("version")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            let git_sha = result.get("git_sha").and_then(|v| v.as_str());
-            crate::style::print_version(version, git_sha, None);
+        OutputFormat::Plain => {
+            let (status, found) = match &daemon {
+                None => ("not-running", None),
+                Some(Ok(dv)) => ("running", Some((dv.version.as_str(), dv.git_sha.as_str()))),
+                Some(Err((status, _))) => (*status, None),
+            };
+            crate::style::print_version_plain(cli, status, found, mismatch);
+        }
+        OutputFormat::Text => {
+            crate::style::print_version(
+                cli.0,
+                Some(cli.1),
+                daemon.is_none().then_some("daemon not running"),
+            );
+            // Only a shux daemon process is stopped and replaced; anything else
+            // on the socket makes the next command refuse instead.
+            let next = || {
+                if crate::daemon_boot::our_live_daemon(socket_path).is_some() {
+                    "the next shux command restarts it, ending its sessions"
+                } else {
+                    "no shux daemon process serves this socket, so shux commands \
+                     refuse to run until whatever serves it is stopped"
+                }
+            };
+            match &daemon {
+                None => {}
+                Some(Ok(dv)) => {
+                    let note = (mismatch == Some(true))
+                        .then(|| format!("differs from this CLI; {}", next()));
+                    crate::style::print_daemon_version(
+                        Some((&dv.version, &dv.git_sha)),
+                        note.as_deref(),
+                    );
+                }
+                Some(Err((_, error))) => {
+                    let note = if mismatch == Some(true) {
+                        format!("{error}; {}", next())
+                    } else {
+                        error.clone()
+                    };
+                    crate::style::print_daemon_version(None, Some(&note));
+                }
+            }
         }
     }
-
     Ok(())
 }

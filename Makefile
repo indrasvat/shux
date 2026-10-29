@@ -751,7 +751,7 @@ fmt: ## Format all code
 	@echo "$(COLOR_GREEN)✓ Formatting complete$(COLOR_RESET)"
 
 .PHONY: check-after-hygiene
-check-after-hygiene: lint shellcheck check-test-sleeps check-darwin test check-test-groups check-test-inventory check-ci-parity test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-lens-frozen check-no-bin-mods check-vt-corpus-scratch
+check-after-hygiene: lint shellcheck check-test-sleeps check-darwin test check-test-groups check-test-inventory check-ci-parity test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-lens-frozen check-no-bin-mods check-action-pins check-vt-corpus-scratch
 
 .PHONY: check
 check: hooks-check check-target-hygiene ## Run lint + test + process/QA guards (what pre-commit runs)
@@ -763,7 +763,7 @@ check: hooks-check check-target-hygiene ## Run lint + test + process/QA guards (
 	@echo ""
 
 .PHONY: ci
-ci: lint shellcheck check-test-sleeps check-darwin test check-test-groups check-test-inventory check-ci-parity test-doc test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-no-bin-mods check-vt-corpus-scratch ## Run the CI pipeline locally (lint + full test + doc tests + process/QA guards)
+ci: lint shellcheck check-test-sleeps check-darwin test check-test-groups check-test-inventory check-ci-parity test-doc test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-no-bin-mods check-action-pins check-vt-corpus-scratch ## Run the CI pipeline locally (lint + full test + doc tests + process/QA guards)
 	@echo ""
 	@echo "$(COLOR_GREEN)$(COLOR_BOLD)✓ CI pipeline passed!$(COLOR_RESET)"
 	@echo ""
@@ -824,6 +824,13 @@ check-tui-qa: ## Verify tracked general TUI QA evidence manifests
 .PHONY: check-gate-docs
 check-gate-docs: ## Verify the lens-gate skill reference matches the shipped CLI + THIRD-PARTY-NOTICES
 	@bash scripts/check-gate-docs.sh
+
+.PHONY: check-action-pins
+# PINS_BASH=/bin/bash runs both under macOS's Bash 3.2, as CI's macOS job does.
+PINS_BASH ?= bash
+check-action-pins: ## Every third-party GitHub Action is pinned to a commit SHA (PINS_BASH)
+	@$(PINS_BASH) scripts/check-action-pins-selftest.sh
+	@$(PINS_BASH) scripts/check-action-pins.sh
 
 .PHONY: check-no-bin-mods
 check-no-bin-mods: ## Assert crates/shux/src/main.rs declares no modules (lib/bin double-compile)

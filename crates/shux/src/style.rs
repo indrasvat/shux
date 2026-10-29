@@ -1296,6 +1296,42 @@ pub fn print_version(version: &str, git_sha: Option<&str>, daemon_status: Option
     let _ = writeln!(out);
 }
 
+/// Print the daemon's line of `shux version`, under the CLI's: its build when
+/// it said, and `note` as a warning. The daemon's words are escaped.
+pub fn print_daemon_version(found: Option<(&str, &str)>, note: Option<&str>) {
+    let mut out = io::stdout().lock();
+    let _ = write!(out, "{}", accent("daemon"));
+    if let Some((version, sha)) = found {
+        let _ = write!(out, " {}", bold(safe_label(version)));
+        let _ = write!(out, " {}", muted(format!("({})", safe_label(sha))));
+    }
+    if let Some(note) = note {
+        let _ = write!(out, " {}", warning(format!("[{}]", safe_label(note))));
+    }
+    let _ = writeln!(out);
+}
+
+/// `shux version --format plain`: `cli<TAB>version<TAB>sha`, then
+/// `daemon<TAB>status<TAB>version<TAB>sha<TAB>match`, `-` where unknown.
+pub fn print_version_plain(
+    cli: (&str, &str),
+    status: &str,
+    daemon: Option<(&str, &str)>,
+    mismatch: Option<bool>,
+) {
+    let mut out = io::stdout().lock();
+    let _ = writeln!(out, "cli\t{}\t{}", cli.0, cli.1);
+    let (version, sha) = daemon.map_or(("-".into(), "-".into()), |(v, s)| {
+        (safe_label(v), safe_label(s))
+    });
+    let matched = match mismatch {
+        Some(true) => "mismatch",
+        Some(false) => "match",
+        None => "-",
+    };
+    let _ = writeln!(out, "daemon\t{status}\t{version}\t{sha}\t{matched}");
+}
+
 /// Print a success confirmation with ✓ prefix and short ID.
 pub fn print_success(action: &str, subject: &str, id: Option<&str>) {
     let mut out = io::stdout().lock();

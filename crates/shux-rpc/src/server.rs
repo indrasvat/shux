@@ -625,7 +625,7 @@ where
                     debug!("client disconnected mid-request; dropping in-flight handler");
                     break;
                 }
-                response = process_frame(&data, &router) => response,
+                response = process_frame(data, &router) => response,
             };
             let response_bytes = serde_json::to_vec(&response)?;
             framed_tx.send(Bytes::from(response_bytes)).await?;
@@ -646,23 +646,34 @@ where
     result
 }
 
-/// Process a single frame: parse JSON-RPC, dispatch, return response.
-async fn process_frame(data: &[u8], router: &Router) -> JsonRpcResponse {
-    // Parse JSON.
+/// Process a single frame: parse JSON-RPC, dispatch, return response. The
+/// frame is dropped once parsed, not kept while the handler runs, which may be
+/// waiting for room in a pane's input.
+async fn process_frame(data: impl AsRef<[u8]>, router: &Router) -> JsonRpcResponse {
+    let request = parse_request(data.as_ref());
+    drop(data);
+    match request {
+        Ok(request) => dispatch_request(request, router).await,
+        Err(response) => *response,
+    }
+}
+
+/// A frame's request, or the error response it gets instead.
+fn parse_request(data: &[u8]) -> Result<JsonRpcRequest, Box<JsonRpcResponse>> {
     let request: JsonRpcRequest = match serde_json::from_slice(data) {
         Ok(req) => req,
         Err(e) => {
             warn!(error = %e, "failed to parse JSON-RPC request");
-            return JsonRpcResponse::error(
+            return Err(Box::new(JsonRpcResponse::error(
                 None,
                 RpcError::with_message(ErrorCode::ParseError, format!("JSON parse error: {e}")),
-            );
+            )));
         }
     };
 
     // Validate JSON-RPC version.
     if request.jsonrpc != "2.0" {
-        return JsonRpcResponse::error(
+        return Err(Box::new(JsonRpcResponse::error(
             request.id,
             RpcError::with_data(
                 ErrorCode::InvalidRequest,
@@ -671,10 +682,12 @@ async fn process_frame(data: &[u8], router: &Router) -> JsonRpcResponse {
                     "got": request.jsonrpc
                 }),
             ),
-        );
+        )));
     }
+    Ok(request)
+}
 
-    // Dispatch to router.
+async fn dispatch_request(request: JsonRpcRequest, router: &Router) -> JsonRpcResponse {
     match router.dispatch(&request.method, request.params).await {
         Ok(result) => JsonRpcResponse::success(request.id, result),
         Err(error) => JsonRpcResponse::error(request.id, error),

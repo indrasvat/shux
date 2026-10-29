@@ -510,7 +510,6 @@ pub async fn handle_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::system::*;
     use crate::cli::test_support::*;
 
     #[test]
@@ -630,7 +629,6 @@ mod tests {
             serde_json::json!({"id": sid, "name": "renamed"}),
             session_list_response(sid, wid), // save: resolve -s
             serde_json::json!({"template": template}),
-            serde_json::json!({"version": "0.26.0", "git_sha": "abc123"}),
         ]);
 
         handle_ls(&mut client, false, OutputFormat::Json)
@@ -658,9 +656,6 @@ mod tests {
             .await
             .unwrap();
         handle_session_save(&mut client, "dev", None).await.unwrap();
-        handle_version(&mut client, OutputFormat::Json)
-            .await
-            .unwrap();
 
         let requests = finish_rpc_script(client, task, requests).await;
         assert_eq!(requests[0]["method"], "session.list");
@@ -690,6 +685,5 @@ mod tests {
         assert_eq!(requests[6]["method"], "session.list");
         assert_eq!(requests[7]["method"], "session.export_template");
         assert_eq!(requests[7]["params"]["id"], sid);
-        assert_eq!(requests[8]["method"], "system.version");
     }
 }

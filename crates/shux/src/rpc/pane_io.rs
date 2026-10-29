@@ -43,7 +43,7 @@ async fn send_to_pane(
         .cloned()
         .ok_or_else(|| shux_rpc::RpcError::not_found("pane PTY", &pane_id.to_string()))?;
     let permit = writer
-        .reserve_owned()
+        .reserve(bytes.len())
         .await
         .map_err(|_| shux_rpc::RpcError::internal("PTY write channel closed"))?;
     io.lock().await.send_outside_paste(pane_id, permit, bytes);
@@ -217,6 +217,8 @@ pub(crate) fn register_pane_io_methods(
                         ));
                     };
 
+                    // Not held while waiting for room: it is a second copy.
+                    drop(params);
                     let len = bytes.len();
                     send_to_pane(&io, pane_id, bytes).await?;
 
@@ -273,7 +275,7 @@ pub(crate) fn register_pane_io_methods(
                         )
                     };
 
-                    // Write the PTY command
+                    drop(params);
                     send_to_pane(&io, pane_id, pty_command.into_bytes()).await?;
 
                     if is_async {
@@ -372,10 +374,14 @@ pub(crate) fn register_pane_io_methods(
                         .ok_or_else(|| shux_rpc::RpcError::not_found("command", cmd_id_str))?;
 
                     // Ctrl-C, without waiting: a pane whose input is backed
-                    // up must not hold this lock.
+                    // up must not hold this lock, and urgent input skips it.
                     let pane_id = shux_core::model::PaneId::from_uuid(pane_uuid);
-                    if let Some(Err(_)) = state.try_send_outside_paste(pane_id, vec![0x03]) {
-                        tracing::warn!(%pane_id, "pane input is backed up; Ctrl-C not delivered");
+                    if let Some(Err(_)) = state.try_send_outside_paste(
+                        pane_id,
+                        vec![0x03],
+                        crate::pane_input::Lane::Urgent,
+                    ) {
+                        tracing::warn!(%pane_id, "pane is gone; Ctrl-C not delivered");
                     }
                     drop(state);
 

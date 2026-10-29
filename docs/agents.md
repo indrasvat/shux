@@ -62,7 +62,7 @@ print(rpc(s, "system.version"))
 
 | Method | What it does | CLI mirror |
 |---|---|---|
-| `system.version` | Daemon version + git SHA | `shux version` |
+| `system.version` | Daemon version + git SHA | `shux rpc call system.version` (`shux version` shows the CLI's and the daemon's) |
 | `system.health` | Daemon health probe | — |
 | `session.list` | All sessions, sorted by created_at | `shux session list` |
 | `session.create` | Create session, optionally with a command and initial pane title. CLI mirror sends caller cwd by default. | `shux session create X --title X` |

@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 
+use crate::pane_input::{PaneInput, PaneInputRx};
 use crate::pane_io::{PASTE_END, PASTE_START, PaneIoState, PaneRevision, ResizeRequest};
 use crate::pane_record::{
     PaneRecorder, finish_pane_recorders, tee_pane_recorders, tee_pane_resize_recorders,
@@ -26,7 +27,7 @@ enum PtyTaskExit {
 struct PtyTaskControl {
     /// See [`PaneIoState::incarnations`].
     incarnation: u64,
-    write_rx: mpsc::Receiver<Vec<u8>>,
+    write_rx: PaneInputRx,
     resize_rx: mpsc::Receiver<ResizeRequest>,
     shutdown: tokio_util::sync::CancellationToken,
     done_tx: oneshot::Sender<()>,
@@ -36,15 +37,14 @@ struct PtyTaskControl {
 /// Everything bound for the program's input, in order: terminal replies
 /// (DA1, DSR, OSC 7501 probes) and user input. Replies go between input
 /// chunks, never inside one or inside a bracketed paste. A reply that does
-/// not fit is dropped whole; input is never dropped — the loop stops taking
-/// more until the program reads.
+/// not fit is dropped whole; input is never dropped. Input is bounded where
+/// it is sent: each chunk holds its pane's budget until it is written.
 #[derive(Default)]
 struct PtyInputQueue {
     replies: std::collections::VecDeque<u8>,
-    input: std::collections::VecDeque<Vec<u8>>,
+    input: std::collections::VecDeque<PaneInput>,
     /// Bytes of `input.front()` already written.
     written: usize,
-    input_len: usize,
     /// The input written so far left the program inside a bracketed paste.
     in_paste: bool,
 }
@@ -52,8 +52,8 @@ struct PtyInputQueue {
 impl PtyInputQueue {
     /// Replies stop queueing early: a program that ignores them gets none.
     const CAP: usize = 4096;
-    /// Input queued past this waits in the pane's channel instead.
-    const INPUT_CAP: usize = 1 << 20;
+    /// Queue capacity kept once the queue drains after a flood of chunks.
+    const KEEP: usize = 64;
 
     fn push(&mut self, reply: &[u8]) -> bool {
         if self.replies.len() + reply.len() > Self::CAP {
@@ -63,15 +63,10 @@ impl PtyInputQueue {
         true
     }
 
-    fn push_input(&mut self, data: Vec<u8>) {
-        if !data.is_empty() {
-            self.input_len += data.len();
+    fn push_input(&mut self, data: PaneInput) {
+        if !data.bytes.is_empty() {
             self.input.push_back(data);
         }
-    }
-
-    fn takes_input(&self) -> bool {
-        self.input_len < Self::INPUT_CAP
     }
 
     /// Nothing to write now: replies held for a paste's end wait for input.
@@ -88,7 +83,7 @@ impl PtyInputQueue {
         if self.replying() {
             self.replies.make_contiguous()
         } else {
-            self.input.front().map_or(&[], |c| &c[self.written..])
+            self.input.front().map_or(&[], |c| &c.bytes[self.written..])
         }
     }
 
@@ -99,9 +94,13 @@ impl PtyInputQueue {
             return;
         }
         self.written += n;
-        self.input_len -= n;
-        if self.input.front().is_some_and(|c| c.len() == self.written) {
+        let Some(front) = self.input.front_mut() else {
+            return;
+        };
+        front.wrote(n);
+        if front.bytes.len() == self.written {
             if let Some(chunk) = self.input.pop_front() {
+                let chunk = &chunk.bytes;
                 let last = |marker: &[u8]| chunk.windows(marker.len()).rposition(|w| w == marker);
                 match (last(PASTE_START), last(PASTE_END)) {
                     (Some(start), end) if end.is_none_or(|end| start > end) => self.in_paste = true,
@@ -110,6 +109,9 @@ impl PtyInputQueue {
                 }
             }
             self.written = 0;
+            if self.input.is_empty() {
+                self.input.shrink_to(Self::KEEP);
+            }
         }
     }
 }
@@ -355,32 +357,8 @@ async fn run_pane_pty_task(
                     }
                 }
             }
-            // Bounded: past the cap, senders wait instead of input being lost.
-            res = write_rx.recv(), if pending.takes_input() => {
-                let Some(data) = res else {
-                    // Sender dropped -- the pane was destroyed.
-                    // Exit so we can kill() the child shell.
-                    tracing::debug!(%pane_id, "writer channel closed");
-                    task_exit = PtyTaskExit::RequestedTeardown;
-                    break;
-                };
-                pending.push_input(data);
-            }
-            // Waits for room, never blocks the loop: a program that stops
-            // reading cannot stop this loop reading output or seeing a cancel.
-            res = input.write_some(pending.next()), if !pending.is_empty() => {
-                match res {
-                    Ok(0) => {
-                        tracing::error!(%pane_id, "PTY write took nothing");
-                        break;
-                    }
-                    Ok(n) => pending.consume(n),
-                    Err(e) => {
-                        tracing::error!(%pane_id, error = %e, "PTY write error");
-                        break;
-                    }
-                }
-            }
+            // Ahead of input: a queue that keeps the write branch ready must
+            // not hold a resize back until it drains.
             res = resize_rx.recv() => {
                 let req = match res {
                     Some(r) => r,
@@ -463,8 +441,36 @@ async fn run_pane_pty_task(
                     .await;
                 }
             }
+            // Unconditional: input is bounded where it is sent.
+            res = write_rx.recv_input() => {
+                let Some(data) = res else {
+                    // Sender dropped -- the pane was destroyed.
+                    // Exit so we can kill() the child shell.
+                    tracing::debug!(%pane_id, "writer channel closed");
+                    task_exit = PtyTaskExit::RequestedTeardown;
+                    break;
+                };
+                pending.push_input(data);
+            }
+            // Waits for room, never blocks the loop: a program that stops
+            // reading cannot stop this loop reading output or seeing a cancel.
+            res = input.write_some(pending.next()), if !pending.is_empty() => {
+                match res {
+                    Ok(0) => {
+                        tracing::error!(%pane_id, "PTY write took nothing");
+                        break;
+                    }
+                    Ok(n) => pending.consume(n),
+                    Err(e) => {
+                        tracing::error!(%pane_id, error = %e, "PTY write error");
+                        break;
+                    }
+                }
+            }
         }
     }
+    // Before the reap: senders waiting for room learn now that none will come.
+    drop((write_rx, pending));
     // A program's last words, staged inside the final interval.
     if task_exit == PtyTaskExit::Natural {
         staged.publish(&graph, pane_id);
@@ -1033,7 +1039,7 @@ async fn spawn_pane_pty_unshared(
     let input = handle.input_writer()?;
     let pid = handle.pid();
 
-    let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(256);
+    let (write_tx, write_rx) = crate::pane_input::channel();
     let (resize_tx, resize_rx) = mpsc::channel::<ResizeRequest>(16);
     let (done_tx, done_rx) = oneshot::channel::<()>();
     let pane_shutdown = shutdown.child_token();
@@ -1571,6 +1577,80 @@ mod tests {
         }
     }
 
+    /// A program that reads nothing holds senders back once a bounded number
+    /// of bytes waits for it, however few messages carry them, and a held
+    /// sender goes through once the program reads again (#198).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn input_for_a_pane_that_reads_nothing_is_bounded_in_bytes() {
+        const CHUNK: usize = 1 << 20;
+        // The 16 MiB budget plus the kernel's own buffer, with room to spare.
+        const BOUND: usize = 32 << 20;
+        let h = crate::rpc::test_harness::RpcHarness::new();
+        let (_s, _w, pane) = h.seed_session("backlog").await;
+        let dir = tempfile::tempdir().unwrap();
+        let gate = dir.path().join("gate");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&gate)
+            .status()
+            .unwrap();
+        assert!(made.success(), "mkfifo failed");
+        // Raw mode: a canonical-mode tty discards input past a full line
+        // instead of pushing back, which would drain the queue.
+        let script = format!(
+            "stty raw -echo; printf 'REA%sDY' ''; read -r _ < '{}'; exec cat > /dev/null",
+            gate.display()
+        );
+        spawn_pane_pty_unshared(
+            pane,
+            "/tmp".into(),
+            vec!["bash".into(), "-c".into(), script],
+            shux_pty::handle::PtySize::default(),
+            Vec::new(),
+            false,
+            h.io.clone(),
+            h.cancel.clone(),
+            h.graph.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        let io = &h.io;
+        shux_testkit::wait_for_async("READY", || async {
+            io.lock().await.vts[&pane]
+                .capture_text(None)
+                .contains("READY")
+                .then_some(())
+        })
+        .await;
+
+        let writer = h.io.lock().await.writers[&pane].clone();
+        let mut queued = 0;
+        loop {
+            match writer.try_send(vec![b'x'; CHUNK]) {
+                Ok(()) => queued += CHUNK,
+                Err(mpsc::error::TrySendError::Full(_)) => break,
+                Err(mpsc::error::TrySendError::Closed(_)) => panic!("the pane closed"),
+            }
+            assert!(
+                queued <= BOUND,
+                "{} MiB queued for a program that reads nothing, and senders are not held back",
+                queued >> 20
+            );
+        }
+
+        let held = tokio::spawn({
+            let writer = writer.clone();
+            async move { writer.send(b"last".to_vec()).await }
+        });
+        std::fs::write(&gate, b"go\n").unwrap();
+        tokio::time::timeout(shux_testkit::BUDGET, held)
+            .await
+            .expect("the held sender goes through once the program reads")
+            .unwrap()
+            .unwrap();
+        h.stop().await;
+    }
+
     /// A recorder the successor armed at spawn belongs to the successor; the
     /// replaced task's exit must not finish it.
     #[tokio::test(flavor = "multi_thread")]
@@ -1692,8 +1772,8 @@ mod tests {
     #[test]
     fn a_reply_waits_for_the_input_chunk_being_written() {
         let mut q = PtyInputQueue::default();
-        q.push_input(b"hello".to_vec());
-        q.push_input(b"world".to_vec());
+        q.push_input(b"hello".to_vec().into());
+        q.push_input(b"world".to_vec().into());
         let mut sent = write(&mut q, 2);
         assert!(q.push(b"\x1b[0n"));
         sent.extend(write(&mut q, usize::MAX));
@@ -1706,10 +1786,10 @@ mod tests {
     #[test]
     fn a_reply_waits_for_the_paste_being_written_to_end() {
         let mut q = PtyInputQueue::default();
-        q.push_input(b"k\x1b[200~a".to_vec());
-        q.push_input(b"b".to_vec());
-        q.push_input(b"c\x1b[201~".to_vec());
-        q.push_input(b"d".to_vec());
+        q.push_input(b"k\x1b[200~a".to_vec().into());
+        q.push_input(b"b".to_vec().into());
+        q.push_input(b"c\x1b[201~".to_vec().into());
+        q.push_input(b"d".to_vec().into());
         let mut sent = write(&mut q, 9);
         assert!(q.push(b"\x1b[0n"));
         sent.extend(write(&mut q, usize::MAX));
@@ -1721,24 +1801,31 @@ mod tests {
 
         // A paste whose end has not come yet holds the reply, with nothing
         // for the loop to write meanwhile.
-        q.push_input(b"\x1b[200~e".to_vec());
+        q.push_input(b"\x1b[200~e".to_vec().into());
         let mut sent = write(&mut q, usize::MAX);
         assert!(q.push(b"\x1b[0n"));
         assert!(q.is_empty(), "a held reply left the loop a write to make");
-        q.push_input(b"\x1b[201~x".to_vec());
+        q.push_input(b"\x1b[201~x".to_vec().into());
         sent.extend(write(&mut q, usize::MAX));
         assert_eq!(sent, b"\x1b[200~e\x1b[201~x\x1b[0n");
     }
 
-    #[test]
-    fn input_is_never_dropped_only_held_back_past_the_cap() {
+    /// The budget comes back as the program reads, before the chunk ends, so
+    /// one large chunk does not hold every sender back until its last byte.
+    #[tokio::test]
+    async fn input_is_never_dropped_only_held_back_past_the_cap() {
+        let (tx, mut rx) = crate::pane_input::channel_with(8, 1000);
+        tx.try_send(vec![b'p'; 900]).unwrap();
         let mut q = PtyInputQueue::default();
-        q.push_input(vec![b'p'; PtyInputQueue::INPUT_CAP + 10]);
-        assert!(!q.takes_input(), "input piled up past the cap");
-        let sent = write(&mut q, 20);
-        assert!(q.takes_input(), "room freed by the program reading");
+        q.push_input(rx.recv_input().await.unwrap());
+        assert!(
+            tx.try_send(vec![b'q'; 100]).is_err(),
+            "unwritten input fits the budget"
+        );
+        let sent = write(&mut q, 200);
+        tx.try_send(vec![b'q'; 100]).unwrap();
         let rest = write(&mut q, usize::MAX);
-        assert_eq!(sent.len() + rest.len(), PtyInputQueue::INPUT_CAP + 10);
+        assert_eq!(sent.len() + rest.len(), 900, "input is never dropped");
     }
 
     #[test]
