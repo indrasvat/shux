@@ -25,7 +25,6 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
-use tokio::net::UnixStream;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
@@ -409,10 +408,16 @@ fn pane_awaits_first_spawn(pane: &shux_core::model::Pane) -> bool {
     pane.exit_status.is_none()
 }
 
+/// A client connection's bytes: the attach socket in the daemon, an
+/// in-memory pipe in tests, where nothing in flight hides from the scheduler.
+trait AttachStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static {}
+
+impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static> AttachStream for S {}
+
 /// Handle one attach connection: handshake, then run the streaming loop.
 #[allow(clippy::too_many_arguments)]
 async fn handle_attach_connection(
-    stream: UnixStream,
+    stream: impl AttachStream,
     graph: GraphHandle,
     io_state: Arc<Mutex<PaneIoState>>,
     config: ConfigHandle,
@@ -791,7 +796,7 @@ async fn apply_resize_to_window(
 
 /// Send an AttachReady::Error and close.
 async fn send_ready_error(
-    framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+    framed: &mut Framed<impl AttachStream, tokio_util::codec::LengthDelimitedCodec>,
     code: &str,
     message: &str,
 ) -> anyhow::Result<()> {
@@ -807,7 +812,7 @@ async fn send_ready_error(
 /// dispatches all client frames.
 #[allow(clippy::too_many_arguments)]
 async fn run_attach_loop(
-    framed: Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+    framed: Framed<impl AttachStream, tokio_util::codec::LengthDelimitedCodec>,
     graph: GraphHandle,
     io_state: Arc<Mutex<PaneIoState>>,
     config: ConfigHandle,
@@ -3847,6 +3852,7 @@ mod tests {
     }
 
     use super::*;
+    use tokio::net::UnixStream;
 
     /// Attach must close the spawn race without resurrecting a pane that
     /// genuinely finished (issue #125 follow-up).
@@ -6948,15 +6954,29 @@ mod tests {
 
     /// The real attach connection, with a pane whose input channel the test
     /// owns: the test decides how fast the "program" reads.
+    ///
+    /// Every test that uses it runs `start_paused`. Its clients talk to the
+    /// attach over an in-memory pipe, so input in flight is always a task
+    /// that can run, and tokio moves the paused clock only once no task can:
+    /// [`INPUT_STALL`] runs out exactly, in virtual time, and the clock moving
+    /// at all means everything in flight has landed.
     struct InputHarness {
         fixture: AttachFixture,
-        framed: Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
         writer_rx: mpsc::Receiver<Vec<u8>>,
-        /// The client's screen so far. Kept across waits: later render
-        /// frames redraw only what changed.
-        screen: shux_vt::VirtualTerminal,
-        server_cancel: CancellationToken,
-        server: tokio::task::JoinHandle<anyhow::Result<()>>,
+        client: Client,
+    }
+
+    impl std::ops::Deref for InputHarness {
+        type Target = Client;
+        fn deref(&self) -> &Client {
+            &self.client
+        }
+    }
+
+    impl std::ops::DerefMut for InputHarness {
+        fn deref_mut(&mut self) -> &mut Client {
+            &mut self.client
+        }
     }
 
     impl InputHarness {
@@ -6965,6 +6985,9 @@ mod tests {
         }
 
         async fn sized(capacity: usize, cols: u16) -> Self {
+            // Panics unless the clock is paused: only then are the waits below
+            // fences rather than guesses.
+            tokio::time::advance(Duration::ZERO).await;
             let fixture = attach_fixture().await;
             let _ = seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
             let (writer_tx, writer_rx) = mpsc::channel(capacity);
@@ -6974,34 +6997,53 @@ mod tests {
                 .await
                 .writers
                 .insert(fixture.first_pane, writer_tx);
-            let (framed, server_cancel, server) = Self::connect(&fixture, cols).await;
+            let client = Client::attach(&fixture, cols).await;
             Self {
                 fixture,
-                framed,
                 writer_rx,
-                screen: shux_vt::VirtualTerminal::new(24, usize::from(cols)),
-                server_cancel,
-                server,
+                client,
             }
         }
 
+        /// A second client attached to the same pane.
+        async fn peer(&self) -> Client {
+            Client::attach(&self.fixture, 90).await
+        }
+
+        /// The next input the pane receives.
+        async fn next_input(&mut self) -> Vec<u8> {
+            tokio::time::timeout(shux_testkit::BUDGET, self.writer_rx.recv())
+                .await
+                .expect("no input reached the pane")
+                .expect("pane input channel closed")
+        }
+
+        async fn stop(self) {
+            self.client.stop().await;
+            self.fixture.stop();
+        }
+    }
+
+    /// One attached client: its end of the connection, and its screen so far.
+    struct Client {
+        framed: Framed<tokio::io::DuplexStream, tokio_util::codec::LengthDelimitedCodec>,
+        /// Kept across waits: later render frames redraw only what changed.
+        screen: shux_vt::VirtualTerminal,
+        cancel: CancellationToken,
+        server: tokio::task::JoinHandle<anyhow::Result<()>>,
+    }
+
+    impl Client {
         /// A client attached to the fixture's session, past the handshake.
-        async fn connect(
-            fixture: &AttachFixture,
-            cols: u16,
-        ) -> (
-            Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
-            CancellationToken,
-            tokio::task::JoinHandle<anyhow::Result<()>>,
-        ) {
+        async fn attach(fixture: &AttachFixture, cols: u16) -> Self {
             let onboarding = crate::onboarding::OnboardingHandle::from_state_for_test(
                 crate::onboarding::OnboardingState {
                     prefix_discovered: true,
                     welcome_toast_seen: true,
                 },
             );
-            let (server_stream, client_stream) = UnixStream::pair().expect("unix pair");
-            let server_cancel = fixture.cancel.child_token();
+            let (server_stream, client_stream) = tokio::io::duplex(1 << 20);
+            let cancel = fixture.cancel.child_token();
             let server = tokio::spawn(handle_attach_connection(
                 server_stream,
                 fixture.graph.clone(),
@@ -7011,7 +7053,7 @@ mod tests {
                 crate::session_meta::SessionMetaCache::new(),
                 onboarding,
                 std::time::Instant::now(),
-                server_cancel.clone(),
+                cancel.clone(),
             ));
             let mut framed = Framed::new(client_stream, create_codec());
             let hello = AttachHello {
@@ -7026,7 +7068,7 @@ mod tests {
                 .send(Bytes::from(serde_json::to_vec(&hello).expect("hello json")))
                 .await
                 .expect("send hello");
-            let ready = tokio::time::timeout(Duration::from_secs(2), framed.next())
+            let ready = tokio::time::timeout(shux_testkit::BUDGET, framed.next())
                 .await
                 .expect("ready timeout")
                 .expect("ready frame")
@@ -7035,7 +7077,12 @@ mod tests {
                 serde_json::from_slice::<AttachReady>(&ready).expect("ready json"),
                 AttachReady::Ok { .. }
             ));
-            (framed, server_cancel, server)
+            Self {
+                framed,
+                screen: shux_vt::VirtualTerminal::new(24, usize::from(cols)),
+                cancel,
+                server,
+            }
         }
 
         async fn send(&mut self, frame: &AttachClientFrame) {
@@ -7045,15 +7092,30 @@ mod tests {
                 .expect("send frame");
         }
 
-        /// Server frames until `pred` matches one, or `budget` runs out.
-        /// `pred` also sees the client's screen: render frames position every
-        /// cell, so their raw bytes never hold a word contiguously.
+        async fn key(&mut self, bytes: &[u8]) {
+            self.send(&AttachClientFrame::Input {
+                data: BASE64.encode(bytes),
+            })
+            .await;
+        }
+
+        async fn paste(&mut self, text: &[u8], more: bool) {
+            self.send(&AttachClientFrame::Paste {
+                data: BASE64.encode(text),
+                more,
+            })
+            .await;
+        }
+
+        /// Server frames until `pred` matches one, or [`shux_testkit::BUDGET`]
+        /// runs out. `pred` also sees the client's screen: render frames
+        /// position every cell, so their raw bytes never hold a word
+        /// contiguously.
         async fn frames_until(
             &mut self,
-            budget: Duration,
             mut pred: impl FnMut(&AttachServerFrame, &str) -> bool,
         ) -> bool {
-            let deadline = tokio::time::Instant::now() + budget;
+            let deadline = tokio::time::Instant::now() + shux_testkit::BUDGET;
             while let Ok(Some(Ok(buf))) =
                 tokio::time::timeout_at(deadline, self.framed.next()).await
             {
@@ -7076,18 +7138,64 @@ mod tests {
             false
         }
 
+        /// Waits for the status bar to say `amount` of this client's input
+        /// was dropped.
+        async fn told_dropped(&mut self, amount: &str) {
+            let notice = format!("not keeping up: {amount} of input dropped");
+            let mut bar = String::new();
+            let told = self
+                .frames_until(|_, text| {
+                    bar = text.lines().last().unwrap_or_default().to_string();
+                    text.contains(&notice)
+                })
+                .await;
+            assert!(told, "never told {notice:?}; the status bar reads {bar:?}");
+        }
+
+        async fn detach(&mut self) {
+            self.send(&AttachClientFrame::Detach).await;
+            let detached = self
+                .frames_until(|f, _| matches!(f, AttachServerFrame::DetachAck))
+                .await;
+            assert!(detached, "detach never landed");
+        }
+
         async fn stop(self) {
             drop(self.framed);
-            self.server_cancel.cancel();
-            let _ = tokio::time::timeout(Duration::from_secs(2), self.server).await;
-            self.fixture.stop();
+            self.cancel.cancel();
+            let _ = tokio::time::timeout(shux_testkit::BUDGET, self.server).await;
         }
+    }
+
+    /// Lets every task run until all of them wait, then moves the paused
+    /// clock on by `by`, firing each timer due on the way.
+    async fn idle_for(by: Duration) {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "drives the paused clock: it moves only once every task waits"
+        )]
+        tokio::time::sleep(by).await;
+    }
+
+    /// How long, in virtual time, the attach must have had nothing left to do
+    /// before the pane's input counts as complete.
+    const QUIET: Duration = Duration::from_millis(200);
+
+    /// Everything the pane receives until the attach has nothing left to do:
+    /// the clock is paused, so [`QUIET`] passing with the pane's channel empty
+    /// means no task has input on its way to it.
+    async fn pane_input(h: &mut InputHarness) -> Vec<u8> {
+        let mut got = Vec::new();
+        while let Ok(Some(chunk)) = tokio::time::timeout(QUIET, h.writer_rx.recv()).await {
+            got.extend_from_slice(&chunk);
+        }
+        got
     }
 
     /// Issue #197: a paste is one Input frame per key, far more frames than a
     /// pane's channel holds. A pane that is reading, only slower than the
     /// frames arrive, must receive every byte in order.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_paste_into_a_pane_that_reads_slowly_arrives_whole() {
         let mut h = InputHarness::new(8).await;
         let paste: Vec<u8> = (0..2000u32).map(|i| b'a' + (i % 26) as u8).collect();
@@ -7097,22 +7205,22 @@ mod tests {
         let reader = tokio::spawn(async move {
             let mut got = Vec::with_capacity(want);
             while got.len() < want {
-                match tokio::time::timeout(Duration::from_secs(10), rx.recv()).await {
+                match tokio::time::timeout(shux_testkit::BUDGET, rx.recv()).await {
                     Ok(Some(chunk)) => got.extend_from_slice(&chunk),
                     _ => break,
                 }
-                // A program that reads a burst, then is busy drawing it.
+                // A program that reads a burst, then is busy drawing it while
+                // the attach keeps the pane's channel full.
                 if got.len() % 16 == 0 {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    for _ in 0..64 {
+                        tokio::task::yield_now().await;
+                    }
                 }
             }
             got
         });
         for &b in &paste {
-            h.send(&AttachClientFrame::Input {
-                data: BASE64.encode([b]),
-            })
-            .await;
+            h.key(&[b]).await;
         }
         let got = reader.await.expect("reader");
         assert_eq!(
@@ -7129,19 +7237,16 @@ mod tests {
     /// The other half of #197: a pane that stops reading altogether must not
     /// freeze the attach. Input it cannot take is dropped only after a bounded
     /// wait, the user is told on the status bar, and detach still works.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_pane_that_stops_reading_drops_input_visibly_and_detach_still_works() {
         // Narrow enough that the notice only fits with the right zone gone.
         let mut h = InputHarness::sized(1, 56).await;
         for _ in 0..50 {
-            h.send(&AttachClientFrame::Input {
-                data: BASE64.encode(b"x"),
-            })
-            .await;
+            h.key(b"x").await;
         }
         let mut screen = String::new();
         let told = h
-            .frames_until(INPUT_STALL + Duration::from_secs(3), |_, text| {
+            .frames_until(|_, text| {
                 if text.contains("[p") {
                     screen = text.lines().last().unwrap_or_default().to_string();
                 }
@@ -7153,16 +7258,15 @@ mod tests {
         let started = tokio::time::Instant::now();
         h.send(&AttachClientFrame::Detach).await;
         let detached = h
-            .frames_until(INPUT_STALL + Duration::from_secs(3), |f, _| {
-                matches!(f, AttachServerFrame::DetachAck)
-            })
+            .frames_until(|f, _| matches!(f, AttachServerFrame::DetachAck))
             .await;
         assert!(
             detached,
             "a stuck pane froze the attach: detach never landed"
         );
+        // Virtual time: any wait on the pane would show here in full.
         assert!(
-            started.elapsed() < INPUT_STALL + Duration::from_secs(2),
+            started.elapsed() < INPUT_STALL,
             "detach waited {:?} behind a pane that is not reading",
             started.elapsed()
         );
@@ -7174,31 +7278,26 @@ mod tests {
     /// A pane that reads, but slower than one frame per [`INPUT_STALL`],
     /// never stalls outright. It must still not hold the attach for longer
     /// than one budget: the wait is a total, not a per-key allowance.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_pane_that_reads_too_slowly_cannot_hold_detach_behind_a_paste() {
         let mut h = InputHarness::new(1).await;
         let mut rx = std::mem::replace(&mut h.writer_rx, mpsc::channel(1).1);
         let reader = tokio::spawn(async move {
             while rx.recv().await.is_some() {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "the program under test: one frame per 0.9 INPUT_STALL of virtual time"
+                )]
                 tokio::time::sleep(INPUT_STALL * 9 / 10).await;
             }
         });
         for _ in 0..10 {
-            h.send(&AttachClientFrame::Input {
-                data: BASE64.encode(b"x"),
-            })
-            .await;
+            h.key(b"x").await;
         }
         let started = tokio::time::Instant::now();
-        h.send(&AttachClientFrame::Detach).await;
-        let detached = h
-            .frames_until(Duration::from_secs(15), |f, _| {
-                matches!(f, AttachServerFrame::DetachAck)
-            })
-            .await;
-        assert!(detached, "detach never landed");
+        h.detach().await;
         assert!(
-            started.elapsed() < INPUT_STALL + Duration::from_millis(700),
+            started.elapsed() <= INPUT_STALL,
             "detach waited {:?} behind a pane that keeps falling behind",
             started.elapsed()
         );
@@ -7208,7 +7307,7 @@ mod tests {
 
     /// Two stuck panes, typed into in turn: each costs one wait, not one per
     /// focus change.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn two_stuck_panes_each_cost_one_wait() {
         let mut h = InputHarness::new(1).await;
         let (second_tx, _second_rx) = mpsc::channel(1);
@@ -7221,10 +7320,7 @@ mod tests {
         let started = tokio::time::Instant::now();
         for _ in 0..6 {
             for _ in 0..2 {
-                h.send(&AttachClientFrame::Input {
-                    data: BASE64.encode(b"a"),
-                })
-                .await;
+                h.key(b"a").await;
             }
             h.send(&AttachClientFrame::Action {
                 kind: ActionKind::FocusNext,
@@ -7232,15 +7328,9 @@ mod tests {
             })
             .await;
         }
-        h.send(&AttachClientFrame::Detach).await;
-        let detached = h
-            .frames_until(Duration::from_secs(15), |f, _| {
-                matches!(f, AttachServerFrame::DetachAck)
-            })
-            .await;
-        assert!(detached, "detach never landed");
+        h.detach().await;
         assert!(
-            started.elapsed() < INPUT_STALL * 2 + Duration::from_millis(800),
+            started.elapsed() <= INPUT_STALL * 2,
             "six focus changes between two stuck panes took {:?}",
             started.elapsed()
         );
@@ -7249,32 +7339,19 @@ mod tests {
 
     /// The notice counts every byte lost to a pane, even when one gets
     /// through in between.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn the_drop_notice_counts_every_lost_byte() {
         let mut h = InputHarness::new(1).await;
         for _ in 0..5 {
-            h.send(&AttachClientFrame::Input {
-                data: BASE64.encode(b"a"),
-            })
-            .await;
+            h.key(b"a").await;
         }
-        assert!(
-            h.frames_until(INPUT_STALL * 3, |_, t| t.contains("4 B of input dropped"))
-                .await,
-            "the first four drops were not reported"
-        );
+        h.told_dropped("4 B").await;
         assert_eq!(h.writer_rx.try_recv().ok(), Some(b"a".to_vec()));
         for _ in 0..3 {
-            h.send(&AttachClientFrame::Input {
-                data: BASE64.encode(b"b"),
-            })
-            .await;
+            h.key(b"b").await;
         }
-        assert!(
-            h.frames_until(INPUT_STALL * 3, |_, t| t.contains("6 B of input dropped"))
-                .await,
-            "drops after a byte got through restarted the count"
-        );
+        // Not restarted by the byte that got through.
+        h.told_dropped("6 B").await;
         h.stop().await;
     }
 
@@ -7364,75 +7441,6 @@ mod tests {
         assert!(joined.ends_with(PASTE_END));
     }
 
-    async fn key(h: &mut InputHarness, bytes: &[u8]) {
-        h.send(&AttachClientFrame::Input {
-            data: BASE64.encode(bytes),
-        })
-        .await;
-    }
-
-    async fn paste(h: &mut InputHarness, text: &[u8], more: bool) {
-        h.send(&AttachClientFrame::Paste {
-            data: BASE64.encode(text),
-            more,
-        })
-        .await;
-    }
-
-    async fn pane_input(h: &mut InputHarness, settle: Duration) -> Vec<u8> {
-        let mut got = Vec::new();
-        while let Ok(Some(chunk)) = tokio::time::timeout(settle, h.writer_rx.recv()).await {
-            got.extend_from_slice(&chunk);
-        }
-        got
-    }
-
-    /// A second client attached to the same pane.
-    struct Peer {
-        framed: Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
-        cancel: CancellationToken,
-        server: tokio::task::JoinHandle<anyhow::Result<()>>,
-    }
-
-    impl Peer {
-        async fn attach(h: &InputHarness) -> Self {
-            let (framed, cancel, server) = InputHarness::connect(&h.fixture, 90).await;
-            Self {
-                framed,
-                cancel,
-                server,
-            }
-        }
-
-        async fn send(&mut self, frame: &AttachClientFrame) {
-            self.framed
-                .send(Bytes::from(serde_json::to_vec(frame).expect("frame json")))
-                .await
-                .expect("send frame");
-        }
-
-        async fn key(&mut self, bytes: &[u8]) {
-            self.send(&AttachClientFrame::Input {
-                data: BASE64.encode(bytes),
-            })
-            .await;
-        }
-
-        async fn paste(&mut self, text: &[u8], more: bool) {
-            self.send(&AttachClientFrame::Paste {
-                data: BASE64.encode(text),
-                more,
-            })
-            .await;
-        }
-
-        async fn stop(self) {
-            drop(self.framed);
-            self.cancel.cancel();
-            let _ = tokio::time::timeout(Duration::from_secs(2), self.server).await;
-        }
-    }
-
     /// Feeds `bytes` to the pane's VT, as its program would print them.
     async fn set_modes(h: &InputHarness, bytes: &[u8]) {
         let pane = h.fixture.first_pane;
@@ -7457,7 +7465,7 @@ mod tests {
     /// Pasted text is not a run of keystrokes: a `q` in it must not close
     /// the help overlay or quit copy mode and let the rest of the paste
     /// through to the pane.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_paste_does_not_drive_the_help_overlay_or_copy_mode() {
         for (enter, leave) in [
             (ActionKind::ToggleHelp, b"\x1b".as_slice()),
@@ -7469,12 +7477,12 @@ mod tests {
                 args: shux_rpc::attach::ActionArgs::default(),
             })
             .await;
-            paste(&mut h, b"q", true).await;
-            paste(&mut h, b"echo half a script\r", false).await;
-            key(&mut h, b"a").await;
-            key(&mut h, leave).await;
-            key(&mut h, b"b").await;
-            let got = pane_input(&mut h, Duration::from_millis(500)).await;
+            h.paste(b"q", true).await;
+            h.paste(b"echo half a script\r", false).await;
+            h.key(b"a").await;
+            h.key(leave).await;
+            h.key(b"b").await;
+            let got = pane_input(&mut h).await;
             assert_eq!(
                 String::from_utf8_lossy(&got),
                 "b",
@@ -7496,30 +7504,26 @@ mod tests {
         }
     }
 
+    /// A paste into a pane of capacity 1 that is not reading: its start
+    /// fills the pane, and its end is dropped once it has waited out
+    /// [`INPUT_STALL`], which spends the pane's wait.
     async fn paste_with_dropped_end(h: &mut InputHarness) {
         set_modes(h, b"\x1b[?2004h").await;
-        paste(h, b"a", true).await;
-        paste(h, b"b", false).await;
-        // Past the wait the end piece is dropped after.
-        tokio::time::sleep(INPUT_STALL + Duration::from_millis(200)).await;
+        h.paste(b"a", true).await;
+        h.paste(b"b", false).await;
+        h.told_dropped("1 B").await;
     }
 
     /// An open paste belongs to the program it was pasted into: a program
     /// that is no longer in it must not read its end as input.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_dropped_paste_end_reaches_only_the_program_still_in_it() {
         for respawn in [false, true] {
             let mut h = InputHarness::new(1).await;
             paste_with_dropped_end(&mut h).await;
             leave_the_paste(&mut h, respawn).await;
-            h.send(&AttachClientFrame::Detach).await;
-            let detached = h
-                .frames_until(INPUT_STALL + Duration::from_secs(3), |f, _| {
-                    matches!(f, AttachServerFrame::DetachAck)
-                })
-                .await;
-            assert!(detached, "detach never landed");
-            let got = pane_input(&mut h, Duration::from_millis(500)).await;
+            h.detach().await;
+            let got = pane_input(&mut h).await;
             assert_eq!(
                 String::from_utf8_lossy(&got),
                 "\x1b[200~a",
@@ -7529,13 +7533,10 @@ mod tests {
 
             let mut h = InputHarness::new(1).await;
             paste_with_dropped_end(&mut h).await;
-            assert_eq!(
-                pane_input(&mut h, Duration::from_millis(200)).await,
-                b"\x1b[200~a"
-            );
+            assert_eq!(pane_input(&mut h).await, b"\x1b[200~a");
             leave_the_paste(&mut h, respawn).await;
-            key(&mut h, b"x").await;
-            let got = pane_input(&mut h, Duration::from_millis(500)).await;
+            h.key(b"x").await;
+            let got = pane_input(&mut h).await;
             assert_eq!(
                 String::from_utf8_lossy(&got),
                 "x",
@@ -7547,17 +7548,14 @@ mod tests {
 
     /// A paste is the pane's, not the client's: a key from another client
     /// attached to the same pane ends it before reaching the program.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn another_clients_key_ends_a_paste_left_open() {
         let mut h = InputHarness::new(1).await;
         paste_with_dropped_end(&mut h).await;
-        assert_eq!(
-            pane_input(&mut h, Duration::from_millis(200)).await,
-            b"\x1b[200~a"
-        );
-        let mut other = Peer::attach(&h).await;
+        assert_eq!(pane_input(&mut h).await, b"\x1b[200~a");
+        let mut other = h.peer().await;
         other.key(b"x").await;
-        let got = pane_input(&mut h, Duration::from_millis(500)).await;
+        let got = pane_input(&mut h).await;
         assert_eq!(
             String::from_utf8_lossy(&got),
             "\x1b[201~x",
@@ -7569,17 +7567,19 @@ mod tests {
 
     /// Two writers waiting on a full pane end its open paste once between
     /// them: the second one queued finds it already ended.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn waiting_writers_end_an_open_paste_once() {
         let mut h = InputHarness::new(1).await;
         paste_with_dropped_end(&mut h).await;
-        let mut b = Peer::attach(&h).await;
-        let mut c = Peer::attach(&h).await;
+        let mut b = h.peer().await;
+        let mut c = h.peer().await;
         b.key(b"x").await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // `x` is waiting for room before `y` is sent, and both before the
+        // pane reads.
+        idle_for(Duration::from_millis(1)).await;
         c.key(b"y").await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let got = pane_input(&mut h, Duration::from_millis(500)).await;
+        idle_for(Duration::from_millis(1)).await;
+        let got = pane_input(&mut h).await;
         assert_eq!(
             String::from_utf8_lossy(&got),
             "\x1b[200~a\x1b[201~xy",
@@ -7592,18 +7592,19 @@ mod tests {
 
     /// A key that waits behind a paste still waiting on a full pane lands
     /// after the paste's start, so it ends the paste first.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_key_queued_behind_a_paste_ends_it() {
         let mut h = InputHarness::new(1).await;
         set_modes(&h, b"\x1b[?2004h").await;
-        key(&mut h, b"k").await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        paste(&mut h, b"a", true).await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let mut other = Peer::attach(&h).await;
+        h.key(b"k").await;
+        h.paste(b"a", true).await;
+        // The paste is waiting for room behind `k`...
+        idle_for(Duration::from_millis(1)).await;
+        let mut other = h.peer().await;
         other.key(b"y").await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let got = pane_input(&mut h, Duration::from_millis(500)).await;
+        // ...and `y` behind the paste, before the pane reads.
+        idle_for(Duration::from_millis(1)).await;
+        let got = pane_input(&mut h).await;
         assert_eq!(
             String::from_utf8_lossy(&got),
             "k\x1b[200~a\x1b[201~y",
@@ -7615,22 +7616,19 @@ mod tests {
 
     /// A new paste is its own paste, never the tail of one whose end was
     /// dropped, whichever client sends it.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_new_paste_does_not_join_one_left_open() {
         for other_client in [false, true] {
             let mut h = InputHarness::new(1).await;
             paste_with_dropped_end(&mut h).await;
-            assert_eq!(
-                pane_input(&mut h, Duration::from_millis(200)).await,
-                b"\x1b[200~a"
-            );
-            let mut other = Peer::attach(&h).await;
+            assert_eq!(pane_input(&mut h).await, b"\x1b[200~a");
+            let mut other = h.peer().await;
             if other_client {
                 other.paste(b"z", false).await;
             } else {
-                paste(&mut h, b"z", false).await;
+                h.paste(b"z", false).await;
             }
-            let got = pane_input(&mut h, Duration::from_millis(500)).await;
+            let got = pane_input(&mut h).await;
             assert_eq!(
                 String::from_utf8_lossy(&got),
                 "\x1b[201~\x1b[200~z\x1b[201~",
@@ -7643,18 +7641,16 @@ mod tests {
 
     /// A paste whose first piece was dropped is still a new paste: its later
     /// pieces do not continue the one an earlier paste left open.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_paste_whose_start_was_dropped_does_not_join_one_left_open() {
         let mut h = InputHarness::new(1).await;
         paste_with_dropped_end(&mut h).await;
-        paste(&mut h, b"p1", true).await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(
-            pane_input(&mut h, Duration::from_millis(200)).await,
-            b"\x1b[200~a"
-        );
-        paste(&mut h, b"p2", false).await;
-        let got = pane_input(&mut h, Duration::from_millis(500)).await;
+        h.paste(b"p1", true).await;
+        // Dropped at once: the pane has spent its wait.
+        h.told_dropped("3 B").await;
+        assert_eq!(pane_input(&mut h).await, b"\x1b[200~a");
+        h.paste(b"p2", false).await;
+        let got = pane_input(&mut h).await;
         assert_eq!(
             String::from_utf8_lossy(&got),
             "\x1b[201~\x1b[200~p2\x1b[201~",
@@ -7666,19 +7662,16 @@ mod tests {
     /// A paste is framed as the program asked when it began: a mode change
     /// seen while its pieces arrive may be from before the program read its
     /// start, so the rest stays between the markers of one paste.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_paste_keeps_the_framing_it_began_with() {
         for change in [b"\x1b[?2004l".as_slice(), b"\x1b[?2004l\x1b[?2004h"] {
             let mut h = InputHarness::new(8).await;
             set_modes(&h, b"\x1b[?2004h").await;
-            paste(&mut h, b"p1", true).await;
-            assert_eq!(
-                pane_input(&mut h, Duration::from_millis(200)).await,
-                b"\x1b[200~p1"
-            );
+            h.paste(b"p1", true).await;
+            assert_eq!(pane_input(&mut h).await, b"\x1b[200~p1");
             set_modes(&h, change).await;
-            paste(&mut h, b"p2\r", false).await;
-            let got = pane_input(&mut h, Duration::from_millis(500)).await;
+            h.paste(b"p2\r", false).await;
+            let got = pane_input(&mut h).await;
             assert_eq!(
                 String::from_utf8_lossy(&got),
                 "p2\r\x1b[201~",
@@ -7691,29 +7684,43 @@ mod tests {
 
     /// The rest of a paste goes where the paste began, not to a pane focused
     /// while it was arriving, which would run it as typed lines.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_paste_stays_with_the_pane_it_began_in() {
         let mut h = InputHarness::new(8).await;
         set_modes(&h, b"\x1b[?2004h").await;
         let (mut second_rx, _resize, _shutdown) =
             seed_io_for_pane(&h.fixture.io_state, h.fixture.second_pane).await;
-        paste(&mut h, b"p1", true).await;
+        h.paste(b"p1", true).await;
         h.send(&AttachClientFrame::Action {
             kind: ActionKind::FocusNext,
             args: shux_rpc::attach::ActionArgs::default(),
         })
         .await;
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        paste(&mut h, b"p2\r", false).await;
-        let got = pane_input(&mut h, Duration::from_millis(500)).await;
+        let (graph, window, second) = (
+            h.fixture.graph.clone(),
+            h.fixture.first_window,
+            h.fixture.second_pane,
+        );
+        shux_testkit::wait_until_async("focus to move to the second pane", || {
+            let focused = graph
+                .snapshot()
+                .windows
+                .get(&window)
+                .is_some_and(|w| w.active_pane == second);
+            async move { focused }
+        })
+        .await;
+        h.paste(b"p2\r", false).await;
+        let got = pane_input(&mut h).await;
         assert_eq!(
             String::from_utf8_lossy(&got),
             "\x1b[200~p1p2\r\x1b[201~",
             "the paste did not finish where it began"
         );
-        let stray = tokio::time::timeout(Duration::from_millis(200), second_rx.recv()).await;
+        // Fenced by `pane_input`: the attach had nothing left to do.
+        let stray = second_rx.try_recv();
         assert!(
-            !matches!(stray, Ok(Some(_))),
+            stray.is_err(),
             "the newly focused pane got part of the paste: {stray:?}"
         );
         h.stop().await;
@@ -7721,26 +7728,20 @@ mod tests {
 
     /// Detaching ends only the paste this client left open: one another
     /// client opened since stays open until that client goes.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn detaching_leaves_another_clients_open_paste() {
         let mut h = InputHarness::new(1).await;
         paste_with_dropped_end(&mut h).await;
-        let mut other = Peer::attach(&h).await;
+        let mut other = h.peer().await;
         other.key(b"x").await;
-        assert_eq!(h.writer_rx.recv().await.unwrap(), b"\x1b[200~a");
+        assert_eq!(h.next_input().await, b"\x1b[200~a");
         other.paste(b"p", true).await;
-        assert_eq!(h.writer_rx.recv().await.unwrap(), b"\x1b[201~x");
+        assert_eq!(h.next_input().await, b"\x1b[201~x");
         // Its end is dropped behind the start, which the pane leaves unread.
         other.paste(b"q", false).await;
-        tokio::time::sleep(INPUT_STALL + Duration::from_millis(200)).await;
-        h.send(&AttachClientFrame::Detach).await;
-        let detached = h
-            .frames_until(INPUT_STALL + Duration::from_secs(3), |f, _| {
-                matches!(f, AttachServerFrame::DetachAck)
-            })
-            .await;
-        assert!(detached, "detach never landed");
-        let got = pane_input(&mut h, Duration::from_millis(500)).await;
+        other.told_dropped("1 B").await;
+        h.detach().await;
+        let got = pane_input(&mut h).await;
         assert_eq!(
             String::from_utf8_lossy(&got),
             "\x1b[200~p",
@@ -7752,17 +7753,14 @@ mod tests {
 
     /// A mouse report forwarded to the program is not pasted text: an open
     /// paste ends before it.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_forwarded_click_ends_a_paste_left_open() {
         let mut h = InputHarness::new(1).await;
         paste_with_dropped_end(&mut h).await;
-        assert_eq!(
-            pane_input(&mut h, Duration::from_millis(200)).await,
-            b"\x1b[200~a"
-        );
+        assert_eq!(pane_input(&mut h).await, b"\x1b[200~a");
         set_modes(&h, b"\x1b[?1002h\x1b[?1006h").await;
         press(&mut h).await;
-        let got = pane_input(&mut h, Duration::from_millis(500)).await;
+        let got = pane_input(&mut h).await;
         assert_eq!(
             String::from_utf8_lossy(&got),
             "\x1b[201~\x1b[<0;3;2M",
@@ -7774,27 +7772,26 @@ mod tests {
     /// A held button released on detach is a mouse report, not pasted text:
     /// the open paste ends before it, or the program reads it as text and
     /// keeps the button down.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn detaching_ends_an_open_paste_before_releasing_a_held_button() {
         let mut h = InputHarness::new(2).await;
         set_modes(&h, b"\x1b[?2004h\x1b[?1002h\x1b[?1006h").await;
         press(&mut h).await;
-        let press = pane_input(&mut h, Duration::from_millis(300)).await;
+        let press = pane_input(&mut h).await;
         assert!(
             press.ends_with(b"M"),
             "the press never reached the app: {press:?}"
         );
-        paste(&mut h, b"a", true).await;
-        paste(&mut h, b"b", true).await;
-        paste(&mut h, b"c", false).await;
-        tokio::time::sleep(INPUT_STALL + Duration::from_millis(200)).await;
-        assert_eq!(
-            pane_input(&mut h, Duration::from_millis(200)).await,
-            b"\x1b[200~ab"
-        );
+        h.paste(b"a", true).await;
+        h.paste(b"b", true).await;
+        h.paste(b"c", false).await;
+        // The end waits out INPUT_STALL behind two pieces the pane leaves
+        // unread, and is dropped.
+        h.told_dropped("1 B").await;
+        assert_eq!(pane_input(&mut h).await, b"\x1b[200~ab");
 
-        h.send(&AttachClientFrame::Detach).await;
-        let got = pane_input(&mut h, Duration::from_millis(500)).await;
+        h.detach().await;
+        let got = pane_input(&mut h).await;
         assert!(
             got.starts_with(PASTE_END) && got.ends_with(b"m"),
             "the release went into the paste: {:?}",
@@ -7805,22 +7802,16 @@ mod tests {
 
     /// A paste whose end was dropped leaves the pane's program in paste mode.
     /// Detaching must close it: no later key from this client will.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn detaching_closes_a_paste_whose_end_was_dropped() {
         let mut h = InputHarness::new(1).await;
         set_modes(&h, b"\x1b[?2004h").await;
-        paste(&mut h, b"a", true).await;
-        paste(&mut h, b"b", false).await;
-        h.send(&AttachClientFrame::Detach).await;
-        let detached = h
-            .frames_until(INPUT_STALL + Duration::from_secs(3), |f, _| {
-                matches!(f, AttachServerFrame::DetachAck)
-            })
-            .await;
-        assert!(detached, "detach never landed");
+        h.paste(b"a", true).await;
+        h.paste(b"b", false).await;
+        h.detach().await;
         // The program reads again only long after the client has gone.
-        tokio::time::sleep(INPUT_STALL * 3).await;
-        let got = pane_input(&mut h, Duration::from_millis(500)).await;
+        idle_for(INPUT_STALL * 3).await;
+        let got = pane_input(&mut h).await;
         assert_eq!(
             String::from_utf8_lossy(&got),
             "\x1b[200~a\x1b[201~",
