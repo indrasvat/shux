@@ -65,8 +65,8 @@ pub async fn handle_version(
 
     let cli = (env!("CARGO_PKG_VERSION"), env!("SHUX_GIT_SHA"));
     // `daemon`: `None` when no daemon serves the socket, `Err` when one is
-    // there but did not say which build. `mismatch`: whether the next command
-    // that needs the daemon replaces it.
+    // there but did not say which build. `mismatch`: whether it is not this
+    // build, as far as it said.
     let (daemon, mismatch) = match crate::client::ask_daemon_version(socket_path).await {
         DaemonAnswer::Absent => (None, None),
         DaemonAnswer::Answered(dv) => {
@@ -138,17 +138,19 @@ pub async fn handle_version(
             );
             // Only a shux daemon process is stopped and replaced; anything else
             // on the socket makes the next command refuse instead.
-            let next = if crate::daemon_boot::our_live_daemon(socket_path).is_some() {
-                "the next shux command restarts it, ending its sessions"
-            } else {
-                "no shux daemon process serves this socket, so shux commands \
-                 refuse to run until whatever serves it is stopped"
+            let next = || {
+                if crate::daemon_boot::our_live_daemon(socket_path).is_some() {
+                    "the next shux command restarts it, ending its sessions"
+                } else {
+                    "no shux daemon process serves this socket, so shux commands \
+                     refuse to run until whatever serves it is stopped"
+                }
             };
             match &daemon {
                 None => {}
                 Some(Ok(dv)) => {
-                    let note =
-                        (mismatch == Some(true)).then(|| format!("differs from this CLI; {next}"));
+                    let note = (mismatch == Some(true))
+                        .then(|| format!("differs from this CLI; {}", next()));
                     crate::style::print_daemon_version(
                         Some((&dv.version, &dv.git_sha)),
                         note.as_deref(),
@@ -156,7 +158,7 @@ pub async fn handle_version(
                 }
                 Some(Err((_, error))) => {
                     let note = if mismatch == Some(true) {
-                        format!("{error}; {next}")
+                        format!("{error}; {}", next())
                     } else {
                         error.clone()
                     };

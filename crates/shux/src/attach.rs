@@ -7951,24 +7951,32 @@ mod tests {
     }
 
     /// Drives a press, a long drag and a release into a pane whose app has
-    /// stopped reading, with `fill` bytes already queued for it, and returns
-    /// the mouse reports the app would read.
-    async fn drag_over_a_stalled_app(fill: usize) -> Vec<String> {
+    /// stopped reading, and returns the mouse reports the app would read.
+    /// With `full`, every budget is spent first: the main one before the
+    /// press, the control lane after it.
+    async fn drag_over_a_stalled_app(full: bool) -> Vec<String> {
         let mut h = AppMouseHarness::new().await;
         // Slots to spare: only the byte budgets may hold the reports back.
         let (writer_tx, mut wr) = crate::pane_input::channel_with(8192, crate::pane_input::BUDGET);
-        let mut queued = 0;
-        while queued < fill && writer_tx.try_send(vec![b'x'; 1 << 20]).is_ok() {
-            queued += 1 << 20;
+        let mut size = 1 << 20;
+        while full && size > 0 {
+            if writer_tx.try_send(vec![b'x'; size]).is_err() {
+                size /= 2;
+            }
         }
         let mut vt = shux_vt::VirtualTerminal::new(28, 49);
         vt.process(b"\x1b[?1002h\x1b[?1006h");
         {
             let mut state = h.fixture.io_state.lock().await;
-            state.writers.insert(h.fixture.first_pane, writer_tx);
+            state
+                .writers
+                .insert(h.fixture.first_pane, writer_tx.clone());
             state.vts.insert(h.fixture.first_pane, vt);
         }
         h.send(MouseKind::Down, ProtoMouseButton::Left, 10, 5).await;
+        while full && let Ok(permit) = writer_tx.try_reserve_in(1, Lane::Control) {
+            permit.send(b"x".to_vec());
+        }
         for i in 0..3000u16 {
             h.send(MouseKind::Drag, ProtoMouseButton::Left, 10 + i % 30, 5)
                 .await;
@@ -7985,30 +7993,24 @@ mod tests {
     }
 
     /// A drag held over an app that has stopped reading must not use up the
-    /// room its release needs: an app given the press and the drags but not
-    /// the release sits button-held once it reads again.
+    /// room its release needs, with room to spare or none left: an app given
+    /// the press and the drags but not the release sits button-held once it
+    /// reads again.
     #[tokio::test]
     async fn a_long_drag_over_an_app_that_stopped_reading_still_delivers_its_release() {
-        let got = drag_over_a_stalled_app(0).await;
-        assert_eq!(got.first().map(String::as_str), Some("\x1b[<0;10;5M"));
-        assert_eq!(
-            got.last().map(String::as_str),
-            Some("\x1b[<0;12;5m"),
-            "the app got the press and {} reports but no release",
-            got.len().saturating_sub(1)
-        );
-    }
-
-    /// The same once the pane's whole budget is already taken by other input.
-    #[tokio::test]
-    async fn a_drag_over_a_full_pane_still_delivers_its_release() {
-        let got = drag_over_a_stalled_app(crate::pane_input::BUDGET).await;
-        assert_eq!(got.first().map(String::as_str), Some("\x1b[<0;10;5M"));
-        assert_eq!(
-            got.last().map(String::as_str),
-            Some("\x1b[<0;12;5m"),
-            "the app got the press and {} reports but no release",
-            got.len().saturating_sub(1)
-        );
+        for full in [false, true] {
+            let got = drag_over_a_stalled_app(full).await;
+            assert_eq!(
+                got.first().map(String::as_str),
+                Some("\x1b[<0;10;5M"),
+                "full={full}: the press was dropped"
+            );
+            assert_eq!(
+                got.last().map(String::as_str),
+                Some("\x1b[<0;12;5m"),
+                "full={full}: the app got the press and {} reports but no release",
+                got.len().saturating_sub(1)
+            );
+        }
     }
 }

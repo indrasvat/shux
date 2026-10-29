@@ -17,12 +17,12 @@ cd "$root"
 
 # Workflows, and composite actions wherever they live: `uses: ./tools/x` runs
 # tools/x/action.yml, and its own `uses:` lines need pins just the same.
-mapfile -t files < <(find . \( -name .git -o -name target -o -name node_modules \
-    -o -path ./.claude/worktrees \) -prune -o \
+mapfile -t files < <(find . \( -path ./.git -o -path ./target -o -path ./fuzz/target \
+    -o -path ./.claude/worktrees -o -path '*/node_modules' \) -prune -o \
     \( -type f -o -type l \) \( -path './.github/workflows/*.yml' -o -path './.github/workflows/*.yaml' \
     -o -name 'action.yml' -o -name 'action.yaml' \) -print | sed 's|^\./||' | sort)
 if [[ ${#files[@]} -eq 0 ]]; then
-    echo "✗ no workflows or actions under ${root}/.github — this guard would check nothing" >&2
+    echo "✗ no workflows or actions under ${root} — this guard would check nothing" >&2
     exit 2
 fi
 

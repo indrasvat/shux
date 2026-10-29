@@ -58,6 +58,11 @@ printf '%s\n' 'runs:' '  using: composite' '  steps:' '    - uses: actions/cache
     >"$work/tools/x/action.yml"
 expect 1 "a composite action outside .github is scanned"
 rm -rf "$work/tools"
+mkdir -p "$work/.github/actions/target"
+printf '%s\n' 'runs:' '  using: composite' '  steps:' '    - uses: actions/cache@v4' \
+    >"$work/.github/actions/target/action.yml"
+expect 1 "a composite action in a directory named target is scanned"
+rm -rf "$work/.github/actions"
 
 # YAML shapes GitHub Actions parses as a `uses:` key, none of them `- uses: x`.
 for shape in '      - {uses: actions/checkout@v4}' \

@@ -620,22 +620,12 @@ where
             // The B2 fix: the dispatch races the connection-close signal, so
             // a client that disconnects mid-request DROPS the handler future
             // instead of letting it run to completion unobserved.
-            // The raw frame is not kept while the handler runs, which may be
-            // waiting for room in a pane's input.
-            let request = parse_request(&data);
-            drop(data);
-            let handle = async {
-                match request {
-                    Ok(request) => dispatch_request(request, &router).await,
-                    Err(response) => *response,
-                }
-            };
             let response = tokio::select! {
                 _ = conn_closed.cancelled() => {
                     debug!("client disconnected mid-request; dropping in-flight handler");
                     break;
                 }
-                response = handle => response,
+                response = process_frame(data, &router) => response,
             };
             let response_bytes = serde_json::to_vec(&response)?;
             framed_tx.send(Bytes::from(response_bytes)).await?;
@@ -656,10 +646,13 @@ where
     result
 }
 
-/// Process a single frame: parse JSON-RPC, dispatch, return response.
-#[cfg(test)]
-async fn process_frame(data: &[u8], router: &Router) -> JsonRpcResponse {
-    match parse_request(data) {
+/// Process a single frame: parse JSON-RPC, dispatch, return response. The
+/// frame is dropped once parsed, not kept while the handler runs, which may be
+/// waiting for room in a pane's input.
+async fn process_frame(data: impl AsRef<[u8]>, router: &Router) -> JsonRpcResponse {
+    let request = parse_request(data.as_ref());
+    drop(data);
+    match request {
         Ok(request) => dispatch_request(request, router).await,
         Err(response) => *response,
     }

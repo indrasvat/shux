@@ -4,8 +4,10 @@
 //! reserves room for it until the PTY task has written it, so a program that
 //! stops reading holds every sender back once [`BUDGET`] unwritten bytes wait
 //! for it, in the channel or in the PTY task. The daemon then holds at most the
-//! budget for the pane, plus each waiting sender's own chunk: the budget bounds
-//! what waits for the program, not how many senders wait.
+//! budget and [`CONTROL_BUDGET`] for the pane, a few urgent reports bounded by
+//! what they answer (see [`Lane::Urgent`]), and each waiting sender's own
+//! chunk: the budgets bound what waits for the program, not how many senders
+//! wait.
 //!
 //! Waiting reservations take room in order, so a large one is not starved by
 //! small ones; while one waits, [`PaneWriter::try_reserve`] finds no room. Small
@@ -118,7 +120,7 @@ pub struct PaneInputRx {
 /// Room for one chunk: a slot in the channel and its bytes' budget.
 pub struct InputPermit {
     slot: mpsc::OwnedPermit<PaneInput>,
-    budget: OwnedSemaphorePermit,
+    budget: Option<OwnedSemaphorePermit>,
 }
 
 /// A pane's input channel with the default bounds.
@@ -156,7 +158,10 @@ impl PaneWriter {
             .reserve_owned()
             .await
             .map_err(|_| SendError(()))?;
-        Ok(InputPermit { slot, budget })
+        Ok(InputPermit {
+            slot,
+            budget: Some(budget),
+        })
     }
 
     /// [`Self::reserve`] without waiting.
@@ -167,23 +172,14 @@ impl PaneWriter {
     /// [`Self::try_reserve`], then wherever `lane` allows: for small input
     /// that must not wait behind input still waiting for room.
     pub fn try_reserve_in(&self, len: usize, lane: Lane) -> Result<InputPermit, TrySendError<()>> {
-        let full =
-            |r: &Result<InputPermit, TrySendError<()>>| matches!(r, Err(TrySendError::Full(())));
-        let main = self.try_reserve(len);
-        if lane == Lane::Main || !full(&main) {
-            return main;
+        let mut permit = self.try_reserve(len);
+        if lane != Lane::Main && matches!(permit, Err(TrySendError::Full(()))) {
+            permit = self.try_reserve_from(&self.control, len);
         }
-        let control = self.try_reserve_from(&self.control, len);
-        if lane == Lane::Control || !full(&control) {
-            return control;
+        if lane == Lane::Urgent && matches!(permit, Err(TrySendError::Full(()))) {
+            permit = self.try_slot(None);
         }
-        let budget = self
-            .control
-            .permits
-            .clone()
-            .try_acquire_many_owned(0)
-            .map_err(|_| TrySendError::Closed(()))?;
-        self.try_slot(budget)
+        permit
     }
 
     fn try_reserve_from(
@@ -194,10 +190,13 @@ impl PaneWriter {
         if self.tx.is_closed() {
             return Err(TrySendError::Closed(()));
         }
-        self.try_slot(budget.try_take(len)?)
+        self.try_slot(Some(budget.try_take(len)?))
     }
 
-    fn try_slot(&self, budget: OwnedSemaphorePermit) -> Result<InputPermit, TrySendError<()>> {
+    fn try_slot(
+        &self,
+        budget: Option<OwnedSemaphorePermit>,
+    ) -> Result<InputPermit, TrySendError<()>> {
         let slot = self.tx.clone().try_reserve_owned().map_err(|e| match e {
             TrySendError::Full(_) => TrySendError::Full(()),
             TrySendError::Closed(_) => TrySendError::Closed(()),
@@ -233,7 +232,7 @@ impl InputPermit {
     pub fn send(self, bytes: Vec<u8>) {
         self.slot.send(PaneInput {
             bytes,
-            budget: Some(self.budget),
+            budget: self.budget,
         });
     }
 
