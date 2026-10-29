@@ -1,0 +1,62 @@
+{
+  "gate": "shux-vt-solid-qa",
+  "scope": "226-deflake-timing-tests",
+  "issue": "#226",
+  "head_commit_at_audit": "38977fb464262d06068b3865b82a9a5939dea998",
+  "baseline_commit": "946a066eb4ffb7524b5c7e12636b964bc8d8a5e9",
+  "trigger": [
+    "crates/shux-vt/src/lib.rs"
+  ],
+  "solid_qa_report": "SOLID-QA.md",
+  "dootsabha_design": "council-record.md",
+  "dootsabha_implementation": "council-record.md",
+  "screenshots": [],
+  "screenshots_rationale": "No PNG committed: every metric compares the head arm against the base arm; neither is a repo-tracked baseline. Head also matched the committed .shux/goldens/073-vt-corpus via make test-vt-corpus. Full-resolution PNGs and diffs are in .shux/out/226-deflake-timing-tests/.",
+  "pixel_metrics": [
+    "pixel/pixel-corpus-rich-tui-btop-head-vs-base.json",
+    "pixel/pixel-corpus-rich-tui-lazygit-head-vs-base.json",
+    "pixel/pixel-corpus-rich-tui-nvim-head-vs-base.json",
+    "pixel/pixel-corpus-rich-tui-vicaya-head-vs-base.json",
+    "pixel/pixel-corpus-rich-tui-vivecaka-head-vs-base.json",
+    "pixel/pixel-corpus-synthetic-alternate-screen-head-vs-base.json",
+    "pixel/pixel-corpus-synthetic-dec-special-graphics-head-vs-base.json",
+    "pixel/pixel-corpus-synthetic-grapheme-storage-current-head-vs-base.json",
+    "pixel/pixel-corpus-synthetic-origin-response-head-vs-base.json",
+    "pixel/pixel-corpus-synthetic-origin-scroll-region-head-vs-base.json",
+    "pixel/pixel-corpus-synthetic-osc-default-colors-head-vs-base.json",
+    "pixel/pixel-corpus-synthetic-plain-crlf-head-vs-base.json",
+    "pixel/pixel-corpus-synthetic-resize-smoke-head-vs-base.json",
+    "pixel/pixel-corpus-synthetic-scroll-region-head-vs-base.json",
+    "pixel/pixel-corpus-synthetic-sync-output-head-vs-base.json",
+    "pixel/pixel-corpus-synthetic-tab-stops-head-vs-base.json",
+    "pixel/pixel-corpus-synthetic-tabs-current-head-vs-base.json",
+    "pixel/pixel-corpus-synthetic-wide-cjk-ansi-dec-edit-head-vs-base.json",
+    "pixel/pixel-corpus-synthetic-wide-cjk-head-vs-base.json",
+    "pixel/pixel-live-pane-probe-120x40-head-vs-base.json",
+    "pixel/pixel-live-pane-probe-200x60-head-vs-base.json",
+    "pixel/pixel-live-pane-probe-80x24-head-vs-base.json",
+    "pixel/pixel-live-pane-replay-btop-120x36-head-vs-base.json",
+    "pixel/pixel-live-pane-replay-nvim-120x36-head-vs-base.json",
+    "pixel/pixel-live-pane-vim-120x40-head-vs-base.json"
+  ],
+  "pixel_metric_thresholds": {
+    "max_pixel_diff_ratio": 0,
+    "max_mean_channel_delta": 0
+  },
+  "evidence_layers": {
+    "release_identity": "release asm of shux-vt lib at base vs head differs only in 3 panic Location line constants (+43 lines); instruction stream identical",
+    "mutation": "M1-M6 (sweep never expires, not re-armed per BSU, byte cap ignored, seam bypassed x3, deadline early/late) all caught; M7 restamp-every-batch uncaught on head and on base (F1, P2)",
+    "unit_and_integration": "make test-focus PKG=shux-vt 706/706; stress 40 iterations x 8 timing tests under stress-ng --cpu 8: 320/320",
+    "raw_replay": "make test-vt-corpus at head and base: 19/19 vs committed goldens; head vs base 19/19 PNG+TXT byte-identical",
+    "shux_automation": "isolated daemons per arm; colour probe + open silent DEC 2026 window released by the daemon sweep at 80x24/120x40/200x60, nvim/btop raw replays 120x36, live vim 120x40; pane.capture identical, pane.snapshot 0/0; head run-to-run 0/0",
+    "leak_check": "session kill + daemon stop per arm; per-run ps needles empty"
+  },
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "P2",
+      "blocking": false,
+      "title": "no test pins the deadline of a window that keeps receiving output (restamp-every-batch mutant survives; pre-existing)"
+    }
+  ]
+}

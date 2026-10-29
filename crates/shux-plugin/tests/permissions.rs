@@ -5,12 +5,12 @@
 //! a real `PluginManager` and `Router`.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use serde_json::{Value, json};
 use shux_core::bus::EventBus;
 use shux_plugin::{PluginManager, PluginSource};
 use shux_rpc::{Policy, Router, Sensitivity};
+use shux_testkit::{gate, open_gate_async};
 
 fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
     let path = dir.join(name);
@@ -41,23 +41,27 @@ fn router_with(method: &str, sensitivity: Sensitivity) -> Router {
         .build()
 }
 
-/// Plugin that calls one RPC on startup, prints the response to
-/// stderr (relayed to daemon log) AND to a sentinel file passed in
-/// argv[1], then sits until plugin.shutdown.
+/// Plugin that calls one RPC once let through the gate (a FIFO) in
+/// argv[2], writes the response to a sentinel file passed in argv[1],
+/// then sits until plugin.shutdown. The gate orders the call after
+/// whatever grant the test makes first.
 fn call_one_method_plugin(method: &str, params_json: &str) -> String {
     format!(
         r#"#!/usr/bin/env bash
 set -u
 out_file="$1"
+gate="$2"
 IFS= read -r _ || exit 1
 printf '%s\n' '{{"jsonrpc":"2.0","id":"init","result":{{"name":"perm-tester","version":"0.1.0","subscribes":[],"provides":[],"capabilities":[]}}}}'
 
 # Issue the call
+IFS= read -r _ < "$gate"
 printf '{{"jsonrpc":"2.0","method":"{method}","params":{params_json},"id":1}}\n'
 
 # Read first response and dump to sentinel file
 IFS= read -r resp
-printf '%s' "$resp" > "$out_file"
+printf '%s' "$resp" > "$out_file.tmp"
+mv "$out_file.tmp" "$out_file"
 
 while IFS= read -r line; do
   case "$line" in
@@ -82,7 +86,8 @@ async fn plugins_forbidden_method_is_denied_even_with_grant() {
         &call_one_method_plugin("plugin.install", "{}"),
     );
     let mut source = PluginSource::from_path(&script);
-    source.args = vec![sentinel.display().to_string()];
+    let held = gate(tmp.path(), "gate");
+    source.args = vec![sentinel.display().to_string(), held.display().to_string()];
     let info = mgr.install(source).await.expect("install");
 
     // Even with an explicit (blanket) grant, plugins.install must be denied.
@@ -91,7 +96,8 @@ async fn plugins_forbidden_method_is_denied_even_with_grant() {
         .unwrap();
 
     // Wait for the plugin to issue + read the response
-    let resp = wait_for_file(&sentinel, Duration::from_secs(5)).await;
+    open_gate_async(&held).await;
+    let resp = wait_for_file(&sentinel).await;
     let v: Value = serde_json::from_str(&resp).unwrap();
     let err = v.get("error").expect("expected error response");
     assert_eq!(err["code"], -32004);
@@ -118,11 +124,13 @@ async fn unowned_owned_mutation_denied_then_allowed_via_grant() {
         ),
     );
     let mut source = PluginSource::from_path(&script);
-    source.args = vec![sentinel.display().to_string()];
+    let held = gate(tmp.path(), "gate");
+    source.args = vec![sentinel.display().to_string(), held.display().to_string()];
     let info = mgr.install(source).await.unwrap();
 
     // First call: no grant, no ownership → deny.
-    let resp = wait_for_file(&sentinel, Duration::from_secs(5)).await;
+    open_gate_async(&held).await;
+    let resp = wait_for_file(&sentinel).await;
     let v: Value = serde_json::from_str(&resp).unwrap();
     let err = v.get("error").expect("first call must be denied");
     assert_eq!(err["code"], -32004);
@@ -141,7 +149,8 @@ async fn unowned_owned_mutation_denied_then_allowed_via_grant() {
         ),
     );
     let mut source2 = PluginSource::from_path(&script2);
-    source2.args = vec![sentinel2.display().to_string()];
+    let held2 = gate(tmp.path(), "gate2");
+    source2.args = vec![sentinel2.display().to_string(), held2.display().to_string()];
     let info2 = mgr.install(source2).await.unwrap();
 
     mgr.grant(
@@ -153,7 +162,8 @@ async fn unowned_owned_mutation_denied_then_allowed_via_grant() {
     .await
     .unwrap();
 
-    let resp2 = wait_for_file(&sentinel2, Duration::from_secs(5)).await;
+    open_gate_async(&held2).await;
+    let resp2 = wait_for_file(&sentinel2).await;
     let v2: Value = serde_json::from_str(&resp2).unwrap();
     assert!(
         v2.get("result").is_some(),
@@ -180,12 +190,13 @@ async fn audit_log_records_allow_and_deny() {
         ),
     );
     let mut source = PluginSource::from_path(&script);
-    source.args = vec![sentinel.display().to_string()];
+    let held = gate(tmp.path(), "gate");
+    source.args = vec![sentinel.display().to_string(), held.display().to_string()];
     let info = mgr.install(source).await.unwrap();
 
-    // Wait for plugin to fire its RPC + record the audit entry.
-    let _ = wait_for_file(&sentinel, Duration::from_secs(5)).await;
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // The audit entry is written before the response is sent.
+    open_gate_async(&held).await;
+    let _ = wait_for_file(&sentinel).await;
 
     let path = mgr.audit_path(&info.name).await.unwrap();
     let body = std::fs::read_to_string(&path).expect("audit log should exist");
@@ -215,10 +226,12 @@ async fn plugin_self_namespace_events_publish_audited_but_allowed() {
         ),
     );
     let mut source = PluginSource::from_path(&script);
-    source.args = vec![sentinel.display().to_string()];
+    let held = gate(tmp.path(), "gate");
+    source.args = vec![sentinel.display().to_string(), held.display().to_string()];
     let info = mgr.install(source).await.unwrap();
 
-    let resp = wait_for_file(&sentinel, Duration::from_secs(5)).await;
+    open_gate_async(&held).await;
+    let resp = wait_for_file(&sentinel).await;
     let v: Value = serde_json::from_str(&resp).unwrap();
     assert!(v.get("result").is_some(), "{v:?}");
 
@@ -249,7 +262,6 @@ done
     let p1 = write_script(tmp.path(), "v1.sh", v1);
     mgr.install(PluginSource::from_path(&p1)).await.unwrap();
     mgr.kill("sub-tester").await.unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
 
     // Re-install with a wider subscribes — should fail.
     let v2 = r#"#!/usr/bin/env bash
@@ -301,7 +313,6 @@ done
     let info1 = mgr.install(PluginSource::from_path(&script)).await.unwrap();
     let id1 = info1.plugin_id.expect("plugin_id populated");
     mgr.kill("stable-id").await.unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
 
     let info2 = mgr.install(PluginSource::from_path(&script)).await.unwrap();
     let id2 = info2.plugin_id.expect("plugin_id populated on re-install");
@@ -310,15 +321,8 @@ done
     mgr.kill("stable-id").await.unwrap();
 }
 
-async fn wait_for_file(path: &Path, timeout: Duration) -> String {
-    let deadline = std::time::Instant::now() + timeout;
-    while std::time::Instant::now() < deadline {
-        if let Ok(s) = std::fs::read_to_string(path)
-            && !s.is_empty()
-        {
-            return s;
-        }
-        tokio::time::sleep(Duration::from_millis(40)).await;
-    }
-    panic!("sentinel never appeared at {}", path.display());
+/// The sentinel's contents, once the plugin has renamed it into place.
+async fn wait_for_file(path: &Path) -> String {
+    let what = format!("the sentinel at {}", path.display());
+    shux_testkit::wait_for_async(&what, || async { std::fs::read_to_string(path).ok() }).await
 }

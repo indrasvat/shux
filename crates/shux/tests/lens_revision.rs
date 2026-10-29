@@ -25,7 +25,7 @@ fn g3_revision_monotonicity() {
     let mut prev = h.content_revision(&f.session_id, &f.pane_id);
     for i in 0..3 {
         h.send_line_token(&f.pane_id, "");
-        h.wait_for(&f.pane_id, &frame_marker(i), 5_000)
+        h.wait_for(&f.pane_id, &frame_marker(i), BUDGET_MS)
             .unwrap_or_else(|e| panic!("G3: repaint {i} never landed: {e}"));
         let now = h.content_revision(&f.session_id, &f.pane_id);
         assert!(
@@ -56,7 +56,7 @@ fn g4_revision_is_not_graph_version() {
     // Five pure repaints — no splits/renames/resizes.
     for i in 0..5 {
         h.send_line_token(&f.pane_id, "");
-        h.wait_for(&f.pane_id, &frame_marker(i), 5_000)
+        h.wait_for(&f.pane_id, &frame_marker(i), BUDGET_MS)
             .unwrap_or_else(|e| panic!("G4: repaint {i} never landed: {e}"));
     }
 

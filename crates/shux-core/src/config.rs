@@ -351,6 +351,10 @@ const DELETE_GRACE: std::time::Duration = std::time::Duration::from_millis(150);
 async fn reload_settled(path: &Path, handle: &ConfigHandle) {
     let mut file = read_config_file(path);
     if matches!(file, ConfigFile::Absent) {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "an editor's delete-then-write gap has no event that marks its end"
+        )]
         tokio::time::sleep(DELETE_GRACE).await;
         file = read_config_file(path);
     }
@@ -450,6 +454,7 @@ pub async fn run_hot_reload(
             ev = rx.recv() => {
                 if ev.is_none() { break; }
                 // Drain any extra events that arrived in the same burst.
+                #[expect(clippy::disallowed_methods, reason = "debounce window for one save's burst of events")]
                 tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                 while rx.try_recv().is_ok() {}
                 reload_settled(&path, &handle).await;
@@ -650,21 +655,15 @@ mod tests {
             run_hot_reload(watcher_path, watcher_handle, cancel_for_watcher).await;
         });
 
-        // Give the watcher time to attach.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-
-        std::fs::write(&path, "[appearance]\nborder_style = \"double\"\n").unwrap();
-
-        // Wait up to 2s for the change to land.
-        let mut got_double = false;
-        for _ in 0..40 {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            if h.current().appearance.border_style == "double" {
-                got_double = true;
-                break;
-            }
-        }
+        // The watcher attaches asynchronously and says nothing when it has,
+        // so keep re-saving until a save lands: one before the attach is
+        // missed, the first after it is seen.
+        shux_testkit::wait_until_async("hot reload to pick up the file change", || {
+            std::fs::write(&path, "[appearance]\nborder_style = \"double\"\n").unwrap();
+            let landed = h.current().appearance.border_style == "double";
+            async move { landed }
+        })
+        .await;
         cancel.cancel();
-        assert!(got_double, "hot reload did not pick up the file change");
     }
 }

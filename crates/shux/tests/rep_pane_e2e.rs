@@ -14,11 +14,6 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::thread;
-use std::time::{Duration, Instant};
-
-use nix::sys::signal::{Signal, kill};
-use nix::unistd::Pid;
 
 const COLS: usize = 40;
 const ROWS: usize = 8;
@@ -126,6 +121,8 @@ impl Env {
         pane
     }
 
+    /// Every scene prints `READY` last, and the VT parses pane output in
+    /// order, so once it shows the whole scene has landed; nothing writes after.
     fn wait_for(&self, session: &str, pane: &str, needle: &str) {
         let out = self.run(&[
             "pane",
@@ -137,25 +134,13 @@ impl Env {
             "-t",
             needle,
             "--timeout-ms",
-            "20000",
+            "30000",
         ]);
         assert!(
             out.status.success(),
             "pane never showed {needle:?}; screen was:\n{}",
             self.capture(session, pane)
         );
-    }
-
-    fn settle(&self, pane: &str) {
-        self.ok(&[
-            "pane",
-            "wait-settled",
-            pane,
-            "--quiet",
-            "400",
-            "--timeout",
-            "15000",
-        ]);
     }
 
     fn capture(&self, session: &str, pane: &str) -> String {
@@ -198,15 +183,10 @@ impl Drop for Env {
         if let Some(pid) = std::fs::read_to_string(&pidfile)
             .ok()
             .and_then(|s| s.trim().parse::<i32>().ok())
+            && !shux_testkit::terminate(pid)
+            // A second panic during unwinding aborts and hides the first.
+            && !std::thread::panicking()
         {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while Instant::now() < deadline {
-                if kill(Pid::from_raw(pid), None).is_err() {
-                    return;
-                }
-                thread::sleep(Duration::from_millis(50));
-            }
-            let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
             panic!("daemon {pid} outlived the test");
         }
     }
@@ -229,7 +209,6 @@ fn a_real_pane_drawing_a_rule_with_rep_gets_a_rule() {
         ),
     );
     env.wait_for("rep-rule", &pane, "READY");
-    env.settle(&pane);
 
     let rows = env.glance_rows(&pane);
     assert_eq!(
@@ -260,7 +239,6 @@ fn a_real_pane_repeating_at_column_zero_is_not_dropped() {
         ),
     );
     env.wait_for("rep-home", &pane, "READY");
-    env.settle(&pane);
 
     let rows = env.glance_rows(&pane);
     assert!(
@@ -290,7 +268,6 @@ fn a_real_pane_redrawing_a_progress_bar_in_place_advances() {
         ),
     );
     env.wait_for("rep-bar", &pane, "READY");
-    env.settle(&pane);
 
     let rows = env.glance_rows(&pane);
     assert_eq!(
@@ -316,7 +293,6 @@ fn a_real_pane_drawing_a_box_rule_repeats_the_line_glyph() {
         ),
     );
     env.wait_for("rep-box", &pane, "READY");
-    env.settle(&pane);
 
     let rows = env.glance_rows(&pane);
     assert!(
@@ -344,7 +320,6 @@ fn a_real_pane_cannot_buy_unbounded_work_with_one_rep() {
         ),
     );
     env.wait_for("rep-bound", &pane, "READY");
-    env.settle(&pane);
 
     // The daemon is still answering, which is the point of the bound.
     let rows = env.glance_rows(&pane);

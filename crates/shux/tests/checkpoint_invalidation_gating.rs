@@ -30,9 +30,8 @@
 #[path = "lens_common/mod.rs"]
 mod lens_common;
 
-use std::time::Duration;
-
-use lens_common::{Harness, unique, wait_until};
+use lens_common::{Harness, unique};
+use shux_testkit::{BUDGET, poll_until};
 
 fn checkpoint(h: &Harness, pane: &str, ctx: &str) -> u64 {
     h.rpc_raw("pane.checkpoint", serde_json::json!({ "pane_id": pane }))
@@ -41,51 +40,25 @@ fn checkpoint(h: &Harness, pane: &str, ctx: &str) -> u64 {
         .expect("checkpoint revision")
 }
 
-/// Wait until a keystroke sent to `pane` has actually reached the screen, then
-/// wait for the pane to go quiet.
+/// Wait until F4's `a` keystroke has been drawn in full.
 ///
-/// Settling alone is not enough and the failure is silent. `pane.wait_settled`
-/// answers "has this pane stopped writing" — and a pane that has not yet STARTED
-/// writing is, by that measure, perfectly settled. Sending `a` and settling
-/// immediately can therefore return before the byte has been through the PTY at
-/// all, and the diff that follows reports `cells_changed: 0` and blames the
-/// checkpoint. Observed once in 36 full-suite runs.
-///
-/// So: require the content first (the revision has moved past the checkpoint),
-/// then require the stillness. This is the house rule from CLAUDE.md, applied
-/// to an input rather than to an app's startup.
-fn settle_after_input(h: &Harness, pane: &str, since_revision: u64, ctx: &str) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    loop {
-        let changed = h
-            .rpc_raw(
-                "pane.diff_since",
-                serde_json::json!({ "pane_id": pane, "since_revision": since_revision }),
-            )
-            .result
-            .and_then(|d| d["cells_changed"].as_u64())
-            .unwrap_or(0);
-        if changed > 0 {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "{ctx}: the pane never rendered the input at all"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    settle(h, pane, ctx);
+/// F4 draws the block, then `A-PRESSED`, and then only moves the cursor, so the
+/// whole word on screen means all 10 cells have changed and no more will. A
+/// wait on stillness instead (`pane.wait_settled`) holds for a pane that has
+/// not STARTED writing, and its quiet window is a guess at how fast the host is.
+fn wait_for_a_drawn(h: &Harness, pane: &str, ctx: &str) {
+    h.wait_for(pane, "A-PRESSED", shux_testkit::BUDGET_MS)
+        .unwrap_or_else(|e| panic!("{ctx}: the pane never drew `a`: {e}"));
 }
 
-fn settle(h: &Harness, pane: &str, ctx: &str) {
-    let env = h.rpc_raw(
-        "pane.wait_settled",
-        serde_json::json!({ "pane_id": pane, "quiet_ms": 300, "timeout_ms": 5_000 }),
-    );
-    assert_eq!(
-        env.expect_result(ctx)["settled"],
-        serde_json::Value::Bool(true),
-        "{ctx}: expected settle"
+/// Apply every resize already queued for `pane`: a synchronous same-size
+/// `pane.set_size` is queued behind them on the pane's resize channel, and its
+/// ack fires only once the PTY task has processed everything before it.
+fn flush_resizes(h: &Harness, pane: &str) {
+    let (cols, rows) = pane_dims(h, pane);
+    h.rpc_ok(
+        "pane.set_size",
+        serde_json::json!({ "pane_id": pane, "cols": cols, "rows": rows }),
     );
 }
 
@@ -148,7 +121,7 @@ fn same_size_set_size_preserves_checkpoints() {
 
     // And the checkpoint still yields an exact delta for a real change.
     h.send_raw(&f.pane_id, "a");
-    settle_after_input(&h, &f.pane_id, r, "settle after a");
+    wait_for_a_drawn(&h, &f.pane_id, "after a");
     let d = h
         .rpc_raw(
             "pane.diff_since",
@@ -277,8 +250,8 @@ impl AttachClient {
         });
 
         ready_rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("attach handshake result within 10s")
+            .recv_timeout(BUDGET)
+            .expect("attach handshake result")
             .expect("attach handshake must succeed");
 
         Self {
@@ -350,11 +323,10 @@ fn real_attach_window_switch_preserves_checkpoints_and_diff_exact() {
     let client = AttachClient::connect(attach_sock, session_name);
     client.send(AttachCmd::Action(ActionKind::SwitchToWindow, Some(1)));
     assert!(
-        wait_until(Duration::from_secs(10), || pane_dims(&h, &pane_id)
-            != (80, 24)),
+        poll_until(BUDGET, || pane_dims(&h, &pane_id) != (80, 24)),
         "attach re-fan must resize the F4 pane away from 80x24"
     );
-    settle(&h, &pane_id, "settle after attach re-fan");
+    flush_resizes(&h, &pane_id);
 
     // Checkpoint the post-attach frame.
     let r = checkpoint(&h, &pane_id, "checkpoint while attached");
@@ -368,23 +340,15 @@ fn real_attach_window_switch_preserves_checkpoints_and_diff_exact() {
     client.send(AttachCmd::Action(ActionKind::SwitchToWindow, Some(1)));
     client.send(AttachCmd::Input(base64_encode(b"\t")));
     assert!(
-        wait_until(Duration::from_secs(10), || {
-            glance_char_at(&h, &pane_id, 8, 25) == Some('▶')
-        }),
+        poll_until(BUDGET, || glance_char_at(&h, &pane_id, 8, 25) == Some('▶')),
         "Tab marker move (grid (8,25)) must land after the window switches"
     );
 
-    // Flush the pane's resize channel: a synchronous same-size set_size is
-    // queued BEHIND the switch-back re-fan on the same channel and its ack
-    // only fires after the PTY task processed everything before it. After
-    // this, the (buggy) invalidation would have landed — the diff below is
-    // deterministic in both directions.
-    let (cols, rows) = pane_dims(&h, &pane_id);
-    h.rpc_ok(
-        "pane.set_size",
-        serde_json::json!({ "pane_id": pane_id, "cols": cols, "rows": rows }),
-    );
-    settle(&h, &pane_id, "settle after switches + Tab");
+    // After the flush the (buggy) invalidation would have landed, and the Tab
+    // redraw is complete once its new marker shows (F4 clears the old cell
+    // first, in the same write), so the diff below is deterministic in both
+    // directions.
+    flush_resizes(&h, &pane_id);
 
     // The checkpoint must survive the away/back re-fans: exact 2-cell Tab
     // delta (old marker cell cleared at (8,5), new marker drawn at (8,25)).
@@ -410,9 +374,7 @@ fn real_attach_window_switch_preserves_checkpoints_and_diff_exact() {
     // Claude minor folded in: drive `a` through the REAL attach input path
     // and assert the accumulated delta stays exact while still attached.
     client.send(AttachCmd::Input(base64_encode(b"a")));
-    h.wait_for(&pane_id, "A-PRESSED", 10_000)
-        .expect("A-PRESSED after in-band `a`");
-    settle(&h, &pane_id, "settle after in-band a");
+    wait_for_a_drawn(&h, &pane_id, "after in-band `a`");
     let d = h
         .rpc_raw(
             "pane.diff_since",

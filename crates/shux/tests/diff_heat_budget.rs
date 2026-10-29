@@ -42,7 +42,11 @@ fn oversized_pane_heat_diff_rejected_before_render() {
         "pane.send_keys",
         serde_json::json!({ "pane_id": pane_id, "text": format!("exec sh {abs}\n") }),
     );
-    h.wait_for(&pane_id, "दृश्यते", 10_000).expect("F1 sentinel");
+    // F1 draws `⚠` last; its `दृश्यते` sentinel lands two rows before the end,
+    // so a checkpoint taken on it can miss rows the zero-delta diff below
+    // would then count.
+    h.wait_for(&pane_id, "⚠", shux_testkit::BUDGET_MS)
+        .expect("F1 drawn in full");
 
     // Checkpoint at the oversized size (cell-level storage — no raster).
     let env = h.rpc_raw("pane.checkpoint", serde_json::json!({ "pane_id": pane_id }));

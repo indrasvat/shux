@@ -8,10 +8,6 @@
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::thread;
-use std::time::{Duration, Instant};
-
-use nix::sys::signal::{Signal, kill};
-use nix::unistd::Pid;
 
 /// Truecolor + 256-indexed + basic ANSI, all on one line. Mandatory on every
 /// daemon-backed capture (see CLAUDE.md).
@@ -199,19 +195,11 @@ impl Drop for Env {
         if let Some(pid) = std::fs::read_to_string(&pidfile)
             .ok()
             .and_then(|s| s.trim().parse::<i32>().ok())
-        {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while Instant::now() < deadline {
-                if kill(Pid::from_raw(pid), None).is_err() {
-                    return;
-                }
-                thread::sleep(Duration::from_millis(50));
-            }
-            let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+            && !shux_testkit::terminate(pid)
             // A second panic during unwinding aborts and hides the first.
-            if !thread::panicking() {
-                panic!("daemon {pid} outlived the test");
-            }
+            && !thread::panicking()
+        {
+            panic!("daemon {pid} outlived the test");
         }
     }
 }

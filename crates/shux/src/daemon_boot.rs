@@ -473,6 +473,10 @@ pub(crate) fn handle_daemon_command(
             let deadline = std::time::Instant::now() + STOP_TIMEOUT;
             let mut gone = !is_live_shux_daemon(p, socket);
             while !gone && std::time::Instant::now() < deadline {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "another process's exit has no event to wait on; poll its identity"
+                )]
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 gone = !is_live_shux_daemon(p, socket);
             }
@@ -933,7 +937,7 @@ mod tests {
         use std::os::unix::process::CommandExt;
         let child = std::process::Command::new("/bin/sleep")
             .arg0("watch-for shux __daemon")
-            .arg("5")
+            .arg("60")
             .spawn()
             .expect("spawn crafted-argv bystander");
         // Adopted BEFORE the poll below, which asserts and so can panic. An
@@ -952,25 +956,15 @@ mod tests {
         // Wait for the exec, not for a duration: before it lands argv is still
         // this test's own, and the negative below would again pass for the
         // wrong reason.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            let argv = super::process_argv(child.id());
-            let exec_landed = match &argv {
+        shux_testkit::wait_until("the bystander to exec", || {
+            match super::process_argv(child.id()) {
                 Some(super::ProcessArgv::Exact(v, _)) => {
                     v.first().is_some_and(|a| a.contains("watch-for"))
                 }
                 Some(super::ProcessArgv::Joined(j)) => j.contains("watch-for"),
                 None => false,
-            };
-            if exec_landed {
-                break;
             }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "bystander never exec'd; argv still {argv:?}"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        });
         let verdict = super::is_live_shux_daemon(child.id(), sock);
         let _ = child.kill();
         let _ = child.wait();
@@ -1174,7 +1168,9 @@ mod tests {
         assert_eq!(super::served_socket(&argv), None);
     }
 
-    #[tokio::test]
+    // Paused clock: the 50ms below elapses only once every task is parked, so
+    // "not finished" means shutdown is blocked on the waiter, not slow.
+    #[tokio::test(start_paused = true)]
     async fn shutdown_awaits_explicit_teardown_waiters() {
         let pane_id = shux_core::model::PaneId::new();
         let pane_shutdown = CancellationToken::new();

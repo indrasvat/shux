@@ -8,15 +8,16 @@
 //! pane's channel holds.
 
 use std::io::{Read, Write};
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+#[cfg(target_os = "linux")]
+use std::time::Instant;
 
-use nix::sys::signal::{Signal, kill};
-use nix::unistd::Pid;
+use nix::errno::Errno;
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+use shux_testkit::BUDGET;
 use shux_vt::{Color, VirtualTerminal};
 
 const PASTE_LEN: usize = 128 * 1024;
@@ -71,14 +72,10 @@ impl Drop for Harness {
             .ok()
             .and_then(|s| s.trim().parse().ok());
         // By pidfile, never by an argv substring.
-        if let Some(pid) = pid {
-            let _ = kill(Pid::from_raw(pid), Signal::SIGTERM);
-            for _ in 0..50 {
-                if kill(Pid::from_raw(pid), None).is_err() {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
+        if let Some(pid) = pid
+            && !shux_testkit::terminate(pid)
+            && !std::thread::panicking()
+        {
             panic!("daemon {pid} survived SIGTERM");
         }
     }
@@ -109,18 +106,14 @@ fn paste_bytes() -> Vec<u8> {
         .collect()
 }
 
-fn wait_for(path: &Path, budget: Duration) -> bool {
-    let deadline = Instant::now() + budget;
-    while Instant::now() < deadline {
-        if path.exists() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    false
+/// Whether the pane's program wrote `path` within [`BUDGET`], for a caller
+/// that reports what did arrive before it fails.
+fn appears(path: &Path) -> bool {
+    shux_testkit::poll_until(BUDGET, || path.exists())
 }
 
-const PROBES: &str = "printf '\\033[38;2;120;220;180mTRUECOLOR\\033[0m \\033[38;5;208mINDEXED\\033[0m \\033[34mBASIC\\033[0m\\r\\n'";
+/// Each word is split in the command, so only the program's output holds it.
+const PROBES: &str = "printf '\\033[38;2;120;220;180mTRUE%sCOLOR\\033[0m \\033[38;5;208mINDE%sXED\\033[0m \\033[34mBA%sSIC\\033[0m\\r\\n' '' '' ''";
 
 /// A session whose pane prints the colour probes, enters raw mode, touches
 /// `ready` and then runs `then`.
@@ -137,17 +130,15 @@ fn pane_session(h: &Harness, then: &str) {
         "session.create",
         serde_json::json!({ "name": "paste", "command": command }),
     );
-    assert!(
-        wait_for(&ready, Duration::from_secs(20)),
-        "the pane's program never reached raw mode"
-    );
+    shux_testkit::wait_until("the pane's program to reach raw mode", || ready.exists());
 }
 
 /// A real attach client on a PTY of its own.
 struct Client {
     keys: std::fs::File,
     screen: Arc<std::sync::Mutex<Vec<u8>>>,
-    stop: Arc<AtomicBool>,
+    /// Closing it wakes the drain and ends it.
+    stop: Option<OwnedFd>,
     drain: Option<std::thread::JoinHandle<()>>,
     process: KillOnDrop,
 }
@@ -222,20 +213,42 @@ impl Client {
             nix::fcntl::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
         )
         .expect("set O_NONBLOCK");
-        let stop = Arc::new(AtomicBool::new(false));
+        let (stopped, stop) = nix::unistd::pipe().expect("pipe");
+        for fd in [&stopped, &stop] {
+            nix::fcntl::fcntl(fd, nix::fcntl::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC))
+                .expect("set FD_CLOEXEC");
+        }
         let screen = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
         let drain = {
-            let (stop, screen) = (stop.clone(), screen.clone());
+            let screen = screen.clone();
             std::thread::spawn(move || {
                 let mut buf = [0u8; 16 * 1024];
-                while !stop.load(Ordering::Relaxed) {
+                loop {
+                    let mut fds = [
+                        PollFd::new(screen_side.as_fd(), PollFlags::POLLIN),
+                        PollFd::new(stopped.as_fd(), PollFlags::POLLIN),
+                    ];
+                    match poll(&mut fds, PollTimeout::NONE) {
+                        Ok(_) => {}
+                        Err(Errno::EINTR) => continue,
+                        Err(_) => break,
+                    }
+                    if fds[1].revents().is_some_and(|r| !r.is_empty()) {
+                        break;
+                    }
                     match screen_side.read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => screen
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .extend_from_slice(&buf[..n]),
-                        Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                            ) => {}
+                        // EIO: the client has closed its terminal.
+                        Err(_) => break,
                     }
                 }
             })
@@ -243,7 +256,7 @@ impl Client {
         let client = Self {
             keys,
             screen,
-            stop,
+            stop: Some(stop),
             drain: Some(drain),
             process,
         };
@@ -256,14 +269,9 @@ impl Client {
     }
 
     fn wait_for_text(&self, text: &str) {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while find_cell(&self.screen(), text).is_none() {
-            assert!(
-                Instant::now() < deadline,
-                "the attach client never drew {text:?}"
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        shux_testkit::wait_until(&format!("the attach client to draw {text:?}"), || {
+            find_cell(&self.screen(), text).is_some()
+        });
     }
 
     fn screen(&self) -> VirtualTerminal {
@@ -302,56 +310,107 @@ impl Client {
 
     /// The master shares the drain's non-blocking file description, so a full
     /// terminal input queue answers WouldBlock: that is the client applying
-    /// backpressure, and the typist waits for it like a real one would.
+    /// backpressure, and the typist waits for room like a real one would.
+    ///
+    /// Room is found by trying the write: POLLOUT on a pty master wakes only
+    /// when the reader drains it below the tty's low-water mark, so a client
+    /// reading a little at a time would never wake a waiter.
     fn type_bytes(&mut self, bytes: &[u8]) {
         let mut rest = bytes;
-        let deadline = Instant::now() + Duration::from_secs(60);
         while !rest.is_empty() {
-            match self.keys.write(rest) {
-                Ok(n) => rest = &rest[n..],
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(
-                        Instant::now() < deadline,
-                        "the attach client stopped reading keys with {} left to type",
-                        rest.len()
-                    );
-                    std::thread::sleep(Duration::from_millis(1));
+            let wrote = shux_testkit::poll(BUDGET, || match self.keys.write(rest) {
+                Ok(n) => Some(n),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    None
                 }
                 Err(e) => panic!("type into the client: {e}"),
-            }
+            });
+            let Some(n) = wrote else {
+                panic!(
+                    "the attach client read no key for {BUDGET:?} with {} left to type",
+                    rest.len()
+                );
+            };
+            rest = &rest[n..];
+        }
+    }
+
+    fn stop_drain(&mut self) {
+        drop(self.stop.take());
+        if let Some(drain) = self.drain.take() {
+            let _ = drain.join();
         }
     }
 
     /// Closes the terminal, as closing its window does, and waits up to
-    /// `budget` for the client to exit.
-    fn hang_up(&mut self, budget: Duration) -> bool {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(drain) = self.drain.take() {
-            let _ = drain.join();
-        }
+    /// [`BUDGET`] for the client to exit.
+    fn hang_up(&mut self) -> bool {
+        self.stop_drain();
         self.keys = std::fs::File::open("/dev/null").expect("open /dev/null");
-        let deadline = Instant::now() + budget;
-        while Instant::now() < deadline {
-            if matches!(self.process.0.try_wait(), Ok(Some(_))) {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        false
+        shux_testkit::poll_until(BUDGET, || matches!(self.process.0.try_wait(), Ok(Some(_))))
     }
 
     #[cfg(target_os = "linux")]
     fn pid(&self) -> u32 {
         self.process.0.id()
     }
+
+    /// The thread that reads the client's terminal. tokio names its workers,
+    /// so it is the one thread besides the main one that keeps the process's
+    /// own name.
+    #[cfg(target_os = "linux")]
+    fn input_thread(&self) -> u32 {
+        let pid = self.pid();
+        let comm = |tid: u32| std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/comm")).ok();
+        shux_testkit::wait_for("one unnamed thread in the attach client", || {
+            let own = comm(pid)?;
+            let mut unnamed = std::fs::read_dir(format!("/proc/{pid}/task"))
+                .ok()?
+                .filter_map(|t| t.ok()?.file_name().to_str()?.parse::<u32>().ok())
+                .filter(|&tid| tid != pid && comm(tid).as_ref() == Some(&own));
+            let tid = unnamed.next()?;
+            unnamed.next().is_none().then_some(tid)
+        })
+    }
+
+    /// How many times thread `tid` has blocked; `None` once it has exited.
+    #[cfg(target_os = "linux")]
+    fn blocks(&self, tid: u32) -> Option<u64> {
+        let status =
+            std::fs::read_to_string(format!("/proc/{}/task/{tid}/status", self.pid())).ok()?;
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix("voluntary_ctxt_switches:"))?
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    /// Waits for the input thread `tid` to come back from `n` poll timeouts
+    /// with nothing typed. Each blocks it again, and before it does it has run
+    /// the checks the client makes when idle. False if the thread exited.
+    #[cfg(target_os = "linux")]
+    fn idle_polls(&self, tid: u32, n: u64) -> bool {
+        let Some(start) = self.blocks(tid) else {
+            return false;
+        };
+        // One more than `n`: `start` may have been read before it first blocked.
+        let past = || match self.blocks(tid) {
+            None => Some(false),
+            Some(blocks) => (blocks > start + n).then_some(true),
+        };
+        shux_testkit::wait_for("the client's input thread to time out idle", past)
+    }
 }
 
 impl Drop for Client {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(drain) = self.drain.take() {
-            let _ = drain.join();
-        }
+        self.stop_drain();
     }
 }
 
@@ -375,7 +434,7 @@ fn a_large_paste_through_a_real_attach_client_arrives_whole() {
     // Nothing is typed after the paste: under an event source that stops
     // reading before the terminal is drained, the tail waits for a next key
     // that never comes.
-    let arrived = wait_for(&done, Duration::from_secs(60));
+    let arrived = appears(&done);
     let received = std::fs::read(&got).unwrap_or_default();
     drop(client);
 
@@ -406,7 +465,7 @@ fn a_bracketed_paste_reaches_the_pane() {
     );
     let mut client = Client::attach(&h);
     client.paste(b"hello world");
-    let arrived = wait_for(&done, Duration::from_secs(10));
+    let arrived = appears(&done);
     let received = std::fs::read(&got).unwrap_or_default();
     drop(client);
     assert!(
@@ -428,7 +487,7 @@ fn a_paste_into_a_program_that_asked_for_brackets_keeps_them() {
     pane_session(
         &h,
         &format!(
-            "printf '\\033[?2004hARMED\\r\\n'; head -c {n} > '{got}'; : > '{done}'; \
+            "printf '\\033[?2004hAR%sMED\\r\\n' ''; head -c {n} > '{got}'; : > '{done}'; \
              while :; do sleep 3600; done",
             n = want.len(),
             got = got.display(),
@@ -439,7 +498,7 @@ fn a_paste_into_a_program_that_asked_for_brackets_keeps_them() {
     // Drawn after the mode switch, so the daemon has seen it.
     client.wait_for_text("ARMED");
     client.paste(b"echo a\recho b\r");
-    let arrived = wait_for(&done, Duration::from_secs(10));
+    let arrived = appears(&done);
     let received = std::fs::read(&got).unwrap_or_default();
     drop(client);
     assert!(
@@ -463,7 +522,7 @@ fn a_paste_larger_than_a_frame_is_still_one_paste() {
     pane_session(
         &h,
         &format!(
-            "printf '\\033[?2004hARMED\\r\\n'; head -c {n} > '{got}'; : > '{done}'; \
+            "printf '\\033[?2004hAR%sMED\\r\\n' ''; head -c {n} > '{got}'; : > '{done}'; \
              while :; do sleep 3600; done",
             n = LEN + 12,
             got = got.display(),
@@ -474,7 +533,7 @@ fn a_paste_larger_than_a_frame_is_still_one_paste() {
     client.wait_for_text("ARMED");
     let text: Vec<u8> = paste_bytes().iter().copied().cycle().take(LEN).collect();
     client.paste(&text);
-    let arrived = wait_for(&done, Duration::from_secs(60));
+    let arrived = appears(&done);
     let received = std::fs::read(&got).unwrap_or_default();
     drop(client);
     assert!(arrived, "{} of {} bytes arrived", received.len(), LEN + 12);
@@ -504,8 +563,8 @@ fn a_client_whose_terminal_hung_up_exits() {
     pane_session(&h, "while :; do sleep 3600; done");
     let mut client = Client::attach(&h);
     assert!(
-        client.hang_up(Duration::from_secs(10)),
-        "the client still runs 10 s after its terminal hung up"
+        client.hang_up(),
+        "the client still runs {BUDGET:?} after its terminal hung up"
     );
 }
 
@@ -515,11 +574,16 @@ fn a_client_whose_terminal_hung_up_exits() {
 #[test]
 fn a_client_without_stdin_stays_attached() {
     let h = Harness::new();
-    pane_session(&h, "head -c 3 > /dev/null; echo GOT-KEYS; sleep 3600");
+    pane_session(
+        &h,
+        "head -c 3 > /dev/null; printf 'GOT-%sKEYS\\n' ''; sleep 3600",
+    );
     let mut client = Client::attach_without_stdin(&h);
-    std::thread::sleep(Duration::from_secs(3));
+    // The client looks for a hangup each time its wait for a key times out.
+    let input = client.input_thread();
+    let idled = client.idle_polls(input, 2);
     assert!(
-        matches!(client.process.0.try_wait(), Ok(None)),
+        idled && matches!(client.process.0.try_wait(), Ok(None)),
         "the client left an idle attach because its stdin was an empty pipe"
     );
     client.type_bytes(b"abc");
@@ -535,8 +599,8 @@ fn a_client_reading_dev_tty_exits_when_it_hangs_up() {
     pane_session(&h, "while :; do sleep 3600; done");
     let mut client = Client::attach_without_stdin(&h);
     assert!(
-        client.hang_up(Duration::from_secs(10)),
-        "the client still runs 10 s after its terminal hung up"
+        client.hang_up(),
+        "the client still runs {BUDGET:?} after its terminal hung up"
     );
 }
 
@@ -548,7 +612,12 @@ fn an_idle_attach_client_sleeps() {
     let h = Harness::new();
     pane_session(&h, "while :; do sleep 3600; done");
     let client = Client::attach(&h);
-    std::thread::sleep(Duration::from_secs(1));
+    let input = client.input_thread();
+    // Past the first frame's work: the client has sat through an idle poll.
+    assert!(
+        client.idle_polls(input, 1),
+        "the client's input thread exited"
+    );
 
     // CPU time each of the client's threads has run, in nanoseconds.
     let cpu = |pid: u32| -> std::collections::HashMap<String, u64> {
@@ -562,10 +631,13 @@ fn an_idle_attach_client_sleeps() {
             })
             .collect()
     };
-    let window = Duration::from_secs(5);
-    let start = cpu(client.pid());
-    std::thread::sleep(window);
-    let end = cpu(client.pid());
+    // The window is the client's own idle cycle, however long it takes to run.
+    let (start, started) = (cpu(client.pid()), Instant::now());
+    assert!(
+        client.idle_polls(input, 4),
+        "the client's input thread exited"
+    );
+    let (end, window) = (cpu(client.pid()), started.elapsed());
     drop(client);
 
     let busiest_ms_per_s = end

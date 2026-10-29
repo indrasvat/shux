@@ -15,7 +15,6 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::time::{Duration, Instant};
 
 /// Truecolor + 256-indexed + basic ANSI on one line. Mandatory on every
 /// daemon-backed capture (CLAUDE.md).
@@ -147,16 +146,12 @@ impl Env {
     /// races a slow starter and captures a blank screen.
     #[track_caller]
     fn wait_for(&self, session: &str, window: &str, needle: &str) -> String {
-        let deadline = Instant::now() + Duration::from_secs(20);
         let mut last = String::new();
-        while Instant::now() < deadline {
+        shux_testkit::poll(shux_testkit::BUDGET, || {
             last = self.capture(session, window);
-            if last.contains(needle) {
-                return last;
-            }
-            std::thread::sleep(Duration::from_millis(150));
-        }
-        panic!("{needle:?} never appeared in {session}:{window}:\n{last}");
+            last.contains(needle).then(|| last.clone())
+        })
+        .unwrap_or_else(|| panic!("{needle:?} never appeared in {session}:{window}:\n{last}"))
     }
 
     /// Type `line` and wait until the command has FINISHED writing.
@@ -545,7 +540,7 @@ fn run_command_delivers_a_metacharacter_argument_whole_and_completes() {
             "pane_id": pane,
             "command": "printf",
             "args": ["[%s]", arg],
-            "timeout": 10,
+            "timeout": 30,
         })
         .to_string();
         let out = env.ok(&[
@@ -581,7 +576,7 @@ fn run_command_keeps_an_empty_argument() {
         "pane_id": pane,
         "command": "printf",
         "args": ["<%s>", "A", "", "B"],
-        "timeout": 10,
+        "timeout": 30,
     })
     .to_string();
     env.ok(&["rpc", "call", "pane.run_command", "--params", &params]);
@@ -630,7 +625,7 @@ fn a_control_byte_in_args_is_refused_and_leaves_the_pane_usable() {
         "pane_id": pane,
         "command": "printf",
         "args": ["[%s]", "STILL-ALIVE"],
-        "timeout": 15,
+        "timeout": 30,
     })
     .to_string();
     let out = env.ok(&[

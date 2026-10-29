@@ -1233,6 +1233,7 @@ dependencies = [
  "shux-pty",
  "shux-raster",
  "shux-rpc",
+ "shux-testkit",
  "shux-ui",
  "shux-vt",
  "tempfile",
@@ -1255,6 +1256,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shux-program-status",
+ "shux-testkit",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -1276,6 +1278,7 @@ dependencies = [
  "sha2",
  "shux-core",
  "shux-rpc",
+ "shux-testkit",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -1300,6 +1303,7 @@ version = "0.54.10"
 dependencies = [
  "nix",
  "serde",
+ "shux-testkit",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -1332,10 +1336,19 @@ dependencies = [
  "nix",
  "serde",
  "serde_json",
+ "shux-testkit",
  "tempfile",
  "tokio",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "shux-testkit"
+version = "0.54.10"
+dependencies = [
+ "nix",
+ "tokio",
 ]
 
 [[package]]
@@ -1373,6 +1386,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "shux-program-status",
+ "shux-testkit",
  "thiserror 2.0.18",
  "tracing",
  "unicode-width",

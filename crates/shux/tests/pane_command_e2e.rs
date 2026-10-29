@@ -13,11 +13,8 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::thread;
-use std::time::{Duration, Instant};
 
-use nix::sys::signal::{Signal, kill};
-use nix::unistd::Pid;
+use shux_testkit::{BUDGET, poll};
 
 /// Truecolor + 256-indexed + basic ANSI on one line. Mandatory on every
 /// daemon-backed capture (CLAUDE.md).
@@ -138,7 +135,7 @@ impl Env {
             "-t",
             needle,
             "--timeout-ms",
-            "20000",
+            "30000",
         ]);
         assert!(
             out.status.success(),
@@ -158,46 +155,45 @@ impl Env {
     /// different machines, and the caller compares focus against the wrong one.
     #[track_caller]
     fn wait_for_exited_pane(&self, session: &str, command_needle: &str) -> serde_json::Value {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        loop {
-            let panes = self.json(&["pane", "list", "-s", session]);
-            let ready = panes.as_array().expect("panes").iter().any(|p| {
+        let exited = |panes: &serde_json::Value| {
+            panes.as_array().expect("panes").iter().any(|p| {
                 p["exit_status"].is_number() && p["command"].to_string().contains(command_needle)
-            });
-            if ready {
-                return panes;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
+            })
+        };
+        poll(BUDGET, || {
+            let panes = self.json(&["pane", "list", "-s", session]);
+            exited(&panes).then_some(panes)
+        })
+        .unwrap_or_else(|| {
+            let panes = self.json(&["pane", "list", "-s", session]);
+            panic!(
                 "the pane running {command_needle:?} never reported an exit_status \
-                 within 20s; panes were:\n{panes:#}"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
+                 within {BUDGET:?}; panes were:\n{panes:#}"
+            )
+        })
     }
 
     /// Same wait, scoped to one window — so a rep in a loop cannot be satisfied
     /// by an earlier rep's corpse.
     #[track_caller]
     fn wait_for_exited_pane_in_window(&self, session: &str, window: &str) -> serde_json::Value {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        loop {
-            let panes = self.json(&["pane", "list", "-s", session, "-w", window]);
-            if panes
+        let list = || self.json(&["pane", "list", "-s", session, "-w", window]);
+        poll(BUDGET, || {
+            let panes = list();
+            panes
                 .as_array()
                 .expect("panes")
                 .iter()
                 .any(|p| p["exit_status"].is_number())
-            {
-                return panes;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
+                .then_some(panes)
+        })
+        .unwrap_or_else(|| {
+            panic!(
                 "the pane in window {window:?} never reported an exit_status \
-                 within 20s; panes were:\n{panes:#}"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+                 within {BUDGET:?}; panes were:\n{:#}",
+                list()
+            )
+        })
     }
 
     fn capture(&self, session: &str, pane: &str) -> String {
@@ -276,15 +272,10 @@ impl Drop for Env {
         if let Some(pid) = std::fs::read_to_string(&pidfile)
             .ok()
             .and_then(|s| s.trim().parse::<i32>().ok())
+            && !shux_testkit::terminate(pid)
+            // A second panic during unwinding aborts and hides the first.
+            && !std::thread::panicking()
         {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while Instant::now() < deadline {
-                if kill(Pid::from_raw(pid), None).is_err() {
-                    return;
-                }
-                thread::sleep(Duration::from_millis(50));
-            }
-            let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
             panic!("daemon {pid} outlived the test");
         }
     }
@@ -726,15 +717,16 @@ fn a_failing_shell_command_ends_the_pane_without_wedging_the_daemon() {
     let mut env = Env::new();
     env.ok(&["session", "create", "fails", "-d", "--cmd", "exit 3"]);
     env.sessions.push("fails".to_string());
+    let panes = env.wait_for_exited_pane("fails", "exit 3");
+    assert_eq!(
+        panes[0]["exit_status"], 3,
+        "the pane should carry the shell's exit status: {panes:#}"
+    );
     // The daemon stays healthy and answerable after the pane's child dies.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
-        if env.run(&["session", "list"]).status.success() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    panic!("daemon stopped answering after a --cmd pane exited non-zero");
+    assert!(
+        env.run(&["session", "list"]).status.success(),
+        "daemon stopped answering after a --cmd pane exited non-zero"
+    );
 }
 
 // ── follow-ups found by adversarial review ──────────────────────────────

@@ -103,27 +103,62 @@ impl Server {
         self
     }
 
-    /// Start the server (UDS + optional TCP).
+    /// Start the server (UDS + optional TCP): [`Self::bind`], then
+    /// [`BoundServer::serve`].
     ///
     /// This runs until the CancellationToken is triggered.
-    pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let mut uds = crate::uds::OwnedSocket::bind(&self.config.socket_path)?;
-        info!(path = %self.config.socket_path.display(), "UDS listener bound");
-        let mut socket_check = tokio::time::interval(crate::uds::CHECK_INTERVAL);
-        socket_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    pub async fn run(self) -> Result<(), Box<dyn std::error::Error>> {
+        let bound = self.bind().await?;
+        bound.serve().await
+    }
 
-        // Optionally bind TCP listener.
-        let tcp_listener = if !self.config.tcp_addr.is_empty() {
+    /// Bind the listeners. Once this returns, connections queue until
+    /// [`BoundServer::serve`] accepts them.
+    pub async fn bind(self) -> Result<BoundServer, Box<dyn std::error::Error>> {
+        let uds = crate::uds::OwnedSocket::bind(&self.config.socket_path)?;
+        info!(path = %self.config.socket_path.display(), "UDS listener bound");
+
+        let tcp = if !self.config.tcp_addr.is_empty() {
             let listener = TcpListener::bind(&self.config.tcp_addr).await?;
-            info!(addr = %self.config.tcp_addr, "TCP listener bound");
+            info!(addr = %listener.local_addr()?, "TCP listener bound");
             Some(listener)
         } else {
             None
         };
+        Ok(BoundServer {
+            server: self,
+            uds,
+            tcp,
+        })
+    }
+}
 
-        let router = self.router.clone();
-        let cancel = self.cancel.clone();
-        let auth_token = self.config.auth_token.clone();
+/// A [`Server`] whose listeners are bound but not yet accepting.
+pub struct BoundServer {
+    server: Server,
+    uds: crate::uds::OwnedSocket,
+    tcp: Option<TcpListener>,
+}
+
+impl BoundServer {
+    /// The TCP listener's address, with the port the OS chose for `:0`.
+    pub fn tcp_local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.tcp.as_ref().and_then(|l| l.local_addr().ok())
+    }
+
+    /// Accept connections until the CancellationToken is triggered.
+    pub async fn serve(self) -> Result<(), Box<dyn std::error::Error>> {
+        let BoundServer {
+            server,
+            mut uds,
+            tcp: tcp_listener,
+        } = self;
+        let mut socket_check = tokio::time::interval(crate::uds::CHECK_INTERVAL);
+        socket_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        let router = server.router.clone();
+        let cancel = server.cancel.clone();
+        let auth_token = server.config.auth_token.clone();
 
         // Accept loop.
         loop {
@@ -132,7 +167,7 @@ impl Server {
                     info!("server shutting down");
                     break;
                 }
-                _ = socket_check.tick() => uds.check(self.rebind_gate.as_ref())?,
+                _ = socket_check.tick() => uds.check(server.rebind_gate.as_ref())?,
                 // Accept UDS connections.
                 result = uds.listener().accept() => {
                     match result {
@@ -842,14 +877,7 @@ mod tests {
         };
 
         let server = Server::new(config, router, cancel.clone());
-
-        // Run server in background.
-        let server_handle = tokio::spawn(async move {
-            server.run().await.unwrap();
-        });
-
-        // Give the server a moment to bind.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let server_handle = serve(server).await;
 
         // Connect a client.
         let stream = UnixStream::connect(&socket_path).await.unwrap();
@@ -878,7 +906,7 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server_handle).await;
     }
 
-    fn spawn_builtin_server(
+    async fn spawn_builtin_server(
         socket_path: &std::path::Path,
     ) -> (
         tokio_util::sync::CancellationToken,
@@ -892,9 +920,7 @@ mod tests {
             auth_token: None,
         };
         let server = Server::new(config, router, cancel.clone());
-        let handle = tokio::spawn(async move {
-            server.run().await.unwrap();
-        });
+        let handle = serve(server).await;
         (cancel, handle)
     }
 
@@ -903,11 +929,14 @@ mod tests {
     async fn an_unlinked_socket_is_rebound() {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("test.sock");
-        let (cancel, handle) = spawn_builtin_server(&socket_path);
-        drop(connect_with_retries(&socket_path).await);
+        let (cancel, handle) = spawn_builtin_server(&socket_path).await;
+        drop(UnixStream::connect(&socket_path).await.unwrap());
 
         std::fs::remove_file(&socket_path).unwrap();
-        drop(connect_with_retries(&socket_path).await);
+        shux_testkit::wait_for_async("the server to rebind its socket", || async {
+            UnixStream::connect(&socket_path).await.ok()
+        })
+        .await;
 
         cancel.cancel();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
@@ -918,8 +947,8 @@ mod tests {
     async fn shutdown_leaves_a_socket_bound_in_its_place() {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("test.sock");
-        let (cancel, handle) = spawn_builtin_server(&socket_path);
-        drop(connect_with_retries(&socket_path).await);
+        let (cancel, handle) = spawn_builtin_server(&socket_path).await;
+        drop(UnixStream::connect(&socket_path).await.unwrap());
 
         // A rename replaces the path atomically, so the server never sees it missing.
         let staged = dir.path().join("other.sock");
@@ -927,7 +956,7 @@ mod tests {
         std::fs::rename(&staged, &socket_path).unwrap();
 
         cancel.cancel();
-        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+        tokio::time::timeout(shux_testkit::BUDGET, handle)
             .await
             .expect("server stops")
             .unwrap();
@@ -938,21 +967,12 @@ mod tests {
         drop(other);
     }
 
-    /// Connect to a UDS server with a bounded retry loop (replaces a fixed
-    /// bind sleep with a deadline-bounded event wait).
-    async fn connect_with_retries(path: &std::path::Path) -> UnixStream {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            match UnixStream::connect(path).await {
-                Ok(s) => return s,
-                Err(e) => {
-                    if tokio::time::Instant::now() >= deadline {
-                        panic!("server never bound {}: {e}", path.display());
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                }
-            }
-        }
+    /// Bind `server` and serve it in the background; clients may connect at once.
+    async fn serve(server: Server) -> tokio::task::JoinHandle<()> {
+        let bound = server.bind().await.unwrap();
+        tokio::spawn(async move {
+            bound.serve().await.unwrap();
+        })
     }
 
     /// Drop guard for the hang handler: proves the in-flight future was
@@ -1030,11 +1050,9 @@ mod tests {
             router,
             cancel.clone(),
         );
-        let server_handle = tokio::spawn(async move {
-            server.run().await.unwrap();
-        });
+        let server_handle = serve(server).await;
 
-        let stream = connect_with_retries(&socket_path).await;
+        let stream = UnixStream::connect(&socket_path).await.unwrap();
         let mut framed = Framed::new(stream, create_codec());
         framed
             .send(frame_bytes(&serde_json::json!({
@@ -1044,7 +1062,7 @@ mod tests {
             .unwrap();
 
         // Deterministic: the handler signals when it is actually executing.
-        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+        tokio::time::timeout(shux_testkit::BUDGET, entered.notified())
             .await
             .expect("test.hang handler never entered");
         assert!(
@@ -1057,13 +1075,13 @@ mod tests {
 
         // The in-flight future must be dropped promptly — not after the
         // (infinite) handler completes.
-        tokio::time::timeout(std::time::Duration::from_secs(5), dropped_notify.notified())
+        tokio::time::timeout(shux_testkit::BUDGET, dropped_notify.notified())
             .await
             .expect("in-flight handler was not dropped on client disconnect");
         assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
 
         // Server stays healthy: a fresh connection serves normal requests.
-        let stream2 = connect_with_retries(&socket_path).await;
+        let stream2 = UnixStream::connect(&socket_path).await.unwrap();
         let mut framed2 = Framed::new(stream2, create_codec());
         framed2
             .send(frame_bytes(&serde_json::json!({
@@ -1096,11 +1114,9 @@ mod tests {
             router,
             cancel.clone(),
         );
-        let server_handle = tokio::spawn(async move {
-            server.run().await.unwrap();
-        });
+        let server_handle = serve(server).await;
 
-        let stream = connect_with_retries(&socket_path).await;
+        let stream = UnixStream::connect(&socket_path).await.unwrap();
         let mut framed = Framed::new(stream, create_codec());
 
         // Pipeline both requests up front, then read both responses.
@@ -1147,12 +1163,10 @@ mod tests {
             router,
             cancel.clone(),
         );
-        let server_handle = tokio::spawn(async move {
-            server.run().await.unwrap();
-        });
+        let server_handle = serve(server).await;
 
         // Conn A: park a hanging request.
-        let stream_a = connect_with_retries(&socket_path).await;
+        let stream_a = UnixStream::connect(&socket_path).await.unwrap();
         let mut framed_a = Framed::new(stream_a, create_codec());
         framed_a
             .send(frame_bytes(&serde_json::json!({
@@ -1160,12 +1174,12 @@ mod tests {
             })))
             .await
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+        tokio::time::timeout(shux_testkit::BUDGET, entered.notified())
             .await
             .expect("hang handler never entered");
 
         // Conn B: normal request completes WHILE A's request is in flight.
-        let stream_b = connect_with_retries(&socket_path).await;
+        let stream_b = UnixStream::connect(&socket_path).await.unwrap();
         let mut framed_b = Framed::new(stream_b, create_codec());
         framed_b
             .send(frame_bytes(&serde_json::json!({
@@ -1179,7 +1193,7 @@ mod tests {
 
         // Drop A → its in-flight handler is aborted...
         drop(framed_a);
-        tokio::time::timeout(std::time::Duration::from_secs(5), dropped_notify.notified())
+        tokio::time::timeout(shux_testkit::BUDGET, dropped_notify.notified())
             .await
             .expect("conn A's in-flight handler was not dropped");
         assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
@@ -1222,11 +1236,9 @@ mod tests {
             router,
             cancel.clone(),
         );
-        let server_handle = tokio::spawn(async move {
-            server.run().await.unwrap();
-        });
+        let server_handle = serve(server).await;
 
-        let stream = connect_with_retries(&socket_path).await;
+        let stream = UnixStream::connect(&socket_path).await.unwrap();
         let mut framed = Framed::new(stream, create_codec());
         framed
             .send(frame_bytes(&serde_json::json!({
@@ -1234,7 +1246,7 @@ mod tests {
             })))
             .await
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+        tokio::time::timeout(shux_testkit::BUDGET, entered.notified())
             .await
             .expect("test.hang handler never entered");
 
@@ -1253,7 +1265,7 @@ mod tests {
         drop(framed);
 
         // The in-flight handler must still be dropped promptly.
-        tokio::time::timeout(std::time::Duration::from_secs(5), dropped_notify.notified())
+        tokio::time::timeout(shux_testkit::BUDGET, dropped_notify.notified())
             .await
             .expect("in-flight handler not dropped under a pipelined backlog");
         assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
@@ -1282,11 +1294,9 @@ mod tests {
             router,
             cancel.clone(),
         );
-        let server_handle = tokio::spawn(async move {
-            server.run().await.unwrap();
-        });
+        let server_handle = serve(server).await;
 
-        let stream = connect_with_retries(&socket_path).await;
+        let stream = UnixStream::connect(&socket_path).await.unwrap();
         let mut framed = Framed::new(stream, create_codec());
         framed
             .send(frame_bytes(&serde_json::json!({
@@ -1296,7 +1306,7 @@ mod tests {
             .unwrap();
         // Ensure the hang frame has been DEQUEUED (the handler is running)
         // before flooding, so the pending count below is purely the flood.
-        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+        tokio::time::timeout(shux_testkit::BUDGET, entered.notified())
             .await
             .expect("test.hang handler never entered");
 
@@ -1317,7 +1327,7 @@ mod tests {
         }
 
         // Deliberate cancellation: the in-flight handler is dropped...
-        tokio::time::timeout(std::time::Duration::from_secs(5), dropped_notify.notified())
+        tokio::time::timeout(shux_testkit::BUDGET, dropped_notify.notified())
             .await
             .expect("cap violation did not drop the in-flight handler");
         assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
@@ -1325,7 +1335,7 @@ mod tests {
         // ...and the CLIENT (which never closed) observes the connection
         // being closed by the server: EOF or a connection error — never a
         // response frame, and never a hang.
-        let next = tokio::time::timeout(std::time::Duration::from_secs(5), framed.next())
+        let next = tokio::time::timeout(shux_testkit::BUDGET, framed.next())
             .await
             .expect("server did not close the violating connection");
         assert!(
@@ -1357,14 +1367,12 @@ mod tests {
             router,
             cancel.clone(),
         );
-        let server_handle = tokio::spawn(async move {
-            server.run().await.unwrap();
-        });
+        let server_handle = serve(server).await;
 
         // Run several iterations: the old bug was a race (EOF vs dequeue), so
         // a single pass could false-green.
         for iteration in 0..10 {
-            let stream = connect_with_retries(&socket_path).await;
+            let stream = UnixStream::connect(&socket_path).await.unwrap();
             let (read_half, write_half) = stream.into_split();
             let mut framed_w = tokio_util::codec::FramedWrite::new(write_half, create_codec());
             let mut framed_r = tokio_util::codec::FramedRead::new(read_half, create_codec());
@@ -1380,25 +1388,22 @@ mod tests {
             // read half stays open for the response.
             drop(framed_w);
 
-            let response_frame =
-                tokio::time::timeout(std::time::Duration::from_secs(5), framed_r.next())
-                    .await
-                    .unwrap_or_else(|_| {
-                        panic!("iteration {iteration}: no response after half-close")
-                    })
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "iteration {iteration}: bare EOF — the half-closed \
+            let response_frame = tokio::time::timeout(shux_testkit::BUDGET, framed_r.next())
+                .await
+                .unwrap_or_else(|_| panic!("iteration {iteration}: no response after half-close"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "iteration {iteration}: bare EOF — the half-closed \
                              client's request was discarded"
-                        )
-                    })
-                    .expect("decode response");
+                    )
+                })
+                .expect("decode response");
             let response: serde_json::Value = serde_json::from_slice(&response_frame).unwrap();
             assert_eq!(response["id"], 1, "iteration {iteration}: {response}");
             assert_eq!(response["result"]["name"], "shux");
 
             // Then the connection ends naturally.
-            let next = tokio::time::timeout(std::time::Duration::from_secs(5), framed_r.next())
+            let next = tokio::time::timeout(shux_testkit::BUDGET, framed_r.next())
                 .await
                 .expect("connection should close after the drain");
             assert!(!matches!(next, Some(Ok(_))));
@@ -1443,11 +1448,9 @@ mod tests {
             router,
             cancel.clone(),
         );
-        let server_handle = tokio::spawn(async move {
-            server.run().await.unwrap();
-        });
+        let server_handle = serve(server).await;
 
-        let stream = connect_with_retries(&socket_path).await;
+        let stream = UnixStream::connect(&socket_path).await.unwrap();
         let (read_half, write_half) = stream.into_split();
         let mut framed_w = tokio_util::codec::FramedWrite::new(write_half, create_codec());
         let mut framed_r = tokio_util::codec::FramedRead::new(read_half, create_codec());
@@ -1459,7 +1462,7 @@ mod tests {
             })))
             .await
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+        tokio::time::timeout(shux_testkit::BUDGET, entered.notified())
             .await
             .expect("gate handler never entered");
         // ...a second request queues behind it, then the client half-closes
@@ -1477,7 +1480,7 @@ mod tests {
 
         // Both responses must arrive, in order.
         let first: serde_json::Value = serde_json::from_slice(
-            &tokio::time::timeout(std::time::Duration::from_secs(5), framed_r.next())
+            &tokio::time::timeout(shux_testkit::BUDGET, framed_r.next())
                 .await
                 .expect("gate response after half-close")
                 .expect("not bare EOF — in-flight request was dropped")
@@ -1488,7 +1491,7 @@ mod tests {
         assert_eq!(first["result"]["gate"], "released");
 
         let second: serde_json::Value = serde_json::from_slice(
-            &tokio::time::timeout(std::time::Duration::from_secs(5), framed_r.next())
+            &tokio::time::timeout(shux_testkit::BUDGET, framed_r.next())
                 .await
                 .expect("queued response after half-close")
                 .expect("not bare EOF — queued frame was discarded")
@@ -1499,7 +1502,7 @@ mod tests {
         assert_eq!(second["result"]["status"], "ok");
 
         // Then natural close.
-        let next = tokio::time::timeout(std::time::Duration::from_secs(5), framed_r.next())
+        let next = tokio::time::timeout(shux_testkit::BUDGET, framed_r.next())
             .await
             .expect("connection should close after the drain");
         assert!(!matches!(next, Some(Ok(_))));
@@ -1560,11 +1563,9 @@ mod tests {
             router,
             cancel.clone(),
         );
-        let server_handle = tokio::spawn(async move {
-            server.run().await.unwrap();
-        });
+        let server_handle = serve(server).await;
 
-        let stream = connect_with_retries(&socket_path).await;
+        let stream = UnixStream::connect(&socket_path).await.unwrap();
         let mut framed = Framed::new(stream, create_codec());
         framed
             .send(frame_bytes(&serde_json::json!({
@@ -1572,7 +1573,7 @@ mod tests {
             })))
             .await
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+        tokio::time::timeout(shux_testkit::BUDGET, entered.notified())
             .await
             .expect("hang handler never entered");
         // Queue a backlog behind the hang, then FULLY close (both halves).
@@ -1588,7 +1589,7 @@ mod tests {
 
         // In-flight handler dropped promptly (the moment this fires, the
         // executor has taken the close branch — no further dequeues happen).
-        tokio::time::timeout(std::time::Duration::from_secs(5), dropped_notify.notified())
+        tokio::time::timeout(shux_testkit::BUDGET, dropped_notify.notified())
             .await
             .expect("in-flight handler not dropped on full close");
         assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
@@ -1623,11 +1624,9 @@ mod tests {
             router,
             cancel.clone(),
         );
-        let server_handle = tokio::spawn(async move {
-            server.run().await.unwrap();
-        });
+        let server_handle = serve(server).await;
 
-        let stream = connect_with_retries(&socket_path).await;
+        let stream = UnixStream::connect(&socket_path).await.unwrap();
         let mut framed = Framed::new(stream, create_codec());
         framed
             .send(frame_bytes(&serde_json::json!({
@@ -1635,7 +1634,7 @@ mod tests {
             })))
             .await
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+        tokio::time::timeout(shux_testkit::BUDGET, entered.notified())
             .await
             .expect("hang handler never entered");
 
@@ -1655,13 +1654,13 @@ mod tests {
         }
 
         // Deliberate cancellation: in-flight handler dropped...
-        tokio::time::timeout(std::time::Duration::from_secs(5), dropped_notify.notified())
+        tokio::time::timeout(shux_testkit::BUDGET, dropped_notify.notified())
             .await
             .expect("byte-cap violation did not drop the in-flight handler");
         assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
 
         // ...and the still-open client observes server-side EOF/error.
-        let next = tokio::time::timeout(std::time::Duration::from_secs(5), framed.next())
+        let next = tokio::time::timeout(shux_testkit::BUDGET, framed.next())
             .await
             .expect("server did not close the violating connection");
         assert!(
@@ -1717,7 +1716,7 @@ mod tests {
             })))
             .await
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+        tokio::time::timeout(shux_testkit::BUDGET, entered.notified())
             .await
             .expect("hang handler never entered");
 
@@ -1735,7 +1734,7 @@ mod tests {
 
         // The degraded drain must observe EOF and drop the in-flight handler
         // promptly.
-        tokio::time::timeout(std::time::Duration::from_secs(5), dropped_notify.notified())
+        tokio::time::timeout(shux_testkit::BUDGET, dropped_notify.notified())
             .await
             .expect(
                 "in-flight handler not dropped: degraded mode lost disconnect \
@@ -1773,19 +1772,18 @@ mod tests {
             // has been read — the "while connected" condition under test.
 
             let mut framed_r = tokio_util::codec::FramedRead::new(client_read, create_codec());
-            let response_frame =
-                tokio::time::timeout(std::time::Duration::from_secs(5), framed_r.next())
-                    .await
-                    .unwrap_or_else(|_| {
-                        panic!("iteration {iteration}: no frame-error response (degraded)")
-                    })
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "iteration {iteration}: bare EOF instead of the \
+            let response_frame = tokio::time::timeout(shux_testkit::BUDGET, framed_r.next())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("iteration {iteration}: no frame-error response (degraded)")
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "iteration {iteration}: bare EOF instead of the \
                              frame_too_large response in degraded mode"
-                        )
-                    })
-                    .expect("decode response");
+                    )
+                })
+                .expect("decode response");
             let response: serde_json::Value = serde_json::from_slice(&response_frame).unwrap();
             assert_eq!(
                 response["error"]["code"], -32001,
@@ -1793,7 +1791,7 @@ mod tests {
             );
 
             // Then the server closes the connection.
-            let next = tokio::time::timeout(std::time::Duration::from_secs(5), framed_r.next())
+            let next = tokio::time::timeout(shux_testkit::BUDGET, framed_r.next())
                 .await
                 .expect("connection should close after the error response");
             assert!(!matches!(next, Some(Ok(_))));
@@ -1832,12 +1830,10 @@ mod tests {
             router,
             cancel.clone(),
         );
-        let server_handle = tokio::spawn(async move {
-            server.run().await.unwrap();
-        });
+        let server_handle = serve(server).await;
 
         for iteration in 0..25 {
-            let mut stream = connect_with_retries(&socket_path).await;
+            let mut stream = UnixStream::connect(&socket_path).await.unwrap();
             // Raw oversized frame: a 4-byte BE length prefix past the codec
             // cap plus a little payload — the decoder rejects it from the
             // length field alone (InvalidData).
@@ -1852,19 +1848,18 @@ mod tests {
             // The client MUST receive the frame_too_large error response —
             // every iteration, never bare EOF.
             let mut framed = Framed::new(stream, create_codec());
-            let response_frame =
-                tokio::time::timeout(std::time::Duration::from_secs(5), framed.next())
-                    .await
-                    .unwrap_or_else(|_| {
-                        panic!("iteration {iteration}: no frame-error response within 5s")
-                    })
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "iteration {iteration}: bare EOF instead of the \
+            let response_frame = tokio::time::timeout(shux_testkit::BUDGET, framed.next())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("iteration {iteration}: no frame-error response within the budget")
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "iteration {iteration}: bare EOF instead of the \
                              frame_too_large error response (the round-2 race)"
-                        )
-                    })
-                    .expect("response frame decode");
+                    )
+                })
+                .expect("response frame decode");
             let response: serde_json::Value = serde_json::from_slice(&response_frame).unwrap();
             assert_eq!(
                 response["error"]["code"], -32001,
@@ -1872,7 +1867,7 @@ mod tests {
             );
 
             // And then the server closes the connection.
-            let next = tokio::time::timeout(std::time::Duration::from_secs(5), framed.next())
+            let next = tokio::time::timeout(shux_testkit::BUDGET, framed.next())
                 .await
                 .unwrap_or_else(|_| {
                     panic!("iteration {iteration}: connection not closed after frame error")
@@ -1889,41 +1884,30 @@ mod tests {
 
     #[tokio::test]
     async fn test_tcp_auth_required() {
-        // KNOWN FLAKE: bind→drop→re-bind TOCTOU race on the auto-
-        // assigned port. Between `drop(tcp_listener)` and the Server's
-        // own `TcpListener::bind`, another process can grab the port
-        // (CI runners with parallel jobs are most likely; locally
-        // this almost never trips). Tracked in
-        // .config/nextest.toml's flake list; a proper fix would
-        // hand the listener directly to Server::new instead of
-        // round-tripping through a port string. For now the test
-        // re-runs on retry per the nextest override.
-        //
         // TCP connections with a configured token must authenticate first.
         let cancel = tokio_util::sync::CancellationToken::new();
         let router = register_builtin_methods(Router::builder()).build();
-
-        // Use port 0 to let the OS assign a random available port.
-        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let tcp_addr = tcp_listener.local_addr().unwrap();
+        // Kept alive to the end: the server's UDS lives in it.
+        let dir = tempfile::tempdir().unwrap();
 
         let config = ServerConfig {
             // We still need a UDS path even though we're testing TCP.
-            socket_path: tempfile::tempdir().unwrap().path().join("test.sock"),
-            tcp_addr: tcp_addr.to_string(),
+            socket_path: dir.path().join("test.sock"),
+            // Port 0: the server's own listener takes whatever port the OS
+            // gives it, so no other process can win it in between.
+            tcp_addr: "127.0.0.1:0".to_string(),
             auth_token: Some("test-token-42".to_string()),
         };
 
-        // Drop the pre-bound listener so the server can bind.
-        drop(tcp_listener);
-
-        let server = Server::new(config, router, cancel.clone());
+        let bound = Server::new(config, router, cancel.clone())
+            .bind()
+            .await
+            .unwrap();
+        let tcp_addr = bound.tcp_local_addr().expect("TCP listener bound");
 
         let server_handle = tokio::spawn(async move {
-            server.run().await.unwrap();
+            bound.serve().await.unwrap();
         });
-
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Connect via TCP without authenticating first.
         let stream = tokio::net::TcpStream::connect(tcp_addr).await.unwrap();

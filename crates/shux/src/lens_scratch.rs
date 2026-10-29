@@ -489,6 +489,51 @@ fn unix_ms(t: SystemTime) -> u64 {
         .unwrap_or(0)
 }
 
+/// Move a corrupt registry aside as `<path>.corrupt.<unix_ms>`, adding
+/// `.<n>` when that name is taken. Linking first never replaces an
+/// existing file, as a rename would.
+fn preserve_corrupt_registry(path: &Path, now: SystemTime) -> std::io::Result<PathBuf> {
+    preserve_corrupt_registry_with(path, now, |from, to| std::fs::hard_link(from, to))
+}
+
+fn preserve_corrupt_registry_with(
+    path: &Path,
+    now: SystemTime,
+    link: impl Fn(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<PathBuf> {
+    use std::io::ErrorKind;
+    let stamp = unix_ms(now);
+    let mut n = 0u64;
+    loop {
+        let corrupt = match n {
+            0 => path.with_extension(format!("json.corrupt.{stamp}")),
+            n => path.with_extension(format!("json.corrupt.{stamp}.{n}")),
+        };
+        match link(path, &corrupt) {
+            Ok(()) => {
+                if let Err(e) = std::fs::remove_file(path)
+                    && e.kind() != ErrorKind::NotFound
+                {
+                    tracing::warn!(error = %e, "scratch-registry: corrupt original not removed");
+                }
+                return Ok(corrupt);
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+            // No hard link here: rename onto a name seen free. The daemon's
+            // instance lock makes it the only writer of these names.
+            Err(_) => match std::fs::symlink_metadata(&corrupt) {
+                Ok(_) => {}
+                Err(e) if e.kind() == ErrorKind::NotFound => {
+                    std::fs::rename(path, &corrupt)?;
+                    return Ok(corrupt);
+                }
+                Err(e) => return Err(e),
+            },
+        }
+        n += 1;
+    }
+}
+
 // ── process start-time token (LENS-R-044 "start time matches") ──────────
 
 /// An OS-reported process start token for `pid`, used to disambiguate a
@@ -758,7 +803,7 @@ impl ScratchRegistry {
     ///   unrelated NEW group inside the restart window — same class as
     ///   the §17 M14 double-fork tolerance, documented in the task file.
     ///
-    /// Corrupt file (codex B2): preserved as `<path>.corrupt.<unix_ms>`
+    /// Corrupt file (codex B2): preserved as `<path>.corrupt.<unix_ms>[.<n>]`
     /// (timestamped so repeated corrupt startups never overwrite earlier
     /// evidence — P5 round-2 codex minor), logged at ERROR, never silently
     /// deleted; nothing is killed.
@@ -788,16 +833,18 @@ impl ScratchRegistry {
         let rows: Vec<RegistryRow> = match serde_json::from_str(&text) {
             Ok(r) => r,
             Err(e) => {
-                let corrupt =
-                    path.with_extension(format!("json.corrupt.{}", unix_ms(SystemTime::now())));
-                tracing::error!(
-                    error = %e,
-                    preserved = %corrupt.display(),
-                    "scratch-registry: unreadable (crash mid-write or tampering); \
-                     preserving as evidence — NOT killing anything; inspect + remove manually"
-                );
-                if let Err(re) = std::fs::rename(&path, &corrupt) {
-                    tracing::error!(error = %re, "scratch-registry: could not preserve corrupt file");
+                match preserve_corrupt_registry(&path, SystemTime::now()) {
+                    Ok(corrupt) => tracing::error!(
+                        error = %e,
+                        preserved = %corrupt.display(),
+                        "scratch-registry: unreadable (crash mid-write or tampering); \
+                         preserving as evidence — NOT killing anything; inspect + remove manually"
+                    ),
+                    Err(re) => tracing::error!(
+                        error = %e,
+                        preserve_error = %re,
+                        "scratch-registry: unreadable, and could not preserve the corrupt file"
+                    ),
                 }
                 return (0, Vec::new());
             }
@@ -1151,6 +1198,10 @@ async fn kill_pgid_lens_sequence(pgid: u32) -> KillOutcome {
         if probe_group(pgid) == GroupProbe::Gone {
             return KillOutcome::Died;
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "re-probes the group through SIGTERM's grace period"
+        )]
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let _ = killpg(pid, Signal::SIGKILL);
@@ -1159,6 +1210,10 @@ async fn kill_pgid_lens_sequence(pgid: u32) -> KillOutcome {
         if probe_group(pgid) == GroupProbe::Gone {
             return KillOutcome::Died;
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "re-probes the group until SIGKILL's death is confirmed or the window ends"
+        )]
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     KillOutcome::Unconfirmed
@@ -1215,6 +1270,10 @@ async fn kill_with_retry(pgid: u32) -> KillOutcome {
         pgid,
         "scratch reap: group survived the kill sequence unconfirmed; retrying once"
     );
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "backoff before the one retry, for a zombie leader's reap to land"
+    )]
     tokio::time::sleep(Duration::from_millis(500)).await;
     kill_pgid_lens_sequence(pgid).await
 }
@@ -1523,25 +1582,40 @@ async fn scratch_reaper(
     // not a runtime cap; the audit must say so).
     deadline_reason: &'static str,
 ) {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a scratch is reaped at its max-runtime deadline"
+    )]
+    let deadline = tokio::time::sleep_until(max_runtime_deadline.into());
     let reason = tokio::select! {
         biased;
         _ = explicit_kill.cancelled() => {
             // on_session_killed owns (or already finished) the reap.
             return;
         }
-        _ = tokio::time::sleep_until(max_runtime_deadline.into()) => {
+        _ = deadline => {
             deadline_reason
         }
         exit_status = wait_for_pane_exit(exit_sub, pane_id) => {
             let _ = exit_status;
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "an exited scratch is kept for its post-exit TTL, never past its deadline"
+            )]
+            let (deadline, ttl) = (
+                tokio::time::sleep_until(max_runtime_deadline.into()),
+                tokio::time::sleep(Duration::from_millis(post_exit_ttl_ms as u64)),
+            );
             tokio::select! {
                 biased;
                 _ = explicit_kill.cancelled() => return,
-                _ = tokio::time::sleep_until(max_runtime_deadline.into()) => deadline_reason,
-                _ = tokio::time::sleep(Duration::from_millis(post_exit_ttl_ms as u64)) => "exit",
+                _ = deadline => deadline_reason,
+                _ = ttl => "exit",
             }
         }
     };
+    #[cfg(test)]
+    test_hooks::maybe_pause(&test_hooks::PAUSE_BEFORE_REAP).await;
     // Reap-ownership claim: if an explicit kill got here first, back off.
     let Some(claim) = registry.claim(&session_id) else {
         return;
@@ -1753,6 +1827,8 @@ pub(crate) mod test_hooks {
     pub(crate) static PAUSE_AFTER_CREATE: StdMutex<Option<Arc<Pause>>> = StdMutex::new(None);
     /// Between PTY spawn and registry commit.
     pub(crate) static PAUSE_BEFORE_COMMIT: StdMutex<Option<Arc<Pause>>> = StdMutex::new(None);
+    /// In a reaper whose deadline or TTL has fired, before it reaps.
+    pub(crate) static PAUSE_BEFORE_REAP: StdMutex<Option<Arc<Pause>>> = StdMutex::new(None);
 
     pub(crate) async fn maybe_pause(slot: &StdMutex<Option<Arc<Pause>>>) {
         let armed = slot.lock().unwrap().clone();
@@ -2120,8 +2196,6 @@ mod tests {
         // P5 round-2 codex minor: a SECOND corrupt startup must not
         // overwrite the first evidence file.
         std::fs::write(&path, "{second corruption").unwrap();
-        // The timestamp suffix has ms resolution; ensure it differs.
-        std::thread::sleep(Duration::from_millis(5));
         let (killed, unresolved) = ScratchRegistry::startup_reap(dir.path(), &audit).await;
         assert!(
             unresolved.is_empty(),
@@ -2134,6 +2208,93 @@ mod tests {
             2,
             "repeated corrupt startups keep distinct evidence files: {preserved:?}"
         );
+    }
+
+    /// Where link(2) is refused (no hard links on the filesystem, or a
+    /// registry another uid owns under protected_hardlinks) the evidence is
+    /// still moved aside, never left for the next persist to overwrite.
+    #[test]
+    fn corrupt_evidence_survives_a_filesystem_without_hard_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scratch-registry.json");
+        let now = SystemTime::now();
+        let eperm = |_: &Path, _: &Path| Err(std::io::Error::from_raw_os_error(nix::libc::EPERM));
+        std::fs::write(&path, "{first").unwrap();
+        let first = preserve_corrupt_registry_with(&path, now, eperm)
+            .expect("a filesystem that refuses link(2) left the evidence in place");
+        std::fs::write(&path, "{second").unwrap();
+        let second = preserve_corrupt_registry_with(&path, now, eperm).unwrap();
+        assert_ne!(first, second, "the fallback reused a taken name");
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "{first");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "{second");
+        assert!(!path.exists(), "the corrupt registry was not moved aside");
+    }
+
+    /// Evidence linked aside counts as preserved even if the original is gone
+    /// by the time it is unlinked.
+    #[test]
+    fn evidence_linked_then_original_vanished_is_reported_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scratch-registry.json");
+        std::fs::write(&path, "{evidence").unwrap();
+        let link_then_vanish = |a: &Path, b: &Path| {
+            std::fs::hard_link(a, b)?;
+            std::fs::remove_file(a)
+        };
+        let kept = preserve_corrupt_registry_with(&path, SystemTime::now(), link_then_vanish)
+            .expect("evidence was linked aside but reported as not preserved");
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), "{evidence");
+    }
+
+    /// Evidence linked aside is preserved even when the original cannot then be
+    /// removed; the next startup only preserves it again.
+    #[test]
+    fn evidence_linked_but_original_kept_is_reported_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scratch-registry.json");
+        std::fs::write(&path, "{evidence").unwrap();
+        // A directory in the original's place makes its removal fail.
+        let link_then_block = |a: &Path, b: &Path| {
+            std::fs::hard_link(a, b)?;
+            std::fs::remove_file(a)?;
+            std::fs::create_dir(a)
+        };
+        let kept = preserve_corrupt_registry_with(&path, SystemTime::now(), link_then_block)
+            .expect("evidence was linked aside but reported as not preserved");
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), "{evidence");
+    }
+
+    /// A clock stuck on one millisecond still never runs out of names.
+    #[test]
+    fn a_stuck_clock_never_runs_out_of_evidence_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scratch-registry.json");
+        std::fs::write(path.with_extension("json.corrupt.0"), "{0").unwrap();
+        for n in 1..=1000 {
+            std::fs::write(path.with_extension(format!("json.corrupt.0.{n}")), "{n").unwrap();
+        }
+        std::fs::write(&path, "{1001").unwrap();
+        let kept = preserve_corrupt_registry(&path, UNIX_EPOCH)
+            .unwrap_or_else(|e| panic!("startup 1002 on a stuck clock lost its evidence: {e}"));
+        assert_eq!(kept, path.with_extension("json.corrupt.0.1001"));
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), "{1001");
+    }
+
+    /// Two corrupt startups in the same millisecond, or a clock stepped back
+    /// onto one already used, must still keep both files.
+    #[test]
+    fn corrupt_evidence_is_never_overwritten_by_a_same_millisecond_startup() {
+        let dir = tmpdir();
+        let path = dir.path().join("scratch-registry.json");
+        let now = SystemTime::now();
+        std::fs::write(&path, "{first").unwrap();
+        let first = preserve_corrupt_registry(&path, now).unwrap();
+        std::fs::write(&path, "{second").unwrap();
+        let second = preserve_corrupt_registry(&path, now).unwrap();
+        assert_ne!(first, second, "the second startup reused the first's name");
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "{first");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "{second");
+        assert_eq!(corrupt_files(dir.path()).len(), 2);
     }
 
     // ── M4: start-token match ───────────────────────────────────────────
@@ -2970,7 +3131,7 @@ mod production_route_tests {
 
             // Wait until the core is INSIDE the window, then drop the
             // dispatch future — the exact client-disconnect shape.
-            tokio::time::timeout(Duration::from_secs(10), pause.reached.notified())
+            tokio::time::timeout(shux_testkit::BUDGET, pause.reached.notified())
                 .await
                 .unwrap_or_else(|_| panic!("core never reached the pause ({name})"));
             dispatch.abort();
@@ -2984,14 +3145,11 @@ mod production_route_tests {
             // Wait for the COMMITTED row (ids() counts rows only — the
             // in-flight reservation itself already counts toward
             // test_total, which would pass before the commit happened).
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            while harness.scratch_registry.ids().len() != 1 {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "core did not commit the scratch after the drop ({name})"
-                );
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
+            let what = format!("the core to commit the scratch after the drop ({name})");
+            shux_testkit::wait_until_async(&what, || async {
+                harness.scratch_registry.ids().len() == 1
+            })
+            .await;
 
             // No phantom: every __scratch session in the graph is ALSO in
             // the registry (claude round-2: a leaked one would show in
@@ -3019,14 +3177,11 @@ mod production_route_tests {
                 0,
                 "quota slot free ({name})"
             );
-            let proc_deadline = std::time::Instant::now() + Duration::from_secs(5);
-            while count_procs_containing(&format!("sleep {sleep_tag}")) != 0 {
-                assert!(
-                    std::time::Instant::now() < proc_deadline,
-                    "stray scratch process survived ({name})"
-                );
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
+            let what = format!("the scratch process to be gone ({name})");
+            shux_testkit::wait_until_async(&what, || async {
+                count_procs_containing(&format!("sleep {sleep_tag}")) == 0
+            })
+            .await;
         }
 
         harness.stop().await;
@@ -3086,10 +3241,10 @@ mod production_route_tests {
         // (the forced flag only faked the lens sequence) — wait it out so
         // the leak guard stays clean; the surviving row simply ages out
         // with the harness tempdir, exactly like a crash-preserved row.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while count_procs_containing(&marker) > 0 && std::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        shux_testkit::wait_until_async("the scratch process to be gone", || async {
+            count_procs_containing(&marker) == 0
+        })
+        .await;
         harness.stop().await;
     }
 
@@ -3146,9 +3301,11 @@ mod production_route_tests {
         assert_eq!(killed, 0);
         assert_eq!(unresolved.len(), 1, "row returned for seeding");
 
-        // Seed the LIVE registry (test-friendly retry delay: long enough
-        // to deterministically observe the survive-a-normal-persist
-        // window first).
+        // Seed the LIVE registry. Its reaper's retry is due at once but held
+        // at the pause until the survive-a-normal-persist window is observed.
+        let reap = crate::lens_scratch::test_hooks::Pause::arm(
+            &crate::lens_scratch::test_hooks::PAUSE_BEFORE_REAP,
+        );
         harness
             .scratch_registry
             .seed_unresolved(
@@ -3156,7 +3313,7 @@ mod production_route_tests {
                 &harness.graph,
                 &harness.io,
                 &harness.bus,
-                Duration::from_secs(3),
+                Duration::ZERO,
             )
             .await;
         assert_eq!(
@@ -3181,22 +3338,21 @@ mod production_route_tests {
         );
         assert!(text.contains(&normal_sid), "normal row persisted too");
 
-        // The short-deadline retry then confirms death, removes the row,
-        // and audits reason=registry.
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
-        loop {
-            let still_there = std::fs::read_to_string(&reg_path)
-                .map(|t| t.contains(&seeded_sid))
-                .unwrap_or(false);
-            if !still_there {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "seeded row not reaped by the running daemon's retry"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        // The retry then confirms death, removes the row, and audits
+        // reason=registry.
+        reap.release.notify_one();
+        *crate::lens_scratch::test_hooks::PAUSE_BEFORE_REAP
+            .lock()
+            .unwrap() = None;
+        shux_testkit::wait_until_async(
+            "the running daemon's retry to reap the seeded row",
+            || async {
+                !std::fs::read_to_string(&reg_path)
+                    .map(|t| t.contains(&seeded_sid))
+                    .unwrap_or(false)
+            },
+        )
+        .await;
         let audit_text = std::fs::read_to_string(dir.join("lens-audit.ndjson")).unwrap_or_default();
         assert!(
             audit_text
@@ -3478,6 +3634,10 @@ mod production_route_tests {
         *crate::lens_scratch::TEST_FORCE_UNCONFIRMED_PGID
             .lock()
             .unwrap() = Some(pgid_b);
+        // C's reaper is due at once but held until its sibling checks ran.
+        let reap = crate::lens_scratch::test_hooks::Pause::arm(
+            &crate::lens_scratch::test_hooks::PAUSE_BEFORE_REAP,
+        );
         harness
             .scratch_registry
             .seed_unresolved(
@@ -3485,7 +3645,7 @@ mod production_route_tests {
                 &harness.graph,
                 &harness.io,
                 &harness.bus,
-                Duration::from_secs(3),
+                Duration::ZERO,
             )
             .await;
         *crate::lens_scratch::TEST_FORCE_UNCONFIRMED_PGID
@@ -3517,20 +3677,17 @@ mod production_route_tests {
         assert_eq!(count_reaps(raw_a), 1, "A audited exactly once");
         assert_eq!(count_reaps(raw_b), 0, "B not audited while unresolved");
 
-        // C's short-deadline reaper confirms and removes its row.
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
-        loop {
+        // C's reaper confirms and removes its row.
+        reap.release.notify_one();
+        *crate::lens_scratch::test_hooks::PAUSE_BEFORE_REAP
+            .lock()
+            .unwrap() = None;
+        let text = shux_testkit::wait_for_async("C's seeded reaper to resolve it", || async {
             let text = std::fs::read_to_string(&reg_path).unwrap_or_default();
-            if !text.contains(&uuid_c) {
-                assert!(text.contains(raw_b), "B still persisted after C's removal");
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "C's seeded reaper never resolved it"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+            (!text.contains(&uuid_c)).then_some(text)
+        })
+        .await;
+        assert!(text.contains(raw_b), "B still persisted after C's removal");
         assert_eq!(count_reaps(&uuid_c), 1, "C audited exactly once");
 
         // Simulated restart resolves B for real: clean end state.

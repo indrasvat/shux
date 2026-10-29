@@ -1,0 +1,12 @@
+[package]
+name = "shux-testkit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Event-based waits and process helpers for shux tests. Dev-dependency only."
+
+[dependencies]
+tokio = { workspace = true }
+nix = { workspace = true, features = ["time"] }

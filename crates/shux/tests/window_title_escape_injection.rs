@@ -20,11 +20,6 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::thread;
-use std::time::{Duration, Instant};
-
-use nix::sys::signal::{Signal, kill};
-use nix::unistd::Pid;
 
 /// The reported payload: ESC ] 0 ; … BEL retitles the operator's terminal.
 const OSC_PAYLOAD: &str = "\u{1b}]0;PWNED\u{7}deploy";
@@ -90,14 +85,7 @@ impl Env {
 impl Drop for Env {
     fn drop(&mut self) {
         if let Some(pid) = self.daemon_pid() {
-            let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while Instant::now() < deadline {
-                if kill(Pid::from_raw(pid as i32), None).is_err() {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(50));
-            }
+            shux_testkit::terminate(pid as i32);
         }
     }
 }

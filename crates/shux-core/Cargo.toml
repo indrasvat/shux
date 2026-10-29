@@ -22,3 +22,4 @@ shux-program-status = { path = "../shux-program-status" }
 tokio = { workspace = true, features = ["test-util"] }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
+shux-testkit = { path = "../shux-testkit" }

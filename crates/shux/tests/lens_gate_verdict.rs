@@ -33,8 +33,12 @@ impl Gate {
 
 /// Run `shux lens gate <args...>` with an optional CI flag; capture streams + exit.
 fn gate(h: &Harness, args: &[&str], ci: bool) -> Gate {
+    gate_with(h, args, ci, &[])
+}
+
+fn gate_with(h: &Harness, args: &[&str], ci: bool, env: &[(&str, &str)]) -> Gate {
     let mut cmd = h.shux();
-    cmd.args(["lens", "gate"]);
+    cmd.args(["lens", "gate"]).envs(env.iter().copied());
     cmd.args(args);
     if ci {
         cmd.env("CI", "true");
@@ -47,6 +51,29 @@ fn gate(h: &Harness, args: &[&str], ci: bool) -> Gate {
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         exit: out.status.code().unwrap_or(-1),
     }
+}
+
+/// [`gate`] with a JSON report, while a child parked on `fifo` is released once the
+/// trace in `dir` shows the golden compare.
+fn gate_released(h: &Harness, dir: &Path, fifo: &Path, golden_dir: &str, scn: &str) -> Gate {
+    let trace = dir.join("trace.ndjson").to_string_lossy().into_owned();
+    std::thread::scope(|s| {
+        s.spawn(|| lens_common::release_after_compare(dir, fifo));
+        gate_with(
+            h,
+            &[
+                "--report",
+                "-",
+                "--trace",
+                &trace,
+                "--golden-dir",
+                golden_dir,
+                scn,
+            ],
+            false,
+            &[lens_common::HELD_POST_COMPARE_GRACE],
+        )
+    })
 }
 
 /// Write a scenario TOML to a temp file and return its path string.
@@ -69,11 +96,11 @@ cols = 40
 [[steps]]
 action = "wait_for_text"
 text = "{text}"
-timeout_ms = 5000
+timeout_ms = 30000
 [[steps]]
 action = "settle"
 quiet_ms = 250
-timeout_ms = 5000
+timeout_ms = 30000
 [[steps]]
 action = "expect_golden"
 name = "frame"
@@ -399,19 +426,22 @@ fn a_golden_is_never_minted_from_a_run_that_did_not_complete() {
     let d = tmp();
     let g = tmp();
     let gd = g.path().to_string_lossy().into_owned();
-    let toml = r#"name = "crashy"
-command = ["/bin/sh", "-c", "printf 'DRAWN'; sleep 2; exit 9"]
+    // The child dies only once the trace shows the compare: after the capture.
+    let fifo = lens_common::make_fifo(d.path());
+    let toml = format!(
+        r#"name = "crashy"
+command = ["/bin/sh", "-c", "printf 'DRAWN'; read x < '{fifo}'; exit 9"]
 [terminal]
 rows = 8
 cols = 24
 [[steps]]
 action = "wait_for_text"
 text = "DRAWN"
-timeout_ms = 8000
+timeout_ms = 30000
 [[steps]]
 action = "settle"
 quiet_ms = 200
-timeout_ms = 5000
+timeout_ms = 30000
 [[steps]]
 action = "expect_golden"
 name = "f"
@@ -419,23 +449,32 @@ tier = "cell"
 [[steps]]
 action = "wait"
 ms = 4000
-"#;
-    let scn = write_scenario(d.path(), "crashy", toml);
-    let out = gate(
-        &h,
-        &[
-            "--on-missing",
-            "create",
-            "--reason",
-            "x",
-            "--report",
-            "-",
-            "--golden-dir",
-            &gd,
-            &scn,
-        ],
-        false,
+"#,
+        fifo = fifo.display()
     );
+    let scn = write_scenario(d.path(), "crashy", &toml);
+    let trace = d.path().join("trace.ndjson").to_string_lossy().into_owned();
+    let out = std::thread::scope(|s| {
+        s.spawn(|| lens_common::release_after_compare(d.path(), &fifo));
+        gate_with(
+            &h,
+            &[
+                "--on-missing",
+                "create",
+                "--reason",
+                "x",
+                "--report",
+                "-",
+                "--trace",
+                &trace,
+                "--golden-dir",
+                &gd,
+                &scn,
+            ],
+            false,
+            &[lens_common::HELD_POST_COMPARE_GRACE],
+        )
+    });
     assert_ne!(
         out.exit, 0,
         "a crashed run is never green; stderr:\n{}",
@@ -602,7 +641,7 @@ MY_SECRET = "AKIAIOSFODNN7EXAMPLE"
 [[steps]]
 action = "wait_for_text"
 text = "READY"
-timeout_ms = 5000
+timeout_ms = 30000
 [[steps]]
 action = "expect_golden"
 name = "frame"
@@ -642,31 +681,36 @@ fn delayed_post_compare_crash_does_not_false_pass() {
     let gd = g.path().to_string_lossy().into_owned();
     // Bless a golden capturing "READY".
     bless_golden(&h, d.path(), &gd, "base", "READY");
-    // A scenario whose child paints the SAME frame (→ frame_match), then crashes ~1s later
-    // (within the 2s post-compare grace). It must NOT false-pass: the crash → child_error.
-    let crash = r#"name = "crash"
-command = ["/bin/sh", "-c", "printf 'READY'; sleep 1; kill -SEGV $$"]
+    // A scenario whose child paints the SAME frame (→ frame_match), then crashes once the
+    // trace shows the compare (within the 2s post-compare grace). It must NOT false-pass:
+    // the crash → child_error.
+    let fifo = lens_common::make_fifo(d.path());
+    let crash = format!(
+        r#"name = "crash"
+command = ["/bin/sh", "-c", "printf 'READY'; read x < '{fifo}'; kill -SEGV $$"]
 [terminal]
 rows = 12
 cols = 40
 [[steps]]
 action = "wait_for_text"
 text = "READY"
-timeout_ms = 5000
+timeout_ms = 30000
 [[steps]]
 action = "settle"
 quiet_ms = 250
-timeout_ms = 5000
+timeout_ms = 30000
 [[steps]]
 action = "expect_golden"
 name = "frame"
 tier = "cell"
-"#;
-    let scn = write_scenario(d.path(), "crash", crash);
-    let out = gate(&h, &["--report", "-", "--golden-dir", &gd, &scn], false);
+"#,
+        fifo = fifo.display()
+    );
+    let scn = write_scenario(d.path(), "crash", &crash);
+    let out = gate_released(&h, d.path(), &fifo, &gd, &scn);
     assert_eq!(
         out.exit, 5,
-        "a crash ~1s after the matching frame must surface as child_error (exit 5), not \
+        "a crash after the matching frame must surface as child_error (exit 5), not \
          false-pass; stderr:\n{}",
         out.stderr
     );
@@ -680,28 +724,33 @@ fn clean_exit_after_matching_frame_is_a_pass() {
     let g = tmp();
     let gd = g.path().to_string_lossy().into_owned();
     bless_golden(&h, d.path(), &gd, "base", "READY");
-    // The child paints the matching frame, holds it, then exits CLEANLY (0). A graceful
-    // shutdown after a successful compare is a PASS, not child_error (impl-review #6).
-    let clean = r#"name = "clean"
-command = ["/bin/sh", "-c", "printf 'READY'; sleep 1; exit 0"]
+    // The child paints the matching frame, holds it until the compare, then exits CLEANLY
+    // (0). A graceful shutdown after a successful compare is a PASS, not child_error
+    // (impl-review #6).
+    let fifo = lens_common::make_fifo(d.path());
+    let clean = format!(
+        r#"name = "clean"
+command = ["/bin/sh", "-c", "printf 'READY'; read x < '{fifo}'; exit 0"]
 [terminal]
 rows = 12
 cols = 40
 [[steps]]
 action = "wait_for_text"
 text = "READY"
-timeout_ms = 5000
+timeout_ms = 30000
 [[steps]]
 action = "settle"
 quiet_ms = 250
-timeout_ms = 5000
+timeout_ms = 30000
 [[steps]]
 action = "expect_golden"
 name = "frame"
 tier = "cell"
-"#;
-    let scn = write_scenario(d.path(), "clean", clean);
-    let out = gate(&h, &["--report", "-", "--golden-dir", &gd, &scn], false);
+"#,
+        fifo = fifo.display()
+    );
+    let scn = write_scenario(d.path(), "clean", &clean);
+    let out = gate_released(&h, d.path(), &fifo, &gd, &scn);
     assert_eq!(
         out.exit, 0,
         "a clean exit-0 after a matching frame is a pass; stderr:\n{}",

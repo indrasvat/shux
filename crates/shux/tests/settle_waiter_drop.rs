@@ -53,9 +53,14 @@ fn killed_cli_mid_wait_leaves_daemon_healthy() {
         .spawn()
         .expect("spawn wait-settled CLI");
 
-    // Action pacing, mirroring the frozen R4 spec's "SIGKILLed after ~500 ms"
-    // pattern (§16.1: this paces the KILL action so the CLI has issued its
-    // RPC; no assertion below synchronizes on this sleep).
+    // Paces the KILL so the CLI has probably issued its RPC. Nothing outside
+    // the daemon shows a parked waiter, and no assertion below depends on one:
+    // a kill that lands first still has to leave the daemon healthy. The
+    // in-process twin proves parked-then-dropped deterministically.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "no observable for a parked server-side waiter; pacing only, never synchronisation"
+    )]
     std::thread::sleep(Duration::from_millis(500));
 
     // SIGKILL — the client vanishes without any protocol goodbye.
@@ -79,7 +84,7 @@ fn killed_cli_mid_wait_leaves_daemon_healthy() {
     // still be parked server-side; after it, this waiter is the only one.
     let env = h.rpc_raw(
         "pane.wait_settled",
-        serde_json::json!({ "pane_id": pane_id, "quiet_ms": 1_000, "timeout_ms": 10_000 }),
+        serde_json::json!({ "pane_id": pane_id, "quiet_ms": 1_000, "timeout_ms": lens_common::BUDGET_MS }),
     );
     let settled = env.expect_result("post-kill wait_settled");
     assert_eq!(

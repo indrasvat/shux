@@ -217,7 +217,13 @@ pub async fn run_daemon_state_loop(
             // Grace timer expired — auto-exit
             _ = async {
                 match grace_deadline {
-                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    Some(deadline) => {
+                        #[expect(
+                            clippy::disallowed_methods,
+                            reason = "the auto-exit grace period is a deadline by definition"
+                        )]
+                        tokio::time::sleep_until(deadline).await;
+                    }
                     None => std::future::pending::<()>().await,
                 }
             } => {

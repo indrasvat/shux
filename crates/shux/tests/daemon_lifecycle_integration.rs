@@ -8,7 +8,6 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::thread;
-use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
@@ -84,8 +83,7 @@ impl ShuxHarness {
 
     fn terminate_daemon(&self) {
         if let Some(pid) = self.daemon_pid() {
-            let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
-            wait_for_pid_gone(pid, Duration::from_secs(5));
+            shux_testkit::terminate(pid as i32);
         }
     }
 }
@@ -139,20 +137,12 @@ fn try_read_pid(path: &Path) -> Option<u32> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
+#[track_caller]
 fn wait_for_pid_file(path: &Path) -> u32 {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if let Some(pid) = try_read_pid(path)
-            && pid_exists(pid)
-        {
-            return pid;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    panic!(
-        "pid file {} did not appear with a live process",
-        path.display()
-    );
+    shux_testkit::wait_for(
+        &format!("pid file {} to name a live process", path.display()),
+        || try_read_pid(path).filter(|pid| pid_exists(*pid)),
+    )
 }
 
 fn pid_exists(pid: u32) -> bool {
@@ -163,19 +153,14 @@ fn pid_exists(pid: u32) -> bool {
     }
 }
 
-fn wait_for_pid_gone(pid: u32, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if !pid_exists(pid) {
-            return true;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    false
+/// Whether `pid` is gone, waiting for it. Gone includes reaped: a daemon's
+/// zombie lasts until init or a subreaper gets round to it.
+fn wait_for_pid_gone(pid: u32) -> bool {
+    shux_testkit::poll_until(shux_testkit::BUDGET, || !pid_exists(pid))
 }
 
 fn assert_pid_gone(pid: u32, context: &str) {
-    if wait_for_pid_gone(pid, Duration::from_secs(5)) {
+    if wait_for_pid_gone(pid) {
         return;
     }
     let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGKILL);
@@ -397,35 +382,24 @@ fn copy_bin(dir: &Path, name: &str) -> PathBuf {
     dst
 }
 
-/// Poll until `dir` holds `n` pidfiles naming live processes.
-///
-/// A fixed sleep is not good enough here: daemon startup under the coverage job's
-/// instrumentation, or on a loaded macOS runner, routinely outruns any constant
-/// small enough to keep the suite quick. This mirrors `wait_for_pid_file`.
+/// Wait until `dir` holds `n` pidfiles naming live processes.
+#[track_caller]
 fn wait_for_pid_files(dir: &Path, n: usize) -> Vec<(PathBuf, u32)> {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let found: Vec<(PathBuf, u32)> = std::fs::read_dir(dir)
-            .into_iter()
-            .flatten()
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "pid"))
-            .filter_map(|p| try_read_pid(&p).map(|pid| (p, pid)))
-            .filter(|(_, pid)| pid_exists(*pid))
-            .collect();
-        if found.len() >= n {
-            return found;
-        }
-        if Instant::now() >= deadline {
-            panic!(
-                "{} held {} live pidfile(s), expected {n}",
-                dir.display(),
-                found.len()
-            );
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
+    shux_testkit::wait_for(
+        &format!("{} to hold {n} live pidfile(s)", dir.display()),
+        || {
+            let found: Vec<(PathBuf, u32)> = std::fs::read_dir(dir)
+                .into_iter()
+                .flatten()
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x == "pid"))
+                .filter_map(|p| try_read_pid(&p).map(|pid| (p, pid)))
+                .filter(|(_, pid)| pid_exists(*pid))
+                .collect();
+            (found.len() >= n).then_some(found)
+        },
+    )
 }
 
 fn bin_cmd(bin: &Path, runtime: &Path, socket: Option<&Path>, args: &[&str]) -> Command {
@@ -470,7 +444,7 @@ fn one_build_stops_a_daemon_another_build_started() {
     let stopped = run_bin(&stopper, runtime.path(), None, &["daemon", "stop"]);
     assert!(stopped.status.success(), "daemon stop failed");
     assert!(
-        wait_for_pid_gone(pid, Duration::from_secs(5)),
+        wait_for_pid_gone(pid),
         "daemon {pid} started by shux-AAA survived `shux-BBB daemon stop`: {}",
         String::from_utf8_lossy(&stopped.stdout)
     );
@@ -559,7 +533,7 @@ fn two_sockets_in_one_runtime_dir_do_not_share_a_pidfile() {
     }
     for pid in &pids {
         assert!(
-            wait_for_pid_gone(*pid, Duration::from_secs(5)),
+            wait_for_pid_gone(*pid),
             "daemon {pid} was orphaned -- its pidfile was overwritten by the other socket"
         );
     }
@@ -599,7 +573,7 @@ fn a_daemon_from_before_the_socket_keyed_pidfile_is_still_stoppable() {
     let stopped = run_bin(&bin, runtime.path(), Some(&sock), &["daemon", "stop"]);
     assert!(stopped.status.success(), "daemon stop failed");
     assert!(
-        wait_for_pid_gone(pid, Duration::from_secs(5)),
+        wait_for_pid_gone(pid),
         "a daemon recorded at the pre-upgrade pidfile path was orphaned: {}",
         String::from_utf8_lossy(&stopped.stdout)
     );
@@ -665,21 +639,20 @@ fn daemons_serving(socket: &Path) -> Vec<i32> {
         .collect()
 }
 
-/// Poll until exactly `n` daemons serve `socket`, returning the last count seen.
+/// Wait until exactly `n` daemons serve `socket`, returning the last count seen.
 fn settle_daemon_count(socket: &Path, n: usize, reaper: &mut Reaper) -> usize {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
+    let mut seen = 0;
+    shux_testkit::poll_until(shux_testkit::BUDGET, || {
         let pids = daemons_serving(socket);
         for pid in &pids {
             if !reaper.0.contains(pid) {
                 reaper.0.push(*pid);
             }
         }
-        if pids.len() == n || Instant::now() >= deadline {
-            return pids.len();
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
+        seen = pids.len();
+        seen == n
+    });
+    seen
 }
 
 /// Concurrent first-use clients must start one daemon, and `daemon stop` must
@@ -769,7 +742,7 @@ fn a_second_daemon_on_a_served_socket_exits() {
     let stopped = run_bin(&bin, runtime.path(), None, &["daemon", "stop"]);
     assert!(stopped.status.success(), "daemon stop failed");
     assert!(
-        wait_for_pid_gone(first, Duration::from_secs(5)),
+        wait_for_pid_gone(first),
         "daemon stop left the first daemon running"
     );
 }
@@ -801,10 +774,9 @@ fn a_daemon_leaves_a_socket_a_lockless_server_already_serves() {
 
     // The daemon's probe connects here before it gives up; waiting for it means
     // the count below cannot read zero merely because it has not started yet.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while listener.accept().is_err() && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(20));
-    }
+    shux_testkit::wait_until("the late daemon to probe the server", || {
+        listener.accept().is_ok()
+    });
     let running = settle_daemon_count(&socket, 0, &mut reaper);
     assert_eq!(running, 0, "a daemon is running beside the server");
     assert!(
@@ -835,10 +807,7 @@ fn a_client_during_a_daemon_drain_gets_the_next_daemon() {
     reaper.0.extend([old as i32, pane as i32]);
 
     kill(Pid::from_raw(old as i32), Signal::SIGTERM).expect("SIGTERM daemon");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while socket.exists() && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(10));
-    }
+    shux_testkit::wait_until("the daemon to stop serving", || !socket.exists());
     assert!(
         !socket.exists() && pid_exists(old),
         "precondition: the daemon has stopped serving but is still draining"
@@ -881,7 +850,7 @@ fn daemon_stop_finds_a_daemon_whose_pidfile_was_lost() {
     let stopped = run_bin(&bin, runtime.path(), None, &["daemon", "stop"]);
     assert!(stopped.status.success(), "daemon stop failed");
     assert!(
-        wait_for_pid_gone(pid, Duration::from_secs(5)),
+        wait_for_pid_gone(pid),
         "daemon stop left a daemon it could not name: {}",
         String::from_utf8_lossy(&stopped.stdout)
     );
@@ -929,6 +898,10 @@ fn a_client_does_not_take_the_socket_of_a_server_it_cannot_stop() {
 
 /// `daemon stop` must not unlink files once its daemon has exited: a client that
 /// arrived during the stop may already have started the successor they belong to.
+///
+/// Linux only: ordering the successor inside the stop needs the stop's SIGTERM
+/// to be seen pending, which only `/proc` shows.
+#[cfg(target_os = "linux")]
 #[test]
 fn daemon_stop_leaves_the_successors_files_alone() {
     let h = ShuxHarness::new();
@@ -946,16 +919,30 @@ fn daemon_stop_leaves_the_successors_files_alone() {
     let old = h.daemon_pid().expect("daemon pidfile");
     reaper.0.push(old as i32);
 
+    // Order the successor before `daemon stop` can notice the exit: hold the
+    // old daemon stopped until the stop's SIGTERM is pending on it, then
+    // freeze the stop, and only let it look again once the successor exists.
+    let old_pid = Pid::from_raw(old as i32);
+    kill(old_pid, Signal::SIGSTOP).expect("freeze the old daemon");
     let stop = h
         .shux()
         .args(["daemon", "stop"])
         .stdout(std::process::Stdio::null())
         .spawn()
         .expect("spawn daemon stop");
-    // The client comes once the daemon has exited and before `daemon stop` has
-    // noticed: a fixed head start could land before the stop had even begun.
+    let stop_pid = Pid::from_raw(stop.id() as i32);
+    shux_testkit::wait_until("daemon stop to send its SIGTERM", || {
+        std::fs::read_to_string(format!("/proc/{old}/status")).is_ok_and(|st| {
+            st.lines()
+                .filter_map(|l| l.strip_prefix("ShdPnd:"))
+                .filter_map(|v| u64::from_str_radix(v.trim(), 16).ok())
+                .any(|mask| mask & (1 << (Signal::SIGTERM as u64 - 1)) != 0)
+        })
+    });
+    kill(stop_pid, Signal::SIGSTOP).expect("freeze daemon stop");
+    kill(old_pid, Signal::SIGCONT).expect("let the old daemon exit");
     assert!(
-        wait_for_pid_gone(old, Duration::from_secs(10)),
+        wait_for_pid_gone(old),
         "daemon stop never ended the old daemon"
     );
     let during = h
@@ -964,23 +951,51 @@ fn daemon_stop_leaves_the_successors_files_alone() {
         .output()
         .expect("run shux");
     assert!(during.status.success(), "a client during the stop failed");
+    // The successor's files as it made them. A rebind after an unlink makes a
+    // new inode, so comparing identities catches an unlink the daemon has
+    // already repaired, which `exists()` alone would miss.
+    let successor = h.daemon_pid().expect("successor pidfile");
+    reaper.0.push(successor as i32);
+    let socket_id = socket_identity(&socket).expect("successor socket");
+    kill(stop_pid, Signal::SIGCONT).expect("let daemon stop look again");
     stop.wait_with_output().expect("wait for daemon stop");
     assert_pid_gone(old, "the stopped daemon");
 
     assert_eq!(settle_daemon_count(&socket, 1, &mut reaper), 1);
-    assert!(socket.exists(), "the successor's socket was unlinked");
-    let started = Instant::now();
+    assert_eq!(
+        socket_identity(&socket),
+        Some(socket_id),
+        "`daemon stop` unlinked the successor's socket"
+    );
+    assert_eq!(
+        h.daemon_pid(),
+        Some(successor),
+        "`daemon stop` removed the successor's pidfile"
+    );
     let after = h
         .shux()
         .args(["session", "list"])
         .output()
         .expect("run shux");
     assert!(
-        after.status.success() && started.elapsed() < Duration::from_secs(2),
-        "the successor stopped answering ({:?}): {}",
-        started.elapsed(),
+        after.status.success(),
+        "the successor stopped answering: {}",
         String::from_utf8_lossy(&after.stderr)
     );
+    assert_eq!(
+        daemons_serving(&socket),
+        vec![successor as i32],
+        "another daemon answered instead of the successor"
+    );
+}
+
+/// Device and inode of the file at `path`, if there is one.
+#[cfg(target_os = "linux")]
+fn socket_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path)
+        .ok()
+        .map(|m| (m.dev(), m.ino()))
 }
 
 /// Every spelling of one socket path names one daemon: concurrent clients
@@ -1082,7 +1097,7 @@ fn a_daemon_started_from_a_relative_socket_is_stopped_by_its_absolute_path() {
     .output()
     .expect("run shux");
     assert!(
-        wait_for_pid_gone(pid, Duration::from_secs(5)),
+        wait_for_pid_gone(pid),
         "the absolute path did not stop the daemon: {}{}",
         String::from_utf8_lossy(&stopped.stdout),
         String::from_utf8_lossy(&stopped.stderr)
@@ -1114,16 +1129,14 @@ fn a_daemon_whose_socket_was_unlinked_serves_it_again() {
     std::fs::remove_file(&socket).expect("unlink the socket");
     std::fs::remove_file(&pidfile).expect("unlink the pidfile");
 
-    let started = Instant::now();
     let out = h
         .shux()
         .args(["session", "list"])
         .output()
         .expect("run shux");
     assert!(
-        out.status.success() && started.elapsed() < Duration::from_secs(3),
-        "the daemon did not serve its socket again ({:?}): {}",
-        started.elapsed(),
+        out.status.success(),
+        "the daemon did not serve its socket again: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
@@ -1171,11 +1184,11 @@ fn a_client_reports_a_daemon_that_does_not_answer() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn shux");
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while client.try_wait().expect("poll client").is_none() && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(50));
-    }
-    let hung = client.try_wait().expect("poll client").is_none();
+    // The client gives up after its own 5s version-check timeout; the budget
+    // only decides when a client that never does counts as hung.
+    let hung = !shux_testkit::poll_until(shux_testkit::BUDGET, || {
+        client.try_wait().expect("poll client").is_some()
+    });
     if hung {
         let _ = client.kill();
     }
@@ -1249,19 +1262,12 @@ fn daemon_stop_sees_a_daemon_exit_under_a_subreaper() {
     // Precondition, or the test proves nothing: the daemon is a zombie, not gone.
     // Its argv reads back empty from the moment the kernel drops its memory, a
     // little before it turns Z, so stop can return while it still shows R.
-    let deadline = Instant::now() + Duration::from_secs(5);
     let mut stat = String::new();
-    while Instant::now() < deadline {
+    let zombie = shux_testkit::poll_until(shux_testkit::BUDGET, || {
         stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
-        if stat.contains(") Z ") {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    assert!(
-        stat.contains(") Z "),
-        "the daemon was reaped after all: {stat:?}"
-    );
+        stat.contains(") Z ")
+    });
+    assert!(zombie, "the daemon was reaped after all: {stat:?}");
 }
 
 /// A daemon that neither a pidfile nor the instance lock names -- one from
@@ -1292,7 +1298,7 @@ fn daemon_stop_finds_a_daemon_nothing_names() {
     let stopped = run_bin(&bin, runtime.path(), None, &["daemon", "stop"]);
     assert!(stopped.status.success(), "daemon stop failed");
     assert!(
-        wait_for_pid_gone(pid, Duration::from_secs(5)),
+        wait_for_pid_gone(pid),
         "daemon stop left a daemon nothing names: {}",
         String::from_utf8_lossy(&stopped.stdout)
     );
@@ -1426,7 +1432,7 @@ fn a_relative_socket_names_the_callers_directory() {
     .output()
     .expect("run shux");
     assert!(
-        wait_for_pid_gone(pid, Duration::from_secs(5)),
+        wait_for_pid_gone(pid),
         "daemon stop in its own directory missed it: {}",
         String::from_utf8_lossy(&here.stdout)
     );
@@ -1454,13 +1460,10 @@ fn a_process_with_a_daemons_argv_is_not_signalled() {
         .expect("spawn bystander");
     let pid = bystander.id();
     let reaper = Reaper(vec![pid as i32]);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while std::fs::read(format!("/proc/{pid}/cmdline"))
-        .map_or(true, |c| !String::from_utf8_lossy(&c).contains("--socket"))
-    {
-        assert!(Instant::now() < deadline, "bystander never started");
-        thread::sleep(Duration::from_millis(20));
-    }
+    shux_testkit::wait_until("the bystander to exec", || {
+        std::fs::read(format!("/proc/{pid}/cmdline"))
+            .is_ok_and(|c| String::from_utf8_lossy(&c).contains("--socket"))
+    });
 
     let status = run_bin(&bin, runtime.path(), None, &["daemon", "status"]);
     let stopped = run_bin(&bin, runtime.path(), None, &["daemon", "stop"]);
@@ -1503,11 +1506,9 @@ fn a_lockless_daemon_is_stopped_by_the_spelling_it_was_started_with() {
     let pid = legacy.id();
     let reaper = Reaper(vec![pid as i32]);
     // Its own ready file, not `/proc`: macOS has none.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !cwd.path().join("ready").exists() {
-        assert!(Instant::now() < deadline, "legacy daemon never started");
-        thread::sleep(Duration::from_millis(20));
-    }
+    shux_testkit::wait_until("the legacy daemon to start", || {
+        cwd.path().join("ready").exists()
+    });
     // FNV-1a of the spelling: the pidfile name earlier builds wrote.
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in typed.as_os_str().as_encoded_bytes() {
@@ -1525,12 +1526,9 @@ fn a_lockless_daemon_is_stopped_by_the_spelling_it_was_started_with() {
         .current_dir(cwd.path())
         .output()
         .expect("run shux");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut exited = false;
-    while !exited && Instant::now() < deadline {
-        exited = legacy.try_wait().expect("poll legacy daemon").is_some();
-        thread::sleep(Duration::from_millis(20));
-    }
+    let exited = shux_testkit::poll_until(shux_testkit::BUDGET, || {
+        legacy.try_wait().expect("poll legacy daemon").is_some()
+    });
     drop(reaper);
     let _ = legacy.wait();
     assert!(
@@ -1559,14 +1557,9 @@ fn a_daemon_whose_attach_socket_was_unlinked_serves_it_again() {
         .0
         .push(wait_for_pid_file(&runtime.path().join("shux").join("shux.pid")) as i32);
     std::fs::remove_file(&attach).expect("unlink attach socket");
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while std::os::unix::net::UnixStream::connect(&attach).is_err() {
-        assert!(
-            Instant::now() < deadline,
-            "the attach socket was not rebound"
-        );
-        thread::sleep(Duration::from_millis(50));
-    }
+    shux_testkit::wait_until("the attach socket to be rebound", || {
+        std::os::unix::net::UnixStream::connect(&attach).is_ok()
+    });
 }
 
 /// A client racing the deletion of the whole runtime dir must not leave two
@@ -1656,7 +1649,15 @@ fn a_rebind_does_not_follow_a_runtime_dir_replaced_by_a_symlink() {
         .push(wait_for_pid_file(&dir.join("shux.pid")) as i32);
     std::fs::remove_dir_all(&dir).expect("delete runtime dir");
     std::os::unix::fs::symlink(elsewhere.path(), &dir).expect("plant symlink");
-    thread::sleep(Duration::from_millis(1500));
+    // A refused rebind leaves no trace, and the deleted dir took every socket
+    // with it, so nothing can be ordered after the daemon's checks. Three
+    // check intervals (`shux_rpc::uds::CHECK_INTERVAL`) is the fence that is
+    // left; a loaded machine can only make this pass vacuously, never fail.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "negative assertion with no observable fence; see above"
+    )]
+    thread::sleep(shux_rpc::uds::CHECK_INTERVAL * 3);
     let planted: Vec<_> = std::fs::read_dir(elsewhere.path())
         .expect("read planted dir")
         .filter_map(|e| e.ok())
@@ -1729,7 +1730,7 @@ fn daemon_stop_stops_a_daemon_hosting_a_watched_plugin() {
     let (daemon, grandchild) = install_tree_plugin(&h, work.path(), true);
 
     let stopped = daemon_stop(&h, work.path());
-    let daemon_gone = wait_for_pid_gone(daemon, Duration::from_secs(2));
+    let daemon_gone = wait_for_pid_gone(daemon);
     for pid in [daemon, grandchild] {
         let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
     }

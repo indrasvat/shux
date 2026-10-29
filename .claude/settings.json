@@ -5,7 +5,7 @@
     "report only when the change touches VT rendering, and nothing otherwise. ~1s.",
     "",
     "This file previously held a Stop hook running `check-progress-active`, which",
-    "required every session to append to docs/PROGRESS.md \u2014 a shared tail that made two",
+    "required every session to append to docs/PROGRESS.md — a shared tail that made two",
     "concurrent branches conflict before they touched code. Issue #123 deleted that, and",
     "with it the only end-of-session enforcement an agent could not simply forget.",
     "",
@@ -13,7 +13,9 @@
     "but must never require you to WRITE to a file someone else is also writing to.",
     "Nothing here writes, and nothing here is shared.",
     "",
-    "SessionStart runs scripts/ensure-hooks.sh so a fresh checkout \u2014 cloud or local \u2014 has its git hooks before the first commit. An agent cannot forget to run `make hooks` if it never has to. The CI guard lives in that script, once, because these sessions can run inside GitHub Actions."
+    "SessionStart runs scripts/ensure-hooks.sh so a fresh checkout — cloud or local — has its git hooks before the first commit. An agent cannot forget to run `make hooks` if it never has to. The CI guard lives in that script, once, because these sessions can run inside GitHub Actions.",
+    "",
+    "PostToolUse runs scripts/check-test-sleeps.sh on every edited file: a test waits for a condition, never for time (docs/testing.md). In crates/*/tests it flags qualified sleep calls and sleep imports on code lines without a statement-level #[expect(clippy::disallowed_methods)]; in any crates/ source or Cargo.toml it flags a waiver of the ban. It says so on stderr; clippy's disallowed-methods is the gate."
   ],
   "hooks": {
     "PreToolUse": [
@@ -37,6 +39,19 @@
             "command": "bash \"$CLAUDE_PROJECT_DIR/scripts/ensure-hooks.sh\"",
             "timeout": 30,
             "statusMessage": "Ensuring git hooks are installed..."
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/scripts/check-test-sleeps.sh\" --hook",
+            "timeout": 10,
+            "statusMessage": "Checking for raw sleeps in test code..."
           }
         ]
       }

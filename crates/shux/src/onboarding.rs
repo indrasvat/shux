@@ -157,13 +157,13 @@ mod tests {
         assert!(!handle.current().await.prefix_discovered);
 
         handle.mark_prefix_discovered().await;
-        // Give the spawn_blocking writer a moment.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(handle.current().await.prefix_discovered);
 
-        // Reload from disk → still dismissed.
-        let handle2 = OnboardingHandle::load();
-        assert!(handle2.current().await.prefix_discovered);
+        // The write is spawned, not awaited: reload from disk until it lands.
+        shux_testkit::wait_until_async("the dismissal to reach disk", || async {
+            OnboardingHandle::load().current().await.prefix_discovered
+        })
+        .await;
 
         unsafe {
             std::env::remove_var("XDG_STATE_HOME");

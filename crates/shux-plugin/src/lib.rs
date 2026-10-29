@@ -71,8 +71,9 @@ pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 /// recording that they existed. One failed handshake, one stray process.
 ///
 /// `install` spawns each plugin with `process_group(0)`, so the group id
-/// equals the plugin's own pid and a single `killpg` reaches the whole tree
-/// however deeply nested.
+/// equals the plugin's own pid and a single `killpg` reaches every process
+/// still in that group, however deeply nested. A descendant that leaves the
+/// group (`setsid`, `setpgid`) is out of its reach.
 ///
 /// **Only ever call this while the `Child` handle is still alive.** An
 /// unreaped child pins its pid against reuse; once it is reaped the kernel
@@ -184,6 +185,10 @@ async fn wait_for_group_exit(pid: Option<u32>, budget: Duration) {
         if !running.await.unwrap_or(false) {
             return;
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "production grace: re-probe the plugin's group between checks"
+        )]
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
@@ -377,6 +382,11 @@ pub struct PluginManager {
     /// the test that asserts the timeout FIRES does not have to sit out the
     /// production budget to do it.
     handshake_timeout: Duration,
+    /// How long a killed plugin gets to exit by itself, defaulting to
+    /// [`SHUTDOWN_GRACE`].
+    shutdown_grace: Duration,
+    /// Reload watchers started and stopped; see [`Self::watcher_counts`].
+    watchers: Arc<WatcherCounts>,
     /// Set once by [`PluginManager::shutdown`]: every watcher exits and no
     /// install registers after it.
     stopping: Arc<AtomicBool>,
@@ -408,6 +418,8 @@ impl PluginManager {
             graph: Arc::new(tokio::sync::OnceCell::new()),
             denial_hook: Arc::new(tokio::sync::OnceCell::new()),
             handshake_timeout: HANDSHAKE_TIMEOUT,
+            shutdown_grace: SHUTDOWN_GRACE,
+            watchers: Arc::new(WatcherCounts::default()),
             stopping: Arc::new(AtomicBool::new(false)),
             pending: Arc::new(std::sync::Mutex::new(HashMap::new())),
             retiring: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -420,6 +432,25 @@ impl PluginManager {
     pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
         self.handshake_timeout = timeout;
         self
+    }
+
+    /// Override the shutdown grace. A test that must show the grace ends when
+    /// the plugin exits sets one that would never expire on its own.
+    #[must_use]
+    pub fn with_shutdown_grace(mut self, grace: Duration) -> Self {
+        self.shutdown_grace = grace;
+        self
+    }
+
+    /// `(started, stopped)` reload watchers. A stopped watcher never reloads
+    /// or reinstalls anything again, so `started == stopped` means no save can
+    /// bring a plugin back. For tests that order a save against a watcher.
+    #[doc(hidden)]
+    pub fn watcher_counts(&self) -> (u64, u64) {
+        // `stopped` first: a watcher started between the loads then reads as
+        // live rather than as stopped.
+        let stopped = self.watchers.stopped.load(Ordering::SeqCst);
+        (self.watchers.started.load(Ordering::SeqCst), stopped)
     }
 
     /// Root for grant + audit files (`<state_root>/by-id/<uuid>/`).
@@ -754,6 +785,7 @@ impl PluginManager {
             self.graph.clone(),
             self.denial_hook.clone(),
             last_error.clone(),
+            self.shutdown_grace,
         ));
 
         let info = PluginInfo {
@@ -824,6 +856,10 @@ impl PluginManager {
         // Without this, `install` can race the old child's stdin
         // close, and the new child sometimes inherits a stale
         // file descriptor on macOS.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "production settle delay between stopping and respawning a plugin"
+        )]
         tokio::time::sleep(Duration::from_millis(150)).await;
         let result = self
             .install_unless(source.clone(), Some(killed.clone()))
@@ -1057,6 +1093,22 @@ impl PluginManager {
     }
 }
 
+#[derive(Default)]
+struct WatcherCounts {
+    started: std::sync::atomic::AtomicU64,
+    stopped: std::sync::atomic::AtomicU64,
+}
+
+/// Counts its watcher stopped when the debouncer task ends, however it ends.
+/// The debouncer is the only part of a watcher that acts on a save.
+struct WatcherStopped(Arc<WatcherCounts>);
+
+impl Drop for WatcherStopped {
+    fn drop(&mut self) {
+        self.0.stopped.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 /// Stops a watcher armed for an install that never registered.
 struct WatchGuard(Option<Arc<AtomicBool>>);
 
@@ -1119,6 +1171,8 @@ fn spawn_reload_watcher(
     let watcher_name = name.clone();
     let watcher_cancel = cancel.clone();
     let stopping = mgr.stopping.clone();
+    mgr.watchers.started.fetch_add(1, Ordering::SeqCst);
+    let stopped = WatcherStopped(mgr.watchers.clone());
     tokio::task::spawn_blocking(move || {
         let name = watcher_name;
         let cancel = watcher_cancel;
@@ -1184,6 +1238,10 @@ fn spawn_reload_watcher(
         // handle, dropping when this block exits.
         while !cancel.load(Ordering::SeqCst) && !stopping.load(Ordering::SeqCst) && !tx.is_closed()
         {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "production: the watcher thread re-checks its stop flags between naps"
+            )]
             std::thread::sleep(Duration::from_millis(200));
         }
         drop(watcher);
@@ -1201,9 +1259,14 @@ fn spawn_reload_watcher(
     let source_for_reinstall = source.clone();
     let debounce_cancel = cancel.clone();
     tokio::spawn(async move {
+        let _stopped = stopped;
         while rx.recv().await.is_some() {
             // Coalesce a burst of saves into one reload by draining
             // anything that arrives within the next 250ms.
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "production debounce window that coalesces a burst of saves"
+            )]
             tokio::time::sleep(Duration::from_millis(250)).await;
             while let Ok(()) = rx.try_recv() {}
             if debounce_cancel.load(Ordering::SeqCst) || mgr.stopping.load(Ordering::SeqCst) {
@@ -1324,6 +1387,7 @@ async fn run_plugin_io(
     graph: Arc<tokio::sync::OnceCell<GraphHandle>>,
     denial_hook: Arc<tokio::sync::OnceCell<DenialHook>>,
     last_error: Arc<Mutex<Option<String>>>,
+    grace: Duration,
 ) {
     // Plugin→daemon RPC dispatches run in spawned tasks so a slow
     // handler can't stall this loop; responses come back via resp_tx
@@ -1418,7 +1482,7 @@ async fn run_plugin_io(
         // `plugin.shutdown` notification that `PluginManager::kill` pushes
         // immediately before signaling us — inside the grace, so a plugin
         // that stopped reading cannot stall the kill on a full pipe.
-        let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
+        let deadline = tokio::time::Instant::now() + grace;
         let drain = async {
             // Finish the interrupted frame first: it may be `plugin.shutdown`
             // itself, and a half-written one would swallow the next line.
@@ -1435,7 +1499,7 @@ async fn run_plugin_io(
         }
         debug!(plugin = %name, "kill signal received; draining grace");
         // Grace WITHOUT reaping. `child.wait()` would be the obvious way
-        // to wait out the 2s, and it is the wrong one: `wait` calls
+        // to wait out the grace, and it is the wrong one: `wait` calls
         // `waitpid`, and a reaped pid goes straight back into the
         // kernel's free pool. The group kill in the tail below would
         // then be aimed at a number that may already belong to somebody
@@ -1979,10 +2043,13 @@ done
             "the watcher was ready on its first poll"
         );
         drop(arming);
-        tokio::time::sleep(Duration::from_millis(300)).await;
-
         std::fs::write(&script, body).unwrap();
-        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        // Once every watcher has stopped, nothing is left to act on the save.
+        shux_testkit::wait_until_async("the dropped watcher to stop", || {
+            let (started, stopped) = mgr.watcher_counts();
+            async move { started == stopped }
+        })
+        .await;
         let listed = mgr.list().await;
         mgr.shutdown().await;
         assert!(
@@ -2109,7 +2176,7 @@ done
     }
 
     async fn recv_json(rx: &mut mpsc::Receiver<String>) -> Value {
-        let line = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        let line = tokio::time::timeout(shux_testkit::BUDGET, rx.recv())
             .await
             .expect("response timeout")
             .expect("response line");

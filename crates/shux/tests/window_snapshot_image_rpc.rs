@@ -57,7 +57,7 @@ fn window_and_session_snapshot_draw_a_panes_inline_image() {
     // and basic, so a monochrome or overpaint regression cannot pass.
     let script = format!(
         "printf '\\033[38;2;0;200;90mTRUECOLOR\\033[0m \\033[38;5;208mIDX\\033[0m \\033[34mBASIC\\033[0m\\n'; \
-         printf '{}'; exec cat",
+         printf '{}'; printf 'IMAGE-%s\\n' HELD; exec cat",
         kitty_apc(10, 6)
     );
     let created = h.rpc_ok(
@@ -72,10 +72,10 @@ fn window_and_session_snapshot_draw_a_panes_inline_image() {
     let pane_id = created["pane_id"].as_str().expect("pane id").to_string();
 
     // The picture must actually be held before any of this means anything.
-    h.rpc_ok(
-        "pane.wait_settled",
-        json!({ "pane_id": pane_id, "quiet_ms": 400, "timeout_ms": 15000 }),
-    );
+    // The VT stores it as it parses the APC, before the marker printed after
+    // it, so the marker on screen means the picture is held.
+    h.wait_for(&pane_id, "IMAGE-HELD", shux_testkit::BUDGET_MS)
+        .expect("the pane never got past drawing its picture");
     let pane = decode(&h.rpc_ok("pane.snapshot", json!({ "pane_id": pane_id })));
     let pane_px = magenta_px(&pane);
     assert!(

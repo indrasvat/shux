@@ -26,3 +26,6 @@ nix = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+shux-testkit = { path = "../shux-testkit" }
+# `test-util`: the handshake-budget tests drive tokio's paused clock.
+tokio = { workspace = true, features = ["test-util"] }

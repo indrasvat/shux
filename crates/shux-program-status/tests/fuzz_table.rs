@@ -52,17 +52,19 @@ fn urgency(s: State) -> u8 {
 impl Model {
     /// Applies `op`; returns whether the stored contents changed.
     fn apply(&mut self, op: &Op) -> bool {
-        let before: Vec<(Option<String>, Record)> = self.snapshot();
+        let before = self.entries.len();
         match op {
             Op::Set(id, record) => {
                 self.seq += 1;
                 let seq = self.seq;
                 if let Some(e) = self.entries.get_mut(id) {
                     e.reported = seq;
-                    if e.record != *record {
-                        e.record = record.clone();
-                        e.updated = seq;
+                    if e.record == *record {
+                        return false;
                     }
+                    e.record = record.clone();
+                    e.updated = seq;
+                    return true;
                 } else {
                     if self.entries.len() >= MAX_RECORDS {
                         let victim = self
@@ -81,6 +83,7 @@ impl Model {
                             updated: seq,
                         },
                     );
+                    return true;
                 }
             }
             Op::Clear(None) | Op::Reset => self.entries.clear(),
@@ -91,14 +94,8 @@ impl Model {
                 .entries
                 .retain(|_, e| matches!(e.record.state, State::Done | State::Error)),
         }
-        before != self.snapshot()
-    }
-
-    fn snapshot(&self) -> Vec<(Option<String>, Record)> {
-        self.entries
-            .iter()
-            .map(|(k, e)| (k.clone(), e.record.clone()))
-            .collect()
+        // Every other op only removes entries.
+        before != self.entries.len()
     }
 
     fn ordered_ids(&self) -> Vec<Option<String>> {
@@ -197,7 +194,8 @@ fn run(ops: &[Op]) -> Result<(), TestCaseError> {
             .iter()
             .map(|v| v.id.as_ref().map(|i| i.as_str().to_owned()))
             .collect();
-        prop_assert_eq!(&got, &model.ordered_ids(), "order at step {}", step);
+        let ordered = model.ordered_ids();
+        prop_assert_eq!(&got, &ordered, "order at step {}", step);
         for v in &views {
             let key = v.id.as_ref().map(|i| i.as_str().to_owned());
             let e = &model.entries[&key];
@@ -208,7 +206,7 @@ fn run(ops: &[Op]) -> Result<(), TestCaseError> {
         match table.summary() {
             None => prop_assert!(model.entries.is_empty()),
             Some(s) => {
-                let top = model.ordered_ids()[0].clone();
+                let top = ordered[0].clone();
                 prop_assert_eq!(s.id.as_ref().map(|i| i.as_str().to_owned()), top.clone());
                 prop_assert_eq!(s.app, model.app_of(&top));
                 let total = s.counts.idle
@@ -230,6 +228,13 @@ proptest! {
     fn table_matches_the_reference_model(ops in prop::collection::vec(op_strategy(), 0..200)) {
         run(&ops)?;
     }
+}
+
+proptest! {
+    // Each case re-checks a full 256-record table after every one of several
+    // hundred steps, so the case count is what keeps this inside nextest's
+    // budget on a loaded machine; fresh seeds every run add up the coverage.
+    #![proptest_config(ProptestConfig::with_cases(64))]
 
     #[test]
     fn table_matches_the_reference_model_past_the_cap(

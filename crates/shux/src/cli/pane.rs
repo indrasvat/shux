@@ -610,7 +610,13 @@ pub async fn handle_pane_record(
         .to_string();
 
     match duration_ms {
-        Some(ms) => tokio::time::sleep(std::time::Duration::from_millis(ms)).await,
+        Some(ms) => {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "--duration is how long the user asked to record"
+            )]
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        }
         None => {
             eprintln!(
                 "{} recording lossless pane output; press Ctrl-C to stop",

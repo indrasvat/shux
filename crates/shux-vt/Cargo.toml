@@ -18,6 +18,7 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"
+shux-testkit = { path = "../shux-testkit" }
 # Only the differential tests hash a frame, and only to get an exact identity to
 # compare two terminals on. The gate's `capture_sha256` used to live here and made
 # this a library dependency; it is the gate's now (#151), and the library itself

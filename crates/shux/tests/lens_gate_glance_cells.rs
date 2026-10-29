@@ -59,7 +59,7 @@ fn draw_colored(h: &Harness, pane_id: &str, sentinel: &str) {
         "pane.send_keys",
         serde_json::json!({ "pane_id": pane_id, "text": colored_line(sentinel) }),
     );
-    h.wait_for(pane_id, sentinel, 10_000)
+    h.wait_for(pane_id, sentinel, BUDGET_MS)
         .unwrap_or_else(|e| panic!("pane never drew {sentinel:?}: {e}"));
 }
 
@@ -172,7 +172,8 @@ fn glance_cells_masks_redact_emitted_content() {
             "text": SECRET_LINE,
         }),
     );
-    h.wait_for(&pane_id, "READYSEC", 10_000).expect("sentinel");
+    h.wait_for(&pane_id, "READYSEC", BUDGET_MS)
+        .expect("sentinel");
 
     // Mask the 15 columns of row 5 that carry the secret.
     let masks = serde_json::json!([{ "row": 5, "col": 0, "width": 15 }]);

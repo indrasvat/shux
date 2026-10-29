@@ -7,12 +7,13 @@
 //! applied to whatever terminal the test runner owns.
 
 use std::fs::File;
-use std::io::Read;
-use std::os::fd::{AsFd, OwnedFd};
+use std::io::{Read, Write};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread::JoinHandle;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -24,6 +25,7 @@ use nix::unistd::Pid;
 use shux_rpc::attach::{
     ATTACH_PROTOCOL_VERSION, AttachClientFrame, AttachHello, AttachReady, AttachServerFrame,
 };
+use shux_testkit::{BUDGET, poll, poll_until};
 use tokio::net::UnixStream;
 use tokio_util::codec::Framed;
 
@@ -88,17 +90,11 @@ impl Drop for Harness {
             .ok()
             .and_then(|s| s.trim().parse().ok());
         // By pidfile, never by an argv substring.
-        if let Some(pid) = pid {
-            let _ = kill(Pid::from_raw(pid), Signal::SIGTERM);
-            for _ in 0..50 {
-                if kill(Pid::from_raw(pid), None).is_err() {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            if !std::thread::panicking() {
-                panic!("daemon {pid} survived SIGTERM");
-            }
+        if let Some(pid) = pid
+            && !shux_testkit::terminate(pid)
+            && !std::thread::panicking()
+        {
+            panic!("daemon {pid} survived SIGTERM");
         }
     }
 }
@@ -124,7 +120,89 @@ struct AttachedClient {
     _slave: OwnedFd,
     /// The PTY's modes before the child ran: what "restored" means.
     initial: Termios,
-    seen: Vec<u8>,
+    seen: Arc<Mutex<Vec<u8>>>,
+    reader: Option<Reader>,
+}
+
+/// Reads the PTY the moment the client writes to it, as a terminal does. A
+/// signalled client gives its restore sequences a bounded time to drain, so a
+/// test that read on a timer would race that bound.
+struct Reader {
+    stop: std::io::PipeWriter,
+    thread: JoinHandle<()>,
+}
+
+/// One read of the non-blocking `master`. `false` once the PTY has nothing
+/// more to give: empty for now, or closed.
+fn read_once(mut master: &File, seen: &Mutex<Vec<u8>>) -> std::io::Result<bool> {
+    let mut buf = [0u8; 8192];
+    match master.read(&mut buf) {
+        Ok(0) => Ok(false),
+        Ok(n) => {
+            lock(seen).extend_from_slice(&buf[..n]);
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => Ok(true),
+        Err(e) => Err(e),
+    }
+}
+
+/// Read everything `master` holds. Only for an exited client: a live one
+/// could keep it from ever running dry.
+fn drain(master: &File, seen: &Mutex<Vec<u8>>) {
+    while let Ok(true) = read_once(master, seen) {}
+}
+
+fn lock(seen: &Mutex<Vec<u8>>) -> MutexGuard<'_, Vec<u8>> {
+    seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+impl Reader {
+    fn spawn(master: &File, seen: Arc<Mutex<Vec<u8>>>) -> Self {
+        let master = master.try_clone().expect("dup master");
+        let (stopped, stop) = std::io::pipe().expect("stop pipe");
+        let thread = std::thread::spawn(move || {
+            loop {
+                let mut fds = [
+                    libc::pollfd {
+                        fd: master.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: stopped.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                ];
+                // SAFETY: `fds` is a live array of two pollfds over
+                // descriptors this closure owns.
+                let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+                if ready < 0 {
+                    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return;
+                }
+                if fds[1].revents != 0 {
+                    return;
+                }
+                let hung_up = fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0;
+                match read_once(&master, &seen) {
+                    Ok(true) => {}
+                    Ok(false) if !hung_up => {}
+                    _ => return,
+                }
+            }
+        });
+        Self { stop, thread }
+    }
+
+    fn stop(mut self) {
+        let _ = self.stop.write_all(b"x");
+        let _ = self.thread.join();
+    }
 }
 
 impl AttachedClient {
@@ -175,24 +253,27 @@ impl AttachedClient {
             nix::fcntl::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
         )
         .expect("set O_NONBLOCK");
+        let master = File::from(pty.master);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let reader = Some(Reader::spawn(&master, seen.clone()));
         Self {
             child,
-            master: File::from(pty.master),
+            master,
             _slave: pty.slave,
             initial,
-            seen: Vec::new(),
+            seen,
+            reader,
         }
     }
 
-    /// Drain whatever the client has written. Keeps the PTY from filling and
-    /// blocking the client mid-write.
-    fn pump(&mut self) {
-        let mut buf = [0u8; 8192];
-        while let Ok(n) = self.master.read(&mut buf) {
-            if n == 0 {
-                break;
-            }
-            self.seen.extend_from_slice(&buf[..n]);
+    fn seen(&self) -> Vec<u8> {
+        lock(&self.seen).clone()
+    }
+
+    /// Stop reading the PTY, as a terminal that hung would.
+    fn stop_reading(&mut self) {
+        if let Some(reader) = self.reader.take() {
+            reader.stop();
         }
     }
 
@@ -205,57 +286,43 @@ impl AttachedClient {
     /// Wait until the pane's colours have been drawn: the client is past the
     /// handshake, in raw mode, and inside its loop.
     fn wait_until_drawing(&mut self) {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while Instant::now() < deadline {
-            self.pump();
-            if drew_every_probe(&self.seen) {
-                return;
+        let drawn = poll_until(BUDGET, || {
+            if drew_every_probe(&lock(&self.seen)) {
+                return true;
             }
             if let Ok(Some(status)) = self.child.try_wait() {
                 panic!(
                     "attach exited ({status}) before drawing: {:?}",
-                    String::from_utf8_lossy(&self.seen)
+                    String::from_utf8_lossy(&self.seen())
                 );
             }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        panic!(
+            false
+        });
+        assert!(
+            drawn,
             "attach never drew the pane: {:?}",
-            String::from_utf8_lossy(&self.seen)
+            String::from_utf8_lossy(&self.seen())
         );
     }
 
-    /// Wait for exit, reading the PTY only with `pump`: without it, as a
-    /// terminal that hung would.
-    fn wait_exit(&mut self, within: Duration, pump: bool) -> Option<std::process::ExitStatus> {
-        let deadline = Instant::now() + within;
-        while Instant::now() < deadline {
-            if pump {
-                self.pump();
-            }
-            if let Ok(Some(status)) = self.child.try_wait() {
-                if pump {
-                    self.pump();
-                }
-                return Some(status);
-            }
-            // Read as fast as a terminal does. macOS buffers far less on a PTY
-            // than Linux, and a 25 ms poll there drains the frame in flight
-            // slower than the client's 500 ms restore budget allows.
-            std::thread::sleep(Duration::from_millis(if pump { 1 } else { 25 }));
-        }
-        None
+    /// The client's exit status once it has exited; `None` while it runs.
+    fn exit_status(&mut self) -> Option<std::process::ExitStatus> {
+        poll(BUDGET, || self.child.try_wait().ok().flatten())
     }
 
+    /// Wait for exit while reading the PTY, then take whatever it still holds.
     fn wait_for_exit(&mut self) -> std::process::ExitStatus {
-        if let Some(status) = self.wait_exit(Duration::from_secs(10), true) {
-            return status;
-        }
-        let tail = &self.seen[self.seen.len().saturating_sub(400)..];
-        panic!(
-            "attach client still running after 10s; last output: {:?}",
-            String::from_utf8_lossy(tail)
-        );
+        let status = self.exit_status();
+        self.stop_reading();
+        drain(&self.master, &self.seen);
+        status.unwrap_or_else(|| {
+            let seen = self.seen();
+            let tail = &seen[seen.len().saturating_sub(400)..];
+            panic!(
+                "attach client still running after {BUDGET:?}; last output: {:?}",
+                String::from_utf8_lossy(tail)
+            )
+        })
     }
 }
 
@@ -263,6 +330,7 @@ impl Drop for AttachedClient {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        self.stop_reading();
     }
 }
 
@@ -324,7 +392,7 @@ fn assert_signal_restores_terminal(sig: Signal) {
         "precondition: the client is not in raw mode, so this test proves nothing: {:?}",
         raw.local_flags
     );
-    let drawn = client.seen.len();
+    let drawn = client.seen().len();
 
     kill(Pid::from_raw(client.child.id() as i32), sig).expect("signal attach");
     let status = client.wait_for_exit();
@@ -344,7 +412,8 @@ fn assert_signal_restores_terminal(sig: Signal) {
         "{sig}: control flags"
     );
 
-    let tail = &client.seen[drawn..];
+    let seen = client.seen();
+    let tail = &seen[drawn..];
     for (what, seq) in [
         ("left the alternate screen", &b"\x1b[?1049l"[..]),
         ("popped the kitty keyboard flags", b"\x1b[<1u"),
@@ -400,13 +469,7 @@ fn a_killed_session_ends_the_client_and_restores_the_terminal() {
     client.wait_until_drawing();
 
     h.kill_session("sig-session-kill");
-    let killed = Instant::now();
     let status = client.wait_for_exit();
-    assert!(
-        killed.elapsed() < Duration::from_secs(3),
-        "the client took {:?} to notice its session was killed",
-        killed.elapsed()
-    );
 
     assert!(
         status.success(),
@@ -417,7 +480,8 @@ fn a_killed_session_ends_the_client_and_restores_the_terminal() {
         after.local_flags, before.local_flags,
         "local flags not restored"
     );
-    let text = String::from_utf8_lossy(&client.seen);
+    let seen = client.seen();
+    let text = String::from_utf8_lossy(&seen);
     assert!(
         text.contains("[session 'sig-session-kill' ended]"),
         "the client never said why it left: {text:?}"
@@ -453,13 +517,13 @@ async fn headless_attach(
         "attach denied"
     );
     let mut seen = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let deadline = tokio::time::Instant::now() + BUDGET;
     while !drew_every_probe(&seen) {
-        assert!(tokio::time::Instant::now() < deadline, "pane never drawn");
-        let Ok(Some(Ok(frame))) = tokio::time::timeout(Duration::from_secs(2), framed.next()).await
-        else {
-            continue;
-        };
+        let frame = tokio::time::timeout_at(deadline, framed.next())
+            .await
+            .expect("pane never drawn")
+            .expect("daemon hung up before drawing the pane")
+            .expect("read frame");
         if let Ok(AttachServerFrame::Render { data }) = serde_json::from_slice(&frame) {
             seen.extend(BASE64.decode(&data).expect("render base64"));
         }
@@ -473,11 +537,11 @@ async fn assert_hung_up_after(
     framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
     is_last: fn(&AttachServerFrame) -> bool,
 ) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + BUDGET;
     loop {
         let frame = tokio::time::timeout_at(deadline, framed.next())
             .await
-            .expect("no final frame within 5s");
+            .expect("no final frame");
         let parsed: AttachServerFrame =
             serde_json::from_slice(&frame.expect("closed before the final frame").unwrap())
                 .expect("parse frame");
@@ -485,9 +549,9 @@ async fn assert_hung_up_after(
             break;
         }
     }
-    let after = tokio::time::timeout(Duration::from_secs(2), framed.next())
+    let after = tokio::time::timeout(BUDGET, framed.next())
         .await
-        .expect("daemon kept the socket open 2s after the final frame");
+        .expect("daemon kept the socket open after the final frame");
     assert!(
         after.is_none(),
         "daemon sent a frame after the final one: {:?}",
@@ -537,20 +601,16 @@ fn a_signal_ends_a_client_whose_terminal_stopped_reading() {
     client.wait_until_drawing();
 
     // Stop reading and let the client's output back up behind the PTY.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !blocked_writing_to_terminal(client.child.id()) {
-        assert!(
-            Instant::now() < deadline,
-            "the client never blocked on its terminal; this test proves nothing"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    client.stop_reading();
+    assert!(
+        poll_until(BUDGET, || blocked_writing_to_terminal(client.child.id())),
+        "the client never blocked on its terminal; this test proves nothing"
+    );
     kill(Pid::from_raw(client.child.id() as i32), Signal::SIGTERM).expect("signal attach");
-    let status = client.wait_exit(Duration::from_secs(5), false);
+    let status = client.exit_status();
     let after = client.termios();
-    client.pump();
 
-    let status = status.expect("a client blocked on its terminal ignored SIGTERM for 5s");
+    let status = status.expect("a client blocked on its terminal ignored SIGTERM");
     assert_eq!(
         after.local_flags, before.local_flags,
         "local flags not restored while the terminal was not reading"

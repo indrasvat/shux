@@ -255,6 +255,8 @@ fn toggling_always_moves_the_generation_forward() {
     );
 }
 
+use shux_testkit::thread_cpu_ns;
+
 /// One `process()` call over output dense with OSC strings (hyperlinks) must
 /// cost linear time, status on or off: the scanner runs either way.
 #[test]
@@ -262,9 +264,9 @@ fn osc_dense_output_scans_in_linear_time() {
     fn cost_ns(repeats: usize) -> u128 {
         let chunk = b"\x1b]8;;f\x07x\x1b]8;;\x07 ".repeat(repeats);
         let mut vt = VirtualTerminal::new(24, 80);
-        let start = std::time::Instant::now();
+        let start = thread_cpu_ns();
         vt.process(&chunk);
-        start.elapsed().as_nanos()
+        thread_cpu_ns() - start
     }
     let (small, large) = (2_000usize, 16_000usize);
     cost_ns(small);

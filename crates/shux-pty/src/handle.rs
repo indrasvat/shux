@@ -534,6 +534,10 @@ impl Drop for PtyHandle {
         let _ = self.kill();
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
         while matches!(self.child.try_wait(), Ok(None)) && std::time::Instant::now() < deadline {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "Drop cannot await; a bounded reap of a SIGKILLed child"
+            )]
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
     }
@@ -891,6 +895,10 @@ impl PtyHandle {
                 // and the release only happens with the queue empty, because
                 // on BSD/macOS that close discards whatever is still in it.
                 let poll = self.slave_release_poll();
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "an exited child sends no event while we hold the slave; poll for it"
+                )]
                 let exit_tick = tokio::select! {
                     biased;
 
@@ -989,6 +997,10 @@ impl PtyHandle {
                 info!(pid = self.pid, ?status, "PTY child exited");
                 return Ok(status);
             }
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "std::process::Child has no async wait; poll its exit"
+            )]
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     }

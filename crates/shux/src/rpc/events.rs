@@ -551,23 +551,29 @@ mod tests {
                     "pane.output.watch",
                     Some(serde_json::json!({
                         "pane_id": pane_str,
-                        "timeout_ms": 500,
+                        "timeout_ms": 30_000,
                         "limit": 2,
                     })),
                 )
                 .await
                 .unwrap()
         });
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        let output_seq = harness.bus.publish_pane_output(
-            pane_id,
-            window_id,
-            session_id,
-            "aGVsbG8=".to_string(),
-            false,
-        );
+        let published = publish_until_watched(&watch, || {
+            harness.bus.publish_pane_output(
+                pane_id,
+                window_id,
+                session_id,
+                "aGVsbG8=".to_string(),
+                false,
+            )
+        })
+        .await;
         let output = watch.await.unwrap();
-        assert_eq!(output["chunks"][0]["seq"], output_seq);
+        let first = output["chunks"][0]["seq"].as_u64().unwrap();
+        assert!(
+            published.contains(&first),
+            "{output} not one of {published:?}"
+        );
         assert_eq!(output["chunks"][0]["bytes"], "aGVsbG8=");
         assert_eq!(output["chunks"][0]["sampled"], false);
 
@@ -592,17 +598,49 @@ mod tests {
             })
     }
 
+    /// Elapsed on the tokio clock. The deadline tests below pause it, so a
+    /// handler that parks until its deadline reads exactly `timeout_ms`, and
+    /// one that returns early reads only the time the test itself let pass.
     async fn timed_watch(
         harness: &RpcHarness,
         params: serde_json::Value,
     ) -> (serde_json::Value, Duration) {
-        let started = std::time::Instant::now();
+        let started = tokio::time::Instant::now();
         let result = dispatch_ok(&harness.router, "events.watch", params).await;
         (result, started.elapsed())
     }
 
+    /// The data plane keeps no history and does not expose its subscriber
+    /// count, so a chunk only reaches a watcher that has already subscribed.
+    /// Publish until the watcher returns; the chunks it holds are some of
+    /// the returned seqs.
+    async fn publish_until_watched<T>(
+        watch: &tokio::task::JoinHandle<T>,
+        mut publish: impl FnMut() -> u64,
+    ) -> Vec<u64> {
+        let published = std::cell::RefCell::new(Vec::new());
+        shux_testkit::wait_until_async("the pane.output.watch call to return a chunk", || {
+            let done = watch.is_finished();
+            if !done {
+                published.borrow_mut().push(publish());
+            }
+            async move { done }
+        })
+        .await;
+        published.into_inner()
+    }
+
+    /// Wait until `events.watch` has subscribed to the bus, so the next
+    /// publish is live rather than history.
+    async fn wait_for_live_subscriber(harness: &RpcHarness, before: usize) {
+        shux_testkit::wait_until_async("events.watch to subscribe", || async {
+            harness.bus.subscriber_count() > before
+        })
+        .await;
+    }
+
     /// History already in hand is returned at once, not after `timeout_ms`.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn watch_with_history_returns_without_waiting_for_the_deadline() {
         let harness = RpcHarness::new();
         let first = plugin_tick(&harness);
@@ -616,14 +654,14 @@ mod tests {
         assert_eq!(watched["events"].as_array().unwrap().len(), 3, "{watched}");
         assert_eq!(watched["next_seq"], first + 3);
         assert!(
-            elapsed < Duration::from_millis(2_000),
+            elapsed < Duration::from_millis(5_000),
             "waited {elapsed:?} with 3 events of history already collected"
         );
         harness.stop().await;
     }
 
     /// With nothing to return the call still long-polls for the full timeout.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn watch_without_history_waits_for_the_deadline() {
         let harness = RpcHarness::new();
         let next = plugin_tick(&harness) + 1;
@@ -635,19 +673,20 @@ mod tests {
         assert_eq!(watched["events"].as_array().unwrap().len(), 0, "{watched}");
         assert_eq!(watched["next_seq"], next);
         assert!(
-            elapsed >= Duration::from_millis(350),
+            elapsed >= Duration::from_millis(400),
             "returned after {elapsed:?}, before the 400 ms deadline, with nothing to return"
         );
         harness.stop().await;
     }
 
     /// The first live event ends the long poll.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn watch_returns_the_first_live_event_without_waiting_for_the_deadline() {
         let harness = RpcHarness::new();
         let router = harness.router.clone();
+        let before = harness.bus.subscriber_count();
         let watch = tokio::spawn(async move {
-            let started = std::time::Instant::now();
+            let started = tokio::time::Instant::now();
             let result = router
                 .dispatch(
                     "events.watch",
@@ -657,12 +696,12 @@ mod tests {
                 .unwrap();
             (result, started.elapsed())
         });
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        wait_for_live_subscriber(&harness, before).await;
         let seq = plugin_tick(&harness);
         let (watched, elapsed) = watch.await.unwrap();
         assert_eq!(watched["events"][0]["seq"], seq, "{watched}");
         assert!(
-            elapsed < Duration::from_millis(2_000),
+            elapsed < Duration::from_millis(5_000),
             "held a live event for {elapsed:?} waiting for more"
         );
         harness.stop().await;
@@ -670,14 +709,14 @@ mod tests {
 
     /// `pane.output.watch` hands back the first chunk it gets rather than
     /// holding it for `limit` chunks or the deadline.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn pane_output_watch_returns_the_first_chunk_without_waiting_for_the_deadline() {
         let harness = RpcHarness::new();
         let (session_id, window_id, pane_id) = harness.seed_session("chunks").await;
         let router = harness.router.clone();
         let pane = pane_id.to_string();
         let watch = tokio::spawn(async move {
-            let started = std::time::Instant::now();
+            let started = tokio::time::Instant::now();
             let result = router
                 .dispatch(
                     "pane.output.watch",
@@ -687,18 +726,25 @@ mod tests {
                 .unwrap();
             (result, started.elapsed())
         });
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let seq = harness.bus.publish_pane_output(
-            pane_id,
-            window_id,
-            session_id,
-            "aGk=".to_string(),
-            false,
-        );
+        let published = publish_until_watched(&watch, || {
+            harness.bus.publish_pane_output(
+                pane_id,
+                window_id,
+                session_id,
+                "aGk=".to_string(),
+                false,
+            )
+        })
+        .await;
         let (watched, elapsed) = watch.await.unwrap();
-        assert_eq!(watched["chunks"][0]["seq"], seq, "{watched}");
+        let chunks = watched["chunks"].as_array().unwrap();
         assert!(
-            elapsed < Duration::from_millis(2_000),
+            !chunks.is_empty() && chunks.len() < 50,
+            "held chunks waiting for the limit: {watched}"
+        );
+        assert!(published.contains(&chunks[0]["seq"].as_u64().unwrap()));
+        assert!(
+            elapsed < Duration::from_millis(5_000),
             "held a chunk for {elapsed:?} waiting for more"
         );
         harness.stop().await;

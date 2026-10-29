@@ -78,13 +78,16 @@ fn near(actual: (u8, u8, u8, u8), expected: (u8, u8, u8)) -> bool {
 
 /// Start a pane whose every column carries the fill, and snapshot the window.
 fn snapshot_filled_window(env: &Env, cols: u16, rows: u16) -> (image::RgbaImage, u32, u32) {
+    // The script draws only once the pane has the size set below, and ends on
+    // a marker of its own: the first one lands before the fill rows do.
     let script = format!(
-        "printf 'BORDERSTYLE-MARKER\\n'; \
+        "while [ \"$(stty size)\" != '{rows} {cols}' ]; do sleep 0.05; done; \
+         printf 'BORDERSTYLE-MARKER\\n'; \
          i=1; while [ \"$i\" -le 8 ]; do \
            printf '\\033[48;2;200;40;40m%s\\033[0m\\n' \
              \"$(printf 'X%.0s' $(seq 1 {cols}))\"; \
            i=$((i+1)); \
-         done; exec cat"
+         done; printf 'BORDERSTYLE-%s\\n' DONE; exec cat"
     );
     let name = format!("bstyle-{}", std::process::id());
     env.run(&["session", "create", &name, "-d", "--", "sh", "-c", &script]);
@@ -112,9 +115,9 @@ fn snapshot_filled_window(env: &Env, cols: u16, rows: u16) -> (image::RgbaImage,
         "-p",
         &pane_id,
         "-t",
-        "BORDERSTYLE-MARKER",
+        "BORDERSTYLE-DONE",
         "--timeout-ms",
-        "20000",
+        "30000",
     ]);
 
     let png = env.runtime.path().join("snap.png");

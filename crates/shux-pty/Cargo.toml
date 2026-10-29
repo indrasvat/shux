@@ -16,3 +16,4 @@ nix = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+shux-testkit = { path = "../shux-testkit" }

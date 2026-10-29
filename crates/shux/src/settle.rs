@@ -306,6 +306,11 @@ pub(crate) async fn wait_settled_frame_stability(
         };
         let wake = stability_wake(now_inst, remaining_hold_ns, timeout_deadline);
 
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "settling holds for a quiet window and gives up at its timeout"
+        )]
+        let woken = tokio::time::sleep_until(wake);
         tokio::select! {
             changed = rx.changed() => {
                 if changed.is_err() {
@@ -317,7 +322,7 @@ pub(crate) async fn wait_settled_frame_stability(
                 let (rev, hash) = read_frame(io).await?;
                 stability.observe(rev, hash, shux_vt::monotonic_now_ns());
             }
-            _ = tokio::time::sleep_until(wake) => {
+            _ = woken => {
                 // Hold-deadline / silence wake: re-evaluate `is_settled` at the top.
             }
         }

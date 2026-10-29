@@ -2,7 +2,7 @@
 //! the exact delta even while OTHER readers hammer the same pane's render path
 //! concurrently. The daemon serves `pane.snapshot` / `pane.glance` (the same
 //! grid reads an attached client's render loop performs) from background
-//! threads while the foreground does checkpoint → drive → settle → diff.
+//! threads while the foreground does checkpoint → drive → wait for the drawn input → diff.
 //!
 //! The DirtyState-independence angle (the literal "attached client drains
 //! DirtyState") is proven directly in-process by
@@ -63,17 +63,12 @@ fn diff_exact_while_concurrent_readers_render_same_pane() {
         }));
     }
 
-    // Drive `a` and settle while the readers churn.
+    // Drive `a` while the readers churn. F4 draws the block, then
+    // `A-PRESSED`, then only moves the cursor, so the whole word on screen
+    // means all 10 cells have landed and no more will.
     h.send_raw(&f.pane_id, "a");
-    let env = h.rpc_raw(
-        "pane.wait_settled",
-        serde_json::json!({ "pane_id": f.pane_id, "quiet_ms": 300, "timeout_ms": 5_000 }),
-    );
-    assert_eq!(
-        env.expect_result("settle after a")["settled"],
-        serde_json::Value::Bool(true),
-        "pane must settle after `a` despite concurrent readers"
-    );
+    h.wait_for(&f.pane_id, "A-PRESSED", shux_testkit::BUDGET_MS)
+        .expect("pane must draw `a` despite concurrent readers");
 
     // The diff must still be exact — concurrent render reads never corrupt it.
     let env = h.rpc_raw(

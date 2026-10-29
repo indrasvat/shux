@@ -215,6 +215,12 @@ async fn run_pane_pty_task(
 
     loop {
         let output_due = staged.due_at();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "staged output is published at most once per sampling interval"
+        )]
+        let publish_due =
+            tokio::time::sleep_until(output_due.unwrap_or_else(tokio::time::Instant::now));
         tokio::select! {
             biased;
 
@@ -225,8 +231,7 @@ async fn run_pane_pty_task(
             }
             // Ahead of reads, and due at most once per interval, so it
             // neither starves them nor waits behind a steady stream.
-            _ = tokio::time::sleep_until(output_due.unwrap_or_else(tokio::time::Instant::now)),
-                if output_due.is_some() =>
+            _ = publish_due, if output_due.is_some() =>
             {
                 staged.publish(&graph, pane_id);
             }
@@ -1302,7 +1307,7 @@ mod tests {
         spawn().await.unwrap();
         let first_done = h.io.lock().await.pty_done.remove(&pane).unwrap();
         spawn().await.unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), first_done)
+        tokio::time::timeout(shux_testkit::BUDGET, first_done)
             .await
             .expect("the replaced task finishes")
             .ok();
@@ -1334,8 +1339,11 @@ mod tests {
         for (mode, owed) in [(r"\033[?2004l", false), (r"\033[?2004l\033[?2004h", true)] {
             let h = crate::rpc::test_harness::RpcHarness::new();
             let (_s, _w, pane) = h.seed_session("replies").await;
+            // The program asks for its cursor only after reading the
+            // paste's start, then prints MARK, so the reply's fate is decided
+            // before MARK shows. A held reply comes out behind the paste's end.
             let script = format!(
-                r#"stty raw -echo; printf '\033[?2004h'; sleep 1; printf '{mode}\033[6n'; if IFS= read -r -t 3 -d R _; then echo GOT-REPLY; else echo NO-REPLY; fi; sleep 30"#
+                r#"stty raw -echo; printf '\033[?2004h'; printf 'REA%sDY' ''; IFS= read -r -d '~' _; printf '{mode}\033[6nMA%sRK' ''; IFS= read -r -d R x; case $x in *201~*) echo HELD-REPLY;; *) echo GOT-REPLY;; esac; sleep 30"#
             );
             spawn_pane_pty_unshared(
                 pane,
@@ -1351,7 +1359,14 @@ mod tests {
             )
             .await
             .unwrap();
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let io = &h.io;
+            let screen_shows = |needle: &'static str| {
+                shux_testkit::wait_for_async(needle, move || async move {
+                    let text = io.lock().await.vts[&pane].capture_text(None);
+                    text.contains(needle).then_some(text)
+                })
+            };
+            screen_shows("READY").await;
             let writer = {
                 let mut state = h.io.lock().await;
                 let program = state.incarnations[&pane];
@@ -1366,19 +1381,15 @@ mod tests {
                 state.writers[&pane].clone()
             };
             writer.send(PASTE_START.to_vec()).await.unwrap();
-
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
-            let text = loop {
-                let text = h.io.lock().await.vts[&pane].capture_text(None);
-                if text.contains("-REPLY") || tokio::time::Instant::now() > deadline {
-                    break text;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            };
-            let expected = if owed { "NO-REPLY" } else { "GOT-REPLY" };
-            assert!(text.contains(expected), "{mode}: {}", text.trim());
+            screen_shows("MARK").await;
             let open = h.io.lock().await.open_paste(pane);
             assert_eq!(open.is_some(), owed, "{mode}: owed an end");
+            if owed {
+                writer.send(PASTE_END.to_vec()).await.unwrap();
+            }
+            let text = screen_shows("-REPLY").await;
+            let expected = if owed { "HELD-REPLY" } else { "GOT-REPLY" };
+            assert!(text.contains(expected), "{mode}: {}", text.trim());
             h.stop().await;
         }
     }
@@ -1411,11 +1422,19 @@ mod tests {
             .unwrap();
         let outcome = rec.outcome.clone();
         spawn(Some(rec)).await.unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), first_done)
+        tokio::time::timeout(shux_testkit::BUDGET, first_done)
             .await
             .expect("the replaced task finishes")
             .ok();
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Any Finish the predecessor sent is queued ahead of this fence on
+        // the recorder's own channel, so it is processed before the fence is.
+        crate::pane_record::tee_pane_recorders(&h.io, pane, None, b"FENCE", &h.cancel).await;
+        let cast = dir.path().join("s.cast");
+        shux_testkit::wait_until_async("the recorder to reach the fence or stop", || async {
+            outcome.lock().unwrap().status != crate::pane_record::PaneRecordStatus::Recording
+                || std::fs::read_to_string(&cast).is_ok_and(|c| c.contains("FENCE"))
+        })
+        .await;
         assert_eq!(
             outcome.lock().unwrap().status,
             crate::pane_record::PaneRecordStatus::Recording,
@@ -1452,13 +1471,16 @@ mod tests {
         // What pane.kill does: tear the pane down, VT and all.
         let (_pulse, done) = h.io.lock().await.teardown_panes_collecting(&[pane], true);
         for rx in done {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await;
+            let _ = tokio::time::timeout(shux_testkit::BUDGET, rx).await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        shux_testkit::wait_until_async("the killed pane's recording to finish", || async {
+            outcome.lock().unwrap().status != crate::pane_record::PaneRecordStatus::Recording
+        })
+        .await;
         assert_eq!(
             outcome.lock().unwrap().status,
             crate::pane_record::PaneRecordStatus::Complete,
-            "a recording on a killed pane was never finished"
+            "a recording on a killed pane ended other than complete"
         );
         h.stop().await;
     }
@@ -1558,33 +1580,42 @@ mod tests {
         );
     }
 
-    /// A pane id plus the pid file its shell writes, so a test can prove the
-    /// child of a refused spawn did not survive.
-    fn pid_probe(dir: &std::path::Path) -> (std::path::PathBuf, Vec<String>) {
-        let pid_file = dir.join("pid");
-        let cmd = format!("echo $$ > '{}'; exec sleep 30", pid_file.display());
-        (pid_file, vec!["sh".into(), "-c".into(), cmd])
+    /// The child of a probe spawn: the pid file its shell writes, and a
+    /// needle unique to this run that its argv carries before and after the
+    /// `exec`, so `ps` sees it at every stage.
+    struct Probe {
+        pid_file: std::path::PathBuf,
+        needle: String,
     }
 
-    /// The child either never got far enough to write its pid, or is reaped.
-    async fn assert_child_gone(pid_file: &std::path::Path) {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
-        loop {
-            let alive = std::fs::read_to_string(pid_file)
+    /// A probe plus its argv, so a test can prove the child of a refused
+    /// spawn did not survive.
+    fn pid_probe(dir: &std::path::Path) -> (Probe, Vec<String>) {
+        let pid_file = dir.join("pid");
+        let nonce = uuid::Uuid::new_v4().as_u128() % 1_000_000_000;
+        let needle = format!("sleep 30.{nonce:09}");
+        let cmd = format!("echo $$ > '{}'; exec {needle}", pid_file.display());
+        (
+            Probe { pid_file, needle },
+            vec!["sh".into(), "-c".into(), cmd],
+        )
+    }
+
+    /// No process of the probe is left, and one that wrote its pid is reaped.
+    /// A spawn returns only once its child has exec'd, so a surviving child
+    /// is in the process table by the time this runs.
+    async fn assert_child_gone(probe: &Probe) {
+        let gone = shux_testkit::poll_until_async(shux_testkit::BUDGET, || async {
+            let reaped = std::fs::read_to_string(&probe.pid_file)
                 .ok()
                 .and_then(|s| s.trim().parse::<i32>().ok())
-                .is_some_and(|pid| {
-                    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+                .is_none_or(|pid| {
+                    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err()
                 });
-            if !alive && (pid_file.exists() || tokio::time::Instant::now() >= deadline) {
-                return;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the refused spawn's child is still running"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
+            reaped && crate::rpc::test_harness::count_procs_containing(&probe.needle) == 0
+        })
+        .await;
+        assert!(gone, "the refused spawn's child is still running");
     }
 
     async fn spawn_probe(
@@ -1613,14 +1644,14 @@ mod tests {
         let h = crate::rpc::test_harness::RpcHarness::new();
         let (_s, _w, pane) = h.seed_session("lost-claim").await;
         let dir = tempfile::tempdir().unwrap();
-        let (pid_file, argv) = pid_probe(dir.path());
+        let (probe, argv) = pid_probe(dir.path());
         let _ = h.graph.claim_pane_pty(pane, u64::MAX).await;
         spawn_probe(&h, pane, argv).await.unwrap();
         assert!(
             !h.io.lock().await.writers.contains_key(&pane),
             "a spawn older than the pane's owner installed its PTY"
         );
-        assert_child_gone(&pid_file).await;
+        assert_child_gone(&probe).await;
         h.stop().await;
     }
 
@@ -1631,7 +1662,7 @@ mod tests {
         let h = crate::rpc::test_harness::RpcHarness::new();
         let (_s, _w, pane) = h.seed_session("lost-install").await;
         let dir = tempfile::tempdir().unwrap();
-        let (pid_file, argv) = pid_probe(dir.path());
+        let (probe, argv) = pid_probe(dir.path());
         h.io.lock().await.incarnations.insert(pane, u64::MAX);
         spawn_probe(&h, pane, argv).await.unwrap();
         let state = h.io.lock().await;
@@ -1641,7 +1672,7 @@ mod tests {
             "an older spawn replaced the newer installed PTY"
         );
         drop(state);
-        assert_child_gone(&pid_file).await;
+        assert_child_gone(&probe).await;
         h.stop().await;
     }
 
@@ -1649,14 +1680,14 @@ mod tests {
     async fn a_replaced_pty_task_for_a_missing_pane_fails() {
         let h = crate::rpc::test_harness::RpcHarness::new();
         let dir = tempfile::tempdir().unwrap();
-        let (pid_file, argv) = pid_probe(dir.path());
+        let (probe, argv) = pid_probe(dir.path());
         let ghost = shux_core::model::PaneId::new();
         assert!(
             spawn_probe(&h, ghost, argv).await.is_err(),
             "a spawn for a pane that does not exist reported success"
         );
         assert!(!h.io.lock().await.writers.contains_key(&ghost));
-        assert_child_gone(&pid_file).await;
+        assert_child_gone(&probe).await;
         h.stop().await;
     }
 
@@ -1668,7 +1699,7 @@ mod tests {
         let h = crate::rpc::test_harness::RpcHarness::new();
         let (_s, _w, pane) = h.seed_session("refused-at-shutdown").await;
         let dir = tempfile::tempdir().unwrap();
-        let (pid_file, argv) = pid_probe(dir.path());
+        let (probe, argv) = pid_probe(dir.path());
         h.graph.set_pane_exit_status(pane, 0).await.unwrap();
         let stopping = tokio_util::sync::CancellationToken::new();
         stopping.cancel();
@@ -1690,7 +1721,7 @@ mod tests {
             matches!(e.data, shux_core::event::EventData::PaneRespawned { pane_id, .. } if pane_id == pane)
         });
         assert!(!respawned, "announced a respawn that never happened");
-        assert_child_gone(&pid_file).await;
+        assert_child_gone(&probe).await;
         h.stop().await;
     }
 
@@ -1701,7 +1732,7 @@ mod tests {
         let h = crate::rpc::test_harness::RpcHarness::new();
         let (session, _w, pane) = h.seed_session("died-mid-spawn").await;
         let dir = tempfile::tempdir().unwrap();
-        let (pid_file, argv) = pid_probe(dir.path());
+        let (probe, argv) = pid_probe(dir.path());
         // An exited pane makes the claim observable: it clears the exit.
         h.graph.set_pane_exit_status(pane, 0).await.unwrap();
         let guard = h.io.lock().await;
@@ -1725,14 +1756,10 @@ mod tests {
                 .await
             })
         };
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        while h.graph.snapshot().panes[&pane].exit_status.is_some() {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "spawn never claimed"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        shux_testkit::wait_until_async("the spawn to claim the pane", || async {
+            h.graph.snapshot().panes[&pane].exit_status.is_none()
+        })
+        .await;
         h.graph.destroy_session(session, None).await.unwrap();
         drop(guard);
         let result = task.await.unwrap();
@@ -1748,7 +1775,7 @@ mod tests {
             "a destroyed pane kept its PTY handles"
         );
         drop(state);
-        assert_child_gone(&pid_file).await;
+        assert_child_gone(&probe).await;
         h.stop().await;
     }
 
@@ -1776,7 +1803,7 @@ mod tests {
         .await
         .unwrap();
         let mut seen = Vec::new();
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        let deadline = tokio::time::Instant::now() + shux_testkit::BUDGET;
         while !String::from_utf8_lossy(&seen).contains("LAST") {
             match tokio::time::timeout_at(deadline, sub.recv()).await {
                 Ok(Some(shux_core::bus::PaneOutputSubscriptionEvent::Chunk(c)))

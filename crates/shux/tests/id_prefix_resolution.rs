@@ -26,8 +26,6 @@
 //! hand-built snapshots in `shux_core::idref`, over crafted listings in the CLI
 //! resolvers, and over the `RefError` → RPC mapping in the daemon.
 
-use std::time::Duration;
-
 mod lens_common;
 mod typed_marker;
 use lens_common::*;
@@ -75,28 +73,14 @@ const PROBE: &str = concat!(
 /// Pane B's line, typed into its shell. The PTY echoes it before the shell
 /// runs it, so it must not contain `BRAVO` or the fixture's wait for pane B's
 /// output returns on the echo.
-const PANE_B_LINE: &str = "printf '%s%s\\n' BRA VO\n";
-
-/// Wait for a pane to stop writing, so two captures of it can be compared.
 ///
-/// Retries around a transient `not_found`, and gives up quietly rather than
-/// failing the test: the caller wants the pane QUIET, and a pane with no VT is
-/// as quiet as it gets. A never-settling pane still fails, loudly, at the
-/// assertion that actually cares.
-fn settle(h: &Harness, pane_id: &str) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        let env = h.rpc_raw(
-            "pane.wait_settled",
-            serde_json::json!({ "pane_id": pane_id, "quiet_ms": 250, "timeout_ms": 10_000 }),
-        );
-        match env.result {
-            Some(v) if v["settled"] == serde_json::Value::Bool(true) => return,
-            _ if std::time::Instant::now() >= deadline => return,
-            _ => std::thread::sleep(Duration::from_millis(50)),
-        }
-    }
-}
+/// It also sets the prompt the shell draws after the line has run, which is
+/// that shell's last write until something is typed at it again.
+const PANE_B_LINE: &str = "PS1='RE''ADY> '; printf '%s%s\\n' BRA VO\n";
+
+/// The prompt [`PANE_B_LINE`] sets, as a capture shows it (trailing blank
+/// trimmed); the line spells it so its echo cannot contain it.
+const PANE_B_PROMPT: &str = "READY>";
 
 fn fixture(h: &Harness, tag: &str) -> Fixed {
     let name = format!("id120-{tag}-{}", unique());
@@ -132,7 +116,7 @@ fn fixture(h: &Harness, tag: &str) -> Fixed {
     // identical to a wait on stillness alone. The budget is generous because
     // the coverage job runs the workspace instrumented and in parallel; it is
     // a deadline for reporting failure, not an assertion.
-    h.wait_for(&pane_a, "ALPHA", 60_000)
+    h.wait_for(&pane_a, "BASIC", 60_000)
         .expect("pane A never printed its colour probe");
 
     // A second pane in the same window, with its own marker on screen.
@@ -151,29 +135,13 @@ fn fixture(h: &Harness, tag: &str) -> Fixed {
     h.wait_for(&pane_b, "BRAVO", 60_000)
         .expect("pane B never printed its marker");
 
-    // Content, THEN settle — the second half of the rule, which this fixture
-    // was only doing the first half of.
-    //
-    // `BRAVO` appearing does not mean pane B has stopped writing: it is an
-    // interactive shell, and the prompt it redraws afterwards lands whenever
-    // the scheduler gets round to it. Tests below glance the same pane twice
-    // and assert the two agree; on a loaded machine the shell's next write can
-    // slip between them, and the two captures differ by a line of prompt. The
-    // symptom reads as "the short id resolved to a different pane", which is a
-    // slander on the resolver — nothing about ids is wrong.
-    //
-    // Both panes settle: A parks in `sleep 300` after its probe, but the same
-    // prompt-after-output shape applies to it.
-    //
-    // Tolerant of `not_found`, deliberately. A pane's VT is registered slightly
-    // after `pane.split` returns and torn down as soon as its command exits, so
-    // "no VT" is a legitimate transient at both ends and means the same thing
-    // settling does: nothing is writing. Treating it as a hard error made this
-    // fixture FAIL under load — a strict `rpc_ok` here turned a benign race into
-    // three red tests that had nothing to do with what they were testing.
-    for pane in [&pane_a, &pane_b] {
-        settle(h, pane);
-    }
+    // Both panes are now quiet for good, which the glance comparisons below
+    // rely on: A has printed its whole probe line and parked in `sleep`, and
+    // B has drawn the prompt that follows BRAVO and blocks reading its input.
+    // Waiting on that prompt rather than on stillness is what makes it
+    // independent of when the scheduler lets the shell redraw.
+    h.wait_for(&pane_b, PANE_B_PROMPT, 60_000)
+        .expect("pane B never drew the prompt after its marker");
 
     // A second window, so `-w 0` has something to be wrong about.
     let w2 = h.rpc_ok(
@@ -379,10 +347,6 @@ fn short_pane_id_from_pane_list_is_accepted_by_every_pane_command() {
     // the verbs above, so the first chunk to arrive is whatever was already in
     // flight. Watch until the marker shows up, then stop.
     {
-        h.rpc_ok(
-            "pane.wait_settled",
-            serde_json::json!({ "pane_id": f.pane_b, "quiet_ms": 300, "timeout_ms": 5000 }),
-        );
         let log = h.state_dir().join("watch.out");
         let sink = std::fs::File::create(&log).expect("create watch log");
         let mut child = h
@@ -404,43 +368,33 @@ fn short_pane_id_from_pane_list_is_accepted_by_every_pane_command() {
 
         // The data plane keeps no history, so anything the pane emits before
         // the watcher attaches is simply gone — and there is no readiness
-        // signal to wait on from out here.
-        //
-        // A fixed sleep is therefore a race, not a synchronisation: it holds
-        // only while subscribing is faster than the number picked. This used to
-        // be one 600 ms sleep and one send, which lost that race on a loaded
-        // macOS runner and asserted that `pane watch` was broken. Re-send
-        // instead, until the output comes back or the deadline expires. The
-        // assertion is unchanged — `pane watch` still has to deliver the pane's
-        // output — but it no longer doubles as a bet on scheduler latency.
+        // signal to wait on from out here. So the line is re-sent until its
+        // output comes back, on probes 1, 2, 4, 8, … of the poll: a backoff
+        // counted in probes, which needs no guess at how long subscribing
+        // takes and still keeps the pane from being flooded.
         let send = || {
             h.rpc_ok(
                 "pane.send_keys",
-                serde_json::json!({ "pane_id": f.pane_b, "text": "printf 'WATCHED\n'
-" }),
+                serde_json::json!({ "pane_id": f.pane_b, "text": "printf 'WATCHED\n'\n" }),
             );
         };
-        std::thread::sleep(std::time::Duration::from_millis(600));
-        send();
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        let mut next_send = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut probes: u32 = 0;
         let mut seen = String::new();
-        while std::time::Instant::now() < deadline {
+        shux_testkit::poll_until(shux_testkit::BUDGET, || {
+            probes += 1;
+            if probes.is_power_of_two() {
+                send();
+            }
             seen = std::fs::read_to_string(&log).unwrap_or_default();
             if seen.contains("WATCHED") {
-                break;
+                return true;
             }
             // A watcher that died is a failure, not something to wait out.
             if let Some(st) = child.try_wait().expect("try_wait") {
                 panic!("`pane watch` exited early ({st}) — output so far: {seen:?}");
             }
-            if std::time::Instant::now() >= next_send {
-                send();
-                next_send = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(150));
-        }
+            false
+        });
         let _ = child.kill();
         let _ = child.wait();
         assert!(
@@ -726,13 +680,8 @@ fn partial_hyphenated_and_uppercase_prefixes_resolve() {
     let h = Harness::new();
     let f = fixture(&h, "forms");
 
-    // Settle first. The shell prints a fresh prompt after BRAVO, so a
-    // reference frame grabbed too early differs from the ones the variants
-    // grab a moment later — a flake that has nothing to do with id resolution.
-    h.rpc_ok(
-        "pane.wait_settled",
-        serde_json::json!({ "pane_id": f.pane_b, "quiet_ms": 300, "timeout_ms": 5000 }),
-    );
+    // The fixture has already waited for the prompt that follows BRAVO, so
+    // pane B is quiet and every glance below sees the same frame.
     let expected = h.rpc_ok(
         "pane.glance",
         serde_json::json!({ "pane_id": f.pane_b, "include_png": false }),
@@ -1109,4 +1058,8 @@ fn session_attach_resolves_an_id_instead_of_creating_a_session_named_after_it() 
 #[test]
 fn pane_b_marker_cannot_be_satisfied_by_the_echoed_line() {
     typed_marker::assert_echo_cannot_satisfy(PANE_B_LINE, "", &["BRAVO"]);
+    assert!(
+        !PANE_B_LINE.contains(PANE_B_PROMPT),
+        "the echo of {PANE_B_LINE:?} would satisfy the wait for its prompt"
+    );
 }

@@ -55,6 +55,17 @@ fn run_gate(
     golden_dir: Option<&Path>,
     argv_override: &[&str],
 ) -> GateRun {
+    run_gate_with(h, dir, scenario_toml, golden_dir, argv_override, &[])
+}
+
+fn run_gate_with(
+    h: &Harness,
+    dir: &Path,
+    scenario_toml: &str,
+    golden_dir: Option<&Path>,
+    argv_override: &[&str],
+    env: &[(&str, &str)],
+) -> GateRun {
     let scenario_path = dir.join(format!("scn-{}.toml", lens_common::unique()));
     std::fs::write(&scenario_path, scenario_toml).unwrap();
     let trace_path = dir.join(format!("trace-{}.ndjson", lens_common::unique()));
@@ -73,7 +84,12 @@ fn run_gate(
         args.extend_from_slice(argv_override);
     }
 
-    let out = h.cli(&args);
+    let out = h
+        .shux()
+        .args(&args)
+        .envs(env.iter().copied())
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run shux {args:?}: {e}"));
     let trace = std::fs::read_to_string(&trace_path).unwrap_or_default();
     let signals = trace
         .lines()
@@ -97,11 +113,15 @@ fn capture_cell_json(h: &Harness, argv: &[&str], cols: u16, rows: u16, sentinel:
     );
     let pane = run["pane_id"].as_str().unwrap().to_string();
     let sid = run["session_id"].as_str().unwrap().to_string();
-    h.wait_for(&pane, sentinel, 5000)
+    h.wait_for(&pane, sentinel, lens_common::BUDGET_MS)
         .unwrap_or_else(|e| panic!("capture sentinel {sentinel:?} never drew: {e}"));
-    let _ = h.rpc_raw(
+    let settled = h.rpc_ok(
         "pane.wait_settled",
-        serde_json::json!({ "pane_id": pane, "quiet_ms": 200, "timeout_ms": 2000 }),
+        serde_json::json!({ "pane_id": pane, "quiet_ms": 200, "timeout_ms": lens_common::BUDGET_MS }),
+    );
+    assert_eq!(
+        settled["settled"], true,
+        "capture {sentinel:?}: pane never settled"
     );
     let g = h.rpc_ok(
         "pane.glance",
@@ -262,7 +282,7 @@ cols = 80
 [[steps]]
 action = "wait_for_text"
 text = "ENVDONE"
-timeout_ms = 5000
+timeout_ms = 30000
 [[steps]]
 action = "assert_contains"
 text = "LC_ALL=C.UTF-8"
@@ -310,11 +330,11 @@ cols = 80
 [[steps]]
 action = "wait_for_text"
 text = "MATCHME"
-timeout_ms = 5000
+timeout_ms = 30000
 [[steps]]
 action = "settle"
 quiet_ms = 250
-timeout_ms = 5000
+timeout_ms = 30000
 [[steps]]
 action = "expect_golden"
 name = "frame"
@@ -436,7 +456,7 @@ cols = 120
 [[steps]]
 action = "wait_for_text"
 text = "WIDEFRAME"
-timeout_ms = 5000
+timeout_ms = 30000
 [[steps]]
 action = "settle"
 [[steps]]
@@ -472,7 +492,7 @@ cols = 80
 [[steps]]
 action = "wait_for_text"
 text = "CRASH"
-timeout_ms = 5000
+timeout_ms = 30000
 [[steps]]
 action = "expect_golden"
 name = "frame"
@@ -509,14 +529,14 @@ cols = 80
 [[steps]]
 action = "wait_for_text"
 text = "READY"
-timeout_ms = 5000
+timeout_ms = 30000
 [[steps]]
 action = "type_text"
 text = "\n"
 [[steps]]
 action = "expect_exit"
 code = 42
-timeout_ms = 5000
+timeout_ms = 30000
 "#;
     let run = run_gate(&h, d.path(), scn, None, &[]);
     assert!(
@@ -554,7 +574,7 @@ cols = 80
 [[steps]]
 action = "wait_for_text"
 text = "CRASHSCREEN"
-timeout_ms = 5000
+timeout_ms = 30000
 [[steps]]
 action = "expect_golden"
 name = "frame"
@@ -583,13 +603,16 @@ tier = "cell"
 fn child_exit_after_terminal_expect_golden_is_not_dropped() {
     // adv MAJOR 2: a child that paints, settles, then exits while `expect_golden` is the
     // LAST step used to drop the exit entirely (false-pass on a matching golden). The
-    // final post-loop check must surface it.
+    // final post-loop check must surface it. The child exits only once the trace shows the
+    // compare, so the exit falls inside the runner's post-compare grace.
     let h = Harness::new();
     let d = tmp();
     let golden = tmp();
-    let scn = r#"
+    let fifo = lens_common::make_fifo(d.path());
+    let scn = format!(
+        r#"
 name = "paint-settle-exit"
-command = ["/bin/sh", "-c", "printf 'DONE'; sleep 0.4; exit 7"]
+command = ["/bin/sh", "-c", "printf 'DONE'; read x < '{fifo}'; exit 7"]
 [terminal]
 rows = 24
 cols = 80
@@ -598,9 +621,21 @@ action = "expect_golden"
 name = "frame"
 tier = "cell"
 quiet_ms = 250
-timeout_ms = 5000
-"#;
-    let run = run_gate(&h, d.path(), scn, Some(golden.path()), &[]);
+timeout_ms = 30000
+"#,
+        fifo = fifo.display()
+    );
+    let run = std::thread::scope(|s| {
+        s.spawn(|| lens_common::release_after_compare(d.path(), &fifo));
+        run_gate_with(
+            &h,
+            d.path(),
+            &scn,
+            Some(golden.path()),
+            &[],
+            &[lens_common::HELD_POST_COMPARE_GRACE],
+        )
+    });
     let ce = run.find("child_exit").unwrap_or_else(|| {
         panic!(
             "a post-compare unexpected exit must surface: {:?} stderr {}",
@@ -635,22 +670,17 @@ rows = 24
 cols = 80
 [[steps]]
 action = "wait"
-ms = 8000
+ms = 600000
 "#;
-    let start = std::time::Instant::now();
+    // The step outlasts any test budget: only an interrupted run returns at all, and a
+    // single step that ran to completion would leave no timeout signal behind.
     let run = run_gate(&h, d.path(), scn, None, &[]);
-    let elapsed = start.elapsed();
     assert!(
         run.find("timeout")
             .map(|t| t["class"] == "scenario")
             .unwrap_or(false),
         "expected a scenario timeout mid-step, got {:?}",
         run.kinds()
-    );
-    // It cut the 8s step well before completion (generous CI bound).
-    assert!(
-        elapsed < std::time::Duration::from_secs(5),
-        "deadline did not interrupt the long step (took {elapsed:?})"
     );
     assert_no_scratch_leak(&h);
 }
@@ -670,14 +700,14 @@ cols = 80
 [[steps]]
 action = "wait_for_text"
 text = "READY"
-timeout_ms = 5000
+timeout_ms = 30000
 [[steps]]
 action = "type_text"
 text = "\n"
 [[steps]]
 action = "expect_exit"
 code = 99
-timeout_ms = 5000
+timeout_ms = 30000
 "#;
     let run = run_gate(&h, d.path(), scn, None, &[]);
     let ce = run
@@ -731,7 +761,7 @@ rows = 24
 cols = 80
 [[steps]]
 action = "settle"
-quiet_ms = 200
+quiet_ms = 1500
 timeout_ms = 1500
 "#;
     let run = run_gate(&h, d.path(), scn, None, &[]);
@@ -785,7 +815,7 @@ command = ["/bin/sh", "-c", "printf 'HI'; exec cat"]
 [[steps]]
 action = "wait_for_text"
 text = "HI"
-timeout_ms = 5000
+timeout_ms = 30000
 [[steps]]
 action = "assert_contains"
 text = "HI"
@@ -811,7 +841,7 @@ cols = 80
 [[steps]]
 action = "wait_for_text"
 text = "SIZE=24 80"
-timeout_ms = 5000
+timeout_ms = 30000
 [[steps]]
 action = "resize"
 rows = 30
@@ -819,7 +849,7 @@ cols = 100
 [[steps]]
 action = "wait_for_text"
 text = "SIZE=30 100"
-timeout_ms = 5000
+timeout_ms = 30000
 "#,
         f7.to_string_lossy()
     );
@@ -859,7 +889,7 @@ command = ["/bin/sh", "-c", "printf 'HI'; exec cat"]
 [[steps]]
 action = "wait_for_text"
 text = "HI"
-timeout_ms = 5000
+timeout_ms = 30000
 [[steps]]
 action = "expect_golden"
 name = "frame"
@@ -874,7 +904,7 @@ tier = "cell"
         h.kill_session(s);
     }
     assert!(
-        lens_common::wait_until(std::time::Duration::from_secs(10), || {
+        lens_common::wait_until(lens_common::BUDGET, || {
             let list = h.rpc_ok(
                 "session.list",
                 serde_json::json!({ "include_scratch": true }),
@@ -911,7 +941,7 @@ cwd = "."
 [[steps]]
 action = "wait_for_text"
 text = "cwd-resolved"
-timeout_ms = 5000
+timeout_ms = 30000
 
 [[steps]]
 action = "assert_contains"

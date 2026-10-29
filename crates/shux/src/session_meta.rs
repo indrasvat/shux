@@ -66,12 +66,17 @@ impl SessionMetaCache {
 /// the short hash via `git rev-parse --short HEAD` when HEAD is
 /// detached.
 pub fn detect_git_branch(cwd: &Path) -> Option<String> {
+    // Generous for a HEAD-only query but bounded enough that a hung NFS /
+    // fsmonitor won't stall daemon startup.
+    detect_git_branch_within(cwd, std::time::Duration::from_millis(500))
+}
+
+/// [`detect_git_branch`], giving each git query up to `budget`.
+fn detect_git_branch_within(cwd: &Path, budget: std::time::Duration) -> Option<String> {
     use std::process::{Command, Stdio};
     use std::time::Duration;
 
-    fn run(cwd: &Path, args: &[&str]) -> Option<String> {
-        // 500ms is generous for a HEAD-only query but bounded enough
-        // that a hung NFS / fsmonitor won't stall daemon startup.
+    let run = |args: &[&str]| -> Option<String> {
         let mut child = Command::new("git")
             .args(args)
             .current_dir(cwd)
@@ -81,7 +86,7 @@ pub fn detect_git_branch(cwd: &Path) -> Option<String> {
             .spawn()
             .ok()?;
 
-        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        let deadline = std::time::Instant::now() + budget;
         loop {
             match child.try_wait() {
                 Ok(Some(status)) if status.success() => {
@@ -102,16 +107,20 @@ pub fn detect_git_branch(cwd: &Path) -> Option<String> {
                         let _ = child.wait();
                         return None;
                     }
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "polls a git child that has no async handle, up to its budget"
+                    )]
                     std::thread::sleep(Duration::from_millis(15));
                 }
                 Err(_) => return None,
             }
         }
-    }
+    };
 
-    run(cwd, &["symbolic-ref", "--short", "HEAD"]).or_else(|| {
+    run(&["symbolic-ref", "--short", "HEAD"]).or_else(|| {
         // Detached HEAD: fall back to short SHA.
-        run(cwd, &["rev-parse", "--short", "HEAD"])
+        run(&["rev-parse", "--short", "HEAD"])
     })
 }
 
@@ -130,8 +139,10 @@ mod tests {
     fn detect_git_branch_in_this_repo() {
         // We're inside indrasvat/shux which is a git repo, so this
         // should yield Some(branch).
+        // The test's budget, not the daemon's: git under a loaded test run
+        // can take longer than the daemon is willing to wait.
         let cwd = std::env::current_dir().expect("cwd");
-        let branch = detect_git_branch(&cwd);
+        let branch = detect_git_branch_within(&cwd, shux_testkit::BUDGET);
         assert!(
             branch.is_some(),
             "expected to detect a branch in the shux repo, got None"

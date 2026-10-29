@@ -45,7 +45,8 @@ fn f2_spinner_advances_and_signals_ready() {
         h.send_line_token(&f.pane_id, "");
     }
     h.send_line_token(&f.pane_id, "R");
-    h.wait_for(&f.pane_id, "READY", 5_000).expect("F2 READY");
+    h.wait_for(&f.pane_id, "READY", BUDGET_MS)
+        .expect("F2 READY");
     let ready_text = h.capture_text(&f.pane_id);
     assert!(ready_text.contains("READY"));
 
@@ -72,9 +73,7 @@ fn f2_spinner_advances_and_signals_ready() {
     );
     h.send_raw(&f.pane_id, "\u{4}");
     assert!(
-        wait_until(std::time::Duration::from_secs(5), || h
-            .count_fixture_procs("f2_spinner.sh")
-            == 0),
+        wait_until(BUDGET, || h.count_fixture_procs("f2_spinner.sh") == 0),
         "F2: fixture must exit on stdin EOF (no busy-spin, no residual process)"
     );
     h.kill_session(&f.session_id);
@@ -92,7 +91,7 @@ fn f3_flip_alternates_frames_and_colours() {
 
     // One token flips to frame B.
     h.send_line_token(&f.pane_id, "");
-    h.wait_for(&f.pane_id, "BBBBBBBBBB", 5_000)
+    h.wait_for(&f.pane_id, "BBBBBBBBBB", BUDGET_MS)
         .expect("F3 flip to B");
     let (png_b, _, _) = h.snapshot_png(&f.pane_id);
     assert_eq!(
@@ -118,7 +117,7 @@ fn f3_flip_alternates_frames_and_colours() {
     // ?2026l release bumps exactly once).
     let rev_before = h.content_revision(&f.session_id, &f.pane_id);
     h.send_line_token(&f.pane_id, "");
-    h.wait_for(&f.pane_id, "AAAAAAAAAA", 5_000)
+    h.wait_for(&f.pane_id, "AAAAAAAAAA", BUDGET_MS)
         .expect("F3 flip back to A");
     assert_eq!(
         h.content_revision(&f.session_id, &f.pane_id),
@@ -142,7 +141,8 @@ fn f4_keys_press_recolour_and_marker() {
     // Give the fixture a wait_for gate on something that must NOT appear: use a
     // short absent-check via a fresh capture after a marker round-trip.
     h.send_raw(&f.pane_id, "\t"); // harmless marker move to force a redraw
-    h.wait_for(&f.pane_id, "▶", 5_000).expect("marker present");
+    h.wait_for(&f.pane_id, "▶", BUDGET_MS)
+        .expect("marker present");
     assert!(
         !h.capture_text(&f.pane_id).contains("A-PRESSED"),
         "F4: `s` before `a` must be a no-op"
@@ -150,7 +150,7 @@ fn f4_keys_press_recolour_and_marker() {
 
     // Now `a` paints, `s` recolours the same glyphs (still A-PRESSED).
     h.send_raw(&f.pane_id, "a");
-    h.wait_for(&f.pane_id, "A-PRESSED", 5_000)
+    h.wait_for(&f.pane_id, "A-PRESSED", BUDGET_MS)
         .expect("F4 A-PRESSED");
     h.send_raw(&f.pane_id, "s");
     assert!(h.capture_text(&f.pane_id).contains("A-PRESSED"));
@@ -201,7 +201,7 @@ fn f7_winsize_reports_and_reprints_on_resize() {
         "pane.set_size",
         serde_json::json!({ "pane_id": f.pane_id, "cols": 120, "rows": 40 }),
     );
-    h.wait_for(&f.pane_id, "SIZE=40 120", 5_000)
+    h.wait_for(&f.pane_id, "SIZE=40 120", BUDGET_MS)
         .expect("F7 WINCH reprint");
 
     // p0-council-r2 major 1, part (a): the SIGWINCH-interrupted `read` returned
@@ -217,9 +217,7 @@ fn f7_winsize_reports_and_reprints_on_resize() {
     // busy-spun at 100% CPU here).
     h.send_raw(&f.pane_id, "\u{4}");
     assert!(
-        wait_until(std::time::Duration::from_secs(5), || h
-            .count_fixture_procs("f7_winsize.sh")
-            == 0),
+        wait_until(BUDGET, || h.count_fixture_procs("f7_winsize.sh") == 0),
         "F7: fixture must exit on stdin EOF (no busy-spin, no residual process)"
     );
     h.kill_session(&f.session_id);
@@ -230,10 +228,10 @@ fn f8_repaint_progresses_glyphs() {
     let h = Harness::new();
     let f = h.launch_fixture("f8_repaint.sh", 80, 24, "LENS-F8-REPAINT");
     h.send_line_token(&f.pane_id, "");
-    h.wait_for(&f.pane_id, "FRAME:0", 5_000)
+    h.wait_for(&f.pane_id, "FRAME:0", BUDGET_MS)
         .expect("F8 FRAME:0");
     h.send_line_token(&f.pane_id, "");
-    h.wait_for(&f.pane_id, "FRAME:1", 5_000)
+    h.wait_for(&f.pane_id, "FRAME:1", BUDGET_MS)
         .expect("F8 FRAME:1");
     h.kill_session(&f.session_id);
 }
@@ -252,7 +250,7 @@ fn f9_metadata_only_v_draws_a_cell() {
     );
     // `V` draws the one visible green cell.
     h.send_line_token(&f.pane_id, "V");
-    h.wait_for(&f.pane_id, "▮", 5_000).expect("F9 V mark");
+    h.wait_for(&f.pane_id, "▮", BUDGET_MS).expect("F9 V mark");
     h.kill_session(&f.session_id);
 }
 
@@ -263,12 +261,12 @@ fn f10_altscreen_enter_and_leave() {
     assert!(h.capture_text(&f.pane_id).contains("NORMAL-SCREEN"));
 
     h.send_line_token(&f.pane_id, "E");
-    h.wait_for(&f.pane_id, "ALT-SCREEN", 5_000)
+    h.wait_for(&f.pane_id, "ALT-SCREEN", BUDGET_MS)
         .expect("F10 enter alt");
     assert!(h.capture_text(&f.pane_id).contains("ALT-SCREEN"));
 
     h.send_line_token(&f.pane_id, "L");
-    h.wait_for(&f.pane_id, "NORMAL-SCREEN", 5_000)
+    h.wait_for(&f.pane_id, "NORMAL-SCREEN", BUDGET_MS)
         .expect("F10 leave alt restores normal");
     h.kill_session(&f.session_id);
 }

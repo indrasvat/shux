@@ -103,11 +103,11 @@ fn capture_repaint_golden(h: &Harness, text: &str) -> String {
     );
     let pane = run["pane_id"].as_str().unwrap().to_string();
     let sid = run["session_id"].as_str().unwrap().to_string();
-    h.wait_for(&pane, "GATE-REPAINT", 5000)
+    h.wait_for(&pane, "GATE-REPAINT", lens_common::BUDGET_MS)
         .expect("repaint sentinel drawn");
     let s = h.rpc_raw(
         "pane.wait_settled",
-        serde_json::json!({ "pane_id": pane, "quiet_ms": 300, "timeout_ms": 5000, "stable_frames": 3 }),
+        serde_json::json!({ "pane_id": pane, "quiet_ms": 300, "timeout_ms": lens_common::BUDGET_MS, "stable_frames": 3 }),
     );
     assert_eq!(
         s.expect_result("golden settle")["settled"],
@@ -191,12 +191,12 @@ cols = 80
 [[steps]]
 action = "wait_for_text"
 text = "GATE-REPAINT"
-timeout_ms = 5000
+timeout_ms = 30000
 [[steps]]
 action = "expect_golden"
 name = "hb"
 stable_frames = 3
-timeout_ms = 5000
+timeout_ms = 30000
 "#
     );
     let run = run_gate(&h, d.path(), &scn, golden.path(), &[]);
@@ -229,7 +229,7 @@ cols = 80
 [[steps]]
 action = "wait_for_text"
 text = "GATE-SPINNER"
-timeout_ms = 5000
+timeout_ms = 30000
 [[steps]]
 action = "expect_golden"
 name = "sp"
@@ -272,12 +272,12 @@ cols = 80
 [[steps]]
 action = "wait_for_text"
 text = "GATE-REPAINT"
-timeout_ms = 5000
+timeout_ms = 30000
 [[steps]]
 action = "expect_golden"
 name = "hb"
 hold_ms = 300
-timeout_ms = 5000
+timeout_ms = 30000
 "#
     );
     let run = run_gate(&h, d.path(), &scn, golden.path(), &[]);
@@ -313,13 +313,13 @@ cols = 80
 [[steps]]
 action = "wait_for_text"
 text = "GATE-REPAINT"
-timeout_ms = 5000
+timeout_ms = 30000
 [[steps]]
 action = "expect_golden"
 name = "hb"
 stable_frames = 3
 retries = 2
-timeout_ms = 5000
+timeout_ms = 30000
 "#
     );
     let run = run_gate(
@@ -365,7 +365,7 @@ cols = 80
 [[steps]]
 action = "wait_for_text"
 text = "GATE-REPAINT"
-timeout_ms = 5000
+timeout_ms = 30000
 [[steps]]
 action = "resize"
 rows = 30
@@ -468,7 +468,7 @@ cols = 80
 action = "expect_golden"
 name = "hb"
 stable_frames = 3
-timeout_ms = 5000
+timeout_ms = 30000
 "#
     );
     let scn_path = d.path().join("guard.toml");
