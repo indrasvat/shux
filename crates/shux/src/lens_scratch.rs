@@ -2269,11 +2269,15 @@ mod tests {
     fn a_stuck_clock_never_runs_out_of_evidence_names() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("scratch-registry.json");
-        for i in 0..1001 {
-            std::fs::write(&path, format!("{{{i}")).unwrap();
-            preserve_corrupt_registry(&path, UNIX_EPOCH)
-                .unwrap_or_else(|e| panic!("corrupt startup {i} lost its evidence: {e}"));
+        std::fs::write(path.with_extension("json.corrupt.0"), "{0").unwrap();
+        for n in 1..=1000 {
+            std::fs::write(path.with_extension(format!("json.corrupt.0.{n}")), "{n").unwrap();
         }
+        std::fs::write(&path, "{1001").unwrap();
+        let kept = preserve_corrupt_registry(&path, UNIX_EPOCH)
+            .unwrap_or_else(|e| panic!("startup 1002 on a stuck clock lost its evidence: {e}"));
+        assert_eq!(kept, path.with_extension("json.corrupt.0.1001"));
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), "{1001");
     }
 
     /// Two corrupt startups in the same millisecond, or a clock stepped back

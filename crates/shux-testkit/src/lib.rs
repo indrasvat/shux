@@ -86,6 +86,10 @@ pub fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
 ///
 /// The interval is a tokio sleep: under a paused clock with auto-advance held
 /// off it never wakes. Wait on the blocking pool with [`poll`] there.
+///
+/// The budget is checked between probes, so a probe must bound its own waits.
+/// Wrapping each probe in a tokio timeout would fire early under a paused
+/// clock's auto-advance.
 pub async fn poll_async<T, F, Fut>(budget: Duration, mut probe: F) -> Option<T>
 where
     F: FnMut() -> Fut,
