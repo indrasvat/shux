@@ -161,16 +161,45 @@ where
 /// [`BUDGET`]. Returns whether it exited on SIGTERM, so a teardown can still
 /// fail the test without leaking the process.
 pub fn terminate(pid: i32) -> bool {
+    terminate_within(pid, BUDGET)
+}
+
+fn terminate_within(pid: i32, grace: Duration) -> bool {
     use nix::sys::signal::{Signal, kill};
-    let pid = nix::unistd::Pid::from_raw(pid);
-    let gone = || kill(pid, None).is_err();
-    let _ = kill(pid, Signal::SIGTERM);
-    if poll_until(BUDGET, gone) {
+    let target = nix::unistd::Pid::from_raw(pid);
+    let gone = || kill(target, None).is_err() || is_zombie(pid);
+    let _ = kill(target, Signal::SIGTERM);
+    if poll_until(grace, gone) {
         return true;
     }
-    let _ = kill(pid, Signal::SIGKILL);
+    let _ = kill(target, Signal::SIGKILL);
     poll_until(BUDGET, gone);
     false
+}
+
+/// An exited process its parent has not reaped still answers `kill(pid, 0)`.
+fn is_zombie(pid: i32) -> bool {
+    #[cfg(target_os = "linux")]
+    let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            stat.get(stat.rfind(')')? + 1..)?
+                .trim_start()
+                .chars()
+                .next()
+        });
+    #[cfg(not(target_os = "linux"))]
+    let state = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .ok()
+        .and_then(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .trim_start()
+                .chars()
+                .next()
+        });
+    state == Some('Z')
 }
 
 /// A FIFO for a child to wait at (`read -r _ < gate`) until [`open_gate`].
@@ -251,6 +280,45 @@ mod tests {
             async move { *rx.borrow() }
         })
         .await;
+    }
+
+    /// A child that has printed `ready`, with SIGTERM ignored or not.
+    fn ready_child(ignore_term: bool) -> std::process::Child {
+        use std::io::BufRead;
+        let trap = if ignore_term { "trap '' TERM; " } else { "" };
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", &format!("{trap}echo ready; exec sleep 300")])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn sh");
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().expect("piped stdout"))
+            .read_line(&mut line)
+            .expect("read the ready line");
+        assert_eq!(line, "ready\n");
+        child
+    }
+
+    #[test]
+    fn terminate_counts_an_unreaped_child_as_gone() {
+        let mut child = ready_child(false);
+        assert!(
+            terminate(child.id() as i32),
+            "a child that died on SIGTERM and awaits its parent's wait was reported alive"
+        );
+        child.wait().expect("reap");
+    }
+
+    #[test]
+    fn terminate_kills_what_ignores_sigterm() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut child = ready_child(true);
+        assert!(
+            !terminate_within(child.id() as i32, Duration::ZERO),
+            "SIGTERM was ignored"
+        );
+        let status = child.wait().expect("reap");
+        assert_eq!(status.signal(), Some(nix::libc::SIGKILL));
     }
 
     #[tokio::test(flavor = "current_thread")]
