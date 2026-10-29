@@ -28,14 +28,16 @@ use lens_common::{BUDGET, BUDGET_MS, Harness, wait_until};
 fn count_procs_with_tag(tag: &str) -> usize {
     let out = std::process::Command::new("ps")
         .args(["-axo", "args="])
-        .output();
-    match out {
-        Ok(o) => String::from_utf8_lossy(&o.stdout)
-            .lines()
-            .filter(|l| l.contains(tag))
-            .count(),
-        Err(_) => 0,
-    }
+        .output()
+        .expect("run ps");
+    assert!(
+        out.status.success(),
+        "ps failed: a failed scan would count 0"
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| l.contains(tag))
+        .count()
 }
 
 #[test]

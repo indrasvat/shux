@@ -88,10 +88,26 @@ scan() {
         # An attribute that waives the ban: allow of it or of a group holding
         # it, an expect of a group, or a crate-wide expect of it.
         function waiver(a) {
+            gsub(/[ \t]*::[ \t]*/, "::", a)
             if (a !~ /(allow|expect)[ \t]*\(/) return 0
+            if (a ~ /(allow|expect)[ \t]*\(([^)]*[^A-Za-z0-9_:])?warnings([^A-Za-z0-9_]|$)/) return 1
             if (a ~ /allow[ \t]*\(.*clippy::(disallowed_methods|style|all)([^A-Za-z0-9_]|$)/) return 1
             if (a ~ /expect[ \t]*\(.*clippy::(style|all)([^A-Za-z0-9_]|$)/) return 1
             return a ~ /^#!/ && a ~ /clippy::disallowed_methods/
+        }
+        # The text after the attribute at line n, past any further attributes.
+        function item_after(n, p,    k, t, i, sq, ch, out) {
+            t = substr(code[n], p)
+            for (k = n + 1; k <= NR && k <= n + 20; k++) t = t " " code[k]
+            sq = 0; out = ""
+            for (i = 1; i <= length(t); i++) {
+                ch = substr(t, i, 1)
+                if (ch == "[") sq++
+                else if (ch == "]") sq--
+                else if (sq == 0 && ch != "#") out = out ch
+                if (sq == 0 && ch !~ /[][#( \t]/ && out ~ /[A-Za-z]/ && length(out) > 40) break
+            }
+            return out
         }
         {
             orig[NR] = $0
@@ -129,7 +145,13 @@ scan() {
                         a = a " " code[k]; open += gsub(/\[/, "[", code[k]) - gsub(/\]/, "]", code[k])
                     }
                     if (waiver(a)) { printf "%s:%d: waiver: %s\n", path, n, orig[n]; continue }
-                    if (a ~ /^#[ \t]*\[/ && a ~ /expect[ \t]*\(/ && a ~ /clippy::disallowed_methods/) cover(n, p)
+                    if (a ~ /^#[ \t]*\[/ && a ~ /expect[ \t]*\(/ && a ~ /clippy[ \t]*::[ \t]*disallowed_methods/) {
+                        # Per statement or fn: on a module, impl or trait it waives the ban.
+                        if (item_after(n, p) ~ /^[ \t]*(pub[ \t]*(\([^)]*\))?[ \t]+)?(unsafe[ \t]+)?(mod|impl|trait)[^A-Za-z0-9_]/) {
+                            printf "%s:%d: waiver: %s\n", path, n, orig[n]; continue
+                        }
+                        cover(n, p)
+                    }
                 }
                 if (!tests || covered[n]) continue
                 call = c ~ /(^|[^A-Za-z0-9_:])(::)?((std::)?thread|(tokio::)?time)::sleep(_until)?[ \t]*\(/
@@ -144,8 +166,15 @@ scan() {
 # or expects the ban or a group holding it.
 scan_manifest() {
     awk -v path="$1" '
-        /^[ \t]*\[/ { t = $0; gsub(/[ \t]/, "", t); clippy = (t == "[lints.clippy]" || t == "[workspace.lints.clippy]") }
-        clippy && /^[ \t]*"?(disallowed[-_]methods|style|all)"?[ \t]*=/ && /"(allow|expect)"/ {
+        /^[ \t]*\[/ { t = $0; gsub(/[ \t]/, "", t); sub(/#.*/, "", t)
+            clippy = (t == "[lints.clippy]" || t == "[workspace.lints.clippy]")
+            lints = (t == "[lints]" || t == "[workspace.lints]") }
+        { l = $0; sub(/^[ \t]*/, "", l); gsub(/"/, "", l) }
+        ((clippy && l ~ /^(disallowed[-_]methods|style|all)[ \t]*=/ \
+         || lints && l ~ /^clippy[ \t]*\.[ \t]*(disallowed[-_]methods|style|all)[ \t]*=/ \
+         || lints && l ~ /^clippy[ \t]*=.*(disallowed[-_]methods|style|all)/ \
+         || l ~ /^(workspace[ \t]*\.[ \t]*)?lints[ \t]*\.[ \t]*clippy[ \t]*\.[ \t]*(disallowed[-_]methods|style|all)[ \t]*=/)) \
+         && l ~ /(^|[={,\t ])(allow|expect)([^A-Za-z_]|$)/ {
             printf "%s:%d: waiver: %s\n", path, NR, $0
         }
     ' "$1"

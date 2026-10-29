@@ -214,7 +214,7 @@ mod tests {
         let path = dir.path().join("s.sock");
         let held = std::os::unix::net::UnixListener::bind(&path).expect("bind");
         let _queued = fill_backlog(&path);
-        let probe = tokio::time::timeout(Duration::from_secs(2), async {
+        let probe = tokio::time::timeout(shux_testkit::BUDGET, async {
             tokio::task::spawn_blocking({
                 let path = path.clone();
                 let rt = tokio::runtime::Handle::current();

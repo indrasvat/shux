@@ -122,7 +122,24 @@ printf '%s\n' '[workspace.lints.clippy]' 'all = { level = "warn", priority = -1 
 expect 0 "a Cargo.toml lint table that warns relaxes nothing under -D warnings" bash "$guard"
 printf '%s\n' '[lints.clippy]' 'disallowed_methods = "deny"' >"$work/crates/k/Cargo.toml"
 expect 0 "a Cargo.toml lint table that keeps the ban passes" bash "$guard"
+printf '%s\n' '[lints]' 'clippy.disallowed_methods = "allow"' >"$work/crates/k/Cargo.toml"
+expect 1 "a dotted Cargo.toml lint key relaxing the ban is flagged" bash "$guard"
+printf '%s\n' '[lints]' 'clippy = { all = { level = "allow" } }' >"$work/crates/k/Cargo.toml"
+expect 1 "an inline Cargo.toml clippy table relaxing a group is flagged" bash "$guard"
+printf '%s\n' '[lints]' 'clippy = { all = "deny" }' >"$work/crates/k/Cargo.toml"
+expect 0 "an inline Cargo.toml clippy table that denies passes" bash "$guard"
 rm "$work/crates/k/Cargo.toml"
+src_file '#![allow(warnings)]'
+expect 1 "allow of warnings is flagged" bash "$guard"
+src_file 'fn f() {' '    #[allow(clippy :: disallowed_methods)]' '    std::thread::sleep(d);' '}'
+expect 1 "an allow spelled with spaced paths is flagged" bash "$guard"
+src_file '#[expect(clippy::disallowed_methods, reason = "x")]' 'mod m {' '    fn f() {}' '}'
+expect 1 "an expect on a module is flagged" bash "$guard"
+src_file '#[expect(clippy::disallowed_methods, reason = "x")]' '#[cfg(test)]' 'impl S {' '    fn f() {}' '}'
+expect 1 "an expect on an impl is flagged" bash "$guard"
+src_file '#[expect(clippy::disallowed_methods, reason = "x")]' 'pub(crate) fn module_like() {}'
+expect 0 "an expect on a fn named like an item kind passes" bash "$guard"
+src_file 'fn f() {}'
 case_file 'fn t() {' "    let q = '\"'; std::thread::sleep(d); let p = '\"';" '}'
 expect 1 "a char literal holding a quote does not hide a sleep" bash "$guard"
 case_file 'fn t() {' '    let r = r#"a "//" b"#; std::thread::sleep(d);' '}'

@@ -28,7 +28,8 @@ finishes as soon as the condition holds.
 | A program to be ready before you act | Wait for a marker it prints **after** the state holds, spelled so the shell's echo of the typed command cannot contain it (`printf 'RE%sDY\n' ''`), and not one that lands mid-output | `sleep(500ms)` "head start" |
 | Something **not** to happen | Fence it: after the action, do a later action ordered behind it (a sentinel through the same pipe, an RPC serialised after it), wait for the sentinel, then assert absence | `sleep(300ms); assert!(nothing_arrived)` |
 | A timeout/deadline in the code under test | Drive the clock: `#[tokio::test(start_paused = true)]` + `tokio::time::advance` for tokio time, or a `cfg(test)` clock seam (see `test_clock` in `shux-vt`) | sleeping past the deadline |
-| A process to exit | Poll `kill(pid, None)` / `try_wait()` with `wait_until` | `sleep(1s)` then check |
+| A process to exit | Poll `kill(pid, None)` / `try_wait()` with `wait_until`, or `shux_testkit::terminate` (an exited, unreaped child counts as gone) | `sleep(1s)` then check |
+| Real I/O under `start_paused = true` | Keep the clock paused only around the timer you drive; auto-advance jumps to the next pending timer whenever the runtime idles, so a `timeout` around a socket read fires before the peer answers | relying on a paused clock while a real process or socket does the work |
 
 ## When a sleep is the subject
 
@@ -48,16 +49,16 @@ deadline is ordered by the monotonic clock.
 
 ## Enforcement
 
-- `clippy.toml` disallows `std::thread::sleep`, `tokio::time::sleep` and
-  `tokio::time::sleep_until` everywhere. `make clippy` (CI's Clippy step) also
+- `clippy.toml` disallows `std::thread::sleep`, `tokio::time::sleep`,
+  `tokio::time::sleep_until` and the `nix`/`libc` sleeps everywhere. `make clippy` (CI's Clippy step) also
   lints the `test = false` lens lane, which `--all-targets` skips, and pins
   `CLIPPY_CONF_DIR` to the root: clippy reads the nearest `clippy.toml` and
   does not merge, so a crate-local one would drop the ban. `make check-darwin`
   runs the same lints over macOS-only code.
 - `scripts/check-test-sleeps.sh` flags a raw sleep in `crates/*/tests/`, and
-  any attribute or `[lints.clippy]` entry that waives `clippy::disallowed_methods`
-  or a group holding it, except the per-statement `expect`, anywhere in
-  `crates/` or a `Cargo.toml`. It is textual: a waiver built by a macro, or a
+  any attribute or Cargo.toml lint entry that waives `clippy::disallowed_methods`
+  or a group holding it (`warnings` included), except an `expect` on a
+  statement or fn, anywhere in `crates/` or a `Cargo.toml`. It is textual: a waiver built by a macro, or a
   sleep reached through an alias, gets past it and not past clippy.
   `.claude/settings.json` runs it after every edit, so an agent hears
   about it at write time; `make check-test-sleeps` runs its self-test and scans
@@ -66,7 +67,8 @@ deadline is ordered by the monotonic clock.
 None of these catch a sleep in disguise: `recv_timeout(SHORT)`,
 `timeout(SHORT, ..)` or `!poll_until(SHORT, ..)` used to assert absence,
 `park_timeout`, a busy loop on `Instant::now()`, or a fixture script's
-`sleep 1; echo ready`. Those are the same defect; review for them.
+`sleep 1; echo ready`. Those are the same defect; review for them. The shell
+QA scripts under `.shux/scripts/` follow the same rule and are not scanned.
 
 ## Proving a de-flake
 

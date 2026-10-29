@@ -20,16 +20,18 @@ use shux_testkit::{BUDGET, gate, open_gate_async, wait_for_async, wait_until_asy
 /// is no longer about the thing under test — and once the suite runs in
 /// parallel it is a coin flip.
 fn count_procs_containing(needle: &str) -> usize {
-    std::process::Command::new("ps")
+    let out = std::process::Command::new("ps")
         .args(["-axo", "args="])
         .output()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .filter(|l| l.contains(needle))
-                .count()
-        })
-        .unwrap_or(0)
+        .expect("run ps");
+    assert!(
+        out.status.success(),
+        "ps failed: a failed scan would count 0"
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| l.contains(needle))
+        .count()
 }
 
 /// Wait for `count_procs_containing(needle)` to equal `want`; returns the

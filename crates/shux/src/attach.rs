@@ -4018,7 +4018,7 @@ mod tests {
     }
 
     async fn recv_render_text(out_rx: &mut mpsc::Receiver<AttachServerFrame>) -> String {
-        let frame = tokio::time::timeout(Duration::from_secs(1), out_rx.recv())
+        let frame = tokio::time::timeout(shux_testkit::BUDGET, out_rx.recv())
             .await
             .expect("render frame timeout")
             .expect("render frame");
@@ -4075,11 +4075,11 @@ mod tests {
         )
         .await;
 
-        let first = tokio::time::timeout(Duration::from_secs(1), first_resize_rx.recv())
+        let first = tokio::time::timeout(shux_testkit::BUDGET, first_resize_rx.recv())
             .await
             .expect("first resize")
             .expect("first resize request");
-        let second = tokio::time::timeout(Duration::from_secs(1), second_resize_rx.recv())
+        let second = tokio::time::timeout(shux_testkit::BUDGET, second_resize_rx.recv())
             .await
             .expect("second resize")
             .expect("second resize request");
@@ -4172,7 +4172,7 @@ mod tests {
                     ("first", &mut first_resize_rx),
                     ("second", &mut second_resize_rx),
                 ] {
-                    let req = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                    let req = tokio::time::timeout(shux_testkit::BUDGET, rx.recv())
                         .await
                         .unwrap_or_else(|_| panic!("{label} resize (zoomed={zoomed})"))
                         .unwrap_or_else(|| panic!("{label} resize request"));
@@ -5012,7 +5012,7 @@ mod tests {
     }
 
     async fn recv_bytes(rx: &mut mpsc::Receiver<Vec<u8>>) -> Vec<u8> {
-        tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        tokio::time::timeout(shux_testkit::BUDGET, rx.recv())
             .await
             .expect("pane write timeout")
             .expect("pane write channel closed")
@@ -6168,7 +6168,7 @@ mod tests {
             )
             .await;
             for (pid, mut rx) in receivers {
-                let req = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                let req = tokio::time::timeout(shux_testkit::BUDGET, rx.recv())
                     .await
                     .expect("resize request")
                     .expect("resize request");
@@ -6218,7 +6218,7 @@ mod tests {
         .await;
         let mut before = Vec::new();
         for (pid, rx) in receivers.iter_mut() {
-            let req = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            let req = tokio::time::timeout(shux_testkit::BUDGET, rx.recv())
                 .await
                 .expect("baseline resize")
                 .expect("baseline resize");
@@ -6240,7 +6240,7 @@ mod tests {
         )
         .await;
         for ((pid, was_cols, was_rows), (_, rx)) in before.iter().zip(receivers.iter_mut()) {
-            let req = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            let req = tokio::time::timeout(shux_testkit::BUDGET, rx.recv())
                 .await
                 .expect("post-reload resize")
                 .expect("post-reload resize");

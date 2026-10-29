@@ -731,7 +731,7 @@ clippy: ## Run clippy linter
 .PHONY: clippy-beta
 clippy-beta: ## Run clippy on the beta toolchain, as CI's advisory job does (needs: rustup toolchain install beta -c clippy)
 	@echo "$(COLOR_BLUE)▶ Running clippy (+beta)...$(COLOR_RESET)"
-	@cargo +beta clippy --workspace --all-targets -- -D warnings
+	@CLIPPY_CONF_DIR="$(CURDIR)" cargo +beta clippy --workspace --all-targets -- -D warnings
 	@echo "$(COLOR_GREEN)✓ Clippy (beta) passed$(COLOR_RESET)"
 
 .PHONY: fmt-check

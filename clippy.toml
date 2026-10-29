@@ -14,4 +14,10 @@ disallowed-methods = [
     { path = "std::thread::sleep", reason = "wait for a condition with shux_testkit, not for time (docs/testing.md)" },
     { path = "tokio::time::sleep", reason = "wait for a condition with shux_testkit, not for time (docs/testing.md)" },
     { path = "tokio::time::sleep_until", reason = "wait for a condition with shux_testkit, not for time (docs/testing.md)" },
+    { path = "std::thread::sleep_ms", reason = "wait for a condition with shux_testkit, not for time (docs/testing.md)" },
+    { path = "nix::unistd::sleep", reason = "wait for a condition with shux_testkit, not for time (docs/testing.md)" },
+    { path = "nix::time::clock_nanosleep", reason = "wait for a condition with shux_testkit, not for time (docs/testing.md)" },
+    { path = "libc::sleep", reason = "wait for a condition with shux_testkit, not for time (docs/testing.md)" },
+    { path = "libc::usleep", reason = "wait for a condition with shux_testkit, not for time (docs/testing.md)" },
+    { path = "libc::nanosleep", reason = "wait for a condition with shux_testkit, not for time (docs/testing.md)" },
 ]

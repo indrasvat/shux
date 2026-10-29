@@ -102,28 +102,24 @@ fn g1_glance_atomicity_under_concurrent_flips() {
         // Token pump (§12 G1, p0-council-r2 major 2): loops on the shared
         // done-flag so it OUTLIVES the slowest glance — a fixed token budget
         // could quiesce early and let late glances see a still pane, weakening
-        // the atomicity claim. The 10_000-token hard cap and the deadline are
-        // PANIC BOUNDS only (a paniced sibling can no longer hang the scope);
+        // the atomicity claim. The deadline is a panic bound only (a panicked
+        // sibling can no longer hang the scope);
         // each 5-token batch is a tiny write — a full canonical PTY buffer
         // (≈4 KiB) only backpressures the pump until F3 (which reads
         // continuously) drains it, so the write can never wedge permanently.
         // The pump never inspects the glance handles.
-        // The pump returns its exit reason: true iff it stopped because the
-        // done-flag was set (PR #86 bot review — exiting via the cap/deadline
-        // panic bounds while done=false means late glances raced a QUIET pane
-        // and the atomicity claim was not actually exercised).
+        // The pump returns true iff it stopped because the done-flag was set;
+        // stopping at the deadline means late glances raced a quiet pane.
         let pump = scope.spawn(|| {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-            let mut sent = 0_u32;
             loop {
                 if done.load(Ordering::Relaxed) {
                     break true; // stopped by flag — glances all finished first
                 }
-                if sent >= 10_000 || std::time::Instant::now() >= deadline {
+                if std::time::Instant::now() >= deadline {
                     break false; // panic bound hit while glances still running
                 }
                 h.pump_line_tokens(&f.pane_id, 5);
-                sent += 5;
             }
         });
 
