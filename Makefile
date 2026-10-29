@@ -825,9 +825,11 @@ check-gate-docs: ## Verify the lens-gate skill reference matches the shipped CLI
 	@bash scripts/check-gate-docs.sh
 
 .PHONY: check-action-pins
-check-action-pins: ## Every third-party GitHub Action is pinned to a commit SHA
-	@bash scripts/check-action-pins-selftest.sh
-	@bash scripts/check-action-pins.sh
+# PINS_BASH=/bin/bash runs both under macOS's Bash 3.2, as CI's macOS job does.
+PINS_BASH ?= bash
+check-action-pins: ## Every third-party GitHub Action is pinned to a commit SHA (PINS_BASH)
+	@$(PINS_BASH) scripts/check-action-pins-selftest.sh
+	@$(PINS_BASH) scripts/check-action-pins.sh
 
 .PHONY: check-no-bin-mods
 check-no-bin-mods: ## Assert crates/shux/src/main.rs declares no modules (lib/bin double-compile)

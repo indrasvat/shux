@@ -8,7 +8,7 @@
 # must be pinned by `@sha256:` digest.
 #
 # Scans every workflow, and every composite action in the tree. Finding no files to
-# scan is an error, not a pass.
+# scan is an error, not a pass. Runs under Bash 3.2, macOS's /bin/bash.
 
 set -euo pipefail
 
@@ -17,7 +17,10 @@ cd "$root"
 
 # Workflows, and composite actions wherever they live: `uses: ./tools/x` runs
 # tools/x/action.yml, and its own `uses:` lines need pins just the same.
-mapfile -t files < <(find . \( -path ./.git -o -path ./target -o -path ./fuzz/target \
+files=()
+while IFS= read -r f; do
+    files+=("$f")
+done < <(find . \( -path ./.git -o -path ./target -o -path ./fuzz/target \
     -o -path ./.claude/worktrees -o -path '*/node_modules' \) -prune -o \
     \( -type f -o -type l \) \( -path './.github/workflows/*.yml' -o -path './.github/workflows/*.yaml' \
     -o -name 'action.yml' -o -name 'action.yaml' \) -print | sed 's|^\./||' | sort)
@@ -39,9 +42,12 @@ for f in "${files[@]}"; do
             # mapping, a quoted or explicit key, a space before the colon, other
             # case -- is refused rather than skipped. Comment lines are not code.
             [[ "$line" =~ ^[[:space:]]*# ]] && continue
-            lower="${line,,}"
-            [[ "$lower" =~ (^|[^a-z0-9_-])[\"\']?uses[\"\']?[[:space:]]*:([[:space:]]|$) ||
-                "$lower" =~ \?[[:space:]]+[\"\']?uses ]] || continue
+            shopt -s nocasematch
+            other=0
+            [[ "$line" =~ (^|[^a-z0-9_-])[\"\']?uses[\"\']?[[:space:]]*:([[:space:]]|$) ||
+                "$line" =~ \?[[:space:]]+[\"\']?uses ]] && other=1
+            shopt -u nocasematch
+            [[ $other -eq 1 ]] || continue
             echo "  ${f}:${n}: \`uses\` in a shape this guard does not read; write \`- uses: owner/repo@<sha>\`" >&2
             bad=1
             continue

@@ -17,7 +17,7 @@ sha=11d5960a326750d6838e8c26ee5ac8ec0a2d0a5c
 fail=0
 expect() { # expect <want-exit> <label>
     local want="$1" label="$2" got=0
-    bash "$guard" "$work" >/dev/null 2>&1 || got=$?
+    "$BASH" "$guard" "$work" >/dev/null 2>&1 || got=$?
     if [[ "$got" == "$want" ]]; then
         echo "  ✓ $label"
     else

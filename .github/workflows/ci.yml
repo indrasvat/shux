@@ -292,6 +292,12 @@ jobs:
       - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32  # v2.88.0
         with:
           tool: nextest
+      # `make check` runs this guard on macOS too, where /bin/bash is 3.2. After
+      # the toolchain steps: the Makefile asks rustc and cargo for their versions.
+      - name: Actions pinned to commits (Bash 3.2)
+        run: |
+          /bin/bash --version | head -1
+          make check-action-pins PINS_BASH=/bin/bash
       - name: Unit tests (nextest + doc)
         run: |
           make test

@@ -18,7 +18,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::error::{SendError, TrySendError};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore, mpsc};
 
 /// Unwritten bytes that may wait for one pane's program.
 pub const BUDGET: usize = 16 << 20;
@@ -28,6 +28,7 @@ pub const CONTROL_BUDGET: usize = 64 << 10;
 /// allocation, so a flood of one-byte chunks is bounded too, with room for the
 /// paste markers framing may add after room was reserved.
 const CHUNK_COST: usize = 64;
+/// Chunks that may wait to be received, urgent input aside.
 const SLOTS: usize = 256;
 
 /// One chunk of input, holding its unwritten bytes' share of the budget.
@@ -98,28 +99,37 @@ pub enum Lane {
     Main,
     /// A separate, smaller budget, such as for a press.
     Control,
-    /// That budget, then a slot with no budget at all: input that must arrive
-    /// and is bounded by something else, such as the release of a delivered
-    /// press or a cancelled command's Ctrl-C.
+    /// That budget, then room outside every bound, slots included: input that
+    /// must arrive and is bounded by something else, such as the release of a
+    /// delivered press or a cancelled command's Ctrl-C.
     Urgent,
 }
 
 /// The sending side of a pane's input channel.
 #[derive(Clone)]
 pub struct PaneWriter {
-    tx: mpsc::Sender<PaneInput>,
+    tx: mpsc::UnboundedSender<Queued>,
+    slots: Arc<Semaphore>,
     budget: Budget,
     control: Budget,
 }
 
-/// The PTY task's side of a pane's input channel.
-pub struct PaneInputRx {
-    rx: mpsc::Receiver<PaneInput>,
+/// A chunk in the channel, holding its slot until it is received.
+struct Queued {
+    input: PaneInput,
+    _slot: Option<OwnedSemaphorePermit>,
 }
 
-/// Room for one chunk: a slot in the channel and its bytes' budget.
+/// The PTY task's side of a pane's input channel.
+pub struct PaneInputRx {
+    rx: mpsc::UnboundedReceiver<Queued>,
+}
+
+/// Room for one chunk: a slot in the channel and its bytes' budget, either
+/// absent for urgent input.
 pub struct InputPermit {
-    slot: mpsc::OwnedPermit<PaneInput>,
+    tx: mpsc::UnboundedSender<Queued>,
+    slot: Option<OwnedSemaphorePermit>,
     budget: Option<OwnedSemaphorePermit>,
 }
 
@@ -129,12 +139,13 @@ pub fn channel() -> (PaneWriter, PaneInputRx) {
 }
 
 /// A pane's input channel holding at most `slots` chunks and `budget`
-/// unwritten bytes.
+/// unwritten bytes, urgent input aside.
 pub fn channel_with(slots: usize, budget: usize) -> (PaneWriter, PaneInputRx) {
-    let (tx, rx) = mpsc::channel(slots);
+    let (tx, rx) = mpsc::unbounded_channel();
     let (budget, control) = (Budget::new(budget), Budget::new(CONTROL_BUDGET));
     let writer = PaneWriter {
         tx,
+        slots: Arc::new(Semaphore::new(slots)),
         budget,
         control,
     };
@@ -145,23 +156,18 @@ impl PaneWriter {
     /// Room for a chunk of `len` bytes, waiting for it. Fails once the pane
     /// is gone.
     pub async fn reserve(&self, len: usize) -> Result<InputPermit, SendError<()>> {
-        let budget = tokio::select! {
+        let room = async {
+            let cost = self.budget.cost(len);
+            let budget = self.budget.permits.clone().acquire_many_owned(cost).await?;
+            let slot = self.slots.clone().acquire_owned().await?;
+            Ok::<_, AcquireError>((slot, budget))
+        };
+        let (slot, budget) = tokio::select! {
             biased;
             () = self.tx.closed() => return Err(SendError(())),
-            budget = self.budget.permits.clone().acquire_many_owned(self.budget.cost(len)) => {
-                budget.map_err(|_| SendError(()))?
-            }
+            room = room => room.map_err(|_| SendError(()))?,
         };
-        let slot = self
-            .tx
-            .clone()
-            .reserve_owned()
-            .await
-            .map_err(|_| SendError(()))?;
-        Ok(InputPermit {
-            slot,
-            budget: Some(budget),
-        })
+        Ok(self.permit(Some(slot), Some(budget)))
     }
 
     /// [`Self::reserve`] without waiting.
@@ -177,7 +183,7 @@ impl PaneWriter {
             permit = self.try_reserve_from(&self.control, len);
         }
         if lane == Lane::Urgent && matches!(permit, Err(TrySendError::Full(()))) {
-            permit = self.try_slot(None);
+            permit = Ok(self.permit(None, None));
         }
         permit
     }
@@ -190,18 +196,25 @@ impl PaneWriter {
         if self.tx.is_closed() {
             return Err(TrySendError::Closed(()));
         }
-        self.try_slot(Some(budget.try_take(len)?))
+        let budget = budget.try_take(len)?;
+        let slot = self
+            .slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| TrySendError::Full(()))?;
+        Ok(self.permit(Some(slot), Some(budget)))
     }
 
-    fn try_slot(
+    fn permit(
         &self,
+        slot: Option<OwnedSemaphorePermit>,
         budget: Option<OwnedSemaphorePermit>,
-    ) -> Result<InputPermit, TrySendError<()>> {
-        let slot = self.tx.clone().try_reserve_owned().map_err(|e| match e {
-            TrySendError::Full(_) => TrySendError::Full(()),
-            TrySendError::Closed(_) => TrySendError::Closed(()),
-        })?;
-        Ok(InputPermit { slot, budget })
+    ) -> InputPermit {
+        InputPermit {
+            tx: self.tx.clone(),
+            slot,
+            budget,
+        }
     }
 
     #[cfg(test)]
@@ -229,34 +242,39 @@ impl PaneWriter {
 }
 
 impl InputPermit {
+    /// Queues `bytes`, or drops them if the pane is gone.
     pub fn send(self, bytes: Vec<u8>) {
-        self.slot.send(PaneInput {
+        let input = PaneInput {
             bytes,
             budget: self.budget,
+        };
+        let _ = self.tx.send(Queued {
+            input,
+            _slot: self.slot,
         });
     }
 
     /// Whether this is room in `writer`'s channel.
     pub fn is_for(&self, writer: &PaneWriter) -> bool {
-        self.slot.same_channel_as_sender(&writer.tx)
+        self.tx.same_channel(&writer.tx)
     }
 }
 
 impl PaneInputRx {
     /// The next chunk, holding its budget until it is written.
     pub async fn recv_input(&mut self) -> Option<PaneInput> {
-        self.rx.recv().await
+        self.rx.recv().await.map(|queued| queued.input)
     }
 
     /// The next chunk's bytes, giving its budget back.
     #[cfg(test)]
     pub async fn recv(&mut self) -> Option<Vec<u8>> {
-        self.rx.recv().await.map(|input| input.bytes)
+        self.rx.recv().await.map(|queued| queued.input.bytes)
     }
 
     #[cfg(test)]
     pub fn try_recv(&mut self) -> Result<Vec<u8>, TryRecvError> {
-        self.rx.try_recv().map(|input| input.bytes)
+        self.rx.try_recv().map(|queued| queued.input.bytes)
     }
 }
 
@@ -347,8 +365,25 @@ mod tests {
             Err(TrySendError::Full(()))
         ));
         tx.try_reserve_in(100, Lane::Urgent)
-            .expect("urgent input finds a slot with both budgets spent")
+            .expect("urgent input finds room with both budgets spent")
             .send(vec![2; 100]);
+    }
+
+    #[tokio::test]
+    async fn urgent_input_arrives_in_order_with_every_slot_taken() {
+        let (tx, mut rx) = channel();
+        let mut queued = 0;
+        while let Ok(permit) = tx.try_reserve_in(1, Lane::Control) {
+            permit.send(vec![0]);
+            queued += 1;
+        }
+        tx.try_reserve_in(1, Lane::Urgent)
+            .expect("urgent input waits for no slot")
+            .send(vec![1]);
+        for _ in 0..queued {
+            assert_eq!(rx.recv().await.unwrap(), vec![0]);
+        }
+        assert_eq!(rx.recv().await.unwrap(), vec![1]);
     }
 
     #[tokio::test]

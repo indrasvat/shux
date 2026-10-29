@@ -237,9 +237,7 @@ fn send_input(
 }
 
 /// Ends every paste this client left open, as a held button is released: no
-/// later key from this client will. An end with no room waits in the
-/// background until the pane reads again or closes, and is not sent if other
-/// input ended the paste first.
+/// later key from this client will.
 async fn close_open_pastes(io_state: &Arc<Mutex<PaneIoState>>, client: u64) {
     let mut state = io_state.lock().await;
     let mine: Vec<PaneId> = state
@@ -256,29 +254,10 @@ async fn close_open_pastes(io_state: &Arc<Mutex<PaneIoState>>, client: u64) {
         let Some(tx) = state.writers.get(&pane).cloned() else {
             continue;
         };
-        match tx.try_reserve_in(PASTE_END.len(), crate::pane_input::Lane::Urgent) {
-            Ok(permit) => {
-                state.open_pastes.remove(&pane);
-                permit.send(PASTE_END.to_vec());
-            }
-            Err(mpsc::error::TrySendError::Full(())) => {
-                let io_state = io_state.clone();
-                tokio::spawn(async move {
-                    let Ok(permit) = tx.reserve(PASTE_END.len()).await else {
-                        return;
-                    };
-                    let mut state = io_state.lock().await;
-                    if state.is_current_writer(pane, &permit)
-                        && state
-                            .open_paste(pane)
-                            .is_some_and(|open| open.client == client)
-                    {
-                        state.open_pastes.remove(&pane);
-                        permit.send(PASTE_END.to_vec());
-                    }
-                });
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {}
+        // Urgent input fails only once the pane is gone.
+        if let Ok(permit) = tx.try_reserve_in(PASTE_END.len(), crate::pane_input::Lane::Urgent) {
+            state.open_pastes.remove(&pane);
+            permit.send(PASTE_END.to_vec());
         }
     }
 }
@@ -7950,14 +7929,15 @@ mod tests {
         h.stop().await;
     }
 
-    /// Drives a press, a long drag and a release into a pane whose app has
-    /// stopped reading, and returns the mouse reports the app would read.
-    /// With `full`, every budget is spent first: the main one before the
-    /// press, the control lane after it.
-    async fn drag_over_a_stalled_app(full: bool) -> Vec<String> {
+    /// Drives a press, a long drag and a release through `channel` into a
+    /// pane whose app has stopped reading, and returns the mouse reports the
+    /// app would read. With `full`, every budget is spent first: the main one
+    /// before the press, the control lane after it.
+    async fn drag_over_a_stalled_app(
+        (writer_tx, mut wr): (PaneWriter, crate::pane_input::PaneInputRx),
+        full: bool,
+    ) -> Vec<String> {
         let mut h = AppMouseHarness::new().await;
-        // Slots to spare: only the byte budgets may hold the reports back.
-        let (writer_tx, mut wr) = crate::pane_input::channel_with(8192, crate::pane_input::BUDGET);
         let mut size = 1 << 20;
         while full && size > 0 {
             if writer_tx.try_send(vec![b'x'; size]).is_err() {
@@ -7993,22 +7973,27 @@ mod tests {
     }
 
     /// A drag held over an app that has stopped reading must not use up the
-    /// room its release needs, with room to spare or none left: an app given
-    /// the press and the drags but not the release sits button-held once it
-    /// reads again.
+    /// room its release needs, whether the channel's slots or its budgets run
+    /// out first: an app given the press and the drags but not the release
+    /// sits button-held once it reads again.
     #[tokio::test]
     async fn a_long_drag_over_an_app_that_stopped_reading_still_delivers_its_release() {
-        for full in [false, true] {
-            let got = drag_over_a_stalled_app(full).await;
+        let spare_slots = || crate::pane_input::channel_with(8192, crate::pane_input::BUDGET);
+        for (case, channel, full) in [
+            ("slots to spare", spare_slots(), false),
+            ("budgets spent", spare_slots(), true),
+            ("production slots", crate::pane_input::channel(), false),
+        ] {
+            let got = drag_over_a_stalled_app(channel, full).await;
             assert_eq!(
                 got.first().map(String::as_str),
                 Some("\x1b[<0;10;5M"),
-                "full={full}: the press was dropped"
+                "{case}: the press was dropped"
             );
             assert_eq!(
                 got.last().map(String::as_str),
                 Some("\x1b[<0;12;5m"),
-                "full={full}: the app got the press and {} reports but no release",
+                "{case}: the app got the press and {} reports but no release",
                 got.len().saturating_sub(1)
             );
         }
