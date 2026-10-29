@@ -474,7 +474,7 @@ pub(crate) fn register_window_methods(
                         let mut state = io.lock().await;
                         let pulse = state.teardown_panes(&pane_ids, true);
                         drop(state);
-                        pulse.notify_one();
+                        pulse.bump();
                     }
 
                     Ok(serde_json::json!({ "killed": window_id.to_string() }))

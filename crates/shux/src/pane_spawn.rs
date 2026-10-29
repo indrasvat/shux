@@ -323,12 +323,8 @@ async fn run_pane_pty_task(
 
                         staged.bus = bus_opt;
                         staged.stage(data);
-                        // Wake any attach-render loops outside the lock.
-                        // notify_one queues a permit that survives even if
-                        // the renderer happens to be mid-render and not
-                        // yet awaiting; notify_waiters would silently drop
-                        // the wakeup in that window.
-                        pulse.notify_one();
+                        // Wake every attach render loop, outside the lock.
+                        pulse.bump();
                         // Forward OSC 0/2 title changes to the graph
                         // (outside the io_state lock). Don't hold the
                         // mutex across the mpsc send — that's the
@@ -447,7 +443,7 @@ async fn run_pane_pty_task(
                     }
                     (state.render_pulse.clone(), dims_changed)
                 };
-                pulse.notify_one();
+                pulse.bump();
                 // Fire the ack AFTER vt + render_pulse so a synchronous
                 // caller (pane.set_size RPC) is guaranteed that the next
                 // pane.snapshot it issues sees the new dimensions.
@@ -585,7 +581,7 @@ async fn run_pane_pty_task(
     }
     let pulse = state.render_pulse.clone();
     drop(state);
-    pulse.notify_one();
+    pulse.bump();
     let _ = done_tx.send(());
 }
 
@@ -1034,7 +1030,7 @@ async fn spawn_pane_pty_unshared(
         if state.is_current(pane_id, incarnation) {
             let (pulse, _done) = state.teardown_panes_collecting(&[pane_id], true);
             drop(state);
-            pulse.notify_waiters();
+            pulse.bump();
         }
         return Err(pane_gone(
             pane_id,

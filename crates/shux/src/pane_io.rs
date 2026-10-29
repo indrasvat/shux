@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::sync::{Notify, mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::pane_record::PaneRecorder;
 
@@ -106,10 +106,9 @@ pub struct PaneIoState {
     pub(crate) invalidations: HashMap<shux_core::model::PaneId, u64>,
     /// Command execution engine for marker-based completion detection.
     pub cmd_engine: shux_pty::CommandEngine,
-    /// Notify any attach-render loops that a pane's VT has new bytes to
-    /// flush. Bumped after every PTY read so the renderer can wake up
-    /// promptly (instead of polling a fixed interval).
-    pub render_pulse: Arc<tokio::sync::Notify>,
+    /// Wakes every attach render loop: bumped after each PTY read, resize,
+    /// teardown and visible client action.
+    pub render_pulse: RenderPulse,
     /// PR 2c — data-plane publisher. The per-pane PTY task forwards
     /// sampled PTY chunks here via `publish_pane_output`. `None` in
     /// test harnesses that don't wire an event bus. Cheap to clone
@@ -138,6 +137,36 @@ pub struct PaneIoState {
     /// to the pane's writer, under this lock, so it follows the channel's
     /// order: take room in the channel first, then this lock.
     pub(crate) open_pastes: HashMap<shux_core::model::PaneId, OpenPaste>,
+}
+
+/// A generation counter every attach render loop watches. Unlike
+/// `Notify::notify_one`, a bump wakes every subscriber, and one that lands
+/// while a loop is rendering leaves that loop's receiver marked changed, so its
+/// next wait returns at once. Bumps that land together coalesce into one frame.
+#[derive(Clone, Debug)]
+pub struct RenderPulse(Arc<watch::Sender<u64>>);
+
+impl RenderPulse {
+    pub fn new() -> Self {
+        Self(Arc::new(watch::Sender::new(0)))
+    }
+
+    pub fn bump(&self) {
+        self.0.send_modify(|g| *g = g.wrapping_add(1));
+    }
+
+    /// Subscribe once per render loop, before its first wait: a receiver
+    /// starts at the current generation, so one made after a bump never sees
+    /// that bump.
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.0.subscribe()
+    }
+}
+
+impl Default for RenderPulse {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// A bracketed paste whose end has not reached the pane's program.
@@ -174,7 +203,7 @@ impl PaneIoState {
             checkpoints: HashMap::new(),
             invalidations: HashMap::new(),
             cmd_engine: shux_pty::CommandEngine::new(),
-            render_pulse: Arc::new(tokio::sync::Notify::new()),
+            render_pulse: RenderPulse::new(),
             event_bus: None,
             recorders: HashMap::new(),
             pty_pids: HashMap::new(),
@@ -194,7 +223,7 @@ impl PaneIoState {
         &mut self,
         pane_ids: &[shux_core::model::PaneId],
         remove_vts: bool,
-    ) -> Arc<Notify> {
+    ) -> RenderPulse {
         let (pulse, done) = self.teardown_panes_collecting(pane_ids, remove_vts);
         self.track_teardown_waiters(done);
         pulse
@@ -278,7 +307,7 @@ impl PaneIoState {
         &mut self,
         pane_ids: &[shux_core::model::PaneId],
         remove_vts: bool,
-    ) -> (Arc<Notify>, Vec<oneshot::Receiver<()>>) {
+    ) -> (RenderPulse, Vec<oneshot::Receiver<()>>) {
         let mut done = Vec::new();
         for pane_id in pane_ids {
             if let Some(token) = self.shutdowns.remove(pane_id) {
@@ -488,6 +517,39 @@ pub(crate) fn diff_lookup_checkpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::FutureExt as _;
+
+    #[test]
+    fn one_bump_reaches_every_subscriber() {
+        let pulse = RenderPulse::new();
+        let receivers: Vec<_> = (0..3).map(|_| pulse.subscribe()).collect();
+        assert!(receivers.iter().all(|rx| !rx.has_changed().unwrap()));
+        pulse.bump();
+        for (i, rx) in receivers.iter().enumerate() {
+            assert!(rx.has_changed().unwrap(), "receiver {i} missed the bump");
+        }
+    }
+
+    #[test]
+    fn a_bump_while_not_waiting_is_kept_and_bumps_coalesce() {
+        let pulse = RenderPulse::new();
+        let mut rx = pulse.subscribe();
+        // Two bumps while the loop renders: one wake, then nothing pending.
+        pulse.bump();
+        pulse.bump();
+        assert!(matches!(rx.changed().now_or_never(), Some(Ok(()))));
+        assert!(rx.changed().now_or_never().is_none());
+    }
+
+    #[test]
+    fn teardown_hands_back_the_pulse_render_loops_watch() {
+        let mut state = PaneIoState::new();
+        let rx = state.render_pulse.subscribe();
+        state
+            .teardown_panes(&[shux_core::model::PaneId::new()], true)
+            .bump();
+        assert!(rx.has_changed().unwrap());
+    }
 
     /// codex P2 review major — checkpoint resurrection: `pane.glance` stores
     /// its checkpoint under a SECOND lock acquisition, so the pane can be

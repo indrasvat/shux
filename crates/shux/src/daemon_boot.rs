@@ -722,7 +722,7 @@ pub(crate) async fn run_rpc_server(
                                 revealed_titles.push((pane_id, title));
                             }
                         }
-                        state.render_pulse.notify_waiters();
+                        state.render_pulse.bump();
                         // Outside the io_state lock: holding it across the
                         // graph's mpsc send is the deadlock pattern from PR #7.
                         drop(state);
@@ -858,7 +858,7 @@ pub(crate) async fn shutdown_all_pane_io(io_state: Arc<Mutex<PaneIoState>>) {
             .retain(|waiter| !waiter.is_finished());
         let teardown_waiters = std::mem::take(&mut state.teardown_waiters);
         drop(state);
-        pulse.notify_waiters();
+        pulse.bump();
         (done, teardown_waiters)
     };
 
@@ -1182,7 +1182,7 @@ mod tests {
             state.shutdowns.insert(pane_id, pane_shutdown.clone());
             state.pty_done.insert(pane_id, done_rx);
             let pulse = state.teardown_panes(&[pane_id], true);
-            pulse.notify_one();
+            pulse.bump();
 
             assert!(pane_shutdown.is_cancelled());
             assert!(state.pty_done.is_empty());

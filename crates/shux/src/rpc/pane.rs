@@ -332,7 +332,7 @@ pub(crate) fn register_pane_methods(
                     let mut state = io.lock().await;
                     let pulse = state.teardown_panes(&[pane_id], true);
                     drop(state);
-                    pulse.notify_one();
+                    pulse.bump();
                 }
 
                 Ok(serde_json::json!({ "killed": pane_id.to_string() }))
