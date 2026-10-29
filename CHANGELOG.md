@@ -1,3 +1,10 @@
+## [0.54.13](https://github.com/indrasvat/shux/compare/v0.54.12...v0.54.13) (2026-10-29)
+
+
+### Bug Fixes
+
+* bound pane input by bytes; shux version shows CLI and daemon; pin Actions to SHAs ([#231](https://github.com/indrasvat/shux/issues/231)) ([e222d38](https://github.com/indrasvat/shux/commit/e222d38a20fdf4cbf2d6705e33043800d038de8a)), closes [#198](https://github.com/indrasvat/shux/issues/198) [#200](https://github.com/indrasvat/shux/issues/200)
+
 ## [0.54.12](https://github.com/indrasvat/shux/compare/v0.54.11...v0.54.12) (2026-10-29)
 
 
