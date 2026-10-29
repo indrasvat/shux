@@ -323,12 +323,8 @@ async fn run_pane_pty_task(
 
                         staged.bus = bus_opt;
                         staged.stage(data);
-                        // Wake any attach-render loops outside the lock.
-                        // notify_one queues a permit that survives even if
-                        // the renderer happens to be mid-render and not
-                        // yet awaiting; notify_waiters would silently drop
-                        // the wakeup in that window.
-                        pulse.notify_one();
+                        // Wake every attach render loop, outside the lock.
+                        pulse.bump();
                         // Forward OSC 0/2 title changes to the graph
                         // (outside the io_state lock). Don't hold the
                         // mutex across the mpsc send — that's the
@@ -447,7 +443,7 @@ async fn run_pane_pty_task(
                     }
                     (state.render_pulse.clone(), dims_changed)
                 };
-                pulse.notify_one();
+                pulse.bump();
                 // Fire the ack AFTER vt + render_pulse so a synchronous
                 // caller (pane.set_size RPC) is guaranteed that the next
                 // pane.snapshot it issues sees the new dimensions.
@@ -585,7 +581,7 @@ async fn run_pane_pty_task(
     }
     let pulse = state.render_pulse.clone();
     drop(state);
-    pulse.notify_one();
+    pulse.bump();
     let _ = done_tx.send(());
 }
 
@@ -725,10 +721,9 @@ impl SplitUndo {
     /// Read the window of `pane` before it is split. `None` when the pane is
     /// gone, in which case the split itself fails.
     pub(crate) fn capture(
-        graph: &shux_core::graph::GraphHandle,
+        snap: &shux_core::graph::SessionGraphSnapshot,
         pane: shux_core::model::PaneId,
     ) -> Option<Self> {
-        let snap = graph.snapshot();
         let window = snap.panes.get(&pane)?.window_id;
         let w = snap.windows.get(&window)?;
         Some(Self {
@@ -739,51 +734,175 @@ impl SplitUndo {
     }
 }
 
+/// Split `pane`, reading in the same step what undoing the split puts back.
+pub(crate) async fn split_noting_undo(
+    graph: &shux_core::graph::GraphHandle,
+    pane: shux_core::model::PaneId,
+    direction: shux_core::layout::Direction,
+    ratio: f32,
+    command: Vec<String>,
+) -> Result<(shux_core::model::PaneId, Option<SplitUndo>), shux_core::graph::GraphError> {
+    graph
+        .atomically(move |g| {
+            let prior = SplitUndo::capture(&g.current(), pane);
+            g.split_pane_with_command(pane, direction, ratio, command)
+                .map(|new_pane| (new_pane, prior))
+        })
+        .await
+        .and_then(|split| split)
+}
+
 /// Destroy `new_pane`, a split whose PTY never started, and restore what
-/// `prior` recorded. Compare-and-restore: an operator who changed focus or
-/// zoom while the PTY was starting keeps their choice. The prior zoom comes
-/// back only with focus back where it was, and an operator's zoom only on the
-/// focused pane, so a re-zoom never hides a pane the split left focused.
+/// `prior` recorded. Compare-and-restore, in one step: an operator who changed
+/// focus or zoom while the PTY was starting keeps their choice. The prior zoom
+/// comes back only with focus back where it was, and an operator's zoom only on
+/// the focused pane, so a re-zoom never hides a pane the split left focused.
 pub(crate) async fn undo_split(
     graph: &shux_core::graph::GraphHandle,
     new_pane: shux_core::model::PaneId,
     prior: Option<SplitUndo>,
 ) {
-    let Some(prior) = prior else {
-        let _ = graph.destroy_pane(new_pane, None).await;
-        return;
-    };
-    let window = || {
-        graph
-            .snapshot()
-            .windows
-            .get(&prior.window)
-            .map(|w| (w.active_pane, w.layout.zoom.as_ref().map(|z| z.zoomed_pane)))
-    };
-    let (active, zoomed) = window().unzip();
-    let focus_is_still_ours = active == Some(new_pane);
-    // Destroying any pane unzooms its window, so a zoom the operator chose
-    // meanwhile has to be read now and put back too.
-    let operator_zoom = zoomed.flatten().filter(|z| *z != new_pane);
+    let _ = graph
+        .atomically(move |g| {
+            let Some(prior) = prior else {
+                let _ = g.destroy_pane(new_pane, None);
+                return;
+            };
+            let window = || {
+                g.current()
+                    .windows
+                    .get(&prior.window)
+                    .map(|w| (w.active_pane, w.layout.zoom.as_ref().map(|z| z.zoomed_pane)))
+            };
+            let (active, zoomed) = window().unzip();
+            let focus_is_still_ours = active == Some(new_pane);
+            // Destroying any pane unzooms its window, so a zoom the operator
+            // chose meanwhile has to be read now and put back too.
+            let operator_zoom = zoomed.flatten().filter(|z| *z != new_pane);
 
-    // With the rest of the window killed meanwhile, a window holding only a
-    // pane with no PTY is a phantom, so it goes, and its session if empty.
-    let _ = graph.destroy_pane_and_empty_parents(new_pane).await;
-    let Some((active, _)) = window() else {
-        return;
-    };
-    // `destroy_pane` may already have landed on the prior pane; focusing it
-    // again fires a transition out of nowhere.
-    if focus_is_still_ours && active != prior.active_pane {
-        let _ = graph.focus_pane(prior.active_pane).await;
-    }
-    let rezoom = match operator_zoom {
-        Some(z) => Some((z, z)),
-        None => prior.zoomed_pane.map(|z| (z, prior.active_pane)),
-    };
-    if let Some((z, focused)) = rezoom {
-        let _ = graph.zoom_pane_if_focused(z, focused).await;
-    }
+            // With the rest of the window killed meanwhile, a window holding
+            // only a pane with no PTY is a phantom, so it goes, and its
+            // session if empty.
+            let _ = g.destroy_pane_and_empty_parents(new_pane);
+            let Some((active, _)) = window() else {
+                return;
+            };
+            // `destroy_pane` may already have landed on the prior pane;
+            // focusing it again fires a transition out of nowhere.
+            if focus_is_still_ours && active != prior.active_pane {
+                let _ = g.focus_pane(prior.active_pane);
+            }
+            let rezoom = match operator_zoom {
+                Some(z) => Some((z, z)),
+                None => prior.zoomed_pane.map(|z| (z, prior.active_pane)),
+            };
+            if let Some((z, focused)) = rezoom {
+                let _ = g.zoom_pane_if_focused(z, focused);
+            }
+        })
+        .await;
+}
+
+/// A window whose PTY is not started yet, with what undoing it must put back.
+pub(crate) struct NewWindow {
+    pub(crate) session: shux_core::model::SessionId,
+    pub(crate) window: shux_core::model::WindowId,
+    pub(crate) pane: shux_core::model::PaneId,
+    prior_focus: Option<shux_core::model::WindowId>,
+}
+
+/// Creating a window focuses it, and destroying one focuses the session's
+/// first window, so a failed create has to hand focus back itself. `title`
+/// `None` takes the lowest index not already a window name in the session.
+fn create_in(
+    g: &shux_core::graph::SessionGraph,
+    session: shux_core::model::SessionId,
+    title: Option<String>,
+    cwd: PathBuf,
+    command: Vec<String>,
+) -> Result<NewWindow, shux_core::graph::GraphError> {
+    let snap = g.current();
+    let title = title.unwrap_or_else(|| {
+        let count = snap.sessions.get(&session).map_or(0, |s| s.windows.len());
+        (count..)
+            .map(|idx| idx.to_string())
+            .find(|t| !snap.window_name_exists_in_session(&session, t))
+            .unwrap_or_default()
+    });
+    let prior_focus = snap.sessions.get(&session).map(|s| s.active_window);
+    let window = g.create_window_with_command(session, title, cwd, command)?;
+    let pane = g
+        .current()
+        .windows
+        .get(&window)
+        .map(|w| w.active_pane)
+        .ok_or(shux_core::graph::GraphError::WindowNotFound(window))?;
+    Ok(NewWindow {
+        session,
+        window,
+        pane,
+        prior_focus,
+    })
+}
+
+/// Creates a window, reading its name, the focus it takes and its pane in the
+/// same step.
+pub(crate) async fn create_window_noting_focus(
+    graph: &shux_core::graph::GraphHandle,
+    session: shux_core::model::SessionId,
+    title: Option<String>,
+    cwd: PathBuf,
+    command: Vec<String>,
+) -> Result<NewWindow, shux_core::graph::GraphError> {
+    graph
+        .atomically(move |g| create_in(g, session, title, cwd, command))
+        .await
+        .and_then(|created| created)
+}
+
+/// Like [`create_window_noting_focus`], unless the session already has a
+/// window called `name`, decided in the same step: then `Ok(Err(that window))`.
+pub(crate) async fn ensure_window_noting_focus(
+    graph: &shux_core::graph::GraphHandle,
+    session: shux_core::model::SessionId,
+    name: String,
+    cwd: PathBuf,
+    command: Vec<String>,
+) -> Result<Result<NewWindow, shux_core::model::WindowId>, shux_core::graph::GraphError> {
+    graph
+        .atomically(
+            move |g| match g.current().find_window_by_name(&session, &name) {
+                Some(w) => Ok(Err(w.id)),
+                None => create_in(g, session, Some(name), cwd, command).map(Ok),
+            },
+        )
+        .await
+        .and_then(|created| created)
+}
+
+/// Destroys the pane of a window whose PTY never started, then the window and
+/// the session if that leaves them empty. Focus goes back only if it is still
+/// on that window, decided in the same step, so a focus chosen while the PTY
+/// was starting stays.
+pub(crate) async fn undo_window_create(graph: &shux_core::graph::GraphHandle, created: NewWindow) {
+    let _ = graph
+        .atomically(move |g| {
+            let active = || {
+                g.current()
+                    .sessions
+                    .get(&created.session)
+                    .map(|s| s.active_window)
+            };
+            let focus_is_still_ours = active() == Some(created.window);
+            let _ = g.destroy_pane_and_empty_parents(created.pane);
+            if focus_is_still_ours
+                && let Some(prev) = created.prior_focus
+                && active().is_some_and(|now| now != prev)
+            {
+                let _ = g.focus_window(prev, None);
+            }
+        })
+        .await;
 }
 
 /// Like [`spawn_pane_pty`] but arms `cast_recorder` (a pre-opened recorder) BEFORE the read loop
@@ -1034,7 +1153,7 @@ async fn spawn_pane_pty_unshared(
         if state.is_current(pane_id, incarnation) {
             let (pulse, _done) = state.teardown_panes_collecting(&[pane_id], true);
             drop(state);
-            pulse.notify_waiters();
+            pulse.bump();
         }
         return Err(pane_gone(
             pane_id,
@@ -1908,7 +2027,7 @@ mod tests {
     // ── undoing a failed split (issue #152) ───────────────────────────
 
     use shux_core::layout::Direction;
-    use shux_core::model::{PaneId, WindowId};
+    use shux_core::model::{PaneId, SessionId, WindowId};
 
     struct Zoomed {
         gh: shux_core::graph::GraphHandle,
@@ -1966,7 +2085,7 @@ mod tests {
             a,
             ..
         } = zoomed_window().await;
-        let prior = SplitUndo::capture(&gh, a);
+        let prior = SplitUndo::capture(&gh.snapshot(), a);
         let new = gh
             .split_pane(a, Direction::Vertical, 0.5)
             .await
@@ -1993,7 +2112,7 @@ mod tests {
             b,
             ..
         } = zoomed_window().await;
-        let prior = SplitUndo::capture(&gh, a);
+        let prior = SplitUndo::capture(&gh.snapshot(), a);
         let new = gh
             .split_pane(a, Direction::Vertical, 0.5)
             .await
@@ -2018,7 +2137,7 @@ mod tests {
             b,
             ..
         } = zoomed_window().await;
-        let prior = SplitUndo::capture(&gh, a);
+        let prior = SplitUndo::capture(&gh.snapshot(), a);
         let new = gh
             .split_pane(a, Direction::Vertical, 0.5)
             .await
@@ -2041,7 +2160,7 @@ mod tests {
             b,
             ..
         } = zoomed_window().await;
-        let prior = SplitUndo::capture(&gh, a);
+        let prior = SplitUndo::capture(&gh.snapshot(), a);
         let new = gh
             .split_pane(a, Direction::Vertical, 0.5)
             .await
@@ -2065,7 +2184,7 @@ mod tests {
             b,
             ..
         } = zoomed_window().await;
-        let prior = SplitUndo::capture(&gh, a);
+        let prior = SplitUndo::capture(&gh.snapshot(), a);
         let new = gh
             .split_pane(a, Direction::Vertical, 0.5)
             .await
@@ -2092,7 +2211,7 @@ mod tests {
             a,
             b,
         } = zoomed_window().await;
-        let prior = SplitUndo::capture(&gh, a);
+        let prior = SplitUndo::capture(&gh.snapshot(), a);
         let new = gh
             .split_pane(a, Direction::Vertical, 0.5)
             .await
@@ -2106,5 +2225,223 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_millis(200), events.recv()).await;
         assert!(stray.is_err(), "undo fired a zoom event: {stray:?}");
         cancel.cancel();
+    }
+
+    // ── a failed create gives focus back to whoever had it ────────────
+
+    /// Queues `cmd` without letting it apply: on a current-thread runtime the
+    /// graph task runs only once this task yields.
+    async fn queue<F: std::future::Future>(cmd: F) -> std::pin::Pin<Box<F>> {
+        let mut cmd = Box::pin(cmd);
+        assert!(futures::poll!(cmd.as_mut()).is_pending());
+        cmd
+    }
+
+    const NO_SUCH_PROGRAM: &str = "shux-no-such-program-for-undo";
+
+    /// A focus queued before a create that then fails lands first, so it is
+    /// the focus the create took and the one its undo hands back.
+    #[tokio::test]
+    async fn a_failed_window_create_hands_focus_back_to_a_focus_that_landed_first() {
+        for method in ["window.create", "window.ensure"] {
+            let h = crate::rpc::test_harness::RpcHarness::new();
+            let (session, wa, _) = h.seed_session("undo-create").await;
+            let wb = h
+                .graph
+                .create_window_with_command(session, "wb".into(), "/tmp".into(), Vec::new())
+                .await
+                .unwrap();
+            h.graph.focus_window(wa, None).await.unwrap();
+
+            let focus = queue(h.graph.focus_window(wb, None)).await;
+            crate::rpc::test_harness::dispatch_err(
+                &h.router,
+                method,
+                serde_json::json!({
+                    "session_id": session.to_string(),
+                    "name": "ghost",
+                    "command": [NO_SUCH_PROGRAM],
+                }),
+            )
+            .await;
+            focus.await.expect("focus wb");
+
+            let snap = h.graph.snapshot();
+            assert_eq!(
+                snap.sessions[&session].active_window, wb,
+                "{method}: undoing the create reverted a focus that landed before it"
+            );
+            assert!(snap.find_window_by_name(&session, "ghost").is_none());
+            h.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_split_hands_focus_back_to_a_focus_that_landed_first() {
+        let h = crate::rpc::test_harness::RpcHarness::new();
+        let (_s, window, a) = h.seed_session("undo-split").await;
+        let b = h
+            .graph
+            .split_pane(a, Direction::Vertical, 0.5)
+            .await
+            .unwrap();
+        h.graph.focus_pane(a).await.unwrap();
+
+        let focus = queue(h.graph.focus_pane(b)).await;
+        crate::rpc::test_harness::dispatch_err(
+            &h.router,
+            "pane.split",
+            serde_json::json!({ "pane_id": a.to_string(), "command": [NO_SUCH_PROGRAM] }),
+        )
+        .await;
+        focus.await.expect("focus b");
+
+        let snap = h.graph.snapshot();
+        assert_eq!(
+            snap.windows[&window].active_pane, b,
+            "undoing the split reverted a focus that landed before it"
+        );
+        assert_eq!(snap.windows[&window].layout.tree.pane_count(), 2);
+        h.stop().await;
+    }
+
+    /// Window titles in `session`, in order.
+    fn titles(h: &crate::rpc::test_harness::RpcHarness, session: SessionId) -> Vec<String> {
+        let snap = h.graph.snapshot();
+        snap.sessions[&session]
+            .windows
+            .iter()
+            .map(|w| snap.windows[w].title.clone())
+            .collect()
+    }
+
+    /// A window that lands before `window.ensure` applies is the window it
+    /// ensures, not a reason to stack a second one with the same name.
+    #[tokio::test]
+    async fn window_ensure_reuses_a_window_that_landed_first() {
+        let h = crate::rpc::test_harness::RpcHarness::new();
+        let (session, _, _) = h.seed_session("ensure-race").await;
+        let dup = queue(h.graph.create_window_with_command(
+            session,
+            "dup".into(),
+            "/tmp".into(),
+            Vec::new(),
+        ))
+        .await;
+        let ensured = crate::rpc::test_harness::dispatch_ok(
+            &h.router,
+            "window.ensure",
+            serde_json::json!({
+                "session_id": session.to_string(),
+                "name": "dup",
+                "command": ["true"],
+            }),
+        )
+        .await;
+        let dup = dup.await.expect("create dup");
+
+        assert_eq!(titles(&h, session), ["1", "dup"]);
+        assert_eq!(ensured["created"], false);
+        assert_eq!(ensured["id"], dup.to_string());
+        h.stop().await;
+    }
+
+    /// The name `window.create` picks is free when the window is created, not
+    /// only when it was picked.
+    #[tokio::test]
+    async fn window_create_names_around_a_window_that_landed_first() {
+        let h = crate::rpc::test_harness::RpcHarness::new();
+        let (session, _, _) = h.seed_session("name-race").await;
+        let taken = queue(h.graph.create_window_with_command(
+            session,
+            "2".into(),
+            "/tmp".into(),
+            Vec::new(),
+        ))
+        .await;
+        crate::rpc::test_harness::dispatch_ok(
+            &h.router,
+            "window.create",
+            serde_json::json!({ "session_id": session.to_string(), "command": ["true"] }),
+        )
+        .await;
+        taken.await.expect("create 2");
+
+        assert_eq!(titles(&h, session), ["1", "2", "3"]);
+        h.stop().await;
+    }
+
+    /// With every other window gone while the PTY was starting, the window
+    /// was the session's last, and a session holding only a phantom goes too.
+    #[tokio::test]
+    async fn undoing_a_session_s_last_window_takes_the_empty_session() {
+        let h = crate::rpc::test_harness::RpcHarness::new();
+        let (session, first, _) = h.seed_session("undo-last").await;
+        let created = create_window_noting_focus(
+            &h.graph,
+            session,
+            Some("ghost".into()),
+            "/tmp".into(),
+            Vec::new(),
+        )
+        .await
+        .expect("create ghost");
+        let ghost = created.window;
+        h.graph
+            .destroy_window(first, None)
+            .await
+            .expect("kill first");
+
+        undo_window_create(&h.graph, created).await;
+        let snap = h.graph.snapshot();
+        assert!(
+            !snap.windows.contains_key(&ghost),
+            "the phantom window survived"
+        );
+        assert!(
+            !snap.sessions.contains_key(&session),
+            "a session holding only a phantom survived"
+        );
+        h.stop().await;
+    }
+
+    /// A pane split off the new window while its PTY was starting is not the
+    /// undo's to take, even when that leaves the window the session's last.
+    #[tokio::test]
+    async fn undoing_a_window_create_keeps_a_pane_split_off_it_meanwhile() {
+        let h = crate::rpc::test_harness::RpcHarness::new();
+        let (session, first, _) = h.seed_session("undo-split-off").await;
+        let created = create_window_noting_focus(
+            &h.graph,
+            session,
+            Some("ghost".into()),
+            "/tmp".into(),
+            Vec::new(),
+        )
+        .await
+        .expect("create ghost");
+        let (window, phantom) = (created.window, created.pane);
+        let kept = h
+            .graph
+            .split_pane(phantom, Direction::Vertical, 0.5)
+            .await
+            .expect("split ghost");
+        h.graph
+            .destroy_window(first, None)
+            .await
+            .expect("kill first");
+
+        undo_window_create(&h.graph, created).await;
+        let snap = h.graph.snapshot();
+        assert!(
+            !snap.panes.contains_key(&phantom),
+            "the phantom pane survived"
+        );
+        assert!(
+            snap.panes.contains_key(&kept),
+            "the undo took a pane split off meanwhile"
+        );
+        assert_eq!(snap.sessions[&session].windows, [window]);
+        h.stop().await;
     }
 }

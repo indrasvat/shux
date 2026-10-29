@@ -1279,8 +1279,8 @@ fn a_flag_shaped_command_does_not_become_the_pane_title() {
 /// the entity being undone, so a choice made meanwhile wins.
 ///
 /// Driven as a real race: the failing create runs concurrently with the focus.
-/// The margin is wide by construction — the reverting build loses focus on
-/// roughly half of these — so the threshold is not measuring jitter.
+/// The create and its undo each read focus in the same step as they change it,
+/// so every interleaving keeps the focus.
 #[test]
 fn a_concurrent_focus_survives_a_rollback() {
     const TRIALS: usize = 16;
@@ -1334,8 +1334,9 @@ fn a_concurrent_focus_survives_a_rollback() {
             kept += 1;
         }
     }
-    assert!(
-        kept >= TRIALS - 3,
+    assert_eq!(
+        kept,
+        TRIALS,
         "a rollback reverted a concurrent focus in {} of {TRIALS} trials",
         TRIALS - kept
     );

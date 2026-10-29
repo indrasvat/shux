@@ -591,6 +591,73 @@ fn a_failed_attach_split_or_new_window_tells_the_user_why() {
     env.wait_for("host", &host_pane, "new window failed");
 }
 
+/// `(title, is_active)` for each window in `session`, in order.
+fn window_titles(env: &Env, session: &str) -> Vec<(String, bool)> {
+    serde_json::from_str::<serde_json::Value>(
+        &env.ok(&["--format", "json", "window", "list", "-s", session]),
+    )
+    .expect("window list json")
+    .as_array()
+    .expect("window array")
+    .iter()
+    .map(|w| {
+        let title = w["title"].as_str().unwrap_or_default().to_string();
+        (title, w["is_active"] == true)
+    })
+    .collect()
+}
+
+/// Destroying a window focuses the session's first window, so the undo of a
+/// failed keyboard new-window has to hand focus back to the window it was
+/// opened from, exactly as the `window.create` RPC's undo does.
+#[test]
+fn a_failed_attach_new_window_keeps_the_window_it_was_opened_from() {
+    let mut env = Env::new(&format!("{ATTACH_KEYS}[shell]\ncommand = []\n"), "/bin/sh");
+    let host_pane = env.session("host");
+    env.session_with_argv("target", &["sleep", "900"]);
+    env.ok(&[
+        "window", "create", "-s", "target", "-n", "second", "--", "sleep", "900",
+    ]);
+    let before = window_titles(&env, "target");
+    assert_eq!(
+        before
+            .iter()
+            .filter(|(_, active)| *active)
+            .collect::<Vec<_>>(),
+        [&("second".to_string(), true)],
+        "the window the attach client opens on must not be the first: {before:?}"
+    );
+
+    let bin = env.bin.display().to_string();
+    let root = env.root.path().display().to_string();
+    env.send_keys(
+        "host",
+        &format!(
+            "XDG_RUNTIME_DIR={root}/runtime XDG_CONFIG_HOME={root}/config \
+             {bin} session attach target\n"
+        ),
+    );
+    env.wait_for("host", &host_pane, "1 pane");
+
+    env.break_shell_config(
+        &format!("{ATTACH_KEYS}[shell]\ncommand = [\"/usr/bin/shux-no-such-shell\"]\n"),
+        "/usr/bin/shux-no-such-shell",
+    );
+    assert!(
+        !env.capture("host", &host_pane).contains("COPY"),
+        "the copy-mode marker is on screen before copy mode, so it proves nothing"
+    );
+    env.send_keys("host", "\x01c");
+    env.send_keys("host", "\x01[");
+    env.wait_for("host", &host_pane, "COPY");
+
+    assert_eq!(
+        window_titles(&env, "target"),
+        before,
+        "a failed new window moved focus off the window it was opened from"
+    );
+}
+
 /// `(zoomed pane, focused pane)` in the session's active window.
 fn zoom_and_focus(env: &Env, session: &str) -> (Option<String>, Option<String>) {
     let v: serde_json::Value =

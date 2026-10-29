@@ -8,7 +8,10 @@ use tokio::sync::Mutex;
 
 use crate::pane_command;
 use crate::pane_io::PaneIoState;
-use crate::pane_spawn::{spawn_failure, spawn_pane_pty};
+use crate::pane_spawn::{
+    create_window_noting_focus, ensure_window_noting_focus, spawn_failure, spawn_pane_pty,
+    undo_window_create,
+};
 use crate::rpc::convert::{graph_error_to_rpc, window_to_json};
 use crate::rpc::params::{
     parse_expected_version, required_str, resolve_session_ref, resolve_window_ref,
@@ -50,25 +53,6 @@ pub(crate) fn register_window_methods(
 
                     let name = params.get("name").and_then(|v| v.as_str());
 
-                    // Auto-generate window name if not provided
-                    let title = match name {
-                        Some(n) => n.to_string(),
-                        None => {
-                            let snap = gh.snapshot();
-                            let session = snap.sessions.get(&session_id).ok_or_else(|| {
-                                shux_rpc::RpcError::not_found("session", session_id_str)
-                            })?;
-                            let mut idx = session.windows.len();
-                            loop {
-                                let candidate = format!("{idx}");
-                                if !snap.window_name_exists_in_session(&session_id, &candidate) {
-                                    break candidate;
-                                }
-                                idx += 1;
-                            }
-                        }
-                    };
-
                     let cwd = params
                         .get("cwd")
                         .and_then(|v| v.as_str())
@@ -79,48 +63,26 @@ pub(crate) fn register_window_methods(
 
                     let command = pane_command::parse_pane_command(&params)?;
 
-                    // Creating a window focuses it, and destroying a window hands
-                    // focus to the session's FIRST window — not the one that had
-                    // it. A rollback therefore has to restore focus itself, or a
-                    // failed create silently relocates the session (see the
-                    // matching comment in `pane.split`).
-                    let prior_active_window = gh
-                        .snapshot()
-                        .sessions
-                        .get(&session_id)
-                        .map(|s| s.active_window);
-
                     // `_with_command` persists the argv on the window's initial
                     // pane, so `pane list` and `PaneCreated` report what is really
                     // running instead of a blank (issue #125).
-                    let window_id = gh
-                        .create_window_with_command(session_id, title, cwd.clone(), command.clone())
-                        .await
-                        .map_err(graph_error_to_rpc)?;
-
-                    let snap = gh.snapshot();
-                    let window = snap
-                        .windows
-                        .get(&window_id)
-                        .ok_or_else(|| shux_rpc::RpcError::internal("window not in snapshot"))?;
-                    let session = snap
-                        .sessions
-                        .get(&window.session_id)
-                        .ok_or_else(|| shux_rpc::RpcError::internal("session not in snapshot"))?;
-                    let index = session
-                        .windows
-                        .iter()
-                        .position(|id| *id == window_id)
-                        .unwrap_or(0);
-                    let is_active = session.active_window == window_id;
-                    let pane_id = window.active_pane.to_string();
+                    let created = create_window_noting_focus(
+                        &gh,
+                        session_id,
+                        name.map(str::to_string),
+                        cwd.clone(),
+                        command.clone(),
+                    )
+                    .await
+                    .map_err(graph_error_to_rpc)?;
+                    let (window_id, pane_id) = (created.window, created.pane);
 
                     // Spawn PTY for the new pane. A window whose only pane
                     // never started is not a window — surface the failure and
                     // undo the create rather than returning success on a
                     // phantom (issue #125 follow-up).
                     if let Err(e) = spawn_pane_pty(
-                        window.active_pane,
+                        pane_id,
                         cwd,
                         command,
                         shux_pty::handle::PtySize::default(),
@@ -132,34 +94,27 @@ pub(crate) fn register_window_methods(
                     )
                     .await
                     {
-                        // Same compare-and-restore as `pane.split`: only put
-                        // focus back if it is still on the window being undone.
-                        let focus_is_still_ours = gh
-                            .snapshot()
-                            .sessions
-                            .get(&session_id)
-                            .map(|s| s.active_window)
-                            == Some(window_id);
-
-                        let _ = gh.destroy_window(window_id, None).await;
-
-                        if focus_is_still_ours
-                            && let Some(prev) = prior_active_window
-                            && gh
-                                .snapshot()
-                                .sessions
-                                .get(&session_id)
-                                .map(|s| s.active_window)
-                                != Some(prev)
-                        {
-                            let _ = gh.focus_window(prev, None).await;
-                        }
+                        undo_window_create(&gh, created).await;
                         return Err(spawn_failure(&e));
                     }
 
+                    let snap = gh.snapshot();
+                    let window = snap.windows.get(&window_id).ok_or_else(|| {
+                        shux_rpc::RpcError::not_found("window", &window_id.to_string())
+                    })?;
+                    let session = snap
+                        .sessions
+                        .get(&window.session_id)
+                        .ok_or_else(|| shux_rpc::RpcError::not_found("session", session_id_str))?;
+                    let index = session
+                        .windows
+                        .iter()
+                        .position(|id| *id == window_id)
+                        .unwrap_or(0);
+                    let is_active = session.active_window == window_id;
                     let mut result = window_to_json(window, index, is_active, &snap);
                     // Include pane_id at top level for convenience
-                    result["pane_id"] = serde_json::Value::String(pane_id);
+                    result["pane_id"] = serde_json::Value::String(pane_id.to_string());
 
                     Ok(result)
                 }
@@ -224,23 +179,6 @@ pub(crate) fn register_window_methods(
                     // has always parsed first; this matches it.
                     let command = pane_command::parse_pane_command(&params)?;
 
-                    // Check if window with this name already exists
-                    let snap = gh.snapshot();
-                    if let Some(w) = snap.find_window_by_name(&session_id, &name) {
-                        let session = snap.sessions.get(&session_id).ok_or_else(|| {
-                            shux_rpc::RpcError::not_found("session", session_id_str)
-                        })?;
-                        let index = session
-                            .windows
-                            .iter()
-                            .position(|id| *id == w.id)
-                            .unwrap_or(0);
-                        let is_active = session.active_window == w.id;
-                        let mut result = window_to_json(w, index, is_active, &snap);
-                        result["created"] = serde_json::Value::Bool(false);
-                        return Ok(result);
-                    }
-
                     let cwd = params
                         .get("cwd")
                         .and_then(|v| v.as_str())
@@ -248,68 +186,52 @@ pub(crate) fn register_window_methods(
                         .unwrap_or_else(|| {
                             std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"))
                         });
-                    let prior_active_window = gh
-                        .snapshot()
-                        .sessions
-                        .get(&session_id)
-                        .map(|s| s.active_window);
-                    let window_id = gh
-                        .create_window_with_command(session_id, name, cwd.clone(), command.clone())
-                        .await
-                        .map_err(graph_error_to_rpc)?;
+                    let created = ensure_window_noting_focus(
+                        &gh,
+                        session_id,
+                        name.clone(),
+                        cwd.clone(),
+                        command.clone(),
+                    )
+                    .await
+                    .map_err(graph_error_to_rpc)?;
+                    let (window_id, is_new) = match created {
+                        Err(window) => (window, false),
+                        Ok(created) => {
+                            let window = created.window;
+                            // Spawn PTY for the new pane. A window whose only pane
+                            // never started is not a window — surface the failure and
+                            // undo the create rather than returning success on a
+                            // phantom (issue #125 follow-up).
+                            if let Err(e) = spawn_pane_pty(
+                                created.pane,
+                                cwd,
+                                command,
+                                shux_pty::handle::PtySize::default(),
+                                Vec::new(),
+                                false,
+                                io,
+                                ct,
+                                gh.clone(),
+                            )
+                            .await
+                            {
+                                undo_window_create(&gh, created).await;
+                                return Err(spawn_failure(&e));
+                            }
+                            (window, true)
+                        }
+                    };
 
                     let snap = gh.snapshot();
                     let window = snap
                         .windows
                         .get(&window_id)
-                        .ok_or_else(|| shux_rpc::RpcError::internal("window not in snapshot"))?;
-
-                    // Spawn PTY for the new pane. A window whose only pane
-                    // never started is not a window — surface the failure and
-                    // undo the create rather than returning success on a
-                    // phantom (issue #125 follow-up).
-                    if let Err(e) = spawn_pane_pty(
-                        window.active_pane,
-                        cwd,
-                        command,
-                        shux_pty::handle::PtySize::default(),
-                        Vec::new(),
-                        false,
-                        io,
-                        ct,
-                        gh.clone(),
-                    )
-                    .await
-                    {
-                        // Same compare-and-restore as `pane.split`: only put
-                        // focus back if it is still on the window being undone.
-                        let focus_is_still_ours = gh
-                            .snapshot()
-                            .sessions
-                            .get(&session_id)
-                            .map(|s| s.active_window)
-                            == Some(window_id);
-
-                        let _ = gh.destroy_window(window_id, None).await;
-
-                        if focus_is_still_ours
-                            && let Some(prev) = prior_active_window
-                            && gh
-                                .snapshot()
-                                .sessions
-                                .get(&session_id)
-                                .map(|s| s.active_window)
-                                != Some(prev)
-                        {
-                            let _ = gh.focus_window(prev, None).await;
-                        }
-                        return Err(spawn_failure(&e));
-                    }
-
+                        .ok_or_else(|| shux_rpc::RpcError::not_found("window", &name))?;
                     let session = snap
                         .sessions
                         .get(&session_id)
-                        .ok_or_else(|| shux_rpc::RpcError::internal("session not in snapshot"))?;
+                        .ok_or_else(|| shux_rpc::RpcError::not_found("session", session_id_str))?;
                     let index = session
                         .windows
                         .iter()
@@ -317,7 +239,7 @@ pub(crate) fn register_window_methods(
                         .unwrap_or(0);
                     let is_active = session.active_window == window_id;
                     let mut result = window_to_json(window, index, is_active, &snap);
-                    result["created"] = serde_json::Value::Bool(true);
+                    result["created"] = serde_json::Value::Bool(is_new);
                     Ok(result)
                 }
             },
@@ -474,7 +396,7 @@ pub(crate) fn register_window_methods(
                         let mut state = io.lock().await;
                         let pulse = state.teardown_panes(&pane_ids, true);
                         drop(state);
-                        pulse.notify_one();
+                        pulse.bump();
                     }
 
                     Ok(serde_json::json!({ "killed": window_id.to_string() }))

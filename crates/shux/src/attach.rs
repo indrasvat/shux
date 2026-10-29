@@ -133,6 +133,21 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often the daemon pings the client to detect dead peers.
 const PING_INTERVAL: Duration = Duration::from_secs(15);
 
+/// How often a render loop redraws with no pulse, so clocks and status
+/// segments move on an idle screen.
+const FALLBACK_TICK: Duration = Duration::from_millis(200);
+/// Overrides [`FALLBACK_TICK`], in milliseconds. A test that must see a frame
+/// caused by a pulse, never by the tick, sets it far past its own budget.
+pub const FALLBACK_TICK_ENV: &str = "SHUX_ATTACH_FALLBACK_TICK_MS";
+
+fn fallback_tick() -> Duration {
+    std::env::var(FALLBACK_TICK_ENV)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&ms: &u64| ms > 0)
+        .map_or(FALLBACK_TICK, Duration::from_millis)
+}
+
 const ESC: u8 = 0x1b;
 
 /// A pane's open paste, as one piece of input sees it.
@@ -894,6 +909,7 @@ async fn run_attach_loop(
             render_tx,
             render_cancel,
             hello.graphics,
+            fallback_tick(),
         )
         .await;
     });
@@ -962,7 +978,7 @@ async fn run_attach_loop(
                     )
                     .await;
                     let pulse = io_state.lock().await.render_pulse.clone();
-                    pulse.notify_one();
+                    pulse.bump();
                 }
             }
             frame = stream.next() => {
@@ -1004,7 +1020,7 @@ async fn run_attach_loop(
                             let mut s = render_session.lock().await;
                             let toast_dismissed = std::mem::take(&mut s.show_welcome_toast);
                             if s.action_error.take().is_some() || toast_dismissed {
-                                io_state.lock().await.render_pulse.notify_one();
+                                io_state.lock().await.render_pulse.bump();
                             }
                             if toast_dismissed {
                                 onboarding.mark_welcome_toast_seen().await;
@@ -1017,7 +1033,7 @@ async fn run_attach_loop(
                                     s.help_visible = false;
                                     let pulse =
                                         io_state.lock().await.render_pulse.clone();
-                                    pulse.notify_one();
+                                    pulse.bump();
                                 }
                                 continue;
                             }
@@ -1039,7 +1055,7 @@ async fn run_attach_loop(
                         };
                         if cleared_mouse_selection {
                             let pulse = io_state.lock().await.render_pulse.clone();
-                            pulse.notify_one();
+                            pulse.bump();
                         }
                         // Copy-mode capture: route bytes through the
                         // copy-mode key handler instead of forwarding
@@ -1099,14 +1115,14 @@ async fn run_attach_loop(
                             match action {
                                 shux_ui::CopyKey::Updated | shux_ui::CopyKey::Ignored => {
                                     let pulse = io_state.lock().await.render_pulse.clone();
-                                    pulse.notify_one();
+                                    pulse.bump();
                                 }
                                 shux_ui::CopyKey::Exit => {
                                     let mut s = render_session.lock().await;
                                     s.copy_mode = None;
                                     drop(s);
                                     let pulse = io_state.lock().await.render_pulse.clone();
-                                    pulse.notify_one();
+                                    pulse.bump();
                                 }
                                 shux_ui::CopyKey::Yank => {
                                     let text = {
@@ -1140,7 +1156,7 @@ async fn run_attach_loop(
                                     s.copy_mode = None;
                                     drop(s);
                                     let pulse = io_state.lock().await.render_pulse.clone();
-                                    pulse.notify_one();
+                                    pulse.bump();
                                 }
                             }
                             continue;
@@ -1198,7 +1214,7 @@ async fn run_attach_loop(
                                         std::time::Instant::now(),
                                     ));
                                     let pulse = io_state.lock().await.render_pulse.clone();
-                                    pulse.notify_one();
+                                    pulse.bump();
                                 }
                             }
                         }
@@ -1212,7 +1228,7 @@ async fn run_attach_loop(
                         let attached = render_session.lock().await.clone();
                         apply_resize_to_window(&graph, &io_state, &attached, &config, cols, rows).await;
                         let pulse = io_state.lock().await.render_pulse.clone();
-                        pulse.notify_one();
+                        pulse.bump();
                     }
                     AttachClientFrame::Action { kind, args } => {
                         // The user pressed prefix + key — onboarding hint
@@ -1266,7 +1282,7 @@ async fn run_attach_loop(
                             apply_resize_to_window(&graph, &io_state, &attached, &config, cols, rows).await;
                         }
                         let pulse = io_state.lock().await.render_pulse.clone();
-                        pulse.notify_one();
+                        pulse.bump();
                     }
                     AttachClientFrame::Mouse {
                         kind,
@@ -1314,7 +1330,7 @@ async fn run_attach_loop(
                             AppMouse::Consumed { redraw } => {
                                 if redraw {
                                     let pulse = io_state.lock().await.render_pulse.clone();
-                                    pulse.notify_one();
+                                    pulse.bump();
                                 }
                                 continue;
                             }
@@ -1336,7 +1352,7 @@ async fn run_attach_loop(
                         .await?
                         {
                             let pulse = io_state.lock().await.render_pulse.clone();
-                            pulse.notify_one();
+                            pulse.bump();
                             continue;
                         }
                         if handle_copy_mode_mouse(
@@ -1355,7 +1371,7 @@ async fn run_attach_loop(
                         .await?
                         {
                             let pulse = io_state.lock().await.render_pulse.clone();
-                            pulse.notify_one();
+                            pulse.bump();
                             continue;
                         }
                         // Scroll wheel (copy mode inactive): scroll scrollback,
@@ -1373,7 +1389,7 @@ async fn run_attach_loop(
                         .await?
                         {
                             let pulse = io_state.lock().await.render_pulse.clone();
-                            pulse.notify_one();
+                            pulse.bump();
                             continue;
                         }
                         if let Err(e) = handle_mouse(
@@ -1393,7 +1409,7 @@ async fn run_attach_loop(
                             warn!(?kind, error = %e, "attach: mouse handle failed");
                         }
                         let pulse = io_state.lock().await.render_pulse.clone();
-                        pulse.notify_one();
+                        pulse.bump();
                     }
                     AttachClientFrame::Detach => {
                         // Detach implies the user found the prefix too.
@@ -1411,7 +1427,7 @@ async fn run_attach_loop(
                     AttachClientFrame::Prefix { prefix } => {
                         render_session.lock().await.client_prefix = Some(prefix);
                         let pulse = io_state.lock().await.render_pulse.clone();
-                        pulse.notify_one();
+                        pulse.bump();
                     }
                     AttachClientFrame::Pong => {}
                 }
@@ -1473,7 +1489,7 @@ async fn run_attach_loop(
 
 /// Run the per-attach render loop.
 ///
-/// The loop wakes on `render_pulse` notifications (PTY data, action
+/// The loop wakes on every `render_pulse` bump (PTY data, action
 /// completion) and also fires a low-rate fallback tick (200ms) so cursor
 /// blinks and clocks update without external input. After each wake-up
 /// it grabs a fresh `SessionGraphSnapshot`, walks all panes in the
@@ -1493,7 +1509,10 @@ async fn run_render_loop(
     out_tx: mpsc::Sender<AttachServerFrame>,
     cancel: CancellationToken,
     graphics: bool,
+    tick_period: Duration,
 ) {
+    // Before anything else: a receiver starts at the current generation.
+    let mut pulse = io_state.lock().await.render_pulse.subscribe();
     let (mut cols, mut rows) = *client_size.lock().await;
     let initial = config.current();
     let initial_theme = shux_core::theme::Theme::resolve(&initial.theme);
@@ -1515,16 +1534,10 @@ async fn run_render_loop(
         .await;
 
     // Fallback tick lets us update clocks etc. even when nothing else
-    // happens. The pulse Notify covers the data-driven case.
-    let mut tick = tokio::time::interval(Duration::from_millis(200));
+    // happens. The pulse covers the data-driven case.
+    let mut tick = tokio::time::interval(tick_period);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    // Register notify *before* the first render so we never miss a wakeup.
-    // `notify_one` enqueues a permit even if no listener exists yet, so
-    // the next `notified().await` returns immediately — but we must
-    // re-prime the listener after every wake.
-    let pulse = io_state.lock().await.render_pulse.clone();
-    let mut pulse_listener = Box::pin(pulse.notified());
+    let mut last_frame: Option<tokio::time::Instant> = None;
 
     // Welcome toast: lazily-initialised first-render instant. Stays
     // None until the first render iteration where we actually start
@@ -1546,10 +1559,30 @@ async fn run_render_loop(
     let mut last_copy_menu: Option<CopyContextMenu> = None;
 
     loop {
+        // A bump landed while the last frame was being drawn: output is
+        // arriving faster than this loop renders.
+        let behind = pulse.has_changed().unwrap_or(false);
         tokio::select! {
             _ = cancel.cancelled() => break,
-            _ = &mut pulse_listener => {
-                pulse_listener = Box::pin(pulse.notified());
+            changed = pulse.changed() => {
+                // Unreachable while `PaneIoState` lives; never spin on it.
+                if changed.is_err() {
+                    break;
+                }
+                // Every loop wakes on every pane's output, so a flood would
+                // have each one composite under the `io_state` lock as fast
+                // as it can. Bumps that land meanwhile coalesce.
+                if behind
+                    && let Some(next) = last_frame.map(|at| at + MIN_FRAME_INTERVAL)
+                    && next > tokio::time::Instant::now()
+                {
+                    #[expect(clippy::disallowed_methods, reason = "paces frames; never synchronises a test")]
+                    let pace = tokio::time::sleep_until(next);
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        _ = pace => {}
+                    }
+                }
             }
             _ = &mut cfg_listener => {
                 cfg_listener = Box::pin(cfg_notify.notified());
@@ -1559,6 +1592,8 @@ async fn run_render_loop(
             }
             _ = tick.tick() => {}
         }
+
+        last_frame = Some(tokio::time::Instant::now());
 
         // Resize from authoritative client_size, NOT from VT grid (which
         // would create a self-feeding shrink loop in split mode).
@@ -1913,6 +1948,10 @@ async fn run_render_loop(
 /// ~10.7 MiB, comfortably inside the codec's 16 MiB frame cap with room for the
 /// JSON envelope.
 const RENDER_PART_BYTES: usize = 8 * 1024 * 1024;
+
+/// The shortest gap between two frames of one client while output arrives
+/// faster than it renders. Output after an idle wait draws at once.
+const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 /// How long the first-attach welcome toast stays on screen before
 /// auto-dismissing. Tuned for "long enough to read, short enough to
@@ -3558,11 +3597,14 @@ async fn split(
         }
     };
 
-    let prior = crate::pane_spawn::SplitUndo::capture(graph, attached.active_pane_id);
-
-    let new_pane = graph
-        .split_pane(attached.active_pane_id, direction, 0.5)
-        .await?;
+    let (new_pane, prior) = crate::pane_spawn::split_noting_undo(
+        graph,
+        attached.active_pane_id,
+        direction,
+        0.5,
+        Vec::new(),
+    )
+    .await?;
 
     // A PTY that never started is not a pane: left in the graph it is focused,
     // drawn, and answers "pane VT not found" to every later verb. A default
@@ -3765,7 +3807,7 @@ async fn cleanup_pane_io(io_state: &Arc<Mutex<PaneIoState>>, pane_ids: &[PaneId]
     let mut state = io_state.lock().await;
     let pulse = state.teardown_panes(pane_ids, true);
     drop(state);
-    pulse.notify_one();
+    pulse.bump();
 }
 
 async fn new_window(
@@ -3783,17 +3825,16 @@ async fn new_window(
         .map(|s| s.windows.len())
         .unwrap_or(0);
     let title = format!("window-{}", count + 1);
-    let window_id = graph
-        .create_window(attached.session_id, title, cwd.clone())
-        .await
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    // The graph's create_window also creates an initial pane.
-    let snap = graph.snapshot();
-    let win = snap
-        .windows
-        .get(&window_id)
-        .ok_or_else(|| anyhow::anyhow!("window vanished after create"))?;
-    let pane_id = win.active_pane;
+    let created = crate::pane_spawn::create_window_noting_focus(
+        graph,
+        attached.session_id,
+        Some(title),
+        cwd.clone(),
+        Vec::new(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let (window_id, pane_id) = (created.window, created.pane);
     // A window whose only pane never started is not a window. Discarding this
     // left one in the graph and then focused it, so the attach UI switched to
     // a window that could never render — same contract the `window.create` RPC
@@ -3811,7 +3852,7 @@ async fn new_window(
     )
     .await
     {
-        let _ = graph.destroy_window(window_id, None).await;
+        crate::pane_spawn::undo_window_create(graph, created).await;
         return Err(
             anyhow::anyhow!("{}", crate::pane_spawn::spawn_failure_message(&e))
                 .context(crate::pane_spawn::spawn_failure_notice(&e)),
@@ -4229,6 +4270,79 @@ mod tests {
 
         cancel.cancel();
         task.abort();
+    }
+
+    /// A bump that lands while a frame is being drawn is drawn next, even with
+    /// no tick to fall back on: the loop's receiver outlives the iteration.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_bump_during_a_frame_is_drawn_by_the_next_one() {
+        let fixture = attach_fixture().await;
+        let onboarding = crate::onboarding::OnboardingHandle::from_state_for_test(
+            crate::onboarding::OnboardingState {
+                prefix_discovered: true,
+                welcome_toast_seen: true,
+            },
+        );
+        let held = onboarding.hold_for_test().await;
+        let pulse = fixture.io_state.lock().await.render_pulse.clone();
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = fixture.cancel.child_token();
+        let render = tokio::spawn(run_render_loop(
+            fixture.graph.clone(),
+            fixture.io_state.clone(),
+            test_config(),
+            SegmentCache::new(),
+            crate::session_meta::SessionMetaCache::new(),
+            onboarding.clone(),
+            std::time::Instant::now(),
+            Arc::new(Mutex::new(fixture.attached.clone())),
+            Arc::new(Mutex::new((100, 24))),
+            tx,
+            cancel.clone(),
+            false,
+            Duration::from_secs(3600),
+        ));
+
+        // The prelude follows the subscription, so from here the only
+        // `io_state` holder is the first frame, stuck reading `onboarding`
+        // after it took the graph snapshot.
+        tokio::time::timeout(shux_testkit::BUDGET, rx.recv())
+            .await
+            .expect("prelude timeout")
+            .expect("prelude");
+        let io_state = fixture.io_state.clone();
+        shux_testkit::wait_until_async("the first frame to hold io_state", || {
+            let io_state = io_state.clone();
+            async move { io_state.try_lock().is_err() }
+        })
+        .await;
+        fixture
+            .graph
+            .rename_window(fixture.first_window, format!("MA{}RK", ""), None)
+            .await
+            .expect("rename window");
+        pulse.bump();
+        drop(held);
+
+        let mut screen = shux_vt::VirtualTerminal::new(24, 100);
+        let deadline = tokio::time::Instant::now() + shux_testkit::BUDGET;
+        let drew = loop {
+            if screen.capture_text(None).contains("MARK") {
+                break true;
+            }
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(AttachServerFrame::Render { data })) => {
+                    screen.process(&BASE64.decode(data).expect("render base64"));
+                }
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break false,
+            }
+        };
+        assert!(drew, "a bump that landed mid-frame was never drawn");
+
+        cancel.cancel();
+        render.await.expect("render loop");
+        fixture.stop();
     }
 
     async fn attach_fixture() -> AttachFixture {
