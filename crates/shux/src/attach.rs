@@ -927,6 +927,7 @@ async fn run_attach_loop(
             render_cancel,
             hello.graphics,
             fallback_tick(),
+            WELCOME_TOAST_DWELL,
         )
         .await;
     });
@@ -1527,6 +1528,7 @@ async fn run_render_loop(
     cancel: CancellationToken,
     graphics: bool,
     tick_period: Duration,
+    toast_dwell: Duration,
 ) {
     // Before anything else: a receiver starts at the current generation.
     let mut pulse = io_state.lock().await.render_pulse.subscribe();
@@ -1875,8 +1877,11 @@ async fn run_render_loop(
         };
         if let Some(menu) = attached.copy_menu {
             // A different menu forced a full redraw above.
-            let base_emitted = !compositor.inner().is_empty();
-            if sheet_due(&mut menu_sheet, sheet(String::new()), base_emitted) {
+            if sheet_due(
+                &mut menu_sheet,
+                sheet(String::new()),
+                !compositor.inner().is_empty(),
+            ) {
                 shux_ui::copy_mode::render_copy_menu_into(
                     compositor.inner_mut(),
                     menu.col,
@@ -1898,8 +1903,11 @@ async fn run_render_loop(
         // compositor's diff would skip those positions because they
         // didn't change in the VT grid.
         if attached.help_visible {
-            let base_emitted = !compositor.inner().is_empty();
-            if sheet_due(&mut help_sheet, sheet(prefix_label.clone()), base_emitted) {
+            if sheet_due(
+                &mut help_sheet,
+                sheet(prefix_label.clone()),
+                !compositor.inner().is_empty(),
+            ) {
                 shux_ui::render_help_overlay_into(
                     compositor.inner_mut(),
                     cols,
@@ -1914,16 +1922,16 @@ async fn run_render_loop(
 
         // Welcome toast (first-attach onboarding). Only fires when the
         // user has never seen it (per the onboarding state file).
-        // Dwells WELCOME_TOAST_DWELL after first render, then auto-
+        // Dwells `toast_dwell` after first render, then auto-
         // dismisses and marks seen on disk so the next attach is clean.
+        let mut toast_expired = false;
         if toast_up {
             let elapsed = welcome_toast_started
                 .get_or_insert_with(std::time::Instant::now)
                 .elapsed();
-            if elapsed < WELCOME_TOAST_DWELL {
-                let base_emitted = !compositor.inner().is_empty();
+            if elapsed < toast_dwell {
                 let stamp = sheet(format!("{prefix_label} {nerd_fonts}"));
-                if sheet_due(&mut toast_sheet, stamp, base_emitted) {
+                if sheet_due(&mut toast_sheet, stamp, !compositor.inner().is_empty()) {
                     render_welcome_toast(
                         compositor.inner_mut(),
                         cols,
@@ -1940,10 +1948,7 @@ async fn run_render_loop(
                 tokio::spawn(async move {
                     onb.mark_welcome_toast_seen().await;
                 });
-                {
-                    let mut s = session.lock().await;
-                    s.show_welcome_toast = false;
-                }
+                toast_expired = true;
                 compositor.force_redraw();
                 toast_drawn = false;
                 toast_sheet = None;
@@ -1961,6 +1966,11 @@ async fn run_render_loop(
         // Re-establish capacity for next frame.
         compositor.inner_mut().reserve(64 * 1024);
         drop(state);
+        // Only once `io_state` is released: the input task takes the session
+        // before `io_state`, so holding both the other way round deadlocks.
+        if toast_expired {
+            session.lock().await.show_welcome_toast = false;
+        }
 
         if !bytes.is_empty() {
             // Split rather than send whole: base64 inflates by 4/3 and the codec
@@ -4351,6 +4361,7 @@ mod tests {
             cancel.clone(),
             false,
             Duration::from_secs(3600),
+            WELCOME_TOAST_DWELL,
         ));
 
         let mut screen = shux_vt::VirtualTerminal::new(40, 100);
@@ -4444,6 +4455,7 @@ mod tests {
             cancel.clone(),
             false,
             Duration::from_secs(3600),
+            WELCOME_TOAST_DWELL,
         ));
 
         // The prelude follows the subscription, so from here the only
@@ -4482,6 +4494,78 @@ mod tests {
             }
         };
         assert!(drew, "a bump that landed mid-frame was never drawn");
+
+        cancel.cancel();
+        render.await.expect("render loop");
+        fixture.stop();
+    }
+
+    /// The frame that ends the welcome toast writes the session only after it
+    /// releases `io_state`. The input task takes the session and then
+    /// `io_state` when a key dismisses the toast, so a frame that held
+    /// `io_state` while waiting for the session froze every pane.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_frame_that_ends_the_welcome_toast_never_waits_for_the_session_holding_io_state() {
+        let fixture = attach_fixture().await;
+        let onboarding = crate::onboarding::OnboardingHandle::from_state_for_test(
+            crate::onboarding::OnboardingState {
+                prefix_discovered: true,
+                welcome_toast_seen: false,
+            },
+        );
+        let held = onboarding.hold_for_test().await;
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = fixture.cancel.child_token();
+        let mut attached = fixture.attached.clone();
+        attached.show_welcome_toast = true;
+        let session = Arc::new(Mutex::new(attached));
+        let render = tokio::spawn(run_render_loop(
+            fixture.graph.clone(),
+            fixture.io_state.clone(),
+            test_config(),
+            SegmentCache::new(),
+            crate::session_meta::SessionMetaCache::new(),
+            onboarding.clone(),
+            std::time::Instant::now(),
+            session.clone(),
+            Arc::new(Mutex::new((100, 24))),
+            tx,
+            cancel.clone(),
+            false,
+            Duration::from_secs(3600),
+            Duration::ZERO,
+        ));
+
+        tokio::time::timeout(shux_testkit::BUDGET, rx.recv())
+            .await
+            .expect("prelude timeout")
+            .expect("prelude");
+        let io_state = fixture.io_state.clone();
+        shux_testkit::wait_until_async("the first frame to hold io_state", || {
+            let io_state = io_state.clone();
+            async move { io_state.try_lock().is_err() }
+        })
+        .await;
+        // Where a key's dismissal would be: holding the session, about to
+        // want `io_state`.
+        let guard = session
+            .try_lock()
+            .expect("the frame holds the session while it holds io_state");
+        drop(held);
+        shux_testkit::wait_until_async(
+            "the toast-ending frame to release io_state while the session is held",
+            || {
+                let io_state = io_state.clone();
+                async move { io_state.try_lock().is_ok() }
+            },
+        )
+        .await;
+        drop(guard);
+        shux_testkit::wait_until_async("the toast to end in the session", || {
+            let session = session.clone();
+            async move { !session.lock().await.show_welcome_toast }
+        })
+        .await;
 
         cancel.cancel();
         render.await.expect("render loop");
@@ -5612,58 +5696,18 @@ mod tests {
             let fixture = attach_fixture().await;
             let (mut writer_rx, _resize_rx, _) =
                 seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
-            let temp = tempfile::tempdir().expect("tempdir");
-            let config = ConfigHandle::load_or_default(&temp.path().join("missing.toml"));
             let onboarding = crate::onboarding::OnboardingHandle::from_state_for_test(
                 crate::onboarding::OnboardingState {
                     prefix_discovered: true,
                     welcome_toast_seen: false,
                 },
             );
-            let (server_stream, client_stream) = UnixStream::pair().expect("unix pair");
-            let server_cancel = fixture.cancel.child_token();
-            let server = tokio::spawn(handle_attach_connection(
-                server_stream,
-                fixture.graph.clone(),
-                fixture.io_state.clone(),
-                config,
-                SegmentCache::new(),
-                crate::session_meta::SessionMetaCache::new(),
-                onboarding.clone(),
-                std::time::Instant::now(),
-                server_cancel.clone(),
-            ));
-            let mut framed = Framed::new(client_stream, create_codec());
-            let hello = AttachHello {
-                protocol: ATTACH_PROTOCOL_VERSION,
-                session_name: Some(fixture.attached.name.clone()),
-                cols: 90,
-                rows: 24,
-                client_version: "test".to_string(),
-                graphics: false,
-            };
-            let send = |frame: &AttachClientFrame| {
-                Bytes::from(serde_json::to_vec(frame).expect("frame json"))
-            };
-            framed
-                .send(Bytes::from(serde_json::to_vec(&hello).expect("hello json")))
-                .await
-                .expect("send hello");
-            tokio::time::timeout(shux_testkit::BUDGET, framed.next())
-                .await
-                .expect("ready timeout")
-                .expect("ready frame")
-                .expect("ready bytes");
+            let mut client = Client::attach_onboarded(&fixture, 90, onboarding.clone()).await;
 
-            framed.send(send(&first)).await.expect("send first key");
+            client.send(&first).await;
             // Frames are handled in order, so the pane receiving this proves
             // the first one was handled.
-            framed
-                .send(send(&AttachClientFrame::Input {
-                    data: BASE64.encode(b"x"),
-                }))
-                .await
-                .expect("send sync input");
+            client.key(b"x").await;
             loop {
                 let written = tokio::time::timeout(shux_testkit::BUDGET, writer_rx.recv())
                     .await
@@ -5678,9 +5722,7 @@ mod tests {
                 "{first:?} left the welcome toast up"
             );
 
-            drop(framed);
-            server_cancel.cancel();
-            let _ = tokio::time::timeout(shux_testkit::BUDGET, server).await;
+            client.stop().await;
             fixture.stop();
         }
     }
@@ -7486,6 +7528,14 @@ mod tests {
                     welcome_toast_seen: true,
                 },
             );
+            Self::attach_onboarded(fixture, cols, onboarding).await
+        }
+
+        async fn attach_onboarded(
+            fixture: &AttachFixture,
+            cols: u16,
+            onboarding: crate::onboarding::OnboardingHandle,
+        ) -> Self {
             let (server_stream, client_stream) = tokio::io::duplex(1 << 20);
             let cancel = fixture.cancel.child_token();
             let server = tokio::spawn(handle_attach_connection(
