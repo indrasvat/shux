@@ -493,25 +493,43 @@ fn unix_ms(t: SystemTime) -> u64 {
 /// `.<n>` when that name is taken. Linking first never replaces an
 /// existing file, as a rename would.
 fn preserve_corrupt_registry(path: &Path, now: SystemTime) -> std::io::Result<PathBuf> {
+    preserve_corrupt_registry_with(path, now, |from, to| std::fs::hard_link(from, to))
+}
+
+fn preserve_corrupt_registry_with(
+    path: &Path,
+    now: SystemTime,
+    link: impl Fn(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<PathBuf> {
+    use std::io::ErrorKind;
     let stamp = unix_ms(now);
-    for n in 0..1000u32 {
+    let mut n = 0u64;
+    loop {
         let corrupt = match n {
             0 => path.with_extension(format!("json.corrupt.{stamp}")),
             n => path.with_extension(format!("json.corrupt.{stamp}.{n}")),
         };
-        match std::fs::hard_link(path, &corrupt) {
+        match link(path, &corrupt) {
             Ok(()) => {
-                std::fs::remove_file(path)?;
-                return Ok(corrupt);
+                return match std::fs::remove_file(path) {
+                    Err(e) if e.kind() != ErrorKind::NotFound => Err(e),
+                    _ => Ok(corrupt),
+                };
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+            // No hard link here: rename onto a name seen free. The daemon's
+            // instance lock makes it the only writer of these names.
+            Err(_) => match std::fs::symlink_metadata(&corrupt) {
+                Ok(_) => {}
+                Err(e) if e.kind() == ErrorKind::NotFound => {
+                    std::fs::rename(path, &corrupt)?;
+                    return Ok(corrupt);
+                }
+                Err(e) => return Err(e),
+            },
         }
+        n += 1;
     }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        "every corrupt-evidence name for this millisecond is taken",
-    ))
 }
 
 // ── process start-time token (LENS-R-044 "start time matches") ──────────
@@ -783,7 +801,7 @@ impl ScratchRegistry {
     ///   unrelated NEW group inside the restart window — same class as
     ///   the §17 M14 double-fork tolerance, documented in the task file.
     ///
-    /// Corrupt file (codex B2): preserved as `<path>.corrupt.<unix_ms>`
+    /// Corrupt file (codex B2): preserved as `<path>.corrupt.<unix_ms>[.<n>]`
     /// (timestamped so repeated corrupt startups never overwrite earlier
     /// evidence — P5 round-2 codex minor), logged at ERROR, never silently
     /// deleted; nothing is killed.
@@ -2192,6 +2210,54 @@ mod tests {
 
     /// Two corrupt startups in the same millisecond, or a clock stepped back
     /// onto one already used, must still keep both files.
+    /// Where link(2) is refused (no hard links on the filesystem, or a
+    /// registry another uid owns under protected_hardlinks) the evidence is
+    /// still moved aside, never left for the next persist to overwrite.
+    #[test]
+    fn corrupt_evidence_survives_a_filesystem_without_hard_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scratch-registry.json");
+        let now = SystemTime::now();
+        let eperm = |_: &Path, _: &Path| Err(std::io::Error::from_raw_os_error(nix::libc::EPERM));
+        std::fs::write(&path, "{first").unwrap();
+        let first = preserve_corrupt_registry_with(&path, now, eperm)
+            .expect("a filesystem that refuses link(2) left the evidence in place");
+        std::fs::write(&path, "{second").unwrap();
+        let second = preserve_corrupt_registry_with(&path, now, eperm).unwrap();
+        assert_ne!(first, second, "the fallback reused a taken name");
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "{first");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "{second");
+        assert!(!path.exists(), "the corrupt registry was not moved aside");
+    }
+
+    /// Evidence linked aside counts as preserved even if the original is gone
+    /// by the time it is unlinked.
+    #[test]
+    fn evidence_linked_then_original_vanished_is_reported_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scratch-registry.json");
+        std::fs::write(&path, "{evidence").unwrap();
+        let link_then_vanish = |a: &Path, b: &Path| {
+            std::fs::hard_link(a, b)?;
+            std::fs::remove_file(a)
+        };
+        let kept = preserve_corrupt_registry_with(&path, SystemTime::now(), link_then_vanish)
+            .expect("evidence was linked aside but reported as not preserved");
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), "{evidence");
+    }
+
+    /// A clock stuck on one millisecond still never runs out of names.
+    #[test]
+    fn a_stuck_clock_never_runs_out_of_evidence_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scratch-registry.json");
+        for i in 0..1001 {
+            std::fs::write(&path, format!("{{{i}")).unwrap();
+            preserve_corrupt_registry(&path, UNIX_EPOCH)
+                .unwrap_or_else(|e| panic!("corrupt startup {i} lost its evidence: {e}"));
+        }
+    }
+
     #[test]
     fn corrupt_evidence_is_never_overwritten_by_a_same_millisecond_startup() {
         let dir = tmpdir();
