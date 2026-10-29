@@ -3524,12 +3524,15 @@ async fn split(
         }
     };
 
-    let prior = crate::pane_spawn::SplitUndo::capture(graph, attached.active_pane_id);
-
-    let new_pane = graph
-        .split_pane(attached.active_pane_id, direction, 0.5)
-        .await
-        .map_err(|e| anyhow::anyhow!("split failed: {e}"))?;
+    let (new_pane, prior) = crate::pane_spawn::split_noting_undo(
+        graph,
+        attached.active_pane_id,
+        direction,
+        0.5,
+        Vec::new(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("split failed: {e}"))?;
 
     // A PTY that never started is not a pane: left in the graph it is focused,
     // drawn, and answers "pane VT not found" to every later verb. A default
@@ -3753,17 +3756,16 @@ async fn new_window(
         .map(|s| s.windows.len())
         .unwrap_or(0);
     let title = format!("window-{}", count + 1);
-    let window_id = graph
-        .create_window(attached.session_id, title, cwd.clone())
-        .await
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    // The graph's create_window also creates an initial pane.
-    let snap = graph.snapshot();
-    let win = snap
-        .windows
-        .get(&window_id)
-        .ok_or_else(|| anyhow::anyhow!("window vanished after create"))?;
-    let pane_id = win.active_pane;
+    let created = crate::pane_spawn::create_window_noting_focus(
+        graph,
+        attached.session_id,
+        Some(title),
+        cwd.clone(),
+        Vec::new(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let (window_id, pane_id) = (created.window, created.pane);
     // A window whose only pane never started is not a window. Discarding this
     // left one in the graph and then focused it, so the attach UI switched to
     // a window that could never render — same contract the `window.create` RPC
@@ -3781,7 +3783,7 @@ async fn new_window(
     )
     .await
     {
-        let _ = graph.destroy_window(window_id, None).await;
+        crate::pane_spawn::undo_window_create(graph, created).await;
         return Err(anyhow::anyhow!(
             "{}",
             crate::pane_spawn::spawn_failure_message(&e)

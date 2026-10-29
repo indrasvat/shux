@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 
 use crate::pane_command;
 use crate::pane_io::PaneIoState;
-use crate::pane_spawn::{SplitUndo, spawn_failure, spawn_pane_pty, undo_split};
+use crate::pane_spawn::{spawn_failure, spawn_pane_pty, split_noting_undo, undo_split};
 use crate::rpc::convert::{graph_error_to_rpc, pane_to_json};
 use crate::rpc::params::{
     parse_expected_version, required_str, resolve_pane_id_from_params, resolve_pane_ref,
@@ -107,15 +107,13 @@ pub(crate) fn register_pane_methods(
                         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"))
                     });
 
-                let prior = SplitUndo::capture(&gh, pane_id);
-
                 // `_with_command` persists the argv on the new pane, so
                 // `pane list` and the `PaneCreated` event report what is
                 // really running instead of a blank.
-                let new_pane_id = gh
-                    .split_pane_with_command(pane_id, direction, ratio, command.clone())
-                    .await
-                    .map_err(graph_error_to_rpc)?;
+                let (new_pane_id, prior) =
+                    split_noting_undo(&gh, pane_id, direction, ratio, command.clone())
+                        .await
+                        .map_err(graph_error_to_rpc)?;
 
                 // A PTY that never started is not a pane. Discarding this
                 // error left a phantom in the graph — `pane list` showed it

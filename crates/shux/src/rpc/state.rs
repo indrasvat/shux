@@ -136,36 +136,38 @@ pub(crate) fn register_state_methods(
                         let state = io.lock().await;
                         state.vts.keys().copied().collect()
                     };
-                    let snap = gh.snapshot();
-                    let mut rescue = Vec::new();
-                    for pane_id in &dead {
-                        let Some(window_id) = snap.panes.get(pane_id).map(|p| p.window_id) else {
-                            continue;
-                        };
-                        let Some(window) = snap.windows.get(&window_id) else {
-                            continue;
-                        };
-                        if window.active_pane != *pane_id {
-                            continue;
-                        }
-                        // Layout order, not `HashMap` order: iterating the pane
-                        // map gave a different answer run to run, so a script
-                        // that applied a template and then used the focused pane
-                        // targeted a different one each time.
-                        if let Some(answering) = window
-                            .layout
-                            .tree
-                            .pane_ids()
-                            .into_iter()
-                            .find(|id| usable.contains(id))
-                        {
-                            rescue.push(answering);
-                        }
-                    }
-                    drop(snap);
-                    for pane in rescue {
-                        let _ = gh.focus_pane(pane).await;
-                    }
+                    // Read and refocus in one step, so a focus that landed
+                    // since the batch is seen and kept.
+                    let _ = gh
+                        .atomically(move |g| {
+                            for pane_id in &dead {
+                                let snap = g.current();
+                                let Some(window_id) = snap.panes.get(pane_id).map(|p| p.window_id)
+                                else {
+                                    continue;
+                                };
+                                let Some(window) = snap.windows.get(&window_id) else {
+                                    continue;
+                                };
+                                if window.active_pane != *pane_id {
+                                    continue;
+                                }
+                                // Layout order, not `HashMap` order: iterating the pane
+                                // map gave a different answer run to run, so a script
+                                // that applied a template and then used the focused pane
+                                // targeted a different one each time.
+                                if let Some(answering) = window
+                                    .layout
+                                    .tree
+                                    .pane_ids()
+                                    .into_iter()
+                                    .find(|id| usable.contains(id))
+                                {
+                                    let _ = g.focus_pane(answering);
+                                }
+                            }
+                        })
+                        .await;
                 }
 
                 result.spawn_results = spawn_results;
