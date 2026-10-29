@@ -55,6 +55,17 @@ fn run_gate(
     golden_dir: Option<&Path>,
     argv_override: &[&str],
 ) -> GateRun {
+    run_gate_with(h, dir, scenario_toml, golden_dir, argv_override, &[])
+}
+
+fn run_gate_with(
+    h: &Harness,
+    dir: &Path,
+    scenario_toml: &str,
+    golden_dir: Option<&Path>,
+    argv_override: &[&str],
+    env: &[(&str, &str)],
+) -> GateRun {
     let scenario_path = dir.join(format!("scn-{}.toml", lens_common::unique()));
     std::fs::write(&scenario_path, scenario_toml).unwrap();
     let trace_path = dir.join(format!("trace-{}.ndjson", lens_common::unique()));
@@ -73,7 +84,12 @@ fn run_gate(
         args.extend_from_slice(argv_override);
     }
 
-    let out = h.cli(&args);
+    let out = h
+        .shux()
+        .args(&args)
+        .envs(env.iter().copied())
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run shux {args:?}: {e}"));
     let trace = std::fs::read_to_string(&trace_path).unwrap_or_default();
     let signals = trace
         .lines()
@@ -611,7 +627,14 @@ timeout_ms = 30000
     );
     let run = std::thread::scope(|s| {
         s.spawn(|| lens_common::release_after_compare(d.path(), &fifo));
-        run_gate(&h, d.path(), &scn, Some(golden.path()), &[])
+        run_gate_with(
+            &h,
+            d.path(),
+            &scn,
+            Some(golden.path()),
+            &[],
+            &[lens_common::HELD_POST_COMPARE_GRACE],
+        )
     });
     let ce = run.find("child_exit").unwrap_or_else(|| {
         panic!(

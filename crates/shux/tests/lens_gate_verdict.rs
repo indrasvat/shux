@@ -33,8 +33,12 @@ impl Gate {
 
 /// Run `shux lens gate <args...>` with an optional CI flag; capture streams + exit.
 fn gate(h: &Harness, args: &[&str], ci: bool) -> Gate {
+    gate_with(h, args, ci, &[])
+}
+
+fn gate_with(h: &Harness, args: &[&str], ci: bool, env: &[(&str, &str)]) -> Gate {
     let mut cmd = h.shux();
-    cmd.args(["lens", "gate"]);
+    cmd.args(["lens", "gate"]).envs(env.iter().copied());
     cmd.args(args);
     if ci {
         cmd.env("CI", "true");
@@ -55,7 +59,7 @@ fn gate_released(h: &Harness, dir: &Path, fifo: &Path, golden_dir: &str, scn: &s
     let trace = dir.join("trace.ndjson").to_string_lossy().into_owned();
     std::thread::scope(|s| {
         s.spawn(|| lens_common::release_after_compare(dir, fifo));
-        gate(
+        gate_with(
             h,
             &[
                 "--report",
@@ -67,6 +71,7 @@ fn gate_released(h: &Harness, dir: &Path, fifo: &Path, golden_dir: &str, scn: &s
                 scn,
             ],
             false,
+            &[lens_common::HELD_POST_COMPARE_GRACE],
         )
     })
 }
@@ -451,7 +456,7 @@ ms = 4000
     let trace = d.path().join("trace.ndjson").to_string_lossy().into_owned();
     let out = std::thread::scope(|s| {
         s.spawn(|| lens_common::release_after_compare(d.path(), &fifo));
-        gate(
+        gate_with(
             &h,
             &[
                 "--on-missing",
@@ -467,6 +472,7 @@ ms = 4000
                 &scn,
             ],
             false,
+            &[lens_common::HELD_POST_COMPARE_GRACE],
         )
     });
     assert_ne!(

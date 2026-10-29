@@ -801,6 +801,11 @@ pub fn make_fifo(dir: &Path) -> PathBuf {
     fifo
 }
 
+/// Holds the gate's post-compare exit window open for [`BUDGET`]: set it on a
+/// gate whose child [`release_after_compare`] lets go, so the release can take
+/// as long as a loaded machine needs. The window still ends at the child's exit.
+pub const HELD_POST_COMPARE_GRACE: (&str, &str) = ("SHUX_LENS_POST_COMPARE_GRACE_MS", "30000");
+
 /// Unblock the child parked on `fifo` once a `trace*` file in `dir` records a
 /// golden compare, so the child's exit can only land AFTER the compare. The
 /// fifo is written either way so a run that never compares still ends.

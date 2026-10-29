@@ -38,6 +38,17 @@ const RESOURCE_EXHAUSTED: i64 = -32012;
 /// heuristic window; a robust liveness monitor (catch any exit before the deadline without
 /// penalizing a held-forever frame) is task 083's settle-hardening domain.
 const POST_COMPARE_GRACE_MS: u64 = 2000;
+/// Overrides [`POST_COMPARE_GRACE_MS`]. A test whose child exits on a signal it
+/// sends holds the window open with it, so a loaded machine cannot outlast it.
+pub const POST_COMPARE_GRACE_ENV: &str = "SHUX_LENS_POST_COMPARE_GRACE_MS";
+
+fn post_compare_grace() -> Duration {
+    let ms = std::env::var(POST_COMPARE_GRACE_ENV)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(POST_COMPARE_GRACE_MS);
+    Duration::from_millis(ms)
+}
 
 /// Where the NDJSON trace goes (design D3). `None` = no trace emitted.
 pub enum TraceTarget {
@@ -666,8 +677,7 @@ pub async fn drive_scenario(
         )
     });
     if !stopped && !child_consumed && !exit_reported {
-        let grace = Duration::from_millis(POST_COMPARE_GRACE_MS)
-            .min(deadline.saturating_duration_since(Instant::now()));
+        let grace = post_compare_grace().min(deadline.saturating_duration_since(Instant::now()));
         if let Ok(code) = tokio::time::timeout(grace, monitor.wait()).await {
             // A CLEAN exit-0 AFTER a successful compare is a healthy shutdown, not a crash —
             // the frame was already held long enough to capture + compare, so a graceful
