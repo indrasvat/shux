@@ -12,6 +12,8 @@ libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
 shux-program-status = { path = "../crates/shux-program-status" }
 shux-vt = { path = "../crates/shux-vt" }
+shux-core = { path = "../crates/shux-core" }
+shux-ui = { path = "../crates/shux-ui" }
 
 # Its own workspace: the fuzz crate needs a nightly toolchain and must never
 # join the stable workspace build.
@@ -50,6 +52,13 @@ bench = false
 [[bin]]
 name = "vt_program_status_stream"
 path = "fuzz_targets/vt_program_status_stream.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pane_grid_cell"
+path = "fuzz_targets/pane_grid_cell.rs"
 test = false
 doc = false
 bench = false

@@ -19,6 +19,8 @@
 //! their cursor mapping through [`pane_view_row_offset`], so content and cursor
 //! never disagree and the two render paths stay consistent.
 
+use shux_core::layout::Rect;
+
 /// The index of the first pane-grid row to display when the grid is composited
 /// into a rect `visible_rows` tall, given the pane cursor's row.
 ///
@@ -53,6 +55,37 @@ pub fn pane_view_row_offset(total_rows: usize, visible_rows: usize, cursor_row: 
         // Clamp so a cursor past the grid's end (defensive) never overruns.
         (cursor_row + 1 - visible_rows).min(max_offset)
     }
+}
+
+/// The 1-based grid cell a pointer at screen `(col, row)` names in `vt`'s pane
+/// drawn at `rect`, through the same row offset `compose_pane` draws it with.
+/// Columns are left-anchored, as drawn.
+///
+/// `None` when the point is on no grid cell shown there. `clamp` instead pins
+/// it onto the nearest shown cell, for a gesture already underway that must
+/// still deliver its release.
+pub fn pane_grid_cell(
+    rect: Rect,
+    vt: &shux_vt::VirtualTerminal,
+    (col, row): (u16, u16),
+    clamp: bool,
+) -> Option<(u16, u16)> {
+    let grid = vt.grid();
+    let offset = pane_view_row_offset(grid.rows(), rect.height.into(), vt.cursor().row);
+    let shown_rows = grid.rows().saturating_sub(offset).min(rect.height.into());
+    let shown_cols = grid.cols().min(rect.width.into());
+    if shown_rows == 0 || shown_cols == 0 {
+        return None;
+    }
+    let x = usize::from(col.saturating_sub(rect.x));
+    let y = usize::from(row.saturating_sub(rect.y));
+    let on_grid = col >= rect.x && row >= rect.y && x < shown_cols && y < shown_rows;
+    if !on_grid && !clamp {
+        return None;
+    }
+    let x = x.min(shown_cols - 1) + 1;
+    let y = offset + y.min(shown_rows - 1) + 1;
+    Some((u16::try_from(x).ok()?, u16::try_from(y).ok()?))
 }
 
 #[cfg(test)]
@@ -109,5 +142,133 @@ mod tests {
         assert_eq!(pane_view_row_offset(10, 1, 5), 5);
         assert_eq!(pane_view_row_offset(10, 1, 9), 9);
         assert_eq!(pane_view_row_offset(10, 1, 100), 9, "clamped to last row");
+    }
+
+    /// Every screen point, across grids taller, shorter and narrower than
+    /// their rect: the cell `pane_grid_cell` names holds exactly the character
+    /// the attached client sees there, and a point it rejects shows none.
+    #[test]
+    fn pane_grid_cell_names_the_cell_the_compositor_drew() {
+        use super::pane_grid_cell;
+        use crate::BorderStyle;
+        use crate::compositor::{
+            CompositorConfig, MultiPaneFrame, RenderCompositor, pane_viewport,
+        };
+        use shux_core::layout::{Direction, LayoutNode, Rect};
+        use shux_core::model::PaneId;
+        use shux_vt::VirtualTerminal;
+        use std::collections::HashMap;
+
+        // Distinct for any row error smaller than 94 rows.
+        let sym = |r: usize, c: usize| char::from(33 + ((r * 31 + c) % 94) as u8);
+        let (other, pane) = (PaneId::new(), PaneId::new());
+        let layouts = [
+            LayoutNode::leaf(pane),
+            LayoutNode::split(
+                Direction::Vertical,
+                0.5,
+                LayoutNode::leaf(other),
+                LayoutNode::leaf(pane),
+            ),
+            LayoutNode::split(
+                Direction::Horizontal,
+                0.5,
+                LayoutNode::leaf(other),
+                LayoutNode::leaf(pane),
+            ),
+        ];
+        let filler = VirtualTerminal::new(2, 2);
+        let mut checked = 0usize;
+        for (w, h) in [(17u16, 9u16), (12, 12), (30, 6)] {
+            for style in [BorderStyle::Rounded, BorderStyle::None] {
+                for layout in &layouts {
+                    for (rows, cols) in [(1usize, 1usize), (3, 5), (7, 30), (13, 4), (20, 20)] {
+                        for cursor in [0, rows / 2, rows - 1] {
+                            let mut vt = VirtualTerminal::new(rows, cols);
+                            for r in 0..rows {
+                                let line: String = (0..cols).map(|c| sym(r, c)).collect();
+                                vt.process(format!("\x1b[{};1H{line}", r + 1).as_bytes());
+                            }
+                            vt.process(format!("\x1b[{};1H", cursor + 1).as_bytes());
+                            let mut vts = HashMap::new();
+                            vts.insert(pane, &vt);
+                            vts.insert(other, &filler);
+                            let config = CompositorConfig {
+                                status_bar_height: 1,
+                                border_style: style,
+                                ..CompositorConfig::default()
+                            };
+                            let mut comp = RenderCompositor::new(w, h, Vec::new(), config);
+                            comp.render_multi_pane(MultiPaneFrame {
+                                layout,
+                                zoom: None,
+                                focused: pane,
+                                vts: &vts,
+                                chrome: None,
+                                status_bar: None,
+                            })
+                            .unwrap();
+                            let mut screen = VirtualTerminal::new(h.into(), w.into());
+                            screen.process(comp.inner());
+                            let seen = |x: u16, y: u16| {
+                                screen.grid().visible_row(y.into())[usize::from(x)].ch
+                            };
+                            let content = Rect::new(0, 0, w, h - 1);
+                            let Some((_, rect)) = layout
+                                .compute_rects(pane_viewport(content, style, false))
+                                .into_iter()
+                                .find(|(pid, _)| *pid == pane)
+                            else {
+                                continue;
+                            };
+                            let ctx = format!(
+                                "{w}x{h} {style:?} grid {rows}x{cols} cursor {cursor} {rect:?}"
+                            );
+                            for y in 0..h {
+                                for x in 0..w {
+                                    let inside = x >= rect.x
+                                        && x < rect.x + rect.width
+                                        && y >= rect.y
+                                        && y < rect.y + rect.height;
+                                    let exact = pane_grid_cell(rect, &vt, (x, y), false);
+                                    match exact {
+                                        Some((c, r)) => {
+                                            assert!(inside, "{ctx}: ({x},{y}) is outside the rect");
+                                            assert_eq!(
+                                                seen(x, y),
+                                                sym(usize::from(r) - 1, usize::from(c) - 1),
+                                                "{ctx}: ({x},{y}) named grid cell ({c},{r})"
+                                            );
+                                        }
+                                        None if inside => assert_eq!(
+                                            seen(x, y),
+                                            ' ',
+                                            "{ctx}: ({x},{y}) shows a grid cell but maps to none"
+                                        ),
+                                        None => {}
+                                    }
+                                    let pinned = pane_grid_cell(rect, &vt, (x, y), true)
+                                        .unwrap_or_else(|| panic!("{ctx}: clamp found no cell"));
+                                    if let Some(exact) = exact {
+                                        assert_eq!(pinned, exact, "{ctx}: ({x},{y})");
+                                    }
+                                    let off =
+                                        pane_view_row_offset(rows, rect.height.into(), cursor);
+                                    let (c, r) = (pinned.0 - 1, usize::from(pinned.1) - 1);
+                                    let at = (rect.x + c, rect.y + u16::try_from(r - off).unwrap());
+                                    assert_eq!(
+                                        seen(at.0, at.1),
+                                        sym(r, c.into()),
+                                        "{ctx}: ({x},{y}) pinned to a cell not shown"
+                                    );
+                                    checked += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 40_000, "the sweep covered only {checked} points");
     }
 }

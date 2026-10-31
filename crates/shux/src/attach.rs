@@ -2950,14 +2950,18 @@ async fn handle_app_mouse(
     if !inside && matches!(*gesture, SelectionDrag::None) {
         return Ok(AppMouse::NotHandled);
     }
-    let local_col = col
-        .saturating_sub(rect.x)
-        .min(rect.width.saturating_sub(1))
-        .saturating_add(1);
-    let local_row = row
-        .saturating_sub(rect.y)
-        .min(rect.height.saturating_sub(1))
-        .saturating_add(1);
+    let cell = {
+        let state = io_state.lock().await;
+        state.vts.get(&pane_id).and_then(|vt| {
+            let underway = !matches!(*gesture, SelectionDrag::None);
+            shux_ui::viewport::pane_grid_cell(rect, vt, (col, row), underway)
+        })
+    };
+    let Some((local_col, local_row)) = cell else {
+        // Inside the pane but on no cell the app has: nothing truthful to send.
+        end_gesture_if_released(gesture, action, button);
+        return Ok(AppMouse::Consumed { redraw: false });
+    };
 
     let Some(cb) = button_cb(action, button, alt, ctrl) else {
         // No truthful report exists for a buttonless press or release, but a
@@ -3209,7 +3213,7 @@ async fn handle_wheel(
     // Snapshot the target pane's live mode state + scrollback depth. A pane shux
     // cannot encode for is treated as not mouse-aware, so the wheel falls back
     // to shux's own scrollback. See `coords_are_encodable`.
-    let (mouse_on, sgr, alt, alt_scroll, app_cursor, total_lines) = {
+    let (mouse_on, sgr, alt, alt_scroll, app_cursor, total_lines, cell) = {
         let state = io_state.lock().await;
         match state.vts.get(&pane_id) {
             Some(vt) => {
@@ -3221,26 +3225,21 @@ async fn handle_wheel(
                     m.alternate_scroll,
                     m.application_cursor_keys,
                     vt.presented_total_lines(),
+                    shux_ui::viewport::pane_grid_cell(rect, vt, (col, row), false),
                 )
             }
-            None => (false, false, false, true, false, rect.height as usize),
+            None => (false, false, false, true, false, rect.height as usize, None),
         }
     };
 
     match route_wheel(mouse_on, alt, alt_scroll) {
         WheelRouting::ForwardMouse => {
-            let local_col = col
-                .saturating_sub(rect.x)
-                .min(rect.width.saturating_sub(1))
-                .saturating_add(1);
-            let local_row = row
-                .saturating_sub(rect.y)
-                .min(rect.height.saturating_sub(1))
-                .saturating_add(1);
-            // `None` means the tick cannot be encoded truthfully for this
-            // app's coordinate mode; sending nothing beats sending a tick
-            // aimed at a cell the user never touched.
-            if let Some(bytes) = encode_mouse_wheel(up, sgr, local_col, local_row) {
+            // No grid cell under the pointer, or no truthful encoding for this
+            // app's coordinate mode: sending nothing beats a tick aimed at a
+            // cell the user never touched.
+            if let Some(bytes) = cell.and_then(|(local_col, local_row)| {
+                encode_mouse_wheel(up, sgr, local_col, local_row)
+            }) {
                 forward_bytes_to_pane(io_state, pane_id, bytes, Lane::Main).await;
             }
         }
@@ -5726,7 +5725,8 @@ mod tests {
         let (writer_tx, writer_rx) = crate::pane_input::channel_with(64, crate::pane_input::BUDGET);
         let (resize_tx, _resize_rx) = mpsc::channel(8);
         let shutdown = CancellationToken::new();
-        let mut vt = shux_vt::VirtualTerminal::new(28, 49);
+        // Fits the harness pane's 27-row rect, as an attach sizes a real PTY.
+        let mut vt = shux_vt::VirtualTerminal::new(27, 49);
         for i in 0..300 {
             vt.process(format!("scrollback line {i}\r\n").as_bytes());
         }
@@ -7943,6 +7943,122 @@ mod tests {
             ctrl: false,
         })
         .await;
+    }
+
+    /// Replaces the pane's VT with a mouse-tracking app `rows` x `cols` whose
+    /// row `i` reads `grid-row {i+1}`, cursor parked on the last row, and
+    /// returns once the client's screen shows it.
+    async fn mouse_app_grid(h: &mut InputHarness, rows: usize, cols: usize) {
+        let mut vt = shux_vt::VirtualTerminal::new(rows, cols);
+        vt.process(b"\x1b[?1002h\x1b[?1006h");
+        let lines: Vec<String> = (1..=rows).map(|i| format!("grid-row {i:02}")).collect();
+        vt.process(lines.join("\r\n").as_bytes());
+        let last = format!("grid-row {rows:02}");
+        {
+            let mut state = h.fixture.io_state.lock().await;
+            state.vts.insert(h.fixture.first_pane, vt);
+            state.render_pulse.bump();
+        }
+        let shown = h.frames_until(|_, text| text.contains(&last)).await;
+        assert!(shown, "the client never showed {last:?}");
+    }
+
+    /// Where the client's screen shows `needle`, 0-based, as the attach
+    /// protocol addresses cells.
+    async fn on_screen(h: &mut InputHarness, needle: &str) -> (u16, u16) {
+        let mut at = None;
+        h.frames_until(|_, text| {
+            at = text.lines().enumerate().find_map(|(y, l)| {
+                l.split_once(needle)
+                    .map(|(before, _)| (before.chars().count() as u16, y as u16))
+            });
+            at.is_some()
+        })
+        .await;
+        at.unwrap_or_else(|| panic!("{needle:?} is not on the client's screen"))
+    }
+
+    async fn mouse(h: &mut InputHarness, kind: MouseKind, col: u16, row: u16) {
+        h.send(&AttachClientFrame::Mouse {
+            kind,
+            button: ProtoMouseButton::Left,
+            col,
+            row,
+            shift: false,
+            alt: false,
+            ctrl: false,
+        })
+        .await;
+    }
+
+    /// Issue #192: a grid taller than its rect is drawn from a row offset, and
+    /// a click must reach the app as the grid row the user sees.
+    #[tokio::test(start_paused = true)]
+    async fn a_click_on_an_oversized_pane_reports_the_grid_row_it_shows() {
+        let mut h = InputHarness::new(64).await;
+        mouse_app_grid(&mut h, 60, 40).await;
+        let (x, y) = on_screen(&mut h, "grid-row 55").await;
+        mouse(&mut h, MouseKind::Down, x, y).await;
+        mouse(&mut h, MouseKind::Up, x, y).await;
+        let got = String::from_utf8_lossy(&pane_input(&mut h).await).into_owned();
+        assert!(
+            got.starts_with("\x1b[<0;") && got.contains(";55M") && got.ends_with(";55m"),
+            "clicked the row showing grid-row 55; the app was told {got:?}"
+        );
+        h.stop().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wheel_tick_on_an_oversized_pane_reports_the_grid_row_it_shows() {
+        let mut h = InputHarness::new(64).await;
+        mouse_app_grid(&mut h, 60, 40).await;
+        let (x, y) = on_screen(&mut h, "grid-row 55").await;
+        mouse(&mut h, MouseKind::ScrollDown, x, y).await;
+        let got = String::from_utf8_lossy(&pane_input(&mut h).await).into_owned();
+        assert!(
+            got.starts_with("\x1b[<65;") && got.ends_with(";55M"),
+            "wheeled over the row showing grid-row 55; the app was told {got:?}"
+        );
+        h.stop().await;
+    }
+
+    /// The rect is bigger than this grid: space below and right of it names no
+    /// cell the app has, so neither a click nor a wheel tick there is reported.
+    #[tokio::test(start_paused = true)]
+    async fn mouse_events_outside_the_grid_are_not_reported() {
+        let mut h = InputHarness::new(64).await;
+        mouse_app_grid(&mut h, 4, 12).await;
+        let (x, y) = on_screen(&mut h, "grid-row 01").await;
+        for (col, row) in [(x + 20, y), (x, y + 6)] {
+            mouse(&mut h, MouseKind::Down, col, row).await;
+            mouse(&mut h, MouseKind::Up, col, row).await;
+            mouse(&mut h, MouseKind::ScrollUp, col, row).await;
+        }
+        let got = pane_input(&mut h).await;
+        assert!(
+            got.is_empty(),
+            "events off the grid reached the app as {:?}",
+            String::from_utf8_lossy(&got)
+        );
+        // The same events on the grid still arrive.
+        mouse(&mut h, MouseKind::Down, x, y).await;
+        let got = String::from_utf8_lossy(&pane_input(&mut h).await).into_owned();
+        assert_eq!(got, "\x1b[<0;1;1M");
+        h.stop().await;
+    }
+
+    /// A gesture that leaves the grid still ends: its release is pinned onto
+    /// the nearest shown grid cell, never a cell the grid does not have.
+    #[tokio::test(start_paused = true)]
+    async fn a_release_off_the_grid_is_pinned_to_its_edge() {
+        let mut h = InputHarness::new(64).await;
+        mouse_app_grid(&mut h, 4, 12).await;
+        let (x, y) = on_screen(&mut h, "grid-row 01").await;
+        mouse(&mut h, MouseKind::Down, x, y).await;
+        mouse(&mut h, MouseKind::Up, x + 30, y + 8).await;
+        let got = String::from_utf8_lossy(&pane_input(&mut h).await).into_owned();
+        assert_eq!(got, "\x1b[<0;1;1M\x1b[<0;12;4m");
+        h.stop().await;
     }
 
     /// Pasted text is not a run of keystrokes: a `q` in it must not close
