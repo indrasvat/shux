@@ -635,8 +635,7 @@ struct AttachedSession {
 struct ShownFrames(std::collections::VecDeque<(u64, Arc<HashMap<PaneId, PaneView>>)>);
 
 impl ShownFrames {
-    /// Frames a client can trail the daemon by and still be mapped exactly;
-    /// one further behind maps through the oldest kept, the nearest to it.
+    /// Frames a client can trail the daemon by and still be mapped.
     const KEPT: usize = 16;
 
     fn push(&mut self, frame: u64, views: HashMap<PaneId, PaneView>) {
@@ -648,16 +647,12 @@ impl ShownFrames {
 
     /// The views the client saw when it had written `frame`: the newest frame
     /// not after it. `None` (a client that predates frame numbers) is the
-    /// latest frame sent.
+    /// latest frame sent. A stamp older than every frame kept names nothing:
+    /// any kept frame is newer than what that client shows.
     fn views(&self, frame: Option<u64>) -> Option<&HashMap<PaneId, PaneView>> {
         let entry = match frame {
             None => self.0.back(),
-            Some(f) => self
-                .0
-                .iter()
-                .rev()
-                .find(|(n, _)| *n <= f)
-                .or(self.0.front()),
+            Some(f) => self.0.iter().rev().find(|(n, _)| *n <= f),
         };
         entry.map(|(_, views)| views.as_ref())
     }
@@ -1996,37 +1991,44 @@ async fn run_render_loop(
         }
 
         if !bytes.is_empty() {
-            // Split rather than send whole: base64 inflates by 4/3 and the codec
-            // refuses a frame over MAX_FRAME_SIZE, so one composited frame that
-            // crosses the cap used to fail the send, break the writer task and
-            // leave the attach permanently blank with no error. A frame's cells
-            // alone reach it at the client sizes the daemon already permits.
-            // Splitting is invisible to the terminal: this is a byte stream, and
-            // the compositor wraps each frame in synchronized output, so the
-            // parts are held and applied together.
-            let mut sent_all = true;
             frame_number += 1;
-            let mut parts = bytes.chunks(RENDER_PART_BYTES).peekable();
-            while let Some(part) = parts.next() {
-                let frame = AttachServerFrame::Render {
-                    data: BASE64.encode(part),
-                    frame: parts.peek().is_none().then_some(frame_number),
-                };
-                if out_tx.send(frame).await.is_err() {
-                    sent_all = false;
-                    break;
-                }
-            }
-            if !sent_all {
+            let views = compositor.pane_views().clone();
+            if !send_frame(&out_tx, &session, frame_number, views, &bytes).await {
                 break;
             }
-            session
-                .lock()
-                .await
-                .shown
-                .push(frame_number, compositor.pane_views().clone());
         }
     }
+}
+
+/// Send one composited frame as `Render` parts, the last numbered `frame`.
+/// Its views are recorded first, so an event the client stamps with that
+/// number always finds them. False when the client is gone.
+///
+/// Split rather than sent whole: base64 inflates by 4/3 and the codec refuses
+/// a frame over MAX_FRAME_SIZE, so one composited frame that crosses the cap
+/// used to fail the send, break the writer task and leave the attach
+/// permanently blank with no error. Splitting is invisible to the terminal:
+/// this is a byte stream, and the compositor wraps each frame in synchronized
+/// output, so the parts are held and applied together.
+async fn send_frame(
+    out_tx: &mpsc::Sender<AttachServerFrame>,
+    session: &Arc<Mutex<AttachedSession>>,
+    frame: u64,
+    views: HashMap<PaneId, PaneView>,
+    bytes: &[u8],
+) -> bool {
+    session.lock().await.shown.push(frame, views);
+    let mut parts = bytes.chunks(RENDER_PART_BYTES).peekable();
+    while let Some(part) = parts.next() {
+        let render = AttachServerFrame::Render {
+            data: BASE64.encode(part),
+            frame: parts.peek().is_none().then_some(frame),
+        };
+        if out_tx.send(render).await.is_err() {
+            return false;
+        }
+    }
+    true
 }
 
 /// Bytes of one composited frame per `Render` message. Base64 takes this to
@@ -6193,6 +6195,41 @@ mod tests {
         }
     }
 
+    /// The client can have a numbered frame the instant it is queued; its views
+    /// must already be recorded then. The session is held busy throughout, so
+    /// a sender that queued first and recorded after would be caught between.
+    #[tokio::test]
+    async fn a_numbered_frame_is_recorded_before_the_client_can_have_it() {
+        let fixture = attach_fixture().await;
+        let session = Arc::new(Mutex::new(fixture.attached.clone()));
+        let (out_tx, mut out_rx) = mpsc::channel(1);
+        let busy = session.lock().await;
+        let sender = {
+            let session = session.clone();
+            tokio::spawn(
+                async move { send_frame(&out_tx, &session, 7, HashMap::new(), b"x").await },
+            )
+        };
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        if let Ok(AttachServerFrame::Render { frame, .. }) = out_rx.try_recv() {
+            assert!(
+                busy.shown.views(frame).is_some(),
+                "the client holds frame {frame:?} but its views are not recorded"
+            );
+        }
+        drop(busy);
+        let got = out_rx.recv().await;
+        assert!(matches!(
+            got,
+            Some(AttachServerFrame::Render { frame: Some(7), .. })
+        ));
+        assert!(session.lock().await.shown.views(Some(7)).is_some());
+        assert!(sender.await.expect("sender task"));
+        fixture.stop();
+    }
+
     /// Which frame's views a stamped event maps through.
     #[test]
     fn shown_frames_map_a_stamp_to_the_frame_the_client_had_written() {
@@ -6222,8 +6259,8 @@ mod tests {
         );
         assert_eq!(
             offset(shown.views(Some(2))),
-            Some(5),
-            "a stamp older than any kept: the oldest kept (20 - 16 + 1)"
+            None,
+            "a stamp older than any kept (5..=20) names nothing newer than it"
         );
     }
 

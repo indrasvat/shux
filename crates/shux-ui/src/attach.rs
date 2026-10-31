@@ -226,9 +226,14 @@ where
 
     // Spawn input reader: poll crossterm events on a blocking thread,
     // forward via channel.
-    let (key_tx, mut key_rx) = tokio::sync::mpsc::channel::<Event>(64);
+    let (key_tx, mut key_rx) = tokio::sync::mpsc::channel::<(Event, Option<u64>)>(64);
     // Decided once: a hung-up terminal can stop answering as a terminal.
     let terminal = input_terminal();
+    // The last numbered frame written to the terminal. Read as each event is,
+    // so a mouse event names the frame on screen when it happened, not one
+    // written while it waited in the channel.
+    let written_frame = WrittenFrame::default();
+    let reader_frame = written_frame.clone();
     std::thread::spawn(move || {
         loop {
             // Long, because the wait ends in a busy loop over its last
@@ -237,7 +242,7 @@ where
             match crossterm::event::poll(Duration::from_secs(1)) {
                 Ok(true) => match crossterm::event::read() {
                     Ok(ev) => {
-                        if key_tx.blocking_send(ev).is_err() {
+                        if key_tx.blocking_send((ev, reader_frame.current())).is_err() {
                             break;
                         }
                     }
@@ -254,9 +259,6 @@ where
         }
     });
 
-    // The last numbered frame written to the terminal: mouse events name cells
-    // of what the user was looking at, which the daemon may have redrawn since.
-    let mut written_frame: Option<u64> = None;
     loop {
         #[expect(
             clippy::disallowed_methods,
@@ -295,10 +297,10 @@ where
                             Ok(b) => b,
                             Err(_) => continue,
                         };
-                        stdout.write_all(&bytes).await.ok();
-                        stdout.flush().await.ok();
-                        if frame.is_some() {
-                            written_frame = frame;
+                        let written = stdout.write_all(&bytes).await.is_ok()
+                            && stdout.flush().await.is_ok();
+                        if let (true, Some(frame)) = (written, frame) {
+                            written_frame.wrote(frame);
                         }
                     }
                     AttachServerFrame::Bell => {
@@ -317,7 +319,7 @@ where
 
             // Terminal -> server.
             ev = key_rx.recv() => {
-                let event = match ev {
+                let (event, event_frame) = match ev {
                     Some(e) => e,
                     None => return Ok(ExitReason::Error("input thread died".into())),
                 };
@@ -417,7 +419,7 @@ where
                             shift: m.modifiers.contains(KeyModifiers::SHIFT),
                             alt: m.modifiers.contains(KeyModifiers::ALT),
                             ctrl: m.modifiers.contains(KeyModifiers::CONTROL),
-                            frame: written_frame,
+                            frame: event_frame,
                         };
                         let bytes = serde_json::to_vec(&frame)?;
                         sink.send(Bytes::from(bytes)).await.ok();
@@ -608,6 +610,21 @@ fn key_to_bare_action(key: KeyEvent) -> Option<(ActionKind, ActionArgs)> {
         _ => return None,
     };
     Some((kind, ActionArgs::default()))
+}
+
+/// The last numbered frame the client wrote to its terminal, shared between
+/// the render branch and the input thread. Frames are numbered from 1.
+#[derive(Clone, Default)]
+struct WrittenFrame(std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+impl WrittenFrame {
+    fn wrote(&self, frame: u64) {
+        self.0.store(frame, std::sync::atomic::Ordering::Release);
+    }
+
+    fn current(&self) -> Option<u64> {
+        Some(self.0.load(std::sync::atomic::Ordering::Acquire)).filter(|&f| f != 0)
+    }
 }
 
 #[cfg(test)]
