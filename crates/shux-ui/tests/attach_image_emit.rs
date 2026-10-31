@@ -486,3 +486,33 @@ fn one_frame_never_writes_more_bytes_than_the_attach_frame_can_carry() {
         "refusing the picture disturbed the cells"
     );
 }
+
+/// A grid taller than its pane is drawn from a cursor-following row offset; a
+/// picture in it must be placed with that offset too, on the row its text is.
+#[test]
+fn a_picture_in_a_grid_taller_than_its_pane_moves_with_its_text() {
+    let p = pane(1);
+    let layout = LayoutNode::leaf(p);
+    let mut vt = VirtualTerminal::new(20, 20);
+    vt.process(b"\x1b[16;1H");
+    vt.process(&kitty_rgb(18, 19, [40, 200, 40]));
+    // Cursor on the last grid row: the 6-row pane shows grid rows 14..20.
+    vt.process(b"\x1b[20;1H");
+    let mut vts = HashMap::new();
+    vts.insert(p, &vt);
+
+    let mut c = make_compositor(20, 6);
+    c.render_multi_pane(frame(&layout, &vts, p)).unwrap();
+    let out = drain(&mut c);
+    let cmds = graphics(&out);
+    assert_eq!(cmds.len(), 1, "the picture was not placed: {cmds:?}");
+    let before = &out[..out.find("\x1b_G").expect("a graphics command")];
+    let cup = before.rsplit("\x1b[").next().unwrap_or("");
+    let row: u16 = cup
+        .split(';')
+        .next()
+        .and_then(|r| r.parse().ok())
+        .unwrap_or_else(|| panic!("no cursor move before the picture: {cup:?}"));
+    // Grid row 15 (0-based) at offset 14 is screen row 1, CUP row 2.
+    assert_eq!(row, 2, "picture placed at screen row {row}: {cup:?}");
+}

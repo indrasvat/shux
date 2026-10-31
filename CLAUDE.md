@@ -198,8 +198,10 @@ risk.**
 
 VT gate PASS report commits to `.shux/qa/<scope>/SOLID-QA.md`, first line exactly
 `VERDICT: PASS`. `<scope>` is free-form — name it after the change. `make check-vt-qa`
-demands it from any diff touching `crates/shux-vt/`, `crates/shux-raster/` or
-`crates/shux-pty/src/capture.rs`, and demands nothing from any diff that doesn't.
+demands it from any diff touching a path in `VT_PATHS` in `scripts/check-vt-qa.sh` —
+`crates/shux-vt/`, `crates/shux-raster/`, `crates/shux-pty/src/capture.rs` and the
+`shux-ui` files that compose snapshot cells (compositor, viewport, borders, buffer, …)
+— and demands nothing from any diff that doesn't.
 The one exemption is the `tests/` and `benches/` trees under those crates: they
 ship no cells and no pixels, so the only audit they could carry would be about
 code the diff never touched. A diff touching `src/` **and** `tests/` still owes
