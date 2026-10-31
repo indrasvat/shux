@@ -2132,17 +2132,18 @@ enum SelectionDrag {
     /// `Up(MouseButton::Left)`, so a latch keyed to one button would never
     /// clear. `last` is the pane-local cell of the most recent forwarded
     /// report, used to synthesize a release if the gesture is abandoned.
-    /// `row_offset` is the view offset the press at screen point `pressed_at`
-    /// landed in. Until the pointer leaves that point, events map through it,
-    /// so an app that moves its cursor on the press (vim) does not turn a
-    /// click into a drag when the view follows; after that, every event names
-    /// the cell shown under the pointer now.
+    /// `anchor` is the screen point of the last forwarded event and
+    /// `row_offset` the view offset it mapped through. An event at that same
+    /// point maps through it too, so an app that moves its cursor with the
+    /// mouse (vim) does not shift a click or a drag's release onto another row
+    /// when the view follows; an event anywhere else names the cell shown
+    /// under the pointer now.
     App {
         pane_id: PaneId,
         buttons: u8,
         last: (u16, u16),
         row_offset: usize,
-        pressed_at: Option<(u16, u16)>,
+        anchor: (u16, u16),
     },
 }
 
@@ -2973,19 +2974,10 @@ async fn handle_app_mouse(
     // pane as drawn now.
     let pin = action != ButtonAction::Press;
     let shown = attached.shown.get(&pane_id).copied();
-    let view = match gesture {
+    let view = match *gesture {
         SelectionDrag::App {
-            row_offset,
-            pressed_at,
-            ..
-        } if pin => {
-            if *pressed_at == Some((col, row)) {
-                shown.map(|view| view.with_row_offset(*row_offset))
-            } else {
-                *pressed_at = None;
-                shown
-            }
-        }
+            row_offset, anchor, ..
+        } if pin && anchor == (col, row) => shown.map(|view| view.with_row_offset(row_offset)),
         _ => shown,
     };
     let cell = view.and_then(|view| {
@@ -3056,13 +3048,21 @@ async fn handle_app_mouse(
             buttons: held | button_bit(button),
             last: (local_col, local_row),
             row_offset: view.row_offset,
-            pressed_at: Some((col, row)),
+            anchor: (col, row),
         };
     } else {
         // Where the pointer was when the gesture is abandoned, so
         // `release_app_gesture` can put the synthetic release there.
-        if let SelectionDrag::App { last, .. } = gesture {
+        if let SelectionDrag::App {
+            last,
+            row_offset,
+            anchor,
+            ..
+        } = gesture
+        {
             *last = (local_col, local_row);
+            *row_offset = view.row_offset;
+            *anchor = (col, row);
         }
         end_gesture_if_released(gesture, action, button);
     }
@@ -5988,7 +5988,7 @@ mod tests {
                     buttons: 1,
                     last: (1, 1),
                     row_offset: 0,
-                    pressed_at: None,
+                    anchor: (0, 0),
                 },
                 false,
                 false,
@@ -6008,7 +6008,7 @@ mod tests {
                     buttons: 1,
                     last: (1, 1),
                     row_offset: 0,
-                    pressed_at: None,
+                    anchor: (0, 0),
                 },
                 false,
                 false,
@@ -6133,7 +6133,7 @@ mod tests {
             buttons: 0b101, // left + right
             last: (3, 4),
             row_offset: 0,
-            pressed_at: None,
+            anchor: (0, 0),
         };
         end_gesture_if_released(&mut g, ButtonAction::Release, ProtoMouseButton::Right);
         assert_eq!(
@@ -6143,7 +6143,7 @@ mod tests {
                 buttons: 0b001,
                 last: (3, 4),
                 row_offset: 0,
-                pressed_at: None,
+                anchor: (0, 0),
             },
             "releasing one of two buttons must not end the gesture"
         );
@@ -6157,7 +6157,7 @@ mod tests {
             buttons: 0b100, // right only
             last: (3, 4),
             row_offset: 0,
-            pressed_at: None,
+            anchor: (0, 0),
         };
         end_gesture_if_released(&mut g, ButtonAction::Release, ProtoMouseButton::Left);
         assert_eq!(
@@ -6172,7 +6172,7 @@ mod tests {
             buttons: 1,
             last: (3, 4),
             row_offset: 0,
-            pressed_at: None,
+            anchor: (0, 0),
         };
         end_gesture_if_released(&mut g, ButtonAction::Drag, ProtoMouseButton::Left);
         assert!(matches!(g, SelectionDrag::App { .. }));
@@ -8554,6 +8554,32 @@ mod tests {
             got,
             format!("\x1b[<0;1;55M\x1b[<32;1;10M\x1b[<32;1;{y}M\x1b[<0;1;{y}m")
         );
+        h.stop().await;
+    }
+
+    /// A motion that moves the view (vim follows the drag with its cursor)
+    /// must not shift a release at the same point onto another row.
+    #[tokio::test(start_paused = true)]
+    async fn a_release_where_the_drag_stopped_names_the_dragged_row() {
+        let mut h = InputHarness::new(64).await;
+        mouse_app_grid(&mut h, 60, 40).await;
+        let (x, y) = on_screen(&mut h, "grid-row 55").await;
+        mouse(&mut h, MouseKind::Down, x, y).await;
+        let (dx, dy) = on_screen(&mut h, "grid-row 45").await;
+        mouse(&mut h, MouseKind::Drag, dx, dy).await;
+        {
+            let mut state = h.fixture.io_state.lock().await;
+            state
+                .vts
+                .get_mut(&h.fixture.first_pane)
+                .expect("vt")
+                .process(b"\x1b[1;1H");
+            state.render_pulse.bump();
+        }
+        on_screen(&mut h, "grid-row 01").await;
+        mouse(&mut h, MouseKind::Up, dx, dy).await;
+        let got = String::from_utf8_lossy(&pane_input(&mut h).await).into_owned();
+        assert_eq!(got, "\x1b[<0;1;55M\x1b[<32;1;45M\x1b[<0;1;45m");
         h.stop().await;
     }
 
