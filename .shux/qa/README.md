@@ -1,8 +1,9 @@
 # shux VT QA Evidence
 
-Any diff that touches VT rendering — `crates/shux-vt/`, `crates/shux-raster/`, or
-`crates/shux-pty/src/capture.rs` — must carry the auditable subset of its QA
-evidence here, in the same diff. `make check-vt-qa` enforces both halves from the
+Any diff that touches VT rendering — a path in `VT_PATHS` in
+`scripts/check-vt-qa.sh`: `crates/shux-vt/`, `crates/shux-raster/`,
+`crates/shux-pty/src/capture.rs`, and the `shux-ui` files that compose snapshot cells
+— must carry the auditable subset of its QA evidence here, in the same diff. `make check-vt-qa` enforces both halves from the
 diff itself; a diff touching none of those paths is asked for nothing. The
 `tests/` and `benches/` trees under those crates are exempt — they ship no cells
 and no pixels — but a diff that touches `src/` as well still owes evidence.

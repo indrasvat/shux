@@ -146,7 +146,7 @@ async fn read_renders_until(
         let Ok(Some(Ok(frame))) = tokio::time::timeout_at(deadline, framed.next()).await else {
             break;
         };
-        if let Ok(AttachServerFrame::Render { data }) = serde_json::from_slice(&frame)
+        if let Ok(AttachServerFrame::Render { data, .. }) = serde_json::from_slice(&frame)
             && let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(&data)
         {
             seen.extend_from_slice(&raw);

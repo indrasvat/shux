@@ -966,7 +966,7 @@ pub enum PaneCommand {
         expected_version: Option<u64>,
     },
 
-    /// Toggle zoom on a pane
+    /// Toggle zoom on a pane; zooming in also focuses it
     Zoom {
         /// Session name or id (full UUID, or the short form `session list` prints)
         #[arg(short, long)]

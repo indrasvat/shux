@@ -2212,8 +2212,9 @@ mod tests {
         cancel.cancel();
     }
 
-    /// `pane zoom -p b` does not move focus, so keeping that zoom would hide
-    /// `a` once focus returns to it.
+    /// An operator zooms `b`, then focuses `a`: focusing drops the zoom that
+    /// would hide `a`, and the undo puts back only the zoom the split cleared,
+    /// on `a`, which hides nothing.
     #[tokio::test]
     async fn undoing_a_split_drops_an_operator_zoom_that_would_hide_focus() {
         let Zoomed {
@@ -2230,9 +2231,10 @@ mod tests {
             .await
             .expect("split");
         gh.zoom_pane(b, None).await.expect("zoom b");
+        gh.focus_pane(a).await.expect("focus a");
 
         undo_split(&gh, new, prior).await;
-        assert_eq!(zoom_focus(&gh, window), (None, a));
+        assert_eq!(zoom_focus(&gh, window), (Some(a), a));
         cancel.cancel();
     }
 

@@ -163,7 +163,7 @@ impl Client {
             else {
                 return false;
             };
-            if let Ok(AttachServerFrame::Render { data }) = serde_json::from_slice(&frame)
+            if let Ok(AttachServerFrame::Render { data, .. }) = serde_json::from_slice(&frame)
                 && let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(&data)
             {
                 self.vt.process(&raw);

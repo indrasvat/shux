@@ -844,7 +844,11 @@ FUZZ_SECONDS ?= 60
 FUZZ_PROGRAM_STATUS := program_status_decode program_status_table scanner_vs_vte vt_program_status_stream
 
 .PHONY: fuzz
-fuzz: fuzz-program-status ## Run every libFuzzer target (FUZZ_SECONDS each, default 60)
+fuzz: fuzz-program-status fuzz-pane-mouse ## Run every libFuzzer target (FUZZ_SECONDS each, default 60)
+
+.PHONY: fuzz-pane-mouse
+fuzz-pane-mouse: ## Mouse-to-grid-cell mapping against the live compositor (FUZZ_SECONDS)
+	@bash scripts/fuzz.sh $(FUZZ_SECONDS) pane_grid_cell
 
 .PHONY: fuzz-program-status
 fuzz-program-status: ## OSC 7501 libFuzzer targets in fuzz/ (FUZZ_SECONDS each)
