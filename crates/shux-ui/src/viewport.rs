@@ -82,6 +82,17 @@ impl PaneView {
     }
 }
 
+impl PaneView {
+    /// This view at `row_offset` instead, kept within the grid.
+    pub fn with_row_offset(self, row_offset: usize) -> Self {
+        let max = self.grid_rows.saturating_sub(self.rect.height.into());
+        Self {
+            row_offset: row_offset.min(max),
+            ..self
+        }
+    }
+}
+
 /// The 1-based grid cell a pointer at screen `(col, row)` names in `view`.
 ///
 /// `None` when the point is on no grid cell shown there. `clamp` instead pins

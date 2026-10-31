@@ -1856,12 +1856,38 @@ impl SessionGraph {
         let mut snapshot = (*current).clone();
         snapshot.version += 1;
 
+        // Focusing a pane a zoom hides unzooms (tmux does the same): the
+        // focused pane is never one the window does not show.
+        let mut unzoomed = None;
         if let Some(w) = snapshot.windows.get_mut(&window_id) {
+            if let Some(zoomed) = w.layout.zoom.as_ref().map(|z| z.zoomed_pane)
+                && zoomed != id
+            {
+                w.layout.toggle_zoom(zoomed);
+                unzoomed = Some(zoomed);
+            }
             w.active_pane = id;
             w.version += 1;
         }
+        if unzoomed.is_some() {
+            for p in snapshot
+                .panes
+                .values_mut()
+                .filter(|p| p.window_id == window_id)
+            {
+                p.version += 1;
+            }
+        }
 
         self.commit_snapshot(snapshot);
+        if let Some(zoomed) = unzoomed {
+            self.fire(EventData::PaneZoomed {
+                pane_id: zoomed,
+                window_id,
+                session_id,
+                zoomed: false,
+            });
+        }
         self.fire(EventData::PaneFocused {
             pane_id: id,
             window_id,
@@ -5101,6 +5127,28 @@ mod tests {
         let snap = state.load();
         assert_eq!(snap.panes[&p1].version, p1_v + 1);
         assert_eq!(snap.panes[&p2].version, p2_v + 1);
+    }
+
+    /// Focusing a pane a zoom hides unzooms, as tmux does: the focused pane is
+    /// never one the window does not show.
+    #[test]
+    fn focusing_a_pane_a_zoom_hides_unzooms() {
+        let (graph, state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let wid = state.load().sessions[&sid].windows[0];
+        let a = state.load().windows[&wid].active_pane;
+        let b = graph.split_pane(a, Direction::Vertical, 0.5).unwrap();
+        assert!(graph.zoom_pane(b, None).unwrap());
+
+        graph.focus_pane(b).unwrap();
+        assert!(
+            state.load().windows[&wid].layout.is_zoomed(),
+            "refocusing the zoomed pane keeps it"
+        );
+        graph.focus_pane(a).unwrap();
+        let snap = state.load();
+        assert_eq!(snap.windows[&wid].active_pane, a);
+        assert!(!snap.windows[&wid].layout.is_zoomed());
     }
 
     /// A zoom shows one pane; input must go to that pane, not a hidden one.

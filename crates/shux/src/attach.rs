@@ -2132,14 +2132,14 @@ enum SelectionDrag {
     /// `Up(MouseButton::Left)`, so a latch keyed to one button would never
     /// clear. `last` is the pane-local cell of the most recent forwarded
     /// report, used to synthesize a release if the gesture is abandoned.
-    /// `view` is the frame the press landed in: the whole gesture maps through
-    /// it, so an app that moves its cursor on the press (vim) does not turn
-    /// the click into a drag when the view follows.
+    /// `row_offset` is the view offset the press landed in: the whole gesture
+    /// maps through it, so an app that moves its cursor on the press (vim)
+    /// does not turn the click into a drag when the view follows.
     App {
         pane_id: PaneId,
         buttons: u8,
         last: (u16, u16),
-        view: shux_ui::viewport::PaneView,
+        row_offset: usize,
     },
 }
 
@@ -2966,31 +2966,38 @@ async fn handle_app_mouse(
     if !inside && matches!(*gesture, SelectionDrag::None) {
         return Ok(AppMouse::NotHandled);
     }
-    // A release of a button the gesture does not hold: a legacy host reports
-    // every release as left, or the app never got this press. Either way,
-    // release what the app does hold rather than send an orphan or strand it.
-    let bit = button_bit(button);
-    if action == ButtonAction::Release
-        && matches!(*gesture, SelectionDrag::App { buttons, .. } if bit != 0 && buttons & bit == 0)
-    {
-        release_app_gesture(io_state, gesture).await;
-        return Ok(AppMouse::Consumed { redraw: false });
-    }
-    // A press names a cell or nothing; the rest of a gesture is pinned.
+    // A press names a cell or nothing; the rest of a gesture is pinned, through
+    // the pane as drawn now but at the row offset its press landed in.
     let pin = action != ButtonAction::Press;
+    let shown = attached.shown.get(&pane_id).copied();
     let view = match *gesture {
         SelectionDrag::App {
-            pane_id: p, view, ..
-        } if p == pane_id => Some(view),
-        _ => attached.shown.get(&pane_id).copied(),
+            pane_id: p,
+            row_offset,
+            ..
+        } if p == pane_id => shown.map(|view| view.with_row_offset(row_offset)),
+        _ => shown,
     };
     let cell = view.and_then(|view| {
         shux_ui::viewport::pane_grid_cell(&view, (col, row), pin).map(|cell| (view, cell))
     });
+    // A release the gesture cannot place, or of a button it does not hold (a
+    // legacy host reports every release as left, or the app never got this
+    // press): release what the app holds, rather than send an orphan or
+    // strand a held button.
+    let bit = button_bit(button);
+    if action == ButtonAction::Release
+        && matches!(*gesture, SelectionDrag::App { buttons, .. }
+            if cell.is_none() || (bit != 0 && buttons & bit == 0))
+    {
+        if let (Some((_, at)), SelectionDrag::App { last, .. }) = (cell, &mut *gesture) {
+            *last = at;
+        }
+        release_app_gesture(io_state, gesture).await;
+        return Ok(AppMouse::Consumed { redraw: false });
+    }
     let Some((view, (local_col, local_row))) = cell else {
-        // Only a press gets here (the rest of a gesture is pinned through the
-        // view its press named a cell in): it names no cell, so it only
-        // selects the pane.
+        // No cell: a press only selects the pane, and motion is dropped.
         let redraw = action == ButtonAction::Press
             && select_pane_on_press(graph, session, attached.active_pane_id, pane_id).await;
         return Ok(AppMouse::Consumed { redraw });
@@ -3043,7 +3050,7 @@ async fn handle_app_mouse(
             pane_id,
             buttons: held | button_bit(button),
             last: (local_col, local_row),
-            view,
+            row_offset: view.row_offset,
         };
     } else {
         // Where the pointer was when the gesture is abandoned, so
@@ -5978,7 +5985,7 @@ mod tests {
                     pane_id: pane,
                     buttons: 1,
                     last: (1, 1),
-                    view: any_view(),
+                    row_offset: 0,
                 },
                 false,
                 false,
@@ -5997,7 +6004,7 @@ mod tests {
                     pane_id: pane,
                     buttons: 1,
                     last: (1, 1),
-                    view: any_view(),
+                    row_offset: 0,
                 },
                 false,
                 false,
@@ -6113,16 +6120,6 @@ mod tests {
         }
     }
 
-    /// A view for gesture literals whose mapping the test never exercises.
-    fn any_view() -> shux_ui::viewport::PaneView {
-        shux_ui::viewport::PaneView {
-            rect: Rect::new(0, 0, 1, 1),
-            row_offset: 0,
-            grid_rows: 1,
-            grid_cols: 1,
-        }
-    }
-
     /// A press whose button mask can never empty is a gesture that never ends.
     #[test]
     fn app_gesture_ends_only_when_every_button_is_up() {
@@ -6131,7 +6128,7 @@ mod tests {
             pane_id: pane,
             buttons: 0b101, // left + right
             last: (3, 4),
-            view: any_view(),
+            row_offset: 0,
         };
         end_gesture_if_released(&mut g, ButtonAction::Release, ProtoMouseButton::Right);
         assert_eq!(
@@ -6140,7 +6137,7 @@ mod tests {
                 pane_id: pane,
                 buttons: 0b001,
                 last: (3, 4),
-                view: any_view(),
+                row_offset: 0,
             },
             "releasing one of two buttons must not end the gesture"
         );
@@ -6153,7 +6150,7 @@ mod tests {
             pane_id: pane,
             buttons: 0b100, // right only
             last: (3, 4),
-            view: any_view(),
+            row_offset: 0,
         };
         end_gesture_if_released(&mut g, ButtonAction::Release, ProtoMouseButton::Left);
         assert_eq!(
@@ -6167,7 +6164,7 @@ mod tests {
             pane_id: pane,
             buttons: 1,
             last: (3, 4),
-            view: any_view(),
+            row_offset: 0,
         };
         end_gesture_if_released(&mut g, ButtonAction::Drag, ProtoMouseButton::Left);
         assert!(matches!(g, SelectionDrag::App { .. }));
@@ -6394,7 +6391,7 @@ mod tests {
             .await;
         h.send(MouseKind::Up, ProtoMouseButton::Right, r.x + 1, r.y)
             .await;
-        assert_eq!(drain(&mut wr), "\x1b[<2;1;1M\x1b[<2;1;1m");
+        assert_eq!(drain(&mut wr), "\x1b[<2;1;1M\x1b[<2;2;1m");
         assert_eq!(h.gesture, SelectionDrag::None);
         h.fixture.stop();
     }
@@ -6415,6 +6412,76 @@ mod tests {
         h.fixture.stop();
     }
 
+    /// A legacy host's release lands where the button came up, not where the
+    /// gesture last moved.
+    #[tokio::test]
+    async fn a_legacy_hosts_release_lands_where_the_button_came_up() {
+        let mut h = AppMouseHarness::new().await;
+        let (mut wr, r) =
+            install_app(&h, h.fixture.first_pane, (4, 12), b"\x1b[?1002h\x1b[?1006h").await;
+        h.send(MouseKind::Down, ProtoMouseButton::Right, r.x, r.y)
+            .await;
+        h.send(MouseKind::Up, ProtoMouseButton::Left, r.x + 4, r.y + 1)
+            .await;
+        assert_eq!(drain(&mut wr), "\x1b[<2;1;1M\x1b[<2;5;2m");
+        h.fixture.stop();
+    }
+
+    /// The pane moves mid-gesture (the client widened): the release names the
+    /// cell under the pointer in the pane as it is drawn now.
+    #[tokio::test]
+    async fn a_gesture_follows_its_pane_when_the_layout_moves() {
+        let mut h = AppMouseHarness::new().await;
+        let pane = h.fixture.second_pane;
+        let (mut wr, r) = install_app(&h, pane, (10, 20), b"\x1b[?1002h\x1b[?1006h").await;
+        h.send(MouseKind::Down, ProtoMouseButton::Left, r.x + 2, r.y + 2)
+            .await;
+        *h.client_size.lock().await = (140, 30);
+        let attached = h.session.lock().await.clone();
+        let moved = pane_rect_for(
+            &h.fixture.graph,
+            &attached,
+            &h.client_size,
+            &test_config(),
+            pane,
+        )
+        .await
+        .expect("pane rect");
+        assert_ne!(moved.x, r.x, "the layout did not move the pane");
+        h.send(
+            MouseKind::Up,
+            ProtoMouseButton::Left,
+            moved.x + 2,
+            moved.y + 2,
+        )
+        .await;
+        assert_eq!(drain(&mut wr), "\x1b[<0;3;3M\x1b[<0;3;3m");
+        h.fixture.stop();
+    }
+
+    /// The grid shrinks mid-gesture: the release still names a cell it has.
+    #[tokio::test]
+    async fn a_gesture_releases_inside_a_grid_that_shrank_under_it() {
+        let mut h = AppMouseHarness::new().await;
+        let pane = h.fixture.first_pane;
+        let (mut wr, r) = install_app(&h, pane, (60, 40), b"\x1b[?1002h\x1b[?1006h").await;
+        h.send(MouseKind::Down, ProtoMouseButton::Left, r.x + 2, r.y + 21)
+            .await;
+        assert!(drain(&mut wr).ends_with(";3;55M"));
+        h.fixture
+            .io_state
+            .lock()
+            .await
+            .vts
+            .get_mut(&pane)
+            .expect("vt")
+            .resize(4, 3);
+        h.send(MouseKind::Up, ProtoMouseButton::Left, r.x + 2, r.y + 21)
+            .await;
+        assert_eq!(drain(&mut wr), "\x1b[<0;3;4m");
+        h.fixture.stop();
+    }
+
     /// A second press off the grid during a held gesture names no cell either.
     #[tokio::test]
     async fn a_press_off_the_grid_mid_gesture_is_not_pinned() {
@@ -6429,7 +6496,7 @@ mod tests {
             .await;
         h.send(MouseKind::Up, ProtoMouseButton::Left, r.x, r.y)
             .await;
-        assert_eq!(drain(&mut wr), "\x1b[<0;1;1M\x1b[<0;1;1m");
+        assert_eq!(drain(&mut wr), "\x1b[<0;1;1M\x1b[<0;12;3m");
         h.fixture.stop();
     }
 
