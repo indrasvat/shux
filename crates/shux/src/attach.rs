@@ -2958,9 +2958,12 @@ async fn handle_app_mouse(
         })
     };
     let Some((local_col, local_row)) = cell else {
-        // Inside the pane but on no cell the app has: nothing truthful to send.
+        // Inside the pane but on no cell the app has: nothing truthful to send,
+        // but the click still selects the pane.
+        let redraw = action == ButtonAction::Press
+            && select_pane_on_press(graph, session, attached.active_pane_id, pane_id).await;
         end_gesture_if_released(gesture, action, button);
-        return Ok(AppMouse::Consumed { redraw: false });
+        return Ok(AppMouse::Consumed { redraw });
     };
 
     let Some(cb) = button_cb(action, button, alt, ctrl) else {
@@ -2984,27 +2987,8 @@ async fn handle_app_mouse(
         return Ok(AppMouse::Consumed { redraw: false });
     };
 
-    let mut redraw = false;
-    if action == ButtonAction::Press {
-        // tmux's `MouseDown1Pane` is `select-pane` followed by `send-keys -M`:
-        // the click both focuses the pane and reaches the app. (The wheel's
-        // forward tier deliberately does NOT focus, which is why this cites
-        // tmux rather than `handle_wheel`.)
-        if pane_id != attached.active_pane_id {
-            let _ = graph.focus_pane(pane_id).await;
-            session.lock().await.active_pane_id = pane_id;
-            redraw = true;
-        }
-        // A selection left over from before the app took the mouse can no
-        // longer be cleared by clicking, so clear it here or it renders
-        // forever.
-        let mut s = session.lock().await;
-        if s.mouse_selection.is_some() || s.copy_menu.is_some() {
-            s.mouse_selection = None;
-            s.copy_menu = None;
-            redraw = true;
-        }
-    }
+    let redraw = action == ButtonAction::Press
+        && select_pane_on_press(graph, session, attached.active_pane_id, pane_id).await;
 
     // A release must reach an app that saw its press; motion is worth
     // dropping.
@@ -3038,6 +3022,36 @@ async fn handle_app_mouse(
         end_gesture_if_released(gesture, action, button);
     }
     Ok(AppMouse::Consumed { redraw })
+}
+
+/// What a press inside an app's pane does on shux's side; true when that is a
+/// visible change.
+///
+/// tmux's `MouseDown1Pane` is `select-pane` followed by `send-keys -M`: the
+/// click both focuses the pane and reaches the app. (The wheel's forward tier
+/// deliberately does NOT focus, which is why this cites tmux rather than
+/// `handle_wheel`.) A selection left over from before the app took the mouse
+/// can no longer be cleared by clicking, so it is cleared here or it renders
+/// forever.
+async fn select_pane_on_press(
+    graph: &GraphHandle,
+    session: &Arc<Mutex<AttachedSession>>,
+    active_pane_id: PaneId,
+    pane_id: PaneId,
+) -> bool {
+    let mut redraw = false;
+    if pane_id != active_pane_id {
+        let _ = graph.focus_pane(pane_id).await;
+        session.lock().await.active_pane_id = pane_id;
+        redraw = true;
+    }
+    let mut s = session.lock().await;
+    if s.mouse_selection.is_some() || s.copy_menu.is_some() {
+        s.mouse_selection = None;
+        s.copy_menu = None;
+        redraw = true;
+    }
+    redraw
 }
 
 /// Clear the released button from an app gesture, ending it once nothing is
@@ -6241,6 +6255,50 @@ mod tests {
 
     /// Screen-global coordinates reaching the app is the defect this catches:
     /// the click would land in the wrong place in every pane but the first.
+    #[tokio::test]
+    async fn a_click_off_a_background_panes_grid_still_focuses_it() {
+        let mut h = AppMouseHarness::new().await;
+        let mut wr = seed_scrollback_pane(
+            &h.fixture.io_state,
+            h.fixture.second_pane,
+            b"\x1b[?1002h\x1b[?1006h",
+        )
+        .await;
+        let mut small = shux_vt::VirtualTerminal::new(3, 4);
+        small.process(b"\x1b[?1002h\x1b[?1006h");
+        h.fixture
+            .io_state
+            .lock()
+            .await
+            .vts
+            .insert(h.fixture.second_pane, small);
+        let viewport = current_viewport(&h.client_size, &test_config()).await;
+        let rect = h.fixture.graph.snapshot().windows[&h.fixture.first_window]
+            .layout
+            .compute_rects(viewport)
+            .into_iter()
+            .find(|(pid, _)| *pid == h.fixture.second_pane)
+            .expect("second pane rect")
+            .1;
+
+        let outcome = h
+            .send(
+                MouseKind::Down,
+                ProtoMouseButton::Left,
+                rect.x + 10,
+                rect.y + 8,
+            )
+            .await;
+        assert_eq!(outcome, AppMouse::Consumed { redraw: true });
+        assert_no_bytes(&mut wr, "no grid cell under the click").await;
+        assert_eq!(
+            h.fixture.graph.snapshot().windows[&h.fixture.first_window].active_pane,
+            h.fixture.second_pane,
+            "a click inside a pane selects it, grid or not"
+        );
+        h.fixture.stop();
+    }
+
     #[tokio::test]
     async fn a_click_in_a_second_pane_is_local_to_that_pane_and_focuses_it() {
         let mut h = AppMouseHarness::new().await;
