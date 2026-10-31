@@ -2138,12 +2138,17 @@ enum SelectionDrag {
     /// mouse (vim) does not shift a click or a drag's release onto another row
     /// when the view follows; an event anywhere else names the cell shown
     /// under the pointer now.
+    ///
+    /// `unsent` holds presses made during the gesture that named no cell or
+    /// could not be encoded: the app never saw them, so their releases are
+    /// dropped rather than ending a button it does hold.
     App {
         pane_id: PaneId,
         buttons: u8,
         last: (u16, u16),
         row_offset: usize,
         anchor: (u16, u16),
+        unsent: u8,
     },
 }
 
@@ -2983,11 +2988,18 @@ async fn handle_app_mouse(
     let cell = view.and_then(|view| {
         shux_ui::viewport::pane_grid_cell(&view, (col, row), pin).map(|cell| (view, cell))
     });
-    // A release the gesture cannot place, or of a button it does not hold (a
-    // legacy host reports every release as left, or the app never got this
-    // press): release what the app holds, rather than send an orphan or
-    // strand a held button.
     let bit = button_bit(button);
+    if let SelectionDrag::App { unsent, .. } = gesture
+        && action == ButtonAction::Release
+        && *unsent & bit != 0
+    {
+        *unsent &= !bit;
+        return Ok(AppMouse::Consumed { redraw: false });
+    }
+    // A release the gesture cannot place, or of a button it does not hold (a
+    // legacy host reports every release as left, or the app never got a press
+    // made before the gesture began): release what the app holds, rather than
+    // send an orphan or strand a held button.
     if action == ButtonAction::Release
         && matches!(*gesture, SelectionDrag::App { buttons, .. }
             if cell.is_none() || buttons & bit == 0)
@@ -3000,6 +3012,11 @@ async fn handle_app_mouse(
     }
     let Some((view, (local_col, local_row))) = cell else {
         // No cell: a press only selects the pane, and motion is dropped.
+        if action == ButtonAction::Press
+            && let SelectionDrag::App { unsent, .. } = gesture
+        {
+            *unsent |= bit;
+        }
         let redraw = action == ButtonAction::Press
             && select_pane_on_press(graph, session, attached.active_pane_id, pane_id).await;
         return Ok(AppMouse::Consumed { redraw });
@@ -3017,6 +3034,11 @@ async fn handle_app_mouse(
         // Not encodable for this app's coordinate mode (a release always is).
         // Consume it: the pane is still the app's, and a stray shux selection
         // under a running TUI is not a better answer than nothing happening.
+        if action == ButtonAction::Press
+            && let SelectionDrag::App { unsent, .. } = gesture
+        {
+            *unsent |= bit;
+        }
         let redraw = action == ButtonAction::Press
             && select_pane_on_press(graph, session, attached.active_pane_id, pane_id).await;
         return Ok(AppMouse::Consumed { redraw });
@@ -3049,6 +3071,10 @@ async fn handle_app_mouse(
             last: (local_col, local_row),
             row_offset: view.row_offset,
             anchor: (col, row),
+            unsent: match *gesture {
+                SelectionDrag::App { unsent, .. } => unsent,
+                _ => 0,
+            },
         };
     } else {
         // Where the pointer was when the gesture is abandoned, so
@@ -5989,6 +6015,7 @@ mod tests {
                     last: (1, 1),
                     row_offset: 0,
                     anchor: (0, 0),
+                    unsent: 0,
                 },
                 false,
                 false,
@@ -6009,6 +6036,7 @@ mod tests {
                     last: (1, 1),
                     row_offset: 0,
                     anchor: (0, 0),
+                    unsent: 0,
                 },
                 false,
                 false,
@@ -6134,6 +6162,7 @@ mod tests {
             last: (3, 4),
             row_offset: 0,
             anchor: (0, 0),
+            unsent: 0,
         };
         end_gesture_if_released(&mut g, ButtonAction::Release, ProtoMouseButton::Right);
         assert_eq!(
@@ -6144,6 +6173,7 @@ mod tests {
                 last: (3, 4),
                 row_offset: 0,
                 anchor: (0, 0),
+                unsent: 0,
             },
             "releasing one of two buttons must not end the gesture"
         );
@@ -6158,6 +6188,7 @@ mod tests {
             last: (3, 4),
             row_offset: 0,
             anchor: (0, 0),
+            unsent: 0,
         };
         end_gesture_if_released(&mut g, ButtonAction::Release, ProtoMouseButton::Left);
         assert_eq!(
@@ -6173,6 +6204,7 @@ mod tests {
             last: (3, 4),
             row_offset: 0,
             anchor: (0, 0),
+            unsent: 0,
         };
         end_gesture_if_released(&mut g, ButtonAction::Drag, ProtoMouseButton::Left);
         assert!(matches!(g, SelectionDrag::App { .. }));
@@ -6501,7 +6533,11 @@ mod tests {
             .await;
         h.send(MouseKind::Up, ProtoMouseButton::Left, r.x, r.y)
             .await;
-        assert_eq!(drain(&mut wr), "\x1b[<0;1;1M\x1b[<0;12;3m");
+        assert_eq!(
+            drain(&mut wr),
+            "\x1b[<0;1;1M\x1b[<0;1;1m",
+            "the swallowed right press's release must not end the held left"
+        );
         h.fixture.stop();
     }
 
