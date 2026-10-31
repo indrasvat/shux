@@ -2132,14 +2132,16 @@ enum SelectionDrag {
     /// `Up(MouseButton::Left)`, so a latch keyed to one button would never
     /// clear. `last` is the pane-local cell of the most recent forwarded
     /// report, used to synthesize a release if the gesture is abandoned.
-    /// `row_offset` is the view offset the press landed in: the whole gesture
-    /// maps through it, so an app that moves its cursor on the press (vim)
-    /// does not turn the click into a drag when the view follows.
+    /// `row_offset` is the view offset the press at screen point `pressed_at`
+    /// landed in. An event still at that point maps through it, so an app that
+    /// moves its cursor on the press (vim) does not turn a click into a drag
+    /// when the view follows; one anywhere else names the cell shown there now.
     App {
         pane_id: PaneId,
         buttons: u8,
         last: (u16, u16),
         row_offset: usize,
+        pressed_at: (u16, u16),
     },
 }
 
@@ -2966,16 +2968,19 @@ async fn handle_app_mouse(
     if !inside && matches!(*gesture, SelectionDrag::None) {
         return Ok(AppMouse::NotHandled);
     }
-    // A press names a cell or nothing; the rest of a gesture is pinned, through
-    // the pane as drawn now but at the row offset its press landed in.
+    // A press names a cell or nothing; the rest of a gesture is pinned to the
+    // pane as drawn now.
     let pin = action != ButtonAction::Press;
     let shown = attached.shown.get(&pane_id).copied();
     let view = match *gesture {
         SelectionDrag::App {
             pane_id: p,
             row_offset,
+            pressed_at,
             ..
-        } if p == pane_id => shown.map(|view| view.with_row_offset(row_offset)),
+        } if p == pane_id && pressed_at == (col, row) => {
+            shown.map(|view| view.with_row_offset(row_offset))
+        }
         _ => shown,
     };
     let cell = view.and_then(|view| {
@@ -3051,6 +3056,7 @@ async fn handle_app_mouse(
             buttons: held | button_bit(button),
             last: (local_col, local_row),
             row_offset: view.row_offset,
+            pressed_at: (col, row),
         };
     } else {
         // Where the pointer was when the gesture is abandoned, so
@@ -5986,6 +5992,7 @@ mod tests {
                     buttons: 1,
                     last: (1, 1),
                     row_offset: 0,
+                    pressed_at: (0, 0),
                 },
                 false,
                 false,
@@ -6005,6 +6012,7 @@ mod tests {
                     buttons: 1,
                     last: (1, 1),
                     row_offset: 0,
+                    pressed_at: (0, 0),
                 },
                 false,
                 false,
@@ -6129,6 +6137,7 @@ mod tests {
             buttons: 0b101, // left + right
             last: (3, 4),
             row_offset: 0,
+            pressed_at: (0, 0),
         };
         end_gesture_if_released(&mut g, ButtonAction::Release, ProtoMouseButton::Right);
         assert_eq!(
@@ -6138,6 +6147,7 @@ mod tests {
                 buttons: 0b001,
                 last: (3, 4),
                 row_offset: 0,
+                pressed_at: (0, 0),
             },
             "releasing one of two buttons must not end the gesture"
         );
@@ -6151,6 +6161,7 @@ mod tests {
             buttons: 0b100, // right only
             last: (3, 4),
             row_offset: 0,
+            pressed_at: (0, 0),
         };
         end_gesture_if_released(&mut g, ButtonAction::Release, ProtoMouseButton::Left);
         assert_eq!(
@@ -6165,6 +6176,7 @@ mod tests {
             buttons: 1,
             last: (3, 4),
             row_offset: 0,
+            pressed_at: (0, 0),
         };
         end_gesture_if_released(&mut g, ButtonAction::Drag, ProtoMouseButton::Left);
         assert!(matches!(g, SelectionDrag::App { .. }));
@@ -8506,6 +8518,32 @@ mod tests {
         mouse(&mut h, MouseKind::Up, x, y).await;
         let got = String::from_utf8_lossy(&pane_input(&mut h).await).into_owned();
         assert_eq!(got, "\x1b[<0;1;55M\x1b[<0;1;55m", "a click became a drag");
+        h.stop().await;
+    }
+
+    /// Once the press has moved the view, a drag away from the press point
+    /// names the row the client now shows under the pointer.
+    #[tokio::test(start_paused = true)]
+    async fn a_drag_after_the_press_moved_the_view_names_the_row_now_shown() {
+        let mut h = InputHarness::new(64).await;
+        mouse_app_grid(&mut h, 60, 40).await;
+        let (x, y) = on_screen(&mut h, "grid-row 55").await;
+        mouse(&mut h, MouseKind::Down, x, y).await;
+        {
+            let mut state = h.fixture.io_state.lock().await;
+            state
+                .vts
+                .get_mut(&h.fixture.first_pane)
+                .expect("vt")
+                .process(b"\x1b[1;1H");
+            state.render_pulse.bump();
+        }
+        on_screen(&mut h, "grid-row 01").await;
+        let (dx, dy) = on_screen(&mut h, "grid-row 10").await;
+        mouse(&mut h, MouseKind::Drag, dx, dy).await;
+        mouse(&mut h, MouseKind::Up, dx, dy).await;
+        let got = String::from_utf8_lossy(&pane_input(&mut h).await).into_owned();
+        assert_eq!(got, "\x1b[<0;1;55M\x1b[<32;1;10M\x1b[<0;1;10m");
         h.stop().await;
     }
 
