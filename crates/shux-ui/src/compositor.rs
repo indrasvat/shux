@@ -19,6 +19,7 @@ use crate::borders::{BorderColors, BorderStyle, compute_borders};
 use crate::buffer::{FrameBuffer, RenderAttrs, RenderCell};
 use crate::render::RenderBackend;
 use crate::statusbar::StatusBar;
+use crate::viewport::PaneView;
 
 /// Whether the 1-cell outline ring is actually drawn for `content`.
 ///
@@ -158,6 +159,8 @@ pub struct RenderCompositor<W: Write> {
     /// Keep the terminal cursor hidden whatever the focused pane says.
     cursor_hidden: bool,
     images: crate::kitty_emit::KittyEmitter,
+    /// What each pane showed in the last `render_multi_pane` frame.
+    pane_views: HashMap<PaneId, PaneView>,
 }
 
 impl<W: Write> RenderCompositor<W> {
@@ -173,6 +176,7 @@ impl<W: Write> RenderCompositor<W> {
             cursor_state_known: false,
             cursor_hidden: false,
             images: crate::kitty_emit::KittyEmitter::default(),
+            pane_views: HashMap::new(),
         }
     }
 
@@ -483,9 +487,12 @@ impl<W: Write> RenderCompositor<W> {
 
         // 2. Render each pane's VT cells into the framebuffer.
         let mut placements = Vec::new();
+        self.pane_views.clear();
         for (pid, rect) in &pane_rects {
             if let Some(vt) = frame.vts.get(pid) {
-                let row_offset = self.compose_pane(*rect, vt);
+                let view = PaneView::of(*rect, vt);
+                self.pane_views.insert(*pid, view);
+                let row_offset = self.compose_pane(view, vt);
                 if self.images.enabled() {
                     placements.extend(crate::composed::resolve_placements(
                         *rect,
@@ -695,10 +702,11 @@ impl<W: Write> RenderCompositor<W> {
         Ok(stats)
     }
 
-    /// Compose a single pane's VT grid into the framebuffer at `rect`.
+    /// Compose a single pane's VT grid into the framebuffer through `view`.
     /// Returns the vertical clip it applied, which the image path needs to
     /// undo so a picture lands on the row its text did.
-    fn compose_pane(&mut self, rect: Rect, vt: &shux_vt::VirtualTerminal) -> usize {
+    fn compose_pane(&mut self, view: PaneView, vt: &shux_vt::VirtualTerminal) -> usize {
+        let rect = view.rect;
         let grid = vt.grid();
         let defaults = vt.default_colors();
         let total_rows = grid.rows();
@@ -711,8 +719,7 @@ impl<W: Write> RenderCompositor<W> {
         // resize-down). Use a cursor-following viewport so content and the
         // cursor mapping below agree — a plain bottom anchor rendered
         // top-of-grid content blank while the cursor still painted (#108).
-        let row_offset =
-            crate::viewport::pane_view_row_offset(total_rows, visible_rows, vt.cursor().row);
+        let row_offset = view.row_offset;
 
         for r in 0..visible_rows {
             let grid_row = row_offset + r;
@@ -765,6 +772,12 @@ impl<W: Write> RenderCompositor<W> {
     }
 
     /// Get statistics from the last render pass.
+    /// What each pane showed in the last `render_multi_pane` frame, so input
+    /// can name the cell the client sees rather than one drawn since.
+    pub fn pane_views(&self) -> &HashMap<PaneId, PaneView> {
+        &self.pane_views
+    }
+
     pub fn last_stats(&self) -> Option<&RenderStats> {
         self.last_stats.as_ref()
     }

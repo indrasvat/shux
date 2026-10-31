@@ -2016,6 +2016,9 @@ impl SessionGraph {
         window.layout.toggle_zoom(id);
         let is_zoomed = window.layout.is_zoomed();
         window.version += 1;
+        // A zoom shows only `id`, so input goes to it (tmux does the same).
+        let previous_focus = (is_zoomed && window.active_pane != id)
+            .then(|| std::mem::replace(&mut window.active_pane, id));
 
         // Same rationale as resize_pane: zoom changes what's visible on
         // every pane in the window (siblings get hidden / restored), so
@@ -2039,6 +2042,14 @@ impl SessionGraph {
             session_id,
             zoomed: is_zoomed,
         });
+        if let Some(previous) = previous_focus {
+            self.fire(EventData::PaneFocused {
+                pane_id: id,
+                window_id,
+                session_id,
+                previous_pane_id: Some(previous),
+            });
+        }
         Ok(is_zoomed)
     }
 
@@ -5090,6 +5101,45 @@ mod tests {
         let snap = state.load();
         assert_eq!(snap.panes[&p1].version, p1_v + 1);
         assert_eq!(snap.panes[&p2].version, p2_v + 1);
+    }
+
+    /// A zoom shows one pane; input must go to that pane, not a hidden one.
+    #[tokio::test]
+    async fn zooming_a_pane_focuses_it_and_unzooming_leaves_focus_alone() {
+        let bus = crate::bus::EventBus::new();
+        let mut sub = bus.subscribe();
+        let (graph, state) = SessionGraph::new_with_event_bus(Some(bus));
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let wid = state.load().sessions[&sid].windows[0];
+        let a = state.load().windows[&wid].active_pane;
+        let b = graph.split_pane(a, Direction::Vertical, 0.5).unwrap();
+        graph.focus_pane(b).unwrap();
+
+        assert!(graph.zoom_pane(a, None).unwrap());
+        assert_eq!(state.load().windows[&wid].active_pane, a);
+        let mut focused = false;
+        for _ in 0..16 {
+            let next = tokio::time::timeout(std::time::Duration::from_secs(5), sub.recv())
+                .await
+                .expect("event should arrive")
+                .expect("bus not closed");
+            if let crate::bus::SubscriptionEvent::Event(e) = next
+                && let EventData::PaneFocused {
+                    pane_id,
+                    previous_pane_id,
+                    ..
+                } = e.data
+                && pane_id == a
+            {
+                assert_eq!(previous_pane_id, Some(b));
+                focused = true;
+                break;
+            }
+        }
+        assert!(focused, "no PaneFocused for the zoomed pane");
+
+        assert!(!graph.zoom_pane(a, None).unwrap());
+        assert_eq!(state.load().windows[&wid].active_pane, a);
     }
 
     #[test]
