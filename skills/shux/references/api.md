@@ -293,7 +293,7 @@ the PTY read source before VT processing and before sampled
 { "pane_id": "uuid" }
 { "session_id": "...", "direction": "up|down|left|right" }
 
-// pane.zoom — toggle zoom on a pane
+// pane.zoom — toggle zoom on a pane; zooming in also focuses it
 { "pane_id": "uuid" }
 
 // pane.swap — swap two panes within a window

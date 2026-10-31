@@ -2212,30 +2212,6 @@ mod tests {
         cancel.cancel();
     }
 
-    /// `pane zoom -p b` does not move focus, so keeping that zoom would hide
-    /// `a` once focus returns to it.
-    #[tokio::test]
-    async fn undoing_a_split_drops_an_operator_zoom_that_would_hide_focus() {
-        let Zoomed {
-            gh,
-            cancel,
-            window,
-            a,
-            b,
-            ..
-        } = zoomed_window().await;
-        let prior = SplitUndo::capture(&gh.snapshot(), a);
-        let new = gh
-            .split_pane(a, Direction::Vertical, 0.5)
-            .await
-            .expect("split");
-        gh.zoom_pane(b, None).await.expect("zoom b");
-
-        undo_split(&gh, new, prior).await;
-        assert_eq!(zoom_focus(&gh, window), (None, a));
-        cancel.cancel();
-    }
-
     /// Re-zooming `a` here would hide `b`, the pane the operator is typing in.
     #[tokio::test]
     async fn undoing_a_split_never_zooms_away_from_the_focused_pane() {

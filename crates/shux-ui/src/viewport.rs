@@ -68,7 +68,9 @@ pub struct PaneView {
 }
 
 impl PaneView {
-    /// The view `vt` is drawn with inside `rect`.
+    /// The view `vt` is drawn with inside `rect`. A grid taller than its rect
+    /// (an oversized `pane set-size`, a split that shrank the rect, a transient
+    /// resize-down) follows the cursor, so content and cursor agree (#108).
     pub fn of(rect: Rect, vt: &shux_vt::VirtualTerminal) -> Self {
         let grid = vt.grid();
         Self {

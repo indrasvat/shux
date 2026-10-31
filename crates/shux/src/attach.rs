@@ -2966,16 +2966,18 @@ async fn handle_app_mouse(
     if !inside && matches!(*gesture, SelectionDrag::None) {
         return Ok(AppMouse::NotHandled);
     }
-    // A press the app never got (it named no cell) has no release to send.
+    // A release of a button the gesture does not hold: a legacy host reports
+    // every release as left, or the app never got this press. Either way,
+    // release what the app does hold rather than send an orphan or strand it.
     let bit = button_bit(button);
     if action == ButtonAction::Release
         && matches!(*gesture, SelectionDrag::App { buttons, .. } if bit != 0 && buttons & bit == 0)
     {
+        release_app_gesture(io_state, gesture).await;
         return Ok(AppMouse::Consumed { redraw: false });
     }
-    // Only an event of a gesture already underway is pinned; a press names a
-    // cell or nothing.
-    let pin = action != ButtonAction::Press && !matches!(*gesture, SelectionDrag::None);
+    // A press names a cell or nothing; the rest of a gesture is pinned.
+    let pin = action != ButtonAction::Press;
     let view = match *gesture {
         SelectionDrag::App {
             pane_id: p, view, ..
@@ -2986,15 +2988,11 @@ async fn handle_app_mouse(
         shux_ui::viewport::pane_grid_cell(&view, (col, row), pin).map(|cell| (view, cell))
     });
     let Some((view, (local_col, local_row))) = cell else {
-        // No cell to name: a press only selects the pane, and a release goes
-        // out where the gesture was last seen rather than leave a button held.
+        // Only a press gets here (the rest of a gesture is pinned through the
+        // view its press named a cell in): it names no cell, so it only
+        // selects the pane.
         let redraw = action == ButtonAction::Press
             && select_pane_on_press(graph, session, attached.active_pane_id, pane_id).await;
-        if action == ButtonAction::Release && matches!(*gesture, SelectionDrag::App { .. }) {
-            release_app_gesture(io_state, gesture).await;
-        } else {
-            end_gesture_if_released(gesture, action, button);
-        }
         return Ok(AppMouse::Consumed { redraw });
     };
 
@@ -6360,14 +6358,16 @@ mod tests {
         vt.process(setup);
         vt.process(format!("\x1b[{rows};1H").as_bytes());
         h.fixture.io_state.lock().await.vts.insert(pane, vt);
-        let viewport = current_viewport(&h.client_size, &test_config()).await;
-        let rect = h.fixture.graph.snapshot().windows[&h.fixture.first_window]
-            .layout
-            .compute_rects(viewport)
-            .into_iter()
-            .find(|(pid, _)| *pid == pane)
-            .expect("pane rect")
-            .1;
+        let attached = h.session.lock().await.clone();
+        let rect = pane_rect_for(
+            &h.fixture.graph,
+            &attached,
+            &h.client_size,
+            &test_config(),
+            pane,
+        )
+        .await
+        .expect("pane rect");
         (wr, rect)
     }
 
@@ -6379,8 +6379,8 @@ mod tests {
         String::from_utf8_lossy(&out).into_owned()
     }
 
-    /// A press that named no cell was never sent, so neither is its release,
-    /// and it must not end the gesture the app does know about.
+    /// A press that named no cell was never sent, so its release is not sent
+    /// either; it releases what the app does hold instead of stranding it.
     #[tokio::test]
     async fn a_release_the_app_never_saw_pressed_is_not_sent() {
         let mut h = AppMouseHarness::new().await;
@@ -6394,7 +6394,23 @@ mod tests {
             .await;
         h.send(MouseKind::Up, ProtoMouseButton::Right, r.x + 1, r.y)
             .await;
-        assert_eq!(drain(&mut wr), "\x1b[<2;1;1M\x1b[<2;2;1m");
+        assert_eq!(drain(&mut wr), "\x1b[<2;1;1M\x1b[<2;1;1m");
+        assert_eq!(h.gesture, SelectionDrag::None);
+        h.fixture.stop();
+    }
+
+    /// A host without SGR reporting decodes every release as `Up(Left)`; one
+    /// for a right-button gesture must still end it and release the button.
+    #[tokio::test]
+    async fn a_legacy_hosts_release_ends_a_right_button_gesture() {
+        let mut h = AppMouseHarness::new().await;
+        let (mut wr, r) =
+            install_app(&h, h.fixture.first_pane, (4, 12), b"\x1b[?1002h\x1b[?1006h").await;
+        h.send(MouseKind::Down, ProtoMouseButton::Right, r.x, r.y)
+            .await;
+        h.send(MouseKind::Up, ProtoMouseButton::Left, r.x, r.y)
+            .await;
+        assert_eq!(drain(&mut wr), "\x1b[<2;1;1M\x1b[<2;1;1m");
         assert_eq!(h.gesture, SelectionDrag::None);
         h.fixture.stop();
     }

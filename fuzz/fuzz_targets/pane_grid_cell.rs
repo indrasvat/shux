@@ -83,9 +83,7 @@ fuzz_target!(|case: Case| {
     screen.process(comp.inner());
     let seen = |x: u16, y: u16| screen.grid().visible_row(y.into())[usize::from(x)].ch;
 
-    let Some(view) = comp.pane_views().get(&pane).copied() else {
-        return;
-    };
+    let view = comp.pane_views()[&pane];
     // The rect the attach loop hit-tests against (`pane_rect_in`).
     let content = Rect::new(0, 0, w, h - 1);
     let rect = if zoom.is_some() {

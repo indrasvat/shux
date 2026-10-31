@@ -492,12 +492,12 @@ impl<W: Write> RenderCompositor<W> {
             if let Some(vt) = frame.vts.get(pid) {
                 let view = PaneView::of(*rect, vt);
                 self.pane_views.insert(*pid, view);
-                let row_offset = self.compose_pane(view, vt);
+                self.compose_pane(view, vt);
                 if self.images.enabled() {
                     placements.extend(crate::composed::resolve_placements(
                         *rect,
                         vt.grid(),
-                        row_offset,
+                        view.row_offset,
                     ));
                 }
             } else {
@@ -703,9 +703,7 @@ impl<W: Write> RenderCompositor<W> {
     }
 
     /// Compose a single pane's VT grid into the framebuffer through `view`.
-    /// Returns the vertical clip it applied, which the image path needs to
-    /// undo so a picture lands on the row its text did.
-    fn compose_pane(&mut self, view: PaneView, vt: &shux_vt::VirtualTerminal) -> usize {
+    fn compose_pane(&mut self, view: PaneView, vt: &shux_vt::VirtualTerminal) {
         let rect = view.rect;
         let grid = vt.grid();
         let defaults = vt.default_colors();
@@ -714,11 +712,6 @@ impl<W: Write> RenderCompositor<W> {
         let visible_rows = rect.height as usize;
         let visible_cols = rect.width as usize;
 
-        // The VT grid can be taller than the pane rect (an oversized
-        // `pane set-size`, a split that shrank the rect, or a transient
-        // resize-down). Use a cursor-following viewport so content and the
-        // cursor mapping below agree — a plain bottom anchor rendered
-        // top-of-grid content blank while the cursor still painted (#108).
         let row_offset = view.row_offset;
 
         for r in 0..visible_rows {
@@ -737,7 +730,6 @@ impl<W: Write> RenderCompositor<W> {
                     .set_cell(rect.x + c as u16, rect.y + r as u16, rcell);
             }
         }
-        row_offset
     }
 
     /// Render a placeholder string centered in the rect. Used when a pane
@@ -771,13 +763,13 @@ impl<W: Write> RenderCompositor<W> {
         }
     }
 
-    /// Get statistics from the last render pass.
     /// What each pane showed in the last `render_multi_pane` frame, so input
     /// can name the cell the client sees rather than one drawn since.
     pub fn pane_views(&self) -> &HashMap<PaneId, PaneView> {
         &self.pane_views
     }
 
+    /// Get statistics from the last render pass.
     pub fn last_stats(&self) -> Option<&RenderStats> {
         self.last_stats.as_ref()
     }
