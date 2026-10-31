@@ -1,3 +1,10 @@
+## [0.54.14](https://github.com/indrasvat/shux/compare/v0.54.13...v0.54.14) (2026-10-31)
+
+
+### Bug Fixes
+
+* **attach:** mouse and wheel reach the app at the grid row the client shows ([#233](https://github.com/indrasvat/shux/issues/233)) ([99cb193](https://github.com/indrasvat/shux/commit/99cb1930633fc85c3eac5f5fe1768e35a54fe221)), closes [#192](https://github.com/indrasvat/shux/issues/192) [#108](https://github.com/indrasvat/shux/issues/108) [#192](https://github.com/indrasvat/shux/issues/192)
+
 ## [0.54.13](https://github.com/indrasvat/shux/compare/v0.54.12...v0.54.13) (2026-10-29)
 
 
