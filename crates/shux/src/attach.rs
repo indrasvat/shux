@@ -6213,12 +6213,11 @@ mod tests {
         for _ in 0..8 {
             tokio::task::yield_now().await;
         }
-        if let Ok(AttachServerFrame::Render { frame, .. }) = out_rx.try_recv() {
-            assert!(
-                busy.shown.views(frame).is_some(),
-                "the client holds frame {frame:?} but its views are not recorded"
-            );
-        }
+        assert!(
+            out_rx.try_recv().is_err(),
+            "a frame went out before its views were recorded"
+        );
+        assert!(busy.shown.views(Some(7)).is_none());
         drop(busy);
         let got = out_rx.recv().await;
         assert!(matches!(
