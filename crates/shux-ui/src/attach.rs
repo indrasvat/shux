@@ -254,6 +254,9 @@ where
         }
     });
 
+    // The last numbered frame written to the terminal: mouse events name cells
+    // of what the user was looking at, which the daemon may have redrawn since.
+    let mut written_frame: Option<u64> = None;
     loop {
         #[expect(
             clippy::disallowed_methods,
@@ -287,13 +290,16 @@ where
                     }
                 };
                 match parsed {
-                    AttachServerFrame::Render { data } => {
+                    AttachServerFrame::Render { data, frame } => {
                         let bytes = match BASE64.decode(data.as_bytes()) {
                             Ok(b) => b,
                             Err(_) => continue,
                         };
                         stdout.write_all(&bytes).await.ok();
                         stdout.flush().await.ok();
+                        if frame.is_some() {
+                            written_frame = frame;
+                        }
                     }
                     AttachServerFrame::Bell => {
                         stdout.write_all(b"\x07").await.ok();
@@ -411,6 +417,7 @@ where
                             shift: m.modifiers.contains(KeyModifiers::SHIFT),
                             alt: m.modifiers.contains(KeyModifiers::ALT),
                             ctrl: m.modifiers.contains(KeyModifiers::CONTROL),
+                            frame: written_frame,
                         };
                         let bytes = serde_json::to_vec(&frame)?;
                         sink.send(Bytes::from(bytes)).await.ok();

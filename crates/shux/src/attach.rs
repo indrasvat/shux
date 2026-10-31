@@ -41,6 +41,7 @@ use shux_rpc::attach::{
     AttachServerFrame, MouseButton as ProtoMouseButton, MouseKind,
 };
 use shux_rpc::create_codec;
+use shux_ui::viewport::PaneView;
 use shux_ui::{BorderStyle, CompositorConfig, MultiPaneFrame, RenderCompositor};
 
 use crate::pane_input::{InputPermit, Lane, PaneWriter};
@@ -622,9 +623,44 @@ struct AttachedSession {
     /// key or action ends it, as the toast promises. Either way
     /// `welcome_toast_seen: true` is persisted so the next attach skips it.
     show_welcome_toast: bool,
-    /// What each pane showed in the last frame sent to this client: mouse
-    /// input names cells of that frame, not of one drawn since.
-    shown: HashMap<PaneId, shux_ui::viewport::PaneView>,
+    /// What each pane showed in the last few frames sent to this client:
+    /// mouse input names cells of the frame the client had written when it
+    /// sent the event, not of one drawn since.
+    shown: ShownFrames,
+}
+
+/// Pane views of the latest frames sent to one client, oldest first, each
+/// under the number its `Render { frame }` carried.
+#[derive(Debug, Clone, Default)]
+struct ShownFrames(std::collections::VecDeque<(u64, Arc<HashMap<PaneId, PaneView>>)>);
+
+impl ShownFrames {
+    /// Frames a client can trail the daemon by and still be mapped exactly;
+    /// one further behind maps through the oldest kept, the nearest to it.
+    const KEPT: usize = 16;
+
+    fn push(&mut self, frame: u64, views: HashMap<PaneId, PaneView>) {
+        if self.0.len() == Self::KEPT {
+            self.0.pop_front();
+        }
+        self.0.push_back((frame, Arc::new(views)));
+    }
+
+    /// The views the client saw when it had written `frame`: the newest frame
+    /// not after it. `None` (a client that predates frame numbers) is the
+    /// latest frame sent.
+    fn views(&self, frame: Option<u64>) -> Option<&HashMap<PaneId, PaneView>> {
+        let entry = match frame {
+            None => self.0.back(),
+            Some(f) => self
+                .0
+                .iter()
+                .rev()
+                .find(|(n, _)| *n <= f)
+                .or(self.0.front()),
+        };
+        entry.map(|(_, views)| views.as_ref())
+    }
 }
 
 /// Find a session by name, or create it (with one window + one pane) if
@@ -663,7 +699,7 @@ async fn resolve_or_create_session(
             // time by reading the onboarding state file; this stays
             // true here so the render loop can flip it off after dwell.
             show_welcome_toast: true,
-            shown: HashMap::new(),
+            shown: ShownFrames::default(),
         })
     };
 
@@ -739,7 +775,7 @@ async fn resolve_or_create_session(
         client_prefix: None,
         action_error: None,
         show_welcome_toast: true,
-        shown: HashMap::new(),
+        shown: ShownFrames::default(),
     })
 }
 
@@ -1154,6 +1190,7 @@ async fn run_attach_loop(
                                         let osc = shux_ui::osc52_copy(&text);
                                         let frame = AttachServerFrame::Render {
                                             data: BASE64.encode(&osc),
+                                            frame: None,
                                         };
                                         let _ = out_tx.send(frame).await;
                                     }
@@ -1297,6 +1334,7 @@ async fn run_attach_loop(
                         shift,
                         alt,
                         ctrl,
+                        frame,
                     } => {
                         // Modal guard: swallow mouse events while the
                         // help overlay is visible. Otherwise a click or
@@ -1322,6 +1360,7 @@ async fn run_attach_loop(
                             shift,
                             alt,
                             ctrl,
+                            frame,
                             &graph,
                             &io_state,
                             &render_session,
@@ -1385,6 +1424,7 @@ async fn run_attach_loop(
                             kind,
                             col,
                             row,
+                            frame,
                             &graph,
                             &io_state,
                             &render_session,
@@ -1536,6 +1576,7 @@ async fn run_render_loop(
     let _ = out_tx
         .send(AttachServerFrame::Render {
             data: BASE64.encode(b"\x1b[2J\x1b[H"),
+            frame: None,
         })
         .await;
 
@@ -1544,6 +1585,7 @@ async fn run_render_loop(
     let mut tick = tokio::time::interval(tick_period);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_frame: Option<tokio::time::Instant> = None;
+    let mut frame_number: u64 = 0;
 
     // Welcome toast: lazily-initialised first-render instant. Stays
     // None until the first render iteration where we actually start
@@ -1963,9 +2005,12 @@ async fn run_render_loop(
             // the compositor wraps each frame in synchronized output, so the
             // parts are held and applied together.
             let mut sent_all = true;
-            for part in bytes.chunks(RENDER_PART_BYTES) {
+            frame_number += 1;
+            let mut parts = bytes.chunks(RENDER_PART_BYTES).peekable();
+            while let Some(part) = parts.next() {
                 let frame = AttachServerFrame::Render {
                     data: BASE64.encode(part),
+                    frame: parts.peek().is_none().then_some(frame_number),
                 };
                 if out_tx.send(frame).await.is_err() {
                     sent_all = false;
@@ -1975,8 +2020,12 @@ async fn run_render_loop(
             if !sent_all {
                 break;
             }
+            session
+                .lock()
+                .await
+                .shown
+                .push(frame_number, compositor.pane_views().clone());
         }
-        session.lock().await.shown = compositor.pane_views().clone();
     }
 }
 
@@ -2557,6 +2606,7 @@ async fn handle_copy_mode_mouse(
                         let osc = shux_ui::osc52_copy(&text);
                         let frame = AttachServerFrame::Render {
                             data: BASE64.encode(&osc),
+                            frame: None,
                         };
                         let _ = out_tx.send(frame).await;
                     }
@@ -2870,6 +2920,7 @@ async fn handle_app_mouse(
     shift: bool,
     alt: bool,
     ctrl: bool,
+    frame: Option<u64>,
     graph: &GraphHandle,
     io_state: &Arc<Mutex<PaneIoState>>,
     session: &Arc<Mutex<AttachedSession>>,
@@ -2975,7 +3026,11 @@ async fn handle_app_mouse(
     // drawn now (and below, within legacy encoding's reach), so the app sees
     // every press and every release names a button it holds.
     let pin = !matches!(*gesture, SelectionDrag::None);
-    let shown = attached.shown.get(&pane_id).copied();
+    let shown = attached
+        .shown
+        .views(frame)
+        .and_then(|views| views.get(&pane_id))
+        .copied();
     let view = match *gesture {
         SelectionDrag::App {
             row_offset, anchor, ..
@@ -3251,6 +3306,7 @@ async fn handle_wheel(
     kind: MouseKind,
     col: u16,
     row: u16,
+    frame: Option<u64>,
     graph: &GraphHandle,
     io_state: &Arc<Mutex<PaneIoState>>,
     session: &Arc<Mutex<AttachedSession>>,
@@ -3310,7 +3366,8 @@ async fn handle_wheel(
         WheelRouting::ForwardMouse => {
             let cell = attached
                 .shown
-                .get(&pane_id)
+                .views(frame)
+                .and_then(|views| views.get(&pane_id))
                 .and_then(|view| shux_ui::viewport::pane_grid_cell(view, (col, row), false));
             // No grid cell under the pointer, or no truthful encoding for this
             // app's coordinate mode: sending nothing beats a tick aimed at a
@@ -3496,6 +3553,7 @@ async fn yank_selection(
     let osc = shux_ui::osc52_copy(&text);
     let frame = AttachServerFrame::Render {
         data: BASE64.encode(&osc),
+        frame: None,
     };
     out_tx.send(frame).await.is_ok()
 }
@@ -4432,7 +4490,7 @@ mod tests {
         let deadline = tokio::time::Instant::now() + shux_testkit::BUDGET;
         while !screen.capture_text(None).contains("keybindings") {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(AttachServerFrame::Render { data })) => {
+                Ok(Some(AttachServerFrame::Render { data, .. })) => {
                     screen.process(&BASE64.decode(data).expect("render base64"));
                 }
                 Ok(Some(_)) => {}
@@ -4451,7 +4509,7 @@ mod tests {
         })
         .await;
         while let Ok(frame) = rx.try_recv() {
-            if let AttachServerFrame::Render { data } = frame {
+            if let AttachServerFrame::Render { data, .. } = frame {
                 screen.process(&BASE64.decode(data).expect("render base64"));
             }
         }
@@ -4468,7 +4526,7 @@ mod tests {
         let mut idle_frames = 0;
         let drew = loop {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(AttachServerFrame::Render { data })) => {
+                Ok(Some(AttachServerFrame::Render { data, .. })) => {
                     screen.process(&BASE64.decode(data).expect("render base64"));
                     if screen.capture_text(None).contains("MARK") {
                         break true;
@@ -4550,7 +4608,7 @@ mod tests {
                 break true;
             }
             match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(AttachServerFrame::Render { data })) => {
+                Ok(Some(AttachServerFrame::Render { data, .. })) => {
                     screen.process(&BASE64.decode(data).expect("render base64"));
                 }
                 Ok(Some(_)) => {}
@@ -4709,7 +4767,7 @@ mod tests {
             client_prefix: None,
             action_error: None,
             show_welcome_toast: true,
-            shown: HashMap::new(),
+            shown: ShownFrames::default(),
         };
 
         AttachFixture {
@@ -4754,7 +4812,7 @@ mod tests {
             .expect("render frame timeout")
             .expect("render frame");
         match frame {
-            AttachServerFrame::Render { data } => {
+            AttachServerFrame::Render { data, .. } => {
                 let decoded = BASE64.decode(data.as_bytes()).expect("render base64");
                 String::from_utf8(decoded).expect("render utf8")
             }
@@ -5241,7 +5299,7 @@ mod tests {
         );
         let frame = out_rx.recv().await.expect("render frame");
         match frame {
-            AttachServerFrame::Render { data } => {
+            AttachServerFrame::Render { data, .. } => {
                 let decoded = BASE64.decode(data.as_bytes()).expect("osc52 base64");
                 let text = String::from_utf8(decoded).expect("osc52 utf8");
                 assert!(text.starts_with("\x1b]52;c;"));
@@ -6135,6 +6193,40 @@ mod tests {
         }
     }
 
+    /// Which frame's views a stamped event maps through.
+    #[test]
+    fn shown_frames_map_a_stamp_to_the_frame_the_client_had_written() {
+        let pane = PaneId::new();
+        let view = |row_offset| {
+            HashMap::from([(
+                pane,
+                PaneView {
+                    rect: Rect::new(0, 0, 1, 1),
+                    row_offset,
+                    grid_rows: 1,
+                    grid_cols: 1,
+                },
+            )])
+        };
+        let offset = |views: Option<&HashMap<PaneId, PaneView>>| views.map(|v| v[&pane].row_offset);
+        let mut shown = ShownFrames::default();
+        assert_eq!(offset(shown.views(Some(1))), None, "nothing sent yet");
+        for n in 1..=20 {
+            shown.push(n, view(n as usize));
+        }
+        assert_eq!(offset(shown.views(Some(12))), Some(12), "the stamped frame");
+        assert_eq!(
+            offset(shown.views(None)),
+            Some(20),
+            "an unstamped event: the latest"
+        );
+        assert_eq!(
+            offset(shown.views(Some(2))),
+            Some(5),
+            "a stamp older than any kept: the oldest kept (20 - 16 + 1)"
+        );
+    }
+
     /// A press whose button mask can never empty is a gesture that never ends.
     #[test]
     fn app_gesture_ends_only_when_every_button_is_up() {
@@ -6213,7 +6305,9 @@ mod tests {
                 })
                 .collect()
         };
-        session.lock().await.shown = shown;
+        let mut s = session.lock().await;
+        let next = s.shown.0.back().map_or(1, |(n, _)| n + 1);
+        s.shown.push(next, shown);
     }
 
     /// Every argument `handle_app_mouse` takes but the event itself, so the
@@ -6276,6 +6370,7 @@ mod tests {
                 shift,
                 alt,
                 ctrl,
+                None,
                 &self.fixture.graph,
                 &self.fixture.io_state,
                 &self.session,
@@ -6597,6 +6692,7 @@ mod tests {
             MouseKind::ScrollUp,
             4,
             3,
+            None,
             &h.fixture.graph,
             &h.fixture.io_state,
             &h.session,
@@ -7501,6 +7597,7 @@ mod tests {
             MouseKind::ScrollUp,
             3,
             3,
+            None,
             &fixture.graph,
             &fixture.io_state,
             &session,
@@ -7572,6 +7669,7 @@ mod tests {
             MouseKind::ScrollUp,
             3,
             3,
+            None,
             &fixture.graph,
             &fixture.io_state,
             &session,
@@ -7614,6 +7712,7 @@ mod tests {
             MouseKind::ScrollUp,
             3,
             3,
+            None,
             &fixture.graph,
             &fixture.io_state,
             &session,
@@ -7651,6 +7750,7 @@ mod tests {
             MouseKind::ScrollDown,
             3,
             3,
+            None,
             &fixture.graph,
             &fixture.io_state,
             &session,
@@ -7690,6 +7790,7 @@ mod tests {
             MouseKind::ScrollUp,
             3,
             3,
+            None,
             &fixture.graph,
             &fixture.io_state,
             &session,
@@ -7813,6 +7914,7 @@ mod tests {
             MouseKind::ScrollUp,
             first_point.0,
             first_point.1,
+            None,
             &fixture.graph,
             &fixture.io_state,
             &session,
@@ -7862,6 +7964,7 @@ mod tests {
             MouseKind::ScrollUp,
             second_point.0,
             second_point.1,
+            None,
             &fixture.graph,
             &fixture.io_state,
             &session,
@@ -8012,6 +8115,12 @@ mod tests {
         framed: Framed<tokio::io::DuplexStream, tokio_util::codec::LengthDelimitedCodec>,
         /// Kept across waits: later render frames redraw only what changed.
         screen: shux_vt::VirtualTerminal,
+        /// The last numbered frame applied to `screen`, as the real client
+        /// stamps its mouse events.
+        written_frame: Option<u64>,
+        /// Every frame received, applied or not: what `receive_unapplied`
+        /// reads to know a frame in transit shows what it waits for.
+        shadow: shux_vt::VirtualTerminal,
         cancel: CancellationToken,
         server: tokio::task::JoinHandle<anyhow::Result<()>>,
     }
@@ -8071,6 +8180,8 @@ mod tests {
             Self {
                 framed,
                 screen: shux_vt::VirtualTerminal::new(24, usize::from(cols)),
+                written_frame: None,
+                shadow: shux_vt::VirtualTerminal::new(24, usize::from(cols)),
                 cancel,
                 server,
             }
@@ -8111,9 +8222,13 @@ mod tests {
                 tokio::time::timeout_at(deadline, self.framed.next()).await
             {
                 let frame: AttachServerFrame = serde_json::from_slice(&buf).expect("server frame");
-                if let AttachServerFrame::Render { data } = &frame {
-                    self.screen
-                        .process(&BASE64.decode(data.as_bytes()).expect("render base64"));
+                if let AttachServerFrame::Render { data, frame } = &frame {
+                    let bytes = BASE64.decode(data.as_bytes()).expect("render base64");
+                    self.screen.process(&bytes);
+                    self.shadow.process(&bytes);
+                    if frame.is_some() {
+                        self.written_frame = *frame;
+                    }
                 }
                 let grid = self.screen.grid();
                 let text: String = (0..grid.rows())
@@ -8127,6 +8242,35 @@ mod tests {
                 }
             }
             false
+        }
+
+        /// Takes server frames off the wire, without applying them, until a
+        /// numbered one shows `needle`: a client that has not caught up yet,
+        /// whose screen and mouse-event stamp stay where they were.
+        async fn receive_unapplied(&mut self, needle: &str) {
+            let deadline = tokio::time::Instant::now() + shux_testkit::BUDGET;
+            while let Ok(Some(Ok(buf))) =
+                tokio::time::timeout_at(deadline, self.framed.next()).await
+            {
+                let frame: AttachServerFrame = serde_json::from_slice(&buf).expect("server frame");
+                let AttachServerFrame::Render { data, frame } = frame else {
+                    continue;
+                };
+                self.shadow
+                    .process(&BASE64.decode(data.as_bytes()).expect("render base64"));
+                let grid = self.shadow.grid();
+                let shows = (0..grid.rows()).any(|r| {
+                    let row = grid.visible_row(r);
+                    (0..row.len())
+                        .map(|c| row[c].ch)
+                        .collect::<String>()
+                        .contains(needle)
+                });
+                if frame.is_some() && shows {
+                    return;
+                }
+            }
+            panic!("no frame in transit showed {needle:?}");
         }
 
         /// Waits for the status bar to say `amount` of this client's input
@@ -8474,6 +8618,7 @@ mod tests {
     }
 
     async fn mouse(h: &mut InputHarness, kind: MouseKind, col: u16, row: u16) {
+        let frame = h.written_frame;
         h.send(&AttachClientFrame::Mouse {
             kind,
             button: ProtoMouseButton::Left,
@@ -8482,6 +8627,7 @@ mod tests {
             shift: false,
             alt: false,
             ctrl: false,
+            frame,
         })
         .await;
     }
@@ -8499,6 +8645,33 @@ mod tests {
         assert!(
             got.starts_with("\x1b[<0;") && got.contains(";55M") && got.ends_with(";55m"),
             "clicked the row showing grid-row 55; the app was told {got:?}"
+        );
+        h.stop().await;
+    }
+
+    /// Over a slow link the daemon has sent a frame the client has not applied
+    /// yet; a click names the cell of the frame the client shows, not the one
+    /// still in transit.
+    #[tokio::test(start_paused = true)]
+    async fn a_click_names_the_frame_the_client_applied_not_one_in_transit() {
+        let mut h = InputHarness::new(64).await;
+        mouse_app_grid(&mut h, 60, 40).await;
+        let (x, y) = on_screen(&mut h, "grid-row 55").await;
+        {
+            let mut state = h.fixture.io_state.lock().await;
+            state
+                .vts
+                .get_mut(&h.fixture.first_pane)
+                .expect("vt")
+                .process(b"\x1b[1;1H");
+            state.render_pulse.bump();
+        }
+        h.receive_unapplied("grid-row 01").await;
+        mouse(&mut h, MouseKind::Down, x, y).await;
+        let got = String::from_utf8_lossy(&pane_input(&mut h).await).into_owned();
+        assert!(
+            got.ends_with(";55M"),
+            "clicked grid-row 55 as shown; the app was told {got:?}"
         );
         h.stop().await;
     }

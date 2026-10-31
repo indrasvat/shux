@@ -65,7 +65,14 @@ pub enum AttachReady {
 pub enum AttachServerFrame {
     /// Raw ANSI bytes — base64-encoded — to write directly to the
     /// client's terminal. Used for the entire render output.
-    Render { data: String },
+    Render {
+        data: String,
+        /// Set on the last part of a frame that lays panes out: the client
+        /// stamps its mouse events with the latest one it has written, so the
+        /// daemon maps them through the frame the user was looking at.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frame: Option<u64>,
+    },
     /// Beep — write `\x07` locally.
     Bell,
     /// Banner text to flash (e.g., notification overlay).
@@ -120,6 +127,11 @@ pub enum AttachClientFrame {
         /// Ctrl held -- forwarded to the app as Cb bit 16.
         #[serde(default)]
         ctrl: bool,
+        /// The last `Render { frame }` the client wrote before this event.
+        /// `None` from a client that predates it: the daemon then uses the
+        /// latest frame it sent.
+        #[serde(default)]
+        frame: Option<u64>,
     },
     /// Client wants to detach.
     Detach,
@@ -241,9 +253,11 @@ mod tests {
                 shift,
                 alt,
                 ctrl,
+                frame,
                 ..
             } => {
                 assert_eq!((col, row), (3, 4));
+                assert_eq!(frame, None, "an older client names no frame");
                 assert!(!shift, "shift must default off, not swallow the click");
                 assert!(!alt);
                 assert!(!ctrl);
@@ -312,12 +326,20 @@ mod tests {
     fn test_server_frame_render_roundtrip() {
         let f = AttachServerFrame::Render {
             data: "AAAA".into(),
+            frame: None,
         };
         let s = serde_json::to_string(&f).unwrap();
         assert!(s.contains("\"type\":\"render\""));
+        assert!(
+            !s.contains("frame"),
+            "an unnumbered render omits the field: {s}"
+        );
         let back: AttachServerFrame = serde_json::from_str(&s).unwrap();
         match back {
-            AttachServerFrame::Render { data } => assert_eq!(data, "AAAA"),
+            AttachServerFrame::Render { data, frame } => {
+                assert_eq!(data, "AAAA");
+                assert_eq!(frame, None);
+            }
             _ => panic!("wrong variant"),
         }
     }

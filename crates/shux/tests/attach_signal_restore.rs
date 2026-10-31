@@ -524,7 +524,7 @@ async fn headless_attach(
             .expect("pane never drawn")
             .expect("daemon hung up before drawing the pane")
             .expect("read frame");
-        if let Ok(AttachServerFrame::Render { data }) = serde_json::from_slice(&frame) {
+        if let Ok(AttachServerFrame::Render { data, .. }) = serde_json::from_slice(&frame) {
             seen.extend(BASE64.decode(&data).expect("render base64"));
         }
     }
