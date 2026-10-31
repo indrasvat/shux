@@ -62,8 +62,8 @@ pub fn pane_view_row_offset(total_rows: usize, visible_rows: usize, cursor_row: 
 /// Columns are left-anchored, as drawn.
 ///
 /// `None` when the point is on no grid cell shown there. `clamp` instead pins
-/// it onto the nearest shown cell, for a gesture already underway that must
-/// still deliver its release.
+/// it onto the nearest shown cell, for a gesture already underway; it is still
+/// `None` when the rect shows no cell at all.
 pub fn pane_grid_cell(
     rect: Rect,
     vt: &shux_vt::VirtualTerminal,
@@ -154,7 +154,7 @@ mod tests {
         use crate::compositor::{
             CompositorConfig, MultiPaneFrame, RenderCompositor, pane_viewport,
         };
-        use shux_core::layout::{Direction, LayoutNode, Rect};
+        use shux_core::layout::{Direction, LayoutNode, Rect, ZoomState};
         use shux_core::model::PaneId;
         use shux_vt::VirtualTerminal;
         use std::collections::HashMap;
@@ -181,7 +181,11 @@ mod tests {
         let mut checked = 0usize;
         for (w, h) in [(17u16, 9u16), (12, 12), (30, 6)] {
             for style in [BorderStyle::Rounded, BorderStyle::None] {
-                for layout in &layouts {
+                for (layout, zoomed) in layouts.iter().flat_map(|l| [(l, false), (l, true)]) {
+                    let zoom = zoomed.then(|| ZoomState {
+                        saved_layout: layout.clone(),
+                        zoomed_pane: pane,
+                    });
                     for (rows, cols) in [(1usize, 1usize), (3, 5), (7, 30), (13, 4), (20, 20)] {
                         for cursor in [0, rows / 2, rows - 1] {
                             let mut vt = VirtualTerminal::new(rows, cols);
@@ -201,7 +205,7 @@ mod tests {
                             let mut comp = RenderCompositor::new(w, h, Vec::new(), config);
                             comp.render_multi_pane(MultiPaneFrame {
                                 layout,
-                                zoom: None,
+                                zoom: zoom.as_ref(),
                                 focused: pane,
                                 vts: &vts,
                                 chrome: None,
@@ -214,15 +218,18 @@ mod tests {
                                 screen.grid().visible_row(y.into())[usize::from(x)].ch
                             };
                             let content = Rect::new(0, 0, w, h - 1);
-                            let Some((_, rect)) = layout
-                                .compute_rects(pane_viewport(content, style, false))
-                                .into_iter()
-                                .find(|(pid, _)| *pid == pane)
-                            else {
-                                continue;
+                            // The rect the attach loop hit-tests (`pane_rect_in`).
+                            let rect = if zoomed {
+                                content
+                            } else {
+                                layout
+                                    .compute_rects(pane_viewport(content, style, false))
+                                    .into_iter()
+                                    .find_map(|(pid, r)| (pid == pane).then_some(r))
+                                    .expect("the pane is in its layout")
                             };
                             let ctx = format!(
-                                "{w}x{h} {style:?} grid {rows}x{cols} cursor {cursor} {rect:?}"
+                                "{w}x{h} {style:?} zoomed={zoomed} grid {rows}x{cols} cursor {cursor} {rect:?}"
                             );
                             for y in 0..h {
                                 for x in 0..w {
@@ -269,6 +276,6 @@ mod tests {
                 }
             }
         }
-        assert!(checked > 40_000, "the sweep covered only {checked} points");
+        assert!(checked > 80_000, "the sweep covered only {checked} points");
     }
 }

@@ -115,10 +115,10 @@ fuzz_target!(|case: Case| {
                 }
                 None => {}
             }
-            if rect.width == 0 || rect.height == 0 {
+            let Some((c, r)) = pane_grid_cell(rect, &vt, (x, y), true) else {
+                assert!(rect.width == 0 || rect.height == 0, "clamp found no cell in {rect:?}");
                 continue;
-            }
-            let (c, r) = pane_grid_cell(rect, &vt, (x, y), true).expect("clamp always finds a cell");
+            };
             if let Some(e) = exact {
                 assert_eq!((c, r), e);
             }

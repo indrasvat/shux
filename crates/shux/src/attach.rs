@@ -2958,11 +2958,15 @@ async fn handle_app_mouse(
         })
     };
     let Some((local_col, local_row)) = cell else {
-        // Inside the pane but on no cell the app has: nothing truthful to send,
-        // but the click still selects the pane.
+        // No cell to name: a press only selects the pane, and a release goes
+        // out where the gesture was last seen rather than leave a button held.
         let redraw = action == ButtonAction::Press
             && select_pane_on_press(graph, session, attached.active_pane_id, pane_id).await;
-        end_gesture_if_released(gesture, action, button);
+        if action == ButtonAction::Release && matches!(*gesture, SelectionDrag::App { .. }) {
+            release_app_gesture(io_state, gesture).await;
+        } else {
+            end_gesture_if_released(gesture, action, button);
+        }
         return Ok(AppMouse::Consumed { redraw });
     };
 
@@ -3028,11 +3032,9 @@ async fn handle_app_mouse(
 /// visible change.
 ///
 /// tmux's `MouseDown1Pane` is `select-pane` followed by `send-keys -M`: the
-/// click both focuses the pane and reaches the app. (The wheel's forward tier
-/// deliberately does NOT focus, which is why this cites tmux rather than
-/// `handle_wheel`.) A selection left over from before the app took the mouse
-/// can no longer be cleared by clicking, so it is cleared here or it renders
-/// forever.
+/// click both focuses the pane and reaches the app. A selection left over from
+/// before the app took the mouse can no longer be cleared by clicking, so it is
+/// cleared here or it renders forever.
 async fn select_pane_on_press(
     graph: &GraphHandle,
     session: &Arc<Mutex<AttachedSession>>,
@@ -6253,8 +6255,43 @@ mod tests {
         h.fixture.stop();
     }
 
-    /// Screen-global coordinates reaching the app is the defect this catches:
-    /// the click would land in the wrong place in every pane but the first.
+    /// A release must reach an app that saw the press even when the pane's rect
+    /// has since collapsed to nothing, where no cell can be named.
+    #[tokio::test]
+    async fn a_release_on_a_collapsed_pane_still_reaches_the_app() {
+        let mut h = AppMouseHarness::new().await;
+        let mut wr = seed_scrollback_pane(
+            &h.fixture.io_state,
+            h.fixture.first_pane,
+            b"\x1b[?1002h\x1b[?1006h",
+        )
+        .await;
+        h.send(MouseKind::Down, ProtoMouseButton::Left, 2, 2).await;
+        assert_eq!(recv_text(&mut wr).await, "\x1b[<0;2;2M");
+
+        let mut collapsed = None;
+        for cols in 1..10 {
+            *h.client_size.lock().await = (cols, 30);
+            let viewport = current_viewport(&h.client_size, &test_config()).await;
+            let rect = h.fixture.graph.snapshot().windows[&h.fixture.first_window]
+                .layout
+                .compute_rects(viewport)
+                .into_iter()
+                .find(|(pid, _)| *pid == h.fixture.first_pane)
+                .map(|(_, r)| r);
+            if rect.is_some_and(|r| r.width == 0 || r.height == 0) {
+                collapsed = Some(cols);
+                break;
+            }
+        }
+        assert!(collapsed.is_some(), "no client width collapses the pane");
+        h.send(MouseKind::Up, ProtoMouseButton::Left, 0, 2).await;
+        let got = recv_text(&mut wr).await;
+        assert!(got.ends_with('m'), "the app never saw its release: {got:?}");
+        assert_eq!(h.gesture, SelectionDrag::None);
+        h.fixture.stop();
+    }
+
     #[tokio::test]
     async fn a_click_off_a_background_panes_grid_still_focuses_it() {
         let mut h = AppMouseHarness::new().await;
@@ -6299,6 +6336,8 @@ mod tests {
         h.fixture.stop();
     }
 
+    /// Screen-global coordinates reaching the app is the defect this catches:
+    /// the click would land in the wrong place in every pane but the first.
     #[tokio::test]
     async fn a_click_in_a_second_pane_is_local_to_that_pane_and_focuses_it() {
         let mut h = AppMouseHarness::new().await;
