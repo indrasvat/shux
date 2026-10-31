@@ -1912,31 +1912,13 @@ impl SessionGraph {
             .ok_or(GraphError::WindowNotFound(window_id))?;
 
         let current_pane = window.active_pane;
-        let session_id = window.session_id;
         let neighbor = window
             .layout
             .tree
             .directional_focus(current_pane, direction, viewport);
 
         match neighbor {
-            Some(target) => {
-                let mut snapshot = (*current).clone();
-                snapshot.version += 1;
-
-                if let Some(w) = snapshot.windows.get_mut(&window_id) {
-                    w.active_pane = target;
-                    w.version += 1;
-                }
-
-                self.commit_snapshot(snapshot);
-                self.fire(EventData::PaneFocused {
-                    pane_id: target,
-                    window_id,
-                    session_id,
-                    previous_pane_id: Some(current_pane),
-                });
-                Ok(Some(target))
-            }
+            Some(target) => self.focus_pane(target).map(|_| Some(target)),
             None => Ok(None),
         }
     }
@@ -5151,12 +5133,37 @@ mod tests {
         assert!(!snap.windows[&wid].layout.is_zoomed());
     }
 
+    /// While zoomed the layout is the zoomed pane alone, so directional focus
+    /// has no hidden pane to land on.
+    #[test]
+    fn directional_focus_cannot_reach_a_pane_a_zoom_hides() {
+        let (graph, state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let wid = state.load().sessions[&sid].windows[0];
+        let a = state.load().windows[&wid].active_pane;
+        let b = graph.split_pane(a, Direction::Vertical, 0.5).unwrap();
+        assert!(graph.zoom_pane(a, None).unwrap());
+        for dir in [
+            NavDirection::Left,
+            NavDirection::Right,
+            NavDirection::Up,
+            NavDirection::Down,
+        ] {
+            let moved = graph
+                .focus_pane_direction(wid, dir, Rect::new(0, 0, 80, 24))
+                .unwrap();
+            assert_eq!(moved, None, "{dir:?} reached {b:?} behind the zoom");
+        }
+        let snap = state.load();
+        assert_eq!(snap.windows[&wid].active_pane, a);
+        assert!(snap.windows[&wid].layout.is_zoomed());
+    }
+
     /// A zoom shows one pane; input must go to that pane, not a hidden one.
-    #[tokio::test]
-    async fn zooming_a_pane_focuses_it_and_unzooming_leaves_focus_alone() {
+    #[test]
+    fn zooming_a_pane_focuses_it_and_unzooming_leaves_focus_alone() {
         let bus = crate::bus::EventBus::new();
-        let mut sub = bus.subscribe();
-        let (graph, state) = SessionGraph::new_with_event_bus(Some(bus));
+        let (graph, state) = SessionGraph::new_with_event_bus(Some(bus.clone()));
         let sid = graph.create_session("work".into(), home()).unwrap();
         let wid = state.load().sessions[&sid].windows[0];
         let a = state.load().windows[&wid].active_pane;
@@ -5165,26 +5172,14 @@ mod tests {
 
         assert!(graph.zoom_pane(a, None).unwrap());
         assert_eq!(state.load().windows[&wid].active_pane, a);
-        let mut focused = false;
-        for _ in 0..16 {
-            let next = tokio::time::timeout(std::time::Duration::from_secs(5), sub.recv())
-                .await
-                .expect("event should arrive")
-                .expect("bus not closed");
-            if let crate::bus::SubscriptionEvent::Event(e) = next
-                && let EventData::PaneFocused {
-                    pane_id,
-                    previous_pane_id,
-                    ..
-                } = e.data
-                && pane_id == a
-            {
-                assert_eq!(previous_pane_id, Some(b));
-                focused = true;
-                break;
-            }
-        }
-        assert!(focused, "no PaneFocused for the zoomed pane");
+        assert!(
+            bus.history(100).iter().any(|e| matches!(
+                e.data,
+                EventData::PaneFocused { pane_id, previous_pane_id: Some(p), .. }
+                    if pane_id == a && p == b
+            )),
+            "no PaneFocused for the zoomed pane"
+        );
 
         assert!(!graph.zoom_pane(a, None).unwrap());
         assert_eq!(state.load().windows[&wid].active_pane, a);

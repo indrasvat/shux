@@ -80,9 +80,7 @@ impl PaneView {
             grid_cols: grid.cols(),
         }
     }
-}
 
-impl PaneView {
     /// This view at `row_offset` instead, kept within the grid.
     pub fn with_row_offset(self, row_offset: usize) -> Self {
         let max = self.grid_rows.saturating_sub(self.rect.height.into());

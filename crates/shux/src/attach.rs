@@ -2133,15 +2133,16 @@ enum SelectionDrag {
     /// clear. `last` is the pane-local cell of the most recent forwarded
     /// report, used to synthesize a release if the gesture is abandoned.
     /// `row_offset` is the view offset the press at screen point `pressed_at`
-    /// landed in. An event still at that point maps through it, so an app that
-    /// moves its cursor on the press (vim) does not turn a click into a drag
-    /// when the view follows; one anywhere else names the cell shown there now.
+    /// landed in. Until the pointer leaves that point, events map through it,
+    /// so an app that moves its cursor on the press (vim) does not turn a
+    /// click into a drag when the view follows; after that, every event names
+    /// the cell shown under the pointer now.
     App {
         pane_id: PaneId,
         buttons: u8,
         last: (u16, u16),
         row_offset: usize,
-        pressed_at: (u16, u16),
+        pressed_at: Option<(u16, u16)>,
     },
 }
 
@@ -2835,7 +2836,7 @@ async fn release_app_gesture(io_state: &Arc<Mutex<PaneIoState>>, gesture: &mut S
         let Some(cb) = button_cb(ButtonAction::Release, button, false, false) else {
             continue;
         };
-        if let Some(bytes) = encode_mouse_release(cb, sgr, last.0, last.1) {
+        if let Some(bytes) = encode_mouse_report(cb, true, sgr, last.0, last.1) {
             forward_bytes_to_pane(io_state, pane_id, bytes, Lane::Urgent).await;
         }
     }
@@ -2972,14 +2973,18 @@ async fn handle_app_mouse(
     // pane as drawn now.
     let pin = action != ButtonAction::Press;
     let shown = attached.shown.get(&pane_id).copied();
-    let view = match *gesture {
+    let view = match gesture {
         SelectionDrag::App {
-            pane_id: p,
             row_offset,
             pressed_at,
             ..
-        } if p == pane_id && pressed_at == (col, row) => {
-            shown.map(|view| view.with_row_offset(row_offset))
+        } if pin => {
+            if *pressed_at == Some((col, row)) {
+                shown.map(|view| view.with_row_offset(*row_offset))
+            } else {
+                *pressed_at = None;
+                shown
+            }
         }
         _ => shown,
     };
@@ -2993,7 +2998,7 @@ async fn handle_app_mouse(
     let bit = button_bit(button);
     if action == ButtonAction::Release
         && matches!(*gesture, SelectionDrag::App { buttons, .. }
-            if cell.is_none() || (bit != 0 && buttons & bit == 0))
+            if cell.is_none() || buttons & bit == 0)
     {
         if let (Some((_, at)), SelectionDrag::App { last, .. }) = (cell, &mut *gesture) {
             *last = at;
@@ -3015,18 +3020,13 @@ async fn handle_app_mouse(
         end_gesture_if_released(gesture, action, button);
         return Ok(AppMouse::NotHandled);
     };
-    let encoded = if action == ButtonAction::Release {
-        encode_mouse_release(cb, sgr, local_col, local_row)
-    } else {
-        encode_mouse_report(cb, false, sgr, local_col, local_row)
-    };
-    let Some(bytes) = encoded else {
-        // Not encodable for this app's coordinate mode. Consume it: the pane is
-        // still the app's, and a stray shux selection under a running TUI is
-        // not a better answer than nothing happening.
+    let release = action == ButtonAction::Release;
+    let Some(bytes) = encode_mouse_report(cb, release, sgr, local_col, local_row) else {
+        // Not encodable for this app's coordinate mode (a release always is).
+        // Consume it: the pane is still the app's, and a stray shux selection
+        // under a running TUI is not a better answer than nothing happening.
         let redraw = action == ButtonAction::Press
             && select_pane_on_press(graph, session, attached.active_pane_id, pane_id).await;
-        end_gesture_if_released(gesture, action, button);
         return Ok(AppMouse::Consumed { redraw });
     };
 
@@ -3056,7 +3056,7 @@ async fn handle_app_mouse(
             buttons: held | button_bit(button),
             last: (local_col, local_row),
             row_offset: view.row_offset,
-            pressed_at: (col, row),
+            pressed_at: Some((col, row)),
         };
     } else {
         // Where the pointer was when the gesture is abandoned, so
@@ -3163,8 +3163,15 @@ const X10_MOUSE_LIMIT: u16 = 223;
 ///
 /// `None` — do not forward — for a legacy coordinate past [`X10_MOUSE_LIMIT`]
 /// or a 1-based coordinate of `0`. Clamping instead would name a cell the user
-/// did not click.
+/// did not click. A legacy release is the exception: it is pinned within
+/// reach, because an app waiting on a release recovers from one a few cells
+/// off, never from one that is missing.
 fn encode_mouse_report(cb: u16, release: bool, sgr: bool, col: u16, row: u16) -> Option<Vec<u8>> {
+    let (col, row) = if release && !sgr {
+        (col.min(X10_MOUSE_LIMIT), row.min(X10_MOUSE_LIMIT))
+    } else {
+        (col, row)
+    };
     if col == 0 || row == 0 {
         return None;
     }
@@ -3180,17 +3187,6 @@ fn encode_mouse_report(cb: u16, release: bool, sgr: bool, col: u16, row: u16) ->
     let cb = if release { 3 | (cb & !3) } else { cb };
     let enc = |v: u16| -> u8 { (v + 32) as u8 };
     Some(vec![0x1b, b'[', b'M', enc(cb), enc(col), enc(row)])
-}
-
-/// A release report, pinned within legacy encoding's reach: an app waiting on
-/// a release recovers from one a few cells off, never from one that is missing.
-fn encode_mouse_release(cb: u16, sgr: bool, col: u16, row: u16) -> Option<Vec<u8>> {
-    let (col, row) = if sgr {
-        (col, row)
-    } else {
-        (col.min(X10_MOUSE_LIMIT), row.min(X10_MOUSE_LIMIT))
-    };
-    encode_mouse_report(cb, true, sgr, col, row)
 }
 
 /// Encode a wheel tick. Button 64 = wheel up, 65 = wheel down.
@@ -5992,7 +5988,7 @@ mod tests {
                     buttons: 1,
                     last: (1, 1),
                     row_offset: 0,
-                    pressed_at: (0, 0),
+                    pressed_at: None,
                 },
                 false,
                 false,
@@ -6012,7 +6008,7 @@ mod tests {
                     buttons: 1,
                     last: (1, 1),
                     row_offset: 0,
-                    pressed_at: (0, 0),
+                    pressed_at: None,
                 },
                 false,
                 false,
@@ -6137,7 +6133,7 @@ mod tests {
             buttons: 0b101, // left + right
             last: (3, 4),
             row_offset: 0,
-            pressed_at: (0, 0),
+            pressed_at: None,
         };
         end_gesture_if_released(&mut g, ButtonAction::Release, ProtoMouseButton::Right);
         assert_eq!(
@@ -6147,7 +6143,7 @@ mod tests {
                 buttons: 0b001,
                 last: (3, 4),
                 row_offset: 0,
-                pressed_at: (0, 0),
+                pressed_at: None,
             },
             "releasing one of two buttons must not end the gesture"
         );
@@ -6161,7 +6157,7 @@ mod tests {
             buttons: 0b100, // right only
             last: (3, 4),
             row_offset: 0,
-            pressed_at: (0, 0),
+            pressed_at: None,
         };
         end_gesture_if_released(&mut g, ButtonAction::Release, ProtoMouseButton::Left);
         assert_eq!(
@@ -6176,7 +6172,7 @@ mod tests {
             buttons: 1,
             last: (3, 4),
             row_offset: 0,
-            pressed_at: (0, 0),
+            pressed_at: None,
         };
         end_gesture_if_released(&mut g, ButtonAction::Drag, ProtoMouseButton::Left);
         assert!(matches!(g, SelectionDrag::App { .. }));
@@ -6320,14 +6316,9 @@ mod tests {
         h.fixture.stop();
     }
 
-    /// An `Up` the client cannot attribute to a button must still end the gesture.
-    ///
-    /// `button_cb` refuses `None` on a press or release — correctly, since
-    /// turning it into a left click would forward a click the user never made.
-    /// But that early return is the one path out of `handle_app_mouse` that
-    /// skips both gesture helpers, so the latch never clears. `Mouse` is an
-    /// untrusted wire frame, so this shape is reachable even though shux's own
-    /// client never sends it.
+    /// An `Up` the client cannot attribute to a button still ends the gesture,
+    /// releasing the buttons the app holds: `Mouse` is an untrusted wire frame,
+    /// so this shape is reachable even though shux's own client never sends it.
     #[tokio::test]
     async fn an_unattributable_release_still_ends_the_app_gesture() {
         let mut h = AppMouseHarness::new().await;
@@ -6342,10 +6333,12 @@ mod tests {
         assert_eq!(recv_text(&mut wr).await, "\x1b[<0;10;5M");
         assert!(matches!(h.gesture, SelectionDrag::App { .. }));
 
-        // Nothing is forwarded — there is no truthful report for a buttonless
-        // release — but the gesture must not outlive it.
         h.send(MouseKind::Up, ProtoMouseButton::None, 10, 5).await;
-        assert_no_bytes(&mut wr, "a buttonless release is not encodable").await;
+        assert_eq!(
+            recv_text(&mut wr).await,
+            "\x1b[<0;10;5m",
+            "the held button is released"
+        );
         assert_eq!(
             h.gesture,
             SelectionDrag::None,
@@ -6664,23 +6657,8 @@ mod tests {
     #[tokio::test]
     async fn a_click_off_a_background_panes_grid_still_focuses_it() {
         let mut h = AppMouseHarness::new().await;
-        let mut wr = seed_scrollback_pane(&h.fixture.io_state, h.fixture.second_pane, b"").await;
-        let mut small = shux_vt::VirtualTerminal::new(3, 4);
-        small.process(b"\x1b[?1002h\x1b[?1006h");
-        h.fixture
-            .io_state
-            .lock()
-            .await
-            .vts
-            .insert(h.fixture.second_pane, small);
-        let viewport = current_viewport(&h.client_size, &test_config()).await;
-        let rect = h.fixture.graph.snapshot().windows[&h.fixture.first_window]
-            .layout
-            .compute_rects(viewport)
-            .into_iter()
-            .find(|(pid, _)| *pid == h.fixture.second_pane)
-            .expect("second pane rect")
-            .1;
+        let (mut wr, rect) =
+            install_app(&h, h.fixture.second_pane, (3, 4), b"\x1b[?1002h\x1b[?1006h").await;
 
         let outcome = h
             .send(
@@ -8544,6 +8522,38 @@ mod tests {
         mouse(&mut h, MouseKind::Up, dx, dy).await;
         let got = String::from_utf8_lossy(&pane_input(&mut h).await).into_owned();
         assert_eq!(got, "\x1b[<0;1;55M\x1b[<32;1;10M\x1b[<0;1;10m");
+        h.stop().await;
+    }
+
+    /// Once the pointer has left the press point, coming back to it names the
+    /// row shown there now, not the press's.
+    #[tokio::test(start_paused = true)]
+    async fn a_drag_back_to_the_press_point_names_the_row_shown_there_now() {
+        let mut h = InputHarness::new(64).await;
+        mouse_app_grid(&mut h, 60, 40).await;
+        let (x, y) = on_screen(&mut h, "grid-row 55").await;
+        mouse(&mut h, MouseKind::Down, x, y).await;
+        {
+            let mut state = h.fixture.io_state.lock().await;
+            state
+                .vts
+                .get_mut(&h.fixture.first_pane)
+                .expect("vt")
+                .process(b"\x1b[1;1H");
+            state.render_pulse.bump();
+        }
+        on_screen(&mut h, "grid-row 01").await;
+        let (dx, dy) = on_screen(&mut h, "grid-row 10").await;
+        mouse(&mut h, MouseKind::Drag, dx, dy).await;
+        let (bx, by) = on_screen(&mut h, &format!("grid-row {:02}", y)).await;
+        assert_eq!((bx, by), (x, y), "the press point now shows grid-row {y}");
+        mouse(&mut h, MouseKind::Drag, x, y).await;
+        mouse(&mut h, MouseKind::Up, x, y).await;
+        let got = String::from_utf8_lossy(&pane_input(&mut h).await).into_owned();
+        assert_eq!(
+            got,
+            format!("\x1b[<0;1;55M\x1b[<32;1;10M\x1b[<32;1;{y}M\x1b[<0;1;{y}m")
+        );
         h.stop().await;
     }
 

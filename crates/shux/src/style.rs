@@ -929,11 +929,9 @@ const GAP: usize = 3;
 
 /// Zoom is reported whether or not the pane also has focus.
 ///
-/// `pane.zoom` takes a pane id, so zoomed-without-focus is an ordinary state a
-/// caller can reach — and it is the state an operator most needs told about,
-/// because a zoomed pane is why the others are not on screen. The marker used
-/// to gate `[zoomed]` behind focus, so `--format json` said `is_zoomed: true`
-/// and both human formats said nothing at all.
+/// A zoomed pane is why the others are not on screen, so the human formats
+/// say so whenever `--format json` says `is_zoomed: true`, never gated behind
+/// focus.
 fn pane_marker(is_focused: bool, is_zoomed: bool) -> String {
     match (is_focused, is_zoomed) {
         (true, true) => "\u{25C0} focus [zoomed]".to_string(),
