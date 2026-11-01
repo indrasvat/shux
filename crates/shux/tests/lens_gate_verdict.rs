@@ -1262,3 +1262,45 @@ fn review_reports_a_bad_scenario_as_usage_and_its_own_failure_as_infra() {
     assert_eq!(code, 3, "stderr:\n{stderr}");
     assert!(stderr.contains("not a regression"), "stderr:\n{stderr}");
 }
+
+#[test]
+fn a_malformed_scenario_whose_trace_is_its_cast_writes_nothing() {
+    let h = Harness::new();
+    let d = tmp();
+    let scn = write_scenario(d.path(), "bad", "name = \"bad\"\nnot toml [[[\n");
+    let kept = d.path().join("kept.json");
+    std::fs::write(&kept, "precious").unwrap();
+    let kept = kept.to_string_lossy().into_owned();
+    let out = gate(&h, &["--trace", &kept, "--cast", &kept, &scn], false);
+    assert_eq!(out.exit, 2, "stderr:\n{}", out.stderr);
+    assert!(
+        out.stderr.contains("same file as --trace"),
+        "stderr:\n{}",
+        out.stderr
+    );
+    assert_eq!(std::fs::read_to_string(&kept).unwrap(), "precious");
+}
+
+#[test]
+fn a_malformed_scenario_whose_trace_reader_left_still_writes_its_report() {
+    use std::os::unix::process::ExitStatusExt;
+    let h = Harness::new();
+    let d = tmp();
+    let scn = write_scenario(d.path(), "bad", "name = \"bad\"\nnot toml [[[\n");
+    let report = d.path().join("r.json");
+    let (read, write) = nix::unistd::pipe().expect("pipe");
+    drop(read);
+    let out = h
+        .shux()
+        .args(["lens", "gate", "--trace", "-", "--report"])
+        .arg(&report)
+        .arg(&scn)
+        .env_remove("CI")
+        .stdout(std::process::Stdio::from(write))
+        .output()
+        .expect("spawn shux lens gate");
+    assert_eq!(out.status.signal(), Some(libc::SIGPIPE), "{out:?}");
+    let written: Vec<ScenarioReport> =
+        serde_json::from_str(&std::fs::read_to_string(&report).expect("report written")).unwrap();
+    assert_eq!(written[0].status, GateStatus::ScenarioError);
+}

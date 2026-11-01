@@ -254,18 +254,24 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
         Err(e) => {
             // Preserve the 081 trace contract: a malformed scenario still leaves a
             // greppable `parse_error` in the trace.
-            if let Some(code) = refuse_trace_alias(&opts, None) {
+            // No scenario name yet, so only an explicit `--cast PATH` can be named.
+            let cast = opts
+                .cast
+                .as_deref()
+                .filter(|c| !c.trim().is_empty())
+                .map(Path::new);
+            if let Some(code) = refuse_trace_alias(&opts, cast) {
                 return code;
             }
-            let lost_trace = match runner::emit_parse_error_trace(
+            let (lost_trace, reader_left) = match runner::emit_parse_error_trace(
                 trace_target(opts.trace.clone()),
                 &e.to_string(),
             ) {
-                Ok(trace) if trace.reader_left() => return Err(broken_pipe()),
-                Ok(trace) => trace.failure(),
-                Err(why) => Some(why),
+                Ok(trace) if trace.reader_left() => (None, true),
+                Ok(trace) => (trace.failure(), false),
+                Err(why) => (Some(why), false),
             };
-            if let Some(code) = refuse_trace_alias(&opts, None) {
+            if let Some(code) = refuse_trace_alias(&opts, cast) {
                 return code;
             }
             eprintln!("{}", crate::style::error(format!("lens gate: {e}")));
@@ -275,6 +281,9 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
             }
             if let Err(e) = emit(&opts, &reports) {
                 return report_io_failure(e);
+            }
+            if reader_left {
+                return Err(broken_pipe());
             }
             let code = GateStatus::ScenarioError.exit_code() as i32;
             return Ok(lost_trace.map_or(code, |why| trace_failure(&why, code)));
