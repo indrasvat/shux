@@ -1373,3 +1373,54 @@ fn a_machinery_failure_still_finishes_its_trace() {
         out.stderr
     );
 }
+
+/// An alias is refused before any other refusal can write its report onto it.
+#[test]
+fn an_alias_is_refused_before_a_refusal_writes_its_report() {
+    let h = Harness::new();
+    let d = tmp();
+    let scn = write_scenario(d.path(), "ci", &scenario("ci", "HI", None));
+    let kept = d.path().join("kept.json");
+    std::fs::write(&kept, "precious").unwrap();
+    let kept = kept.to_string_lossy().into_owned();
+    let out = gate(
+        &h,
+        &[
+            "--on-missing",
+            "create",
+            "--trace",
+            &kept,
+            "--report",
+            &kept,
+            &scn,
+        ],
+        true,
+    );
+    assert_eq!(out.exit, 2, "stderr:\n{}", out.stderr);
+    assert_eq!(std::fs::read_to_string(&kept).unwrap(), "precious");
+}
+
+/// A trace through a link to a file that does not exist yet: the refusal removes
+/// the file it created, and writes no trace bytes first.
+#[test]
+fn a_refused_alias_through_a_dangling_link_leaves_nothing() {
+    let h = Harness::new();
+    let d = tmp();
+    let bad = write_scenario(d.path(), "bad", "name = \"bad\"\nnot toml [[[\n");
+    let good = write_scenario(d.path(), "gd", &scenario("gd", "HI", None));
+    let target = d.path().join("absent.json");
+    let link = d.path().join("trace-link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let (target_s, link_s) = (
+        target.to_string_lossy().into_owned(),
+        link.to_string_lossy().into_owned(),
+    );
+    for scn in [&bad, &good] {
+        let out = gate(&h, &["--trace", &link_s, "--report", &target_s, scn], false);
+        assert_eq!(out.exit, 2, "{scn}: stderr:\n{}", out.stderr);
+        assert!(
+            !target.exists(),
+            "{scn}: the refused run left {target_s} behind"
+        );
+    }
+}

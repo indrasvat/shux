@@ -56,20 +56,6 @@ pub enum TraceTarget {
     Path(PathBuf),
 }
 
-/// Emit a single `parse_error` to the trace target (081 contract: a malformed scenario
-/// still leaves a greppable trace). 082's driver calls this before it has a `Scenario`.
-/// Err is why the trace could not be opened.
-pub fn emit_parse_error_trace(
-    trace_target: Option<TraceTarget>,
-    message: &str,
-) -> Result<Trace, String> {
-    let mut trace = Trace::open(trace_target)?;
-    trace.emit(RunnerSignal::ParseError {
-        message: message.to_string(),
-    });
-    Ok(trace)
-}
-
 /// The NDJSON trace writer (design D3). Line-buffered + flushed so a crash still leaves
 /// a partial, greppable trace. The first failed write ends writing (the trace stays a
 /// prefix of the run, possibly ending in a partial line) and is kept for the driver.
@@ -128,6 +114,14 @@ impl Trace {
         self.failure
             .as_ref()
             .is_some_and(|e| e.kind() == std::io::ErrorKind::BrokenPipe)
+    }
+
+    /// Record a scenario that could not be parsed (081 contract: a malformed
+    /// scenario still leaves a greppable trace).
+    pub fn parse_error(&mut self, message: &str) {
+        self.emit(RunnerSignal::ParseError {
+            message: message.to_string(),
+        });
     }
 
     /// Why the trace is incomplete, naming it, if a write failed.

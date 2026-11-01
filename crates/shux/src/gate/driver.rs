@@ -249,32 +249,31 @@ fn emit(opts: &GateRunOptions, reports: &[ScenarioReport]) -> Result<(), OutputF
 /// Run the gate on one scenario and return the frozen exit code (task §4). This is the
 /// 082 entry `main.rs` dispatches to for the default `shux lens gate <scenario>`.
 pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Result<i32> {
+    // Before anything can write: a refusal further down still emits its report.
+    if let Some(code) = refuse_trace_alias(&opts, explicit_cast(&opts), false) {
+        return Ok(code);
+    }
     let scenario = match scenario::load(&opts.scenario_path) {
         Ok(s) => s,
         Err(e) => {
             // Preserve the 081 trace contract: a malformed scenario still leaves a
             // greppable `parse_error` in the trace.
-            // No scenario name yet, so only an explicit `--cast PATH` can be named.
-            let cast = opts
-                .cast
-                .as_deref()
-                .filter(|c| !c.trim().is_empty())
-                .map(Path::new);
-            if let Some(code) = refuse_trace_alias(&opts, cast, false) {
-                return Ok(code);
-            }
             let created = trace_file_is_new(&opts);
-            let (lost_trace, reader_left) = match runner::emit_parse_error_trace(
-                trace_target(opts.trace.clone()),
-                &e.to_string(),
-            ) {
-                Ok(trace) if trace.reader_left() => (None, true),
-                Ok(trace) => (trace.failure(), false),
+            let (lost_trace, reader_left) = match Trace::open(trace_target(opts.trace.clone())) {
+                Ok(mut trace) => {
+                    // No scenario name yet, so only an explicit `--cast PATH` can be named.
+                    if let Some(code) = refuse_trace_alias(&opts, explicit_cast(&opts), created) {
+                        return Ok(code);
+                    }
+                    trace.parse_error(&e.to_string());
+                    if trace.reader_left() {
+                        (None, true)
+                    } else {
+                        (trace.failure(), false)
+                    }
+                }
                 Err(why) => (Some(why), false),
             };
-            if let Some(code) = refuse_trace_alias(&opts, cast, created) {
-                return Ok(code);
-            }
             eprintln!("{}", crate::style::error(format!("lens gate: {e}")));
             let mut reports = parse_error_report(&opts.scenario_path, &e.to_string());
             if let Some(why) = &lost_trace {
@@ -567,7 +566,7 @@ fn refuse_trace_alias(opts: &GateRunOptions, cast: Option<&Path>, created: bool)
     );
     if created
         && let TraceTarget::Path(p) = &target
-        && let Err(e) = std::fs::remove_file(p)
+        && let Err(e) = std::fs::canonicalize(p).and_then(std::fs::remove_file)
     {
         eprintln!(
             "{}",
@@ -580,12 +579,21 @@ fn refuse_trace_alias(opts: &GateRunOptions, cast: Option<&Path>, created: bool)
     Some(GateStatus::ScenarioError.exit_code() as i32)
 }
 
-/// Whether opening the trace will create its file, so a refusal can remove it.
+/// Whether opening the trace will create a file (through a link, too), so a refusal
+/// can remove it.
 fn trace_file_is_new(opts: &GateRunOptions) -> bool {
     match trace_target(opts.trace.clone()) {
-        Some(TraceTarget::Path(p)) => std::fs::symlink_metadata(p).is_err(),
+        Some(TraceTarget::Path(p)) => std::fs::metadata(p).is_err(),
         _ => false,
     }
+}
+
+/// `--cast PATH` as given; a bare `--cast` names a file only once the scenario does.
+fn explicit_cast(opts: &GateRunOptions) -> Option<&Path> {
+    opts.cast
+        .as_deref()
+        .filter(|c| !c.trim().is_empty())
+        .map(Path::new)
 }
 
 /// A trace that could not be written: exit 4, unless the run is a regression, which
