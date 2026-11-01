@@ -400,8 +400,15 @@ async fn run_segment_command(seg: &SegmentDef) -> std::io::Result<Vec<u8>> {
     for (k, v) in &seg.env {
         cmd.env(k, v);
     }
+    // Its own process group, killed whole when the run is abandoned (the
+    // budget ran out, or the daemon is stopping): a command left running piles
+    // up a copy per tick and outlives the daemon.
+    cmd.process_group(0).kill_on_drop(true);
     shux_pty::inherit_only_stdio(cmd.as_std_mut());
-    let out = cmd.output().await?;
+    let child = cmd.spawn()?;
+    let mut group = KillGroupOnDrop(child.id());
+    let out = child.wait_with_output().await?;
+    group.0 = None;
     if !out.status.success() {
         return Err(std::io::Error::other(format!(
             "exit {:?}",
@@ -409,6 +416,20 @@ async fn run_segment_command(seg: &SegmentDef) -> std::io::Result<Vec<u8>> {
         )));
     }
     Ok(out.stdout)
+}
+
+/// SIGKILLs a process group unless disarmed by clearing it.
+struct KillGroupOnDrop(Option<u32>);
+
+impl Drop for KillGroupOnDrop {
+    fn drop(&mut self) {
+        if let Some(pgid) = self.0.and_then(|p| i32::try_from(p).ok()) {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(pgid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+    }
 }
 
 fn fallback_bytes(seg: &SegmentDef) -> Vec<u8> {
@@ -839,6 +860,54 @@ mod tests {
             seg.env.get("TERM").map(String::as_str),
             Some("screen-256color")
         );
+    }
+
+    /// A run cut off by the budget takes its whole process tree with it: left
+    /// running, a slow command piles up a copy per tick and outlives the
+    /// daemon.
+    #[tokio::test]
+    async fn a_segment_run_cut_off_leaves_no_process_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let seg = SegmentDef {
+            zone: "right".to_string(),
+            command: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!("sleep 30 & echo $! > {}; wait", pid_file.display()),
+            ],
+            env: HashMap::new(),
+            starship_config: None,
+            interval_ms: 1000,
+            fallback: None,
+        };
+        let run = tokio::time::timeout(shux_testkit::BUDGET, async {
+            let started = run_segment_command(&seg);
+            tokio::pin!(started);
+            tokio::select! {
+                _ = &mut started => panic!("the 30 s command finished"),
+                () = shux_testkit::wait_until_async("the segment to start its sleep", || {
+                    let pid_file = pid_file.clone();
+                    async move { std::fs::read_to_string(&pid_file).is_ok_and(|s| s.ends_with('\n')) }
+                }) => {}
+            }
+        });
+        run.await.expect("the segment never started");
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let gone = shux_testkit::poll_until(shux_testkit::BUDGET, || {
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err()
+        });
+        if !gone {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+        assert!(gone, "the abandoned run left its sleep {pid} running");
     }
 
     #[tokio::test]
