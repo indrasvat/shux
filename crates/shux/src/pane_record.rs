@@ -206,14 +206,27 @@ pub(crate) type Opener = Arc<
 fn file_opener() -> Opener {
     Arc::new(|_id: uuid::Uuid, path: PathBuf, overwrite: bool| {
         async move {
+            use nix::fcntl::{FcntlArg, OFlag, fcntl};
             let mut options = tokio::fs::OpenOptions::new();
-            options.write(true).custom_flags(nix::libc::O_NOFOLLOW);
+            // Non-blocking only for the open: a FIFO nobody reads fails at
+            // once (ENXIO) instead of parking the open, and the start, forever.
+            options
+                .write(true)
+                .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
             if overwrite {
                 options.create(true).truncate(true);
             } else {
                 options.create_new(true);
             }
-            let file = options.open(&path).await?;
+            let file = options.open(&path).await.map_err(|e| {
+                if e.raw_os_error() == Some(nix::libc::ENXIO) {
+                    std::io::Error::other("no process is reading this FIFO")
+                } else {
+                    e
+                }
+            })?;
+            let flags = OFlag::from_bits_retain(fcntl(&file, FcntlArg::F_GETFL)?);
+            fcntl(&file, FcntlArg::F_SETFL(flags - OFlag::O_NONBLOCK))?;
             Ok(Box::new(file) as RecordSink)
         }
         .boxed()
@@ -815,6 +828,11 @@ async fn write(
     sink.write_all(bytes)
         .await
         .map_err(|e| format!("failed to write {what}: {e}"))?;
+    // A file reports a write done before it lands; the flush waits for it,
+    // so only bytes that reached the file are counted.
+    sink.flush()
+        .await
+        .map_err(|e| format!("failed to write {what}: {e}"))?;
     control
         .progress
         .fetch_add(bytes.len() as u64, Ordering::SeqCst);
@@ -926,12 +944,16 @@ pub(crate) mod testing {
         pub(crate) fail_after: Option<usize>,
         /// Panic in the writer once this many bytes have been accepted.
         pub(crate) panic_after: Option<usize>,
+        /// Like a buffered file on a full disk: past this many bytes, writes
+        /// are taken and lost, and the loss surfaces at the next flush.
+        pub(crate) lose_after: Option<usize>,
     }
 
     struct FaultySink {
         inner: tokio::io::DuplexStream,
         fault: Fault,
         accepted: usize,
+        lost: bool,
     }
 
     impl AsyncWrite for FaultySink {
@@ -946,14 +968,22 @@ pub(crate) mod testing {
             if self.fault.fail_after.is_some_and(|n| self.accepted >= n) {
                 return Poll::Ready(Err(std::io::Error::other("injected write failure")));
             }
-            let room = [self.fault.fail_after, self.fault.panic_after]
-                .into_iter()
-                .flatten()
-                .map(|n| n - self.accepted)
-                .min()
-                .unwrap_or(buf.len())
-                .min(buf.len())
-                .max(1);
+            if self.fault.lose_after.is_some_and(|n| self.accepted >= n) {
+                self.lost = true;
+                return Poll::Ready(Ok(buf.len()));
+            }
+            let room = [
+                self.fault.fail_after,
+                self.fault.panic_after,
+                self.fault.lose_after,
+            ]
+            .into_iter()
+            .flatten()
+            .map(|n| n - self.accepted)
+            .min()
+            .unwrap_or(buf.len())
+            .min(buf.len())
+            .max(1);
             let poll = Pin::new(&mut self.inner).poll_write(cx, &buf[..room]);
             if let Poll::Ready(Ok(n)) = poll {
                 self.accepted += n;
@@ -962,6 +992,11 @@ pub(crate) mod testing {
         }
 
         fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            if self.lost {
+                return Poll::Ready(Err(std::io::Error::other(
+                    "injected deferred write failure",
+                )));
+            }
             Pin::new(&mut self.inner).poll_flush(cx)
         }
 
@@ -999,6 +1034,7 @@ pub(crate) mod testing {
             inner: writer,
             fault,
             accepted: 0,
+            lost: false,
         };
         (Box::new(sink), state)
     }
@@ -1415,6 +1451,33 @@ mod tests {
                 .filter(|(_, p, _)| *p == Some(pane))
                 .count(),
             0
+        );
+    }
+
+    /// A sink that takes a write and loses it, as a buffered file on a full
+    /// disk does: `bytes_written` counts only what landed.
+    #[tokio::test]
+    async fn bytes_written_counts_only_what_landed() {
+        let r = rig(1 << 16);
+        let pane = PaneId::new();
+        *r.opener.fault.lock().unwrap() = Fault {
+            lose_after: Some(5),
+            ..Fault::default()
+        };
+        let id = r.start("a", pane).await;
+        r.send(pane, b"12345").await;
+        r.send(pane, b"67890").await;
+        r.rec.stop(id, EndedBy::Stop);
+        let out = r.ended(id).await;
+        let landed = r.opener.of(id).unwrap();
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(out.status, PaneRecordStatus::Error, "{out:?}");
+        assert_eq!(
+            out.bytes_written,
+            landed.bytes().len() as u64,
+            "bytes_written counts bytes that never landed: {out:?}"
         );
     }
 

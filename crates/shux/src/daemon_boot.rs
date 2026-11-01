@@ -42,7 +42,7 @@ pub fn run_daemon(socket_override: Option<PathBuf>) -> anyhow::Result<()> {
 
     // Step 2: Now we are the daemon process — create tokio runtime
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
+    let served = rt.block_on(async {
         // Initialize tracing (to file, since stdio is /dev/null)
         // TODO: Set up file-based tracing subscriber
         tracing_subscriber::fmt()
@@ -140,7 +140,11 @@ pub fn run_daemon(socket_override: Option<PathBuf>) -> anyhow::Result<()> {
         tracing::info!("Daemon shut down cleanly");
 
         Ok::<(), anyhow::Error>(())
-    })?;
+    });
+    // A write stuck in the blocking pool (a stalled FIFO reader, a hung
+    // filesystem) must not hold the process past its drain budgets.
+    rt.shutdown_timeout(std::time::Duration::from_secs(1));
+    served?;
 
     Ok(())
 }

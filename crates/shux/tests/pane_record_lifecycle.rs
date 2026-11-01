@@ -2,6 +2,7 @@
 //! the command, its pane or the daemon goes first, the others follow.
 
 use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -112,7 +113,9 @@ impl Rig {
     fn record(&self, session: &str, pane: &str, to: &Path) -> Recorder {
         let mut child = self
             .cmd()
-            .args(["pane", "record", "-s", session, "-p", pane, "--to"])
+            .args([
+                "pane", "record", "-s", session, "-p", pane, "--force", "--to",
+            ])
             .arg(to)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -495,5 +498,97 @@ fn seeded_schedules_end_command_and_recording_together() {
                 "round {round} {ending:?}: the pane could not be recorded again"
             );
         }
+    }
+}
+
+/// A FIFO nobody reads would block the open forever; it is refused at once.
+#[test]
+fn a_fifo_nobody_reads_is_refused_at_once() {
+    let rig = Rig::new();
+    let pane = rig.session("fifo");
+    let fifo = rig.path("unread.fifo");
+    nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
+    let mut child = rig
+        .cmd()
+        .args([
+            "pane",
+            "record",
+            "-s",
+            "fifo",
+            "-p",
+            &pane,
+            "--force",
+            "--duration-ms",
+            "100",
+            "--to",
+        ])
+        .arg(&fifo)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn pane record");
+    let status = shux_testkit::poll(BUDGET, || child.try_wait().expect("try_wait"));
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("recording to a FIFO nobody reads never returned");
+    }
+    let mut err = String::new();
+    child
+        .stderr
+        .take()
+        .expect("stderr")
+        .read_to_string(&mut err)
+        .expect("stderr");
+    assert!(!status.expect("status").success(), "{err}");
+    assert!(err.contains("reading"), "the error does not say why: {err}");
+}
+
+/// A recording stuck writing to a reader that stopped reading cannot keep
+/// the daemon alive past `daemon stop`.
+#[test]
+fn a_stalled_reader_does_not_keep_the_daemon_alive() {
+    let rig = Rig::new();
+    let pane = rig.session("stall");
+    let fifo = rig.path("stalled.fifo");
+    nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
+    // A reader that never reads: the pipe fills and the writer blocks.
+    let _reader = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NONBLOCK)
+        .open(&fifo)
+        .expect("open the FIFO's read end");
+    let _rec = rig.record("stall", &pane, &fifo);
+    rig.type_line(
+        "stall",
+        &pane,
+        &format!("i=0; while [ $i -lt 8000 ]; do printf '{COLOUR_PROBE}%060d\\n' $i; i=$((i+1)); done; printf 'FU%s\\n' LL"),
+    );
+    // The recording backpressures the pane, so output stops once the pipe
+    // is full: wait for an early line, not for the end.
+    let seen = rig.run(&[
+        "pane",
+        "wait-for",
+        "-s",
+        "stall",
+        "-p",
+        &pane,
+        "--regex",
+        "[0-9]{60}",
+        "--timeout-ms",
+        "15000",
+    ]);
+    assert!(seen.status.success(), "the output never started");
+    let pid: i32 = std::fs::read_to_string(rig.runtime.path().join("shux/shux.pid"))
+        .expect("pidfile")
+        .trim()
+        .parse()
+        .expect("pid");
+    let _ = rig.run(&["daemon", "stop"]);
+    let gone = shux_testkit::poll_until(BUDGET, || {
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err()
+    });
+    if !gone {
+        let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix::sys::signal::SIGKILL);
+        panic!("the daemon outlived `daemon stop` behind a stalled recording");
     }
 }
