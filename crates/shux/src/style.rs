@@ -629,7 +629,7 @@ impl ColumnLayout {
 // ── Rich List Renderers ────────────────────────────────────────
 
 /// Render a rich session list with box frame, aligned columns, and summary footer.
-pub fn render_session_list(ctx: &TerminalContext, sessions: &[SessionInfo]) {
+pub fn render_session_list(ctx: &TerminalContext, sessions: &[SessionInfo]) -> Printed {
     let mut out = io::stdout().lock();
 
     match ctx.format {
@@ -639,23 +639,23 @@ pub fn render_session_list(ctx: &TerminalContext, sessions: &[SessionInfo]) {
                     // 5th column only on scratch rows (which only appear
                     // under --include-scratch) — ordinary rows keep the
                     // stable 4-column shape scripts already parse.
-                    let _ = writeln!(
+                    writeln!(
                         out,
                         "{}\t{}\t{}\t{}\tscratch",
                         safe_label(&s.name),
                         s.window_count,
                         s.created,
                         short_id(&s.id),
-                    );
+                    )?;
                 } else {
-                    let _ = writeln!(
+                    writeln!(
                         out,
                         "{}\t{}\t{}\t{}",
                         safe_label(&s.name),
                         s.window_count,
                         s.created,
                         short_id(&s.id),
-                    );
+                    )?;
                 }
             }
         }
@@ -668,8 +668,8 @@ pub fn render_session_list(ctx: &TerminalContext, sessions: &[SessionInfo]) {
                     "Sessions",
                     "(no sessions)",
                     "Create one: shux session create my-project",
-                );
-                return;
+                )?;
+                return Ok(out.flush()?);
             }
 
             // Build column data
@@ -744,8 +744,8 @@ pub fn render_session_list(ctx: &TerminalContext, sessions: &[SessionInfo]) {
                 .title(title_text)
                 .footer(footer_text);
 
-            let _ = writeln!(out, "{}", bx.header());
-            let _ = writeln!(out, "{}", bx.empty_row());
+            writeln!(out, "{}", bx.header())?;
+            writeln!(out, "{}", bx.empty_row())?;
 
             for (i, session) in sessions.iter().enumerate() {
                 let is_active = session.is_active;
@@ -772,17 +772,23 @@ pub fn render_session_list(ctx: &TerminalContext, sessions: &[SessionInfo]) {
                         _ => cell.to_string(),
                     }
                 });
-                let _ = writeln!(out, "{}", bx.row(&colored, visible_len));
+                writeln!(out, "{}", bx.row(&colored, visible_len))?;
             }
 
-            let _ = writeln!(out, "{}", bx.empty_row());
-            let _ = writeln!(out, "{}", bx.footer_line());
+            writeln!(out, "{}", bx.empty_row())?;
+            writeln!(out, "{}", bx.footer_line())?;
         }
     }
+    out.flush()?;
+    Ok(())
 }
 
 /// Render a rich window list with box frame, context header, and summary footer.
-pub fn render_window_list(ctx: &TerminalContext, session_name: &str, windows: &[WindowInfo]) {
+pub fn render_window_list(
+    ctx: &TerminalContext,
+    session_name: &str,
+    windows: &[WindowInfo],
+) -> Printed {
     let mut out = io::stdout().lock();
     // Egress guard (issue #104) — see `safe_label`.
     let session_name = &safe_label(session_name);
@@ -794,22 +800,22 @@ pub fn render_window_list(ctx: &TerminalContext, session_name: &str, windows: &[
                 // parse keep their positions (issue #120 added it: `--window`
                 // takes an id, and this was the only listing that printed
                 // none).
-                let _ = writeln!(
+                writeln!(
                     out,
                     "{}\t{}\t{}\t{}",
                     w.index,
                     safe_label(&w.title),
                     w.pane_count,
                     short_id(&w.id),
-                );
+                )?;
             }
         }
         OutputFormat::Json => unreachable!("JSON handled before render"),
         OutputFormat::Text => {
             if windows.is_empty() {
                 let title = format!("Windows \u{2500}\u{2500} session: {session_name}");
-                render_empty_state(&mut out, ctx, &title, "(no windows)", "");
-                return;
+                render_empty_state(&mut out, ctx, &title, "(no windows)", "")?;
+                return Ok(out.flush()?);
             }
 
             let mut layout = ColumnLayout::new(vec![
@@ -876,12 +882,12 @@ pub fn render_window_list(ctx: &TerminalContext, session_name: &str, windows: &[
                 .title(header_text)
                 .footer(footer_text);
 
-            let _ = writeln!(out, "{}", bx.header());
-            let _ = writeln!(out, "{}", bx.empty_row());
+            writeln!(out, "{}", bx.header())?;
+            writeln!(out, "{}", bx.empty_row())?;
 
             // Column headers
             let (header_colored, header_len) = layout.render_header(ctx.colors);
-            let _ = writeln!(out, "{}", bx.row(&header_colored, header_len));
+            writeln!(out, "{}", bx.row(&header_colored, header_len))?;
 
             for (i, window) in windows.iter().enumerate() {
                 let is_active = window.is_active;
@@ -893,13 +899,15 @@ pub fn render_window_list(ctx: &TerminalContext, session_name: &str, windows: &[
                         _ => cell.to_string(),
                     }
                 });
-                let _ = writeln!(out, "{}", bx.row(&colored, visible_len));
+                writeln!(out, "{}", bx.row(&colored, visible_len))?;
             }
 
-            let _ = writeln!(out, "{}", bx.empty_row());
-            let _ = writeln!(out, "{}", bx.footer_line());
+            writeln!(out, "{}", bx.empty_row())?;
+            writeln!(out, "{}", bx.footer_line())?;
         }
     }
+    out.flush()?;
+    Ok(())
 }
 
 /// Render a rich pane list with box frame, hierarchy header, and summary footer.
@@ -908,9 +916,11 @@ pub fn render_pane_list(
     session_name: &str,
     window_name: &str,
     panes: &[PaneInfo],
-) {
+) -> Printed {
     let mut out = io::stdout().lock();
-    render_pane_list_into(&mut out, ctx, session_name, window_name, panes);
+    render_pane_list_into(&mut out, ctx, session_name, window_name, panes)?;
+    out.flush()?;
+    Ok(())
 }
 
 /// Which pane field a text-arm column shows. The set varies with the
@@ -949,7 +959,7 @@ fn render_pane_list_into(
     session_name: &str,
     window_name: &str,
     panes: &[PaneInfo],
-) {
+) -> io::Result<()> {
     // Egress guard (issue #104) — see `safe_label`.
     let session_name = &safe_label(session_name);
     let window_name = &safe_label(window_name);
@@ -973,14 +983,14 @@ fn render_pane_list_into(
                 // `title` is appended LAST so the three fields scripts already
                 // parse keep their positions — the same rule issue #120 followed
                 // when `window list` grew an id column.
-                let _ = writeln!(
+                writeln!(
                     out,
                     "{}\t{}\t{}\t{}",
                     short_id(&p.id),
                     safe_label(&p.cwd),
                     safe_label(&render_argv(&p.command)),
                     safe_label(&p.title),
-                );
+                )?;
             }
         }
         OutputFormat::Json => unreachable!("JSON handled before render"),
@@ -989,8 +999,8 @@ fn render_pane_list_into(
                 let title = format!(
                     "Panes \u{2500}\u{2500} window: {window_name} \u{2500}\u{2500} session: {session_name}"
                 );
-                render_empty_state(out, ctx, &title, "(no panes)", "");
-                return;
+                render_empty_state(out, ctx, &title, "(no panes)", "")?;
+                return Ok(());
             }
 
             // Task 060 §C specified ID / CWD / CMD here and only ID ever
@@ -1101,12 +1111,12 @@ fn render_pane_list_into(
                 .title(header_text)
                 .footer(footer_text);
 
-            let _ = writeln!(out, "{}", bx.header());
-            let _ = writeln!(out, "{}", bx.empty_row());
+            writeln!(out, "{}", bx.header())?;
+            writeln!(out, "{}", bx.empty_row())?;
 
             // Column headers
             let (header_colored, header_len) = layout.render_header(ctx.colors);
-            let _ = writeln!(out, "{}", bx.row(&header_colored, header_len));
+            writeln!(out, "{}", bx.row(&header_colored, header_len))?;
 
             for (i, pane) in panes.iter().enumerate() {
                 let is_focused = pane.is_focused;
@@ -1143,13 +1153,14 @@ fn render_pane_list_into(
                         _ => cell.to_string(),
                     }
                 });
-                let _ = writeln!(out, "{}", bx.row(&colored, visible_len));
+                writeln!(out, "{}", bx.row(&colored, visible_len))?;
             }
 
-            let _ = writeln!(out, "{}", bx.empty_row());
-            let _ = writeln!(out, "{}", bx.footer_line());
+            writeln!(out, "{}", bx.empty_row())?;
+            writeln!(out, "{}", bx.footer_line())?;
         }
     }
+    Ok(())
 }
 
 /// Display columns a box's *inner* area may occupy on this terminal.
@@ -1188,7 +1199,7 @@ fn render_empty_state(
     title: &str,
     message: &str,
     hint: &str,
-) {
+) -> io::Result<()> {
     let msg_w = display_width(message);
     let hint_w = display_width(hint);
     let title_w = display_width(title);
@@ -1197,24 +1208,25 @@ fn render_empty_state(
 
     let bx = BoxRenderer::new(ctx, inner).title(title.to_string());
 
-    let _ = writeln!(out, "{}", bx.header());
-    let _ = writeln!(out, "{}", bx.empty_row());
+    writeln!(out, "{}", bx.header())?;
+    writeln!(out, "{}", bx.empty_row())?;
 
     let msg_styled = styled_if(message, ctx.colors, None, false, true);
     let msg_padding = inner.saturating_sub(msg_w);
     let v = if ctx.unicode { "│" } else { "|" };
-    let _ = writeln!(out, "{v} {msg_styled}{} {v}", " ".repeat(msg_padding));
+    writeln!(out, "{v} {msg_styled}{} {v}", " ".repeat(msg_padding))?;
 
-    let _ = writeln!(out, "{}", bx.empty_row());
+    writeln!(out, "{}", bx.empty_row())?;
 
     if !hint.is_empty() {
         let hint_styled = styled_if(hint, ctx.colors, None, false, true);
         let hint_padding = inner.saturating_sub(hint_w);
-        let _ = writeln!(out, "{v} {hint_styled}{} {v}", " ".repeat(hint_padding));
-        let _ = writeln!(out, "{}", bx.empty_row());
+        writeln!(out, "{v} {hint_styled}{} {v}", " ".repeat(hint_padding))?;
+        writeln!(out, "{}", bx.empty_row())?;
     }
 
-    let _ = writeln!(out, "{}", bx.footer_line());
+    writeln!(out, "{}", bx.footer_line())?;
+    Ok(())
 }
 
 // ── Data Structs for List Rendering ────────────────────────────
@@ -1281,32 +1293,36 @@ fn render_argv(argv: &[String]) -> String {
 // ── Version & Confirmation Printers ────────────────────────────
 
 /// Print the shux banner (used for version output).
-pub fn print_version(version: &str, git_sha: Option<&str>, daemon_status: Option<&str>) {
+pub fn print_version(version: &str, git_sha: Option<&str>, daemon_status: Option<&str>) -> Printed {
     let mut out = io::stdout().lock();
-    let _ = write!(out, "{} ", accent("shux"));
-    let _ = write!(out, "{}", bold(version));
+    write!(out, "{} ", accent("shux"))?;
+    write!(out, "{}", bold(version))?;
     if let Some(sha) = git_sha {
-        let _ = write!(out, " {}", muted(format!("({sha})")));
+        write!(out, " {}", muted(format!("({sha})")))?;
     }
     if let Some(status) = daemon_status {
-        let _ = write!(out, " {}", warning(format!("[{status}]")));
+        write!(out, " {}", warning(format!("[{status}]")))?;
     }
-    let _ = writeln!(out);
+    writeln!(out)?;
+    out.flush()?;
+    Ok(())
 }
 
 /// Print the daemon's line of `shux version`, under the CLI's: its build when
 /// it said, and `note` as a warning. The daemon's words are escaped.
-pub fn print_daemon_version(found: Option<(&str, &str)>, note: Option<&str>) {
+pub fn print_daemon_version(found: Option<(&str, &str)>, note: Option<&str>) -> Printed {
     let mut out = io::stdout().lock();
-    let _ = write!(out, "{}", accent("daemon"));
+    write!(out, "{}", accent("daemon"))?;
     if let Some((version, sha)) = found {
-        let _ = write!(out, " {}", bold(safe_label(version)));
-        let _ = write!(out, " {}", muted(format!("({})", safe_label(sha))));
+        write!(out, " {}", bold(safe_label(version)))?;
+        write!(out, " {}", muted(format!("({})", safe_label(sha))))?;
     }
     if let Some(note) = note {
-        let _ = write!(out, " {}", warning(format!("[{}]", safe_label(note))));
+        write!(out, " {}", warning(format!("[{}]", safe_label(note))))?;
     }
-    let _ = writeln!(out);
+    writeln!(out)?;
+    out.flush()?;
+    Ok(())
 }
 
 /// `shux version --format plain`: `cli<TAB>version<TAB>sha`, then
@@ -1316,9 +1332,9 @@ pub fn print_version_plain(
     status: &str,
     daemon: Option<(&str, &str)>,
     mismatch: Option<bool>,
-) {
+) -> Printed {
     let mut out = io::stdout().lock();
-    let _ = writeln!(out, "cli\t{}\t{}", cli.0, cli.1);
+    writeln!(out, "cli\t{}\t{}", cli.0, cli.1)?;
     let (version, sha) = daemon.map_or(("-".into(), "-".into()), |(v, s)| {
         (safe_label(v), safe_label(s))
     });
@@ -1327,23 +1343,50 @@ pub fn print_version_plain(
         Some(false) => "match",
         None => "-",
     };
-    let _ = writeln!(out, "daemon\t{status}\t{version}\t{sha}\t{matched}");
+    writeln!(out, "daemon\t{status}\t{version}\t{sha}\t{matched}")?;
+    out.flush()?;
+    Ok(())
 }
 
 /// Print a success confirmation with ✓ prefix and short ID.
-pub fn print_success(action: &str, subject: &str, id: Option<&str>) {
+pub fn print_success(action: &str, subject: &str, id: Option<&str>) -> Printed {
     let mut out = io::stdout().lock();
-    let _ = write!(out, "{} ", success("\u{2713}")); // ✓
+    write!(out, "{} ", success("\u{2713}"))?; // ✓
     // Guard here, not only in the callers: this is the funnel every
     // confirmation goes through, so the invariant holds for future callers
     // too. `safe_label` is idempotent, so the wrappers that already escape
     // their name or title are unaffected (issue #104).
-    let _ = write!(out, "{action} {}", bold(safe_label(subject)));
+    write!(out, "{action} {}", bold(safe_label(subject)))?;
     if let Some(id) = id {
-        let _ = write!(out, "  {}", muted(short_id(id)));
+        write!(out, "  {}", muted(short_id(id)))?;
     }
-    let _ = writeln!(out);
+    writeln!(out)?;
+    out.flush()?;
+    Ok(())
 }
+
+/// A command's output that could not be written: what it printed never
+/// arrived. Kept apart from other I/O errors so only a closed stdout, and not
+/// a daemon socket, ends the command the way a closed pipe does.
+#[derive(Debug)]
+pub struct OutputError(pub io::Error);
+
+impl fmt::Display for OutputError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "could not write output: {}", self.0)
+    }
+}
+
+impl std::error::Error for OutputError {}
+
+impl From<io::Error> for OutputError {
+    fn from(e: io::Error) -> Self {
+        Self(e)
+    }
+}
+
+/// What a print helper returns.
+pub type Printed = Result<(), OutputError>;
 
 /// Write one item of a streaming command's output (`events watch`,
 /// `pane watch`) and flush it, so a pipe reader sees it now.
@@ -1478,126 +1521,136 @@ pub fn safe_label(raw: &str) -> String {
 // ── Legacy Confirmation Helpers (now using ✓ prefix + short IDs) ──
 
 /// Print a session creation confirmation.
-pub fn print_session_created(name: &str, id: &str, ensured: bool) {
+pub fn print_session_created(name: &str, id: &str, ensured: bool) -> Printed {
     let action = if ensured { "Ensured" } else { "Created" };
     let name = safe_label(name);
-    print_success(action, &format!("session '{name}'"), Some(id));
+    print_success(action, &format!("session '{name}'"), Some(id))
 }
 
 /// Print a session kill confirmation.
-pub fn print_session_killed(name: &str) {
+pub fn print_session_killed(name: &str) -> Printed {
     let name = safe_label(name);
-    print_success("Killed", &format!("session '{name}'"), None);
+    print_success("Killed", &format!("session '{name}'"), None)
 }
 
 /// Print a session rename confirmation.
-pub fn print_session_renamed(old_name: &str, new_name: &str) {
+pub fn print_session_renamed(old_name: &str, new_name: &str) -> Printed {
     let (old_name, new_name) = (safe_label(old_name), safe_label(new_name));
     print_success(
         "Renamed",
         &format!("session '{old_name}' -> '{new_name}'"),
         None,
-    );
+    )
 }
 
 /// Print a window creation confirmation.
-pub fn print_window_created(title: &str, index: u64) {
+pub fn print_window_created(title: &str, index: u64) -> Printed {
     let mut out = io::stdout().lock();
-    let _ = write!(out, "{} ", success("\u{2713}"));
-    let _ = write!(out, "Created window '{}' ", bold(safe_label(title)));
-    let _ = write!(out, "{}", muted(format!("(index {index})")));
-    let _ = writeln!(out);
+    write!(out, "{} ", success("\u{2713}"))?;
+    write!(out, "Created window '{}' ", bold(safe_label(title)))?;
+    write!(out, "{}", muted(format!("(index {index})")))?;
+    writeln!(out)?;
+    out.flush()?;
+    Ok(())
 }
 
 /// Print a window kill confirmation.
-pub fn print_window_killed(title: &str) {
+pub fn print_window_killed(title: &str) -> Printed {
     let title = safe_label(title);
-    print_success("Killed", &format!("window '{title}'"), None);
+    print_success("Killed", &format!("window '{title}'"), None)
 }
 
 /// Print a window rename confirmation.
-pub fn print_window_renamed(old_name: &str, new_name: &str) {
+pub fn print_window_renamed(old_name: &str, new_name: &str) -> Printed {
     let (old_name, new_name) = (safe_label(old_name), safe_label(new_name));
     print_success(
         "Renamed",
         &format!("window '{old_name}' -> '{new_name}'"),
         None,
-    );
+    )
 }
 
 /// Print a window focus confirmation.
-pub fn print_window_focused(title: &str) {
+pub fn print_window_focused(title: &str) -> Printed {
     let title = safe_label(title);
-    print_success("Focused", &format!("window '{title}'"), None);
+    print_success("Focused", &format!("window '{title}'"), None)
 }
 
 /// Print a window reorder confirmation.
-pub fn print_window_reordered(title: &str, new_index: usize) {
+pub fn print_window_reordered(title: &str, new_index: usize) -> Printed {
     let mut out = io::stdout().lock();
-    let _ = write!(out, "{} ", success("\u{2713}"));
-    let _ = write!(
+    write!(out, "{} ", success("\u{2713}"))?;
+    write!(
         out,
         "Moved window '{}' to index {}",
         bold(safe_label(title)),
         new_index
-    );
-    let _ = writeln!(out);
+    )?;
+    writeln!(out)?;
+    out.flush()?;
+    Ok(())
 }
 
 /// Print a pane split confirmation.
-pub fn print_pane_split(pane_id: &str, direction: &str) {
+pub fn print_pane_split(pane_id: &str, direction: &str) -> Printed {
     let mut out = io::stdout().lock();
-    let _ = write!(out, "{} ", success("\u{2713}"));
-    let _ = write!(out, "Split pane ({direction}) ");
-    let _ = write!(out, "{}", muted(short_id(pane_id)));
-    let _ = writeln!(out);
+    write!(out, "{} ", success("\u{2713}"))?;
+    write!(out, "Split pane ({direction}) ")?;
+    write!(out, "{}", muted(short_id(pane_id)))?;
+    writeln!(out)?;
+    out.flush()?;
+    Ok(())
 }
 
 /// Print a pane focus confirmation.
-pub fn print_pane_focused(pane_id: &str) {
-    print_success("Focused", "pane", Some(pane_id));
+pub fn print_pane_focused(pane_id: &str) -> Printed {
+    print_success("Focused", "pane", Some(pane_id))
 }
 
 /// Print a pane zoom confirmation.
-pub fn print_pane_zoomed(pane_id: &str, is_zoomed: bool) {
+pub fn print_pane_zoomed(pane_id: &str, is_zoomed: bool) -> Printed {
     let action = if is_zoomed { "Zoomed" } else { "Unzoomed" };
-    print_success(action, "pane", Some(pane_id));
+    print_success(action, "pane", Some(pane_id))
 }
 
 /// Print a pane swap confirmation.
-pub fn print_pane_swapped(pane_a: &str, pane_b: &str) {
+pub fn print_pane_swapped(pane_a: &str, pane_b: &str) -> Printed {
     let mut out = io::stdout().lock();
-    let _ = write!(out, "{} ", success("\u{2713}"));
-    let _ = write!(
+    write!(out, "{} ", success("\u{2713}"))?;
+    write!(
         out,
         "Swapped pane {} <-> {}",
         muted(short_id(pane_a)),
         muted(short_id(pane_b)),
-    );
-    let _ = writeln!(out);
+    )?;
+    writeln!(out)?;
+    out.flush()?;
+    Ok(())
 }
 
 /// Print a pane kill confirmation.
-pub fn print_pane_killed(pane_id: &str) {
-    print_success("Killed", "pane", Some(pane_id));
+pub fn print_pane_killed(pane_id: &str) -> Printed {
+    print_success("Killed", "pane", Some(pane_id))
 }
 
 /// Print a pane resize confirmation.
-pub fn print_pane_resized(pane_id: &str) {
-    print_success("Resized", "pane", Some(pane_id));
+pub fn print_pane_resized(pane_id: &str) -> Printed {
+    print_success("Resized", "pane", Some(pane_id))
 }
 
 /// Print a pane title-set confirmation (PR 4 / task 027).
-pub fn print_pane_title_set(pane_id: &str, displayed: &str) {
+pub fn print_pane_title_set(pane_id: &str, displayed: &str) -> Printed {
     let mut out = std::io::stdout();
-    let _ = write!(
+    write!(
         out,
         "{} Set title on pane {} → {}",
         success("✓"),
         muted(&short_id(pane_id)),
         bold(safe_label(displayed)),
-    );
-    let _ = writeln!(out);
+    )?;
+    writeln!(out)?;
+    out.flush()?;
+    Ok(())
 }
 
 /// Print a send-keys confirmation.
@@ -2353,7 +2406,8 @@ mod tests {
             "Sessions",
             "(no sessions)",
             "Create one",
-        );
+        )
+        .unwrap();
         let unicode = String::from_utf8(unicode).expect("unicode output");
         assert!(unicode.contains("Sessions"));
         assert!(unicode.contains("Create one"));
@@ -2366,7 +2420,8 @@ mod tests {
             "Windows",
             "(no windows)",
             "",
-        );
+        )
+        .unwrap();
         let ascii = String::from_utf8(ascii).expect("ascii output");
         assert!(ascii.contains("Windows"));
         assert!(ascii.contains("|"));
@@ -2429,46 +2484,46 @@ mod tests {
         ];
 
         let colored = text_ctx(true, true);
-        render_session_list(&colored, &sessions);
-        render_window_list(&colored, "dev", &windows);
-        render_pane_list(&colored, "dev", "editor", &panes);
+        render_session_list(&colored, &sessions).unwrap();
+        render_window_list(&colored, "dev", &windows).unwrap();
+        render_pane_list(&colored, "dev", "editor", &panes).unwrap();
 
         let plain = plain_ctx();
-        render_session_list(&plain, &sessions);
-        render_window_list(&plain, "dev", &windows);
-        render_pane_list(&plain, "dev", "editor", &panes);
+        render_session_list(&plain, &sessions).unwrap();
+        render_window_list(&plain, "dev", &windows).unwrap();
+        render_pane_list(&plain, "dev", "editor", &panes).unwrap();
 
         let ascii_text = text_ctx(false, false);
-        render_session_list(&ascii_text, &[]);
-        render_window_list(&ascii_text, "dev", &[]);
-        render_pane_list(&ascii_text, "dev", "editor", &[]);
+        render_session_list(&ascii_text, &[]).unwrap();
+        render_window_list(&ascii_text, "dev", &[]).unwrap();
+        render_pane_list(&ascii_text, "dev", "editor", &[]).unwrap();
     }
 
     #[test]
     fn confirmation_printers_cover_optional_and_status_branches() {
-        print_version("0.26.0", Some("abc1234"), Some("daemon offline"));
-        print_version("0.26.0", None, None);
-        print_success("Created", "session", Some("123456789"));
-        print_success("Updated", "config", None);
+        print_version("0.26.0", Some("abc1234"), Some("daemon offline")).unwrap();
+        print_version("0.26.0", None, None).unwrap();
+        print_success("Created", "session", Some("123456789")).unwrap();
+        print_success("Updated", "config", None).unwrap();
         print_error("boom");
 
-        print_session_created("dev", "123456789", false);
-        print_session_created("dev", "123456789", true);
-        print_session_killed("dev");
-        print_session_renamed("old", "new");
-        print_window_created("editor", 2);
-        print_window_killed("editor");
-        print_window_renamed("old", "new");
-        print_window_focused("editor");
-        print_window_reordered("editor", 1);
-        print_pane_split("abcdef012345", "vertical");
-        print_pane_focused("abcdef012345");
-        print_pane_zoomed("abcdef012345", true);
-        print_pane_zoomed("abcdef012345", false);
-        print_pane_swapped("abcdef012345", "fedcba987654");
-        print_pane_killed("abcdef012345");
-        print_pane_resized("abcdef012345");
-        print_pane_title_set("abcdef012345", "editor");
+        print_session_created("dev", "123456789", false).unwrap();
+        print_session_created("dev", "123456789", true).unwrap();
+        print_session_killed("dev").unwrap();
+        print_session_renamed("old", "new").unwrap();
+        print_window_created("editor", 2).unwrap();
+        print_window_killed("editor").unwrap();
+        print_window_renamed("old", "new").unwrap();
+        print_window_focused("editor").unwrap();
+        print_window_reordered("editor", 1).unwrap();
+        print_pane_split("abcdef012345", "vertical").unwrap();
+        print_pane_focused("abcdef012345").unwrap();
+        print_pane_zoomed("abcdef012345", true).unwrap();
+        print_pane_zoomed("abcdef012345", false).unwrap();
+        print_pane_swapped("abcdef012345", "fedcba987654").unwrap();
+        print_pane_killed("abcdef012345").unwrap();
+        print_pane_resized("abcdef012345").unwrap();
+        print_pane_title_set("abcdef012345", "editor").unwrap();
         print_send_keys("abcdef012345", 42);
 
         print_run_command(&serde_json::json!({"command_id": "123456789abcdef"}), true);
@@ -2538,7 +2593,7 @@ mod tests {
         panes: &[PaneInfo],
     ) -> String {
         let mut buf: Vec<u8> = Vec::new();
-        render_pane_list_into(&mut buf, ctx, session, window, panes);
+        render_pane_list_into(&mut buf, ctx, session, window, panes).unwrap();
         String::from_utf8(buf).expect("utf8")
     }
 

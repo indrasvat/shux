@@ -13,7 +13,6 @@ use shux::dispatch::run_client;
 use shux::style;
 
 fn main() {
-    die_quietly_on_a_closed_pipe();
     // Inject the colorised agent reference at runtime so it honours
     // NO_COLOR + the IsTerminal piped-stdout check. clap's derive macro
     // only accepts a `&'static str` literal there, so we set it here.
@@ -30,6 +29,7 @@ fn main() {
         run_daemon(args.socket.clone())
     } else {
         // Normal CLI client mode
+        end_on_a_failed_print();
         run_client(args)
     };
 
@@ -38,11 +38,13 @@ fn main() {
     }
 }
 
-/// A print to a closed stdout or stderr ends the command the Unix way:
-/// killed by SIGPIPE, with no panic text. Only those prints: SIGPIPE stays
-/// ignored otherwise, so a client writing to a daemon that died still gets
-/// EPIPE and reports it, and the daemon is never killed by a hung-up client.
-fn die_quietly_on_a_closed_pipe() {
+/// A print that fails ends the command: a closed stdout or stderr the Unix
+/// way, killed by SIGPIPE with no panic text; any other failure with its cause
+/// on stderr and exit 1. Only those prints: SIGPIPE stays ignored otherwise, so
+/// a client writing to a daemon that died still gets EPIPE and reports it, and
+/// the daemon is never killed by a hung-up client. The client's only: a
+/// daemon task that fails a print must not end the daemon.
+fn end_on_a_failed_print() {
     let report = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let payload = info.payload();
@@ -52,26 +54,35 @@ fn die_quietly_on_a_closed_pipe() {
             .or_else(|| payload.downcast_ref::<&str>().copied())
             .unwrap_or("");
         // std's own message for these prints; EPIPE reads "Broken pipe".
-        let closed = (message.starts_with("failed printing to stdout:")
-            || message.starts_with("failed printing to stderr:"))
-            && message.contains("Broken pipe");
-        if closed {
-            // SAFETY: SIG_DFL installs no handler and runs no Rust code; an
-            // inherited blocked mask is lifted for this thread so the signal
-            // lands; raise delivers it here, which ends the process.
-            unsafe {
-                libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-                let mut pipe: libc::sigset_t = std::mem::zeroed();
-                libc::sigemptyset(&mut pipe);
-                libc::sigaddset(&mut pipe, libc::SIGPIPE);
-                libc::pthread_sigmask(libc::SIG_UNBLOCK, &pipe, std::ptr::null_mut());
-                libc::raise(libc::SIGPIPE);
+        let cause = message
+            .strip_prefix("failed printing to stdout: ")
+            .or_else(|| message.strip_prefix("failed printing to stderr: "));
+        match cause {
+            Some(cause) if cause.contains("Broken pipe") => die_of_sigpipe(),
+            Some(cause) => {
+                style::print_error(&format!("could not write output: {cause}"));
+                std::process::exit(1);
             }
-            // The signal did not end the process: exit as a shell would report it.
-            std::process::exit(141);
+            None => report(info),
         }
-        report(info);
     }));
+}
+
+/// End the process as a write to a closed pipe does by default.
+fn die_of_sigpipe() -> ! {
+    // SAFETY: SIG_DFL installs no handler and runs no Rust code; an inherited
+    // blocked mask is lifted for this thread so the signal lands; raise
+    // delivers it here, which ends the process.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        let mut pipe: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut pipe);
+        libc::sigaddset(&mut pipe, libc::SIGPIPE);
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &pipe, std::ptr::null_mut());
+        libc::raise(libc::SIGPIPE);
+    }
+    // The signal did not end the process: exit as a shell would report it.
+    std::process::exit(141);
 }
 
 /// Render a fatal error once, then exit non-zero.
@@ -89,6 +100,14 @@ fn die_quietly_on_a_closed_pipe() {
 fn report_fatal(e: &anyhow::Error) -> ! {
     use std::io::Write as _;
 
+    let closed = e
+        .chain()
+        .filter_map(|c| c.downcast_ref::<style::OutputError>())
+        .any(|o| o.0.kind() == std::io::ErrorKind::BrokenPipe);
+    if closed {
+        die_of_sigpipe();
+    }
+
     // `{:#}` walks the anyhow chain onto one line; `print_error` owns the
     // marker, the colour and the NO_COLOR check.
     style::print_error(&format!("{e:#}"));
@@ -105,7 +124,11 @@ fn report_fatal(e: &anyhow::Error) -> ! {
         // `safe_diagnostic` keeps `\n`/`\t`, which are this block's structure,
         // and escapes everything else. Asking for a backtrace is not consent
         // to be attacked by one.
-        eprintln!("\n{}", style::safe_diagnostic(&format!("{e:?}")));
+        let _ = writeln!(
+            std::io::stderr(),
+            "\n{}",
+            style::safe_diagnostic(&format!("{e:?}"))
+        );
     }
 
     // `exit` runs no destructors, so anything buffered on the data channel

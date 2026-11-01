@@ -128,14 +128,14 @@ pub async fn handle_version(
                 Some(Ok(dv)) => ("running", Some((dv.version.as_str(), dv.git_sha.as_str()))),
                 Some(Err((status, _))) => (*status, None),
             };
-            crate::style::print_version_plain(cli, status, found, mismatch);
+            crate::style::print_version_plain(cli, status, found, mismatch)?;
         }
         OutputFormat::Text => {
             crate::style::print_version(
                 cli.0,
                 Some(cli.1),
                 daemon.is_none().then_some("daemon not running"),
-            );
+            )?;
             // Only a shux daemon process is stopped and replaced; anything else
             // on the socket makes the next command refuse instead.
             let next = || {
@@ -154,7 +154,7 @@ pub async fn handle_version(
                     crate::style::print_daemon_version(
                         Some((&dv.version, &dv.git_sha)),
                         note.as_deref(),
-                    );
+                    )?;
                 }
                 Some(Err((_, error))) => {
                     let note = if mismatch == Some(true) {
@@ -162,7 +162,7 @@ pub async fn handle_version(
                     } else {
                         error.clone()
                     };
-                    crate::style::print_daemon_version(None, Some(&note));
+                    crate::style::print_daemon_version(None, Some(&note))?;
                 }
             }
         }

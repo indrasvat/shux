@@ -118,7 +118,7 @@ pub async fn handle_pane_list(
                 })
                 .unwrap_or_default();
 
-            style::render_pane_list(&ctx, session_name, &window_title, &pane_infos);
+            style::render_pane_list(&ctx, session_name, &window_title, &pane_infos)?;
         }
     }
 
@@ -181,7 +181,7 @@ pub async fn handle_pane_split(
                 .and_then(|v| v.as_str())
                 .unwrap_or("?");
             let dir_label = direction.unwrap_or("vertical");
-            crate::style::print_pane_split(pane_id, dir_label);
+            crate::style::print_pane_split(pane_id, dir_label)?;
         }
     }
 
@@ -214,7 +214,7 @@ pub async fn handle_pane_focus(
             );
         }
         OutputFormat::Text | OutputFormat::Plain => {
-            crate::style::print_pane_focused(pane_id);
+            crate::style::print_pane_focused(pane_id)?;
         }
     }
 
@@ -254,7 +254,7 @@ pub async fn handle_pane_focus_dir(
                 .get("pane_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("?");
-            crate::style::print_pane_focused(pane_id);
+            crate::style::print_pane_focused(pane_id)?;
         }
     }
 
@@ -305,7 +305,7 @@ pub async fn handle_pane_resize(
                 .get("pane_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("?");
-            crate::style::print_pane_resized(pane_id);
+            crate::style::print_pane_resized(pane_id)?;
         }
     }
 
@@ -353,7 +353,7 @@ pub async fn handle_pane_zoom(
                 .get("is_zoomed")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            crate::style::print_pane_zoomed(pane_id, is_zoomed);
+            crate::style::print_pane_zoomed(pane_id, is_zoomed)?;
         }
     }
 
@@ -395,7 +395,7 @@ pub async fn handle_pane_swap(
             );
         }
         OutputFormat::Text | OutputFormat::Plain => {
-            crate::style::print_pane_swapped(pane_id, target_id);
+            crate::style::print_pane_swapped(pane_id, target_id)?;
         }
     }
 
@@ -466,7 +466,7 @@ pub async fn handle_pane_title(
                 .and_then(|v| v.as_str())
                 .unwrap_or("?");
             let displayed = result.get("title").and_then(|v| v.as_str()).unwrap_or("");
-            crate::style::print_pane_title_set(pid, displayed);
+            crate::style::print_pane_title_set(pid, displayed)?;
         }
     }
 
@@ -821,7 +821,7 @@ pub async fn handle_pane_kill(
             );
         }
         OutputFormat::Text | OutputFormat::Plain => {
-            crate::style::print_pane_killed(pane_id);
+            crate::style::print_pane_killed(pane_id)?;
         }
     }
 

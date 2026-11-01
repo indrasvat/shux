@@ -364,14 +364,14 @@ pub fn validate(path: &Path) -> std::io::Result<Vec<Diagnostic>> {
 
 /// Render diagnostics to stderr in the canonical `path:line:col:
 /// context: message` shape. Returns 0 if no diagnostics, 1 otherwise.
-pub fn print_diagnostics(diags: &[Diagnostic], path: &Path) -> i32 {
+pub fn print_diagnostics(diags: &[Diagnostic], path: &Path) -> Result<i32, style::OutputError> {
     use std::io::Write;
     let mut err = std::io::stderr().lock();
 
     if diags.is_empty() {
         // Use stdout for the "ok" message — pairs nicely with `&&`.
-        style::print_success("Config valid:", path.display().to_string().as_str(), None);
-        return 0;
+        style::print_success("Config valid:", path.display().to_string().as_str(), None)?;
+        return Ok(0);
     }
 
     for d in diags {
@@ -399,7 +399,7 @@ pub fn print_diagnostics(diags: &[Diagnostic], path: &Path) -> i32 {
         n,
         if n == 1 { "error" } else { "errors" }
     );
-    1
+    Ok(1)
 }
 
 #[cfg(test)]
@@ -787,7 +787,7 @@ not = ok
         let f = write_tmp("");
         let path = f.path();
         let none: Vec<Diagnostic> = Vec::new();
-        assert_eq!(print_diagnostics(&none, path), 0);
+        assert_eq!(print_diagnostics(&none, path).unwrap(), 0);
 
         let one = vec![Diagnostic {
             file: path.to_path_buf(),
@@ -796,7 +796,7 @@ not = ok
             context: String::new(),
             message: "fake".to_string(),
         }];
-        assert_eq!(print_diagnostics(&one, path), 1);
+        assert_eq!(print_diagnostics(&one, path).unwrap(), 1);
     }
 
     #[test]
