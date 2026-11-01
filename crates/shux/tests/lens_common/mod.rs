@@ -189,6 +189,9 @@ impl Harness {
         for var in GIT_LOCATION_VARS {
             cmd.env_remove(var);
         }
+        // CI runners export `CI=true`, and the gate refuses to bless under it. A test
+        // that means to exercise CI sets it itself.
+        cmd.env_remove("CI");
         cmd
     }
 
@@ -732,8 +735,13 @@ pub fn assert_png_golden_masked(
         .output()
         .unwrap_or_else(|e| panic!("run pixel_verify.py: {e}"));
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let verdict: serde_json::Value = serde_json::from_str(stdout.trim())
-        .unwrap_or_else(|e| panic!("pixel_verify.py output not JSON: {e}\n{stdout}"));
+    let verdict: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "pixel_verify.py output not JSON ({e}); {}\nstdout:\n{stdout}\nstderr:\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
     assert_eq!(
         verdict.get("status").and_then(|v| v.as_str()),
         Some("pass"),
