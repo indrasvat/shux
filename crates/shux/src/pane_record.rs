@@ -689,41 +689,38 @@ async fn path_key(path: &Path) -> Result<PathBuf, RecordStartError> {
             path.display()
         )));
     }
-    // Resolve the deepest directory that exists; the rest does not exist
-    // yet, so it holds no links and is joined as written. Nothing is created
-    // here: a refused start leaves no trace.
-    let mut existing = path.parent().unwrap_or(Path::new("/")).to_path_buf();
-    let mut rest = vec![path.file_name().expect("checked above").to_owned()];
-    let base = loop {
-        match tokio::fs::canonicalize(&existing).await {
+    // Resolve the deepest prefix that exists. The rest does not exist yet,
+    // so it holds no links and is normalised as written (`..` included).
+    // Nothing is created here: a refused start leaves no trace.
+    let parts: Vec<Component<'_>> = path.components().collect();
+    let mut split = parts.len() - 1;
+    let mut key = loop {
+        let prefix: PathBuf = parts[..split].iter().collect();
+        match tokio::fs::canonicalize(&prefix).await {
             Ok(base) => break base,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let Some(name) = existing.file_name() else {
-                    return Err(RecordStartError::Open(format!(
-                        "failed to resolve {}: {e}",
-                        path.display()
-                    )));
-                };
-                rest.push(name.to_owned());
-                existing.pop();
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && split > 1 => split -= 1,
             Err(e) => {
                 return Err(RecordStartError::Open(format!(
                     "failed to resolve {}: {e}",
-                    existing.display()
+                    prefix.display()
                 )));
             }
         }
     };
-    let mut key = base;
-    for part in rest.iter().rev() {
-        match Path::new(part).components().next() {
-            Some(Component::ParentDir) => {
+    for part in &parts[split..] {
+        match part {
+            Component::ParentDir => {
                 key.pop();
             }
-            Some(Component::CurDir) => {}
-            _ => key.push(part),
+            Component::CurDir => {}
+            other => key.push(other),
         }
+    }
+    if key.file_name().is_none() {
+        return Err(RecordStartError::BadPath(format!(
+            "{} names no file",
+            path.display()
+        )));
     }
     Ok(key)
 }
@@ -1647,6 +1644,31 @@ mod tests {
         if seen.finalized {
             assert_eq!(seen, last, "a final outcome changed after it was published");
         }
+    }
+
+    /// A path whose tail does not exist yet resolves as written, `..`
+    /// included, without creating anything; an existing link resolves.
+    #[tokio::test]
+    async fn a_path_with_a_missing_tail_resolves_without_creating_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir(base.join("real")).unwrap();
+        std::os::unix::fs::symlink(base.join("real"), base.join("link")).unwrap();
+        for (given, want) in [
+            ("missing/../dotdot.raw", "dotdot.raw"),
+            ("missing/a/../../deep/record.raw", "deep/record.raw"),
+            ("link/missing/../dotdot.raw", "real/dotdot.raw"),
+            ("new/dir/x.raw", "new/dir/x.raw"),
+        ] {
+            let key = path_key(&base.join(given))
+                .await
+                .unwrap_or_else(|e| panic!("{given}: {e}"));
+            assert_eq!(key, base.join(want), "{given}");
+        }
+        assert!(
+            !base.join("missing").exists() && !base.join("new").exists(),
+            "a path key created a directory"
+        );
     }
 
     /// A writer that panics still finalizes, with the bytes it wrote.
