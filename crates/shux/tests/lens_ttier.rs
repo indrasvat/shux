@@ -122,6 +122,23 @@ fn t1_nidhi_golden() {
     h.rpc_raw("session.kill", serde_json::json!({ "id": r["session_id"] }));
 }
 
+/// Block until the pane's frame differs from checkpoint `since`: the key just
+/// sent has been drawn.
+fn wait_for_change(h: &Harness, pane: &str, since: u64, ctx: &str) {
+    assert!(
+        wait_until(BUDGET, || {
+            h.rpc_raw(
+                "pane.diff_since",
+                serde_json::json!({ "pane_id": pane, "since_revision": since }),
+            )
+            .expect_result(ctx)["cells_changed"]
+                .as_u64()
+                .is_some_and(|n| n > 0)
+        }),
+        "{ctx}: the key never changed the frame"
+    );
+}
+
 // T2 — nidhi keyboard truth (selection move confined to the stash rows).
 #[test]
 fn t2_nidhi_keyboard_truth() {
@@ -151,8 +168,10 @@ fn t2_nidhi_keyboard_truth() {
         .as_u64()
         .expect("rev");
 
-    // `j` moves the selection down by one stash row.
+    // `j` moves the selection down by one stash row. A pane that has not
+    // drawn its answer yet is quiet too, so wait for the change, then settle.
     h.send_raw(&pane, "j");
+    wait_for_change(&h, &pane, c, "T2 j");
     settle(&h, &pane, "T2 settle after j");
     let d = h
         .rpc_raw(
@@ -173,7 +192,13 @@ fn t2_nidhi_keyboard_truth() {
     );
 
     // `k` returns to the original selection.
+    let after_j = h
+        .rpc_raw("pane.checkpoint", serde_json::json!({ "pane_id": pane }))
+        .expect_result("T2 checkpoint after j")["revision"]
+        .as_u64()
+        .expect("rev");
     h.send_raw(&pane, "k");
+    wait_for_change(&h, &pane, after_j, "T2 k");
     settle(&h, &pane, "T2 settle after k");
     let d = h
         .rpc_raw(
