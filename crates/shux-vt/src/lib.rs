@@ -157,6 +157,10 @@ pub struct VirtualTerminal {
     /// write. Always `false` outside the differential tests — see
     /// [`VirtualTerminal::set_eager_sync_freeze`].
     eager_sync_freeze: bool,
+    /// Whether an open window is released once it has been open
+    /// [`SYNC_UPDATE_TIMEOUT_MS`]. Always `true` outside the differential
+    /// tests — see [`VirtualTerminal::set_sync_deadline`].
+    sync_deadline: bool,
     /// Monotonic nanoseconds at which the open synchronized-output window was
     /// first seen to still be open at the end of a batch, or 0 when no window
     /// is open. Stamped once per window rather than at `?2026h`, so a pane
@@ -321,6 +325,7 @@ impl VirtualTerminal {
             frozen_title: None,
             frozen_alt: None,
             eager_sync_freeze: false,
+            sync_deadline: true,
             sync_opened_ns: 0,
             sync_bytes: 0,
             active_grapheme_cell: None,
@@ -407,6 +412,15 @@ impl VirtualTerminal {
         }
     }
 
+    /// Turn off the wall-clock release of synchronized output; the byte bound
+    /// stays. The differential tests feed two terminals in turn, and on a
+    /// loaded machine the deadline can pass between them, releasing one
+    /// window and not the other. Production never calls it.
+    #[doc(hidden)]
+    pub fn set_sync_deadline(&mut self, enabled: bool) {
+        self.sync_deadline = enabled;
+    }
+
     /// Snapshot every still-unfrozen component of the presented frame.
     ///
     /// Called by the paths that mutate presented state from OUTSIDE the parser
@@ -483,8 +497,9 @@ impl VirtualTerminal {
             return false;
         }
         self.sync_bytes >= SYNC_UPDATE_MAX_BYTES
-            || sync_clock_ns().saturating_sub(self.sync_opened_ns)
-                >= SYNC_UPDATE_TIMEOUT_MS * 1_000_000
+            || (self.sync_deadline
+                && sync_clock_ns().saturating_sub(self.sync_opened_ns)
+                    >= SYNC_UPDATE_TIMEOUT_MS * 1_000_000)
     }
 
     /// Release a synchronized-output window that has outlived its deadline,
@@ -2139,6 +2154,33 @@ mod tests {
         vt.process(b"!");
         assert!(!vt.modes().synchronized_output);
         assert!(compact_capture(&vt).starts_with("after"));
+    }
+
+    /// Why the differential tests turn the deadline off: two terminals fed
+    /// the same bytes in turn diverge when the deadline passes between them,
+    /// as it can on a loaded machine. With it off they cannot.
+    #[test]
+    fn the_sync_deadline_is_what_two_terminals_fed_in_turn_can_disagree_on() {
+        for deadline in [true, false] {
+            let clock = test_clock::Frozen::new();
+            let (mut first, mut second) =
+                (VirtualTerminal::new(3, 10), VirtualTerminal::new(3, 10));
+            first.set_sync_deadline(deadline);
+            second.set_sync_deadline(deadline);
+            for vt in [&mut first, &mut second] {
+                vt.process(b"before\x1b[?2026h\x1b[1;1Hafter   ");
+            }
+            first.process(b"!");
+            clock.advance_ms(SYNC_UPDATE_TIMEOUT_MS);
+            second.process(b"!");
+            assert_eq!(
+                compact_capture(&first) != compact_capture(&second),
+                deadline,
+                "deadline {deadline}: {:?} vs {:?}",
+                compact_capture(&first),
+                compact_capture(&second)
+            );
+        }
     }
 
     /// The pane that goes completely silent is the case `process` cannot
