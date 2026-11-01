@@ -629,14 +629,19 @@ struct AttachedSession {
     shown: ShownFrames,
 }
 
+/// Frames queued to one client before the render loop waits for it.
+const OUTBOUND_FRAMES: usize = 64;
+
 /// Pane views of the latest frames sent to one client, oldest first, each
 /// under the number its `Render { frame }` carried.
 #[derive(Debug, Clone, Default)]
 struct ShownFrames(std::collections::VecDeque<(u64, Arc<HashMap<PaneId, PaneView>>)>);
 
 impl ShownFrames {
-    /// Frames a client can trail the daemon by and still be mapped.
-    const KEPT: usize = 16;
+    /// Frames a client can trail the daemon by and still be mapped: every
+    /// frame the outbound queue can hold, again as many for the socket's
+    /// buffers. A client honestly behind never names a frame no longer kept.
+    const KEPT: usize = 2 * OUTBOUND_FRAMES;
 
     fn push(&mut self, frame: u64, views: HashMap<PaneId, PaneView>) {
         if self.0.len() == Self::KEPT {
@@ -885,7 +890,7 @@ async fn run_attach_loop(
 ) -> anyhow::Result<()> {
     let (mut sink, mut stream) = framed.split();
 
-    let (out_tx, mut out_rx) = mpsc::channel::<AttachServerFrame>(64);
+    let (out_tx, mut out_rx) = mpsc::channel::<AttachServerFrame>(OUTBOUND_FRAMES);
 
     // Spawn the writer task: pulls from out_rx, frames + sends.
     let writer_cancel = cancel.clone();
@@ -6250,19 +6255,20 @@ mod tests {
         let offset = |views: Option<&HashMap<PaneId, PaneView>>| views.map(|v| v[&pane].row_offset);
         let mut shown = ShownFrames::default();
         assert_eq!(offset(shown.views(Some(1))), None, "nothing sent yet");
-        for n in 1..=20 {
+        let last = ShownFrames::KEPT as u64 + 4;
+        for n in 1..=last {
             shown.push(n, view(n as usize));
         }
         assert_eq!(offset(shown.views(Some(12))), Some(12), "the stamped frame");
         assert_eq!(
             offset(shown.views(None)),
-            Some(20),
+            Some(last as usize),
             "an unstamped event: the latest"
         );
         assert_eq!(
             offset(shown.views(Some(2))),
             None,
-            "a stamp older than any kept (5..=20) names nothing newer than it"
+            "a stamp older than any kept (5..=last) names nothing newer than it"
         );
     }
 
@@ -6362,7 +6368,7 @@ mod tests {
         );
         h.select(MouseKind::Down, &tx).await;
         assert!(matches!(h.gesture, SelectionDrag::MouseSelection { .. }));
-        for _ in 0..16 {
+        for _ in 0..ShownFrames::KEPT {
             ship_frame(
                 &h.fixture.graph,
                 &h.fixture.io_state,
@@ -6379,6 +6385,38 @@ mod tests {
             h.gesture,
             SelectionDrag::None,
             "the selection was never finished"
+        );
+    }
+
+    /// A client as far behind as the outbound queue lets it fall still has
+    /// its clicks mapped: a busy pane on a slow link must not cost it the mouse.
+    #[tokio::test]
+    async fn a_client_a_full_queue_behind_still_has_its_clicks_handled() {
+        let mut h = AppMouseHarness::new().await;
+        let _wr = seed_scrollback_pane(&h.fixture.io_state, h.fixture.first_pane, b"").await;
+        ship_frame(
+            &h.fixture.graph,
+            &h.fixture.io_state,
+            &h.session,
+            &h.client_size,
+        )
+        .await;
+        let shown = h.session.lock().await.shown.0.back().map(|(n, _)| *n);
+        for _ in 0..OUTBOUND_FRAMES {
+            ship_frame(
+                &h.fixture.graph,
+                &h.fixture.io_state,
+                &h.session,
+                &h.client_size,
+            )
+            .await;
+        }
+        let route = h.send_stamped(MouseKind::Down, 3, 3, shown).await;
+        h.fixture.stop();
+        assert_eq!(
+            route,
+            AppMouse::NotHandled,
+            "the click was dropped, not handled"
         );
     }
 
