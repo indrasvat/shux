@@ -314,6 +314,28 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
         .clone()
         .unwrap_or_else(|| default_golden_dir(&opts.scenario_path, &scenario));
 
+    // The trace and report are output, never goldens: one written into the golden tree
+    // replaces a golden, and the run then reports the damage as a regression. Refused
+    // before anything writes, the report included.
+    for (flag, path) in [
+        ("--trace", opts.trace.as_deref()),
+        ("--report", opts.report.as_deref()),
+    ] {
+        if let Some(path) = path.filter(|p| *p != "-").map(Path::new)
+            && path_is_under(path, &golden_dir)
+        {
+            eprintln!(
+                "{}",
+                crate::style::error(format!(
+                    "lens gate: {flag} {} is inside the golden dir {}. Write it elsewhere.",
+                    path.display(),
+                    golden_dir.display()
+                ))
+            );
+            return Ok(GateStatus::ScenarioError.exit_code() as i32);
+        }
+    }
+
     // A bless/create is refused in CI up front, before spawning anything (task §5/§7):
     // a golden must never be self-minted in CI. This one keeps its early return: nothing has
     // run yet, so there is no verdict to preserve, and exit 6 fails the build loudly.
@@ -342,7 +364,7 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
     // it would pollute the goldens and trip the dirty-tree guard on a later `--update`. Refuse a
     // `--cast` target inside `--golden-dir` up front (exit 2, usage), before spawning anything.
     if let Some(cast) = &cast_path
-        && cast_is_under(cast, &golden_dir)
+        && path_is_under(cast, &golden_dir)
     {
         eprintln!(
             "{}",
@@ -678,14 +700,14 @@ fn resolve_cast_path(opts: &GateRunOptions, scenario_name: &str) -> Option<PathB
     })
 }
 
-/// True when the `.cast` target resolves to a path inside `golden_dir` (task 083 guard). Compares
-/// CANONICAL forms of the existing directories (`golden_dir`, and the cast's parent — both exist
-/// by the time the gate runs) so a symlinked or `.`-spelled path (e.g. macOS `/tmp` → `/private/
-/// tmp`) still compares; falls back to a lexical absolute compare when a dir does not yet exist.
-fn cast_is_under(cast: &Path, golden_dir: &Path) -> bool {
+/// True when an output path resolves to a place inside `golden_dir` (task 083 guard). Compares
+/// CANONICAL forms of the existing directories (`golden_dir`, and the path's parent) so a
+/// symlinked or `.`-spelled path (e.g. macOS `/tmp` → `/private/tmp`) still compares; falls back
+/// to a lexical absolute compare when a dir does not yet exist.
+fn path_is_under(path: &Path, golden_dir: &Path) -> bool {
     if let (Ok(g), Some(cp)) = (
         golden_dir.canonicalize(),
-        cast.parent().and_then(|p| p.canonicalize().ok()),
+        path.parent().and_then(|p| p.canonicalize().ok()),
     ) {
         return cp == g || cp.starts_with(&g);
     }
@@ -698,7 +720,7 @@ fn cast_is_under(cast: &Path, golden_dir: &Path) -> bool {
                 .unwrap_or_else(|_| p.to_path_buf())
         }
     };
-    abs(cast).starts_with(abs(golden_dir))
+    abs(path).starts_with(abs(golden_dir))
 }
 
 /// Note the produced `.cast` path in every scenario report (task 083) — only when the file
@@ -761,13 +783,13 @@ mod tests {
         let golden = dir.path().join("goldens");
         std::fs::create_dir_all(&golden).unwrap();
         // A cast written INTO the golden dir is caught (canonicalizes through /tmp symlinks).
-        assert!(cast_is_under(&golden.join("sneaky.cast"), &golden));
-        assert!(cast_is_under(&golden.join("sub").join("x.cast"), &golden));
+        assert!(path_is_under(&golden.join("sneaky.cast"), &golden));
+        assert!(path_is_under(&golden.join("sub").join("x.cast"), &golden));
         // A cast under a sibling out dir is allowed.
         let out = dir.path().join("out");
         std::fs::create_dir_all(&out).unwrap();
-        assert!(!cast_is_under(&out.join("run.cast"), &golden));
+        assert!(!path_is_under(&out.join("run.cast"), &golden));
         // A cast in the parent of the golden dir is allowed.
-        assert!(!cast_is_under(&dir.path().join("run.cast"), &golden));
+        assert!(!path_is_under(&dir.path().join("run.cast"), &golden));
     }
 }

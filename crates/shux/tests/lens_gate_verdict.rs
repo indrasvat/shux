@@ -1563,3 +1563,39 @@ fn stderr_onto_the_trace_is_refused_but_stdout_and_stderr_may_share_a_log() {
             .contains("scenario_start")
     );
 }
+
+/// A trace or report aimed into the golden tree would replace a golden; refused
+/// before anything is written.
+#[test]
+fn a_trace_or_report_inside_the_golden_dir_is_refused() {
+    let h = Harness::new();
+    let d = tmp();
+    let g = tmp();
+    let gd = g.path().to_string_lossy().into_owned();
+    bless_golden(&h, d.path(), &gd, "gg", "GOLD242");
+    let scn = d.path().join("gg.toml").to_string_lossy().into_owned();
+    let golden = std::fs::read_dir(g.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.to_string_lossy().ends_with(".capture.json"))
+        .expect("blessed capture golden");
+    let before = std::fs::read(&golden).unwrap();
+    for flag in ["--trace", "--report"] {
+        let out = gate(
+            &h,
+            &[flag, &golden.to_string_lossy(), "--golden-dir", &gd, &scn],
+            false,
+        );
+        assert_eq!(out.exit, 2, "{flag}: stderr:\n{}", out.stderr);
+        assert!(
+            out.stderr.contains("inside the golden dir"),
+            "{}",
+            out.stderr
+        );
+        assert_eq!(
+            std::fs::read(&golden).unwrap(),
+            before,
+            "{flag} replaced the golden"
+        );
+    }
+}
