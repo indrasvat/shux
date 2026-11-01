@@ -2906,6 +2906,32 @@ enum AppMouse {
     Consumed { redraw: bool },
 }
 
+fn holds(rect: Rect, col: u16, row: u16) -> bool {
+    col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
+}
+
+/// The pane the live layout puts under the pointer, for a client that names
+/// no frame still kept. `pane_at`, deliberately not `pane_under_pointer`: that
+/// helper falls back to the active pane whenever the hit-test misses, which
+/// would forward clicks on borders and the status bar into the focused pane.
+fn live_pane_hit(
+    graph: &GraphHandle,
+    attached: &AttachedSession,
+    viewport: Rect,
+    col: u16,
+    row: u16,
+) -> Option<PaneId> {
+    let snap = graph.snapshot();
+    let win = snap.windows.get(&attached.active_window_id)?;
+    if let Some(zoom) = &win.layout.zoom {
+        return Some(zoom.zoomed_pane);
+    }
+    if border_at(&win.layout.tree, viewport, col, row).is_some() {
+        return None;
+    }
+    pane_at(&win.layout.tree, viewport, col, row).map(|(pid, _)| pid)
+}
+
 /// Forward a press / drag / release to a mouse-aware app in the pane under the
 /// pointer.
 ///
@@ -2945,22 +2971,17 @@ async fn handle_app_mouse(
     let copy_active = attached.copy_mode.is_some() || attached.copy_menu.is_some();
     let viewport = current_viewport(client_size, config).await;
 
-    // Resolve the pane under the pointer. `pane_at`, deliberately not
-    // `pane_under_pointer`: that helper falls back to the active pane whenever
-    // the hit-test misses, which would forward clicks on borders, the outline
-    // and the status bar into whatever pane happens to be focused.
-    let (pane_hit, on_border) = {
-        let snap = graph.snapshot();
-        match snap.windows.get(&attached.active_window_id) {
-            None => (None, false),
-            Some(win) if let Some(zoom) = &win.layout.zoom => (Some(zoom.zoomed_pane), false),
-            Some(win) => (
-                pane_at(&win.layout.tree, viewport, col, row).map(|(pid, _)| pid),
-                border_at(&win.layout.tree, viewport, col, row).is_some(),
-            ),
-        }
+    // Resolve the pane under the pointer in the frame the client was shown: a
+    // layout not drawn yet must not move a click into another pane. Views are
+    // content rects, so borders, the outline and the status bar hit none.
+    let views = attached.shown.views(frame);
+    let pane_hit = match views {
+        Some(views) => views
+            .iter()
+            .find(|(_, view)| holds(view.rect, col, row))
+            .map(|(pid, _)| *pid),
+        None => live_pane_hit(graph, &attached, viewport, col, row),
     };
-    let pane_hit = if on_border { None } else { pane_hit };
 
     // Modes are read from the pane the gesture already owns when there is one,
     // so an app that turns tracking off mid-drag still gets its release.
@@ -3015,12 +3036,9 @@ async fn handle_app_mouse(
         release_app_gesture(io_state, gesture).await;
         return Ok(AppMouse::NotHandled);
     };
-    // While zoomed the pane's rect is the whole content area, so a click on the
-    // status bar would otherwise clamp into the pane's last row and be
-    // forwarded as a click the user never made.
-    let inside =
-        col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height;
-    if !inside && matches!(*gesture, SelectionDrag::None) {
+    let shown = views.and_then(|views| views.get(&pane_id)).copied();
+    let drawn_at = shown.map_or(rect, |view| view.rect);
+    if !holds(drawn_at, col, row) && matches!(*gesture, SelectionDrag::None) {
         return Ok(AppMouse::NotHandled);
     }
     // A press that opens a gesture names a cell or nothing. Once a gesture is
@@ -3028,11 +3046,6 @@ async fn handle_app_mouse(
     // drawn now (and below, within legacy encoding's reach), so the app sees
     // every press and every release names a button it holds.
     let pin = !matches!(*gesture, SelectionDrag::None);
-    let shown = attached
-        .shown
-        .views(frame)
-        .and_then(|views| views.get(&pane_id))
-        .copied();
     let view = match *gesture {
         SelectionDrag::App {
             row_offset, anchor, ..
@@ -3323,18 +3336,29 @@ async fn handle_wheel(
     let attached = session.lock().await.clone();
     let viewport = current_viewport(client_size, config).await;
 
-    // Resolve the pane under the cursor (fallback: the active pane).
-    let pane_id = {
-        let snap = graph.snapshot();
-        match snap.windows.get(&attached.active_window_id) {
-            None => return Ok(true),
-            Some(win) => {
-                if let Some(zoom) = &win.layout.zoom {
-                    zoom.zoomed_pane
-                } else {
-                    pane_at(&win.layout.tree, viewport, col, row)
-                        .map(|(pid, _)| pid)
-                        .unwrap_or(attached.active_pane_id)
+    // Resolve the pane under the cursor in the frame the client was shown,
+    // else in the live layout (fallback: the active pane).
+    let views = attached.shown.views(frame);
+    let shown_hit = views.and_then(|views| {
+        views
+            .iter()
+            .find(|(_, view)| holds(view.rect, col, row))
+            .map(|(pid, _)| *pid)
+    });
+    let pane_id = match shown_hit {
+        Some(pid) => pid,
+        None => {
+            let snap = graph.snapshot();
+            match snap.windows.get(&attached.active_window_id) {
+                None => return Ok(true),
+                Some(win) => {
+                    if let Some(zoom) = &win.layout.zoom {
+                        zoom.zoomed_pane
+                    } else {
+                        pane_at(&win.layout.tree, viewport, col, row)
+                            .map(|(pid, _)| pid)
+                            .unwrap_or(attached.active_pane_id)
+                    }
                 }
             }
         }
@@ -3366,9 +3390,7 @@ async fn handle_wheel(
 
     match route_wheel(mouse_on, alt, alt_scroll) {
         WheelRouting::ForwardMouse => {
-            let cell = attached
-                .shown
-                .views(frame)
+            let cell = views
                 .and_then(|views| views.get(&pane_id))
                 .and_then(|view| shux_ui::viewport::pane_grid_cell(view, (col, row), false));
             // No grid cell under the pointer, or no truthful encoding for this
@@ -8709,6 +8731,58 @@ mod tests {
             got.ends_with(";55M"),
             "clicked grid-row 55 as shown; the app was told {got:?}"
         );
+        h.stop().await;
+    }
+
+    /// A layout change the client has not drawn yet: the click lands in the
+    /// pane the client shows under the pointer, not in whatever pane the new
+    /// layout puts there.
+    #[tokio::test(start_paused = true)]
+    async fn a_click_before_a_new_layout_is_drawn_reaches_the_pane_shown() {
+        let mut h = InputHarness::new(64).await;
+        mouse_app_grid(&mut h, 60, 40).await;
+        let (x, y) = on_screen(&mut h, "grid-row 55").await;
+        h.fixture
+            .graph
+            .swap_panes(h.fixture.first_pane, h.fixture.second_pane, None)
+            .await
+            .expect("swap panes");
+        mouse(&mut h, MouseKind::Down, x, y).await;
+        mouse(&mut h, MouseKind::Up, x, y).await;
+        let got = String::from_utf8_lossy(&pane_input(&mut h).await).into_owned();
+        assert_eq!(
+            got, "\x1b[<0;1;55M\x1b[<0;1;55m",
+            "clicked grid-row 55 as shown, before the swap was drawn"
+        );
+        h.stop().await;
+    }
+
+    /// The wheel's half of the same: a tick before a swap is drawn scrolls the
+    /// pane the client shows under the pointer.
+    #[tokio::test(start_paused = true)]
+    async fn a_wheel_tick_before_a_new_layout_is_drawn_reaches_the_pane_shown() {
+        let mut h = InputHarness::new(64).await;
+        mouse_app_grid(&mut h, 60, 40).await;
+        let (x, y) = on_screen(&mut h, "grid-row 55").await;
+        h.fixture
+            .graph
+            .swap_panes(h.fixture.first_pane, h.fixture.second_pane, None)
+            .await
+            .expect("swap panes");
+        let frame = h.written_frame;
+        h.send(&AttachClientFrame::Mouse {
+            kind: MouseKind::ScrollUp,
+            button: ProtoMouseButton::None,
+            col: x,
+            row: y,
+            shift: false,
+            alt: false,
+            ctrl: false,
+            frame,
+        })
+        .await;
+        let got = String::from_utf8_lossy(&pane_input(&mut h).await).into_owned();
+        assert_eq!(got, "\x1b[<64;1;55M", "wheel over grid-row 55 as shown");
         h.stop().await;
     }
 
