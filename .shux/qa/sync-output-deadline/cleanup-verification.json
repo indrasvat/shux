@@ -1,0 +1,11 @@
+{
+  "status": "pass",
+  "audit_daemons": [
+    {
+      "runtime": "/tmp/vq242.ixs4eynz",
+      "pid": 74602,
+      "status": "absent"
+    }
+  ],
+  "follow_along_pid_untouched": 65858
+}

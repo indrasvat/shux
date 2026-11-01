@@ -1,0 +1,24 @@
+PASS late-batch log=$TMPDIR/shux-qa-r2.XXXXXX.log.RKS2LQw9V5
+     Summary [   0.008s] 1 test run: 1 passed, 419 skipped
+PASS two-terminals log=$TMPDIR/shux-qa-r2.XXXXXX.log.qlOJWNyGVb
+     Summary [   0.008s] 1 test run: 1 passed, 419 skipped
+PASS probe log=$TMPDIR/shux-qa-r2.XXXXXX.log.NqeG7QpysE
+     Summary [   0.019s] 1 test run: 1 passed, 76 skipped
+PASS G1-1 log=$TMPDIR/shux-qa-r2.XXXXXX.log.W4KeMfujXI
+     Summary [   2.016s] 3 tests run: 3 passed, 0 skipped
+PASS G1-2 log=$TMPDIR/shux-qa-r2.XXXXXX.log.QRz6rfnTkX
+     Summary [   2.001s] 3 tests run: 3 passed, 0 skipped
+PASS G1-3 log=$TMPDIR/shux-qa-r2.XXXXXX.log.5w8O31CucU
+     Summary [   1.990s] 3 tests run: 3 passed, 0 skipped
+PASS G1-4 log=$TMPDIR/shux-qa-r2.XXXXXX.log.pdz1JhHf56
+     Summary [   1.964s] 3 tests run: 3 passed, 0 skipped
+PASS G1-5 log=$TMPDIR/shux-qa-r2.XXXXXX.log.KCoRFFgMWv
+     Summary [   1.980s] 3 tests run: 3 passed, 0 skipped
+PASS vt-integration log=$TMPDIR/shux-qa-r2.XXXXXX.log.yL5S0urbJe
+     Summary [  14.325s] 732 tests run: 732 passed, 0 skipped
+PASS pty-integration log=$TMPDIR/shux-qa-r2.XXXXXX.log.5zbMDfV2ab
+     Summary [   0.146s] 77 tests run: 77 passed, 0 skipped
+PASS F7-exit-capture log=$TMPDIR/shux-qa-r2.XXXXXX.log.8fCccqGHsp
+     Summary [  10.632s] 72 tests run: 72 passed, 0 skipped
+PASS corpus log=$TMPDIR/shux-qa-r2.XXXXXX.log.Vzr0MiFvWv
+     Summary [   0.013s] 3 tests run: 3 passed, 0 skipped

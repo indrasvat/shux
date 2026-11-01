@@ -1,0 +1,289 @@
+[
+  {
+    "dispatch": [
+      {
+        "provider": "codex",
+        "model": "gpt-6.1-sol",
+        "content": "**DO NOT SHIP**\n\n1. **P1 — Alias refusal overwrites the protected file.** [driver.rs:557](<worktree>/crates/shux/src/gate/driver.rs:557) calls `emit()`, which writes `--report`.\n   - **Trigger:** Existing file `kept`; run with `--trace kept --report kept`. Refusal exits 2 but replaces its contents with JSON. Hard links behave identically. With absent paths, trace creation also violates “writes nothing.”\n   - **Fix:** Refuse before opening any output, including equivalent nonexistent paths; print only the diagnostic to stderr. [lens_gate_verdict.rs:1060](<worktree>/crates/shux/tests/lens_gate_verdict.rs:1060) currently asserts the destructive behavior. Replace it with sentinel-preservation and absent-file assertions.\n\n2. **P2 — Runner errors bypass trace failure and SIGPIPE handling.** [driver.rs:400](<worktree>/crates/shux/src/gate/driver.rs:400) propagates errors before inspecting `trace`.\n   - **Trigger:** `ScenarioStart` encounters EPIPE on closed stdout, then daemon connection or `events.watch` fails. Dispatch exits 3 instead of SIGPIPE. With a failing file trace, the same path silently drops its write diagnostic and exits 3 instead of 4.\n   - **Fix:** Finalize trace handling on both successful and failed runner results; preserve SIGPIPE and lost-trace precedence. Add combined-failure tests.\n\nThe suspected golden-write override is unreachable with current blessing eligibility, so I exclude it. I found no concrete probe lock-order, incarnation, or descriptor-leak defect.\n\nStatic review only; no edits, builds, tests, or daemons run.",
+        "duration_ms": 88219,
+        "cost_usd": 0,
+        "tokens_in": 861786,
+        "tokens_out": 3424
+      },
+      {
+        "provider": "agy",
+        "model": "",
+        "content": "",
+        "duration_ms": 0,
+        "cost_usd": 0,
+        "tokens_in": 0,
+        "tokens_out": 0,
+        "error": "invoke agy: agy: Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 46h50m12s."
+      }
+    ],
+    "reviews": null,
+    "synthesis": {
+      "chair": "claude",
+      "chair_fallback": "codex",
+      "content": "**DO NOT SHIP.** Two concrete defects block release:\n\n1. **P1 — Alias refusal can overwrite the protected file.** When `--trace` and `--report` identify the same file, including hard links, refusal exits 2 but writes JSON over its contents. Absent paths can also be created despite the “writes nothing” guarantee.\n   - **Fix:** Detect aliases before opening any output, including equivalent nonexistent paths, and emit only a stderr diagnostic.\n   - **Verify:** Replace the test asserting destructive behavior with sentinel-preservation and absent-file assertions.\n\n2. **P2 — Runner errors bypass trace-error handling.** A daemon connection or `events.watch` failure can return exit 3 before trace failures are processed, losing SIGPIPE behavior or suppressing a file-write diagnostic that should produce exit 4.\n   - **Fix:** Finalize trace handling for both successful and failed runner results, preserving SIGPIPE and lost-trace precedence.\n   - **Verify:** Add combined-failure tests covering runner errors alongside stdout EPIPE and file-trace failures.\n\nThe suspected golden-write override is unreachable under current blessing eligibility. No concrete probe lock-order, incarnation, or descriptor-leak defect was identified.\n\n**Evidence limit:** Static review only; no edits, builds, tests, or daemon runs were performed."
+    },
+    "meta": {
+      "schema_version": 1,
+      "strategy": "council",
+      "duration_ms": 99997,
+      "total_cost_usd": 0,
+      "total_tokens_in": 890935,
+      "total_tokens_out": 3723,
+      "providers": {
+        "agy": "error",
+        "codex": "ok"
+      }
+    }
+  },
+  {
+    "dispatch": [
+      {
+        "provider": "codex",
+        "model": "gpt-6.1-sol",
+        "content": "**DO NOT SHIP**\n\n1. **P1 — Early refusals still overwrite an aliased file.** [driver.rs:301](<worktree>/crates/shux/src/gate/driver.rs:301)  \n   Trigger: `CI=1 shux lens gate --on-missing create --trace kept.json --report kept.json valid.toml`. The CI refusal calls `emit()` before alias validation, overwrites `kept.json`, and exits 6. The cast-under-goldens refusal has the same hole. **Fix:** validate aliases before every path that emits output; test preservation of existing contents on these refusals.\n\n2. **P2 — A dangling trace symlink defeats refusal cleanup.** [driver.rs:584](<worktree>/crates/shux/src/gate/driver.rs:584)  \n   Trigger: `trace-link → absent.json`, then a malformed scenario with `--trace trace-link --report absent.json`. `symlink_metadata()` says the trace exists, opening creates its target, and `parse_error` is written before alias detection. Exit 2 leaves that content behind. **Fix:** resolve and track the newly created target, and perform post-open alias validation before emitting any trace bytes. Test this reverse-symlink direction.\n\na25d0f9 fixes the original direct-alias and runner-error paths. Probe locking, incarnations, and fd ownership are unchanged. Static review only; no builds, tests, daemons, or edits performed.",
+        "duration_ms": 119135,
+        "cost_usd": 0,
+        "tokens_in": 813291,
+        "tokens_out": 4181
+      },
+      {
+        "provider": "agy",
+        "model": "",
+        "content": "",
+        "duration_ms": 0,
+        "cost_usd": 0,
+        "tokens_in": 0,
+        "tokens_out": 0,
+        "error": "invoke agy: agy: Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 46h37m37s."
+      }
+    ],
+    "reviews": null,
+    "synthesis": {
+      "chair": "claude",
+      "chair_fallback": "codex",
+      "content": "**Do not ship.** Commit `a25d0f9` fixes the original direct-alias and runner-error paths, but two output-safety gaps remain:\n\n1. **P1 — Early refusals can overwrite an aliased file.** CI and cast-under-goldens refusals call `emit()` before alias validation. For example, `CI=1 shux lens gate --on-missing create --trace kept.json --report kept.json valid.toml` overwrites `kept.json` before exiting 6. Validate aliases before every output-emitting refusal, and add tests proving existing contents survive.\n\n2. **P2 — A dangling trace symlink bypasses cleanup.** With `trace-link → absent.json`, a malformed scenario using `--trace trace-link --report absent.json` creates the target and writes `parse_error` before detecting the alias. Exit 2 leaves the content behind. Track the newly created target and validate aliases after opening, before writing trace bytes. Add a regression test for this symlink direction.\n\nProbe locking, incarnations, and file-descriptor ownership are unchanged. This assessment is based on static review only; no builds or tests were run."
+    },
+    "meta": {
+      "schema_version": 1,
+      "strategy": "council",
+      "duration_ms": 129718,
+      "total_cost_usd": 0,
+      "total_tokens_in": 842383,
+      "total_tokens_out": 4451,
+      "providers": {
+        "agy": "error",
+        "codex": "ok"
+      }
+    }
+  },
+  {
+    "dispatch": [
+      {
+        "provider": "codex",
+        "model": "gpt-6.1-sol",
+        "content": "**DO NOT SHIP**\n\n1. **P1 — Redirected stdout can overwrite the trace undetected.** [driver.rs:551](<worktree>/crates/shux/src/gate/driver.rs:551) excludes `--report -` from alias checks. Trigger: `shux lens gate --trace t --report - good.toml >t`. The report writes over the trace through stdout; a passing run can exit **0**. **Fix:** compare stdout’s file identity with the trace whenever the report uses stdout, including `--format json`; refuse before opening/truncating the trace.\n\n2. **P2 — Early refusals still write onto nonexistent aliased destinations.** [driver.rs:253](<worktree>/crates/shux/src/gate/driver.rs:253), [driver.rs:305](<worktree>/crates/shux/src/gate/driver.rs:305). With `t` absent, `CI=1 shux lens gate --on-missing create --trace t --report t good.toml` misses the metadata-based alias check, creates `t` containing a report, and exits **6** instead of **2 with no writes**. A dangling trace symlink has the same gap. **Fix:** validate prospective destination identity before every report-emitting refusal. Extend the new CI refusal test to absent targets and dangling links.\n\n3. **P2 — Malformed scenarios bypass the stdout collision guard.** [driver.rs:268](<worktree>/crates/shux/src/gate/driver.rs:268), [driver.rs:317](<worktree>/crates/shux/src/gate/driver.rs:317). Trigger: `--trace - --report - bad.toml`. The parse-error branch emits NDJSON followed by the JSON report, making stdout unparseable. **Fix:** move the stdout collision check before scenario loading; cover malformed input.\n\nThe targeted existing-file refusal, dangling-symlink cleanup, and runner-error trace handling are correct by inspection. Probe/VT code is unchanged. Review was read-only; no builds, tests, or daemons ran.",
+        "duration_ms": 94016,
+        "cost_usd": 0,
+        "tokens_in": 542477,
+        "tokens_out": 3276
+      },
+      {
+        "provider": "agy",
+        "model": "",
+        "content": "",
+        "duration_ms": 0,
+        "cost_usd": 0,
+        "tokens_in": 0,
+        "tokens_out": 0,
+        "error": "invoke agy: agy: Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 46h32m34s."
+      }
+    ],
+    "reviews": null,
+    "synthesis": {
+      "chair": "claude",
+      "chair_fallback": "codex",
+      "content": "**DO NOT SHIP.** Three destination-validation gaps remain:\n\n| Priority | Finding | Required fix |\n|---|---|---|\n| **P1** | Redirected report stdout can overwrite the trace and still exit **0**: `--trace t --report - good.toml >t`. | Check stdout’s file identity against the trace whenever reports use stdout, including `--format json`, before opening or truncating the trace. |\n| **P2** | Early refusals can write a report to an aliased trace destination when the target is absent or a dangling symlink. The CI case exits **6**, rather than **2 with no writes**. | Validate prospective destination identity before every report-emitting refusal; cover absent targets and dangling links. |\n| **P2** | Malformed scenarios bypass the stdout collision guard: `--trace - --report - bad.toml` mixes NDJSON and JSON on stdout. | Move the stdout collision check before scenario loading; add malformed-input coverage. |\n\nThe common fix is to centralize destination validation before any trace or report output, including error paths.\n\nExisting-file refusal, dangling-symlink cleanup, and runner-error trace handling appear correct by inspection. Probe/VT code is unchanged. **Validation remains incomplete:** this was a read-only review; no builds, tests, or daemons ran. Resolve all three findings and run focused regression tests before shipping."
+    },
+    "meta": {
+      "schema_version": 1,
+      "strategy": "council",
+      "duration_ms": 108891,
+      "total_cost_usd": 0,
+      "total_tokens_in": 571703,
+      "total_tokens_out": 3594,
+      "providers": {
+        "agy": "error",
+        "codex": "ok"
+      }
+    }
+  },
+  {
+    "dispatch": [
+      {
+        "provider": "codex",
+        "model": "gpt-6.1-sol",
+        "content": "**DO NOT SHIP.** Six remaining defects, ranked:\n\n1. **P1 — Derived outputs bypass validation.** [driver.rs:560](<worktree>/crates/shux/src/gate/driver.rs:560)  \n   Heat PNGs, golden artifacts, approval logs, and changed-golden manifests are absent from the destination list. Concrete triggers:\n   - A failing `frame` with `--out out --trace out/frame.heat.png` replaces the trace with PNG bytes.\n   - `--on-missing create --report goldens/frame.capture.json` blesses the golden, then overwrites it with the report.\n   - A symlink at a heat/manifest destination lets those writes truncate another file.\n   \n   **Fix:** enumerate and validate every derived destination before writing; reject unsafe links.\n\n2. **P1 — Missing parent directories defeat comparison.** [driver.rs:567](<worktree>/crates/shux/src/gate/driver.rs:567)  \n   With `new/` absent, `--cast new/shared --report new/shared` fails both validation opens and silently skips them. The recorder subsequently creates the parent and cast; report emission overwrites it.  \n   **Fix:** compare unresolved destinations using resolved existing ancestors plus normalized suffixes; never treat an unsuccessful open as successful validation.\n\n3. **P1 — The stdout collision refusal still writes before validation.** [driver.rs:258](<worktree>/crates/shux/src/gate/driver.rs:258)  \n   `--format json lens gate --trace - --report kept --cast kept SCENARIO` enters this branch and truncates `kept` through `emit()`, without checking the report/cast alias. A malformed scenario behaves identically.  \n   **Fix:** validate destinations before this branch; alias refusals must emit only their diagnostic.\n\n4. **P1 — The summary’s stderr destination is unchecked.** [driver.rs:242](<worktree>/crates/shux/src/gate/driver.rs:242)  \n   `lens gate --report - --trace t SCENARIO 2>>t` appends the summary table to the NDJSON trace. No write fails, so trace-loss handling never detects the corruption.  \n   **Fix:** include stderr’s regular-file identity wherever summaries or diagnostics can write.\n\n5. **P1 — Cleanup can delete a file validation did not create.** [driver.rs:566](<worktree>/crates/shux/src/gate/driver.rs:566)  \n   Interleaving: metadata reports absent → another process creates and populates the destination → validation opens that existing file → cleanup removes it because `existed` was false.  \n   **Fix:** establish creation ownership atomically; never infer ownership from a preceding metadata lookup or delete an unchecked replacement.\n\n6. **P2 — FIFO probing can strand the real open forever.** [driver.rs:567](<worktree>/crates/shux/src/gate/driver.rs:567)  \n   A reader waits on the trace FIFO. Validation opens and closes its writer without bytes; the reader observes EOF and exits. If scheduled before `Trace::open`, the subsequent blocking writer open waits forever. `O_NONBLOCK` protects only validation’s open.  \n   **Fix:** inspect existing FIFOs without opening them, or retain the actual writer through execution.\n\nThe `a25d0f9` runner-error trace handling remains intact. Probe/VT ownership code is unchanged since round 2. These are source-level findings; no edits, builds, tests, or daemons were run.",
+        "duration_ms": 135112,
+        "cost_usd": 0,
+        "tokens_in": 752073,
+        "tokens_out": 5033
+      },
+      {
+        "provider": "agy",
+        "model": "",
+        "content": "",
+        "duration_ms": 0,
+        "cost_usd": 0,
+        "tokens_in": 0,
+        "tokens_out": 0,
+        "error": "invoke agy: agy: Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 46h26m27s."
+      }
+    ],
+    "reviews": null,
+    "synthesis": {
+      "chair": "claude",
+      "chair_fallback": "codex",
+      "content": "**Do not ship.** Six defects remain: five P1 issues that can corrupt or delete files, and one P2 issue that can hang execution.\n\nThe central problem is that destination validation neither covers every write nor reliably establishes file identity and ownership.\n\n| Priority | Defect | Consequence |\n|---|---|---|\n| P1 | Derived destinations are omitted: heat PNGs, golden artifacts, approval logs, and changed-golden manifests | Outputs can overwrite each other or truncate files through symlinks |\n| P1 | Validation silently skips destinations whose parents do not exist | Aliased cast/report paths pass validation, then overwrite each other |\n| P1 | The stdout-collision refusal calls `emit()` before destination validation | Even a rejected invocation or malformed scenario can truncate a report/cast destination |\n| P1 | stderr’s file identity is unchecked | Redirected summaries or diagnostics can corrupt an NDJSON trace without producing a write error |\n| P1 | Cleanup infers creation ownership from an earlier metadata lookup | A race can cause validation to delete a file created by another process |\n| P2 | Validation briefly opens and closes FIFOs | A waiting reader can observe EOF and exit, leaving the real writer open blocked forever |\n\nThe fix should establish one destination-validation boundary **before any output or mutation**:\n\n1. Enumerate all explicit and derived outputs, including stdout/stderr when backed by regular files.\n2. Detect aliases using existing-file identity and resolved existing ancestors plus normalized suffixes for missing paths.\n3. Reject unsafe links and treat validation failures explicitly.\n4. Establish temporary-file ownership atomically and clean up only files whose ownership remains verified.\n5. Inspect FIFOs without opening them, or retain the actual writer through execution.\n6. Ensure collision refusals emit only their diagnostic through a checked channel.\n\nThe `a25d0f9` runner-error trace handling remains intact. Probe/VT ownership code is unchanged since round 2.\n\n**Evidence limit:** these are source-level findings; no edits, builds, tests, or daemon runs were performed. Shipping requires fixes and regression coverage for all six cases."
+    },
+    "meta": {
+      "schema_version": 1,
+      "strategy": "council",
+      "duration_ms": 156118,
+      "total_cost_usd": 0,
+      "total_tokens_in": 781160,
+      "total_tokens_out": 5504,
+      "providers": {
+        "agy": "error",
+        "codex": "ok"
+      }
+    }
+  },
+  {
+    "dispatch": [
+      {
+        "provider": "codex",
+        "model": "gpt-6.1-sol",
+        "content": "**DO NOT SHIP**\n\n1. **P1 — Golden protection runs after destructive early returns.** [driver.rs:276](<worktree>/crates/shux/src/gate/driver.rs:276)  \n   Trigger: `shux --format json lens gate --trace - --report GOLDEN --golden-dir GOLDENS good.toml`. The stdout-collision refusal calls `emit`, overwriting GOLDEN before the protection at line 320 runs. A malformed scenario likewise bypasses that protection. **Fix:** validate golden destinations before every trace/report write, including refusal and parse-error paths.\n\n2. **P1 — File symlinks bypass the new golden guard.** [driver.rs:706](<worktree>/crates/shux/src/gate/driver.rs:706)  \n   Trigger: an existing `outside/trace` symlink targets `GOLDENS/frame.capture.json`; pass it as `--trace` or `--report`. `path_is_under` canonicalizes only its parent, accepts the destination, and the write destroys the golden. **Fix:** canonicalize the complete existing output path before testing containment; retain parent-based resolution for absent files.\n\n3. **P2 — Missing parents disable output-alias detection.** [driver.rs:623](<worktree>/crates/shux/src/gate/driver.rs:623)  \n   Trigger: with `new/` absent, use `--cast new/run.cast --report new/run.cast`. Both validation passes skip these destinations because the parent cannot canonicalize. The recorder subsequently creates the parent in `pane_record::path_key`; report emission then overwrites the cast. **Fix:** compare destinations through their nearest existing ancestor, or fail closed when their independence cannot be established.\n\nThe two a25d0f9 fixes remain present. These findings concern changed validation code and explicitly named outputs/goldens. Static review only; no edits, builds, tests, or daemons.",
+        "duration_ms": 130622,
+        "cost_usd": 0,
+        "tokens_in": 1303487,
+        "tokens_out": 4988
+      },
+      {
+        "provider": "agy",
+        "model": "",
+        "content": "",
+        "duration_ms": 0,
+        "cost_usd": 0,
+        "tokens_in": 0,
+        "tokens_out": 0,
+        "error": "invoke agy: agy: Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 46h10m4s."
+      }
+    ],
+    "reviews": null,
+    "synthesis": {
+      "chair": "claude",
+      "chair_fallback": "codex",
+      "content": "**Do not ship.** The review identifies three output-validation gaps that can overwrite goldens or recordings.\n\n| Priority | Finding | Required fix |\n|---|---|---|\n| **P1** | Early refusal and scenario parse-error paths can write reports before golden protection runs. | Validate golden destinations before **every** trace or report write, including error paths. |\n| **P1** | An output symlink outside the golden directory can target and overwrite a golden file. | Canonicalize the complete existing output path; use parent-based resolution only for absent files. |\n| **P2** | Missing parent directories bypass alias detection, allowing report emission to overwrite a cast at the same destination. | Resolve paths through their nearest existing ancestor, or fail closed when independence cannot be established. |\n\nConsolidate destination validation ahead of all writes, then add regression coverage for early-error writes, symlinks into goldens, and aliased outputs beneath missing directories.\n\nThe two `a25d0f9` fixes remain present. These findings come from **static review only**; no builds or runtime tests were performed."
+    },
+    "meta": {
+      "schema_version": 1,
+      "strategy": "council",
+      "duration_ms": 142933,
+      "total_cost_usd": 0,
+      "total_tokens_in": 1332673,
+      "total_tokens_out": 5249,
+      "providers": {
+        "agy": "error",
+        "codex": "ok"
+      }
+    }
+  },
+  {
+    "dispatch": [
+      {
+        "provider": "codex",
+        "model": "gpt-6.1-sol",
+        "content": "**DO NOT SHIP**\n\n1. **P1 — Golden symlinks pointing outward bypass protection.** [driver.rs:717](<worktree>/crates/shux/src/gate/driver.rs:717)  \n   Trigger: `goldens/frame.capture.json` symlinks to an existing baseline outside the golden directory; pass that golden path to `--trace` or `--report`. Whole-path canonicalization resolves outside and immediately returns false, so the baseline is overwritten.  \n   **Fix:** refuse when either the resolved target **or the resolved parent** is inside the golden tree. Add an outward-link case alongside the inward-link test.\n\n2. **P2 — Unmade-directory aliases still overwrite the cast.** [driver.rs:630](<worktree>/crates/shux/src/gate/driver.rs:630)  \n   Trigger: existing directories `/work/real` and `/work/link -> real`, with `new` absent; use `--report /work/real/new/out --cast /work/link/new/out`. Both parent canonicalizations fail, and the absolute spellings differ. The recorder creates the directory and cast; report emission then truncates that same file.  \n   **Fix:** resolve existing prefixes consistently, or refuse unresolved parents. The new test covers identical spellings only.\n\nThe pre-parse golden check and inward-symlink fix address their reported triggers. The unmade-directory fix remains incomplete. Read-only review; no builds, tests, or daemons run.",
+        "duration_ms": 93268,
+        "cost_usd": 0,
+        "tokens_in": 691841,
+        "tokens_out": 3391
+      },
+      {
+        "provider": "agy",
+        "model": "",
+        "content": "",
+        "duration_ms": 0,
+        "cost_usd": 0,
+        "tokens_in": 0,
+        "tokens_out": 0,
+        "error": "invoke agy: agy: Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 46h4m50s."
+      }
+    ],
+    "reviews": null,
+    "synthesis": {
+      "chair": "claude",
+      "chair_fallback": "codex",
+      "content": "**Do not ship.** Two overwrite paths remain:\n\n| Priority | Finding | Required fix |\n|---|---|---|\n| **P1** | A symlink inside `goldens/` pointing to an external baseline bypasses protection. Passing it to `--trace` or `--report` can overwrite the baseline. | Reject paths when either the resolved target or resolved parent lies inside the golden tree. Add an outward-symlink regression test. |\n| **P2** | Report/cast collision detection fails when aliased paths share a nonexistent directory suffix, such as `/work/real/new/out` and `/work/link/new/out`, where `link -> real`. Report emission can truncate the cast. | Resolve existing path prefixes consistently, or reject unresolved parents. Add a regression test using aliased paths with missing directories. |\n\nThe pre-parse golden check and inward-symlink fix address their reported triggers. The missing-directory collision fix is incomplete.\n\nThis assessment is based on read-only review; no builds, tests, or daemons were run."
+    },
+    "meta": {
+      "schema_version": 1,
+      "strategy": "council",
+      "duration_ms": 105332,
+      "total_cost_usd": 0,
+      "total_tokens_in": 720933,
+      "total_tokens_out": 3644,
+      "providers": {
+        "agy": "error",
+        "codex": "ok"
+      }
+    }
+  },
+  {
+    "dispatch": [
+      {
+        "provider": "codex",
+        "model": "gpt-6.1-sol",
+        "content": "**DO NOT SHIP**\n\n7ee2f57 fixes both exact round-6 cases. Two concrete gaps remain in changed validation code:\n\n1. **P1 — Golden protection falls back to unresolved spelling.** [driver.rs:742](<worktree>/crates/shux/src/gate/driver.rs:742)  \n   Trigger: existing golden directory `G`, symlink `L -> G`, absent `G/new`; pass `--golden-dir G --cast L/new/../frame.capture.json`. Both canonicalization attempts fail, and lexical containment misses `L`. The recorder creates `new`, resolves the parent to `G`, then truncates the existing golden.  \n   **Fix:** resolve existing ancestors for containment, handling unresolved `..` conservatively; retain both name-location and target checks. **Not a regression versus origin/main**; a remaining correctness defect in the modified golden guard.\n\n2. **P2 — `..` bypasses absent-output alias detection.** [driver.rs:656](<worktree>/crates/shux/src/gate/driver.rs:656)  \n   Trigger: existing `/r`, absent `/r/new` and `/r/out`; pass `--report /r/out --cast /r/new/../out`. On the `..` ancestor, `file_name()` returns `None`, so resolution returns the original spelling. Validation accepts distinct destinations; recording creates `new` and writes `/r/out`, then the report overwrites the cast.  \n   **Fix:** handle `ParentDir` components or refuse unresolved traversal before writing. **Not a regression versus origin/main**; the new alias validator remains incomplete.\n\nThe a25d0f9 alias-refusal and runner-error trace fixes remain intact. Static review only; no edits, builds, daemons, or tests run.",
+        "duration_ms": 122014,
+        "cost_usd": 0,
+        "tokens_in": 873174,
+        "tokens_out": 4040
+      },
+      {
+        "provider": "agy",
+        "model": "",
+        "content": "",
+        "duration_ms": 0,
+        "cost_usd": 0,
+        "tokens_in": 0,
+        "tokens_out": 0,
+        "error": "invoke agy: agy: Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 45h59m12s."
+      }
+    ],
+    "reviews": null,
+    "synthesis": {
+      "chair": "claude",
+      "chair_fallback": "codex",
+      "content": "**DO NOT SHIP.** Commit `7ee2f57` fixes both exact round-6 cases, but two correctness gaps remain in the changed validation code:\n\n| Priority | Gap | Consequence | Required fix |\n|---|---|---|---|\n| **P1** | Golden containment falls back to unresolved spelling when canonicalization fails. A symlink path such as `L/new/../frame.capture.json`, with `L -> G`, bypasses protection for golden directory `G`. | Recording can truncate an existing golden. | Resolve existing ancestors, handle unresolved `..` conservatively, and retain both name-location and target checks. |\n| **P2** | Absent-output alias detection does not handle `..`. `/r/out` and `/r/new/../out` are accepted as distinct destinations when `new` is absent. | The report overwrites the cast. | Resolve `ParentDir` components correctly or reject unresolved traversal before writing. |\n\nBoth are remaining defects, **not regressions against `origin/main`**. The `a25d0f9` alias-refusal and runner-error trace fixes remain intact.\n\nValidation was static review only; no edits, builds, daemons, or tests were run. Fix both gaps and verify the reproductions before shipping."
+    },
+    "meta": {
+      "schema_version": 1,
+      "strategy": "council",
+      "duration_ms": 133866,
+      "total_cost_usd": 0,
+      "total_tokens_in": 902331,
+      "total_tokens_out": 4335,
+      "providers": {
+        "agy": "error",
+        "codex": "ok"
+      }
+    }
+  }
+]

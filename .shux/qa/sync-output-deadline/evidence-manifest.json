@@ -1,0 +1,27 @@
+{
+  "solid_qa_report": "SOLID-QA.md",
+  "dootsabha_design": "dootsabha-design.json",
+  "dootsabha_implementation": "dootsabha-implementation.json",
+  "screenshots": [
+    "synthetic-sync-output-actual.png",
+    "synthetic-sync-output-diff.png",
+    "rich-tui-btop-actual.png",
+    "rich-tui-btop-diff.png",
+    "rich-tui-lazygit-actual.png",
+    "rich-tui-lazygit-diff.png",
+    "rich-tui-nvim-actual.png",
+    "rich-tui-nvim-diff.png",
+    "rich-tui-vicaya-actual.png",
+    "rich-tui-vicaya-diff.png",
+    "rich-tui-vivecaka-actual.png",
+    "rich-tui-vivecaka-diff.png"
+  ],
+  "pixel_metrics": [
+    "pixel-synthetic-sync-output.json",
+    "pixel-rich-tui-btop.json",
+    "pixel-rich-tui-lazygit.json",
+    "pixel-rich-tui-nvim.json",
+    "pixel-rich-tui-vicaya.json",
+    "pixel-rich-tui-vivecaka.json"
+  ]
+}

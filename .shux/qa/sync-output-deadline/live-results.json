@@ -1,0 +1,88 @@
+[
+  {
+    "case": "silent-120x40",
+    "status": "pass",
+    "visible_latency_s": 0.7897677080181893,
+    "viewport": [
+      120,
+      40
+    ],
+    "text": "<worktree>/.shux/out/sync-output-deadline/round2/silent-120x40.txt",
+    "png": "<worktree>/.shux/out/sync-output-deadline/round2/silent-120x40-actual.png",
+    "pixels": [
+      1080,
+      760
+    ]
+  },
+  {
+    "case": "killed-120x40",
+    "status": "pass",
+    "visible_latency_s": 0.8268036250083242,
+    "viewport": [
+      120,
+      40
+    ],
+    "text": "<worktree>/.shux/out/sync-output-deadline/round2/killed-120x40.txt",
+    "png": "<worktree>/.shux/out/sync-output-deadline/round2/killed-120x40-actual.png",
+    "pixels": [
+      1080,
+      760
+    ]
+  },
+  {
+    "case": "stream-120x40",
+    "status": "pass",
+    "visible_latency_s": 0.8513272090058308,
+    "viewport": [
+      120,
+      40
+    ],
+    "text": "<worktree>/.shux/out/sync-output-deadline/round2/stream-120x40.txt",
+    "png": "<worktree>/.shux/out/sync-output-deadline/round2/stream-120x40-actual.png",
+    "pixels": [
+      1080,
+      760
+    ]
+  },
+  {
+    "case": "cap-120x40",
+    "status": "pass",
+    "visible_latency_s": 0.02937058301176876,
+    "viewport": [
+      120,
+      40
+    ],
+    "text": "<worktree>/.shux/out/sync-output-deadline/round2/cap-120x40.txt",
+    "png": "<worktree>/.shux/out/sync-output-deadline/round2/cap-120x40-actual.png",
+    "pixels": [
+      1080,
+      760
+    ],
+    "cap_bytes": 2162688
+  },
+  {
+    "case": "nvim-120x40",
+    "status": "pass",
+    "viewport": [
+      120,
+      40
+    ],
+    "command": [
+      "/opt/homebrew/bin/nvim",
+      "--clean",
+      "-u",
+      "NONE",
+      "-i",
+      "NONE",
+      "+set termguicolors",
+      "+syntax on",
+      "<worktree>/.shux/out/sync-output-deadline/round2/sample.rs"
+    ],
+    "text": "<worktree>/.shux/out/sync-output-deadline/round2/nvim-120x40.txt",
+    "png": "<worktree>/.shux/out/sync-output-deadline/round2/nvim-120x40-actual.png",
+    "pixels": [
+      1080,
+      760
+    ]
+  }
+]
