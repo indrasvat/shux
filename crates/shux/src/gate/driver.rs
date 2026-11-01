@@ -614,7 +614,15 @@ fn refuse_shared_outputs(opts: &GateRunOptions, cast: Option<&Path>) -> Option<i
                     "{label} is a link to a file that does not exist. Name the file itself."
                 ));
             }
-            Err(_) => Dest::Absent(resolve_existing_prefix(path)),
+            Err(_) => match resolve_existing_prefix(path) {
+                Some(resolved) => Dest::Absent(resolved),
+                None => {
+                    return refuse(format!(
+                        "{label} goes through `..` or `.` in a directory that does not \
+                         exist yet. Name it without them."
+                    ));
+                }
+            },
         };
         if let Some((earlier, _)) = named.iter().find(|(_, d)| *d == dest) {
             return refuse(format!(
@@ -636,8 +644,10 @@ fn refuse_shared_outputs(opts: &GateRunOptions, cast: Option<&Path>) -> Option<i
 }
 
 /// `path` with its deepest existing ancestor resolved by the kernel and the rest, which
-/// does not exist and so holds no links, appended as spelled.
-fn resolve_existing_prefix(path: &Path) -> PathBuf {
+/// does not exist and so holds no links, appended as spelled. `None` when that rest
+/// holds `..` or `.`: only the kernel resolves those, and only once the directories
+/// exist, so where such a path lands cannot be known without making them.
+fn resolve_existing_prefix(path: &Path) -> Option<PathBuf> {
     let mut rest = Vec::new();
     let mut ancestor = path;
     loop {
@@ -647,14 +657,14 @@ fn resolve_existing_prefix(path: &Path) -> PathBuf {
             ancestor
         };
         if let Ok(resolved) = std::fs::canonicalize(dir) {
-            return rest.iter().rev().fold(resolved, |p, c| p.join(c));
+            return Some(rest.iter().rev().fold(resolved, |p, c| p.join(c)));
         }
-        match (ancestor.file_name(), ancestor.parent()) {
-            (Some(name), Some(parent)) => {
+        match ancestor.components().next_back() {
+            Some(std::path::Component::Normal(name)) => {
                 rest.push(name.to_os_string());
-                ancestor = parent;
+                ancestor = ancestor.parent()?;
             }
-            _ => return path.to_path_buf(),
+            _ => return None,
         }
     }
 }
@@ -714,34 +724,23 @@ fn resolve_cast_path(opts: &GateRunOptions, scenario_name: &str) -> Option<PathB
     })
 }
 
-/// True when an output path resolves to a place inside `golden_dir` (task 083 guard). Compares
-/// CANONICAL forms of the existing directories (`golden_dir`, and the path's parent) so a
-/// symlinked or `.`-spelled path (e.g. macOS `/tmp` → `/private/tmp`) still compares; falls back
-/// to a lexical absolute compare when a dir does not yet exist.
+/// True when an output path is inside `golden_dir` (task 083 guard), by the kernel's
+/// resolution of what exists (so `/tmp` → `/private/tmp` and links compare), with any
+/// tail not made yet appended as spelled.
 fn path_is_under(path: &Path, golden_dir: &Path) -> bool {
-    // Where the write lands and where the name sits both count: a link outside the tree
-    // pointing in, and a link inside it pointing out, are both inside.
-    if let (Ok(g), Ok(p)) = (golden_dir.canonicalize(), path.canonicalize())
-        && p.starts_with(&g)
-    {
-        return true;
-    }
-    if let (Ok(g), Some(cp)) = (
-        golden_dir.canonicalize(),
-        path.parent().and_then(|p| p.canonicalize().ok()),
-    ) {
-        return cp == g || cp.starts_with(&g);
-    }
-    let abs = |p: &Path| -> PathBuf {
-        if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            std::env::current_dir()
-                .map(|d| d.join(p))
-                .unwrap_or_else(|_| p.to_path_buf())
-        }
+    let Some(golden) = resolve_existing_prefix(golden_dir) else {
+        return false;
     };
-    abs(path).starts_with(abs(golden_dir))
+    // Where the write lands and where the name sits both count: a link outside the
+    // tree pointing in, and a link inside it pointing out, are both inside.
+    let lands = path.canonicalize().is_ok_and(|p| p.starts_with(&golden));
+    let sits = match (path.parent(), path.file_name()) {
+        (Some(dir), Some(name)) => {
+            resolve_existing_prefix(dir).is_some_and(|d| d.join(name).starts_with(&golden))
+        }
+        _ => false,
+    };
+    lands || sits
 }
 
 /// Note the produced `.cast` path in every scenario report (task 083) — only when the file

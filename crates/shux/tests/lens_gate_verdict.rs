@@ -1736,3 +1736,68 @@ fn two_spellings_of_an_unmade_directory_are_one_destination() {
         "a refused run made the directory"
     );
 }
+
+/// `..` through a directory not made yet cannot be placed without making it, so such
+/// an output is refused rather than guessed at. The cast recorder makes missing
+/// directories, so a cast spelled this way would land in the golden tree.
+#[test]
+fn dot_dot_through_an_unmade_directory_cannot_reach_a_golden() {
+    let h = Harness::new();
+    let d = tmp();
+    let g = tmp();
+    let gd = g.path().to_string_lossy().into_owned();
+    bless_golden(&h, d.path(), &gd, "dd", "DOTDOT");
+    let scn = d.path().join("dd.toml").to_string_lossy().into_owned();
+    let golden = std::fs::read_dir(g.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.to_string_lossy().ends_with(".capture.json"))
+        .expect("blessed capture golden");
+    let before = std::fs::read(&golden).unwrap();
+    let link = d.path().join("L");
+    std::os::unix::fs::symlink(g.path(), &link).unwrap();
+    let sneaky = link
+        .join("new")
+        .join("..")
+        .join(golden.file_name().unwrap());
+    let out = gate(
+        &h,
+        &[
+            "--cast",
+            &sneaky.to_string_lossy(),
+            "--golden-dir",
+            &gd,
+            &scn,
+        ],
+        false,
+    );
+    assert_eq!(
+        std::fs::read(&golden).unwrap(),
+        before,
+        "the cast replaced the golden"
+    );
+    assert_eq!(out.exit, 2, "stderr:\n{}", out.stderr);
+}
+
+/// The same file spelled with `..` through a directory not made yet is refused.
+#[test]
+fn dot_dot_through_an_unmade_directory_is_refused() {
+    let h = Harness::new();
+    let d = tmp();
+    let scn = write_scenario(d.path(), "dz", &scenario("dz", "HI", None));
+    let plain = d.path().join("out");
+    let dotted = d.path().join("new").join("..").join("out");
+    let out = gate(
+        &h,
+        &[
+            "--report",
+            &plain.to_string_lossy(),
+            "--cast",
+            &dotted.to_string_lossy(),
+            &scn,
+        ],
+        false,
+    );
+    assert_eq!(out.exit, 2, "stderr:\n{}", out.stderr);
+    assert!(!plain.exists() && !d.path().join("new").exists());
+}
