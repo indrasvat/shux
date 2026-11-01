@@ -219,7 +219,7 @@ pub fn handle_config_init(force: bool) -> anyhow::Result<()> {
         "Config initialised at",
         cfg_path.display().to_string().as_str(),
         None,
-    );
+    )?;
     println!("{}", SHELL_HINT);
     Ok(())
 }
@@ -256,13 +256,13 @@ pub fn handle_config_reset_hints() -> anyhow::Result<()> {
             "Reset onboarding hints",
             path.display().to_string().as_str(),
             None,
-        );
+        )?;
     } else {
         crate::style::print_success(
             "Onboarding state already clear",
             path.display().to_string().as_str(),
             None,
-        );
+        )?;
     }
     println!(
         "  {} the welcome toast and right-zone hint will show again on the next `shux` attach.",
@@ -316,5 +316,7 @@ pub fn handle_config_validate(path: Option<std::path::PathBuf>) -> anyhow::Resul
     }
 
     let diags = crate::config_validate::validate(&resolved)?;
-    Ok(crate::config_validate::print_diagnostics(&diags, &resolved))
+    Ok(crate::config_validate::print_diagnostics(
+        &diags, &resolved,
+    )?)
 }

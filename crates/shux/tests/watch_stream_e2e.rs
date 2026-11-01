@@ -252,6 +252,38 @@ fn pane_watch_streams_promptly_and_ends_cleanly_when_its_reader_closes_the_pipe(
     );
 }
 
+/// Raw output with no newline is still pending in stdout's line buffer when
+/// the reader closes; ending the watch must not write it again.
+#[test]
+fn pane_watch_of_unterminated_output_ends_cleanly_when_its_reader_closes_the_pipe() {
+    let h = Harness::new();
+    let out = h.cli(&[
+        "session",
+        "create",
+        "dots",
+        "-d",
+        "--",
+        "sh",
+        "-c",
+        "while :; do printf '\\033[38;2;255;0;128mT\\033[38;5;208mI\\033[31mB\\033[0mdot'; sleep 1; done",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut w = pane_watch(&h, "dots", &pane_id_of(&h, "dots"));
+    let rx = w.output();
+    read_until(&rx, "dot", "pane watch", w.before_the_long_poll_ends());
+    drop(rx);
+
+    let (status, stderr) = w.exit_after_reader_closed(|| {});
+    assert!(
+        status.success() && !stderr.contains("panicked"),
+        "`pane watch` of unterminated output into a closed pipe exited {status}; stderr: {stderr}"
+    );
+}
+
 /// A pane that answers a line and then goes quiet: its last write reaches the
 /// watcher though nothing follows it. The reply is two writes 50 ms apart, so
 /// the second lands inside the 100 ms sampling window the first one opened.

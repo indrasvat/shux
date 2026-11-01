@@ -63,7 +63,7 @@ pub async fn handle_window_list(
                 })
                 .unwrap_or_default();
 
-            style::render_window_list(&ctx, session_name, &window_infos);
+            style::render_window_list(&ctx, session_name, &window_infos)?;
         }
     }
 
@@ -135,7 +135,7 @@ pub async fn handle_window_new(
                 .and_then(|v| v.as_str())
                 .unwrap_or("(untitled)");
             let index = result.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
-            crate::style::print_window_created(title, index);
+            crate::style::print_window_created(title, index)?;
         }
     }
 
@@ -168,7 +168,7 @@ pub async fn handle_window_kill(
             );
         }
         OutputFormat::Text | OutputFormat::Plain => {
-            crate::style::print_window_killed(&window_title);
+            crate::style::print_window_killed(&window_title)?;
         }
     }
 
@@ -215,7 +215,7 @@ pub async fn handle_window_rename(
                 .get("title")
                 .and_then(|v| v.as_str())
                 .unwrap_or(new_name);
-            crate::style::print_window_renamed(&old_title, stored);
+            crate::style::print_window_renamed(&old_title, stored)?;
         }
     }
 
@@ -248,7 +248,7 @@ pub async fn handle_window_focus(
             );
         }
         OutputFormat::Text | OutputFormat::Plain => {
-            crate::style::print_window_focused(&window_title);
+            crate::style::print_window_focused(&window_title)?;
         }
     }
 
@@ -286,7 +286,7 @@ pub async fn handle_window_reorder(
             );
         }
         OutputFormat::Text | OutputFormat::Plain => {
-            crate::style::print_window_reordered(&window_title, new_index);
+            crate::style::print_window_reordered(&window_title, new_index)?;
         }
     }
 

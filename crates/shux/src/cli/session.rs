@@ -96,7 +96,7 @@ pub async fn handle_ls(
                 })
                 .unwrap_or_default();
 
-            style::render_session_list(&ctx, &session_infos);
+            style::render_session_list(&ctx, &session_infos)?;
         }
     }
 
@@ -145,7 +145,7 @@ pub async fn handle_new(
                 .and_then(|v| v.as_str())
                 .unwrap_or("(unnamed)");
             let id = result.get("id").and_then(|v| v.as_str()).unwrap_or("?");
-            style::print_session_created(name, id, opts.ensure);
+            style::print_session_created(name, id, opts.ensure)?;
         }
     }
 
@@ -245,7 +245,7 @@ pub async fn handle_kill(
             );
         }
         OutputFormat::Text | OutputFormat::Plain => {
-            crate::style::print_session_killed(session_name);
+            crate::style::print_session_killed(session_name)?;
         }
     }
 
@@ -283,7 +283,7 @@ pub async fn handle_rename(
             );
         }
         OutputFormat::Text | OutputFormat::Plain => {
-            crate::style::print_session_renamed(session_name, new_name);
+            crate::style::print_session_renamed(session_name, new_name)?;
         }
     }
 
@@ -310,7 +310,7 @@ pub async fn handle_session_save(
 
     if let Some(path) = output {
         std::fs::write(&path, template)?;
-        crate::style::print_success("saved", &path.display().to_string(), None);
+        crate::style::print_success("saved", &path.display().to_string(), None)?;
     } else {
         print!("{template}");
     }
