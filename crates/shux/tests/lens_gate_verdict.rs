@@ -1081,13 +1081,13 @@ fn a_trace_sharing_a_file_with_another_output_is_refused() {
         );
     }
 
-    // A trace file the refused run created is removed again.
+    // A refused run creates nothing: here `--report` is a link to the absent trace.
     std::fs::remove_file(&trace).unwrap();
     let out = gate(&h, &["--trace", &trace, "--report", &link, &scn], false);
     assert_eq!(out.exit, 2, "stderr:\n{}", out.stderr);
     assert!(
         std::fs::symlink_metadata(&trace).is_err(),
-        "the refused run left the trace file it created"
+        "the refused run created the trace file"
     );
 }
 
@@ -1400,8 +1400,8 @@ fn an_alias_is_refused_before_a_refusal_writes_its_report() {
     assert_eq!(std::fs::read_to_string(&kept).unwrap(), "precious");
 }
 
-/// A trace through a link to a file that does not exist yet: the refusal removes
-/// the file it created, and writes no trace bytes first.
+/// A trace through a link to a file that does not exist yet is refused before
+/// anything is created or written.
 #[test]
 fn a_refused_alias_through_a_dangling_link_leaves_nothing() {
     let h = Harness::new();
@@ -1456,7 +1456,10 @@ fn stdout_redirected_onto_the_trace_is_refused() {
             Some(2),
             "report {report:?}; stderr:\n{stderr}"
         );
-        assert!(stderr.contains("same file as --trace"), "stderr:\n{stderr}");
+        assert!(
+            stderr.contains("stdout already writes to"),
+            "stderr:\n{stderr}"
+        );
         assert_eq!(std::fs::read_to_string(&trace).unwrap(), "precious");
     }
 }
@@ -1503,4 +1506,60 @@ fn a_malformed_scenario_cannot_mix_its_trace_into_the_json_report() {
         out.stderr
     );
     assert_eq!(out.report()[0].status, GateStatus::ScenarioError);
+}
+
+/// stderr is checked against the named outputs too, but never against stdout:
+/// `--trace t 2> t` is refused, `> log 2>&1` is not.
+#[test]
+fn stderr_onto_the_trace_is_refused_but_stdout_and_stderr_may_share_a_log() {
+    let h = Harness::new();
+    let d = tmp();
+    let scn = write_scenario(d.path(), "se", &scenario("se", "HI", None));
+    let trace = d.path().join("t.ndjson");
+    std::fs::write(&trace, "precious").unwrap();
+    let err = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&trace)
+        .unwrap();
+    let out = h
+        .shux()
+        .args(["lens", "gate", "--trace"])
+        .arg(&trace)
+        .arg(&scn)
+        .env_remove("CI")
+        .stderr(err)
+        .output()
+        .expect("spawn shux lens gate");
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    let kept = std::fs::read_to_string(&trace).unwrap();
+    assert!(
+        kept.starts_with("precious") && kept.contains("stderr already writes to"),
+        "{kept:?}"
+    );
+
+    let log = d.path().join("log");
+    let log_out = std::fs::File::create(&log).unwrap();
+    let log_err = log_out.try_clone().unwrap();
+    let trace2 = d.path().join("t2.ndjson");
+    let status = h
+        .shux()
+        .args(["lens", "gate", "--trace"])
+        .arg(&trace2)
+        .arg(&scn)
+        .env_remove("CI")
+        .stdout(log_out)
+        .stderr(log_err)
+        .status()
+        .expect("spawn shux lens gate");
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "a missing golden, not a refusal: {}",
+        std::fs::read_to_string(&log).unwrap()
+    );
+    assert!(
+        std::fs::read_to_string(&trace2)
+            .unwrap()
+            .contains("scenario_start")
+    );
 }

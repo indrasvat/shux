@@ -249,6 +249,11 @@ fn emit(opts: &GateRunOptions, reports: &[ScenarioReport]) -> Result<(), OutputF
 /// Run the gate on one scenario and return the frozen exit code (task §4). This is the
 /// 082 entry `main.rs` dispatches to for the default `shux lens gate <scenario>`.
 pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Result<i32> {
+    // Before anything is written, refusals included. A bare `--cast` is checked again
+    // once the scenario names its file.
+    if let Some(code) = refuse_shared_outputs(&opts, explicit_cast(&opts)) {
+        return Ok(code);
+    }
     // 085: `--trace -` and a stdout JSON report both claim stdout, and the result was
     // NDJSON signals followed by the report array — unparseable, with no usage error and
     // exit 0. The report stream is promised to carry ONLY the JSON, so this is a usage
@@ -272,11 +277,6 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
             return report_io_failure(e);
         }
         return Ok(GateStatus::ScenarioError.exit_code() as i32);
-    }
-    // Before anything is written. A bare `--cast` is checked again once the scenario
-    // names its file.
-    if let Some(code) = refuse_shared_outputs(&opts, explicit_cast(&opts)) {
-        return Ok(code);
     }
     let scenario = match scenario::load(&opts.scenario_path) {
         Ok(s) => s,
@@ -532,84 +532,95 @@ fn bless_failure_exit(e: &anyhow::Error, code: i32) -> i32 {
     }
 }
 
-/// Refuses a run whose outputs (the trace, the report, the cast, stdout) include the
-/// same regular file twice, before anything is written: one would overwrite the
-/// other. Every path is opened without truncating, creating it if absent, so links and
-/// files not there yet resolve as the kernel resolves them; what this creates, it
-/// removes again. A FIFO opens without blocking and is never compared, nor is a device.
+/// Refuses, before anything is written, a run in which two of its named outputs (the
+/// trace, the report, the cast) are the same file, or one of them is where stdout or
+/// stderr already goes: one would overwrite the other. Nothing is opened or created.
+/// An existing file is compared by identity, following links; an absent one by its
+/// kernel-resolved directory and name. A link to a file that does not exist is
+/// refused outright, since only creating its target would say where it leads. FIFOs
+/// and devices are never compared, and stdout and stderr are not compared with each
+/// other, so `> log 2>&1` stays legal.
 fn refuse_shared_outputs(opts: &GateRunOptions, cast: Option<&Path>) -> Option<i32> {
     use std::os::fd::AsFd;
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    let regular_id = |meta: std::fs::Metadata| meta.is_file().then(|| (meta.dev(), meta.ino()));
-    let trace = opts.trace.as_deref();
-    let report = opts.report.as_deref();
-    let stdout = std::io::stdout()
-        .as_fd()
-        .try_clone_to_owned()
-        .ok()
-        .and_then(|fd| std::fs::File::from(fd).metadata().ok())
-        .and_then(regular_id);
-    // The trace first, so a clash names it.
-    let mut outputs: Vec<(String, (u64, u64))> = Vec::new();
-    if trace == Some("-")
-        && let Some(id) = stdout
-    {
-        outputs.push(("--trace -".to_string(), id));
+    use std::os::unix::fs::MetadataExt;
+
+    #[derive(PartialEq)]
+    enum Dest {
+        File(u64, u64),
+        Absent(PathBuf),
     }
-    let mut created: Vec<PathBuf> = Vec::new();
+    let refuse = |msg: String| {
+        eprintln!("{}", crate::style::error(format!("lens gate: {msg}")));
+        Some(GateStatus::ScenarioError.exit_code() as i32)
+    };
+    let stream = |fd: std::os::fd::BorrowedFd<'_>| {
+        let meta = std::fs::File::from(fd.try_clone_to_owned().ok()?)
+            .metadata()
+            .ok()?;
+        meta.is_file().then(|| Dest::File(meta.dev(), meta.ino()))
+    };
+    let stdout = stream(std::io::stdout().as_fd());
+    let stderr = stream(std::io::stderr().as_fd());
+
+    let mut named: Vec<(String, Dest)> = Vec::new();
+    if opts.trace.as_deref() == Some("-")
+        && let Some(Dest::File(dev, ino)) = stdout
+    {
+        named.push(("--trace -".to_string(), Dest::File(dev, ino)));
+    }
     for (flag, path) in [
-        ("--trace", trace.filter(|t| *t != "-").map(Path::new)),
-        ("--report", report.filter(|r| *r != "-").map(Path::new)),
+        (
+            "--trace",
+            opts.trace.as_deref().filter(|t| *t != "-").map(Path::new),
+        ),
+        (
+            "--report",
+            opts.report.as_deref().filter(|r| *r != "-").map(Path::new),
+        ),
         ("--cast", cast),
     ] {
         let Some(path) = path else { continue };
-        let existed = std::fs::metadata(path).is_ok();
-        let Ok(file) = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .custom_flags(nix::libc::O_NONBLOCK)
-            .open(path)
-        else {
-            continue;
+        let label = format!("{flag} {}", path.display());
+        let dest = match std::fs::metadata(path) {
+            Ok(meta) if meta.is_file() => Dest::File(meta.dev(), meta.ino()),
+            Ok(_) => continue,
+            Err(_) if std::fs::symlink_metadata(path).is_ok() => {
+                return refuse(format!(
+                    "{label} is a link to a file that does not exist. Name the file itself."
+                ));
+            }
+            Err(_) => {
+                let (Some(name), Some(dir)) = (path.file_name(), path.parent()) else {
+                    continue;
+                };
+                let dir = if dir.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    dir
+                };
+                match std::fs::canonicalize(dir) {
+                    Ok(dir) => Dest::Absent(dir.join(name)),
+                    Err(_) => continue,
+                }
+            }
         };
-        if !existed {
-            created.push(path.to_path_buf());
+        if let Some((earlier, _)) = named.iter().find(|(_, d)| *d == dest) {
+            return refuse(format!(
+                "{label} is the same file as {earlier}, so one would overwrite the other. \
+                 Give them different files."
+            ));
         }
-        if let Some(id) = file.metadata().ok().and_then(regular_id) {
-            outputs.push((format!("{flag} {}", path.display()), id));
+        for (stream_name, stream_dest) in [("stdout", &stdout), ("stderr", &stderr)] {
+            if stream_dest.as_ref() == Some(&dest) {
+                return refuse(format!(
+                    "{label} is the file {stream_name} already writes to, so one would \
+                     overwrite the other. Give them different files."
+                ));
+            }
         }
+        named.push((label, dest));
     }
-    if trace != Some("-")
-        && let Some(id) = stdout
-    {
-        outputs.push(("stdout".to_string(), id));
-    }
-    let clash = outputs.iter().enumerate().find_map(|(i, (later, id))| {
-        outputs[..i]
-            .iter()
-            .find(|(_, other)| other == id)
-            .map(|(earlier, _)| (later.clone(), earlier.clone()))
-    });
-    for path in &created {
-        if let Err(e) = std::fs::canonicalize(path).and_then(std::fs::remove_file) {
-            eprintln!(
-                "{}",
-                crate::style::warning(format!(
-                    "lens gate: could not remove {} after checking it: {e}",
-                    path.display()
-                ))
-            );
-        }
-    }
-    let (later, earlier) = clash?;
-    eprintln!(
-        "{}",
-        crate::style::error(format!(
-            "lens gate: {later} is the same file as {earlier}, so one would overwrite the \
-             other. Give them different files."
-        ))
-    );
-    Some(GateStatus::ScenarioError.exit_code() as i32)
+    None
 }
 
 /// `--cast PATH` as given; a bare `--cast` names a file only once the scenario does.
