@@ -181,6 +181,12 @@ filter = '''
 test-group = 'wall-clock'
 threads-required = "num-test-threads"
 
+# The lens settle flake gate repeats a settle 100 times; the repetition is the test.
+# 70 s on a laptop, past 120 s on a hosted macOS runner. Honest, not stuck.
+[[profile.default.overrides]]
+filter = 'binary_id(=shux::lens_settle) & test(=s2_settle_flake_gate_100x)'
+slow-timeout = { period = "60s", terminate-after = 8 }
+
 # ── CI profile ────────────────────────────────────────────────────────────
 # Same scheduling as local; only the reporting differs. Keeping the groups
 # shared is the point — a CI-only relaxation would put the divergence this
