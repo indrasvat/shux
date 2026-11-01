@@ -260,9 +260,10 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
                 .as_deref()
                 .filter(|c| !c.trim().is_empty())
                 .map(Path::new);
-            if let Some(code) = refuse_trace_alias(&opts, cast) {
-                return code;
+            if let Some(code) = refuse_trace_alias(&opts, cast, false) {
+                return Ok(code);
             }
+            let created = trace_file_is_new(&opts);
             let (lost_trace, reader_left) = match runner::emit_parse_error_trace(
                 trace_target(opts.trace.clone()),
                 &e.to_string(),
@@ -271,8 +272,8 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
                 Ok(trace) => (trace.failure(), false),
                 Err(why) => (Some(why), false),
             };
-            if let Some(code) = refuse_trace_alias(&opts, cast) {
-                return code;
+            if let Some(code) = refuse_trace_alias(&opts, cast, created) {
+                return Ok(code);
             }
             eprintln!("{}", crate::style::error(format!("lens gate: {e}")));
             let mut reports = parse_error_report(&opts.scenario_path, &e.to_string());
@@ -368,9 +369,10 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
         return Ok(GateStatus::ScenarioError.exit_code() as i32);
     }
 
-    if let Some(code) = refuse_trace_alias(&opts, cast_path.as_deref()) {
-        return code;
+    if let Some(code) = refuse_trace_alias(&opts, cast_path.as_deref(), false) {
+        return Ok(code);
     }
+    let created = trace_file_is_new(&opts);
     let mut trace = match Trace::open(trace_target(opts.trace.clone())) {
         Ok(trace) => trace,
         Err(why) => {
@@ -383,11 +385,11 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
             return Ok(4);
         }
     };
-    if let Some(code) = refuse_trace_alias(&opts, cast_path.as_deref()) {
-        return code;
+    if let Some(code) = refuse_trace_alias(&opts, cast_path.as_deref(), created) {
+        return Ok(code);
     }
 
-    let outcome = runner::drive_scenario(
+    let outcome = match runner::drive_scenario(
         socket_path,
         &scenario,
         &runner::scenario_dir_of(&opts.scenario_path),
@@ -397,7 +399,18 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
         opts.retries.unwrap_or(0),
         cast_path.clone(),
     )
-    .await?;
+    .await
+    {
+        Ok(outcome) => outcome,
+        // No verdict: the error exits 3, but the trace still ends as it would.
+        Err(_) if trace.reader_left() => return Err(broken_pipe()),
+        Err(e) => {
+            if let Some(why) = trace.failure() {
+                report_lost_trace(&why);
+            }
+            return Err(e);
+        }
+    };
 
     // Fold the runner's per-frame retry audit notes (task 083 council #5) into the scenario note
     // BEFORE verdict rollup so a flake absorbed by a retry — or a non-deterministic frame that
@@ -500,7 +513,7 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
     }
     if let Err(e) = emit(&opts, &reports) {
         if let Some(why) = lost_trace.as_ref().filter(|_| !trace.reader_left()) {
-            trace_failure(why, 4);
+            report_lost_trace(why);
         }
         return report_io_failure(e);
     }
@@ -530,10 +543,12 @@ fn bless_failure_exit(e: &anyhow::Error, code: i32) -> i32 {
 }
 
 /// Refuses a `--report` or `--cast` naming the trace's file, before and again after the
-/// trace is created: one would silently overwrite the other.
-fn refuse_trace_alias(opts: &GateRunOptions, cast: Option<&Path>) -> Option<anyhow::Result<i32>> {
+/// trace is created: one would silently overwrite the other. A refusal writes nothing,
+/// and removes the trace's file if this run `created` it.
+fn refuse_trace_alias(opts: &GateRunOptions, cast: Option<&Path>, created: bool) -> Option<i32> {
     use std::os::unix::fs::MetadataExt;
-    let trace = runner::trace_file_id(&trace_target(opts.trace.clone())?)?;
+    let target = trace_target(opts.trace.clone())?;
+    let trace = runner::trace_file_id(&target)?;
     let report = opts.report.as_deref().filter(|r| *r != "-").map(Path::new);
     let (flag, path) = [("--report", report), ("--cast", cast)]
         .into_iter()
@@ -550,30 +565,45 @@ fn refuse_trace_alias(opts: &GateRunOptions, cast: Option<&Path>) -> Option<anyh
             path.display()
         ))
     );
-    let reports = parse_error_report(
-        &opts.scenario_path,
-        &format!("{flag} names the same file as --trace"),
-    );
-    Some(match emit(opts, &reports) {
-        Ok(()) => Ok(GateStatus::ScenarioError.exit_code() as i32),
-        Err(e) => report_io_failure(e),
-    })
+    if created
+        && let TraceTarget::Path(p) = &target
+        && let Err(e) = std::fs::remove_file(p)
+    {
+        eprintln!(
+            "{}",
+            crate::style::warning(format!(
+                "lens gate: could not remove the trace file {} this run created: {e}",
+                p.display()
+            ))
+        );
+    }
+    Some(GateStatus::ScenarioError.exit_code() as i32)
+}
+
+/// Whether opening the trace will create its file, so a refusal can remove it.
+fn trace_file_is_new(opts: &GateRunOptions) -> bool {
+    match trace_target(opts.trace.clone()) {
+        Some(TraceTarget::Path(p)) => std::fs::symlink_metadata(p).is_err(),
+        _ => false,
+    }
 }
 
 /// A trace that could not be written: exit 4, unless the run is a regression, which
 /// keeps exit 1 so CI still blocks on it.
 fn trace_failure(why: &str, code: i32) -> i32 {
-    eprintln!(
-        "{}",
-        crate::style::error(format!(
-            "lens gate: {why}. The trace is incomplete; the verdict in the report stands."
-        ))
-    );
+    report_lost_trace(why);
     if code == GateStatus::Fail.exit_code() as i32 {
         code
     } else {
         4
     }
+}
+
+fn report_lost_trace(why: &str) {
+    eprintln!(
+        "{}",
+        crate::style::error(format!("lens gate: {why}. The trace is incomplete."))
+    );
 }
 
 /// The gate's own machinery failed, so there is no verdict: exit 3, never 1.

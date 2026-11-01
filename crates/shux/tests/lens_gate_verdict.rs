@@ -872,9 +872,25 @@ fn review_refuses_non_interactive() {
 /// [`gate`] with every file write failing (EFBIG): the trace file cannot grow. The JSON
 /// report goes to a pipe, which the limit does not touch.
 fn gate_with_files_full(h: &Harness, args: &[&str], stdout: Option<std::fs::File>) -> Gate {
+    files_full(h, args, stdout, &[])
+}
+
+fn gate_with_files_full_env(h: &Harness, args: &[&str], env: &[(&str, &str)]) -> Gate {
+    files_full(h, args, None, env)
+}
+
+fn files_full(
+    h: &Harness,
+    args: &[&str],
+    stdout: Option<std::fs::File>,
+    env: &[(&str, &str)],
+) -> Gate {
     use std::os::unix::process::CommandExt;
     let mut cmd = h.shux();
-    cmd.args(["lens", "gate"]).args(args).env_remove("CI");
+    cmd.args(["lens", "gate"])
+        .args(args)
+        .envs(env.iter().copied())
+        .env_remove("CI");
     if let Some(file) = stdout {
         cmd.stdout(file);
     }
@@ -1044,6 +1060,7 @@ fn a_trace_sharing_a_file_with_another_output_is_refused() {
         ("--cast", &trace),
         ("--report", &link),
     ] {
+        std::fs::write(&trace, "precious").unwrap();
         let _ = std::fs::remove_file(&link);
         std::os::unix::fs::symlink(&trace, &link).unwrap();
         let out = gate(&h, &["--trace", &trace, flag, other, &scn], false);
@@ -1057,12 +1074,21 @@ fn a_trace_sharing_a_file_with_another_output_is_refused() {
             "{flag}: stderr must say why:\n{}",
             out.stderr
         );
-        if flag == "--report" {
-            let report: Vec<ScenarioReport> =
-                serde_json::from_str(&std::fs::read_to_string(other).unwrap()).unwrap();
-            assert_eq!(report[0].status, GateStatus::ScenarioError);
-        }
+        assert_eq!(
+            std::fs::read_to_string(&trace).unwrap(),
+            "precious",
+            "{flag} {other}: a refused run must write nothing"
+        );
     }
+
+    // A trace file the refused run created is removed again.
+    std::fs::remove_file(&trace).unwrap();
+    let out = gate(&h, &["--trace", &trace, "--report", &link, &scn], false);
+    assert_eq!(out.exit, 2, "stderr:\n{}", out.stderr);
+    assert!(
+        std::fs::symlink_metadata(&trace).is_err(),
+        "the refused run left the trace file it created"
+    );
 }
 
 #[test]
@@ -1303,4 +1329,47 @@ fn a_malformed_scenario_whose_trace_reader_left_still_writes_its_report() {
     let written: Vec<ScenarioReport> =
         serde_json::from_str(&std::fs::read_to_string(&report).expect("report written")).unwrap();
     assert_eq!(written[0].status, GateStatus::ScenarioError);
+}
+
+/// The gate's own machinery fails after the trace has started: still exit 3, but the
+/// trace ends as it would have.
+#[test]
+fn a_machinery_failure_still_finishes_its_trace() {
+    use std::os::unix::process::ExitStatusExt;
+    let h = Harness::new();
+    let d = tmp();
+    let scn = write_scenario(d.path(), "mf", &scenario("mf", "HI", None));
+    let not_a_dir = d.path().join("not-a-dir");
+    std::fs::write(&not_a_dir, "").unwrap();
+    let runtime = not_a_dir.to_string_lossy().into_owned();
+
+    let (read, write) = nix::unistd::pipe().expect("pipe");
+    drop(read);
+    let out = h
+        .shux()
+        .args(["lens", "gate", "--trace", "-"])
+        .arg(&scn)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env_remove("CI")
+        .stdout(std::process::Stdio::from(write))
+        .output()
+        .expect("spawn shux lens gate");
+    assert_eq!(
+        out.status.signal(),
+        Some(libc::SIGPIPE),
+        "a trace reader that left ends the gate quietly; {out:?}"
+    );
+
+    let trace = d.path().join("t.ndjson").to_string_lossy().into_owned();
+    let out = gate_with_files_full_env(
+        &h,
+        &["--trace", &trace, &scn],
+        &[("XDG_RUNTIME_DIR", &runtime)],
+    );
+    assert_eq!(out.exit, 3, "stderr:\n{}", out.stderr);
+    assert!(
+        out.stderr.contains("could not write the trace file") && out.stderr.contains(&trace),
+        "stderr must name the lost trace:\n{}",
+        out.stderr
+    );
 }
