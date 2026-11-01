@@ -222,9 +222,6 @@ proptest! {
         let mut lazy = VirtualTerminal::new(8, 24);
         let mut eager = VirtualTerminal::new(8, 24);
         eager.set_eager_sync_freeze(true);
-        // Fed in turn, the two must not see different clocks.
-        lazy.set_sync_deadline(false);
-        eager.set_sync_deadline(false);
 
         for (step, op) in ops.iter().enumerate() {
             let dirty_lazy = apply(&mut lazy, op);
@@ -257,9 +254,6 @@ proptest! {
         let mut lazy = VirtualTerminal::new(6, 20);
         let mut eager = VirtualTerminal::new(6, 20);
         eager.set_eager_sync_freeze(true);
-        // Fed in turn, the two must not see different clocks.
-        lazy.set_sync_deadline(false);
-        eager.set_sync_deadline(false);
         for i in 0..80 {
             let line = format!("history line {i} xyz\r\n");
             lazy.process(line.as_bytes());

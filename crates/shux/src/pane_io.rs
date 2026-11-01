@@ -61,6 +61,26 @@ pub(crate) struct PaneCheckpoint {
 ///
 /// This is the bridge between the RPC handlers and the per-pane PTY read loops.
 /// Each pane gets a write channel; the read loop is a separate tokio task.
+/// Whether a pane's output is still on the way to its VT, for the sweep that
+/// releases a synchronized-output window on time: it may only do so when the
+/// pane has really not finished its frame, never because the daemon has not
+/// parsed it yet.
+pub struct SyncGate {
+    /// Output queued on the PTY master, not read yet.
+    pub probe: shux_pty::PtyOutputProbe,
+    /// Set by the PTY task from the moment a read returns until its batch is
+    /// parsed, inside the VT's critical section.
+    pub in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl SyncGate {
+    /// Whether output the pane has sent may still close its window.
+    pub fn output_pending(&self) -> bool {
+        self.in_flight.load(std::sync::atomic::Ordering::Acquire)
+            || self.probe.has_output().unwrap_or(false)
+    }
+}
+
 pub struct PaneIoState {
     /// Per-pane write channels: send bytes to the pane's PTY read/write task.
     pub writers: HashMap<shux_core::model::PaneId, PaneWriter>,
@@ -87,6 +107,9 @@ pub struct PaneIoState {
     pub teardown_waiters: Vec<tokio::task::JoinHandle<()>>,
     /// Per-pane VirtualTerminal instances for capturing output.
     pub vts: HashMap<shux_core::model::PaneId, shux_vt::VirtualTerminal>,
+    /// Per live PTY: whether its output is still on the way to the VT. Same
+    /// lifetime as `writers`; a pane without one has no output to come.
+    pub sync_gates: HashMap<shux_core::model::PaneId, SyncGate>,
     /// Per-pane lens ContentRevision publishers (PRD §4, LENS-R-003). The
     /// single-writer PTY task publishes `(content_revision, last_mutation_ns)`
     /// here once per Class-A batch; `pane.wait_settled` (P3) subscribes. Same
@@ -188,6 +211,7 @@ impl PaneIoState {
             incarnations: HashMap::new(),
             teardown_waiters: Vec::new(),
             vts: HashMap::new(),
+            sync_gates: HashMap::new(),
             revisions: HashMap::new(),
             checkpoints: HashMap::new(),
             invalidations: HashMap::new(),
@@ -313,6 +337,7 @@ impl PaneIoState {
                 token.cancel();
             }
             self.writers.remove(pane_id);
+            self.sync_gates.remove(pane_id);
             self.resizers.remove(pane_id);
             if let Some(rx) = self.pty_done.remove(pane_id) {
                 done.push(rx);

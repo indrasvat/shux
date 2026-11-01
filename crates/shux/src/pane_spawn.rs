@@ -32,6 +32,8 @@ struct PtyTaskControl {
     shutdown: tokio_util::sync::CancellationToken,
     done_tx: oneshot::Sender<()>,
     input: shux_pty::PtyInputWriter,
+    /// See [`crate::pane_io::SyncGate::in_flight`].
+    in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Everything bound for the program's input, in order: terminal replies
@@ -203,6 +205,7 @@ async fn run_pane_pty_task(
         shutdown,
         done_tx,
         input,
+        in_flight,
     } = control;
     let mut buf = vec![0u8; 8192];
     // Track the last OSC title we forwarded to the graph so we only
@@ -245,6 +248,9 @@ async fn run_pane_pty_task(
                     }
                     Ok(n) => {
                         let data = &buf[..n];
+                        // Before any await: from here until the batch is parsed,
+                        // the sweep must not release a window this may close.
+                        in_flight.store(true, std::sync::atomic::Ordering::Release);
                         tee_pane_recorders(&io_state, pane_id, Some(incarnation), data, &shutdown).await;
                         let (pulse, vt_title, bus_opt, terminal_responses, bracketed) = {
                             let mut state = io_state.lock().await;
@@ -266,6 +272,7 @@ async fn run_pane_pty_task(
                                     // matching §4.2's "nets to no bump".
                                     let alt_before = vt.is_alternate_screen();
                                     let responses = vt.process_with_responses(data);
+                                    in_flight.store(false, std::sync::atomic::Ordering::Release);
                                     let alt_after = vt.is_alternate_screen();
                                     let rev = PaneRevision {
                                         content_revision: vt.content_revision(),
@@ -554,6 +561,7 @@ async fn run_pane_pty_task(
                 // stays until the exit commits, or attach would read the pane
                 // as never spawned and run its command again.
                 state.status_sealed.insert(pane_id);
+                state.sync_gates.remove(&pane_id);
                 vt.note_process_exit();
                 let publication = vt.program_status_publication();
                 let update = crate::program_status::update(&publication);
@@ -1044,6 +1052,8 @@ async fn spawn_pane_pty_unshared(
     let (done_tx, done_rx) = oneshot::channel::<()>();
     let pane_shutdown = shutdown.child_token();
     let mut vt = shux_vt::VirtualTerminal::new(size.rows as usize, size.cols as usize);
+    let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let probe = handle.output_probe();
     // LENS-R-003: seed the per-pane revision watch with the VT's initial
     // (content_revision=1, last_mutation_ns=creation time). The initial
     // receiver is dropped; P3 subscribers call `subscribe()` on the stored
@@ -1103,6 +1113,21 @@ async fn spawn_pane_pty_unshared(
         let status_generation = status.generation;
         state.incarnations.insert(pane_id, incarnation);
         state.writers.insert(pane_id, write_tx);
+        match probe {
+            Ok(probe) => {
+                let gate = crate::pane_io::SyncGate {
+                    probe,
+                    in_flight: in_flight.clone(),
+                };
+                state.sync_gates.insert(pane_id, gate);
+            }
+            Err(e) => {
+                // Without a probe the sweep cannot see queued output, and
+                // releases on time alone, as it did before the gate existed.
+                tracing::warn!(%pane_id, error = %e, "no output probe for the sync gate");
+                state.sync_gates.remove(&pane_id);
+            }
+        }
         state.resizers.insert(pane_id, resize_tx);
         state.pty_done.insert(pane_id, done_rx);
         let replaced = state.vts.insert(pane_id, vt).is_some();
@@ -1150,6 +1175,7 @@ async fn spawn_pane_pty_unshared(
             shutdown: pane_shutdown,
             done_tx,
             input,
+            in_flight,
         },
         graph.clone(),
     ));

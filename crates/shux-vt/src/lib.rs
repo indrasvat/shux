@@ -157,10 +157,6 @@ pub struct VirtualTerminal {
     /// write. Always `false` outside the differential tests — see
     /// [`VirtualTerminal::set_eager_sync_freeze`].
     eager_sync_freeze: bool,
-    /// Whether an open window is released once it has been open
-    /// [`SYNC_UPDATE_TIMEOUT_MS`]. Always `true` outside the differential
-    /// tests — see [`VirtualTerminal::set_sync_deadline`].
-    sync_deadline: bool,
     /// Monotonic nanoseconds at which the open synchronized-output window was
     /// first seen to still be open at the end of a batch, or 0 when no window
     /// is open. Stamped once per window rather than at `?2026h`, so a pane
@@ -325,7 +321,6 @@ impl VirtualTerminal {
             frozen_title: None,
             frozen_alt: None,
             eager_sync_freeze: false,
-            sync_deadline: true,
             sync_opened_ns: 0,
             sync_bytes: 0,
             active_grapheme_cell: None,
@@ -412,15 +407,6 @@ impl VirtualTerminal {
         }
     }
 
-    /// Turn off the wall-clock release of synchronized output; the byte bound
-    /// stays. The differential tests feed two terminals in turn, and on a
-    /// loaded machine the deadline can pass between them, releasing one
-    /// window and not the other. Production never calls it.
-    #[doc(hidden)]
-    pub fn set_sync_deadline(&mut self, enabled: bool) {
-        self.sync_deadline = enabled;
-    }
-
     /// Snapshot every still-unfrozen component of the presented frame.
     ///
     /// Called by the paths that mutate presented state from OUTSIDE the parser
@@ -497,20 +483,19 @@ impl VirtualTerminal {
             return false;
         }
         self.sync_bytes >= SYNC_UPDATE_MAX_BYTES
-            || (self.sync_deadline
-                && sync_clock_ns().saturating_sub(self.sync_opened_ns)
-                    >= SYNC_UPDATE_TIMEOUT_MS * 1_000_000)
+            || sync_clock_ns().saturating_sub(self.sync_opened_ns)
+                >= SYNC_UPDATE_TIMEOUT_MS * 1_000_000
     }
 
     /// Release a synchronized-output window that has outlived its deadline,
     /// reporting whether the presented frame moved.
     ///
-    /// The parse loop enforces the deadline itself on every batch, which is
-    /// enough for a pane that is still producing output — including every
-    /// abusive one, since abuse means output. This exists for the pane that
-    /// opened a window and then went silent: no bytes arrive, so nothing calls
-    /// `process`, and without an outside nudge that pane would show the same
-    /// frame until it was closed. The daemon sweeps its terminals with it.
+    /// The only release on time. Parsing never releases on time: a batch parsed
+    /// late may have been sent in time, and the daemon's own delay must not
+    /// tear a frame the pane finished. So the owner calls this only when the
+    /// pane has nothing queued and no output it has read waits to be parsed,
+    /// i.e. when the pane really has not finished its frame. Parsing still
+    /// releases a window that absorbs [`SYNC_UPDATE_MAX_BYTES`].
     pub fn release_expired_sync(&mut self) -> bool {
         if !self.sync_window_expired() {
             return false;
@@ -895,10 +880,11 @@ impl VirtualTerminal {
         // sync nets to NO presented change. The release batch compares the
         // frozen colors against the now-live value, so a real net change
         // still bumps exactly once at ?2026l, and a net-zero one never does.
-        // A window that has outlived its deadline is released BEFORE this
-        // batch lands, so the bytes about to be parsed are shown rather than
-        // hidden behind a frame the pane has stopped maintaining.
-        if self.sync_window_expired() {
+        // A window that has absorbed too much output is released BEFORE this
+        // batch lands. Time is not judged here: see `release_expired_sync`.
+        if self.sync_armed.load(std::sync::atomic::Ordering::Relaxed)
+            && self.sync_bytes >= SYNC_UPDATE_MAX_BYTES
+        {
             self.force_release_sync();
         }
 
@@ -2144,55 +2130,31 @@ mod tests {
     // Issue #115: a window cannot be held open for ever
     // -----------------------------------------------------------------
 
-    /// `?2026h` is a promise to send `?2026l`. A pane that breaks it — an
-    /// application killed mid-redraw — must not leave its pane showing one
-    /// frame for ever.
+    /// A batch parsed after the deadline may have been sent long before it, so
+    /// parsing never releases a window on time: on a loaded daemon that would
+    /// tear frames the pane finished (G1). Only the owner's sweep does, once
+    /// the pane has nothing left queued.
     #[test]
-    fn a_sync_window_is_released_once_it_outlives_its_deadline() {
+    fn a_late_batch_never_releases_a_window_on_time() {
         let clock = test_clock::Frozen::new();
         let mut vt = VirtualTerminal::new(3, 10);
         vt.process(b"before");
-        vt.process(b"\x1b[?2026h\x1b[1;1Hafter   ");
-        assert_eq!(compact_capture(&vt), "before");
+        vt.process(b"\x1b[?2026h\x1b[1;1Haf");
+        clock.advance_ms(SYNC_UPDATE_TIMEOUT_MS * 2);
 
-        clock.advance_ms(SYNC_UPDATE_TIMEOUT_MS);
-
-        // The next byte of pane output is enough: the deadline is enforced on
-        // the way into every batch.
-        vt.process(b"!");
-        assert!(!vt.modes().synchronized_output);
-        assert!(compact_capture(&vt).starts_with("after"));
+        vt.process(b"ter   ");
+        assert!(vt.modes().synchronized_output);
+        assert_eq!(
+            compact_capture(&vt),
+            "before",
+            "a late batch must not show the half-drawn frame"
+        );
+        vt.process(b"\x1b[?2026l");
+        assert_eq!(compact_capture(&vt), "after");
     }
 
-    /// Why the differential tests turn the deadline off: two terminals fed
-    /// the same bytes in turn diverge when the deadline passes between them,
-    /// as it can on a loaded machine. With it off they cannot.
-    #[test]
-    fn the_sync_deadline_is_what_two_terminals_fed_in_turn_can_disagree_on() {
-        for deadline in [true, false] {
-            let clock = test_clock::Frozen::new();
-            let (mut first, mut second) =
-                (VirtualTerminal::new(3, 10), VirtualTerminal::new(3, 10));
-            first.set_sync_deadline(deadline);
-            second.set_sync_deadline(deadline);
-            for vt in [&mut first, &mut second] {
-                vt.process(b"before\x1b[?2026h\x1b[1;1Hafter   ");
-            }
-            first.process(b"!");
-            clock.advance_ms(SYNC_UPDATE_TIMEOUT_MS);
-            second.process(b"!");
-            assert_eq!(
-                compact_capture(&first) != compact_capture(&second),
-                deadline,
-                "deadline {deadline}: {:?} vs {:?}",
-                compact_capture(&first),
-                compact_capture(&second)
-            );
-        }
-    }
-
-    /// The pane that goes completely silent is the case `process` cannot
-    /// catch, because nothing calls it. The daemon sweeps for it.
+    /// A pane that opened a window and stopped — killed mid-redraw — is
+    /// released by the sweep once the window outlives its deadline.
     #[test]
     fn a_silent_pane_holding_a_sync_window_is_swept() {
         let clock = test_clock::Frozen::new();
@@ -2267,6 +2229,7 @@ mod tests {
         for step in 0..(SYNC_UPDATE_TIMEOUT_MS * 2 / step_ms) {
             vt.process(b"\x1b[?2026h");
             vt.process(b"\x1b[1;1Hframe   ");
+            assert!(!vt.release_expired_sync());
             assert!(
                 vt.modes().synchronized_output,
                 "a window was force-released {} ms into the pane's life",
@@ -2279,7 +2242,7 @@ mod tests {
     }
 
     /// Output inside an open window must not extend its deadline: a TUI that
-    /// streams while holding the window is released on time, not at the cap.
+    /// streams while holding the window is swept on time, not at the cap.
     #[test]
     fn output_inside_a_window_does_not_extend_its_deadline() {
         let clock = test_clock::Frozen::new();
@@ -2289,6 +2252,7 @@ mod tests {
         for elapsed in (step_ms..=SYNC_UPDATE_TIMEOUT_MS).step_by(step_ms as usize) {
             clock.advance_ms(step_ms);
             vt.process(b"x");
+            vt.release_expired_sync();
             assert_eq!(
                 vt.modes().synchronized_output,
                 elapsed < SYNC_UPDATE_TIMEOUT_MS,

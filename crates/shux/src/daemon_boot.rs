@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use tokio::sync::{Mutex, Notify, mpsc};
 
-use crate::pane_io::{PaneIoState, PaneRevision};
+use crate::pane_io::{PaneIoState, PaneRevision, SyncGate};
 use crate::pane_spawn::publish_daemon_config;
 use crate::{
     attach, cli, daemon, lens_scratch, onboarding, rpc, session_meta, statusbar_runner, style,
@@ -701,9 +701,14 @@ pub(crate) async fn run_rpc_server(
                     // title and stale checkpoints for ever. The alt flag and
                     // the title are read on both sides of the release for
                     // exactly that reason.
-                    let expired: Vec<_> = state
-                        .vts
+                    // Only a pane that has really not finished its frame: output
+                    // it sent that is queued or awaiting the parse may close it.
+                    let PaneIoState { vts, sync_gates, .. } = &mut *state;
+                    let expired: Vec<_> = vts
                         .iter_mut()
+                        .filter(|(pane_id, _)| {
+                            !sync_gates.get(pane_id).is_some_and(SyncGate::output_pending)
+                        })
                         .filter_map(|(pane_id, vt)| {
                             let alt_before = vt.is_alternate_screen();
                             if !vt.release_expired_sync() {
