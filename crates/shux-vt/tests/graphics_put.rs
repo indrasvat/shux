@@ -173,3 +173,25 @@ fn a_put_inside_a_sync_window_waits_for_its_release() {
     vt.process(b"\x1b[?2026l");
     assert_eq!(vt.grid().placements().len(), 1);
 }
+
+/// Hostile sizes cannot overflow the aspect arithmetic.
+#[test]
+fn an_extreme_display_size_with_one_side_missing_is_capped() {
+    let mut vt = VirtualTerminal::new(20, 40);
+    vt.process(&transmit(7, 1, 60));
+    vt.process(&apc("a=p,i=7,c=4294967295,C=1"));
+    vt.process(&apc("a=p,i=7,r=4294967295,C=1"));
+    let boxes: Vec<_> = vt
+        .grid()
+        .placements()
+        .iter()
+        .map(|p| p.geometry.display)
+        .collect();
+    assert_eq!(boxes.len(), 2);
+    assert!(
+        boxes
+            .iter()
+            .all(|b| b.is_some_and(|(c, r)| c <= 40 && r <= 20)),
+        "{boxes:?}"
+    );
+}

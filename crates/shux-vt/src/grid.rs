@@ -522,13 +522,18 @@ impl ImageGeometry {
         if w == 0 || h == 0 {
             return None;
         }
-        let (dw, dh) = crate::DECLARED_CELL_PIXELS;
-        let (c, r) = (u64::from(cols), u64::from(rows));
-        let (w64, h64) = (u64::from(w), u64::from(h));
+        let (dw, dh) = (
+            u128::from(crate::DECLARED_CELL_PIXELS.0),
+            u128::from(crate::DECLARED_CELL_PIXELS.1),
+        );
+        // Capped before the aspect arithmetic, which then cannot overflow.
+        let cap = |n: u32, max: usize| u128::from(n).min(max.max(1) as u128);
+        let (c, r) = (cap(cols, max.0), cap(rows, max.1));
+        let (w128, h128) = (u128::from(w), u128::from(h));
         let display = match (c, r) {
             (0, 0) => None,
-            (c, 0) => Some((c, (c * u64::from(dw) * h64).div_ceil(w64 * u64::from(dh)))),
-            (0, r) => Some(((r * u64::from(dh) * w64).div_ceil(h64 * u64::from(dw)), r)),
+            (c, 0) => Some((c, (c * dw * h128).div_ceil(w128 * dh))),
+            (0, r) => Some(((r * dh * w128).div_ceil(h128 * dw), r)),
             (c, r) => Some((c, r)),
         }
         .map(|(c, r)| {
@@ -733,8 +738,13 @@ impl Grid {
             p.placement_id != 0 && q.image_id == p.image_id && q.placement_id == p.placement_id
         };
         if let Some(i) = self.placements.iter().position(same) {
-            let old = self.placements[i].image.payload.len();
-            self.placed_bytes = self.placed_bytes.saturating_sub(old) + p.image.payload.len();
+            let rest = self
+                .placed_bytes
+                .saturating_sub(self.placements[i].image.payload.len());
+            if rest + p.image.payload.len() > crate::graphics::image::MAX_IMAGE_BYTES {
+                return false;
+            }
+            self.placed_bytes = rest + p.image.payload.len();
             self.placements[i] = p;
             self.bump_mutations();
             return true;

@@ -556,7 +556,9 @@ impl Rasterizer {
         // Charged AFTER the cheap declared-size tests and BEFORE the decode, so
         // a placement that is off-screen costs nothing and one that is drawn is
         // paid for once.
-        let cost = declared_rgba_bytes(stored).unwrap_or(u64::MAX as usize) as u64;
+        // The source bitmap or the one it is scaled to, whichever is bigger.
+        let scaled = u64::from(dest_w) * u64::from(dest_h) * 4;
+        let cost = (declared_rgba_bytes(stored).unwrap_or(u64::MAX as usize) as u64).max(scaled);
         match budget.checked_sub(cost) {
             Some(left) => *budget = left,
             None => return,
