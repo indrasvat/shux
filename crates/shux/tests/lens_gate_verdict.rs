@@ -866,3 +866,242 @@ fn review_refuses_non_interactive() {
         "non-interactive review is refused"
     );
 }
+
+// ── #242 a trace that cannot be written · #244 machinery failures ─────────────
+
+/// [`gate`] with every file write failing (EFBIG): the trace file cannot grow. The JSON
+/// report goes to a pipe, which the limit does not touch.
+fn gate_with_files_full(h: &Harness, args: &[&str]) -> Gate {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = h.shux();
+    cmd.args(["lens", "gate"]).args(args).env_remove("CI");
+    // SAFETY: setrlimit and signal are async-signal-safe and touch only the child.
+    // SIGXFSZ ignored turns an over-limit write into EFBIG instead of a kill.
+    unsafe {
+        cmd.pre_exec(|| {
+            let none = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: libc::RLIM_INFINITY,
+            };
+            if libc::setrlimit(libc::RLIMIT_FSIZE, &none) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            Ok(())
+        });
+    }
+    let out = cmd.output().expect("spawn shux lens gate");
+    Gate {
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        exit: out.status.code().unwrap_or(-1),
+    }
+}
+
+fn assert_names_lost_trace(out: &Gate, trace: &str) {
+    assert!(
+        out.stderr.contains("could not write the trace file") && out.stderr.contains(trace),
+        "stderr must name the lost trace {trace}:\n{}",
+        out.stderr
+    );
+    let note = out.report()[0].note.clone().unwrap_or_default();
+    assert!(
+        note.contains("trace incomplete"),
+        "the report must say its trace is incomplete, got note {note:?}"
+    );
+}
+
+#[test]
+fn a_lost_trace_turns_a_green_run_into_exit_4() {
+    let h = Harness::new();
+    let d = tmp();
+    let g = tmp();
+    let gd = g.path().to_string_lossy().into_owned();
+    bless_golden(&h, d.path(), &gd, "tr", "TRACE242");
+    let scn = d.path().join("tr.toml").to_string_lossy().into_owned();
+    let trace = d.path().join("t.ndjson").to_string_lossy().into_owned();
+    let out = gate_with_files_full(
+        &h,
+        &[
+            "--report",
+            "-",
+            "--trace",
+            &trace,
+            "--golden-dir",
+            &gd,
+            &scn,
+        ],
+    );
+    assert_eq!(
+        out.exit, 4,
+        "a lost trace is exit 4; stderr:\n{}",
+        out.stderr
+    );
+    assert_eq!(
+        out.report()[0].status,
+        GateStatus::Pass,
+        "the verdict itself still stands"
+    );
+    assert_names_lost_trace(&out, &trace);
+}
+
+#[test]
+fn a_lost_trace_never_masks_a_regression() {
+    let h = Harness::new();
+    let d = tmp();
+    let g = tmp();
+    let gd = g.path().to_string_lossy().into_owned();
+    bless_golden(&h, d.path(), &gd, "base", "ALPHA");
+    let scn = write_scenario(d.path(), "rg", &scenario("rg", "BRAVO", None));
+    let trace = d.path().join("t.ndjson").to_string_lossy().into_owned();
+    let out = gate_with_files_full(
+        &h,
+        &[
+            "--report",
+            "-",
+            "--trace",
+            &trace,
+            "--golden-dir",
+            &gd,
+            &scn,
+        ],
+    );
+    assert_eq!(
+        out.exit, 1,
+        "a regression keeps exit 1 when its trace is lost; stderr:\n{}",
+        out.stderr
+    );
+    assert_eq!(out.report()[0].status, GateStatus::Fail);
+    assert_names_lost_trace(&out, &trace);
+}
+
+#[test]
+fn a_trace_that_cannot_be_opened_exits_4_without_running_the_scenario() {
+    let h = Harness::new();
+    let d = tmp();
+    let ran = d.path().join("ran");
+    let scn = write_scenario(
+        d.path(),
+        "nt",
+        &format!(
+            r#"name = "nt"
+command = ["/bin/sh", "-c", "/usr/bin/touch {}; exec cat"]
+[terminal]
+rows = 12
+cols = 40
+[[steps]]
+action = "expect_golden"
+name = "frame"
+tier = "cell"
+"#,
+            ran.display()
+        ),
+    );
+    let trace = d.path().join("no-such-dir/t.ndjson");
+    let trace = trace.to_string_lossy();
+    let out = gate(&h, &["--report", "-", "--trace", &trace, &scn], false);
+    assert_eq!(out.exit, 4, "stderr:\n{}", out.stderr);
+    assert!(
+        out.stderr.contains("could not open the trace file") && out.stderr.contains(&*trace),
+        "stderr must name the trace:\n{}",
+        out.stderr
+    );
+    assert!(!ran.exists(), "the scenario must not run without its trace");
+}
+
+#[test]
+fn a_malformed_scenario_with_an_unopenable_trace_exits_4() {
+    let h = Harness::new();
+    let d = tmp();
+    let scn = write_scenario(d.path(), "bad", "name = \"bad\"\nnot toml [[[\n");
+    let trace = d.path().join("no-such-dir/t.ndjson");
+    let trace = trace.to_string_lossy();
+    let out = gate(&h, &["--report", "-", "--trace", &trace, &scn], false);
+    assert_eq!(out.exit, 4, "stderr:\n{}", out.stderr);
+    let report = out.report();
+    assert_eq!(report[0].status, GateStatus::ScenarioError);
+    assert!(
+        out.stderr.contains("could not open the trace file") && out.stderr.contains(&*trace),
+        "stderr must name the trace:\n{}",
+        out.stderr
+    );
+}
+
+#[test]
+fn a_trace_sharing_a_file_with_another_output_is_refused() {
+    let h = Harness::new();
+    let d = tmp();
+    let scn = write_scenario(d.path(), "al", &scenario("al", "HI", None));
+    let trace = d.path().join("t.ndjson").to_string_lossy().into_owned();
+    let link = d.path().join("link.json").to_string_lossy().into_owned();
+    for (flag, other) in [
+        ("--report", &trace),
+        ("--cast", &trace),
+        ("--report", &link),
+    ] {
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&trace, &link).unwrap();
+        let out = gate(&h, &["--trace", &trace, flag, other, &scn], false);
+        assert_eq!(
+            out.exit, 2,
+            "{flag} {other} aliasing the trace is a usage error; stderr:\n{}",
+            out.stderr
+        );
+        assert!(
+            out.stderr.contains("same file as --trace"),
+            "{flag}: stderr must say why:\n{}",
+            out.stderr
+        );
+        if flag == "--report" {
+            let report: Vec<ScenarioReport> =
+                serde_json::from_str(&std::fs::read_to_string(other).unwrap()).unwrap();
+            assert_eq!(report[0].status, GateStatus::ScenarioError);
+        }
+    }
+}
+
+#[test]
+fn a_trace_on_stdout_whose_reader_left_ends_by_sigpipe() {
+    use std::os::unix::process::ExitStatusExt;
+    let h = Harness::new();
+    let d = tmp();
+    let g = tmp();
+    let gd = g.path().to_string_lossy().into_owned();
+    bless_golden(&h, d.path(), &gd, "sp", "PIPE242");
+    let scn = d.path().join("sp.toml").to_string_lossy().into_owned();
+    let (read, write) = nix::unistd::pipe().expect("pipe");
+    drop(read);
+    let out = h
+        .shux()
+        .args(["lens", "gate", "--trace", "-", "--golden-dir", &gd, &scn])
+        .env_remove("CI")
+        .stdout(std::process::Stdio::from(write))
+        .output()
+        .expect("spawn shux lens gate");
+    assert_eq!(
+        out.status.signal(),
+        Some(libc::SIGPIPE),
+        "a trace reader that left ends the gate quietly; {out:?}"
+    );
+}
+
+#[test]
+fn a_failure_in_the_gate_itself_is_infra_not_a_regression() {
+    let h = Harness::new();
+    let d = tmp();
+    let scn = write_scenario(d.path(), "inf", &scenario("inf", "HI", None));
+    // The daemon starts here, so it does not inherit the broken TMPDIR below.
+    assert!(h.cli(&["session", "list"]).status.success());
+    let out = gate_with(
+        &h,
+        &["--report", "-", &scn],
+        false,
+        &[("TMPDIR", &d.path().join("no-such-tmp").to_string_lossy())],
+    );
+    assert_eq!(out.exit, 3, "stderr:\n{}", out.stderr);
+    assert!(
+        out.stderr.contains("not a regression"),
+        "stderr must say it is not a regression:\n{}",
+        out.stderr
+    );
+}

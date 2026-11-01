@@ -58,41 +58,96 @@ pub enum TraceTarget {
 
 /// Emit a single `parse_error` to the trace target (081 contract: a malformed scenario
 /// still leaves a greppable trace). 082's driver calls this before it has a `Scenario`.
-pub fn emit_parse_error_trace(trace_target: Option<TraceTarget>, message: &str) {
-    if let Ok(mut trace) = Trace::open(trace_target) {
-        trace.emit(RunnerSignal::ParseError {
-            message: message.to_string(),
-        });
+/// Returns why the trace could not be opened or written, if it could not.
+pub fn emit_parse_error_trace(trace_target: Option<TraceTarget>, message: &str) -> Option<String> {
+    match Trace::open(trace_target) {
+        Ok(mut trace) => {
+            trace.emit(RunnerSignal::ParseError {
+                message: message.to_string(),
+            });
+            trace.failure()
+        }
+        Err(why) => Some(why),
     }
 }
 
 /// The NDJSON trace writer (design D3). Line-buffered + flushed so a crash still leaves
-/// a partial, greppable trace.
-struct Trace {
+/// a partial, greppable trace. The first failed write ends writing (the trace stays a
+/// prefix of the run, possibly ending in a partial line) and is kept for the driver.
+pub struct Trace {
     sink: Option<Box<dyn std::io::Write + Send>>,
     /// Every signal, retained for the provisional exit decision + a minimal summary.
     signals: Vec<RunnerSignal>,
+    label: String,
+    /// Device and inode of a trace file, to refuse another output naming the same file.
+    file_id: Option<(u64, u64)>,
+    failure: Option<std::io::Error>,
 }
 
 impl Trace {
-    fn open(target: Option<TraceTarget>) -> std::io::Result<Self> {
-        let sink: Option<Box<dyn std::io::Write + Send>> = match target {
-            None => None,
-            Some(TraceTarget::Stdout) => Some(Box::new(std::io::stdout())),
-            Some(TraceTarget::Path(p)) => Some(Box::new(std::fs::File::create(p)?)),
-        };
-        Ok(Self {
-            sink,
-            signals: Vec::new(),
+    /// No trace: signals are only retained.
+    pub fn none() -> Self {
+        Self::with_sink(None, String::new(), None)
+    }
+
+    /// Err is a diagnostic naming the target.
+    pub fn open(target: Option<TraceTarget>) -> Result<Self, String> {
+        use std::os::unix::fs::MetadataExt;
+        Ok(match target {
+            None => Self::none(),
+            Some(TraceTarget::Stdout) => Self::with_sink(
+                Some(Box::new(std::io::stdout())),
+                "the trace stream".to_string(),
+                None,
+            ),
+            Some(TraceTarget::Path(p)) => {
+                let label = format!("the trace file {}", p.display());
+                let file = std::fs::File::create(&p)
+                    .map_err(|e| format!("could not open {label}: {e}"))?;
+                let id = file
+                    .metadata()
+                    .map(|m| (m.dev(), m.ino()))
+                    .map_err(|e| format!("could not open {label}: {e}"))?;
+                Self::with_sink(Some(Box::new(file)), label, Some(id))
+            }
         })
     }
 
+    fn with_sink(
+        sink: Option<Box<dyn std::io::Write + Send>>,
+        label: String,
+        file_id: Option<(u64, u64)>,
+    ) -> Self {
+        Self {
+            sink,
+            signals: Vec::new(),
+            label,
+            file_id,
+            failure: None,
+        }
+    }
+
     fn emit(&mut self, sig: RunnerSignal) {
-        if let Some(w) = self.sink.as_mut() {
-            let _ = writeln!(w, "{}", sig.to_ndjson());
-            let _ = w.flush();
+        if let Some(w) = self.sink.as_mut()
+            && let Err(e) = writeln!(w, "{}", sig.to_ndjson()).and_then(|()| w.flush())
+        {
+            self.failure = Some(e);
+            self.sink = None;
         }
         self.signals.push(sig);
+    }
+
+    /// Why the trace is incomplete, naming it, if a write failed.
+    pub fn failure(&self) -> Option<String> {
+        let e = self.failure.as_ref()?;
+        Some(format!("could not write {}: {e}", self.label))
+    }
+
+    /// Whether `path` resolves to this trace's file.
+    pub fn is_file(&self, path: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        self.file_id.is_some()
+            && std::fs::metadata(path).is_ok_and(|m| Some((m.dev(), m.ino())) == self.file_id)
     }
 }
 
@@ -447,7 +502,7 @@ pub async fn drive_scenario(
     scenario_dir: &Path,
     argv: &[String],
     golden_dir: &Path,
-    trace_target: Option<TraceTarget>,
+    trace: &mut Trace,
     cli_retries: u32,
     cast: Option<PathBuf>,
 ) -> anyhow::Result<RunOutcome> {
@@ -465,7 +520,6 @@ pub async fn drive_scenario(
     let ce_hash = cmd_env_hash(&plan, &sandbox, argv, &scenario.terminal);
     let rasterizer = Rasterizer::new(FONT_SIZE)?;
 
-    let mut trace = Trace::open(trace_target)?;
     trace.emit(RunnerSignal::ScenarioStart {
         scenario: scenario.name.clone(),
         scenario_hash: sc_hash.clone(),
@@ -607,7 +661,7 @@ pub async fn drive_scenario(
         };
         let now = Instant::now();
         if now >= deadline {
-            scenario_timeout(&mut trace);
+            scenario_timeout(trace);
             stopped = true;
             break;
         }
@@ -639,7 +693,7 @@ pub async fn drive_scenario(
                 &sc_hash,
                 &ce_hash,
                 &rasterizer,
-                &mut trace,
+                trace,
                 &mut child_consumed,
                 &mut frames,
                 cli_retries,
@@ -649,7 +703,7 @@ pub async fn drive_scenario(
         {
             Ok(flow) => flow,
             Err(_) => {
-                scenario_timeout(&mut trace);
+                scenario_timeout(trace);
                 stopped = true;
                 break;
             }
@@ -1382,6 +1436,69 @@ mod tests {
     use super::super::signal::RunnerSignal;
     use super::*;
     use crate::gate::scenario;
+
+    /// Accepts `ok_writes` writes, then fails every write; or fails only on flush.
+    struct Flaky {
+        ok_writes: usize,
+        fail_flush: bool,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl std::io::Write for Flaky {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n < self.ok_writes {
+                Ok(buf.len())
+            } else {
+                Err(std::io::Error::other("disk full"))
+            }
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.fail_flush {
+                Err(std::io::Error::other("flush failed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn a_trace_stops_at_its_first_failed_write_and_keeps_every_signal() {
+        for (ok_writes, fail_flush, cause) in
+            [(2, false, "disk full"), (usize::MAX, true, "flush failed")]
+        {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let sink = Flaky {
+                ok_writes,
+                fail_flush,
+                calls: calls.clone(),
+            };
+            let mut trace = Trace::with_sink(Some(Box::new(sink)), "the trace file t".into(), None);
+            assert_eq!(trace.failure(), None);
+            while trace.failure().is_none() {
+                trace.emit(RunnerSignal::NoVisualCheck);
+                assert!(trace.signals.len() < 10, "the sink never failed");
+            }
+            assert_eq!(
+                trace.failure().as_deref(),
+                Some(format!("could not write the trace file t: {cause}").as_str())
+            );
+            let at_failure = calls.load(std::sync::atomic::Ordering::SeqCst);
+            let emitted = trace.signals.len();
+            trace.emit(RunnerSignal::NoVisualCheck);
+            trace.emit(RunnerSignal::NoVisualCheck);
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                at_failure,
+                "no write after the first failure"
+            );
+            assert_eq!(
+                trace.signals.len(),
+                emitted + 2,
+                "signals are kept for the verdict"
+            );
+        }
+    }
 
     fn fp(s: &str) -> String {
         s.to_string()

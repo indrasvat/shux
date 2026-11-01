@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::gate::vocab::{GateStatus, ScenarioReport};
 
-use super::runner::{TraceTarget, default_golden_dir};
+use super::runner::{Trace, TraceTarget, default_golden_dir};
 use super::scenario;
 use super::{bless, heat, runner, summary, verdict};
 use crate::cli::OutputFormat;
@@ -125,7 +125,7 @@ fn apply_refusal(reports: &mut [ScenarioReport], reason: &str) {
     }
 }
 
-/// Exit code for a CLI-level I/O failure while writing the report or trace (085 F18).
+/// Exit code for a CLI-level I/O failure while writing the report (085 F18).
 ///
 /// This used to propagate as an `anyhow` error, which the client turned into exit **1** —
 /// the FROZEN regression code — so a bad `--report` path on a perfectly green run told CI
@@ -231,13 +231,18 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
         Err(e) => {
             // Preserve the 081 trace contract: a malformed scenario still leaves a
             // greppable `parse_error` in the trace.
-            runner::emit_parse_error_trace(trace_target(opts.trace.clone()), &e.to_string());
+            let lost_trace =
+                runner::emit_parse_error_trace(trace_target(opts.trace.clone()), &e.to_string());
             eprintln!("{}", crate::style::error(format!("lens gate: {e}")));
-            let reports = parse_error_report(&opts.scenario_path, &e.to_string());
+            let mut reports = parse_error_report(&opts.scenario_path, &e.to_string());
+            if let Some(why) = &lost_trace {
+                plumb_retry_notes(&mut reports, &[format!("trace incomplete: {why}")]);
+            }
             if let Err(e) = emit(&opts, &reports) {
                 return Ok(report_io_failure(&opts, &e));
             }
-            return Ok(GateStatus::ScenarioError.exit_code() as i32);
+            let code = GateStatus::ScenarioError.exit_code() as i32;
+            return Ok(lost_trace.map_or(code, |why| trace_failure(&why, code)));
         }
     };
     let golden_dir = opts
@@ -319,17 +324,57 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
         return Ok(GateStatus::ScenarioError.exit_code() as i32);
     }
 
-    let outcome = runner::drive_scenario(
+    let mut trace = match Trace::open(trace_target(opts.trace.clone())) {
+        Ok(trace) => trace,
+        Err(why) => {
+            eprintln!(
+                "{}",
+                crate::style::error(format!(
+                    "lens gate: {why}. The scenario was not run (exit 4, not a regression)."
+                ))
+            );
+            return Ok(4);
+        }
+    };
+    let report_file = opts.report.as_deref().filter(|r| *r != "-").map(Path::new);
+    for (flag, path) in [("--report", report_file), ("--cast", cast_path.as_deref())] {
+        if let Some(path) = path
+            && trace.is_file(path)
+        {
+            eprintln!(
+                "{}",
+                crate::style::error(format!(
+                    "lens gate: {flag} {} is the same file as --trace, so one would overwrite \
+                     the other. Give them different files.",
+                    path.display()
+                ))
+            );
+            let reports = parse_error_report(
+                &opts.scenario_path,
+                &format!("{flag} names the same file as --trace"),
+            );
+            if let Err(e) = emit(&opts, &reports) {
+                return Ok(report_io_failure(&opts, &e));
+            }
+            return Ok(GateStatus::ScenarioError.exit_code() as i32);
+        }
+    }
+
+    let outcome = match runner::drive_scenario(
         socket_path,
         &scenario,
         &runner::scenario_dir_of(&opts.scenario_path),
         &argv,
         &golden_dir,
-        trace_target(opts.trace.clone()),
+        &mut trace,
         opts.retries.unwrap_or(0),
         cast_path.clone(),
     )
-    .await?;
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(e) => return Ok(infra_failure(&e)),
+    };
 
     // Fold the runner's per-frame retry audit notes (task 083 council #5) into the scenario note
     // BEFORE verdict rollup so a flake absorbed by a retry — or a non-deterministic frame that
@@ -365,7 +410,12 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
             ),
         );
     } else if let Some(selector) = &opts.update {
-        match bless::run_update(&scenario, &outcome, &reports, &golden_dir, selector, &opts)? {
+        let blessed =
+            match bless::run_update(&scenario, &outcome, &reports, &golden_dir, selector, &opts) {
+                Ok(blessed) => blessed,
+                Err(e) => return Ok(infra_failure(&e)),
+            };
+        match blessed {
             bless::BlessOutcome::Refused(reason) => {
                 apply_refusal(&mut reports, &reason);
             }
@@ -374,7 +424,12 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
             }
         }
     } else if opts.on_missing == crate::cli::OnMissing::Create {
-        match bless::create_missing(&scenario, &outcome, &reports, &golden_dir, &opts)? {
+        let created = match bless::create_missing(&scenario, &outcome, &reports, &golden_dir, &opts)
+        {
+            Ok(created) => created,
+            Err(e) => return Ok(infra_failure(&e)),
+        };
+        match created {
             bless::BlessOutcome::Refused(reason) => {
                 apply_refusal(&mut reports, &reason);
             }
@@ -411,10 +466,43 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
         plumb_cast_note(&mut reports, cast);
     }
 
+    let lost_trace = trace.failure();
+    if let Some(why) = &lost_trace {
+        plumb_retry_notes(&mut reports, &[format!("trace incomplete: {why}")]);
+    }
     if let Err(e) = emit(&opts, &reports) {
         return Ok(report_io_failure(&opts, &e));
     }
-    Ok(verdict::exit_code(&reports) as i32)
+    let code = verdict::exit_code(&reports) as i32;
+    Ok(lost_trace.map_or(code, |why| trace_failure(&why, code)))
+}
+
+/// A trace that could not be written: exit 4, unless the run is a regression, which
+/// keeps exit 1 so CI still blocks on it.
+fn trace_failure(why: &str, code: i32) -> i32 {
+    eprintln!(
+        "{}",
+        crate::style::error(format!(
+            "lens gate: {why}. The trace is incomplete; the verdict in the report stands."
+        ))
+    );
+    if code == GateStatus::Fail.exit_code() as i32 {
+        code
+    } else {
+        4
+    }
+}
+
+/// The gate's own machinery failed, so there is no verdict: exit 3, never 1.
+fn infra_failure(e: &anyhow::Error) -> i32 {
+    eprintln!(
+        "{}",
+        crate::style::error(format!(
+            "lens gate: {e:#}. The gate itself failed, so the scenario has no verdict \
+             (exit 3, infrastructure, not a regression)."
+        ))
+    );
+    GateStatus::InfraError.exit_code() as i32
 }
 
 /// Resolve `--cast [PATH]` to an ABSOLUTE path under the gitignored out dir, or `None` when the
