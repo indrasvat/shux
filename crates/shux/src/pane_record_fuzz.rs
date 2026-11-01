@@ -481,11 +481,19 @@ mod tests {
     /// the runs between them reached every outcome the properties are about.
     #[test]
     fn the_recording_lifecycle_keeps_its_promises() {
-        let mut runner = TestRunner::new(Config {
-            cases: 1024,
-            failure_persistence: None,
-            ..Config::default()
-        });
+        // A fixed seed: the interpreter is deterministic (one thread, paused
+        // time, test sinks), so the cases and the coverage floor below are
+        // the same on every machine. Open-ended search is `make fuzz-pane-record`.
+        let mut runner = TestRunner::new_with_rng(
+            Config {
+                cases: 1024,
+                failure_persistence: None,
+                ..Config::default()
+            },
+            proptest::test_runner::TestRng::deterministic_rng(
+                proptest::test_runner::RngAlgorithm::ChaCha,
+            ),
+        );
         let total = std::cell::Cell::new(super::Coverage::default());
         runner
             .run(&proptest::collection::vec(any::<u8>(), 0..480), |data| {

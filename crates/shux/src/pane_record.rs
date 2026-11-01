@@ -683,45 +683,47 @@ async fn path_key(path: &Path) -> Result<PathBuf, RecordStartError> {
     use std::path::Component;
     let path = std::path::absolute(path)
         .map_err(|e| RecordStartError::BadPath(format!("{}: {e}", path.display())))?;
-    if path.file_name().is_none() {
+    let Some(name) = path.file_name() else {
         return Err(RecordStartError::BadPath(format!(
             "{} names no file",
             path.display()
         )));
-    }
-    // Resolve the deepest prefix that exists. The rest does not exist yet,
-    // so it holds no links and is normalised as written (`..` included).
-    // Nothing is created here: a refused start leaves no trace.
-    let parts: Vec<Component<'_>> = path.components().collect();
-    let mut split = parts.len() - 1;
-    let mut key = loop {
-        let prefix: PathBuf = parts[..split].iter().collect();
-        match tokio::fs::canonicalize(&prefix).await {
-            Ok(base) => break base,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound && split > 1 => split -= 1,
-            Err(e) => {
-                return Err(RecordStartError::Open(format!(
-                    "failed to resolve {}: {e}",
-                    prefix.display()
-                )));
-            }
-        }
     };
-    for part in &parts[split..] {
+    // Walk the directories as the kernel would once the missing ones exist:
+    // a name that exists is resolved (links followed), one that does not is
+    // carried as written, and `..` steps back from wherever the walk stands,
+    // so a link reached again after a missing directory still resolves.
+    // Nothing is created: a refused start leaves no trace. The file name
+    // itself is not followed; the open refuses a link there.
+    let mut key = PathBuf::from("/");
+    let mut missing = 0usize;
+    for part in path.parent().unwrap_or(Path::new("/")).components() {
         match part {
+            Component::RootDir | Component::Prefix(_) | Component::CurDir => {}
             Component::ParentDir => {
                 key.pop();
+                missing = missing.saturating_sub(1);
             }
-            Component::CurDir => {}
-            other => key.push(other),
+            Component::Normal(dir) => {
+                key.push(dir);
+                if missing == 0 {
+                    match tokio::fs::canonicalize(&key).await {
+                        Ok(real) => key = real,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => missing = 1,
+                        Err(e) => {
+                            return Err(RecordStartError::Open(format!(
+                                "failed to resolve {}: {e}",
+                                key.display()
+                            )));
+                        }
+                    }
+                } else {
+                    missing += 1;
+                }
+            }
         }
     }
-    if key.file_name().is_none() {
-        return Err(RecordStartError::BadPath(format!(
-            "{} names no file",
-            path.display()
-        )));
-    }
+    key.push(name);
     Ok(key)
 }
 
@@ -1652,13 +1654,17 @@ mod tests {
     async fn a_path_with_a_missing_tail_resolves_without_creating_it() {
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
-        std::fs::create_dir(base.join("real")).unwrap();
+        std::fs::create_dir_all(base.join("real").join("nested")).unwrap();
         std::os::unix::fs::symlink(base.join("real"), base.join("link")).unwrap();
+        std::os::unix::fs::symlink(base.join("real").join("nested"), base.join("deeplink"))
+            .unwrap();
         for (given, want) in [
             ("missing/../dotdot.raw", "dotdot.raw"),
             ("missing/a/../../deep/record.raw", "deep/record.raw"),
             ("link/missing/../dotdot.raw", "real/dotdot.raw"),
             ("new/dir/x.raw", "new/dir/x.raw"),
+            // `..` out of a missing directory reaches a link again: resolve it.
+            ("missing/../deeplink/../record.raw", "real/record.raw"),
         ] {
             let key = path_key(&base.join(given))
                 .await
