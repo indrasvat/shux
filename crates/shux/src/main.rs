@@ -13,6 +13,7 @@ use shux::dispatch::run_client;
 use shux::style;
 
 fn main() {
+    die_quietly_on_a_closed_pipe();
     // Inject the colorised agent reference at runtime so it honours
     // NO_COLOR + the IsTerminal piped-stdout check. clap's derive macro
     // only accepts a `&'static str` literal there, so we set it here.
@@ -35,6 +36,42 @@ fn main() {
     if let Err(e) = result {
         report_fatal(&e);
     }
+}
+
+/// A print to a closed stdout or stderr ends the command the Unix way:
+/// killed by SIGPIPE, with no panic text. Only those prints: SIGPIPE stays
+/// ignored otherwise, so a client writing to a daemon that died still gets
+/// EPIPE and reports it, and the daemon is never killed by a hung-up client.
+fn die_quietly_on_a_closed_pipe() {
+    let report = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info.payload();
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        // std's own message for these prints; EPIPE reads "Broken pipe".
+        let closed = (message.starts_with("failed printing to stdout:")
+            || message.starts_with("failed printing to stderr:"))
+            && message.contains("Broken pipe");
+        if closed {
+            // SAFETY: SIG_DFL installs no handler and runs no Rust code; an
+            // inherited blocked mask is lifted for this thread so the signal
+            // lands; raise delivers it here, which ends the process.
+            unsafe {
+                libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+                let mut pipe: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut pipe);
+                libc::sigaddset(&mut pipe, libc::SIGPIPE);
+                libc::pthread_sigmask(libc::SIG_UNBLOCK, &pipe, std::ptr::null_mut());
+                libc::raise(libc::SIGPIPE);
+            }
+            // The signal did not end the process: exit as a shell would report it.
+            std::process::exit(141);
+        }
+        report(info);
+    }));
 }
 
 /// Render a fatal error once, then exit non-zero.
