@@ -638,9 +638,10 @@ const OUTBOUND_FRAMES: usize = 64;
 struct ShownFrames(std::collections::VecDeque<(u64, Arc<HashMap<PaneId, PaneView>>)>);
 
 impl ShownFrames {
-    /// Frames a client can trail the daemon by and still be mapped: every
-    /// frame the outbound queue can hold, again as many for the socket's
-    /// buffers. A client honestly behind never names a frame no longer kept.
+    /// Frames a client can trail the daemon by and still be mapped: the
+    /// outbound queue twice over. The socket's buffers hold bytes, not frames,
+    /// so small frames can still outrun this; a stamp past it falls back to
+    /// shux's own handling at the live layout (`handle_app_mouse`).
     const KEPT: usize = 2 * OUTBOUND_FRAMES;
 
     fn push(&mut self, frame: u64, views: HashMap<PaneId, PaneView>) {
