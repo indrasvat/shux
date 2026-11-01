@@ -1364,8 +1364,6 @@ async fn run_attach_loop(
                             &graph,
                             &io_state,
                             &render_session,
-                            &client_size,
-                            &config,
                             &mouse_drag,
                             &mut selection_drag,
                         )
@@ -2935,8 +2933,6 @@ async fn handle_app_mouse(
     graph: &GraphHandle,
     io_state: &Arc<Mutex<PaneIoState>>,
     session: &Arc<Mutex<AttachedSession>>,
-    client_size: &ClientSize,
-    config: &ConfigHandle,
     border_drag: &Option<DragState>,
     gesture: &mut SelectionDrag,
 ) -> anyhow::Result<AppMouse> {
@@ -2952,7 +2948,6 @@ async fn handle_app_mouse(
     };
     let attached = session.lock().await.clone();
     let copy_active = attached.copy_mode.is_some() || attached.copy_menu.is_some();
-    let viewport = current_viewport(client_size, config).await;
 
     // Resolve the pane under the pointer in the frame the client was shown: a
     // layout not drawn yet must not move a click into another pane. Views are
@@ -2977,14 +2972,13 @@ async fn handle_app_mouse(
         .iter()
         .find(|(_, view)| holds(view.rect, col, row))
         .map(|(pid, _)| *pid);
-    let content = current_content_rect(client_size).await;
     // A pane closed, hidden by a zoom or in another window since the frame
     // was drawn takes nothing more: what shux would do there now is not what
     // the user aimed at.
     if let Some(pid) = pane_hit
         && matches!(*gesture, SelectionDrag::None)
         && border_drag.is_none()
-        && pane_rect_in(graph, &attached, content, viewport, pid).is_none()
+        && !pane_is_shown(graph, &attached, pid)
     {
         return Ok(AppMouse::Consumed { redraw: false });
     }
@@ -3037,7 +3031,7 @@ async fn handle_app_mouse(
     // The pane can lose its rect mid-gesture: a window switch or a zoom leaves
     // it off-screen. Let the app know the button came up rather than letting
     // the gesture evaporate with it still held.
-    if pane_rect_in(graph, &attached, content, viewport, pane_id).is_none() {
+    if !pane_is_shown(graph, &attached, pane_id) {
         release_app_gesture(io_state, gesture).await;
         return Ok(AppMouse::Consumed { redraw: false });
     }
@@ -3520,6 +3514,17 @@ async fn pane_rect_for(
 /// `pane_rect_for` with the geometry already resolved, so a caller that has
 /// already computed the viewport for this event hit-tests against that one
 /// rather than re-reading the live config and getting a second answer.
+/// Whether the client's active window draws `pane_id` now.
+fn pane_is_shown(graph: &GraphHandle, attached: &AttachedSession, pane_id: PaneId) -> bool {
+    let snap = graph.snapshot();
+    snap.windows
+        .get(&attached.active_window_id)
+        .is_some_and(|win| match &win.layout.zoom {
+            Some(zoom) => zoom.zoomed_pane == pane_id,
+            None => win.layout.tree.contains_pane(pane_id),
+        })
+}
+
 fn pane_rect_in(
     graph: &GraphHandle,
     attached: &AttachedSession,
@@ -6516,8 +6521,6 @@ mod tests {
                 &self.fixture.graph,
                 &self.fixture.io_state,
                 &self.session,
-                &self.client_size,
-                &test_config(),
                 &self.border_drag,
                 &mut self.gesture,
             )
@@ -6565,8 +6568,6 @@ mod tests {
                 &self.fixture.graph,
                 &self.fixture.io_state,
                 &self.session,
-                &self.client_size,
-                &test_config(),
                 &self.border_drag,
                 &mut self.gesture,
             )

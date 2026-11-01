@@ -161,6 +161,19 @@ where
     })
 }
 
+/// Whether every holder of the pipe whose read end is `read` closes its write
+/// end within [`BUDGET`]: EOF arrives only then. A pipe still held fails after
+/// the budget; one that closes passes as soon as it does.
+pub fn pipe_closes(read: std::os::fd::OwnedFd) -> bool {
+    use std::io::Read;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut sink = Vec::new();
+        let _ = tx.send(std::fs::File::from(read).read_to_end(&mut sink).is_ok());
+    });
+    rx.recv_timeout(BUDGET).unwrap_or(false)
+}
+
 /// SIGTERM `pid` and wait for it to exit; SIGKILL it if it outlasts
 /// [`BUDGET`]. Returns whether it exited on SIGTERM, so a teardown can still
 /// fail the test without leaking the process.

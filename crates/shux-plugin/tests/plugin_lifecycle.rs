@@ -1472,7 +1472,6 @@ done
 /// it open for as long as the plugin runs.
 #[tokio::test]
 async fn a_plugin_inherits_no_descriptor_beyond_its_stdio() {
-    use std::io::Read;
     let tmp = tempfile::tempdir().unwrap();
     let script = write_script(tmp.path(), "noop.sh", NOOP_PLUGIN);
     let (read, write) = nix::unistd::pipe().expect("pipe");
@@ -1483,22 +1482,11 @@ async fn a_plugin_inherits_no_descriptor_beyond_its_stdio() {
         .expect("install");
     drop(write);
 
-    // EOF comes only once every holder of the write end has closed it.
-    let eof = tokio::task::spawn_blocking(move || {
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut sink = Vec::new();
-            let _ = tx.send(std::fs::File::from(read).read_to_end(&mut sink));
-        });
-        rx.recv_timeout(BUDGET)
-    })
-    .await
-    .expect("the EOF wait panicked");
+    let closed = tokio::task::spawn_blocking(move || shux_testkit::pipe_closes(read))
+        .await
+        .expect("the EOF wait panicked");
     let running = mgr.list().await.iter().any(|p| p.status == "running");
     mgr.kill("noop").await.expect("kill");
     assert!(running, "the plugin exited, so the pipe proves nothing");
-    assert!(
-        matches!(eof, Ok(Ok(_))),
-        "the plugin still holds a pipe its host had open"
-    );
+    assert!(closed, "the plugin still holds a pipe its host had open");
 }

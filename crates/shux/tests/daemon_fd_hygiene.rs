@@ -4,11 +4,9 @@
 //! left open without close-on-exec (make's jobserver pipe, a CI step's output
 //! pipe) would otherwise stay open for the daemon's life, and in every pane.
 
-use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::mpsc;
 
 struct Daemon {
     runtime: tempfile::TempDir,
@@ -54,13 +52,7 @@ fn an_auto_started_daemon_holds_no_descriptor_its_starter_leaked() {
     let fd = write.as_raw_fd();
     drop(write);
 
-    // EOF arrives only once every holder of the write end has closed it.
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut sink = Vec::new();
-        let _ = tx.send(std::fs::File::from(read).read_to_end(&mut sink));
-    });
-    let eof = rx.recv_timeout(shux_testkit::BUDGET);
+    let closed = shux_testkit::pipe_closes(read);
     let daemon_up = Command::new(&bin)
         .env("XDG_RUNTIME_DIR", daemon.runtime.path())
         .args(["--format", "json", "daemon", "status"])
@@ -72,7 +64,7 @@ fn an_auto_started_daemon_holds_no_descriptor_its_starter_leaked() {
         String::from_utf8_lossy(&daemon_up.stdout)
     );
     assert!(
-        matches!(eof, Ok(Ok(_))),
+        closed,
         "fd {fd} never reached EOF: the daemon (or a pane) still holds its starter's pipe"
     );
 }

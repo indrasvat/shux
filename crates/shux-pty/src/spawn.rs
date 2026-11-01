@@ -139,12 +139,10 @@ mod tests {
     /// A pipe made without close-on-exec stands in for one another thread
     /// opened a moment before the fork. `/bin/test` opens nothing that high,
     /// so `-e /dev/fd/N` is true only if the child inherited it.
-    fn inherits(fd: i32, hygiene: bool) -> bool {
+    fn inherits(fd: i32, prepare: impl FnOnce(&mut Command)) -> bool {
         let mut cmd = Command::new("/bin/test");
         cmd.args(["-e", &format!("/dev/fd/{fd}")]);
-        if hygiene {
-            inherit_only_stdio(&mut cmd);
-        }
+        prepare(&mut cmd);
         cmd.status().expect("run /bin/test").success()
     }
 
@@ -152,8 +150,11 @@ mod tests {
     fn a_child_inherits_no_descriptor_beyond_its_stdio() {
         let (_read, write) = nix::unistd::pipe().expect("pipe");
         let fd = write.as_raw_fd();
-        assert!(inherits(fd, false), "the probe cannot see fd {fd}");
-        assert!(!inherits(fd, true), "the child inherited fd {fd}");
+        assert!(inherits(fd, |_| {}), "the probe cannot see fd {fd}");
+        assert!(
+            !inherits(fd, inherit_only_stdio),
+            "the child inherited fd {fd}"
+        );
     }
 
     /// The sweep marks rather than closes, so `std`'s exec-error pipe still
@@ -179,16 +180,16 @@ mod tests {
             sweep.list().is_none(),
             "a one-entry buffer cannot hold the table"
         );
-        let mut cmd = Command::new("/bin/test");
-        cmd.args(["-e", &format!("/dev/fd/{fd}")]);
-        use std::os::unix::process::CommandExt;
-        // SAFETY: as in `inherit_only_stdio`.
-        unsafe {
-            cmd.pre_exec(move || {
-                sweep.apply();
-                Ok(())
-            });
-        }
-        assert!(!cmd.status().expect("run /bin/test").success());
+        let forced = inherits(fd, |cmd| {
+            use std::os::unix::process::CommandExt;
+            // SAFETY: as in `inherit_only_stdio`.
+            unsafe {
+                cmd.pre_exec(move || {
+                    sweep.apply();
+                    Ok(())
+                });
+            }
+        });
+        assert!(!forced, "the fallback loop missed fd {fd}");
     }
 }
