@@ -222,9 +222,6 @@ fn file_opener() -> Opener {
     Arc::new(|_id: uuid::Uuid, path: PathBuf, overwrite: bool| {
         async move {
             use nix::fcntl::{FcntlArg, OFlag, fcntl};
-            if let Some(parent) = path.parent() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
             let mut options = tokio::fs::OpenOptions::new();
             // Non-blocking only for the open: a FIFO nobody reads fails at
             // once (ENXIO) instead of parking the open, and the start, forever.
@@ -390,6 +387,10 @@ impl Recordings {
         overwrite: bool,
         pane: Option<PaneId>,
     ) -> Result<Prepared, RecordStartError> {
+        // Refusals that need no filesystem come first, so they leave nothing
+        // behind; a start refused for a busy path finds its directories made
+        // already, by the recording that holds it.
+        self.refuse_early(pane)?;
         let key = path_key(path).await?;
         let id = uuid::Uuid::new_v4();
         let control = Arc::new(Control::new());
@@ -429,6 +430,22 @@ impl Recordings {
         };
         task.await
             .unwrap_or_else(|e| Err(RecordStartError::Open(format!("record open failed: {e}"))))
+    }
+
+    fn refuse_early(&self, pane: Option<PaneId>) -> Result<(), RecordStartError> {
+        let reg = self.lock();
+        if !reg.admitting {
+            return Err(RecordStartError::ShuttingDown);
+        }
+        if let Some(pane) = pane
+            && let Some((running, _)) = reg
+                .entries
+                .iter()
+                .find(|(_, e)| e.live() && e.pane == Some(pane))
+        {
+            return Err(RecordStartError::PaneBusy(*running));
+        }
+        Ok(())
     }
 
     async fn open(
@@ -680,51 +697,25 @@ pub(crate) async fn requested_length(after: Duration) {
 /// `path` with its parent resolved, which is how two spellings of one file
 /// are recognised. Creates the parent, as the open would.
 async fn path_key(path: &Path) -> Result<PathBuf, RecordStartError> {
-    use std::path::Component;
-    let path = std::path::absolute(path)
-        .map_err(|e| RecordStartError::BadPath(format!("{}: {e}", path.display())))?;
-    let Some(name) = path.file_name() else {
-        return Err(RecordStartError::BadPath(format!(
-            "{} names no file",
-            path.display()
-        )));
+    let name = path
+        .file_name()
+        .ok_or_else(|| RecordStartError::BadPath(format!("{} names no file", path.display())))?;
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
     };
-    // Walk the directories as the kernel would once the missing ones exist:
-    // a name that exists is resolved (links followed), one that does not is
-    // carried as written, and `..` steps back from wherever the walk stands,
-    // so a link reached again after a missing directory still resolves.
-    // Nothing is created: a refused start leaves no trace. The file name
-    // itself is not followed; the open refuses a link there.
-    let mut key = PathBuf::from("/");
-    let mut missing = 0usize;
-    for part in path.parent().unwrap_or(Path::new("/")).components() {
-        match part {
-            Component::RootDir | Component::Prefix(_) | Component::CurDir => {}
-            Component::ParentDir => {
-                key.pop();
-                missing = missing.saturating_sub(1);
-            }
-            Component::Normal(dir) => {
-                key.push(dir);
-                if missing == 0 {
-                    match tokio::fs::canonicalize(&key).await {
-                        Ok(real) => key = real,
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => missing = 1,
-                        Err(e) => {
-                            return Err(RecordStartError::Open(format!(
-                                "failed to resolve {}: {e}",
-                                key.display()
-                            )));
-                        }
-                    }
-                } else {
-                    missing += 1;
-                }
-            }
-        }
-    }
-    key.push(name);
-    Ok(key)
+    // The kernel resolves the path, links and `..` included, once the
+    // directories exist; resolving it by hand is how it goes wrong.
+    tokio::fs::create_dir_all(&parent).await.map_err(|e| {
+        RecordStartError::Open(format!(
+            "failed to create parent directory {}: {e}",
+            parent.display()
+        ))
+    })?;
+    let parent = tokio::fs::canonicalize(&parent).await.map_err(|e| {
+        RecordStartError::Open(format!("failed to resolve {}: {e}", parent.display()))
+    })?;
+    Ok(parent.join(name))
 }
 
 /// An opened recording that admits nothing yet. Dropping it uncommitted
@@ -1648,33 +1639,35 @@ mod tests {
         }
     }
 
-    /// A path whose tail does not exist yet resolves as written, `..`
-    /// included, without creating anything; an existing link resolves.
+    /// Record paths resolve as the kernel resolves them once their parent
+    /// directories exist, links included; a regular file is no directory.
     #[tokio::test]
-    async fn a_path_with_a_missing_tail_resolves_without_creating_it() {
+    async fn a_record_path_resolves_as_the_kernel_would() {
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
         std::fs::create_dir_all(base.join("real").join("nested")).unwrap();
         std::os::unix::fs::symlink(base.join("real"), base.join("link")).unwrap();
         std::os::unix::fs::symlink(base.join("real").join("nested"), base.join("deeplink"))
             .unwrap();
+        std::fs::write(base.join("regular"), b"").unwrap();
         for (given, want) in [
             ("missing/../dotdot.raw", "dotdot.raw"),
             ("missing/a/../../deep/record.raw", "deep/record.raw"),
             ("link/missing/../dotdot.raw", "real/dotdot.raw"),
             ("new/dir/x.raw", "new/dir/x.raw"),
-            // `..` out of a missing directory reaches a link again: resolve it.
-            ("missing/../deeplink/../record.raw", "real/record.raw"),
+            ("missing2/../deeplink/../record.raw", "real/record.raw"),
         ] {
             let key = path_key(&base.join(given))
                 .await
                 .unwrap_or_else(|e| panic!("{given}: {e}"));
             assert_eq!(key, base.join(want), "{given}");
         }
-        assert!(
-            !base.join("missing").exists() && !base.join("new").exists(),
-            "a path key created a directory"
-        );
+        for refused in ["regular/../x.raw", "regular/x.raw"] {
+            assert!(
+                path_key(&base.join(refused)).await.is_err(),
+                "{refused}: a regular file was used as a directory"
+            );
+        }
     }
 
     /// A writer that panics still finalizes, with the bytes it wrote.
