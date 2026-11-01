@@ -132,8 +132,11 @@ fn apply_refusal(reports: &mut [ScenarioReport], reason: &str) {
 /// "visual regression" and printed a bare errno. `4` is reserved for exactly this class
 /// (`shux_vt`'s `exit_code_never_returns_four` pins that no gate VERDICT can produce it),
 /// so it is unambiguous: the check itself did not fail, writing its output did.
-fn report_io_failure(failure: &OutputFailure) -> i32 {
+fn report_io_failure(failure: OutputFailure) -> anyhow::Result<i32> {
     let OutputFailure { what, error } = failure;
+    if error.kind() == std::io::ErrorKind::BrokenPipe {
+        return Err(crate::style::OutputError(error).into());
+    }
     eprintln!(
         "{}",
         crate::style::error(format!(
@@ -141,7 +144,18 @@ fn report_io_failure(failure: &OutputFailure) -> i32 {
              output could not be written (exit 4, not a regression)."
         ))
     );
-    4
+    Ok(4)
+}
+
+/// Whether `e` is a write to a reader that left, which ends the client by SIGPIPE.
+pub fn reader_left(e: &anyhow::Error) -> bool {
+    e.chain()
+        .filter_map(|c| c.downcast_ref::<crate::style::OutputError>())
+        .any(|o| o.0.kind() == std::io::ErrorKind::BrokenPipe)
+}
+
+fn broken_pipe() -> anyhow::Error {
+    crate::style::OutputError(std::io::ErrorKind::BrokenPipe.into()).into()
 }
 
 /// An output of the gate that could not be written, and which one.
@@ -241,12 +255,18 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
             // Preserve the 081 trace contract: a malformed scenario still leaves a
             // greppable `parse_error` in the trace.
             if let Some(code) = refuse_trace_alias(&opts, None) {
-                return Ok(code);
+                return code;
             }
-            let lost_trace =
-                runner::emit_parse_error_trace(trace_target(opts.trace.clone()), &e.to_string());
+            let lost_trace = match runner::emit_parse_error_trace(
+                trace_target(opts.trace.clone()),
+                &e.to_string(),
+            ) {
+                Ok(trace) if trace.reader_left() => return Err(broken_pipe()),
+                Ok(trace) => trace.failure(),
+                Err(why) => Some(why),
+            };
             if let Some(code) = refuse_trace_alias(&opts, None) {
-                return Ok(code);
+                return code;
             }
             eprintln!("{}", crate::style::error(format!("lens gate: {e}")));
             let mut reports = parse_error_report(&opts.scenario_path, &e.to_string());
@@ -254,7 +274,7 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
                 plumb_retry_notes(&mut reports, &[format!("trace incomplete: {why}")]);
             }
             if let Err(e) = emit(&opts, &reports) {
-                return Ok(report_io_failure(&e));
+                return report_io_failure(e);
             }
             let code = GateStatus::ScenarioError.exit_code() as i32;
             return Ok(lost_trace.map_or(code, |why| trace_failure(&why, code)));
@@ -274,7 +294,7 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
             "CI mode: goldens are never self-minted here",
         );
         if let Err(e) = emit(&opts, &reports) {
-            return Ok(report_io_failure(&e));
+            return report_io_failure(e);
         }
         return Ok(GateStatus::UpdateRefused.exit_code() as i32);
     }
@@ -299,7 +319,7 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
             "--trace - collides with the stdout JSON report",
         );
         if let Err(e) = emit(&opts, &reports) {
-            return Ok(report_io_failure(&e));
+            return report_io_failure(e);
         }
         return Ok(GateStatus::ScenarioError.exit_code() as i32);
     }
@@ -334,13 +354,13 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
             "--cast path must not be inside the golden dir",
         );
         if let Err(e) = emit(&opts, &reports) {
-            return Ok(report_io_failure(&e));
+            return report_io_failure(e);
         }
         return Ok(GateStatus::ScenarioError.exit_code() as i32);
     }
 
     if let Some(code) = refuse_trace_alias(&opts, cast_path.as_deref()) {
-        return Ok(code);
+        return code;
     }
     let mut trace = match Trace::open(trace_target(opts.trace.clone())) {
         Ok(trace) => trace,
@@ -355,7 +375,7 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
         }
     };
     if let Some(code) = refuse_trace_alias(&opts, cast_path.as_deref()) {
-        return Ok(code);
+        return code;
     }
 
     let outcome = runner::drive_scenario(
@@ -470,10 +490,13 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
         plumb_retry_notes(&mut reports, &[format!("trace incomplete: {why}")]);
     }
     if let Err(e) = emit(&opts, &reports) {
-        if let Some(why) = &lost_trace {
+        if let Some(why) = lost_trace.as_ref().filter(|_| !trace.reader_left()) {
             trace_failure(why, 4);
         }
-        return Ok(report_io_failure(&e));
+        return report_io_failure(e);
+    }
+    if trace.reader_left() {
+        return Err(broken_pipe());
     }
     let code = verdict::exit_code(&reports) as i32;
     let code = lost_trace.map_or(code, |why| trace_failure(&why, code));
@@ -499,7 +522,7 @@ fn bless_failure_exit(e: &anyhow::Error, code: i32) -> i32 {
 
 /// Refuses a `--report` or `--cast` naming the trace's file, before and again after the
 /// trace is created: one would silently overwrite the other.
-fn refuse_trace_alias(opts: &GateRunOptions, cast: Option<&Path>) -> Option<i32> {
+fn refuse_trace_alias(opts: &GateRunOptions, cast: Option<&Path>) -> Option<anyhow::Result<i32>> {
     use std::os::unix::fs::MetadataExt;
     let trace = runner::trace_file_id(&trace_target(opts.trace.clone())?)?;
     let report = opts.report.as_deref().filter(|r| *r != "-").map(Path::new);
@@ -523,8 +546,8 @@ fn refuse_trace_alias(opts: &GateRunOptions, cast: Option<&Path>) -> Option<i32>
         &format!("{flag} names the same file as --trace"),
     );
     Some(match emit(opts, &reports) {
-        Ok(()) => GateStatus::ScenarioError.exit_code() as i32,
-        Err(e) => report_io_failure(&e),
+        Ok(()) => Ok(GateStatus::ScenarioError.exit_code() as i32),
+        Err(e) => report_io_failure(e),
     })
 }
 

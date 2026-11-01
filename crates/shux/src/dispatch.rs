@@ -925,7 +925,12 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     gate::driver::run_gate(&socket_path, opts).await
                 }
             };
-            std::process::exit(ran.unwrap_or_else(|e| gate::driver::infra_failure(&e)));
+            let code = match ran {
+                Ok(code) => code,
+                Err(e) if gate::driver::reader_left(&e) => return Err(e),
+                Err(e) => gate::driver::infra_failure(&e),
+            };
+            std::process::exit(code);
         }
 
         Some(Command::Rpc {

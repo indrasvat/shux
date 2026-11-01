@@ -58,17 +58,16 @@ pub enum TraceTarget {
 
 /// Emit a single `parse_error` to the trace target (081 contract: a malformed scenario
 /// still leaves a greppable trace). 082's driver calls this before it has a `Scenario`.
-/// Returns why the trace could not be opened or written, if it could not.
-pub fn emit_parse_error_trace(trace_target: Option<TraceTarget>, message: &str) -> Option<String> {
-    match Trace::open(trace_target) {
-        Ok(mut trace) => {
-            trace.emit(RunnerSignal::ParseError {
-                message: message.to_string(),
-            });
-            trace.failure()
-        }
-        Err(why) => Some(why),
-    }
+/// Err is why the trace could not be opened.
+pub fn emit_parse_error_trace(
+    trace_target: Option<TraceTarget>,
+    message: &str,
+) -> Result<Trace, String> {
+    let mut trace = Trace::open(trace_target)?;
+    trace.emit(RunnerSignal::ParseError {
+        message: message.to_string(),
+    });
+    Ok(trace)
 }
 
 /// The NDJSON trace writer (design D3). Line-buffered + flushed so a crash still leaves
@@ -122,6 +121,13 @@ impl Trace {
             self.sink = None;
         }
         self.signals.push(sig);
+    }
+
+    /// Whether the trace's reader left (a broken pipe), which ends the client by SIGPIPE.
+    pub fn reader_left(&self) -> bool {
+        self.failure
+            .as_ref()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::BrokenPipe)
     }
 
     /// Why the trace is incomplete, naming it, if a write failed.
