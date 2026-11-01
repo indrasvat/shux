@@ -486,7 +486,8 @@ pub struct ImageGeometry {
 
 impl ImageGeometry {
     /// The whole image at its own size.
-    pub fn full(width: u32, height: u32) -> Self {
+    #[cfg(test)]
+    pub(crate) fn full(width: u32, height: u32) -> Self {
         Self {
             crop: PixelRect {
                 x: 0,
@@ -562,7 +563,8 @@ impl ImageGeometry {
         let Some((cols, rows)) = self.display else {
             // The client sized its bitmap against the declared cell box.
             let scale = |px: u64, cell: u32, declared: u32| {
-                (px * u64::from(cell) / u64::from(declared.max(1))).max(1) as u32
+                let px = (px * u64::from(cell) / u64::from(declared.max(1))).max(1);
+                u32::try_from(px).unwrap_or(u32::MAX)
             };
             return (scale(w, cell_w, dw), scale(h, cell_h, dh));
         };
@@ -688,54 +690,17 @@ impl Grid {
         &self.placements
     }
 
-    /// Add a placement, refusing past either cap. A pane can emit unbounded
-    /// `a=T`, and a tiny image charges almost no bytes while still costing a
-    /// pass per snapshot, so neither cap alone suffices.
-    pub(crate) fn place(&mut self, p: Placement) -> bool {
-        self.prune_evicted_placements();
-        // "The existing image and all its placements are deleted; the new data
-        // replaces the old." An app that redraws under one id would otherwise
-        // spend a slot per frame -- terminal-browser sends `i=1` on every one.
-        let mut freed_a_placement = false;
-        if p.image_id != 0 {
-            let id = p.image_id;
-            let freed: usize = self
-                .placements
-                .iter()
-                .filter(|q| q.image_id == id)
-                .map(|q| q.image.payload.len())
-                .sum();
-            let before = self.placements.len();
-            self.placements.retain(|q| q.image_id != id);
-            freed_a_placement = self.placements.len() != before;
-            self.placed_bytes = self.placed_bytes.saturating_sub(freed);
-        }
-        let cost = p.image.payload.len();
-        if self.placements.len() >= MAX_PLACEMENTS
-            || self.placed_bytes + cost > crate::graphics::image::MAX_IMAGE_BYTES
-        {
-            // The old picture is gone either way, so a refused replacement is
-            // still a change to the grid. `content_revision` is what
-            // `wait-settled` and `pane diff --since` read to decide a pane is
-            // quiet, and it must not say nothing happened.
-            if freed_a_placement {
-                self.bump_mutations();
-            }
-            return false;
-        }
-        self.placed_bytes += cost;
-        self.placements.push(p);
-        self.bump_mutations();
-        true
-    }
-
-    /// Add a placement of an already-transmitted image (`a=p`). One with the
-    /// same image and nonzero placement id is replaced where it stands;
-    /// otherwise this adds, under the same caps as [`Self::place`].
+    /// Add a placement, or replace the one with the same image and nonzero
+    /// placement id where it stands. Refused past either cap: a pane can emit
+    /// unbounded `a=T`, and a tiny image charges almost no bytes while still
+    /// costing a pass per snapshot, so neither cap alone suffices.
     pub(crate) fn put(&mut self, p: Placement) -> bool {
         self.prune_evicted_placements();
         let same = |q: &Placement| {
-            p.placement_id != 0 && q.image_id == p.image_id && q.placement_id == p.placement_id
+            p.image_id != 0
+                && p.placement_id != 0
+                && q.image_id == p.image_id
+                && q.placement_id == p.placement_id
         };
         if let Some(i) = self.placements.iter().position(same) {
             let rest = self
@@ -760,40 +725,30 @@ impl Grid {
         true
     }
 
-    /// Drop the placements `gone` picks, recording the change.
-    fn unplace_where(&mut self, mut gone: impl FnMut(&Placement) -> bool) -> bool {
+    /// Drop the placements `gone` picks, recording the change; returns the
+    /// image ids it dropped.
+    pub(crate) fn unplace_where(&mut self, gone: impl Fn(&Placement) -> bool) -> Vec<u32> {
         let mut freed = 0usize;
-        let before = self.placements.len();
+        let mut ids = Vec::new();
         self.placements.retain(|q| {
             let drop = gone(q);
             if drop {
                 freed += q.image.payload.len();
+                ids.push(q.image_id);
             }
             !drop
         });
         self.placed_bytes = self.placed_bytes.saturating_sub(freed);
-        let changed = self.placements.len() != before;
-        if changed {
+        if !ids.is_empty() {
             self.bump_mutations();
         }
-        changed
+        ids
     }
 
     /// Drop an image's placements, or just one when `placement_id` is nonzero.
-    pub(crate) fn unplace_image(&mut self, image_id: u32, placement_id: u32) -> bool {
+    pub(crate) fn unplace_image(&mut self, image_id: u32, placement_id: u32) -> Vec<u32> {
         self.unplace_where(|q| {
             q.image_id == image_id && (placement_id == 0 || q.placement_id == placement_id)
-        })
-    }
-
-    /// Drop the placements any part of which is on screen (`a=d,d=a`),
-    /// leaving those wholly in scrollback.
-    pub(crate) fn unplace_visible(&mut self) -> bool {
-        let first_visible = self.evicted + self.scrollback_len() as u64;
-        let last = first_visible + self.rows as u64;
-        self.unplace_where(|q| {
-            let rows = q.geometry.cells().1 as u64;
-            q.abs_row < last && q.abs_row + rows > first_visible
         })
     }
 
@@ -2545,6 +2500,7 @@ mod tests {
         let mut grid = Grid::new(4, 8, GridConfig::default());
         let mut cursor = Cursor::default();
         let (mut stashed_grid, mut stashed_cursor, mut spare) = (None, None, None);
+        let mut alt_images = crate::graphics::image::ImageStore::default();
 
         macro_rules! swap {
             ($m:ident) => {{
@@ -2555,6 +2511,7 @@ mod tests {
                     stashed_cursor: &mut stashed_cursor,
                     spare: &mut spare,
                     reuse: true,
+                    alt_images: &mut alt_images,
                 }
                 .$m(true);
             }};
@@ -2858,7 +2815,7 @@ mod placement_refusal_tests {
         const MIB: usize = 1024 * 1024;
         let mut g = Grid::new(10, 20, GridConfig::default());
         for id in 1..=7u32 {
-            assert!(g.place(at(id, 4 * MIB)), "setup placement {id} refused");
+            assert!(g.put(at(id, 4 * MIB)), "setup placement {id} refused");
         }
         assert_eq!(g.placements().len(), 7);
 
@@ -2866,7 +2823,10 @@ mod placement_refusal_tests {
         // Frees id=7's 4 MiB, leaving 24 MiB, then asks for 10 more: past the
         // 32 MiB ceiling, so the replacement is refused.
         assert!(
-            !g.place(at(7, 10 * MIB)),
+            {
+                g.unplace_image(7, 0);
+                !g.put(at(7, 10 * MIB))
+            },
             "the cap should have refused this"
         );
         assert_eq!(

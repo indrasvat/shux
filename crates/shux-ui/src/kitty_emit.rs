@@ -185,10 +185,13 @@ fn resolve(p: &ComposedPlacement) -> Option<Placed> {
         return None;
     }
     let crop = p.geometry.crop;
+    // The start rounds down and the end up, so a visible slice of an upscaled
+    // picture never maps to an empty source.
     let to_src = |v: u64, extent: u32, dest: u64| (v * u64::from(extent) / dest) as u32;
+    let to_src_end = |v: u64, extent: u32, dest: u64| (v * u64::from(extent)).div_ceil(dest) as u32;
     let y = crop.y + to_src(vy0, crop.h, dest_h);
-    let h = to_src(vy1, crop.h, dest_h) - to_src(vy0, crop.h, dest_h);
-    let w = to_src(vx1, crop.w, dest_w);
+    let h = to_src_end(vy1, crop.h, dest_h) - to_src(vy0, crop.h, dest_h);
+    let w = to_src_end(vx1, crop.w, dest_w);
     if w == 0 || h == 0 {
         return None;
     }

@@ -262,8 +262,8 @@ pub struct VtHandler<'a> {
     pub(crate) reuse_retired_grids: bool,
     /// OSC 7501 state; framing lives in `program_status`, RIS lives here.
     pub(crate) program_status: &'a mut Option<crate::program_status::VtProgramStatus>,
-    /// Transmitted kitty images; RIS empties it.
-    pub(crate) image_store: &'a mut crate::graphics::image::ImageStore,
+    /// Each screen's transmitted kitty images; RIS empties both.
+    pub(crate) image_stores: &'a mut [crate::graphics::image::ImageStore; 2],
 }
 
 impl<'a> VtHandler<'a> {
@@ -277,6 +277,7 @@ impl<'a> VtHandler<'a> {
             stashed_cursor: self.alt_cursor,
             spare: self.alt_spare,
             reuse: self.reuse_retired_grids,
+            alt_images: &mut self.image_stores[1],
         }
     }
 
@@ -1814,7 +1815,7 @@ impl<'a> vte::Perform for VtHandler<'a> {
                 // string sequence first. See
                 // `a_ris_does_not_swallow_an_apc_that_starts_after_it_in_the_same_read`.
                 self.grid.unplace_all();
-                self.image_store.clear();
+                self.image_stores.iter_mut().for_each(|s| s.clear());
                 self.reset_charsets();
                 self.tab_stops.reset(self.grid.cols());
                 self.scroll_region.top = 0;
@@ -2575,7 +2576,7 @@ mod tests {
         /// to produce from bytes.
         fn with_handler<R>(&mut self, f: impl FnOnce(&mut VtHandler<'_>, &mut VtParser) -> R) -> R {
             let mut palette_overridden = false;
-            let mut image_store = Default::default();
+            let mut image_stores = Default::default();
             let mut handler = VtHandler {
                 grid: Presented::new(&mut self.grid, &mut self.frozen_grid, &self.sync_armed),
                 cursor: Presented::new(&mut self.cursor, &mut self.frozen_cursor, &self.sync_armed),
@@ -2602,7 +2603,7 @@ mod tests {
                 alt_spare: &mut self.alt_spare,
                 reuse_retired_grids: true,
                 program_status: &mut None,
-                image_store: &mut image_store,
+                image_stores: &mut image_stores,
             };
             f(&mut handler, &mut self.parser)
         }

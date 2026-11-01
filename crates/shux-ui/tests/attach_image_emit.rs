@@ -565,3 +565,41 @@ fn a_letterboxed_put_sends_only_the_cells_its_picture_covers() {
     let cmd = emitted("a=p,i=5,c=6,r=4", 9, 38);
     assert!(cmd.contains("y=0,w=9,h=38,c=2,r=4"), "{cmd}");
 }
+
+/// An upscaled picture clipped above and below still sends a source of at
+/// least one pixel row: rounding both ends down sent nothing at all.
+#[test]
+fn a_clipped_upscaled_put_still_sends_a_source_row() {
+    let p = pane(1);
+    let layout = LayoutNode::leaf(p);
+    // A grid far taller than its two-row pane; the view follows the cursor.
+    let mut vt = VirtualTerminal::new(30, 20);
+    vt.process(b"\x1b[11;1H");
+    // 1x2 px fitted to 10 columns: 90x180 px, about ten rows from row 10.
+    vt.process(&transmit_then_put(5, 1, 2, "a=p,i=5,c=10,r=30,C=1"));
+    vt.process(b"\x1b[13;1H");
+    let mut vts = HashMap::new();
+    vts.insert(p, &vt);
+    let mut c = make_compositor(20, 2);
+    c.render_multi_pane(frame(&layout, &vts, p)).unwrap();
+    let cmds = graphics(&drain(&mut c));
+    assert_eq!(cmds.len(), 1, "the visible part was not sent: {cmds:?}");
+}
+
+/// The same for the right edge: one visible column of a 1x1 picture blown up
+/// to ten is still sent.
+#[test]
+fn a_right_clipped_upscaled_put_still_sends_a_source_column() {
+    let p = pane(1);
+    let layout = LayoutNode::leaf(p);
+    let mut vt = VirtualTerminal::new(10, 20);
+    vt.process(b"\x1b[1;20H");
+    vt.process(&transmit_then_put(5, 1, 1, "a=p,i=5,c=10,r=10,C=1"));
+    let mut vts = HashMap::new();
+    vts.insert(p, &vt);
+    let mut c = make_compositor(20, 10);
+    c.render_multi_pane(frame(&layout, &vts, p)).unwrap();
+    let cmds = graphics(&drain(&mut c));
+    assert_eq!(cmds.len(), 1, "the visible column was not sent: {cmds:?}");
+    assert!(cmds[0].contains("w=1,"), "{}", cmds[0]);
+}

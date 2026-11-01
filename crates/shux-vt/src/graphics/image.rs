@@ -110,7 +110,7 @@ pub(crate) struct ImageStore {
 
 impl ImageStore {
     pub(crate) fn insert(&mut self, id: u32, image: std::sync::Arc<StoredImage>) {
-        self.remove(id);
+        self.retain(|k| k != id);
         self.bytes += image.payload.len();
         self.images.push_back((id, image));
         while self.images.len() > MAX_STORED_IMAGES || self.bytes > MAX_IMAGE_BYTES {
@@ -128,10 +128,6 @@ impl ImageStore {
         let image = entry.1.clone();
         self.images.push_back(entry);
         Some(image)
-    }
-
-    pub(crate) fn remove(&mut self, id: u32) {
-        self.retain(|k| k != id);
     }
 
     pub(crate) fn retain(&mut self, mut keep: impl FnMut(u32) -> bool) {

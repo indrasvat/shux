@@ -47,6 +47,8 @@ pub(crate) struct ScreenSwap<'a> {
     /// differential tests run a second terminal with it `false` so the
     /// recycling path can be compared against the allocate-every-time one.
     pub reuse: bool,
+    /// The alternate screen's images: emptied on the way in and out.
+    pub alt_images: &'a mut crate::graphics::image::ImageStore,
 }
 
 impl ScreenSwap<'_> {
@@ -57,6 +59,7 @@ impl ScreenSwap<'_> {
     /// primary cursor and starts the alternate screen at home, `1047` carries
     /// the cursor across untouched.
     pub(crate) fn enter(&mut self, save_cursor: bool) {
+        self.alt_images.clear();
         let rows = self.grid.rows();
         let cols = self.grid.cols();
         let config = alt_grid_config();
@@ -119,6 +122,7 @@ impl ScreenSwap<'_> {
     /// `restore_cursor` is the `1047`/`1049` distinction again: only `1049`
     /// parked a cursor to put back.
     pub(crate) fn leave(&mut self, restore_cursor: bool) {
+        self.alt_images.clear();
         if let Some(primary) = self.stashed_grid.take() {
             let retired = std::mem::replace(self.grid, primary);
             self.grid.mark_all_dirty();

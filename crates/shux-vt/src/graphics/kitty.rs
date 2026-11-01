@@ -123,9 +123,6 @@ pub(crate) struct Command {
     pub(crate) height: u32,
     /// `C=1`: do not move the cursor after placing.
     pub(crate) no_cursor_move: bool,
-    /// `I=`: an image number. Numbers are not unique, so a put or a delete
-    /// that names one cannot be resolved without kitty's id assignment.
-    pub(crate) image_number: u32,
     /// `p=`: placement id; 0 means a placement no later command can address.
     pub(crate) placement_id: u32,
     /// `x=,y=,w=,h=`: source rectangle in pixels; a 0 width or height runs to
@@ -136,6 +133,8 @@ pub(crate) struct Command {
     pub(crate) rows: u32,
     /// `d=`: what a delete targets, or 0 for the default (`a`).
     pub(crate) delete: u8,
+    /// `z=`: z-index, signed. shux draws every placement at 0.
+    pub(crate) z: i32,
 }
 
 /// Why a command was refused. No reply is ever built from it -- see
@@ -218,6 +217,7 @@ pub(crate) fn parse(command: &[u8]) -> Result<Command, Rejection> {
     let mut transport = Transport::Direct;
     let mut malformed = false;
     let mut virtual_placement = false;
+    let mut image_number = 0;
     let mut cmd = Command::default();
 
     // Read an unsigned key into `slot`, discarding the whole command on a bad
@@ -239,13 +239,20 @@ pub(crate) fn parse(command: &[u8]) -> Result<Command, Rejection> {
                 None => malformed = true,
             },
             b'i' => uint!(cmd.image_id, value),
-            b'I' => uint!(cmd.image_number, value),
+            b'I' => uint!(image_number, value),
             b'p' => uint!(cmd.placement_id, value),
             b'x' => uint!(cmd.src[0], value),
             b'y' => uint!(cmd.src[1], value),
             b'w' => uint!(cmd.src[2], value),
             b'h' => uint!(cmd.src[3], value),
             b'c' => uint!(cmd.cols, value),
+            b'z' => match value.strip_prefix(b"-").map_or_else(
+                || number(value).and_then(|n| i32::try_from(n).ok()),
+                |n| number(n).and_then(|n| i32::try_from(i64::from(n).wrapping_neg()).ok()),
+            ) {
+                Some(z) => cmd.z = z,
+                None => malformed = true,
+            },
             b'r' => uint!(cmd.rows, value),
             b'd' => match value {
                 [t] if b"aAiIpPcCnNqQxXyYzZrRfF".contains(t) => cmd.delete = *t,
@@ -290,7 +297,7 @@ pub(crate) fn parse(command: &[u8]) -> Result<Command, Rejection> {
         return Err(Rejection::Malformed);
     }
 
-    if cmd.image_id != 0 && cmd.image_number != 0 {
+    if cmd.image_id != 0 && image_number != 0 {
         return Err(Rejection::BothIdAndNumber);
     }
 

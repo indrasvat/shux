@@ -35,12 +35,6 @@ fn drawn(put: &str) -> (usize, usize) {
 }
 
 #[test]
-fn a_put_draws_the_whole_image_by_default() {
-    let (red, blue) = drawn("a=p,i=1");
-    assert!(red > 50 && blue > 50, "red {red}, blue {blue}");
-}
-
-#[test]
 fn a_put_draws_only_its_crop() {
     let (red, blue) = drawn("a=p,i=1,y=19,h=19");
     assert_eq!(red, 0, "the cropped-away half was drawn");
@@ -54,6 +48,10 @@ fn a_put_draws_only_its_crop() {
 fn a_put_fits_its_crop_into_the_cells_asked_for() {
     let (red, blue) = drawn("a=p,i=1");
     let (big_red, big_blue) = drawn("a=p,i=1,c=4,r=4");
+    assert!(
+        red > 50 && blue > 50,
+        "at its own size: red {red}, blue {blue}"
+    );
     let (natural, scaled) = (red + blue, big_red + big_blue);
     assert!(
         scaled > natural * 3 && scaled < natural * 5,
@@ -63,4 +61,16 @@ fn a_put_fits_its_crop_into_the_cells_asked_for() {
         big_red > big_blue / 2 && big_blue > big_red / 2,
         "aspect lost"
     );
+}
+
+/// A PNG's declared size is unchecked until it is decoded; absurd dimensions
+/// must be refused there, not overflow the budget arithmetic before it.
+#[test]
+fn an_absurdly_sized_put_renders_without_panicking() {
+    let mut vt = VirtualTerminal::new(10, 20);
+    vt.process(b"\x1b_Ga=t,f=100,s=4294967295,v=4294967295,i=1;iVBORw0KGgo=\x1b\\");
+    vt.process(b"\x1b_Ga=p,i=1\x1b\\\x1b_Ga=p,i=1,c=20,r=10\x1b\\");
+    assert_eq!(vt.grid().placements().len(), 2);
+    let r = Rasterizer::new(14.0).expect("rasterizer");
+    let _ = r.render(vt.grid(), &RasterOptions::default());
 }
