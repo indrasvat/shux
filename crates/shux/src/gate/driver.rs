@@ -254,6 +254,31 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
     if let Some(code) = refuse_shared_outputs(&opts, explicit_cast(&opts)) {
         return Ok(code);
     }
+    // The trace and report are output, never goldens: one written into the golden tree
+    // replaces a golden, and the run then reports the damage as a regression. Without
+    // `--golden-dir`, every default golden dir sits under `<scenario dir>/goldens`.
+    let goldens = opts
+        .golden_dir
+        .clone()
+        .unwrap_or_else(|| runner::scenario_dir_of(&opts.scenario_path).join("goldens"));
+    for (flag, path) in [
+        ("--trace", opts.trace.as_deref()),
+        ("--report", opts.report.as_deref()),
+    ] {
+        if let Some(path) = path.filter(|p| *p != "-").map(Path::new)
+            && path_is_under(path, &goldens)
+        {
+            eprintln!(
+                "{}",
+                crate::style::error(format!(
+                    "lens gate: {flag} {} is inside the golden dir {}. Write it elsewhere.",
+                    path.display(),
+                    goldens.display()
+                ))
+            );
+            return Ok(GateStatus::ScenarioError.exit_code() as i32);
+        }
+    }
     // 085: `--trace -` and a stdout JSON report both claim stdout, and the result was
     // NDJSON signals followed by the report array — unparseable, with no usage error and
     // exit 0. The report stream is promised to carry ONLY the JSON, so this is a usage
@@ -313,28 +338,6 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
         .golden_dir
         .clone()
         .unwrap_or_else(|| default_golden_dir(&opts.scenario_path, &scenario));
-
-    // The trace and report are output, never goldens: one written into the golden tree
-    // replaces a golden, and the run then reports the damage as a regression. Refused
-    // before anything writes, the report included.
-    for (flag, path) in [
-        ("--trace", opts.trace.as_deref()),
-        ("--report", opts.report.as_deref()),
-    ] {
-        if let Some(path) = path.filter(|p| *p != "-").map(Path::new)
-            && path_is_under(path, &golden_dir)
-        {
-            eprintln!(
-                "{}",
-                crate::style::error(format!(
-                    "lens gate: {flag} {} is inside the golden dir {}. Write it elsewhere.",
-                    path.display(),
-                    golden_dir.display()
-                ))
-            );
-            return Ok(GateStatus::ScenarioError.exit_code() as i32);
-        }
-    }
 
     // A bless/create is refused in CI up front, before spawning anything (task §5/§7):
     // a golden must never be self-minted in CI. This one keeps its early return: nothing has
@@ -558,7 +561,8 @@ fn bless_failure_exit(e: &anyhow::Error, code: i32) -> i32 {
 /// trace, the report, the cast) are the same file, or one of them is where stdout or
 /// stderr already goes: one would overwrite the other. Nothing is opened or created.
 /// An existing file is compared by identity, following links; an absent one by its
-/// kernel-resolved directory and name. A link to a file that does not exist is
+/// kernel-resolved directory and name, or its absolute spelling if the directory is
+/// not made yet. A link to a file that does not exist is
 /// refused outright, since only creating its target would say where it leads. FIFOs
 /// and devices are never compared, and stdout and stderr are not compared with each
 /// other, so `> log 2>&1` stays legal.
@@ -622,7 +626,11 @@ fn refuse_shared_outputs(opts: &GateRunOptions, cast: Option<&Path>) -> Option<i
                 };
                 match std::fs::canonicalize(dir) {
                     Ok(dir) => Dest::Absent(dir.join(name)),
-                    Err(_) => continue,
+                    // A directory not made yet: compare the spelling, made absolute.
+                    Err(_) => Dest::Absent(
+                        std::env::current_dir()
+                            .map_or_else(|_| path.to_path_buf(), |d| d.join(path)),
+                    ),
                 }
             }
         };
@@ -705,6 +713,10 @@ fn resolve_cast_path(opts: &GateRunOptions, scenario_name: &str) -> Option<PathB
 /// symlinked or `.`-spelled path (e.g. macOS `/tmp` → `/private/tmp`) still compares; falls back
 /// to a lexical absolute compare when a dir does not yet exist.
 fn path_is_under(path: &Path, golden_dir: &Path) -> bool {
+    // An existing path is resolved whole, so a link outside pointing in is caught.
+    if let (Ok(g), Ok(p)) = (golden_dir.canonicalize(), path.canonicalize()) {
+        return p.starts_with(&g);
+    }
     if let (Ok(g), Some(cp)) = (
         golden_dir.canonicalize(),
         path.parent().and_then(|p| p.canonicalize().ok()),

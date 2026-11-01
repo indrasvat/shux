@@ -1599,3 +1599,82 @@ fn a_trace_or_report_inside_the_golden_dir_is_refused() {
         );
     }
 }
+
+/// The golden tree is protected before anything writes: on a malformed scenario's
+/// report path, and through a link outside the tree that points into it.
+#[test]
+fn the_golden_tree_is_protected_on_every_path() {
+    let h = Harness::new();
+    let d = tmp();
+    let g = tmp();
+    let gd = g.path().to_string_lossy().into_owned();
+    bless_golden(&h, d.path(), &gd, "gp", "GOLDPATH");
+    let golden = std::fs::read_dir(g.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.to_string_lossy().ends_with(".capture.json"))
+        .expect("blessed capture golden");
+    let before = std::fs::read(&golden).unwrap();
+
+    let bad = write_scenario(d.path(), "bad", "name = \"bad\"\nnot toml [[[\n");
+    let out = gate(
+        &h,
+        &[
+            "--report",
+            &golden.to_string_lossy(),
+            "--golden-dir",
+            &gd,
+            &bad,
+        ],
+        false,
+    );
+    assert_eq!(out.exit, 2, "stderr:\n{}", out.stderr);
+    assert_eq!(
+        std::fs::read(&golden).unwrap(),
+        before,
+        "a malformed run replaced the golden"
+    );
+
+    let link = d.path().join("outside-link.ndjson");
+    std::os::unix::fs::symlink(&golden, &link).unwrap();
+    let scn = d.path().join("gp.toml").to_string_lossy().into_owned();
+    let out = gate(
+        &h,
+        &[
+            "--trace",
+            &link.to_string_lossy(),
+            "--golden-dir",
+            &gd,
+            &scn,
+        ],
+        false,
+    );
+    assert_eq!(out.exit, 2, "stderr:\n{}", out.stderr);
+    assert!(
+        out.stderr.contains("inside the golden dir"),
+        "{}",
+        out.stderr
+    );
+    assert_eq!(
+        std::fs::read(&golden).unwrap(),
+        before,
+        "a link replaced the golden"
+    );
+}
+
+/// Two outputs named the same under a directory not made yet are still one file.
+#[test]
+fn outputs_under_a_directory_not_made_yet_are_compared() {
+    let h = Harness::new();
+    let d = tmp();
+    let scn = write_scenario(d.path(), "md", &scenario("md", "HI", None));
+    let same = d.path().join("not-made").join("out.json");
+    let same = same.to_string_lossy().into_owned();
+    let out = gate(&h, &["--report", &same, "--cast", &same, &scn], false);
+    assert_eq!(out.exit, 2, "stderr:\n{}", out.stderr);
+    assert!(out.stderr.contains("same file as"), "{}", out.stderr);
+    assert!(
+        !d.path().join("not-made").exists(),
+        "a refused run made the directory"
+    );
+}
