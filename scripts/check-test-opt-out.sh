@@ -1,11 +1,7 @@
 #!/usr/bin/env bash
-# scripts/check-test-opt-out.sh — fail if an integration test opts out of `make test`.
-#
-# A `[[test]]` declared `test = false` is skipped by `nextest run --workspace` (what
-# `make test` and CI run) and by `clippy --all-targets`. Sixteen lens suites sat
-# there, unrun by CI, long after the reason for it had gone (#245). Daemon-backed
-# suites are bounded by nextest's `daemon-pty` group instead; see
-# .config/nextest.toml.
+# scripts/check-test-opt-out.sh — fail if an integration test opts out of `make test`:
+# a `[[test]]` with `test = false` is skipped by `nextest run --workspace` and by
+# `clippy --all-targets`. Bound a daemon-backed suite with a nextest group instead.
 
 set -euo pipefail
 

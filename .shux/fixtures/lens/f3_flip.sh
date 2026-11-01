@@ -36,11 +36,7 @@ while [ "$i" -lt 79 ]; do
 	i=$((i + 1))
 done
 
-# Each frame is built once into a file, and a flip is one `cat` of it: one
-# write(2) per frame, so the whole synchronized window reaches the PTY at once.
-# Drawn row by row from the shell, a loaded machine could deschedule the
-# fixture mid-frame for longer than shux's 150 ms synchronized-output deadline,
-# which then shows the half-drawn frame by design.
+# A flip is one `cat` of a prebuilt frame: the fixture cannot stall mid-frame.
 frame_a="$(mktemp)"
 frame_b="$(mktemp)"
 trap 'rm -f "$frame_a" "$frame_b"' EXIT
