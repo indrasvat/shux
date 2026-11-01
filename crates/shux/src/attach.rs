@@ -2952,18 +2952,37 @@ async fn handle_app_mouse(
     // Resolve the pane under the pointer in the frame the client was shown: a
     // layout not drawn yet must not move a click into another pane. Views are
     // content rects, so borders, the outline and the status bar hit none.
+    // A frame no longer kept names nothing. A gesture shux owns still
+    // finishes through shux; anything else must not fall through to a border
+    // drag or a selection at today's geometry.
     let Some(views) = attached.shown.views(frame) else {
-        // A frame no longer kept names nothing; it must not fall through to a
-        // border drag or a selection at today's geometry either.
-        if action == ButtonAction::Release && matches!(*gesture, SelectionDrag::App { .. }) {
-            release_app_gesture(io_state, gesture).await;
-        }
-        return Ok(AppMouse::Consumed { redraw: false });
+        return Ok(match *gesture {
+            SelectionDrag::CopyMode | SelectionDrag::MouseSelection { .. } => AppMouse::NotHandled,
+            SelectionDrag::None if border_drag.is_some() => AppMouse::NotHandled,
+            SelectionDrag::App { .. } => {
+                if action == ButtonAction::Release {
+                    release_app_gesture(io_state, gesture).await;
+                }
+                AppMouse::Consumed { redraw: false }
+            }
+            SelectionDrag::None => AppMouse::Consumed { redraw: false },
+        });
     };
     let pane_hit = views
         .iter()
         .find(|(_, view)| holds(view.rect, col, row))
         .map(|(pid, _)| *pid);
+    let content = current_content_rect(client_size).await;
+    // A pane closed, hidden by a zoom or in another window since the frame
+    // was drawn takes nothing more: what shux would do there now is not what
+    // the user aimed at.
+    if let Some(pid) = pane_hit
+        && matches!(*gesture, SelectionDrag::None)
+        && border_drag.is_none()
+        && pane_rect_in(graph, &attached, content, viewport, pid).is_none()
+    {
+        return Ok(AppMouse::Consumed { redraw: false });
+    }
 
     // Modes are read from the pane the gesture already owns when there is one,
     // so an app that turns tracking off mid-drag still gets its release.
@@ -3013,9 +3032,6 @@ async fn handle_app_mouse(
     // The pane can lose its rect mid-gesture: a window switch or a zoom leaves
     // it off-screen. Let the app know the button came up rather than letting
     // the gesture evaporate with it still held.
-    let content = current_content_rect(client_size).await;
-    // A pane closed, hidden by a zoom or in another window since the frame
-    // was drawn takes nothing more; a gesture it held is released.
     if pane_rect_in(graph, &attached, content, viewport, pane_id).is_none() {
         release_app_gesture(io_state, gesture).await;
         return Ok(AppMouse::Consumed { redraw: false });
@@ -6333,6 +6349,71 @@ mod tests {
         s.shown.push(next, shown);
     }
 
+    /// A release whose frame is no longer kept still finishes a selection
+    /// shux owns: rejecting a stale point must not strand the gesture.
+    #[tokio::test]
+    async fn an_expired_release_still_finishes_a_shux_selection() {
+        let mut h = AppMouseHarness::new().await;
+        let _wr = seed_scrollback_pane(&h.fixture.io_state, h.fixture.first_pane, b"").await;
+        let (tx, _rx) = mpsc::channel(8);
+        assert_eq!(
+            h.send(MouseKind::Down, ProtoMouseButton::Left, 3, 3).await,
+            AppMouse::NotHandled
+        );
+        h.select(MouseKind::Down, &tx).await;
+        assert!(matches!(h.gesture, SelectionDrag::MouseSelection { .. }));
+        for _ in 0..16 {
+            ship_frame(
+                &h.fixture.graph,
+                &h.fixture.io_state,
+                &h.session,
+                &h.client_size,
+            )
+            .await;
+        }
+        if h.send_stamped(MouseKind::Up, 3, 3, Some(1)).await == AppMouse::NotHandled {
+            h.select(MouseKind::Up, &tx).await;
+        }
+        h.fixture.stop();
+        assert_eq!(
+            h.gesture,
+            SelectionDrag::None,
+            "the selection was never finished"
+        );
+    }
+
+    /// A pane closed since the frame was drawn takes the click: it must not
+    /// fall through to shux's handling at today's layout.
+    #[tokio::test]
+    async fn a_click_on_a_shown_pane_closed_since_is_consumed() {
+        let mut h = AppMouseHarness::new().await;
+        let tracking = b"\x1b[?1000h\x1b[?1006h";
+        let _a = seed_scrollback_pane(&h.fixture.io_state, h.fixture.first_pane, tracking).await;
+        let _b = seed_scrollback_pane(&h.fixture.io_state, h.fixture.second_pane, tracking).await;
+        ship_frame(
+            &h.fixture.graph,
+            &h.fixture.io_state,
+            &h.session,
+            &h.client_size,
+        )
+        .await;
+        h.fixture
+            .graph
+            .destroy_pane(h.fixture.first_pane, None)
+            .await
+            .unwrap();
+        h.fixture
+            .io_state
+            .lock()
+            .await
+            .vts
+            .remove(&h.fixture.first_pane);
+        h.session.lock().await.active_pane_id = h.fixture.second_pane;
+        let route = h.send_stamped(MouseKind::Down, 3, 3, None).await;
+        h.fixture.stop();
+        assert_eq!(route, AppMouse::Consumed { redraw: false });
+    }
+
     /// Every argument `handle_app_mouse` takes but the event itself, so the
     /// tests below read as the scenario rather than as a call.
     struct AppMouseHarness {
@@ -6394,6 +6475,55 @@ mod tests {
                 alt,
                 ctrl,
                 None,
+                &self.fixture.graph,
+                &self.fixture.io_state,
+                &self.session,
+                &self.client_size,
+                &test_config(),
+                &self.border_drag,
+                &mut self.gesture,
+            )
+            .await
+            .expect("handle_app_mouse")
+        }
+
+        /// shux's own selection handling of a left-button event at (3, 3).
+        async fn select(&mut self, kind: MouseKind, tx: &mpsc::Sender<AttachServerFrame>) {
+            handle_mouse_selection(
+                kind,
+                ProtoMouseButton::Left,
+                3,
+                3,
+                &self.fixture.graph,
+                &self.fixture.io_state,
+                &self.session,
+                &self.client_size,
+                &test_config(),
+                tx,
+                &mut self.gesture,
+            )
+            .await
+            .expect("handle_mouse_selection");
+        }
+
+        /// A left-button event stamped with `frame`, shipping no new frame:
+        /// the client is looking at whatever it was last sent.
+        async fn send_stamped(
+            &mut self,
+            kind: MouseKind,
+            col: u16,
+            row: u16,
+            frame: Option<u64>,
+        ) -> AppMouse {
+            handle_app_mouse(
+                kind,
+                ProtoMouseButton::Left,
+                col,
+                row,
+                false,
+                false,
+                false,
+                frame,
                 &self.fixture.graph,
                 &self.fixture.io_state,
                 &self.session,
