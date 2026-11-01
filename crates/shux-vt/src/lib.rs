@@ -34,7 +34,9 @@ pub use diff::{
 };
 pub use graphics::image::StoredImage;
 pub use graphics::kitty::Format as ImageFormat;
-pub use grid::{CellRect, ComposedPlacement, DirtyRegion, Grid, GridConfig, Row};
+pub use grid::{
+    CellRect, ComposedPlacement, DirtyRegion, Grid, GridConfig, ImageGeometry, PixelRect, Row,
+};
 pub use parser::{MouseMode, ScrollRegion, TerminalModes, VtHandler};
 #[cfg(any(test, fuzzing))]
 #[doc(hidden)]
@@ -559,6 +561,7 @@ impl VirtualTerminal {
             alt_spare: &mut self.alt_spare,
             reuse_retired_grids: self.reuse_retired_grids,
             program_status: &mut self.program_status,
+            image_store: &mut self.graphics.store,
         };
         self.parser.advance(&mut handler, bytes);
     }
@@ -664,18 +667,29 @@ impl VirtualTerminal {
                 let Some((image, opening)) = self.graphics.assembler.feed(&cmd, payload) else {
                     return;
                 };
-                if opening.action == Action::TransmitAndPlace {
-                    self.place_image(std::sync::Arc::new(image), &opening);
+                let image = std::sync::Arc::new(image);
+                if opening.image_id != 0 {
+                    self.graphics.store.insert(opening.image_id, image.clone());
+                }
+                match opening.action {
+                    // `place` drops the id's old placements on its way in.
+                    Action::TransmitAndPlace => self.place_image(image, &opening, false),
+                    // "The existing image and all its placements must be
+                    // deleted"; the new data waits for an `a=p`.
+                    _ if opening.image_id != 0 => {
+                        self.presented_grid().unplace_image(opening.image_id, 0);
+                    }
+                    _ => {}
                 }
             }
-            // `a=d` clears every placement whatever the target: `d=A` is the
-            // only one a real client sends. `a=p` would need an image store to
-            // place from and is a stated gap, not a refusal.
+            // An image number names the newest image transmitted under it,
+            // which only kitty's own id assignment can resolve.
+            Action::Put => match self.graphics.store.get(cmd.image_id) {
+                Some(image) if cmd.image_id != 0 => self.place_image(image, &cmd, true),
+                _ => self.graphics.refusals = self.graphics.refusals.saturating_add(1),
+            },
             Action::Delete => {
-                // Through `Presented` for the same reason `place_image` is:
-                // dropping a picture changes the presented frame.
-                sync::Presented::new(&mut self.grid, &mut self.frozen_grid, &self.sync_armed)
-                    .unplace_all();
+                self.delete_images(&cmd);
                 self.graphics.assembler.abort();
             }
             // Default `kitten icat` probes each transport and waits on a DA1
@@ -688,7 +702,40 @@ impl VirtualTerminal {
                     responses.push(format!("\x1b_Gi={};OK\x1b\\", cmd.image_id).into_bytes());
                 }
             }
-            Action::Put | Action::Animation => {}
+            Action::Animation => {}
+        }
+    }
+
+    /// The live grid, through `Presented`: a placement added or dropped
+    /// changes the presented frame, so inside a `CSI ?2026h` window it must
+    /// freeze first or it tears the redraw it landed in (issue #115).
+    fn presented_grid(&mut self) -> sync::Presented<'_, Grid> {
+        sync::Presented::new(&mut self.grid, &mut self.frozen_grid, &self.sync_armed)
+    }
+
+    /// `a=d`. Lowercase targets drop placements and keep the image data;
+    /// uppercase also frees images no placement still shows. Targets shux does
+    /// not model (cell, column, row, z-index, frame) drop every placement.
+    fn delete_images(&mut self, cmd: &graphics::kitty::Command) {
+        let target = if cmd.delete == 0 { b'a' } else { cmd.delete };
+        match target.to_ascii_lowercase() {
+            b'a' => {
+                self.presented_grid().unplace_visible();
+            }
+            b'i' if cmd.image_id != 0 => {
+                self.presented_grid()
+                    .unplace_image(cmd.image_id, cmd.placement_id);
+            }
+            // By image number: unresolvable, as for `a=p`.
+            b'i' | b'n' => {
+                self.graphics.refusals = self.graphics.refusals.saturating_add(1);
+                return;
+            }
+            _ => self.presented_grid().unplace_all(),
+        }
+        if target.is_ascii_uppercase() {
+            let grid = &self.grid;
+            self.graphics.store.retain(|id| grid.shows_image(id));
         }
     }
 
@@ -697,37 +744,52 @@ impl VirtualTerminal {
     /// kitty (`graphics.c:1315`) and Zellij (`grid.rs:3772`) do against a spec
     /// that says otherwise, and `kitten icat`'s single trailing newline only
     /// lands correctly if the terminal stopped short.
+    ///
+    /// `put` is `a=p`: it adds a placement, or replaces the one with the same
+    /// nonzero placement id. Otherwise this is `a=T`, which first drops every
+    /// placement of the image it re-transmits.
     fn place_image(
         &mut self,
         image: std::sync::Arc<graphics::image::StoredImage>,
         cmd: &graphics::kitty::Command,
+        put: bool,
     ) {
-        let (cell_w, cell_h) = DECLARED_CELL_PIXELS;
+        let max = (self.grid.cols(), self.grid.rows());
+        let Some(geometry) = grid::ImageGeometry::resolve(
+            (image.width, image.height),
+            cmd.src,
+            (cmd.cols, cmd.rows),
+            max,
+        ) else {
+            return;
+        };
         // `s=`/`v=` are unvalidated wire numbers; unclamped, `v=4294967295`
         // is 226 million `scroll_up` calls inside the pane-IO lock.
-        let cols = image.width.div_ceil(cell_w);
-        let rows = image.height.div_ceil(cell_h);
-        let (cols, rows) = (
-            cols.min(self.grid.cols() as u32) as usize,
-            rows.min(self.grid.rows() as u32) as usize,
-        );
+        let (cols, rows) = geometry.cells();
+        let (cols, rows) = (cols.min(max.0), rows.min(max.1));
         if cols == 0 || rows == 0 {
             return;
         }
 
         let abs_row =
             self.grid.evicted() + self.grid.scrollback_len() as u64 + self.cursor.row as u64;
-        // Through `Presented`, not the raw fields: a placement changes the
-        // presented frame, so inside a `CSI ?2026h` window it must freeze
-        // first or it tears the redraw it landed in (issue #115).
+        let col = self.cursor.col;
+        // Disjoint from the cursor, which moves below while this is held.
         let mut grid =
             sync::Presented::new(&mut self.grid, &mut self.frozen_grid, &self.sync_armed);
-        let placed = grid.place(grid::Placement {
+        let placement = grid::Placement {
             image,
             abs_row,
-            col: self.cursor.col,
+            col,
             image_id: cmd.image_id,
-        });
+            placement_id: cmd.placement_id,
+            geometry,
+        };
+        let placed = if put {
+            grid.put(placement)
+        } else {
+            grid.place(placement)
+        };
         if !placed {
             self.graphics.refusals = self.graphics.refusals.saturating_add(1);
             return;

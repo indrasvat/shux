@@ -234,6 +234,7 @@ pub(crate) fn resolve_placements(
             row: p.viewport_row(src) - row_offset as i64 + i64::from(rect.y),
             col: p.col + rect.x as usize,
             clip,
+            geometry: p.geometry,
         })
         .collect()
 }

@@ -262,6 +262,8 @@ pub struct VtHandler<'a> {
     pub(crate) reuse_retired_grids: bool,
     /// OSC 7501 state; framing lives in `program_status`, RIS lives here.
     pub(crate) program_status: &'a mut Option<crate::program_status::VtProgramStatus>,
+    /// Transmitted kitty images; RIS empties it.
+    pub(crate) image_store: &'a mut crate::graphics::image::ImageStore,
 }
 
 impl<'a> VtHandler<'a> {
@@ -1806,13 +1808,13 @@ impl<'a> vte::Perform for VtHandler<'a> {
                 if let Some(ps) = self.program_status.as_mut() {
                     ps.on_full_reset();
                 }
-                // When the image/placement store lands, RIS must clear it here:
-                // the graphics protocol requires that "when resetting the
-                // terminal, all images that are visible on the screen must be
-                // cleared". It must NOT clear the APC scanner: an APC cannot
-                // span a RIS, because the introducing ESC ends the string
-                // sequence first. See
+                // "When resetting the terminal, all images that are visible on
+                // the screen must be cleared." Not the APC scanner: an APC
+                // cannot span a RIS, because the introducing ESC ends the
+                // string sequence first. See
                 // `a_ris_does_not_swallow_an_apc_that_starts_after_it_in_the_same_read`.
+                self.grid.unplace_all();
+                self.image_store.clear();
                 self.reset_charsets();
                 self.tab_stops.reset(self.grid.cols());
                 self.scroll_region.top = 0;
@@ -2573,6 +2575,7 @@ mod tests {
         /// to produce from bytes.
         fn with_handler<R>(&mut self, f: impl FnOnce(&mut VtHandler<'_>, &mut VtParser) -> R) -> R {
             let mut palette_overridden = false;
+            let mut image_store = Default::default();
             let mut handler = VtHandler {
                 grid: Presented::new(&mut self.grid, &mut self.frozen_grid, &self.sync_armed),
                 cursor: Presented::new(&mut self.cursor, &mut self.frozen_cursor, &self.sync_armed),
@@ -2599,6 +2602,7 @@ mod tests {
                 alt_spare: &mut self.alt_spare,
                 reuse_retired_grids: true,
                 program_status: &mut None,
+                image_store: &mut image_store,
             };
             f(&mut handler, &mut self.parser)
         }

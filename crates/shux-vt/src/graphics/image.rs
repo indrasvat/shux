@@ -95,3 +95,93 @@ impl Assembler {
         self.open = None;
     }
 }
+
+/// Images an `a=p` may name, most recently used last.
+pub(crate) const MAX_STORED_IMAGES: usize = 64;
+
+/// Transmitted images by `i=`, for `a=p` to place later. Bounded by count and
+/// by [`MAX_IMAGE_BYTES`]; the least recently used goes first. A placement
+/// holds its own `Arc`, so evicting an image here never takes it off screen.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct ImageStore {
+    images: std::collections::VecDeque<(u32, std::sync::Arc<StoredImage>)>,
+    bytes: usize,
+}
+
+impl ImageStore {
+    pub(crate) fn insert(&mut self, id: u32, image: std::sync::Arc<StoredImage>) {
+        self.remove(id);
+        self.bytes += image.payload.len();
+        self.images.push_back((id, image));
+        while self.images.len() > MAX_STORED_IMAGES || self.bytes > MAX_IMAGE_BYTES {
+            let Some((_, gone)) = self.images.pop_front() else {
+                break;
+            };
+            self.bytes -= gone.payload.len();
+        }
+    }
+
+    /// The image under `id`, now the most recently used.
+    pub(crate) fn get(&mut self, id: u32) -> Option<std::sync::Arc<StoredImage>> {
+        let i = self.images.iter().position(|(k, _)| *k == id)?;
+        let entry = self.images.remove(i)?;
+        let image = entry.1.clone();
+        self.images.push_back(entry);
+        Some(image)
+    }
+
+    pub(crate) fn remove(&mut self, id: u32) {
+        self.retain(|k| k != id);
+    }
+
+    pub(crate) fn retain(&mut self, mut keep: impl FnMut(u32) -> bool) {
+        let mut freed = 0;
+        self.images.retain(|(k, image)| {
+            let kept = keep(*k);
+            if !kept {
+                freed += image.payload.len();
+            }
+            kept
+        });
+        self.bytes -= freed;
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.images.clear();
+        self.bytes = 0;
+    }
+}
+
+#[cfg(test)]
+mod store_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn img(bytes: usize) -> Arc<StoredImage> {
+        Arc::new(StoredImage {
+            payload: vec![0; bytes],
+            format: Format::Rgb24,
+            compressed: false,
+            width: 1,
+            height: 1,
+        })
+    }
+
+    #[test]
+    fn the_store_is_bounded_by_count_and_bytes_evicting_the_least_recently_used() {
+        let mut store = ImageStore::default();
+        for id in 1..=(MAX_STORED_IMAGES as u32 + 10) {
+            store.insert(id, img(1));
+        }
+        assert_eq!(store.images.len(), MAX_STORED_IMAGES);
+        assert!(store.get(1).is_none(), "the oldest went first");
+
+        let mut store = ImageStore::default();
+        store.insert(1, img(MAX_IMAGE_BYTES / 2));
+        store.insert(2, img(MAX_IMAGE_BYTES / 2));
+        assert!(store.get(1).is_some(), "touched, so 2 is now the oldest");
+        store.insert(3, img(MAX_IMAGE_BYTES / 2));
+        assert!(store.get(2).is_none() && store.get(1).is_some() && store.get(3).is_some());
+        assert!(store.bytes <= MAX_IMAGE_BYTES);
+    }
+}

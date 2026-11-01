@@ -30,9 +30,10 @@ const FRAME_IMAGE_BUDGET: usize = 6 * 1024 * 1024;
 struct Placed {
     row: u16,
     col: u16,
-    /// Source rectangle as `y, w, h`. No `x`: a placement can never start left
-    /// of its own clip, the same invariant `shux-raster`'s `blit` relies on.
-    src: (u32, u32, u32),
+    /// Source rectangle as `x, y, w, h`. The left edge is the placement's own
+    /// crop: a placement never starts left of its clip, the same invariant
+    /// `shux-raster`'s `blit` relies on.
+    src: (u32, u32, u32, u32),
     cells: (u16, u16),
 }
 
@@ -145,7 +146,8 @@ impl KittyEmitter {
 }
 
 /// Intersect a placement with its pane. `None` once nothing of it is left
-/// inside; rows above the clip become the source rectangle's `y`.
+/// inside. The visible part, in drawn pixels at the declared cell size, maps
+/// back through the placement's scale to the source rectangle sent.
 fn resolve(p: &ComposedPlacement) -> Option<Placed> {
     // An empty payload is placeable, and transmitting it would record a host id
     // the terminal never heard of. Judged here, so it never enters `want`.
@@ -154,8 +156,8 @@ fn resolve(p: &ComposedPlacement) -> Option<Placed> {
     }
     let (cw, ch) = DECLARED_CELL_PIXELS;
     let clip_top = p.clip.row as i64;
-    let nat_rows = p.image.height.div_ceil(ch).max(1) as i64;
-    let nat_cols = p.image.width.div_ceil(cw).max(1) as i64;
+    let (nat_cols, nat_rows) = p.geometry.cells();
+    let (nat_cols, nat_rows) = (nat_cols as i64, nat_rows as i64);
 
     let top = p.row.max(clip_top);
     let bottom = p
@@ -169,18 +171,26 @@ fn resolve(p: &ComposedPlacement) -> Option<Placed> {
         return None;
     }
 
-    let y = ((top - p.row) as u32).saturating_mul(ch);
-    let h = (rows as u32)
-        .saturating_mul(ch)
-        .min(p.image.height.saturating_sub(y));
-    let w = (cols as u32).saturating_mul(cw).min(p.image.width);
+    let (dest_w, dest_h) = p.geometry.drawn_px(cw, ch);
+    let (dest_w, dest_h) = (u64::from(dest_w), u64::from(dest_h));
+    let vy0 = (top - p.row) as u64 * u64::from(ch);
+    let vy1 = (vy0 + rows as u64 * u64::from(ch)).min(dest_h);
+    let vx1 = (cols as u64 * u64::from(cw)).min(dest_w);
+    if vy0 >= vy1 || vx1 == 0 {
+        return None;
+    }
+    let crop = p.geometry.crop;
+    let to_src = |v: u64, extent: u32, dest: u64| (v * u64::from(extent) / dest) as u32;
+    let y = crop.y + to_src(vy0, crop.h, dest_h);
+    let h = to_src(vy1, crop.h, dest_h) - to_src(vy0, crop.h, dest_h);
+    let w = to_src(vx1, crop.w, dest_w);
     if w == 0 || h == 0 {
         return None;
     }
     Some(Placed {
         row: u16::try_from(top).ok()?,
         col: u16::try_from(p.col).ok()?,
-        src: (y, w, h),
+        src: (crop.x, y, w, h),
         cells: (u16::try_from(cols).ok()?, u16::try_from(rows).ok()?),
     })
 }
@@ -195,9 +205,14 @@ fn resolve(p: &ComposedPlacement) -> Option<Placed> {
 /// z still draws above the cell BACKGROUND, so a picture is not hidden by the
 /// blank cells it covers.
 fn keys(p: &Placed) -> String {
-    let (y, w, h) = p.src;
+    let (x, y, w, h) = p.src;
     let (c, r) = p.cells;
-    format!("p=1,C=1,q=2,z=-1,y={y},w={w},h={h},c={c},r={r}")
+    let x = if x == 0 {
+        String::new()
+    } else {
+        format!("x={x},")
+    };
+    format!("p=1,C=1,q=2,z=-1,{x}y={y},w={w},h={h},c={c},r={r}")
 }
 
 fn cup(out: &mut impl Write, p: &Placed) -> io::Result<()> {

@@ -15,6 +15,8 @@ pub(crate) struct GraphicsSink {
     pub(crate) refusals: u64,
     /// One chunked transmission in flight.
     pub(crate) assembler: image::Assembler,
+    /// Transmitted images an `a=p` may place.
+    pub(crate) store: image::ImageStore,
     /// Every command that reached the dispatcher. Test-only: the dispatcher
     /// has no other visible output, so a public-API test alone would pass on a
     /// build that dropped them all.

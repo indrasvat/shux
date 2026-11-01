@@ -516,3 +516,42 @@ fn a_picture_in_a_grid_taller_than_its_pane_moves_with_its_text() {
     // Grid row 15 (0-based) at offset 14 is screen row 1, CUP row 2.
     assert_eq!(row, 2, "picture placed at screen row {row}: {cup:?}");
 }
+
+/// `a=t` of a `w` x `h` RGB image under `i=id`, then the given `a=p`.
+fn transmit_then_put(id: u32, w: u32, h: u32, put: &str) -> Vec<u8> {
+    use base64::Engine as _;
+    let px = vec![120u8; (w * h * 3) as usize];
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&px);
+    let mut out = format!("\x1b_Ga=t,f=24,s={w},v={h},i={id};{b64}\x1b\\").into_bytes();
+    out.extend_from_slice(format!("\x1b_G{put}\x1b\\").as_bytes());
+    out
+}
+
+fn emitted(put: &str, w: u32, h: u32) -> String {
+    let p = pane(1);
+    let layout = LayoutNode::leaf(p);
+    let mut vt = VirtualTerminal::new(10, 20);
+    vt.process(&transmit_then_put(5, w, h, put));
+    let mut vts = HashMap::new();
+    vts.insert(p, &vt);
+    let mut c = make_compositor(20, 10);
+    c.render_multi_pane(frame(&layout, &vts, p)).unwrap();
+    let cmds = graphics(&drain(&mut c));
+    assert_eq!(cmds.len(), 1, "{cmds:?}");
+    cmds[0].clone()
+}
+
+/// A put's crop is the part of the image the host is told to show.
+#[test]
+fn a_cropped_put_sends_its_crop_as_the_source_rectangle() {
+    let cmd = emitted("a=p,i=5,x=9,y=38,w=9,h=38", 18, 190);
+    assert!(cmd.contains("x=9,y=38,w=9,h=38,c=1,r=2"), "{cmd}");
+}
+
+/// A put fitted to cells is sent as the cells it covers and the source that
+/// fills them; the host does the scaling.
+#[test]
+fn a_scaled_put_sends_its_cells_and_the_source_that_fills_them() {
+    let cmd = emitted("a=p,i=5,c=4", 18, 38);
+    assert!(cmd.contains("y=0,w=18,h=38,c=4,r=4"), "{cmd}");
+}

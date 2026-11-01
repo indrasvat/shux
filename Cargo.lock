@@ -1315,6 +1315,7 @@ dependencies = [
 name = "shux-raster"
 version = "0.54.14"
 dependencies = [
+ "base64",
  "flate2",
  "fontdue",
  "image",
