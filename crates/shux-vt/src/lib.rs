@@ -2127,9 +2127,10 @@ mod tests {
     // Issue #115: a window cannot be held open for ever
     // -----------------------------------------------------------------
 
-    /// Parsed late is not sent late: a busy daemon must not tear a frame the pane finished.
+    /// Parsed late is not sent late: a batch parsed past the deadline must not tear a
+    /// frame the pane finished. Only the sweep releases a window on time.
     #[test]
-    fn a_late_batch_never_releases_a_window_on_time() {
+    fn a_sync_window_is_released_once_it_outlives_its_deadline() {
         let clock = test_clock::Frozen::new();
         let mut vt = VirtualTerminal::new(3, 10);
         vt.process(b"before");
@@ -2143,12 +2144,37 @@ mod tests {
             "before",
             "a late batch must not show the half-drawn frame"
         );
-        vt.process(b"\x1b[?2026l");
-        assert_eq!(compact_capture(&vt), "after");
+        assert!(vt.release_expired_sync(), "the sweep releases it");
+        assert!(compact_capture(&vt).starts_with("after"));
     }
 
-    /// A pane that opened a window and stopped — killed mid-redraw — is
-    /// released by the sweep once the window outlives its deadline.
+    /// Parsing reads no clock, so two terminals fed the same bytes in turn agree
+    /// however long passes between them; only a sweep past the deadline parts them.
+    #[test]
+    fn the_sync_deadline_is_what_two_terminals_fed_in_turn_can_disagree_on() {
+        for swept in [true, false] {
+            let clock = test_clock::Frozen::new();
+            let (mut first, mut second) =
+                (VirtualTerminal::new(3, 10), VirtualTerminal::new(3, 10));
+            for vt in [&mut first, &mut second] {
+                vt.process(b"before\x1b[?2026h\x1b[1;1Hafter   ");
+            }
+            first.process(b"!");
+            clock.advance_ms(SYNC_UPDATE_TIMEOUT_MS);
+            second.process(b"!");
+            if swept {
+                second.release_expired_sync();
+            }
+            assert_eq!(
+                compact_capture(&first) != compact_capture(&second),
+                swept,
+                "swept {swept}: {:?} vs {:?}",
+                compact_capture(&first),
+                compact_capture(&second)
+            );
+        }
+    }
+
     #[test]
     fn a_silent_pane_holding_a_sync_window_is_swept() {
         let clock = test_clock::Frozen::new();
