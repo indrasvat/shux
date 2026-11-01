@@ -229,6 +229,11 @@ where
         bindings = next;
     }
     send_prefix(&mut sink, &keys.0).await;
+    // A resize that landed before the signal watch saw it still converges.
+    report_size(&mut sink, &mut last_size).await?;
+    // Backstop for a size change no signal announced.
+    let mut size_check = tokio::time::interval(Duration::from_secs(5));
+    size_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // Spawn input reader: poll crossterm events on a blocking thread,
     // forward via channel.
@@ -444,6 +449,7 @@ where
             }
 
             _ = resized.recv() => report_size(&mut sink, &mut last_size).await?,
+            _ = size_check.tick() => report_size(&mut sink, &mut last_size).await?,
         }
     }
 }
@@ -453,14 +459,14 @@ where
 async fn report_size<K>(sink: &mut K, last_size: &mut (u16, u16)) -> Result<()>
 where
     K: futures::Sink<Bytes> + Unpin,
+    K::Error: std::error::Error + Send + Sync + 'static,
 {
-    if let Ok(size) = TerminalGuard::size()
-        && size != *last_size
-    {
-        *last_size = size;
+    let size = TerminalGuard::size().context("terminal size")?;
+    if size != *last_size {
         let (cols, rows) = size;
         let frame = serde_json::to_vec(&AttachClientFrame::Resize { cols, rows })?;
-        sink.send(Bytes::from(frame)).await.ok();
+        sink.send(Bytes::from(frame)).await.context("send resize")?;
+        *last_size = size;
     }
     Ok(())
 }

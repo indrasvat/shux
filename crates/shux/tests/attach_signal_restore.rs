@@ -685,4 +685,29 @@ async fn a_resize_during_the_handshake_reaches_the_daemon() {
             break;
         }
     }
+
+    // Two resizes back to back once running: the last one is what sticks.
+    for (cols, rows) in [(130, 45), (140, 50)] {
+        let size = nix::pty::Winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: TIOCSWINSZ only reads `size`, which outlives the call.
+        let rc = unsafe { libc::ioctl(client.master.as_raw_fd(), libc::TIOCSWINSZ, &size) };
+        assert_eq!(rc, 0, "TIOCSWINSZ: {}", std::io::Error::last_os_error());
+    }
+    loop {
+        let frame = tokio::time::timeout_at(deadline, framed.next())
+            .await
+            .expect("the client never reported its final size")
+            .expect("the client hung up")
+            .expect("read frame");
+        if let Ok(AttachClientFrame::Resize { cols, rows }) = serde_json::from_slice(&frame)
+            && (cols, rows) == (140, 50)
+        {
+            break;
+        }
+    }
 }
