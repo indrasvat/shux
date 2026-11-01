@@ -181,6 +181,9 @@ proptest! {
         let mut recycling = VirtualTerminal::new(8, 24);
         let mut reference = VirtualTerminal::new(8, 24);
         reference.set_retired_grid_reuse(false);
+        // Fed in turn, the two must not see different clocks.
+        recycling.set_sync_deadline(false);
+        reference.set_sync_deadline(false);
 
         for (step, op) in ops.iter().enumerate() {
             let dirty_recycling = apply(&mut recycling, op);

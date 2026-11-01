@@ -24,6 +24,7 @@ tracing = { workspace = true }
 # needs neither: the crate turns a `Grid<Cell>` into a PNG and serializes nothing.
 # The example harnesses still emit JSON reports, which is what dev-dependencies are for.
 [dev-dependencies]
+base64 = "0.22"
 tempfile = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -465,6 +465,122 @@ pub struct CellRect {
     pub rows: usize,
 }
 
+/// A rectangle of an image's own pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PixelRect {
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+}
+
+/// Which part of an image a placement shows, and at what size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageGeometry {
+    /// Inside the image, never empty.
+    pub crop: PixelRect,
+    /// Cells the crop is fitted into with its aspect kept, anchored top-left;
+    /// `None` draws it at its own size.
+    pub display: Option<(usize, usize)>,
+}
+
+impl ImageGeometry {
+    /// The whole image at its own size.
+    #[cfg(test)]
+    pub(crate) fn full(width: u32, height: u32) -> Self {
+        Self {
+            crop: PixelRect {
+                x: 0,
+                y: 0,
+                w: width,
+                h: height,
+            },
+            display: None,
+        }
+    }
+
+    /// From a placement's `x,y,w,h` and `c,r` keys: the crop is their
+    /// intersection with the image, and a missing `c` or `r` follows the
+    /// crop's aspect. `None` when the crop leaves nothing. The display box is
+    /// capped at `max` cells, the pane, so a tiny payload cannot ask for an
+    /// unbounded bitmap.
+    pub(crate) fn resolve(
+        (width, height): (u32, u32),
+        [x, y, w, h]: [u32; 4],
+        (cols, rows): (u32, u32),
+        max: (usize, usize),
+    ) -> Option<Self> {
+        if x >= width || y >= height {
+            return None;
+        }
+        let w = if w == 0 { width - x } else { w.min(width - x) };
+        let h = if h == 0 {
+            height - y
+        } else {
+            h.min(height - y)
+        };
+        let crop = PixelRect { x, y, w, h };
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let (dw, dh) = (
+            u128::from(crate::DECLARED_CELL_PIXELS.0),
+            u128::from(crate::DECLARED_CELL_PIXELS.1),
+        );
+        // Capped before the aspect arithmetic, which then cannot overflow.
+        let cap = |n: u32, max: usize| u128::from(n).min(max.max(1) as u128);
+        let (c, r) = (cap(cols, max.0), cap(rows, max.1));
+        let (w128, h128) = (u128::from(w), u128::from(h));
+        let display = match (c, r) {
+            (0, 0) => None,
+            (c, 0) => Some((c, (c * dw * h128).div_ceil(w128 * dh))),
+            (0, r) => Some(((r * dh * w128).div_ceil(h128 * dw), r)),
+            (c, r) => Some((c, r)),
+        }
+        .map(|(c, r)| {
+            (
+                (c as usize).clamp(1, max.0.max(1)),
+                (r as usize).clamp(1, max.1.max(1)),
+            )
+        });
+        Some(Self { crop, display })
+    }
+
+    /// Cells the placement covers: its display box, or the crop at the
+    /// declared cell size.
+    pub fn cells(&self) -> (usize, usize) {
+        let (dw, dh) = crate::DECLARED_CELL_PIXELS;
+        self.display.unwrap_or((
+            self.crop.w.div_ceil(dw).max(1) as usize,
+            self.crop.h.div_ceil(dh).max(1) as usize,
+        ))
+    }
+
+    /// The drawn size in pixels for cells of `cell_w` x `cell_h`.
+    pub fn drawn_px(&self, cell_w: u32, cell_h: u32) -> (u32, u32) {
+        let (dw, dh) = crate::DECLARED_CELL_PIXELS;
+        let (w, h) = (u64::from(self.crop.w), u64::from(self.crop.h));
+        let Some((cols, rows)) = self.display else {
+            // The client sized its bitmap against the declared cell box.
+            let scale = |px: u64, cell: u32, declared: u32| {
+                let px = (px * u64::from(cell) / u64::from(declared.max(1))).max(1);
+                u32::try_from(px).unwrap_or(u32::MAX)
+            };
+            return (scale(w, cell_w, dw), scale(h, cell_h, dh));
+        };
+        let (bw, bh) = (
+            cols as u64 * u64::from(cell_w),
+            rows as u64 * u64::from(cell_h),
+        );
+        // Fit: the tighter of the two scales, so neither side overflows its box.
+        if w * bh <= h * bw {
+            ((w * bh / h).clamp(1, bw.max(1)) as u32, bh.max(1) as u32)
+        } else {
+            (bw.max(1) as u32, (h * bw / w).clamp(1, bh.max(1)) as u32)
+        }
+    }
+}
+
 /// A placement resolved into a composed multi-pane frame.
 ///
 /// Separate from [`Placement`] because a composed frame numbers rows from zero,
@@ -479,6 +595,7 @@ pub struct ComposedPlacement {
     pub row: i64,
     pub col: usize,
     pub clip: CellRect,
+    pub geometry: ImageGeometry,
 }
 
 /// A picture placed in this grid, anchored to an absolute line.
@@ -492,8 +609,13 @@ pub struct Placement {
     pub abs_row: u64,
     pub col: usize,
     /// The client's `i=`, or 0 for none. Re-transmitting an id replaces that
-    /// image and its placements, so this is the identity `place` matches on.
+    /// image and its placements, so this is the identity `put` matches on.
     pub image_id: u32,
+    /// The client's `p=`, or 0 for a placement nothing can address again.
+    pub placement_id: u32,
+    /// The client's `z=`: drawing ignores it, a z-index delete matches it.
+    pub z: i32,
+    pub geometry: ImageGeometry,
 }
 
 impl Placement {
@@ -570,45 +692,71 @@ impl Grid {
         &self.placements
     }
 
-    /// Add a placement, refusing past either cap. A pane can emit unbounded
-    /// `a=T`, and a tiny image charges almost no bytes while still costing a
-    /// pass per snapshot, so neither cap alone suffices.
-    pub(crate) fn place(&mut self, p: Placement) -> bool {
+    /// Add a placement, or replace the one with the same image and nonzero
+    /// placement id where it stands. Refused past either cap: a pane can emit
+    /// unbounded `a=T`, and a tiny image charges almost no bytes while still
+    /// costing a pass per snapshot, so neither cap alone suffices.
+    pub(crate) fn put(&mut self, p: Placement) -> bool {
         self.prune_evicted_placements();
-        // "The existing image and all its placements are deleted; the new data
-        // replaces the old." An app that redraws under one id would otherwise
-        // spend a slot per frame -- terminal-browser sends `i=1` on every one.
-        let mut freed_a_placement = false;
-        if p.image_id != 0 {
-            let id = p.image_id;
-            let freed: usize = self
-                .placements
-                .iter()
-                .filter(|q| q.image_id == id)
-                .map(|q| q.image.payload.len())
-                .sum();
-            let before = self.placements.len();
-            self.placements.retain(|q| q.image_id != id);
-            freed_a_placement = self.placements.len() != before;
-            self.placed_bytes = self.placed_bytes.saturating_sub(freed);
-        }
-        let cost = p.image.payload.len();
-        if self.placements.len() >= MAX_PLACEMENTS
-            || self.placed_bytes + cost > crate::graphics::image::MAX_IMAGE_BYTES
-        {
-            // The old picture is gone either way, so a refused replacement is
-            // still a change to the grid. `content_revision` is what
-            // `wait-settled` and `pane diff --since` read to decide a pane is
-            // quiet, and it must not say nothing happened.
-            if freed_a_placement {
-                self.bump_mutations();
+        let same = |q: &Placement| {
+            p.image_id != 0
+                && p.placement_id != 0
+                && q.image_id == p.image_id
+                && q.placement_id == p.placement_id
+        };
+        if let Some(i) = self.placements.iter().position(same) {
+            let rest = self
+                .placed_bytes
+                .saturating_sub(self.placements[i].image.payload.len());
+            if rest + p.image.payload.len() > crate::graphics::image::MAX_IMAGE_BYTES {
+                return false;
             }
+            self.placed_bytes = rest + p.image.payload.len();
+            self.placements[i] = p;
+            self.bump_mutations();
+            return true;
+        }
+        if self.placements.len() >= MAX_PLACEMENTS
+            || self.placed_bytes + p.image.payload.len() > crate::graphics::image::MAX_IMAGE_BYTES
+        {
             return false;
         }
-        self.placed_bytes += cost;
+        self.placed_bytes += p.image.payload.len();
         self.placements.push(p);
         self.bump_mutations();
         true
+    }
+
+    /// Drop the placements `gone` picks, recording the change; returns the
+    /// image ids it dropped.
+    pub(crate) fn unplace_where(&mut self, gone: impl Fn(&Placement) -> bool) -> Vec<u32> {
+        let mut freed = 0usize;
+        let mut ids = Vec::new();
+        self.placements.retain(|q| {
+            let drop = gone(q);
+            if drop {
+                freed += q.image.payload.len();
+                ids.push(q.image_id);
+            }
+            !drop
+        });
+        self.placed_bytes = self.placed_bytes.saturating_sub(freed);
+        if !ids.is_empty() {
+            self.bump_mutations();
+        }
+        ids
+    }
+
+    /// Drop an image's placements, or just one when `placement_id` is nonzero.
+    pub(crate) fn unplace_image(&mut self, image_id: u32, placement_id: u32) -> Vec<u32> {
+        self.unplace_where(|q| {
+            q.image_id == image_id && (placement_id == 0 || q.placement_id == placement_id)
+        })
+    }
+
+    /// Whether any placement shows image `id`.
+    pub(crate) fn shows_image(&self, id: u32) -> bool {
+        self.placements.iter().any(|q| q.image_id == id)
     }
 
     /// Drop placements whose last row has fallen off the front of the grid.
@@ -620,10 +768,9 @@ impl Grid {
     /// reach of scrollback.
     fn prune_evicted_placements(&mut self) {
         let evicted = self.evicted;
-        let cell_h = u64::from(crate::DECLARED_CELL_PIXELS.1.max(1));
         let mut freed = 0usize;
         self.placements.retain(|p| {
-            let rows = u64::from(p.image.height).div_ceil(cell_h).max(1);
+            let rows = p.geometry.cells().1 as u64;
             let live = p.abs_row.saturating_add(rows) > evicted;
             if !live {
                 freed += p.image.payload.len();
@@ -633,7 +780,7 @@ impl Grid {
         self.placed_bytes = self.placed_bytes.saturating_sub(freed);
     }
 
-    /// Drop every placement -- `a=d,d=A`, the only target a real client sends.
+    /// Drop every placement, as RIS does.
     pub(crate) fn unplace_all(&mut self) {
         if self.placements.is_empty() {
             return;
@@ -2355,6 +2502,7 @@ mod tests {
         let mut grid = Grid::new(4, 8, GridConfig::default());
         let mut cursor = Cursor::default();
         let (mut stashed_grid, mut stashed_cursor, mut spare) = (None, None, None);
+        let mut alt_images = crate::graphics::image::ImageStore::default();
 
         macro_rules! swap {
             ($m:ident) => {{
@@ -2365,6 +2513,7 @@ mod tests {
                     stashed_cursor: &mut stashed_cursor,
                     spare: &mut spare,
                     reuse: true,
+                    alt_images: &mut alt_images,
                 }
                 .$m(true);
             }};
@@ -2653,6 +2802,9 @@ mod placement_refusal_tests {
             abs_row: 0,
             col: 0,
             image_id: id,
+            placement_id: 0,
+            z: 0,
+            geometry: ImageGeometry::full(1, 1),
         }
     }
 
@@ -2666,7 +2818,7 @@ mod placement_refusal_tests {
         const MIB: usize = 1024 * 1024;
         let mut g = Grid::new(10, 20, GridConfig::default());
         for id in 1..=7u32 {
-            assert!(g.place(at(id, 4 * MIB)), "setup placement {id} refused");
+            assert!(g.put(at(id, 4 * MIB)), "setup placement {id} refused");
         }
         assert_eq!(g.placements().len(), 7);
 
@@ -2674,7 +2826,10 @@ mod placement_refusal_tests {
         // Frees id=7's 4 MiB, leaving 24 MiB, then asks for 10 more: past the
         // 32 MiB ceiling, so the replacement is refused.
         assert!(
-            !g.place(at(7, 10 * MIB)),
+            {
+                g.unplace_image(7, 0);
+                !g.put(at(7, 10 * MIB))
+            },
             "the cap should have refused this"
         );
         assert_eq!(

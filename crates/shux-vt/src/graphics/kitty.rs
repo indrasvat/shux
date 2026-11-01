@@ -27,8 +27,8 @@
 //! ## Where shux is deliberately laxer than kitty
 //!
 //! kitty discards a whole command when any key it knows carries a malformed
-//! value -- `o=`, `d=`, `f=`, `m=`, `S=`, `z=`, `p=`. shux reads five keys and
-//! acts on none of the rest, so validating them here would be knowledge with no
+//! value -- `o=`, `d=`, `f=`, `m=`, `S=`, `z=`, `p=`. shux validates the keys it
+//! acts on and skips the rest, so validating those would be knowledge with no
 //! consumer. The store that reads a payload must validate `m=`: a garbage
 //! chunking key is a dropped command in kitty and would otherwise be a live
 //! transfer here.
@@ -123,6 +123,18 @@ pub(crate) struct Command {
     pub(crate) height: u32,
     /// `C=1`: do not move the cursor after placing.
     pub(crate) no_cursor_move: bool,
+    /// `p=`: placement id; 0 means a placement no later command can address.
+    pub(crate) placement_id: u32,
+    /// `x=,y=,w=,h=`: source rectangle in pixels; a 0 width or height runs to
+    /// the image's edge.
+    pub(crate) src: [u32; 4],
+    /// `c=,r=`: display size in cells; 0 means "from the image".
+    pub(crate) cols: u32,
+    pub(crate) rows: u32,
+    /// `d=`: what a delete targets, or 0 for the default (`a`).
+    pub(crate) delete: u8,
+    /// `z=`: z-index, signed. shux draws every placement at 0.
+    pub(crate) z: i32,
 }
 
 /// Why a command was refused. No reply is ever built from it -- see
@@ -134,6 +146,9 @@ pub(crate) enum Rejection {
     UnsupportedTransport(Transport),
     /// Animation, in any of its three actions.
     UnsupportedAnimation,
+    /// `U=1`: a virtual placement for Unicode placeholders. Drawn as an ordinary
+    /// placement it would cover the text the client meant to show.
+    UnsupportedVirtualPlacement,
     /// `i=` and `I=` together. `graphics-protocol.rst:839` makes this an error
     /// the terminal must not act on, and kitty checks it before the action
     /// switch and before any transport work (`graphics.c:2569`). The next line,
@@ -200,8 +215,9 @@ pub(crate) fn parse(command: &[u8]) -> Result<Command, Rejection> {
 
     let mut action = None;
     let mut transport = Transport::Direct;
-    let mut image_number = 0;
     let mut malformed = false;
+    let mut virtual_placement = false;
+    let mut image_number = 0;
     let mut cmd = Command::default();
 
     // Read an unsigned key into `slot`, discarding the whole command on a bad
@@ -224,6 +240,29 @@ pub(crate) fn parse(command: &[u8]) -> Result<Command, Rejection> {
             },
             b'i' => uint!(cmd.image_id, value),
             b'I' => uint!(image_number, value),
+            b'p' => uint!(cmd.placement_id, value),
+            b'x' => uint!(cmd.src[0], value),
+            b'y' => uint!(cmd.src[1], value),
+            b'w' => uint!(cmd.src[2], value),
+            b'h' => uint!(cmd.src[3], value),
+            b'c' => uint!(cmd.cols, value),
+            b'z' => match value.strip_prefix(b"-").map_or_else(
+                || number(value).and_then(|n| i32::try_from(n).ok()),
+                |n| number(n).and_then(|n| i32::try_from(i64::from(n).wrapping_neg()).ok()),
+            ) {
+                Some(z) => cmd.z = z,
+                None => malformed = true,
+            },
+            b'r' => uint!(cmd.rows, value),
+            b'd' => match value {
+                [t] if b"aAiIpPcCnNqQxXyYzZrRfF".contains(t) => cmd.delete = *t,
+                _ => malformed = true,
+            },
+            b'U' => match value {
+                b"0" => {}
+                b"1" => virtual_placement = true,
+                _ => malformed = true,
+            },
             b's' => uint!(cmd.width, value),
             b'v' => uint!(cmd.height, value),
             b'f' => match value {
@@ -260,6 +299,10 @@ pub(crate) fn parse(command: &[u8]) -> Result<Command, Rejection> {
 
     if cmd.image_id != 0 && image_number != 0 {
         return Err(Rejection::BothIdAndNumber);
+    }
+
+    if virtual_placement {
+        return Err(Rejection::UnsupportedVirtualPlacement);
     }
 
     // `a` defaults to `t` (control data reference). A continuation chunk carries
@@ -399,6 +442,34 @@ mod tests {
     #[test]
     fn an_unknown_transport_is_malformed() {
         assert_eq!(refused(b"a=T,t=zz,i=8;PAY"), Rejection::Malformed);
+    }
+
+    #[test]
+    fn reads_the_placement_keys() {
+        let cmd = ok(b"a=p,i=7,p=2,x=1,y=2,w=3,h=4,c=5,r=6,C=1");
+        assert_eq!(cmd.action, Action::Put);
+        assert_eq!((cmd.image_id, cmd.placement_id), (7, 2));
+        assert_eq!(cmd.src, [1, 2, 3, 4]);
+        assert_eq!((cmd.cols, cmd.rows, cmd.no_cursor_move), (5, 6, true));
+        assert_eq!(ok(b"a=d,d=I,i=7").delete, b'I');
+        assert_eq!(refused(b"a=d,d=J,i=7"), Rejection::Malformed);
+        assert_eq!(refused(b"a=d,d=ii,i=7"), Rejection::Malformed);
+        assert_eq!(refused(b"a=p,i=7,c=-1"), Rejection::Malformed);
+    }
+
+    /// A Unicode-placeholder placement is refused, not drawn as a picture
+    /// over the cells meant to hold the placeholders.
+    #[test]
+    fn a_virtual_placement_is_refused() {
+        assert_eq!(
+            refused(b"a=p,U=1,i=7,c=4,r=2"),
+            Rejection::UnsupportedVirtualPlacement
+        );
+        assert_eq!(
+            refused(b"a=T,U=1,f=24,s=1,v=1,i=7;AAAA"),
+            Rejection::UnsupportedVirtualPlacement
+        );
+        assert!(parse(b"a=p,U=0,i=7").is_ok());
     }
 
     #[test]

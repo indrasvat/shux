@@ -516,3 +516,153 @@ fn a_picture_in_a_grid_taller_than_its_pane_moves_with_its_text() {
     // Grid row 15 (0-based) at offset 14 is screen row 1, CUP row 2.
     assert_eq!(row, 2, "picture placed at screen row {row}: {cup:?}");
 }
+
+/// `a=t` of a `w` x `h` RGB image under `i=id`, then the given `a=p`.
+fn transmit_then_put(id: u32, w: u32, h: u32, put: &str) -> Vec<u8> {
+    use base64::Engine as _;
+    let px = vec![120u8; (w * h * 3) as usize];
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&px);
+    let mut out = format!("\x1b_Ga=t,f=24,s={w},v={h},i={id};{b64}\x1b\\").into_bytes();
+    out.extend_from_slice(format!("\x1b_G{put}\x1b\\").as_bytes());
+    out
+}
+
+fn emitted(put: &str, w: u32, h: u32) -> String {
+    let p = pane(1);
+    let layout = LayoutNode::leaf(p);
+    let mut vt = VirtualTerminal::new(10, 20);
+    vt.process(&transmit_then_put(5, w, h, put));
+    let mut vts = HashMap::new();
+    vts.insert(p, &vt);
+    let mut c = make_compositor(20, 10);
+    c.render_multi_pane(frame(&layout, &vts, p)).unwrap();
+    let cmds = graphics(&drain(&mut c));
+    assert_eq!(cmds.len(), 1, "{cmds:?}");
+    cmds[0].clone()
+}
+
+/// A put's crop is the part of the image the host is told to show.
+#[test]
+fn a_cropped_put_sends_its_crop_as_the_source_rectangle() {
+    let cmd = emitted("a=p,i=5,x=9,y=38,w=9,h=38", 18, 190);
+    assert!(cmd.contains("x=9,y=38,w=9,h=38,c=1,r=2"), "{cmd}");
+}
+
+/// A put fitted to cells is sent as the cells it covers and the source that
+/// fills them; the host does the scaling.
+#[test]
+fn a_scaled_put_sends_its_cells_and_the_source_that_fills_them() {
+    let cmd = emitted("a=p,i=5,c=4", 18, 38);
+    assert!(cmd.contains("y=0,w=18,h=38,c=4,r=4"), "{cmd}");
+}
+
+/// A put letterboxed into a wider box is sent as the cells the picture covers,
+/// so a terminal that stretches into `c` x `r` (kitty 0.32) draws it as one
+/// that letterboxes does.
+#[test]
+fn a_letterboxed_put_sends_only_the_cells_its_picture_covers() {
+    // 9x38 px fitted into 6x4 cells: the height binds, the width is 2 cells.
+    let cmd = emitted("a=p,i=5,c=6,r=4", 9, 38);
+    assert!(cmd.contains("y=0,w=9,h=38,c=2,r=4"), "{cmd}");
+}
+
+/// An upscaled picture clipped above and below still sends a source of at
+/// least one pixel row: rounding both ends down sent nothing at all.
+#[test]
+fn a_clipped_upscaled_put_still_sends_a_source_row() {
+    let p = pane(1);
+    let layout = LayoutNode::leaf(p);
+    // A grid far taller than its two-row pane; the view follows the cursor.
+    let mut vt = VirtualTerminal::new(30, 20);
+    vt.process(b"\x1b[11;1H");
+    // 1x2 px fitted to 10 columns: 90x180 px, about ten rows from row 10.
+    vt.process(&transmit_then_put(5, 1, 2, "a=p,i=5,c=10,r=30,C=1"));
+    vt.process(b"\x1b[13;1H");
+    let mut vts = HashMap::new();
+    vts.insert(p, &vt);
+    let mut c = make_compositor(20, 2);
+    c.render_multi_pane(frame(&layout, &vts, p)).unwrap();
+    let cmds = graphics(&drain(&mut c));
+    assert_eq!(cmds.len(), 1, "the visible part was not sent: {cmds:?}");
+}
+
+/// The same for the right edge: one visible column of a 1x1 picture blown up
+/// to ten is still sent.
+#[test]
+fn a_right_clipped_upscaled_put_still_sends_a_source_column() {
+    let p = pane(1);
+    let layout = LayoutNode::leaf(p);
+    let mut vt = VirtualTerminal::new(10, 20);
+    vt.process(b"\x1b[1;20H");
+    vt.process(&transmit_then_put(5, 1, 1, "a=p,i=5,c=10,r=10,C=1"));
+    let mut vts = HashMap::new();
+    vts.insert(p, &vt);
+    let mut c = make_compositor(20, 10);
+    c.render_multi_pane(frame(&layout, &vts, p)).unwrap();
+    let cmds = graphics(&drain(&mut c));
+    assert_eq!(cmds.len(), 1, "the visible column was not sent: {cmds:?}");
+    assert!(cmds[0].contains("w=1,"), "{}", cmds[0]);
+}
+
+/// What a host that honours `c,r` draws from the emitter: a picture that is
+/// not a whole number of cells keeps its origin and is fitted to its ceil
+/// footprint, at most one cell larger, never past it.
+#[test]
+fn a_host_draws_a_non_cell_multiple_picture_within_one_cell_of_its_size() {
+    let p = pane(1);
+    let layout = LayoutNode::leaf(p);
+    let mut vt = VirtualTerminal::new(10, 20);
+    vt.process(&kitty_rgb(64, 48, [200, 40, 40]));
+    let mut vts = HashMap::new();
+    vts.insert(p, &vt);
+    let mut c = make_compositor(20, 10);
+    c.render_multi_pane(frame(&layout, &vts, p)).unwrap();
+
+    let mut host = VirtualTerminal::new(10, 20);
+    host.process(drain(&mut c).as_bytes());
+    let inner = &vt.grid().placements()[0];
+    let outer = &host.grid().placements()[0];
+    assert_eq!(
+        (outer.abs_row, outer.col),
+        (inner.abs_row, inner.col),
+        "origin moved"
+    );
+    let (dw, dh) = shux_vt::DECLARED_CELL_PIXELS;
+    let (w, h) = outer.geometry.drawn_px(dw, dh);
+    assert_eq!((w, h), (72, 54), "64x48 fitted to its 8x3-cell footprint");
+    assert!(
+        w - 64 < dw && h - 48 < dh,
+        "more than a cell larger: {w}x{h}"
+    );
+}
+
+/// A moderately upscaled picture clipped at a pane edge keeps its scale on a
+/// host to within one source pixel: the source rectangle is whole pixels, so
+/// a slice that ends mid-pixel is rounded outward, never lost.
+#[test]
+fn a_clipped_scaled_put_keeps_its_scale_on_the_host() {
+    let p = pane(1);
+    let layout = LayoutNode::leaf(p);
+    // A grid taller than its two-row pane; the view follows the cursor.
+    let mut vt = VirtualTerminal::new(30, 20);
+    vt.process(b"\x1b[11;1H");
+    // 20x20 px fitted to 4 columns: drawn 36x36, rows 10 and 11.
+    vt.process(&transmit_then_put(5, 20, 20, "a=p,i=5,c=4,C=1"));
+    vt.process(b"\x1b[13;1H");
+    let mut vts = HashMap::new();
+    vts.insert(p, &vt);
+    let mut c = make_compositor(20, 2);
+    c.render_multi_pane(frame(&layout, &vts, p)).unwrap();
+
+    let mut host = VirtualTerminal::new(2, 20);
+    host.process(drain(&mut c).as_bytes());
+    let outer = &host.grid().placements()[0];
+    let (dw, dh) = shux_vt::DECLARED_CELL_PIXELS;
+    let (w, h) = outer.geometry.drawn_px(dw, dh);
+    // The visible slice is 36 px wide and the 17 px left of the second row.
+    let scale = 36.0 / 20.0;
+    assert!(
+        (w as f64 - 36.0).abs() <= scale && (h as f64 - 17.0).abs() <= scale + 1.0,
+        "the clipped slice was drawn {w}x{h}, not about 36x17"
+    );
+}

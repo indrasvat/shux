@@ -469,6 +469,7 @@ impl Rasterizer {
             self.blit(
                 img,
                 &p.image,
+                &p.geometry,
                 top,
                 p.col as u32 * self.cell_w,
                 (0, w, h),
@@ -501,7 +502,15 @@ impl Rasterizer {
                 (c.row + c.rows) as u32 * self.cell_h,
             );
             let top = p.row * i64::from(self.cell_h);
-            self.blit(img, &p.image, top, p.col as u32 * self.cell_w, clip, budget);
+            self.blit(
+                img,
+                &p.image,
+                &p.geometry,
+                top,
+                p.col as u32 * self.cell_w,
+                clip,
+                budget,
+            );
         }
     }
 
@@ -513,14 +522,19 @@ impl Rasterizer {
     /// clip's left edge from the same pane origin, so a picture cannot start
     /// left of its own clip.
     ///
-    /// The client sized its bitmap against the DECLARED cell box, so the
-    /// conversion runs through that rather than the box being drawn --
-    /// `appearance.font` changes the latter and an unconverted image overruns
-    /// its rows.
+    /// Only the placement's crop is drawn, at the size its geometry gives
+    /// for this cell box: the client's bitmap converted through the DECLARED
+    /// cell box (`appearance.font` changes the drawn one), or fitted to the
+    /// cells it asked for.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one placement's pixels, geometry, position and clip"
+    )]
     fn blit(
         &self,
         img: &mut RgbaImage,
         stored: &shux_vt::StoredImage,
+        geometry: &shux_vt::ImageGeometry,
         top: i64,
         ox: u32,
         (y0, x1, y1): (u32, u32, u32),
@@ -530,22 +544,22 @@ impl Rasterizer {
         if y0 >= y1 || ox >= x1 || top >= i64::from(y1) {
             return;
         }
-        let (dw, dh) = shux_vt::DECLARED_CELL_PIXELS;
-        let convert = |px: u32, cell: u32, declared: u32| {
-            (u64::from(px) * u64::from(cell) / u64::from(declared.max(1))).max(1) as u32
-        };
-        // Both visibility tests run on the DECLARED height, before any decode:
-        // a placement outside the clip is discarded without inflating its
-        // payload. `decode_placement` refuses a payload that does not match the
-        // declared size, so the two agree on anything drawn.
+        let (dest_w, dest_h) = geometry.drawn_px(self.cell_w, self.cell_h);
+        // Both visibility tests run on the size the geometry gives, before any
+        // decode: a placement outside the clip is discarded without inflating
+        // its payload. `decode_placement` refuses a payload that does not
+        // match the declared size, so the crop lies inside anything drawn.
         let skip = (i64::from(y0) - top).max(0);
-        if skip >= i64::from(convert(stored.height, self.cell_h, dh)) {
+        if skip >= i64::from(dest_h) {
             return;
         }
         // Charged AFTER the cheap declared-size tests and BEFORE the decode, so
         // a placement that is off-screen costs nothing and one that is drawn is
         // paid for once.
-        let cost = declared_rgba_bytes(stored).unwrap_or(u64::MAX as usize) as u64;
+        let scaled = u64::from(dest_w)
+            .saturating_mul(u64::from(dest_h))
+            .saturating_mul(4);
+        let cost = (declared_rgba_bytes(stored).unwrap_or(u64::MAX as usize) as u64).max(scaled);
         match budget.checked_sub(cost) {
             Some(left) => *budget = left,
             None => return,
@@ -553,8 +567,12 @@ impl Rasterizer {
         let Some(src) = decode_placement(stored) else {
             return;
         };
-        let dest_w = convert(src.width(), self.cell_w, dw);
-        let dest_h = convert(src.height(), self.cell_h, dh);
+        let c = geometry.crop;
+        let src = if (c.x, c.y, c.w, c.h) == (0, 0, src.width(), src.height()) {
+            src
+        } else {
+            image::imageops::crop_imm(&src, c.x, c.y, c.w, c.h).to_image()
+        };
         let src = if (dest_w, dest_h) == (src.width(), src.height()) {
             src
         } else {

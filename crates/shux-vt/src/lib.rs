@@ -34,7 +34,9 @@ pub use diff::{
 };
 pub use graphics::image::StoredImage;
 pub use graphics::kitty::Format as ImageFormat;
-pub use grid::{CellRect, ComposedPlacement, DirtyRegion, Grid, GridConfig, Row};
+pub use grid::{
+    CellRect, ComposedPlacement, DirtyRegion, Grid, GridConfig, ImageGeometry, PixelRect, Row,
+};
 pub use parser::{MouseMode, ScrollRegion, TerminalModes, VtHandler};
 #[cfg(any(test, fuzzing))]
 #[doc(hidden)]
@@ -155,6 +157,10 @@ pub struct VirtualTerminal {
     /// write. Always `false` outside the differential tests — see
     /// [`VirtualTerminal::set_eager_sync_freeze`].
     eager_sync_freeze: bool,
+    /// Whether an open window is released once it has been open
+    /// [`SYNC_UPDATE_TIMEOUT_MS`]. Always `true` outside the differential
+    /// tests — see [`VirtualTerminal::set_sync_deadline`].
+    sync_deadline: bool,
     /// Monotonic nanoseconds at which the open synchronized-output window was
     /// first seen to still be open at the end of a batch, or 0 when no window
     /// is open. Stamped once per window rather than at `?2026h`, so a pane
@@ -319,6 +325,7 @@ impl VirtualTerminal {
             frozen_title: None,
             frozen_alt: None,
             eager_sync_freeze: false,
+            sync_deadline: true,
             sync_opened_ns: 0,
             sync_bytes: 0,
             active_grapheme_cell: None,
@@ -405,6 +412,15 @@ impl VirtualTerminal {
         }
     }
 
+    /// Turn off the wall-clock release of synchronized output; the byte bound
+    /// stays. The differential tests feed two terminals in turn, and on a
+    /// loaded machine the deadline can pass between them, releasing one
+    /// window and not the other. Production never calls it.
+    #[doc(hidden)]
+    pub fn set_sync_deadline(&mut self, enabled: bool) {
+        self.sync_deadline = enabled;
+    }
+
     /// Snapshot every still-unfrozen component of the presented frame.
     ///
     /// Called by the paths that mutate presented state from OUTSIDE the parser
@@ -481,8 +497,9 @@ impl VirtualTerminal {
             return false;
         }
         self.sync_bytes >= SYNC_UPDATE_MAX_BYTES
-            || sync_clock_ns().saturating_sub(self.sync_opened_ns)
-                >= SYNC_UPDATE_TIMEOUT_MS * 1_000_000
+            || (self.sync_deadline
+                && sync_clock_ns().saturating_sub(self.sync_opened_ns)
+                    >= SYNC_UPDATE_TIMEOUT_MS * 1_000_000)
     }
 
     /// Release a synchronized-output window that has outlived its deadline,
@@ -559,6 +576,7 @@ impl VirtualTerminal {
             alt_spare: &mut self.alt_spare,
             reuse_retired_grids: self.reuse_retired_grids,
             program_status: &mut self.program_status,
+            image_stores: &mut self.graphics.stores,
         };
         self.parser.advance(&mut handler, bytes);
     }
@@ -661,21 +679,42 @@ impl VirtualTerminal {
         use graphics::kitty::Action;
         match cmd.action {
             Action::Transmit | Action::TransmitAndPlace => {
+                // "The existing image and all its placements must be deleted"
+                // as the re-transmit begins, whether or not it completes or is
+                // placed. An app that redraws under one id (terminal-browser
+                // sends `i=1` every frame) would otherwise spend a slot per
+                // frame.
+                let alt = self.modes.alternate_screen;
+                if !self.graphics.assembler.is_open() {
+                    self.graphics.transfer_on_alt = alt;
+                    if cmd.image_id != 0 {
+                        self.store().retain(|k| k != cmd.image_id);
+                        self.presented_grid().unplace_image(cmd.image_id, 0);
+                    }
+                }
                 let Some((image, opening)) = self.graphics.assembler.feed(&cmd, payload) else {
                     return;
                 };
+                if self.graphics.transfer_on_alt != alt {
+                    self.graphics.refusals = self.graphics.refusals.saturating_add(1);
+                    return;
+                }
+                let image = std::sync::Arc::new(image);
+                if opening.image_id != 0 {
+                    self.store().insert(opening.image_id, image.clone());
+                }
                 if opening.action == Action::TransmitAndPlace {
-                    self.place_image(std::sync::Arc::new(image), &opening);
+                    self.place_image(image, &opening);
                 }
             }
-            // `a=d` clears every placement whatever the target: `d=A` is the
-            // only one a real client sends. `a=p` would need an image store to
-            // place from and is a stated gap, not a refusal.
+            // An image number names the newest image transmitted under it,
+            // which only kitty's own id assignment can resolve.
+            Action::Put => match self.store().get(cmd.image_id) {
+                Some(image) => self.place_image(image, &cmd),
+                None => self.graphics.refusals = self.graphics.refusals.saturating_add(1),
+            },
             Action::Delete => {
-                // Through `Presented` for the same reason `place_image` is:
-                // dropping a picture changes the presented frame.
-                sync::Presented::new(&mut self.grid, &mut self.frozen_grid, &self.sync_armed)
-                    .unplace_all();
+                self.delete_images(&cmd);
                 self.graphics.assembler.abort();
             }
             // Default `kitten icat` probes each transport and waits on a DA1
@@ -688,7 +727,76 @@ impl VirtualTerminal {
                     responses.push(format!("\x1b_Gi={};OK\x1b\\", cmd.image_id).into_bytes());
                 }
             }
-            Action::Put | Action::Animation => {}
+            Action::Animation => {}
+        }
+    }
+
+    /// The live grid, through `Presented`: a placement added or dropped
+    /// changes the presented frame, so inside a `CSI ?2026h` window it must
+    /// freeze first or it tears the redraw it landed in (issue #115).
+    fn presented_grid(&mut self) -> sync::Presented<'_, Grid> {
+        sync::Presented::new(&mut self.grid, &mut self.frozen_grid, &self.sync_armed)
+    }
+
+    /// The store of the screen now showing.
+    fn store(&mut self) -> &mut graphics::image::ImageStore {
+        &mut self.graphics.stores[usize::from(self.modes.alternate_screen)]
+    }
+
+    /// `a=d`: drop the placements the target hits. Uppercase also frees the
+    /// data of the images it removed, or named, once nothing shows them.
+    /// Targets by image number or animation frame are refused: shux can
+    /// resolve neither.
+    fn delete_images(&mut self, cmd: &graphics::kitty::Command) {
+        let target = if cmd.delete == 0 { b'a' } else { cmd.delete };
+        let first = self.grid.evicted() + self.grid.scrollback_len() as u64;
+        let rows = self.grid.rows() as u64;
+        // `x,y` name a 1-based cell; a cell is (screen column, absolute row).
+        let (x, y) = (cmd.src[0] as usize, cmd.src[1] as usize);
+        // A 0 coordinate names no cell.
+        let cell = (
+            x.wrapping_sub(1),
+            y.checked_sub(1).map_or(u64::MAX, |y| first + y as u64),
+        );
+        let cursor = (self.cursor.col, first + self.cursor.row as u64);
+        let z = cmd.z;
+        let covers = |p: &grid::Placement, col: Option<usize>, row: Option<u64>| {
+            let (w, h) = p.geometry.cells();
+            col.is_none_or(|c| (p.col..p.col + w).contains(&c))
+                && row.is_none_or(|r| (p.abs_row..p.abs_row + h as u64).contains(&r))
+        };
+        let (id, pid) = (cmd.image_id, cmd.placement_id);
+        let hit: Box<dyn Fn(&grid::Placement) -> bool> = match target.to_ascii_lowercase() {
+            // Any part on screen; a placement wholly in scrollback stays.
+            b'a' => Box::new(move |p| {
+                p.abs_row < first + rows && p.abs_row + p.geometry.cells().1 as u64 > first
+            }),
+            b'i' if id != 0 => {
+                Box::new(move |p| p.image_id == id && (pid == 0 || p.placement_id == pid))
+            }
+            b'r' if x <= y => Box::new(move |p| (x as u32..=y as u32).contains(&p.image_id)),
+            b'c' => Box::new(move |p| covers(p, Some(cursor.0), Some(cursor.1))),
+            b'p' => Box::new(move |p| covers(p, Some(cell.0), Some(cell.1))),
+            b'q' => Box::new(move |p| p.z == z && covers(p, Some(cell.0), Some(cell.1))),
+            b'x' => Box::new(move |p| covers(p, Some(cell.0), None)),
+            b'y' => Box::new(move |p| covers(p, None, Some(cell.1))),
+            b'z' => Box::new(move |p| p.z == z),
+            _ => {
+                self.graphics.refusals = self.graphics.refusals.saturating_add(1);
+                return;
+            }
+        };
+        let removed = self.presented_grid().unplace_where(hit);
+        if target.is_ascii_uppercase() {
+            // Named outright: an id with no placement given, or an id range.
+            let named = |k: u32| match target {
+                b'I' => pid == 0 && k == id,
+                b'R' => (x as u64..=y as u64).contains(&u64::from(k)),
+                _ => false,
+            };
+            let grid = &self.grid;
+            let store = &mut self.graphics.stores[usize::from(self.modes.alternate_screen)];
+            store.retain(|k| !(removed.contains(&k) || named(k)) || grid.shows_image(k));
         }
     }
 
@@ -702,33 +810,39 @@ impl VirtualTerminal {
         image: std::sync::Arc<graphics::image::StoredImage>,
         cmd: &graphics::kitty::Command,
     ) {
-        let (cell_w, cell_h) = DECLARED_CELL_PIXELS;
+        let max = (self.grid.cols(), self.grid.rows());
+        let Some(geometry) = grid::ImageGeometry::resolve(
+            (image.width, image.height),
+            cmd.src,
+            (cmd.cols, cmd.rows),
+            max,
+        ) else {
+            return;
+        };
         // `s=`/`v=` are unvalidated wire numbers; unclamped, `v=4294967295`
         // is 226 million `scroll_up` calls inside the pane-IO lock.
-        let cols = image.width.div_ceil(cell_w);
-        let rows = image.height.div_ceil(cell_h);
-        let (cols, rows) = (
-            cols.min(self.grid.cols() as u32) as usize,
-            rows.min(self.grid.rows() as u32) as usize,
-        );
+        let (cols, rows) = geometry.cells();
+        let (cols, rows) = (cols.min(max.0), rows.min(max.1));
         if cols == 0 || rows == 0 {
             return;
         }
 
         let abs_row =
             self.grid.evicted() + self.grid.scrollback_len() as u64 + self.cursor.row as u64;
-        // Through `Presented`, not the raw fields: a placement changes the
-        // presented frame, so inside a `CSI ?2026h` window it must freeze
-        // first or it tears the redraw it landed in (issue #115).
+        let col = self.cursor.col;
+        // Disjoint from the cursor, which moves below while this is held.
         let mut grid =
             sync::Presented::new(&mut self.grid, &mut self.frozen_grid, &self.sync_armed);
-        let placed = grid.place(grid::Placement {
+        let placement = grid::Placement {
             image,
             abs_row,
-            col: self.cursor.col,
+            col,
             image_id: cmd.image_id,
-        });
-        if !placed {
+            placement_id: cmd.placement_id,
+            z: cmd.z,
+            geometry,
+        };
+        if !grid.put(placement) {
             self.graphics.refusals = self.graphics.refusals.saturating_add(1);
             return;
         }
@@ -1189,6 +1303,7 @@ impl VirtualTerminal {
             stashed_cursor: &mut self.alt_cursor,
             spare: &mut self.alt_spare,
             reuse: self.reuse_retired_grids,
+            alt_images: &mut self.graphics.stores[1],
         }
     }
 
@@ -2047,6 +2162,33 @@ mod tests {
         vt.process(b"!");
         assert!(!vt.modes().synchronized_output);
         assert!(compact_capture(&vt).starts_with("after"));
+    }
+
+    /// Why the differential tests turn the deadline off: two terminals fed
+    /// the same bytes in turn diverge when the deadline passes between them,
+    /// as it can on a loaded machine. With it off they cannot.
+    #[test]
+    fn the_sync_deadline_is_what_two_terminals_fed_in_turn_can_disagree_on() {
+        for deadline in [true, false] {
+            let clock = test_clock::Frozen::new();
+            let (mut first, mut second) =
+                (VirtualTerminal::new(3, 10), VirtualTerminal::new(3, 10));
+            first.set_sync_deadline(deadline);
+            second.set_sync_deadline(deadline);
+            for vt in [&mut first, &mut second] {
+                vt.process(b"before\x1b[?2026h\x1b[1;1Hafter   ");
+            }
+            first.process(b"!");
+            clock.advance_ms(SYNC_UPDATE_TIMEOUT_MS);
+            second.process(b"!");
+            assert_eq!(
+                compact_capture(&first) != compact_capture(&second),
+                deadline,
+                "deadline {deadline}: {:?} vs {:?}",
+                compact_capture(&first),
+                compact_capture(&second)
+            );
+        }
     }
 
     /// The pane that goes completely silent is the case `process` cannot

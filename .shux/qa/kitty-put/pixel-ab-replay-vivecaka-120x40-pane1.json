@@ -1,0 +1,1 @@
+{"actual": "ab/new/replay-vivecaka-120x40/pane1.png", "changed_pixels": 0, "diff": ".shux/out/kitty-put/diff/ab-replay-vivecaka-120x40-pane1.png", "expected": "ab/base/replay-vivecaka-120x40/pane1.png", "max_mean_channel_delta": 0.0, "max_pixel_diff_ratio": 0.0, "mean_rgba_channel_delta": 0.0, "pixel_diff_ratio": 0.0, "size": [1062, 703], "status": "pass", "total_pixels": 746586}
