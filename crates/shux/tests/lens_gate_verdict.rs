@@ -1678,3 +1678,61 @@ fn outputs_under_a_directory_not_made_yet_are_compared() {
         "a refused run made the directory"
     );
 }
+
+/// A link inside the golden tree is inside it wherever it points.
+#[test]
+fn a_link_inside_the_golden_dir_is_inside_it_wherever_it_points() {
+    let h = Harness::new();
+    let d = tmp();
+    let g = tmp();
+    let gd = g.path().to_string_lossy().into_owned();
+    let scn = write_scenario(d.path(), "lk", &scenario("lk", "HI", None));
+
+    let baseline = d.path().join("baseline.json");
+    std::fs::write(&baseline, "precious").unwrap();
+    let inward = g.path().join("points-out.json");
+    std::os::unix::fs::symlink(&baseline, &inward).unwrap();
+    let out = gate(
+        &h,
+        &[
+            "--report",
+            &inward.to_string_lossy(),
+            "--golden-dir",
+            &gd,
+            &scn,
+        ],
+        false,
+    );
+    assert_eq!(out.exit, 2, "stderr:\n{}", out.stderr);
+    assert_eq!(std::fs::read_to_string(&baseline).unwrap(), "precious");
+}
+
+/// Two spellings of one directory not made yet name one destination.
+#[test]
+fn two_spellings_of_an_unmade_directory_are_one_destination() {
+    let h = Harness::new();
+    let d = tmp();
+    let scn = write_scenario(d.path(), "sp", &scenario("sp", "HI", None));
+    let real = d.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::os::unix::fs::symlink(&real, d.path().join("link")).unwrap();
+    let via_real = real.join("new").join("out");
+    let via_link = d.path().join("link").join("new").join("out");
+    let out = gate(
+        &h,
+        &[
+            "--report",
+            &via_real.to_string_lossy(),
+            "--cast",
+            &via_link.to_string_lossy(),
+            &scn,
+        ],
+        false,
+    );
+    assert_eq!(out.exit, 2, "stderr:\n{}", out.stderr);
+    assert!(out.stderr.contains("same file as"), "{}", out.stderr);
+    assert!(
+        !real.join("new").exists(),
+        "a refused run made the directory"
+    );
+}

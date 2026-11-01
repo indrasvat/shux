@@ -561,8 +561,7 @@ fn bless_failure_exit(e: &anyhow::Error, code: i32) -> i32 {
 /// trace, the report, the cast) are the same file, or one of them is where stdout or
 /// stderr already goes: one would overwrite the other. Nothing is opened or created.
 /// An existing file is compared by identity, following links; an absent one by its
-/// kernel-resolved directory and name, or its absolute spelling if the directory is
-/// not made yet. A link to a file that does not exist is
+/// deepest existing ancestor, resolved by the kernel, and the rest as spelled. A link to a file that does not exist is
 /// refused outright, since only creating its target would say where it leads. FIFOs
 /// and devices are never compared, and stdout and stderr are not compared with each
 /// other, so `> log 2>&1` stays legal.
@@ -615,24 +614,7 @@ fn refuse_shared_outputs(opts: &GateRunOptions, cast: Option<&Path>) -> Option<i
                     "{label} is a link to a file that does not exist. Name the file itself."
                 ));
             }
-            Err(_) => {
-                let (Some(name), Some(dir)) = (path.file_name(), path.parent()) else {
-                    continue;
-                };
-                let dir = if dir.as_os_str().is_empty() {
-                    Path::new(".")
-                } else {
-                    dir
-                };
-                match std::fs::canonicalize(dir) {
-                    Ok(dir) => Dest::Absent(dir.join(name)),
-                    // A directory not made yet: compare the spelling, made absolute.
-                    Err(_) => Dest::Absent(
-                        std::env::current_dir()
-                            .map_or_else(|_| path.to_path_buf(), |d| d.join(path)),
-                    ),
-                }
-            }
+            Err(_) => Dest::Absent(resolve_existing_prefix(path)),
         };
         if let Some((earlier, _)) = named.iter().find(|(_, d)| *d == dest) {
             return refuse(format!(
@@ -651,6 +633,30 @@ fn refuse_shared_outputs(opts: &GateRunOptions, cast: Option<&Path>) -> Option<i
         named.push((label, dest));
     }
     None
+}
+
+/// `path` with its deepest existing ancestor resolved by the kernel and the rest, which
+/// does not exist and so holds no links, appended as spelled.
+fn resolve_existing_prefix(path: &Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut ancestor = path;
+    loop {
+        let dir = if ancestor.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            ancestor
+        };
+        if let Ok(resolved) = std::fs::canonicalize(dir) {
+            return rest.iter().rev().fold(resolved, |p, c| p.join(c));
+        }
+        match (ancestor.file_name(), ancestor.parent()) {
+            (Some(name), Some(parent)) => {
+                rest.push(name.to_os_string());
+                ancestor = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
 }
 
 /// `--cast PATH` as given; a bare `--cast` names a file only once the scenario does.
@@ -713,9 +719,12 @@ fn resolve_cast_path(opts: &GateRunOptions, scenario_name: &str) -> Option<PathB
 /// symlinked or `.`-spelled path (e.g. macOS `/tmp` → `/private/tmp`) still compares; falls back
 /// to a lexical absolute compare when a dir does not yet exist.
 fn path_is_under(path: &Path, golden_dir: &Path) -> bool {
-    // An existing path is resolved whole, so a link outside pointing in is caught.
-    if let (Ok(g), Ok(p)) = (golden_dir.canonicalize(), path.canonicalize()) {
-        return p.starts_with(&g);
+    // Where the write lands and where the name sits both count: a link outside the tree
+    // pointing in, and a link inside it pointing out, are both inside.
+    if let (Ok(g), Ok(p)) = (golden_dir.canonicalize(), path.canonicalize())
+        && p.starts_with(&g)
+    {
+        return true;
     }
     if let (Ok(g), Some(cp)) = (
         golden_dir.canonicalize(),
