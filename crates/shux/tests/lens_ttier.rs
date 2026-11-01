@@ -11,6 +11,11 @@ use lens_common::*;
 
 use std::process::Command;
 
+/// Cells of nidhi's 120x40 frame the environment decides, not shux: the header's
+/// nidhi and git versions, and the stash dates, which nidhi only shows relative to
+/// today ("6y ago" turns into "7y ago" with the calendar).
+const NIDHI_VOLATILE: [(u32, u32, u32, u32); 2] = [(80, 0, 120, 1), (104, 1, 120, 7)];
+
 /// Build the deterministic nidhi repo (pinned dates, exactly 3 stashes).
 fn build_nidhi_repo(h: &Harness) -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().expect("nidhi repo tmp");
@@ -106,7 +111,13 @@ fn t1_nidhi_golden() {
         !is_near_grayscale_png(&png),
         "T1: truecolor nidhi render came out near-grayscale — NO_COLOR poisoning"
     );
-    assert_png_golden(&h, &png, "t1_nidhi_nerd_color_120x40.png");
+    assert_png_golden_masked(
+        &h,
+        &png,
+        "t1_nidhi_nerd_color_120x40.png",
+        (120, 40),
+        &NIDHI_VOLATILE,
+    );
 
     h.rpc_raw("session.kill", serde_json::json!({ "id": r["session_id"] }));
 }
@@ -258,7 +269,7 @@ fn t3_nidhi_matrix() {
                 cell.golden
             );
         }
-        assert_png_golden(&h, &png, cell.golden);
+        assert_png_golden_masked(&h, &png, cell.golden, (120, 40), &NIDHI_VOLATILE);
         if cell.no_color {
             assert!(
                 is_near_grayscale_png(&png),

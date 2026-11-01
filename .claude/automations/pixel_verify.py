@@ -27,6 +27,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-pixel-diff-ratio", type=float, default=0.0)
     parser.add_argument("--max-mean-channel-delta", type=float, default=0.0)
     parser.add_argument("--allow-size-mismatch", action="store_true")
+    parser.add_argument(
+        "--mask",
+        action="append",
+        default=[],
+        metavar="X0,Y0,X1,Y1",
+        help="ignore this pixel rectangle (end-exclusive); repeatable",
+    )
     return parser.parse_args()
 
 
@@ -71,6 +78,9 @@ def main() -> int:
     actual_arr = np.array(actual, dtype=np.int16)
     expected_arr = np.array(expected, dtype=np.int16)
     diff_arr = np.abs(actual_arr - expected_arr)
+    for mask in args.mask:
+        x0, y0, x1, y1 = (int(v) for v in mask.split(","))
+        diff_arr[y0:y1, x0:x1] = 0
 
     total_pixels = actual.width * actual.height
     changed_pixels = int(np.sum(np.any(diff_arr > 0, axis=-1)))
@@ -119,6 +129,7 @@ def main() -> int:
         "max_pixel_diff_ratio": args.max_pixel_diff_ratio,
         "max_mean_channel_delta": args.max_mean_channel_delta,
         "diff": str(args.diff) if args.diff else None,
+        "masks": args.mask,
     }
     print(json.dumps(payload, sort_keys=True))
     return 0 if passed else 1

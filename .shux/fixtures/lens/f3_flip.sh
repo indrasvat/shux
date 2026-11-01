@@ -13,7 +13,7 @@
 # (by row mod 3) so the red/blue identity survives a monochrome regression and
 # the house colour rule holds. Used by: G1, S3.
 #
-# Every frame draw is wrapped in DEC 2026 synchronized output
+# Every frame is wrapped in DEC 2026 synchronized output
 # (\033[?2026h ... \033[?2026l) so the 24 row writes present as ONE atomic
 # frame (LENS-TEST-CHANGE, P2 G1 dispute: without the wrap, a PTY read batch
 # can land mid-repaint and a reader legitimately observes a mixed A/B frame —
@@ -36,10 +36,18 @@ while [ "$i" -lt 79 ]; do
 	i=$((i + 1))
 done
 
+# Each frame is built once into a file, and a flip is one `cat` of it: one
+# write(2) per frame, so the whole synchronized window reaches the PTY at once.
+# Drawn row by row from the shell, a loaded machine could deschedule the
+# fixture mid-frame for longer than shux's 150 ms synchronized-output deadline,
+# which then shows the half-drawn frame by design.
+frame_a="$(mktemp)"
+frame_b="$(mktemp)"
+trap 'rm -f "$frame_a" "$frame_b"' EXIT
+
 # $1 = 'A' or 'B'
-draw_frame() {
-	# Freeze presentation: the whole frame lands as one atomic batch.
-	printf '\033[?2026h'
+build_frame() {
+	out='\033[?2026h'
 	r=0
 	while [ "$r" -lt 24 ]; do
 		if [ "$1" = 'A' ]; then
@@ -61,24 +69,26 @@ draw_frame() {
 			fill="$B79"
 			ck=$(((r + 5) % 10))
 		fi
-		printf '\033[%d;1H\033[%s;%sm%s%d\033[0m' "$((r + 1))" "$fg" "$bg" "$fill" "$ck"
+		out="${out}\033[$((r + 1));1H\033[${fg};${bg}m${fill}${ck}\033[0m"
 		r=$((r + 1))
 	done
-	# Park the cursor out of the way so the frame reads clean, then
-	# release synchronized output: present the frame atomically.
-	printf '\033[24;80H\033[?2026l'
+	# Park the cursor out of the way so the frame reads clean, then release
+	# synchronized output: present the frame atomically.
+	printf '%b' "${out}\033[24;80H\033[?2026l"
 }
+build_frame A >"$frame_a"
+build_frame B >"$frame_b"
 
 # Initial frame so the pane is non-blank before the first token.
-draw_frame A
+cat "$frame_a"
 frame='A'
 
 while read -r _; do
 	if [ "$frame" = 'A' ]; then
-		draw_frame B
 		frame='B'
+		cat "$frame_b"
 	else
-		draw_frame A
 		frame='A'
+		cat "$frame_a"
 	fi
 done
