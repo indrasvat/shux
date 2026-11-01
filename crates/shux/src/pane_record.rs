@@ -196,11 +196,18 @@ struct Registry {
 
 /// Where a recording's bytes go. Production opens a file; tests inject sinks.
 pub(crate) type RecordSink = Box<dyn AsyncWrite + Send + Unpin>;
+
+/// An opened sink, and how many bytes actually reached it where that can be
+/// measured: after a failed write, a file holds some prefix of what it was
+/// handed, and only the file can say how much.
+pub(crate) struct Opened {
+    pub(crate) sink: RecordSink,
+    pub(crate) landed: Option<Box<dyn Fn() -> Option<u64> + Send>>,
+}
+
 /// Opens `path` for recording `id` (the id is for tests; files ignore it).
 pub(crate) type Opener = Arc<
-    dyn Fn(uuid::Uuid, PathBuf, bool) -> BoxFuture<'static, std::io::Result<RecordSink>>
-        + Send
-        + Sync,
+    dyn Fn(uuid::Uuid, PathBuf, bool) -> BoxFuture<'static, std::io::Result<Opened>> + Send + Sync,
 >;
 
 fn file_opener() -> Opener {
@@ -227,7 +234,19 @@ fn file_opener() -> Opener {
             })?;
             let flags = OFlag::from_bits_retain(fcntl(&file, FcntlArg::F_GETFL)?);
             fcntl(&file, FcntlArg::F_SETFL(flags - OFlag::O_NONBLOCK))?;
-            Ok(Box::new(file) as RecordSink)
+            // Its own descriptor, so the size is the open file's, whatever
+            // later happens to the path.
+            let probe = file.try_clone().await?.into_std().await;
+            Ok(Opened {
+                sink: Box::new(file),
+                landed: Some(Box::new(move || {
+                    probe
+                        .metadata()
+                        .ok()
+                        .filter(|m| m.is_file())
+                        .map(|m| m.len())
+                })),
+            })
         }
         .boxed()
     })
@@ -402,8 +421,8 @@ impl Recordings {
             std::panic::AssertUnwindSafe((self.shared.opener)(id, path.clone(), overwrite))
                 .catch_unwind()
                 .await;
-        let sink = match opened {
-            Ok(Ok(sink)) => sink,
+        let opened = match opened {
+            Ok(Ok(opened)) => opened,
             failed => {
                 self.lock().entries.remove(&id);
                 let why = match failed {
@@ -420,7 +439,7 @@ impl Recordings {
         let writer = self
             .shared
             .tracker
-            .spawn(write_recording(rx, sink, control.clone()));
+            .spawn(write_recording(rx, opened, control.clone()));
         let this = self.clone();
         self.shared
             .tracker
@@ -760,9 +779,27 @@ impl Drop for Admission {
 }
 
 async fn write_recording(
+    rx: mpsc::Receiver<PaneRecordChunk>,
+    opened: Opened,
+    control: Arc<Control>,
+) -> Result<(), String> {
+    let Opened { sink, landed } = opened;
+    let written = std::panic::AssertUnwindSafe(write_chunks(rx, sink, &control))
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|_| Err("pane recorder writer panicked".to_string()));
+    if written.is_err()
+        && let Some(n) = landed.as_ref().and_then(|landed| landed())
+    {
+        control.progress.store(n, Ordering::SeqCst);
+    }
+    written
+}
+
+async fn write_chunks(
     mut rx: mpsc::Receiver<PaneRecordChunk>,
     mut sink: RecordSink,
-    control: Arc<Control>,
+    control: &Control,
 ) -> Result<(), String> {
     let mut cast: Option<shux_vt::CastWriter> = None;
     while let Some(chunk) = rx.recv().await {
@@ -779,7 +816,7 @@ async fn write_recording(
                 });
                 write(
                     &mut sink,
-                    &control,
+                    control,
                     format!("{header}\n").as_bytes(),
                     "cast header",
                 )
@@ -803,12 +840,12 @@ async fn write_recording(
         } else {
             "record chunk"
         };
-        write(&mut sink, &control, &line, what).await?;
+        write(&mut sink, control, &line, what).await?;
     }
     if let Some(line) = cast.as_mut().and_then(shux_vt::CastWriter::flush_line) {
         write(
             &mut sink,
-            &control,
+            control,
             format!("{line}\n").as_bytes(),
             "cast tail",
         )
@@ -829,7 +866,8 @@ async fn write(
         .await
         .map_err(|e| format!("failed to write {what}: {e}"))?;
     // A file reports a write done before it lands; the flush waits for it,
-    // so only bytes that reached the file are counted.
+    // so a chunk is counted once it reached the file. A chunk that lands only
+    // in part is measured from the file instead (see `Opened::landed`).
     sink.flush()
         .await
         .map_err(|e| format!("failed to write {what}: {e}"))?;
@@ -954,6 +992,8 @@ pub(crate) mod testing {
         fault: Fault,
         accepted: usize,
         lost: bool,
+        /// What reached the pipe, as a file's size would say.
+        landed: Arc<AtomicU64>,
     }
 
     impl AsyncWrite for FaultySink {
@@ -987,6 +1027,7 @@ pub(crate) mod testing {
             let poll = Pin::new(&mut self.inner).poll_write(cx, &buf[..room]);
             if let Poll::Ready(Ok(n)) = poll {
                 self.accepted += n;
+                self.landed.fetch_add(n as u64, Ordering::SeqCst);
             }
             poll
         }
@@ -1010,7 +1051,7 @@ pub(crate) mod testing {
 
     /// A sink of `capacity` bytes in flight, its state, and the task reading
     /// it (which runs until the writer drops the sink).
-    pub(crate) fn sink(capacity: usize, fault: Fault) -> (RecordSink, SinkState) {
+    pub(crate) fn sink(capacity: usize, fault: Fault) -> (Opened, SinkState) {
         let (writer, mut reader) = tokio::io::duplex(capacity.max(1));
         let (draining, mut on) = watch::channel(true);
         let state = SinkState {
@@ -1030,13 +1071,19 @@ pub(crate) mod testing {
                 }
             }
         });
+        let landed = Arc::new(AtomicU64::new(0));
         let sink = FaultySink {
             inner: writer,
             fault,
             accepted: 0,
             lost: false,
+            landed: landed.clone(),
         };
-        (Box::new(sink), state)
+        let opened = Opened {
+            sink: Box::new(sink),
+            landed: Some(Box::new(move || Some(landed.load(Ordering::SeqCst)))),
+        };
+        (opened, state)
     }
 
     /// An opener handing out [`sink`]s, one per open, each held at its open
@@ -1461,11 +1508,12 @@ mod tests {
         let r = rig(1 << 16);
         let pane = PaneId::new();
         *r.opener.fault.lock().unwrap() = Fault {
-            lose_after: Some(5),
+            lose_after: Some(7),
             ..Fault::default()
         };
         let id = r.start("a", pane).await;
         r.send(pane, b"12345").await;
+        // Lands two bytes, then fails.
         r.send(pane, b"67890").await;
         r.rec.stop(id, EndedBy::Stop);
         let out = r.ended(id).await;

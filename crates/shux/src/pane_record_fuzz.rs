@@ -460,7 +460,11 @@ impl Model {
                 }
                 PaneRecordStatus::Error => {
                     assert!(sent.starts_with(&file), "an errored file is not a prefix");
-                    assert!(outcome.bytes_written <= file.len() as u64);
+                    assert_eq!(
+                        outcome.bytes_written,
+                        file.len() as u64,
+                        "an errored recording miscounts what landed"
+                    );
                 }
                 PaneRecordStatus::Recording => panic!("finalized while still recording"),
             }
