@@ -57,6 +57,7 @@ shux-testkit = { path = "../shux-testkit" }
 tempfile.workspace = true
 base64 = "0.22"
 tokio = { workspace = true, features = ["test-util"] }
+proptest = "1"
 
 # ── lens red suite (§12/§13) — SEPARATE TEST LANE ──────────────────────────
 # `test = false` keeps these daemon-backed integration tests out of the default
@@ -163,3 +164,7 @@ test = false
 name = "lens_gate_settle"
 path = "tests/lens_gate_settle.rs"
 test = false
+
+[lints.rust]
+# cargo-fuzz builds with `--cfg fuzzing`; fuzz/ drives the recording registry through it.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
