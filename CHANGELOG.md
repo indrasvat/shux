@@ -1,3 +1,10 @@
+## [0.55.4](https://github.com/indrasvat/shux/compare/v0.55.3...v0.55.4) (2026-11-01)
+
+
+### Bug Fixes
+
+* **gate:** output errors fail the gate honestly; every lens suite runs in CI ([#246](https://github.com/indrasvat/shux/issues/246)) ([b04ccce](https://github.com/indrasvat/shux/commit/b04ccce9bf5f9abaddd938569f423dfc43766c06)), closes [#244](https://github.com/indrasvat/shux/issues/244) [#242](https://github.com/indrasvat/shux/issues/242) [#244](https://github.com/indrasvat/shux/issues/244) [#241](https://github.com/indrasvat/shux/issues/241) [#115](https://github.com/indrasvat/shux/issues/115) [#245](https://github.com/indrasvat/shux/issues/245) [#115](https://github.com/indrasvat/shux/issues/115) [#245](https://github.com/indrasvat/shux/issues/245) [#245](https://github.com/indrasvat/shux/issues/245) [#115](https://github.com/indrasvat/shux/issues/115) [#115](https://github.com/indrasvat/shux/issues/115) [#237](https://github.com/indrasvat/shux/issues/237)
+
 ## [0.55.3](https://github.com/indrasvat/shux/compare/v0.55.2...v0.55.3) (2026-11-01)
 
 
