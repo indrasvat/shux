@@ -1367,6 +1367,8 @@ async fn run_attach_loop(
                             &graph,
                             &io_state,
                             &render_session,
+                            &client_size,
+                            &config,
                             &mouse_drag,
                             &mut selection_drag,
                         )
@@ -2923,6 +2925,8 @@ async fn handle_app_mouse(
     graph: &GraphHandle,
     io_state: &Arc<Mutex<PaneIoState>>,
     session: &Arc<Mutex<AttachedSession>>,
+    client_size: &ClientSize,
+    config: &ConfigHandle,
     border_drag: &Option<DragState>,
     gesture: &mut SelectionDrag,
 ) -> anyhow::Result<AppMouse> {
@@ -2947,13 +2951,41 @@ async fn handle_app_mouse(
     // handling at the live layout, as before frames were stamped. A gesture
     // an app holds still gets its release.
     let Some(views) = attached.shown.views(frame) else {
-        if !matches!(*gesture, SelectionDrag::App { .. }) {
-            return Ok(AppMouse::NotHandled);
+        if matches!(*gesture, SelectionDrag::App { .. }) {
+            if action == ButtonAction::Release {
+                release_app_gesture(io_state, gesture).await;
+            }
+            return Ok(AppMouse::Consumed { redraw: false });
         }
-        if action == ButtonAction::Release {
-            release_app_gesture(io_state, gesture).await;
+        // Over a pane whose app reports the mouse, the press is not shux's to
+        // select with: it only focuses that pane.
+        if matches!(*gesture, SelectionDrag::None) && border_drag.is_none() && !shift {
+            let viewport = current_viewport(client_size, config).await;
+            let live = {
+                let snap = graph.snapshot();
+                snap.windows
+                    .get(&attached.active_window_id)
+                    .and_then(|win| match &win.layout.zoom {
+                        Some(zoom) => Some(zoom.zoomed_pane),
+                        None => pane_at(&win.layout.tree, viewport, col, row).map(|(p, _)| p),
+                    })
+            };
+            let tracked = match live {
+                Some(pid) => io_state
+                    .lock()
+                    .await
+                    .vts
+                    .get(&pid)
+                    .is_some_and(|vt| vt.modes().mouse_tracking != shux_vt::MouseMode::None),
+                None => false,
+            };
+            if let (Some(pid), true) = (live, tracked) {
+                let redraw = action == ButtonAction::Press
+                    && select_pane_on_press(graph, session, attached.active_pane_id, pid).await;
+                return Ok(AppMouse::Consumed { redraw });
+            }
         }
-        return Ok(AppMouse::Consumed { redraw: false });
+        return Ok(AppMouse::NotHandled);
     };
     let pane_hit = views
         .iter()
@@ -6478,6 +6510,39 @@ mod tests {
         );
     }
 
+    /// Past every kept frame, a press over a pane whose app reports the mouse
+    /// is not shux's: it focuses that pane and goes no further, so a drag
+    /// cannot open a selection under the app and copy it on release.
+    #[tokio::test]
+    async fn a_press_from_a_frame_no_longer_kept_over_a_mouse_app_opens_no_selection() {
+        let mut h = AppMouseHarness::new().await;
+        let tracking = b"\x1b[?1000h\x1b[?1006h";
+        let _wr = seed_scrollback_pane(&h.fixture.io_state, h.fixture.first_pane, tracking).await;
+        ship_frame(
+            &h.fixture.graph,
+            &h.fixture.io_state,
+            &h.session,
+            &h.client_size,
+        )
+        .await;
+        let shown = h.session.lock().await.shown.0.back().map(|(n, _)| *n);
+        for _ in 0..ShownFrames::KEPT + 10 {
+            ship_frame(
+                &h.fixture.graph,
+                &h.fixture.io_state,
+                &h.session,
+                &h.client_size,
+            )
+            .await;
+        }
+        let route = h.send_stamped(MouseKind::Down, 3, 3, shown).await;
+        h.fixture.stop();
+        assert!(
+            matches!(route, AppMouse::Consumed { .. }),
+            "the press fell through to shux's selection: {route:?}"
+        );
+    }
+
     /// A pane closed since the frame was drawn takes the click: it must not
     /// fall through to shux's handling at today's layout.
     #[tokio::test]
@@ -6574,6 +6639,8 @@ mod tests {
                 &self.fixture.graph,
                 &self.fixture.io_state,
                 &self.session,
+                &self.client_size,
+                &test_config(),
                 &self.border_drag,
                 &mut self.gesture,
             )
@@ -6621,6 +6688,8 @@ mod tests {
                 &self.fixture.graph,
                 &self.fixture.io_state,
                 &self.session,
+                &self.client_size,
+                &test_config(),
                 &self.border_drag,
                 &mut self.gesture,
             )
