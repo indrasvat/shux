@@ -249,8 +249,33 @@ fn emit(opts: &GateRunOptions, reports: &[ScenarioReport]) -> Result<(), OutputF
 /// Run the gate on one scenario and return the frozen exit code (task §4). This is the
 /// 082 entry `main.rs` dispatches to for the default `shux lens gate <scenario>`.
 pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Result<i32> {
-    // Before anything can write: a refusal further down still emits its report.
-    if let Some(code) = refuse_trace_alias(&opts, explicit_cast(&opts), false) {
+    // 085: `--trace -` and a stdout JSON report both claim stdout, and the result was
+    // NDJSON signals followed by the report array — unparseable, with no usage error and
+    // exit 0. The report stream is promised to carry ONLY the JSON, so this is a usage
+    // error, refused before anything else is read or written.
+    let stdout_is_json =
+        matches!(opts.format, OutputFormat::Json) || opts.report.as_deref() == Some("-");
+    if stdout_is_json && opts.trace.as_deref() == Some("-") {
+        eprintln!(
+            "{}",
+            crate::style::error(
+                "lens gate: --trace - and the JSON report both write to stdout, which would \
+                 make the report unparseable. Send the trace to a file instead (--trace \
+                 run.jsonl)."
+            )
+        );
+        let reports = parse_error_report(
+            &opts.scenario_path,
+            "--trace - collides with the stdout JSON report",
+        );
+        if let Err(e) = emit(&opts, &reports) {
+            return report_io_failure(e);
+        }
+        return Ok(GateStatus::ScenarioError.exit_code() as i32);
+    }
+    // Before anything is written. A bare `--cast` is checked again once the scenario
+    // names its file.
+    if let Some(code) = refuse_shared_outputs(&opts, explicit_cast(&opts)) {
         return Ok(code);
     }
     let scenario = match scenario::load(&opts.scenario_path) {
@@ -258,13 +283,8 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
         Err(e) => {
             // Preserve the 081 trace contract: a malformed scenario still leaves a
             // greppable `parse_error` in the trace.
-            let created = trace_file_is_new(&opts);
             let (lost_trace, reader_left) = match Trace::open(trace_target(opts.trace.clone())) {
                 Ok(mut trace) => {
-                    // No scenario name yet, so only an explicit `--cast PATH` can be named.
-                    if let Some(code) = refuse_trace_alias(&opts, explicit_cast(&opts), created) {
-                        return Ok(code);
-                    }
                     trace.parse_error(&e.to_string());
                     if trace.reader_left() {
                         (None, true)
@@ -308,31 +328,6 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
         return Ok(GateStatus::UpdateRefused.exit_code() as i32);
     }
 
-    // 085: `--trace -` and a stdout JSON report both claim stdout, and the result was
-    // NDJSON signals followed by the report array — unparseable, with no usage error and
-    // exit 0. The report stream is promised to carry ONLY the JSON, so this is a usage
-    // error, refused before anything spawns.
-    let stdout_is_json =
-        matches!(opts.format, OutputFormat::Json) || opts.report.as_deref() == Some("-");
-    if stdout_is_json && opts.trace.as_deref() == Some("-") {
-        eprintln!(
-            "{}",
-            crate::style::error(
-                "lens gate: --trace - and the JSON report both write to stdout, which would \
-                 make the report unparseable. Send the trace to a file instead (--trace \
-                 run.jsonl)."
-            )
-        );
-        let reports = parse_error_report(
-            &opts.scenario_path,
-            "--trace - collides with the stdout JSON report",
-        );
-        if let Err(e) = emit(&opts, &reports) {
-            return report_io_failure(e);
-        }
-        return Ok(GateStatus::ScenarioError.exit_code() as i32);
-    }
-
     let argv = if opts.argv.is_empty() {
         scenario.command.clone()
     } else {
@@ -368,10 +363,9 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
         return Ok(GateStatus::ScenarioError.exit_code() as i32);
     }
 
-    if let Some(code) = refuse_trace_alias(&opts, cast_path.as_deref(), false) {
+    if let Some(code) = refuse_shared_outputs(&opts, cast_path.as_deref()) {
         return Ok(code);
     }
-    let created = trace_file_is_new(&opts);
     let mut trace = match Trace::open(trace_target(opts.trace.clone())) {
         Ok(trace) => trace,
         Err(why) => {
@@ -384,9 +378,6 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
             return Ok(4);
         }
     };
-    if let Some(code) = refuse_trace_alias(&opts, cast_path.as_deref(), created) {
-        return Ok(code);
-    }
 
     let outcome = match runner::drive_scenario(
         socket_path,
@@ -541,51 +532,84 @@ fn bless_failure_exit(e: &anyhow::Error, code: i32) -> i32 {
     }
 }
 
-/// Refuses a `--report` or `--cast` naming the trace's file, before and again after the
-/// trace is created: one would silently overwrite the other. A refusal writes nothing,
-/// and removes the trace's file if this run `created` it.
-fn refuse_trace_alias(opts: &GateRunOptions, cast: Option<&Path>, created: bool) -> Option<i32> {
-    use std::os::unix::fs::MetadataExt;
-    let target = trace_target(opts.trace.clone())?;
-    let trace = runner::trace_file_id(&target)?;
-    let report = opts.report.as_deref().filter(|r| *r != "-").map(Path::new);
-    let (flag, path) = [("--report", report), ("--cast", cast)]
-        .into_iter()
-        .find_map(|(flag, path)| {
-            let path = path?;
-            let meta = std::fs::metadata(path).ok()?;
-            ((meta.dev(), meta.ino()) == trace).then_some((flag, path))
-        })?;
+/// Refuses a run whose outputs (the trace, the report, the cast, stdout) include the
+/// same regular file twice, before anything is written: one would overwrite the
+/// other. Every path is opened without truncating, creating it if absent, so links and
+/// files not there yet resolve as the kernel resolves them; what this creates, it
+/// removes again. A FIFO opens without blocking and is never compared, nor is a device.
+fn refuse_shared_outputs(opts: &GateRunOptions, cast: Option<&Path>) -> Option<i32> {
+    use std::os::fd::AsFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let regular_id = |meta: std::fs::Metadata| meta.is_file().then(|| (meta.dev(), meta.ino()));
+    let trace = opts.trace.as_deref();
+    let report = opts.report.as_deref();
+    let stdout = std::io::stdout()
+        .as_fd()
+        .try_clone_to_owned()
+        .ok()
+        .and_then(|fd| std::fs::File::from(fd).metadata().ok())
+        .and_then(regular_id);
+    // The trace first, so a clash names it.
+    let mut outputs: Vec<(String, (u64, u64))> = Vec::new();
+    if trace == Some("-")
+        && let Some(id) = stdout
+    {
+        outputs.push(("--trace -".to_string(), id));
+    }
+    let mut created: Vec<PathBuf> = Vec::new();
+    for (flag, path) in [
+        ("--trace", trace.filter(|t| *t != "-").map(Path::new)),
+        ("--report", report.filter(|r| *r != "-").map(Path::new)),
+        ("--cast", cast),
+    ] {
+        let Some(path) = path else { continue };
+        let existed = std::fs::metadata(path).is_ok();
+        let Ok(file) = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .custom_flags(nix::libc::O_NONBLOCK)
+            .open(path)
+        else {
+            continue;
+        };
+        if !existed {
+            created.push(path.to_path_buf());
+        }
+        if let Some(id) = file.metadata().ok().and_then(regular_id) {
+            outputs.push((format!("{flag} {}", path.display()), id));
+        }
+    }
+    if trace != Some("-")
+        && let Some(id) = stdout
+    {
+        outputs.push(("stdout".to_string(), id));
+    }
+    let clash = outputs.iter().enumerate().find_map(|(i, (later, id))| {
+        outputs[..i]
+            .iter()
+            .find(|(_, other)| other == id)
+            .map(|(earlier, _)| (later.clone(), earlier.clone()))
+    });
+    for path in &created {
+        if let Err(e) = std::fs::canonicalize(path).and_then(std::fs::remove_file) {
+            eprintln!(
+                "{}",
+                crate::style::warning(format!(
+                    "lens gate: could not remove {} after checking it: {e}",
+                    path.display()
+                ))
+            );
+        }
+    }
+    let (later, earlier) = clash?;
     eprintln!(
         "{}",
         crate::style::error(format!(
-            "lens gate: {flag} {} is the same file as --trace, so one would overwrite the \
-             other. Give them different files.",
-            path.display()
+            "lens gate: {later} is the same file as {earlier}, so one would overwrite the \
+             other. Give them different files."
         ))
     );
-    if created
-        && let TraceTarget::Path(p) = &target
-        && let Err(e) = std::fs::canonicalize(p).and_then(std::fs::remove_file)
-    {
-        eprintln!(
-            "{}",
-            crate::style::warning(format!(
-                "lens gate: could not remove the trace file {} this run created: {e}",
-                p.display()
-            ))
-        );
-    }
     Some(GateStatus::ScenarioError.exit_code() as i32)
-}
-
-/// Whether opening the trace will create a file (through a link, too), so a refusal
-/// can remove it.
-fn trace_file_is_new(opts: &GateRunOptions) -> bool {
-    match trace_target(opts.trace.clone()) {
-        Some(TraceTarget::Path(p)) => std::fs::metadata(p).is_err(),
-        _ => false,
-    }
 }
 
 /// `--cast PATH` as given; a bare `--cast` names a file only once the scenario does.

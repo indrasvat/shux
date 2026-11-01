@@ -131,21 +131,6 @@ impl Trace {
     }
 }
 
-/// The device and inode the trace would be written to, when that is a regular file.
-pub fn trace_file_id(target: &TraceTarget) -> Option<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
-    match target {
-        TraceTarget::Path(p) => std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino())),
-        TraceTarget::Stdout => {
-            let st = nix::sys::stat::fstat(std::io::stdout()).ok()?;
-            use nix::sys::stat::SFlag;
-            let regular = st.st_mode & SFlag::S_IFMT.bits() == SFlag::S_IFREG.bits();
-            // Same widening as std's `MetadataExt::dev`/`ino`.
-            regular.then_some((st.st_dev as u64, st.st_ino as u64))
-        }
-    }
-}
-
 /// A concurrent monitor for the scratch child's exit (design D7). Subscribes from a
 /// PRE-SPAWN sequence cursor so a fast-exiting child cannot publish its exit before we
 /// listen (codex's race). `notify_one` stores a permit so [`ExitMonitor::wait`] can

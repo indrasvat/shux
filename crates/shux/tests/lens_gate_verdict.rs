@@ -1424,3 +1424,83 @@ fn a_refused_alias_through_a_dangling_link_leaves_nothing() {
         );
     }
 }
+
+/// stdout is an output too: redirected onto the trace's file, the run is refused
+/// before either is written.
+#[test]
+fn stdout_redirected_onto_the_trace_is_refused() {
+    let h = Harness::new();
+    let d = tmp();
+    let scn = write_scenario(d.path(), "so", &scenario("so", "HI", None));
+    let trace = d.path().join("t.ndjson");
+    for report in [Some("-"), None] {
+        std::fs::write(&trace, "precious").unwrap();
+        let stdout = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&trace)
+            .unwrap();
+        let mut cmd = h.shux();
+        cmd.args(["lens", "gate", "--trace"]).arg(&trace);
+        if let Some(r) = report {
+            cmd.args(["--report", r]);
+        }
+        let out = cmd
+            .arg(&scn)
+            .env_remove("CI")
+            .stdout(stdout)
+            .output()
+            .expect("spawn shux lens gate");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "report {report:?}; stderr:\n{stderr}"
+        );
+        assert!(stderr.contains("same file as --trace"), "stderr:\n{stderr}");
+        assert_eq!(std::fs::read_to_string(&trace).unwrap(), "precious");
+    }
+}
+
+/// An alias through a link to a file not there yet is refused before the CI
+/// refusal writes its report, and nothing is left behind.
+#[test]
+fn an_alias_through_a_dangling_link_is_refused_before_any_report() {
+    let h = Harness::new();
+    let d = tmp();
+    let scn = write_scenario(d.path(), "ci", &scenario("ci", "HI", None));
+    let target = d.path().join("absent.json");
+    let link = d.path().join("trace-link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let out = gate(
+        &h,
+        &[
+            "--on-missing",
+            "create",
+            "--trace",
+            &link.to_string_lossy(),
+            "--report",
+            &target.to_string_lossy(),
+            &scn,
+        ],
+        true,
+    );
+    assert_eq!(out.exit, 2, "stderr:\n{}", out.stderr);
+    assert!(!target.exists(), "the refused run left the report behind");
+}
+
+/// The stdout collision holds for a malformed scenario too: stdout stays one
+/// parseable JSON report.
+#[test]
+fn a_malformed_scenario_cannot_mix_its_trace_into_the_json_report() {
+    let h = Harness::new();
+    let d = tmp();
+    let scn = write_scenario(d.path(), "bad", "name = \"bad\"\nnot toml [[[\n");
+    let out = gate(&h, &["--trace", "-", "--report", "-", &scn], false);
+    assert_eq!(out.exit, 2, "stderr:\n{}", out.stderr);
+    assert!(
+        out.stderr.contains("both write to stdout"),
+        "stderr:\n{}",
+        out.stderr
+    );
+    assert_eq!(out.report()[0].status, GateStatus::ScenarioError);
+}
