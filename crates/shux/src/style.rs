@@ -1393,8 +1393,8 @@ pub type Printed = Result<(), OutputError>;
 ///
 /// `Ok(false)` means the reader closed the pipe: the stream is over, and the
 /// caller ends successfully.
-pub fn print_stream(bytes: &[u8]) -> io::Result<bool> {
-    write_stream(&mut io::stdout().lock(), bytes)
+pub fn print_stream(bytes: &[u8]) -> Result<bool, OutputError> {
+    Ok(write_stream(&mut io::stdout().lock(), bytes)?)
 }
 
 fn write_stream(out: &mut impl Write, bytes: &[u8]) -> io::Result<bool> {

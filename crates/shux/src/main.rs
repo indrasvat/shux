@@ -20,7 +20,7 @@ fn main() {
         .before_help(style::banner())
         .long_about(cli::long_about())
         .after_long_help(cli::agent_help());
-    let matches = cmd.get_matches();
+    let matches = cmd.try_get_matches().unwrap_or_else(|e| exit_from_clap(&e));
     let args = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
     let result = if matches!(args.command, Some(Command::__daemon)) {
@@ -30,7 +30,14 @@ fn main() {
     } else {
         // Normal CLI client mode
         end_on_a_failed_print();
-        run_client(args)
+        run_client(args).and_then(|()| {
+            // A print without a final newline is still buffered here, and
+            // std's flush at exit ignores its error.
+            use std::io::Write as _;
+            std::io::stdout()
+                .flush()
+                .map_err(|e| style::OutputError(e).into())
+        })
     };
 
     if let Err(e) = result {
@@ -53,12 +60,14 @@ fn end_on_a_failed_print() {
             .map(String::as_str)
             .or_else(|| payload.downcast_ref::<&str>().copied())
             .unwrap_or("");
-        // std's own message for these prints; EPIPE reads "Broken pipe".
+        // std's own message for these prints, which ends in the errno.
         let cause = message
             .strip_prefix("failed printing to stdout: ")
             .or_else(|| message.strip_prefix("failed printing to stderr: "));
         match cause {
-            Some(cause) if cause.contains("Broken pipe") => die_of_sigpipe(),
+            Some(cause) if cause.ends_with(&format!("(os error {})", libc::EPIPE)) => {
+                die_of_sigpipe()
+            }
             Some(cause) => {
                 style::print_error(&format!("could not write output: {cause}"));
                 std::process::exit(1);
@@ -66,6 +75,22 @@ fn end_on_a_failed_print() {
             None => report(info),
         }
     }));
+}
+
+/// What `clap::Error::exit` does, without discarding a failed write: help or
+/// version that never arrived fails the command as any other output does.
+fn exit_from_clap(e: &clap::Error) -> ! {
+    match e.print() {
+        Ok(()) => {}
+        // A usage error goes to stderr, which cannot report its own failure.
+        Err(_) if e.use_stderr() => {}
+        Err(io) if io.kind() == std::io::ErrorKind::BrokenPipe => die_of_sigpipe(),
+        Err(io) => {
+            style::print_error(&format!("could not write output: {io}"));
+            std::process::exit(1);
+        }
+    }
+    std::process::exit(e.exit_code());
 }
 
 /// End the process as a write to a closed pipe does by default.
