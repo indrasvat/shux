@@ -1,3 +1,10 @@
+## [0.55.3](https://github.com/indrasvat/shux/compare/v0.55.2...v0.55.3) (2026-11-01)
+
+
+### Bug Fixes
+
+* **cli:** output that fails to write fails the command ([#243](https://github.com/indrasvat/shux/issues/243)) ([0037b76](https://github.com/indrasvat/shux/commit/0037b76996c3299801a8ae36ff20b5165aeb11de)), closes [#239](https://github.com/indrasvat/shux/issues/239) [#240](https://github.com/indrasvat/shux/issues/240)
+
 ## [0.55.2](https://github.com/indrasvat/shux/compare/v0.55.1...v0.55.2) (2026-11-01)
 
 
