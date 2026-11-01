@@ -807,3 +807,41 @@ async fn a_pane_inherits_no_descriptor_beyond_its_terminal() {
     assert!(alive, "the pane exited, so the pipe proves nothing");
     assert!(closed, "the pane still holds a pipe its spawner had open");
 }
+
+/// The output probe sees, from its own copy of the master fd, output the child
+/// wrote that nobody has read, and nothing once it has been read.
+#[tokio::test]
+async fn the_output_probe_sees_unread_output() {
+    const OUTPUT: &str = "queued-output";
+    let config = PtyConfig::with_command(
+        vec![
+            "sh".into(),
+            "-c".into(),
+            format!("printf {OUTPUT}; exec cat"),
+        ],
+        test_cwd(),
+    );
+    let mut handle = PtyHandle::spawn(&config).unwrap();
+    let probe = handle.output_probe().unwrap();
+
+    shux_testkit::wait_until_async("the child's output is queued", || async {
+        probe.has_output().unwrap()
+    })
+    .await;
+
+    let mut buf = [0u8; 64];
+    let mut got = Vec::new();
+    tokio::time::timeout(shux_testkit::BUDGET, async {
+        while got.len() < OUTPUT.len() {
+            let n = handle.read(&mut buf).await.unwrap();
+            got.extend_from_slice(&buf[..n]);
+        }
+    })
+    .await
+    .expect("read the queued output");
+    assert_eq!(String::from_utf8_lossy(&got), OUTPUT);
+    assert!(
+        !probe.has_output().unwrap(),
+        "read output is no longer queued"
+    );
+}
