@@ -1,3 +1,10 @@
+## [0.55.1](https://github.com/indrasvat/shux/compare/v0.55.0...v0.55.1) (2026-11-01)
+
+
+### Bug Fixes
+
+* **record:** a pane recording and the command that owns it end together ([#238](https://github.com/indrasvat/shux/issues/238)) ([1bdb525](https://github.com/indrasvat/shux/commit/1bdb5250d8f17ee7eab074250beb1d3dfaf8d8f9)), closes [#237](https://github.com/indrasvat/shux/issues/237) [#237](https://github.com/indrasvat/shux/issues/237)
+
 # [0.55.0](https://github.com/indrasvat/shux/compare/v0.54.14...v0.55.0) (2026-11-01)
 
 
