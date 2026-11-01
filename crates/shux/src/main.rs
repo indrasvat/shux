@@ -32,8 +32,12 @@ fn main() {
         end_on_a_failed_print();
         run_client(args).and_then(|()| {
             // A print without a final newline is still buffered here, and
-            // std's flush at exit ignores its error.
+            // std's flush at exit ignores its error. A stream whose reader
+            // left has nothing more to deliver.
             use std::io::Write as _;
+            if style::stream_reader_gone() {
+                return Ok(());
+            }
             std::io::stdout()
                 .flush()
                 .map_err(|e| style::OutputError(e).into())

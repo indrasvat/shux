@@ -1394,7 +1394,21 @@ pub type Printed = Result<(), OutputError>;
 /// `Ok(false)` means the reader closed the pipe: the stream is over, and the
 /// caller ends successfully.
 pub fn print_stream(bytes: &[u8]) -> Result<bool, OutputError> {
-    Ok(write_stream(&mut io::stdout().lock(), bytes)?)
+    let open = write_stream(&mut io::stdout().lock(), bytes)?;
+    if !open {
+        STREAM_READER_GONE.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(open)
+}
+
+/// Set once a stream's reader has closed the pipe: stdout's buffer may still
+/// hold the bytes that write failed on, and nothing should write them again.
+static STREAM_READER_GONE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a stream ended because its reader went away.
+pub fn stream_reader_gone() -> bool {
+    STREAM_READER_GONE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 fn write_stream(out: &mut impl Write, bytes: &[u8]) -> io::Result<bool> {
