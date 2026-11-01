@@ -27,7 +27,7 @@ authors = ["indrasvat"]
 [workspace.dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
-tokio-util = { version = "0.7", features = ["codec"] }
+tokio-util = { version = "0.7", features = ["codec", "rt"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

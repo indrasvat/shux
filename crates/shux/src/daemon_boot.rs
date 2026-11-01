@@ -42,7 +42,7 @@ pub fn run_daemon(socket_override: Option<PathBuf>) -> anyhow::Result<()> {
 
     // Step 2: Now we are the daemon process — create tokio runtime
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
+    let served = rt.block_on(async {
         // Initialize tracing (to file, since stdio is /dev/null)
         // TODO: Set up file-based tracing subscriber
         tracing_subscriber::fmt()
@@ -140,7 +140,11 @@ pub fn run_daemon(socket_override: Option<PathBuf>) -> anyhow::Result<()> {
         tracing::info!("Daemon shut down cleanly");
 
         Ok::<(), anyhow::Error>(())
-    })?;
+    });
+    // A write stuck in the blocking pool (a stalled FIFO reader, a hung
+    // filesystem) must not hold the process past its drain budgets.
+    rt.shutdown_timeout(std::time::Duration::from_secs(1));
+    served?;
 
     Ok(())
 }
@@ -567,7 +571,9 @@ pub(crate) async fn run_rpc_server(
     // chunks land on its data plane, separate from
     // `events.history`. See `docs/PR2c-DESIGN.md`.
     let io_state = Arc::new(Mutex::new(
-        PaneIoState::new().with_event_bus(event_bus.clone()),
+        PaneIoState::new()
+            .with_event_bus(event_bus.clone())
+            .with_shutdown(cancel.clone()),
     ));
     let shutdown_io_state = io_state.clone();
 
@@ -851,8 +857,10 @@ pub(crate) async fn run_rpc_server(
 }
 
 pub(crate) async fn shutdown_all_pane_io(io_state: Arc<Mutex<PaneIoState>>) {
-    let (done, teardown_waiters) = {
+    let (done, teardown_waiters, recordings) = {
         let mut state = io_state.lock().await;
+        state.recordings.close_admission();
+        let recordings = state.recordings.clone();
         let pane_ids: Vec<_> = state
             .shutdowns
             .keys()
@@ -874,7 +882,7 @@ pub(crate) async fn shutdown_all_pane_io(io_state: Arc<Mutex<PaneIoState>>) {
         let teardown_waiters = std::mem::take(&mut state.teardown_waiters);
         drop(state);
         pulse.bump();
-        (done, teardown_waiters)
+        (done, teardown_waiters, recordings)
     };
 
     let wait_all = async move {
@@ -890,6 +898,15 @@ pub(crate) async fn shutdown_all_pane_io(io_state: Arc<Mutex<PaneIoState>>) {
         .is_err()
     {
         tracing::warn!("timed out waiting for pane PTY tasks during daemon shutdown");
+    }
+    // Its own budget: a slow PTY drain must not cost a recording its tail.
+    recordings.stop_all(crate::pane_record::EndedBy::DaemonShutdown);
+    let unfinished = recordings.drain(Duration::from_secs(3)).await;
+    if !unfinished.is_empty() {
+        tracing::error!(
+            ?unfinished,
+            "recordings still writing when daemon shutdown gave up on them"
+        );
     }
 }
 

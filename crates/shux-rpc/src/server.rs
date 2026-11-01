@@ -11,6 +11,7 @@ use futures::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, UnixStream};
 #[cfg(test)]
 use tokio_util::codec::Framed;
+use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, error, info, warn};
 
 use crate::codec::{MAX_FRAME_SIZE, create_codec};
@@ -424,6 +425,9 @@ where
 
     use tokio_util::codec::{FramedRead, FramedWrite};
 
+    // Cancelled however serving ends, the serving future being dropped included.
+    let life = tokio_util::sync::CancellationToken::new();
+    let _life = life.clone().drop_guard();
     let mut framed_tx = FramedWrite::new(write_half, create_codec());
     let (frame_tx, mut frame_rx) =
         tokio::sync::mpsc::unbounded_channel::<Result<bytes::BytesMut, std::io::Error>>();
@@ -440,18 +444,18 @@ where
     // is detected promptly whether or not the read task has seen EOF yet.
     let monitor_task = monitor.map(|m| {
         let monitor_closed = conn_closed.clone();
-        tokio::spawn(async move {
+        AbortOnDropHandle::new(tokio::spawn(async move {
             m.peer_dead().await;
             debug!("peer fully closed; cancelling connection");
             monitor_closed.cancel();
-        })
+        }))
     });
     let have_monitor = monitor_task.is_some();
 
     let read_closed = conn_closed.clone();
     let read_pending = pending_frames.clone();
     let read_bytes = pending_bytes.clone();
-    let read_task = tokio::spawn(async move {
+    let read_task = AbortOnDropHandle::new(tokio::spawn(async move {
         let mut framed_rx = FramedRead::new(read_half, create_codec());
         // Which exits CANCEL the connection: IO-level read errors and cap
         // violations do; clean EOF (half-close — codex-bot PR #90 P2) and
@@ -545,7 +549,7 @@ where
         if cancel_on_exit {
             read_closed.cancel();
         }
-    });
+    }));
 
     // Executor loop. Errors (`?` on writes) must still abort the read task,
     // so run the loop in an inner async block and join on `result` below.
@@ -625,7 +629,10 @@ where
                     debug!("client disconnected mid-request; dropping in-flight handler");
                     break;
                 }
-                response = process_frame(data, &router) => response,
+                response = crate::connection::with_connection(
+                    life.clone(),
+                    process_frame(data, &router),
+                ) => response,
             };
             let response_bytes = serde_json::to_vec(&response)?;
             framed_tx.send(Bytes::from(response_bytes)).await?;
@@ -1108,6 +1115,170 @@ mod tests {
 
         cancel.cancel();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server_handle).await;
+    }
+
+    /// A router whose `test.life` captures the serving connection's lifetime
+    /// and answers once `release` is notified (a permit is queued up front
+    /// when the test does not need to hold the request).
+    fn life_router() -> (
+        Router,
+        Arc<std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>>,
+        Arc<tokio::sync::Notify>,
+    ) {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (seen_h, release_h) = (seen.clone(), release.clone());
+        let router = register_builtin_methods(Router::builder())
+            .register("test.life", move |_: Option<serde_json::Value>| {
+                let (seen, release) = (seen_h.clone(), release_h.clone());
+                async move {
+                    *seen.lock().unwrap() = crate::connection::current_connection();
+                    release.notified().await;
+                    Ok(serde_json::json!("served"))
+                }
+            })
+            .build();
+        (router, seen, release)
+    }
+
+    async fn serve_life(
+        dir: &std::path::Path,
+    ) -> (
+        std::path::PathBuf,
+        tokio_util::sync::CancellationToken,
+        Arc<std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>>,
+        Arc<tokio::sync::Notify>,
+    ) {
+        let socket_path = dir.join("life.sock");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (router, seen, release) = life_router();
+        let server = Server::new(
+            ServerConfig {
+                socket_path: socket_path.clone(),
+                tcp_addr: String::new(),
+                auth_token: None,
+            },
+            router,
+            cancel.clone(),
+        );
+        serve(server).await;
+        (socket_path, cancel, seen, release)
+    }
+
+    #[tokio::test]
+    async fn a_connections_lifetime_ends_when_its_client_hangs_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let (socket_path, cancel, seen, release) = serve_life(dir.path()).await;
+        release.notify_one();
+        let mut framed = Framed::new(
+            UnixStream::connect(&socket_path).await.unwrap(),
+            create_codec(),
+        );
+        framed
+            .send(frame_bytes(
+                &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "test.life"}),
+            ))
+            .await
+            .unwrap();
+        let response: serde_json::Value =
+            serde_json::from_slice(&framed.next().await.unwrap().unwrap()).unwrap();
+        assert_eq!(response["result"], "served");
+        let life = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("a served request has a lifetime");
+        assert!(!life.is_cancelled(), "the client is still connected");
+
+        drop(framed);
+        tokio::time::timeout(shux_testkit::BUDGET, life.cancelled())
+            .await
+            .expect("the lifetime outlived the connection");
+        cancel.cancel();
+    }
+
+    /// Half-closing after the last request still gets it answered: the
+    /// lifetime ends only once serving does.
+    #[tokio::test]
+    async fn a_half_closed_client_is_answered_before_its_lifetime_ends() {
+        use tokio::io::AsyncWriteExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (socket_path, cancel, seen, release) = serve_life(dir.path()).await;
+        let (read, mut write) = UnixStream::connect(&socket_path)
+            .await
+            .unwrap()
+            .into_split();
+        let mut tx = tokio_util::codec::FramedWrite::new(&mut write, create_codec());
+        tx.send(frame_bytes(
+            &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "test.life"}),
+        ))
+        .await
+        .unwrap();
+        drop(tx);
+        let life = shux_testkit::wait_for_async("the request to be served", || {
+            let seen = seen.clone();
+            async move { seen.lock().unwrap().clone() }
+        })
+        .await;
+        write.shutdown().await.unwrap();
+
+        assert!(
+            !life.is_cancelled(),
+            "a half-closed client's request is still being served"
+        );
+        release.notify_one();
+        let mut rx = tokio_util::codec::FramedRead::new(read, create_codec());
+        let response: serde_json::Value =
+            serde_json::from_slice(&rx.next().await.unwrap().unwrap()).unwrap();
+        assert_eq!(response["result"], "served");
+        tokio::time::timeout(shux_testkit::BUDGET, life.cancelled())
+            .await
+            .expect("the lifetime outlived serving");
+        cancel.cancel();
+    }
+
+    /// Dropping a connection's serving future also ends its reader and
+    /// peer-death watcher, which would otherwise wait on a live client forever.
+    #[tokio::test]
+    async fn dropping_a_served_connection_ends_its_child_tasks() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let tasks = || {
+            tokio::runtime::Handle::current()
+                .metrics()
+                .num_alive_tasks()
+        };
+        let before = tasks();
+        let monitor = PeerDeathMonitor::try_new(&server);
+        assert!(
+            monitor.is_some(),
+            "no peer-death monitor: the test would prove nothing"
+        );
+        let (read_half, write_half) = server.into_split();
+        let serving = tokio::spawn(serve_connection(
+            read_half,
+            write_half,
+            register_builtin_methods(Router::builder()).build(),
+            tokio_util::sync::CancellationToken::new(),
+            ConnAuth::Trusted,
+            true,
+            monitor,
+        ));
+        shux_testkit::wait_until_async("the connection and its children to start", || async {
+            tasks() == before + 3
+        })
+        .await;
+
+        serving.abort();
+        let _ = serving.await;
+        let ended =
+            shux_testkit::poll_until_async(shux_testkit::BUDGET, || async { tasks() == before })
+                .await;
+        assert!(
+            ended,
+            "{} child tasks outlived their connection",
+            tasks() - before
+        );
+        drop(client);
     }
 
     #[tokio::test]

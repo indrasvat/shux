@@ -7,6 +7,7 @@
 pub mod attach;
 pub mod caller;
 pub mod codec;
+pub mod connection;
 pub mod error;
 pub mod policy;
 pub mod router;
@@ -20,6 +21,7 @@ pub use attach::{
 };
 pub use caller::{current_caller, with_caller};
 pub use codec::{MAX_FRAME_SIZE, create_codec};
+pub use connection::current_connection;
 pub use error::{ErrorCode, RpcError};
 pub use policy::{Policy, Sensitivity};
 pub use router::{Handler, Router, RouterBuilder};

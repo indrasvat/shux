@@ -15,7 +15,7 @@ use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use crate::pane_input::{PaneInput, PaneInputRx};
 use crate::pane_io::{PASTE_END, PASTE_START, PaneIoState, PaneRevision, ResizeRequest};
 use crate::pane_record::{
-    PaneRecorder, finish_pane_recorders, tee_pane_recorders, tee_pane_resize_recorders,
+    Prepared, finish_pane_recorders, tee_pane_recorders, tee_pane_resize_recorders,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -925,7 +925,7 @@ pub(crate) async fn spawn_pane_pty_with_recorder(
     io_state: Arc<Mutex<PaneIoState>>,
     shutdown: tokio_util::sync::CancellationToken,
     graph: shux_core::graph::GraphHandle,
-    cast_recorder: Option<PaneRecorder>,
+    cast_recorder: Option<Prepared>,
 ) -> Result<(), shux_pty::PtyError> {
     // One spawn per pane, decided before anything forks. A second spawn
     // waits for one in flight and reports its outcome, or finds the pane
@@ -1024,7 +1024,7 @@ async fn spawn_pane_pty_unshared(
     io_state: Arc<Mutex<PaneIoState>>,
     shutdown: tokio_util::sync::CancellationToken,
     graph: shux_core::graph::GraphHandle,
-    cast_recorder: Option<PaneRecorder>,
+    cast_recorder: Option<Prepared>,
 ) -> Result<(), shux_pty::PtyError> {
     let (argv, env) = resolve_pane_spawn(command, &daemon_shell_config(), extra_env, env_clear);
     let mut config = if argv.is_empty() {
@@ -1127,8 +1127,10 @@ async fn spawn_pane_pty_unshared(
         }
         // Arm the cast recorder in the SAME lock, before the read task spawns, so no output can
         // race ahead of it (task 083).
-        if let Some(rec) = cast_recorder {
-            state.recorders.entry(pane_id).or_default().push(rec);
+        if let Some(rec) = cast_recorder
+            && let Err(e) = rec.commit(pane_id, Some((size.cols, size.rows)))
+        {
+            tracing::error!(%pane_id, error = %e, "cast recorder not armed");
         }
     }
 
@@ -1674,28 +1676,30 @@ mod tests {
         };
         spawn(None).await.unwrap();
         let first_done = h.io.lock().await.pty_done.remove(&pane).unwrap();
-        let rec = crate::pane_record::open_cast_recorder(dir.path().join("s.cast"), 80, 24)
+        let recordings = h.io.lock().await.recordings.clone();
+        let rec = recordings
+            .prepare(&dir.path().join("s.cast"), true, None)
             .await
             .unwrap();
-        let outcome = rec.outcome.clone();
+        let (outcome, _) = recordings.watch(rec.id()).unwrap();
         spawn(Some(rec)).await.unwrap();
         tokio::time::timeout(shux_testkit::BUDGET, first_done)
             .await
             .expect("the replaced task finishes")
             .ok();
-        // Any Finish the predecessor sent is queued ahead of this fence on
-        // the recorder's own channel, so it is processed before the fence is.
+        // A predecessor's end is decided under the lock this tee takes, so
+        // by the time the fence is admitted, any such end has happened.
         crate::pane_record::tee_pane_recorders(&h.io, pane, None, b"FENCE", &h.cancel).await;
         let cast = dir.path().join("s.cast");
         shux_testkit::wait_until_async("the recorder to reach the fence or stop", || async {
-            outcome.lock().unwrap().status != crate::pane_record::PaneRecordStatus::Recording
+            outcome.borrow().finalized
                 || std::fs::read_to_string(&cast).is_ok_and(|c| c.contains("FENCE"))
         })
         .await;
-        assert_eq!(
-            outcome.lock().unwrap().status,
-            crate::pane_record::PaneRecordStatus::Recording,
-            "the successor's recording was finished by its predecessor"
+        let now = outcome.borrow().clone();
+        assert!(
+            now.ended_by.is_none() && !now.finalized,
+            "the successor's recording was ended by its predecessor: {now:?}"
         );
         h.stop().await;
     }
@@ -1707,10 +1711,12 @@ mod tests {
         let h = crate::rpc::test_harness::RpcHarness::new();
         let (_s, _w, pane) = h.seed_session("kill-rec").await;
         let dir = tempfile::tempdir().unwrap();
-        let rec = crate::pane_record::open_cast_recorder(dir.path().join("k.cast"), 80, 24)
+        let recordings = h.io.lock().await.recordings.clone();
+        let rec = recordings
+            .prepare(&dir.path().join("k.cast"), true, None)
             .await
             .unwrap();
-        let outcome = rec.outcome.clone();
+        let (mut outcome, _) = recordings.watch(rec.id()).unwrap();
         spawn_pane_pty_with_recorder(
             pane,
             "/tmp".into(),
@@ -1730,13 +1736,17 @@ mod tests {
         for rx in done {
             let _ = tokio::time::timeout(shux_testkit::BUDGET, rx).await;
         }
-        shux_testkit::wait_until_async("the killed pane's recording to finish", || async {
-            outcome.lock().unwrap().status != crate::pane_record::PaneRecordStatus::Recording
-        })
-        .await;
+        let ended = tokio::time::timeout(shux_testkit::BUDGET, outcome.wait_for(|o| o.finalized))
+            .await
+            .expect("the killed pane's recording never finished")
+            .unwrap()
+            .clone();
         assert_eq!(
-            outcome.lock().unwrap().status,
-            crate::pane_record::PaneRecordStatus::Complete,
+            (ended.status, ended.ended_by),
+            (
+                crate::pane_record::PaneRecordStatus::Complete,
+                Some(crate::pane_record::EndedBy::PaneExit)
+            ),
             "a recording on a killed pane ended other than complete"
         );
         h.stop().await;

@@ -153,6 +153,11 @@ pub fn channel_with(slots: usize, budget: usize) -> (PaneWriter, PaneInputRx) {
 }
 
 impl PaneWriter {
+    /// The pane's PTY task has stopped taking input.
+    pub fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+
     /// Room for a chunk of `len` bytes, waiting for it. Fails once the pane
     /// is gone.
     pub async fn reserve(&self, len: usize) -> Result<InputPermit, SendError<()>> {

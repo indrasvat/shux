@@ -38,6 +38,7 @@ const EXPECTED_SURFACE: &[&str] = &[
     "pane.output.watch => ContentRead",
     "pane.record.start => PluginsForbidden",
     "pane.record.stop => PluginsForbidden",
+    "pane.record.wait => PluginsForbidden",
     "pane.resize => OwnedMutation",
     "pane.run_command => OwnedMutation",
     "pane.send_keys => OwnedMutation",

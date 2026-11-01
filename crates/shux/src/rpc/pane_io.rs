@@ -11,10 +11,27 @@ use crate::lens_render::{
     glance_row_text, lens_pixel_budget_check, parse_glance_masks, render_lens_heat_png,
 };
 use crate::pane_io::{PaneIoState, ResizeRequest, diff_lookup_checkpoint};
-use crate::pane_record::{
-    PANE_RECORD_COMPLETED_TTL, PaneRecordChunk, PaneRecordFormat, PaneRecordStatus, PaneRecorder,
-    spawn_pane_recorder,
-};
+use crate::pane_record::{EndedBy, requested_length};
+
+/// How long `pane.record.stop` waits for the file to be finished.
+const STOP_FINALIZE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The pane's PTY task still takes input: it closes that channel before it
+/// ends the pane's recordings, and drops its writer only later.
+fn pane_takes_input(state: &PaneIoState, pane: shux_core::model::PaneId) -> bool {
+    state.writers.get(&pane).is_some_and(|w| !w.is_closed())
+}
+
+fn recording_id_param(
+    params: Option<&serde_json::Value>,
+) -> Result<uuid::Uuid, shux_rpc::RpcError> {
+    params
+        .and_then(|p| p.get("recording_id"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'recording_id' parameter"))?
+        .parse()
+        .map_err(|_| shux_rpc::RpcError::invalid_params("invalid recording_id format"))
+}
 use crate::rpc::params::{
     required_str, resolve_pane_id_from_params, resolve_session_ref, resolve_window_id_from_params,
 };
@@ -101,6 +118,7 @@ pub(crate) fn register_pane_io_methods(
     let io14 = io_state.clone(); // pane.wait_settled
     let io15 = io_state.clone(); // pane.checkpoint
     let io16 = io_state.clone(); // pane.diff_since
+    let io_wait = io_state.clone(); // pane.record.wait
     let io12 = io_state;
 
     // Shared rasterizer for `pane.snapshot` / `window.snapshot` / `session.snapshot`.
@@ -596,122 +614,76 @@ pub(crate) fn register_pane_io_methods(
                         }
                     }
 
-                    // Verify the pane is live and not already recording, and (for cast) read its
-                    // current geometry for the asciinema header — all in one critical section.
-                    let record_format = {
+                    // Captured here: the connection's lifetime does not cross a spawn.
+                    let owned = match params.get("owned_by_connection") {
+                        None | Some(serde_json::Value::Null) => false,
+                        Some(serde_json::Value::Bool(owned)) => *owned,
+                        Some(_) => {
+                            return Err(shux_rpc::RpcError::invalid_params(
+                                "owned_by_connection must be a boolean",
+                            ));
+                        }
+                    };
+                    let owner = if owned {
+                        Some(shux_rpc::current_connection().ok_or_else(|| {
+                            shux_rpc::RpcError::invalid_params(
+                                "owned_by_connection needs a socket connection to own the recording",
+                            )
+                        })?)
+                    } else {
+                        None
+                    };
+                    let recordings = {
                         let state = io.lock().await;
-                        if !state.writers.contains_key(&pane_id) {
+                        if !pane_takes_input(&state, pane_id) {
                             return Err(shux_rpc::RpcError::not_found(
                                 "live pane PTY",
                                 &pane_id.to_string(),
                             ));
                         }
-                        if state.recorders.get(&pane_id).is_some_and(|recorders| {
-                            recorders.iter().any(|r| {
-                                r.outcome.lock().expect("record outcome poisoned").status
-                                    == PaneRecordStatus::Recording
-                            })
-                        }) {
-                            return Err(shux_rpc::RpcError::name_conflict(
-                                "pane recording",
+                        state.recordings.clone()
+                    };
+                    let prepared = recordings
+                        .prepare(&path, overwrite, Some(pane_id))
+                        .await
+                        .map_err(|e| e.to_rpc(pane_id))?;
+                    // Checked and committed under one lock: either the pane's
+                    // input is seen closed here, or its PTY task, which needs
+                    // this lock to end the pane's recordings, ends this one.
+                    let (recording_id, path) = {
+                        let state = io.lock().await;
+                        if !pane_takes_input(&state, pane_id) {
+                            return Err(shux_rpc::RpcError::not_found(
+                                "live pane PTY",
                                 &pane_id.to_string(),
                             ));
                         }
-                        if cast {
+                        // A cast's header geometry is the pane's as output starts.
+                        let cast_size = if cast {
                             let vt = state.vts.get(&pane_id).ok_or_else(|| {
                                 shux_rpc::RpcError::not_found("pane VT", &pane_id.to_string())
                             })?;
-                            PaneRecordFormat::Cast {
-                                cols: vt.grid().cols() as u16,
-                                rows: vt.grid().rows() as u16,
-                            }
+                            Some((vt.grid().cols() as u16, vt.grid().rows() as u16))
                         } else {
-                            PaneRecordFormat::Raw
-                        }
+                            None
+                        };
+                        prepared
+                            .commit(pane_id, cast_size)
+                            .map_err(|e| e.to_rpc(pane_id))?
                     };
-
-                    let (sender, outcome, task) =
-                        spawn_pane_recorder(path.clone(), overwrite, record_format)
-                            .await
-                            .map_err(|e| shux_rpc::RpcError::internal(&e))?;
-                    let recording_id = uuid::Uuid::new_v4();
-                    let mut state = io.lock().await;
-                    if !state.writers.contains_key(&pane_id) {
-                        drop(state);
-                        let _ = sender
-                            .send(PaneRecordChunk::Finish {
-                                status: PaneRecordStatus::Aborted,
-                            })
-                            .await;
-                        let _ = task.await;
-                        return Err(shux_rpc::RpcError::not_found(
-                            "live pane PTY",
-                            &pane_id.to_string(),
-                        ));
+                    if let Some(owner) = owner {
+                        recordings.end_when(
+                            recording_id,
+                            owner.cancelled_owned(),
+                            EndedBy::OwnerDisconnected,
+                        );
                     }
-                    state
-                        .recorders
-                        .entry(pane_id)
-                        .or_default()
-                        .push(PaneRecorder {
-                            id: recording_id,
-                            path: path.clone(),
-                            sender: sender.clone(),
-                            outcome: outcome.clone(),
-                            task,
-                        });
-                    drop(state);
-
                     if let Some(ms) = duration_ms {
-                        let io_for_deadline = io.clone();
-                        tokio::spawn(async move {
-                            #[expect(
-                                clippy::disallowed_methods,
-                                reason = "duration_ms is the recording's requested length"
-                            )]
-                            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-                            let deadline_sender = {
-                                let state = io_for_deadline.lock().await;
-                                state.recorders.get(&pane_id).and_then(|recorders| {
-                                    recorders
-                                        .iter()
-                                        .find(|r| r.id == recording_id)
-                                        .and_then(|r| {
-                                            let status = r
-                                                .outcome
-                                                .lock()
-                                                .expect("record outcome poisoned")
-                                                .status;
-                                            (status == PaneRecordStatus::Recording)
-                                                .then(|| r.sender.clone())
-                                        })
-                                })
-                            };
-                            if let Some(sender) = deadline_sender {
-                                let _ = sender
-                                    .send(PaneRecordChunk::Finish {
-                                        status: PaneRecordStatus::Complete,
-                                    })
-                                    .await;
-                            }
-                            #[expect(
-                                clippy::disallowed_methods,
-                                reason = "a finished recording stays queryable for its TTL"
-                            )]
-                            tokio::time::sleep(PANE_RECORD_COMPLETED_TTL).await;
-                            let mut state = io_for_deadline.lock().await;
-                            for recorders in state.recorders.values_mut() {
-                                if let Some(pos) = recorders.iter().position(|r| {
-                                    r.id == recording_id
-                                        && r.outcome.lock().expect("record outcome poisoned").status
-                                            != PaneRecordStatus::Recording
-                                }) {
-                                    recorders.remove(pos);
-                                    break;
-                                }
-                            }
-                            state.recorders.retain(|_, recorders| !recorders.is_empty());
-                        });
+                        recordings.end_when(
+                            recording_id,
+                            requested_length(std::time::Duration::from_millis(ms)),
+                            EndedBy::Duration,
+                        );
                     }
 
                     Ok(serde_json::json!({
@@ -731,83 +703,45 @@ pub(crate) fn register_pane_io_methods(
             move |params: Option<serde_json::Value>| {
                 let io = io12.clone();
                 async move {
-                    let params = params.unwrap_or_default();
-                    let recording_id_str = params
-                        .get("recording_id")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| {
-                            shux_rpc::RpcError::invalid_params("missing 'recording_id' parameter")
-                        })?;
-                    let recording_id: uuid::Uuid = recording_id_str.parse().map_err(|_| {
-                        shux_rpc::RpcError::invalid_params("invalid recording_id format")
-                    })?;
-
-                    let recorder = {
-                        let mut state = io.lock().await;
-                        let mut found = None;
-                        for recorders in state.recorders.values_mut() {
-                            if let Some(pos) = recorders.iter().position(|r| r.id == recording_id) {
-                                found = Some(recorders.remove(pos));
-                                break;
-                            }
-                        }
-                        state.recorders.retain(|_, recorders| !recorders.is_empty());
-                        found
+                    let id = recording_id_param(params.as_ref())?;
+                    let recordings = io.lock().await.recordings.clone();
+                    let (mut outcome, path) = recordings
+                        .watch(id)
+                        .ok_or_else(|| shux_rpc::RpcError::not_found("pane recording", &id.to_string()))?;
+                    recordings.stop(id, EndedBy::Stop);
+                    let finished = tokio::time::timeout(
+                        STOP_FINALIZE_BUDGET,
+                        outcome.wait_for(|o| o.finalized),
+                    )
+                    .await
+                    .is_ok();
+                    let mut reply = outcome.borrow().to_json(id, &path);
+                    if !finished {
+                        reply["pending"] = serde_json::json!(
+                            "still finalizing; call pane.record.stop or pane.record.wait again"
+                        );
                     }
-                    .ok_or_else(|| {
-                        shux_rpc::RpcError::not_found("pane recording", recording_id_str)
-                    })?;
-
-                    let should_finish = recorder
-                        .outcome
-                        .lock()
-                        .expect("record outcome poisoned")
-                        .status
-                        == PaneRecordStatus::Recording;
-                    if should_finish {
-                        let _ = recorder
-                            .sender
-                            .send(PaneRecordChunk::Finish {
-                                status: PaneRecordStatus::Complete,
-                            })
-                            .await;
-                    }
-                    drop(recorder.sender);
-                    let join_result =
-                        tokio::time::timeout(std::time::Duration::from_secs(5), recorder.task)
-                            .await;
-                    match join_result {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => {
-                            let mut outcome =
-                                recorder.outcome.lock().expect("record outcome poisoned");
-                            outcome.status = PaneRecordStatus::Error;
-                            outcome.error = Some(format!("pane recorder task failed: {e}"));
-                        }
-                        Err(_) => {
-                            let mut outcome =
-                                recorder.outcome.lock().expect("record outcome poisoned");
-                            if outcome.status == PaneRecordStatus::Recording {
-                                outcome.status = PaneRecordStatus::Error;
-                                outcome.error =
-                                    Some("timed out while finalizing pane recording".to_string());
-                            }
-                        }
-                    }
-                    let result = recorder
-                        .outcome
-                        .lock()
-                        .expect("record outcome poisoned")
-                        .clone();
-
-                    Ok(serde_json::json!({
-                        "recording_id": recording_id.to_string(),
-                        "path": recorder.path.display().to_string(),
-                        "bytes_written": result.bytes_written,
-                        "status": result.status.as_str(),
-                        "lossless": result.status == PaneRecordStatus::Complete,
-                        "error": result.error,
-                    }))
+                    Ok(reply)
+                }
+            },
+        )
+        .register_with_policy(
+            "pane.record.wait",
+            Policy::fixed(Sensitivity::PluginsForbidden),
+            move |params: Option<serde_json::Value>| {
+                let io = io_wait.clone();
+                async move {
+                    let id = recording_id_param(params.as_ref())?;
+                    let recordings = io.lock().await.recordings.clone();
+                    let (mut outcome, path) = recordings
+                        .watch(id)
+                        .ok_or_else(|| shux_rpc::RpcError::not_found("pane recording", &id.to_string()))?;
+                    let done = outcome
+                        .wait_for(|o| o.finalized)
+                        .await
+                        .map_err(|_| shux_rpc::RpcError::internal("recording abandoned"))?
+                        .to_json(id, &path);
+                    Ok(done)
                 }
             },
         )
@@ -2039,6 +1973,210 @@ mod tests {
         harness.stop().await;
     }
 
+    /// Two starts racing on one pane: one wins, and the loser leaves the
+    /// winner's recording (and its own file) alone.
+    #[tokio::test]
+    async fn overlapping_starts_on_one_pane_admit_one_recording() {
+        let harness = RpcHarness::new();
+        let (_session_id, _window_id, pane_id) = harness.seed_session("record-race").await;
+        let _writer_rx = harness.seed_io(pane_id, b"ready\n").await;
+        let dir = tempfile::tempdir().unwrap();
+        let start = |name: &str| {
+            let router = harness.router.clone();
+            let params = serde_json::json!({
+                "pane_id": pane_id.to_string(),
+                "path": dir.path().join(name).display().to_string(),
+            });
+            async move { router.dispatch("pane.record.start", Some(params)).await }
+        };
+        let (a, b) = tokio::join!(start("a.bin"), start("b.bin"));
+        assert_eq!(
+            usize::from(a.is_ok()) + usize::from(b.is_ok()),
+            1,
+            "both overlapping starts registered a recorder: {a:?} / {b:?}"
+        );
+        harness.stop().await;
+    }
+
+    /// A chunk a tee admitted (it took the recorder's sender) is written even
+    /// when a stop runs between the tee taking the sender and sending on it.
+    #[tokio::test]
+    async fn a_stop_does_not_overtake_a_chunk_already_admitted() {
+        let harness = RpcHarness::new();
+        let (_session_id, _window_id, pane_id) = harness.seed_session("record-admit").await;
+        let _writer_rx = harness.seed_io(pane_id, b"ready\n").await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("admit.bin");
+        let started = dispatch_ok(
+            &harness.router,
+            "pane.record.start",
+            serde_json::json!({ "pane_id": pane_id.to_string(), "path": path.display().to_string() }),
+        )
+        .await;
+        // What tee_pane_recorders does under the lock: admit the chunk.
+        let admitted = harness
+            .io
+            .lock()
+            .await
+            .recordings
+            .admit(pane_id)
+            .pop()
+            .expect("an accepting recording");
+        let stop = {
+            let router = harness.router.clone();
+            let id = started["recording_id"].clone();
+            tokio::spawn(async move {
+                router
+                    .dispatch(
+                        "pane.record.stop",
+                        Some(serde_json::json!({ "recording_id": id })),
+                    )
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        admitted
+            .send_bytes(
+                b"admitted".to_vec(),
+                std::time::Instant::now(),
+                &harness.cancel,
+            )
+            .await;
+        let stopped = stop.await.unwrap().expect("stop");
+        assert_eq!(stopped["status"], "complete");
+        assert_eq!(
+            tokio::fs::read(&path).await.unwrap(),
+            b"admitted",
+            "the stop overtook a chunk its tee had already admitted"
+        );
+        harness.stop().await;
+    }
+
+    /// The PTY loop closes the pane's input, then ends its recordings, and
+    /// only later drops its writer: a start in that window is refused, not
+    /// left recording a pane nothing will ever tee or end again.
+    #[tokio::test]
+    async fn a_start_after_its_pane_ended_is_refused() {
+        let harness = RpcHarness::new();
+        let (_s, _w, pane_id) = harness.seed_session("record-gone").await;
+        let writer_rx = harness.seed_io(pane_id, b"ready\n").await;
+        drop(writer_rx);
+        crate::pane_record::finish_pane_recorders(&harness.io, pane_id, None).await;
+        assert!(harness.io.lock().await.writers.contains_key(&pane_id));
+        let dir = tempfile::tempdir().unwrap();
+        let err = dispatch_err(
+            &harness.router,
+            "pane.record.start",
+            serde_json::json!({
+                "pane_id": pane_id.to_string(),
+                "path": dir.path().join("gone.bin").display().to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(err.code, shux_rpc::ErrorCode::NotFound.code(), "{err:?}");
+        harness.stop().await;
+    }
+
+    /// A pane that ends while a start's file is still opening: the start is
+    /// told the pane is gone, not that the daemon is shutting down.
+    #[tokio::test]
+    async fn a_pane_ending_mid_start_refuses_it_as_gone() {
+        use crate::pane_record::testing::TestOpener;
+        let harness = RpcHarness::new();
+        let (_s, _w, pane_id) = harness.seed_session("record-mid").await;
+        let writer_rx = harness.seed_io(pane_id, b"ready\n").await;
+        let opener = TestOpener::new();
+        opener.set_open(false);
+        let recordings = crate::pane_record::Recordings::with_opener(
+            CancellationToken::new(),
+            opener.opener(1 << 16),
+            crate::pane_record::PANE_RECORD_CHANNEL_CAPACITY,
+        );
+        harness.io.lock().await.recordings = recordings.clone();
+        let dir = tempfile::tempdir().unwrap();
+        let start = {
+            let router = harness.router.clone();
+            let params = serde_json::json!({
+                "pane_id": pane_id.to_string(),
+                "path": dir.path().join("mid.bin").display().to_string(),
+            });
+            tokio::spawn(async move { router.dispatch("pane.record.start", Some(params)).await })
+        };
+        shux_testkit::wait_until_async("the start to reserve the pane", || {
+            let recordings = recordings.clone();
+            async move { !recordings.live().is_empty() }
+        })
+        .await;
+        drop(writer_rx);
+        crate::pane_record::finish_pane_recorders(&harness.io, pane_id, None).await;
+        opener.set_open(true);
+        let err = start
+            .await
+            .unwrap()
+            .expect_err("a start on an ended pane succeeded");
+        assert_eq!(err.code, shux_rpc::ErrorCode::NotFound.code(), "{err:?}");
+        harness.stop().await;
+    }
+
+    /// Ownership decides how long a recording lives; a value that is not a
+    /// boolean is refused, not read as "unowned".
+    #[tokio::test]
+    async fn a_non_boolean_owned_by_connection_is_refused() {
+        let harness = RpcHarness::new();
+        let (_s, _w, pane_id) = harness.seed_session("record-owned").await;
+        let _writer_rx = harness.seed_io(pane_id, b"ready\n").await;
+        let dir = tempfile::tempdir().unwrap();
+        let err = dispatch_err(
+            &harness.router,
+            "pane.record.start",
+            serde_json::json!({
+                "pane_id": pane_id.to_string(),
+                "path": dir.path().join("o.bin").display().to_string(),
+                "owned_by_connection": "true",
+            }),
+        )
+        .await;
+        assert_eq!(
+            err.code,
+            shux_rpc::ErrorCode::InvalidParams.code(),
+            "{err:?}"
+        );
+        harness.stop().await;
+    }
+
+    /// A refused start leaves nothing behind: not even the directory its
+    /// path named.
+    #[tokio::test]
+    async fn a_refused_start_creates_no_directory() {
+        let harness = RpcHarness::new();
+        let (_s, _w, pane_id) = harness.seed_session("record-nodir").await;
+        let _writer_rx = harness.seed_io(pane_id, b"ready\n").await;
+        let dir = tempfile::tempdir().unwrap();
+        dispatch_ok(
+            &harness.router,
+            "pane.record.start",
+            serde_json::json!({ "pane_id": pane_id.to_string(), "path": dir.path().join("first.bin").display().to_string() }),
+        )
+        .await;
+        let fresh = dir.path().join("never").join("made");
+        let err = dispatch_err(
+            &harness.router,
+            "pane.record.start",
+            serde_json::json!({ "pane_id": pane_id.to_string(), "path": fresh.join("second.bin").display().to_string() }),
+        )
+        .await;
+        assert_eq!(
+            err.code,
+            shux_rpc::ErrorCode::NameConflict.code(),
+            "{err:?}"
+        );
+        assert!(
+            !dir.path().join("never").exists(),
+            "a refused start created the directory its path named"
+        );
+        harness.stop().await;
+    }
+
     /// Paused clock: the duration deadline fires only once the test idles, so
     /// "before" is teed strictly before it and "after" strictly after it.
     #[tokio::test(start_paused = true)]
@@ -2069,15 +2207,14 @@ mod tests {
         )
         .await;
         let id: uuid::Uuid = recording_id.parse().unwrap();
-        shux_testkit::wait_until_async("the duration deadline to end the recording", || async {
-            let state = harness.io.lock().await;
-            state.recorders.values().flatten().any(|r| {
-                r.id == id
-                    && r.outcome.lock().expect("record outcome poisoned").status
-                        != PaneRecordStatus::Recording
-            })
-        })
-        .await;
+        let (mut outcome, _) = harness.io.lock().await.recordings.watch(id).unwrap();
+        tokio::time::timeout(
+            shux_testkit::BUDGET,
+            outcome.wait_for(|o| o.ended_by.is_some()),
+        )
+        .await
+        .expect("the duration deadline never ended the recording")
+        .unwrap();
         tee_pane_recorders(
             &harness.io,
             pane_id,

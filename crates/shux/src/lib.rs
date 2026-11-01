@@ -39,6 +39,8 @@ pub mod pane_command;
 pub mod pane_input;
 pub mod pane_io;
 pub mod pane_record;
+#[cfg(any(test, fuzzing))]
+pub mod pane_record_fuzz;
 pub mod pane_spawn;
 pub mod program_status;
 pub mod rpc;

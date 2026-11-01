@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::pane_input::{InputPermit, PaneWriter};
-use crate::pane_record::PaneRecorder;
+use crate::pane_record::Recordings;
 
 /// A pane-resize message sent through `PaneIoState::resizers`.
 ///
@@ -114,10 +114,10 @@ pub struct PaneIoState {
     /// test harnesses that don't wire an event bus. Cheap to clone
     /// (Arc internally).
     pub event_bus: Option<shux_core::bus::EventBus>,
-    /// Lossless pane-output recorders, keyed by pane. The PTY read task
-    /// awaits these sends before sampled publishing, so this path is
-    /// byte-exact and intentionally applies backpressure.
-    pub(crate) recorders: HashMap<shux_core::model::PaneId, Vec<PaneRecorder>>,
+    /// Lossless pane-output recordings. The PTY read task awaits these sends
+    /// before sampled publishing, so this path is byte-exact and
+    /// intentionally applies backpressure.
+    pub(crate) recordings: Recordings,
     /// Per-pane PTY child PID (== pgid; children are session leaders, see
     /// `shux-pty::handle::PtyHandle::terminate`). `lens.run` (P5) reads this
     /// to populate the scratch registry's `pgid` field (LENS-R-044) without
@@ -194,7 +194,7 @@ impl PaneIoState {
             cmd_engine: shux_pty::CommandEngine::new(),
             render_pulse: RenderPulse::default(),
             event_bus: None,
-            recorders: HashMap::new(),
+            recordings: Recordings::new(tokio_util::sync::CancellationToken::new()),
             pty_pids: HashMap::new(),
             status: HashMap::new(),
             program_status_enabled: true,
@@ -205,6 +205,12 @@ impl PaneIoState {
 
     pub fn with_event_bus(mut self, bus: shux_core::bus::EventBus) -> Self {
         self.event_bus = Some(bus);
+        self
+    }
+
+    /// Recordings that know when daemon shutdown (`root`) has begun.
+    pub(crate) fn with_shutdown(mut self, root: tokio_util::sync::CancellationToken) -> Self {
+        self.recordings = Recordings::new(root);
         self
     }
 
