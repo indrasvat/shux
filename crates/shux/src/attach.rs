@@ -1336,6 +1336,9 @@ async fn run_attach_loop(
                         ctrl,
                         frame,
                     } => {
+                        // Another client may have moved focus since this
+                        // one last heard: a click compares against it.
+                        sync_focus(&graph, &mut session, &render_session).await;
                         // Modal guard: swallow mouse events while the
                         // help overlay is visible. Otherwise a click or
                         // drag on the cheat sheet would leak through to
@@ -1485,20 +1488,7 @@ async fn run_attach_loop(
         // clobbered by a `*rs = session.clone()`. Keep the local
         // `session` in lockstep too so its `session_id` stays valid for
         // the next iteration's snapshot lookup.
-        let still_alive = {
-            let snap = graph.snapshot();
-            let live = snap.sessions.contains_key(&session.session_id);
-            if live && let Some(s) = snap.sessions.get(&session.session_id) {
-                session.active_window_id = s.active_window;
-                if let Some(w) = snap.windows.get(&s.active_window) {
-                    session.active_pane_id = w.active_pane;
-                }
-                let mut rs = render_session.lock().await;
-                rs.active_window_id = session.active_window_id;
-                rs.active_pane_id = session.active_pane_id;
-            }
-            live
-        };
+        let still_alive = sync_focus(&graph, &mut session, &render_session).await;
         if !still_alive {
             final_frame.get_or_insert(AttachServerFrame::SessionEnded {
                 reason: "session_destroyed".into(),
@@ -2952,21 +2942,18 @@ async fn handle_app_mouse(
     // Resolve the pane under the pointer in the frame the client was shown: a
     // layout not drawn yet must not move a click into another pane. Views are
     // content rects, so borders, the outline and the status bar hit none.
-    // A frame no longer kept names nothing. A gesture shux owns still
-    // finishes through shux; anything else must not fall through to a border
-    // drag or a selection at today's geometry.
+    // A frame no longer kept cannot be mapped into an app: a client that far
+    // behind (small frames fill the socket's byte buffers) gets shux's own
+    // handling at the live layout, as before frames were stamped. A gesture
+    // an app holds still gets its release.
     let Some(views) = attached.shown.views(frame) else {
-        return Ok(match *gesture {
-            SelectionDrag::CopyMode | SelectionDrag::MouseSelection { .. } => AppMouse::NotHandled,
-            SelectionDrag::None if border_drag.is_some() => AppMouse::NotHandled,
-            SelectionDrag::App { .. } => {
-                if action == ButtonAction::Release {
-                    release_app_gesture(io_state, gesture).await;
-                }
-                AppMouse::Consumed { redraw: false }
-            }
-            SelectionDrag::None => AppMouse::Consumed { redraw: false },
-        });
+        if !matches!(*gesture, SelectionDrag::App { .. }) {
+            return Ok(AppMouse::NotHandled);
+        }
+        if action == ButtonAction::Release {
+            release_app_gesture(io_state, gesture).await;
+        }
+        return Ok(AppMouse::Consumed { redraw: false });
     };
     let pane_hit = views
         .iter()
@@ -3177,6 +3164,27 @@ async fn select_pane_on_press(
     redraw
 }
 
+/// Copy the session's live focus into this client's cache. `false` once the
+/// session is gone.
+async fn sync_focus(
+    graph: &GraphHandle,
+    session: &mut AttachedSession,
+    render_session: &Arc<Mutex<AttachedSession>>,
+) -> bool {
+    let snap = graph.snapshot();
+    let Some(s) = snap.sessions.get(&session.session_id) else {
+        return false;
+    };
+    session.active_window_id = s.active_window;
+    if let Some(w) = snap.windows.get(&s.active_window) {
+        session.active_pane_id = w.active_pane;
+    }
+    let mut rs = render_session.lock().await;
+    rs.active_window_id = session.active_window_id;
+    rs.active_pane_id = session.active_pane_id;
+    true
+}
+
 /// Clear the released button from an app gesture, ending it once nothing is
 /// held.
 ///
@@ -3334,15 +3342,27 @@ async fn handle_wheel(
     };
     let attached = session.lock().await.clone();
 
-    // Resolve the pane under the cursor in the frame the client was shown
-    // (fallback: the active pane). A frame no longer kept names nothing.
-    let Some(views) = attached.shown.views(frame) else {
-        return Ok(true);
+    // Resolve the pane under the cursor in the frame the client was shown,
+    // or the live layout for a frame no longer kept (fallback: the active
+    // pane). Only a shown frame can place a report in an app.
+    let views = attached.shown.views(frame);
+    let hit = match views {
+        Some(views) => views
+            .iter()
+            .find(|(_, view)| holds(view.rect, col, row))
+            .map(|(pid, _)| *pid),
+        None => {
+            let viewport = current_viewport(client_size, config).await;
+            let snap = graph.snapshot();
+            snap.windows
+                .get(&attached.active_window_id)
+                .and_then(|win| match &win.layout.zoom {
+                    Some(zoom) => Some(zoom.zoomed_pane),
+                    None => pane_at(&win.layout.tree, viewport, col, row).map(|(pid, _)| pid),
+                })
+        }
     };
-    let pane_id = views
-        .iter()
-        .find(|(_, view)| holds(view.rect, col, row))
-        .map_or(attached.active_pane_id, |(pid, _)| *pid);
+    let pane_id = hit.unwrap_or(attached.active_pane_id);
     let Some(rect) = pane_rect_for(graph, &attached, client_size, config, pane_id).await else {
         return Ok(true);
     };
@@ -3371,7 +3391,7 @@ async fn handle_wheel(
     match route_wheel(mouse_on, alt, alt_scroll) {
         WheelRouting::ForwardMouse => {
             let cell = views
-                .get(&pane_id)
+                .and_then(|views| views.get(&pane_id))
                 .and_then(|view| shux_ui::viewport::pane_grid_cell(view, (col, row), false));
             // No grid cell under the pointer, or no truthful encoding for this
             // app's coordinate mode: sending nothing beats a tick aimed at a
@@ -6425,6 +6445,39 @@ mod tests {
         );
     }
 
+    /// A client further behind than every kept frame (small frames fill the
+    /// socket's byte buffers with far more than the queue's count) still has
+    /// shux's own mouse handling, as on base: only app reports need the frame.
+    #[tokio::test]
+    async fn a_client_behind_every_kept_frame_still_has_shux_handling() {
+        let mut h = AppMouseHarness::new().await;
+        let _wr = seed_scrollback_pane(&h.fixture.io_state, h.fixture.first_pane, b"").await;
+        ship_frame(
+            &h.fixture.graph,
+            &h.fixture.io_state,
+            &h.session,
+            &h.client_size,
+        )
+        .await;
+        let shown = h.session.lock().await.shown.0.back().map(|(n, _)| *n);
+        for _ in 0..ShownFrames::KEPT + 10 {
+            ship_frame(
+                &h.fixture.graph,
+                &h.fixture.io_state,
+                &h.session,
+                &h.client_size,
+            )
+            .await;
+        }
+        let route = h.send_stamped(MouseKind::Down, 3, 3, shown).await;
+        h.fixture.stop();
+        assert_eq!(
+            route,
+            AppMouse::NotHandled,
+            "the click was dropped, not handled"
+        );
+    }
+
     /// A pane closed since the frame was drawn takes the click: it must not
     /// fall through to shux's handling at today's layout.
     #[tokio::test]
@@ -8891,11 +8944,11 @@ mod tests {
         h.stop().await;
     }
 
-    /// A press stamped with a frame no longer kept names nothing. It must not
-    /// fall through to today's layout, where the same point may be a border
-    /// and the drag that follows would resize the split.
+    /// A press stamped with a frame no longer kept is shux's to handle at the
+    /// live layout, as before frames were stamped: on a border it drags. Only
+    /// an app report needs the frame the client drew.
     #[tokio::test(start_paused = true)]
-    async fn a_press_from_a_frame_no_longer_kept_starts_no_border_drag() {
+    async fn a_press_from_a_frame_no_longer_kept_is_handled_by_shux() {
         let mut h = InputHarness::new(64).await;
         mouse_app_grid(&mut h, 60, 40).await;
         let (_, y) = on_screen(&mut h, "grid-row 55").await;
@@ -8933,7 +8986,34 @@ mod tests {
             pane_input(&mut h).await.is_empty(),
             "the app was sent a report"
         );
-        assert_eq!(layout(&h), before, "an expired press dragged the border");
+        assert_ne!(
+            layout(&h),
+            before,
+            "an expired press did not drag the border"
+        );
+        h.stop().await;
+    }
+
+    /// Another client moved focus away; this client's click on the pane it
+    /// last had active must still focus it, not be taken as already focused.
+    #[tokio::test(start_paused = true)]
+    async fn a_click_refocuses_a_pane_another_client_moved_focus_from() {
+        let mut h = InputHarness::new(64).await;
+        mouse_app_grid(&mut h, 60, 40).await;
+        let (x, y) = on_screen(&mut h, "grid-row 55").await;
+        h.fixture
+            .graph
+            .focus_pane(h.fixture.second_pane)
+            .await
+            .expect("focus the other pane, as a second client would");
+        mouse(&mut h, MouseKind::Down, x, y).await;
+        mouse(&mut h, MouseKind::Up, x, y).await;
+        let _ = pane_input(&mut h).await;
+        let active = h.fixture.graph.snapshot().windows[&h.fixture.first_window].active_pane;
+        assert_eq!(
+            active, h.fixture.first_pane,
+            "the click did not take focus back"
+        );
         h.stop().await;
     }
 
