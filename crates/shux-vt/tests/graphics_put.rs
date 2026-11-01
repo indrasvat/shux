@@ -407,3 +407,30 @@ fn an_uppercase_delete_by_id_or_range_frees_what_it_names() {
         "a missing placement freed 7"
     );
 }
+
+/// A transfer the alternate screen started and the primary screen finished
+/// belongs to neither: it must not overwrite the primary's image under the
+/// same id.
+#[test]
+fn a_transfer_finished_on_the_other_screen_stores_nothing() {
+    use base64::Engine as _;
+    let enc = |byte: u8| base64::engine::general_purpose::STANDARD.encode([byte; 3]);
+    let mut vt = VirtualTerminal::new(20, 40);
+    vt.process(format!("\x1b_Ga=t,f=24,s=1,v=1,i=7;{}\x1b\\", enc(0)).as_bytes());
+    vt.process(b"\x1b[?1049h");
+    vt.process(format!("\x1b_Ga=t,f=24,s=1,v=1,i=7,m=1;{}\x1b\\", enc(255)).as_bytes());
+    vt.process(b"\x1b[?1049l");
+    vt.process(b"\x1b_Gm=0;\x1b\\");
+    vt.process(&apc("a=p,i=7,C=1"));
+    let drawn: Vec<u8> = vt
+        .grid()
+        .placements()
+        .iter()
+        .map(|p| p.image.payload[0])
+        .collect();
+    assert_eq!(
+        drawn,
+        [0],
+        "the alternate screen's transfer replaced the primary's image"
+    );
+}

@@ -15,6 +15,9 @@ pub(crate) struct GraphicsSink {
     pub(crate) refusals: u64,
     /// One chunked transmission in flight.
     pub(crate) assembler: image::Assembler,
+    /// Whether the alternate screen opened the transmission in flight: one
+    /// finished on the other screen belongs to neither and is dropped.
+    pub(crate) transfer_on_alt: bool,
     /// Transmitted images an `a=p` may place: the primary screen's, then the
     /// alternate screen's.
     pub(crate) stores: [image::ImageStore; 2],

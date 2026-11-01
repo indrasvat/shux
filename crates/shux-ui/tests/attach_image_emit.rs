@@ -635,3 +635,34 @@ fn a_host_draws_a_non_cell_multiple_picture_within_one_cell_of_its_size() {
         "more than a cell larger: {w}x{h}"
     );
 }
+
+/// A moderately upscaled picture clipped at a pane edge keeps its scale on a
+/// host to within one source pixel: the source rectangle is whole pixels, so
+/// a slice that ends mid-pixel is rounded outward, never lost.
+#[test]
+fn a_clipped_scaled_put_keeps_its_scale_on_the_host() {
+    let p = pane(1);
+    let layout = LayoutNode::leaf(p);
+    // A grid taller than its two-row pane; the view follows the cursor.
+    let mut vt = VirtualTerminal::new(30, 20);
+    vt.process(b"\x1b[11;1H");
+    // 20x20 px fitted to 4 columns: drawn 36x36, rows 10 and 11.
+    vt.process(&transmit_then_put(5, 20, 20, "a=p,i=5,c=4,C=1"));
+    vt.process(b"\x1b[13;1H");
+    let mut vts = HashMap::new();
+    vts.insert(p, &vt);
+    let mut c = make_compositor(20, 2);
+    c.render_multi_pane(frame(&layout, &vts, p)).unwrap();
+
+    let mut host = VirtualTerminal::new(2, 20);
+    host.process(drain(&mut c).as_bytes());
+    let outer = &host.grid().placements()[0];
+    let (dw, dh) = shux_vt::DECLARED_CELL_PIXELS;
+    let (w, h) = outer.geometry.drawn_px(dw, dh);
+    // The visible slice is 36 px wide and the 17 px left of the second row.
+    let scale = 36.0 / 20.0;
+    assert!(
+        (w as f64 - 36.0).abs() <= scale && (h as f64 - 17.0).abs() <= scale + 1.0,
+        "the clipped slice was drawn {w}x{h}, not about 36x17"
+    );
+}

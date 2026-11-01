@@ -684,13 +684,21 @@ impl VirtualTerminal {
                 // placed. An app that redraws under one id (terminal-browser
                 // sends `i=1` every frame) would otherwise spend a slot per
                 // frame.
-                if !self.graphics.assembler.is_open() && cmd.image_id != 0 {
-                    self.store().retain(|k| k != cmd.image_id);
-                    self.presented_grid().unplace_image(cmd.image_id, 0);
+                let alt = self.modes.alternate_screen;
+                if !self.graphics.assembler.is_open() {
+                    self.graphics.transfer_on_alt = alt;
+                    if cmd.image_id != 0 {
+                        self.store().retain(|k| k != cmd.image_id);
+                        self.presented_grid().unplace_image(cmd.image_id, 0);
+                    }
                 }
                 let Some((image, opening)) = self.graphics.assembler.feed(&cmd, payload) else {
                     return;
                 };
+                if self.graphics.transfer_on_alt != alt {
+                    self.graphics.refusals = self.graphics.refusals.saturating_add(1);
+                    return;
+                }
                 let image = std::sync::Arc::new(image);
                 if opening.image_id != 0 {
                     self.store().insert(opening.image_id, image.clone());
