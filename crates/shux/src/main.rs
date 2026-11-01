@@ -52,15 +52,23 @@ fn die_quietly_on_a_closed_pipe() {
             .or_else(|| payload.downcast_ref::<&str>().copied())
             .unwrap_or("");
         // std's own message for these prints; EPIPE reads "Broken pipe".
-        let closed =
-            message.starts_with("failed printing to std") && message.contains("Broken pipe");
+        let closed = (message.starts_with("failed printing to stdout:")
+            || message.starts_with("failed printing to stderr:"))
+            && message.contains("Broken pipe");
         if closed {
-            // SAFETY: SIG_DFL installs no handler and runs no Rust code;
-            // raise delivers the signal to this thread, which ends the process.
+            // SAFETY: SIG_DFL installs no handler and runs no Rust code; an
+            // inherited blocked mask is lifted for this thread so the signal
+            // lands; raise delivers it here, which ends the process.
             unsafe {
                 libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+                let mut pipe: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut pipe);
+                libc::sigaddset(&mut pipe, libc::SIGPIPE);
+                libc::pthread_sigmask(libc::SIG_UNBLOCK, &pipe, std::ptr::null_mut());
                 libc::raise(libc::SIGPIPE);
             }
+            // The signal did not end the process: exit as a shell would report it.
+            std::process::exit(141);
         }
         report(info);
     }));

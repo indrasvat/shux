@@ -189,3 +189,37 @@ async fn closed_stdout_daemon_still_ignores_sigpipe() {
         pid
     );
 }
+
+/// Started with SIGPIPE blocked (an inherited mask): still no panic, and the
+/// command still ends the way a closed pipe should.
+#[test]
+fn closed_stdout_with_sigpipe_blocked() {
+    use std::os::unix::process::CommandExt;
+    let daemon = Daemon::new();
+    let (read, write) = nix::unistd::pipe().expect("pipe");
+    drop(read);
+    let mut command = daemon.command();
+    command.args(["--format", "json", "session", "list"]);
+    // SAFETY: sigprocmask is async-signal-safe and only touches the child.
+    unsafe {
+        command.pre_exec(|| {
+            let mut pipe = nix::sys::signal::SigSet::empty();
+            pipe.add(nix::sys::signal::Signal::SIGPIPE);
+            pipe.thread_block().map_err(std::io::Error::from)
+        });
+    }
+    let output = command
+        .stdout(Stdio::from(write))
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn shux")
+        .wait_with_output()
+        .expect("wait for shux");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("panicked"), "{} {stderr}", output.status);
+    assert!(
+        output.status.signal() == Some(13) || output.status.code() == Some(141),
+        "status {} stderr: {stderr}",
+        output.status
+    );
+}
