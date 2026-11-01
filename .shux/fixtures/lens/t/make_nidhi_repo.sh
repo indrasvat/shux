@@ -11,6 +11,12 @@ set -eu
 
 target="${1:?usage: make_nidhi_repo.sh <target-dir>}"
 
+# A git hook (the project's pre-push runs `make test`) exports these, and they
+# override the repository every git command below is pointed at: the fixture would
+# commit, stash and configure in the caller's repo instead of its own.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX GIT_OBJECT_DIRECTORY \
+	GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_QUARANTINE_PATH GIT_COMMON_DIR
+
 # Pin every timestamp so relative-time rendering is stable for years.
 GIT_AUTHOR_DATE='2020-01-01T00:00:00Z'
 GIT_COMMITTER_DATE='2020-01-01T00:00:00Z'

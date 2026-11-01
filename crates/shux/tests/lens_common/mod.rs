@@ -85,6 +85,19 @@ pub struct Fixture {
 }
 
 /// Black-box harness: the built `shux` binary against an isolated XDG env.
+/// What a git hook exports to point git at its repository (the project's pre-push
+/// runs `make test`); each overrides the repository a git command names.
+pub const GIT_LOCATION_VARS: [&str; 8] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_PREFIX",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_QUARANTINE_PATH",
+    "GIT_COMMON_DIR",
+];
+
 pub struct Harness {
     bin: PathBuf,
     repo_root: PathBuf,
@@ -172,6 +185,10 @@ impl Harness {
             .env_remove("NO_COLOR")
             .env_remove("CLICOLOR")
             .env("SHELL", "/bin/sh");
+        // A git hook's repository must not reach the daemon, nor the panes it spawns.
+        for var in GIT_LOCATION_VARS {
+            cmd.env_remove(var);
+        }
         cmd
     }
 

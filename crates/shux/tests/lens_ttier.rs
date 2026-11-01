@@ -332,3 +332,67 @@ fn t4_vivecaka_help_card() {
         h.rpc_raw("session.kill", serde_json::json!({ "id": r["session_id"] }));
     }
 }
+
+/// A git hook (the project's own `pre-push` runs `make test`) sets `GIT_DIR`, which
+/// overrides any repository a git command is pointed at. The fixture must build its
+/// repo in its target however it is invoked, and leave the hook's repository alone.
+#[test]
+fn the_nidhi_fixture_never_touches_the_callers_repository() {
+    let h = Harness::new();
+    let decoy = tempfile::tempdir().expect("decoy repo");
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(decoy.path())
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    git(&["init", "-q"]);
+    git(&[
+        "-c",
+        "user.name=d",
+        "-c",
+        "user.email=d@example.invalid",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "decoy",
+    ]);
+    let decoy_head = git(&["rev-parse", "HEAD"]);
+
+    let target = tempfile::tempdir().expect("nidhi repo tmp");
+    let out = Command::new("sh")
+        .arg(
+            h.repo_root()
+                .join(".shux/fixtures/lens/t/make_nidhi_repo.sh"),
+        )
+        .arg(target.path().join("repo"))
+        .env("GIT_DIR", decoy.path().join(".git"))
+        .env("GIT_WORK_TREE", decoy.path())
+        .output()
+        .expect("run make_nidhi_repo.sh");
+    assert!(out.status.success(), "make_nidhi_repo failed: {out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "3");
+    assert_eq!(
+        git(&["rev-parse", "HEAD"]),
+        decoy_head,
+        "the fixture committed to the caller's repo"
+    );
+    assert_eq!(
+        git(&["stash", "list"]),
+        "",
+        "the fixture stashed in the caller's repo"
+    );
+    assert!(
+        !std::fs::read_to_string(decoy.path().join(".git/config"))
+            .unwrap()
+            .contains("gpgsign"),
+        "the fixture configured the caller's repo"
+    );
+}
