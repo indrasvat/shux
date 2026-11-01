@@ -412,7 +412,8 @@ impl InstanceLock {
 /// 2. setsid(): child becomes session leader (detaches from terminal)
 /// 3. Second fork: session leader exits, grandchild continues
 ///    (grandchild cannot accidentally acquire a controlling terminal)
-/// 4. Redirect stdin/stdout/stderr to /dev/null
+/// 4. Redirect stdin/stdout/stderr to /dev/null, and close every other
+///    descriptor the starter left open
 /// 5. Take the instance lock and record our pid in it
 /// 6. Write PID file
 ///
@@ -446,6 +447,7 @@ pub fn daemonize(socket: &Path) -> Result<Option<InstanceLock>, DaemonError> {
 
     // Redirect stdio to /dev/null
     redirect_stdio_to_devnull();
+    close_inherited_descriptors();
 
     ensure_runtime_dir()?;
     // Both checks come before anything that names this process as the daemon:
@@ -468,6 +470,26 @@ pub fn daemonize(socket: &Path) -> Result<Option<InstanceLock>, DaemonError> {
         socket: socket.to_path_buf(),
         file: std::sync::Mutex::new(lock),
     }))
+}
+
+/// Close every descriptor above stderr. A daemon outlives its starter, so a
+/// pipe the starter left without close-on-exec (make's jobserver, a CI step's
+/// output) would otherwise stay open for the daemon's life and pass on to
+/// every pane. Nothing of the daemon's own is open yet.
+fn close_inherited_descriptors() {
+    let Ok(dir) = fs::read_dir("/dev/fd") else {
+        return;
+    };
+    let fds: Vec<i32> = dir
+        .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+        .filter(|fd| *fd > 2)
+        .collect();
+    // The listing's own descriptor is among them; it closed with `dir`.
+    for fd in fds {
+        // SAFETY: nothing in this process owns a descriptor above 2 yet, so
+        // closing one cannot pull it out from under a live handle.
+        unsafe { nix::libc::close(fd) };
+    }
 }
 
 /// Redirect stdin, stdout, stderr to /dev/null.

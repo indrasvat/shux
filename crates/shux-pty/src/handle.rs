@@ -543,6 +543,41 @@ impl Drop for PtyHandle {
     }
 }
 
+/// Mark every descriptor above stderr close-on-exec, in a child between fork
+/// and exec. The spawner is multithreaded and, outside Linux, every pipe,
+/// socket and PTY pair it opens becomes close-on-exec only in a second step,
+/// so a fork in between would hand the child another pane's terminal or a
+/// client's socket. Marked rather than closed: the exec-error pipe `std`
+/// reports a failed exec through must stay open until the exec.
+///
+/// # Safety
+/// Only between fork and exec: it touches descriptors it does not own.
+unsafe fn close_on_exec_above_stdio(ceiling: i32) {
+    use nix::libc;
+    #[cfg(target_os = "linux")]
+    // SAFETY: close_range takes plain integers; CLOEXEC closes nothing.
+    if unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            3u32,
+            u32::MAX,
+            libc::CLOSE_RANGE_CLOEXEC,
+        )
+    } == 0
+    {
+        return;
+    }
+    for fd in 3..ceiling {
+        // SAFETY: F_GETFD/F_SETFD on any integer is defined: EBADF at worst.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+                libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
+        }
+    }
+}
+
 /// Open a PTY pair that no child inherits: a pane's terminal held by any
 /// other process could be read from and typed into.
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -826,11 +861,15 @@ impl PtyHandle {
         }
 
         let slave_fd = pty_pair.slave.as_raw_fd();
+        // SAFETY: getdtablesize takes no arguments and only reads a limit.
+        let ceiling = unsafe { nix::libc::getdtablesize() };
         // SAFETY: pre_exec runs in the child after fork and before exec. The
-        // closure only calls async-signal-safe syscalls to create a session and
-        // assign the slave PTY as the controlling terminal.
+        // closure only calls async-signal-safe syscalls to create a session,
+        // assign the slave PTY as the controlling terminal, and mark the
+        // descriptors it must not inherit.
         unsafe {
             cmd.pre_exec(move || {
+                close_on_exec_above_stdio(ceiling);
                 nix::unistd::setsid().map_err(std::io::Error::from)?;
                 #[cfg(any(target_os = "macos", target_os = "ios"))]
                 let tiocsctty = nix::libc::TIOCSCTTY as nix::libc::c_ulong;

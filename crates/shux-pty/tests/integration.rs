@@ -788,3 +788,31 @@ fn terminal_descriptors(pid: u32) -> Vec<String> {
     }
     found
 }
+
+/// A descriptor the daemon holds without close-on-exec must not reach a pane.
+/// On macOS every pipe, socket and PTY pair is made close-on-exec in a second
+/// step, so a pane forked on one thread while another opens one inherits it;
+/// a pipe made without the flag stands in for one caught in that gap.
+#[tokio::test]
+async fn a_pane_inherits_no_descriptor_beyond_its_terminal() {
+    use std::io::Read;
+    let (read, write) = nix::unistd::pipe().expect("pipe");
+    let config = PtyConfig::with_command(vec!["sleep".into(), "3600".into()], test_cwd());
+    let mut handle = PtyHandle::spawn(&config).unwrap();
+    drop(write);
+
+    // EOF comes only once every holder of the write end has closed it.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut sink = Vec::new();
+        let _ = tx.send(std::fs::File::from(read).read_to_end(&mut sink));
+    });
+    let eof = rx.recv_timeout(shux_testkit::BUDGET);
+    let alive = handle.try_wait().unwrap().is_none();
+    handle.kill().unwrap();
+    assert!(alive, "the pane exited, so the pipe proves nothing");
+    assert!(
+        matches!(eof, Ok(Ok(_))),
+        "the pane still holds a pipe its spawner had open"
+    );
+}
