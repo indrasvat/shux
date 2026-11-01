@@ -712,11 +712,11 @@ fn report_recording(outcome: &serde_json::Value, format: OutputFormat) -> anyhow
     let path = field("path");
     let status = field("status");
     let ended_by = outcome.get("ended_by").and_then(|v| v.as_str());
-    let finalized = outcome.get("finalized").and_then(|v| v.as_bool()) == Some(true);
     let bytes = outcome
         .get("bytes_written")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
+    let failure = recording_failure(outcome);
 
     match format {
         OutputFormat::Json => println!(
@@ -729,38 +729,66 @@ fn report_recording(outcome: &serde_json::Value, format: OutputFormat) -> anyhow
                 ended_by.unwrap_or("-")
             );
         }
-        OutputFormat::Text => {
-            println!(
-                "{} {} bytes to {} ({}{})",
-                crate::style::success("✓ recorded"),
-                crate::style::bold(&bytes.to_string()),
-                crate::style::muted(path),
-                status,
-                ended_by
-                    .map(|c| format!(", {}", c.replace('_', " ")))
-                    .unwrap_or_default(),
-            );
-        }
+        OutputFormat::Text => println!("{}", recorded_line(outcome, failure.is_none())),
     }
+    match failure {
+        None => Ok(()),
+        Some(why) => Err(anyhow::anyhow!(why)),
+    }
+}
 
-    if !finalized {
-        anyhow::bail!("the recording of {path} was still being written when the daemon answered");
+/// Why the command fails for this outcome, or `None` when the recording
+/// ended normally with every byte on disk.
+fn recording_failure(outcome: &serde_json::Value) -> Option<String> {
+    let field = |k: &str| outcome.get(k).and_then(|v| v.as_str()).unwrap_or("unknown");
+    let (path, status) = (field("path"), field("status"));
+    let bytes = outcome
+        .get("bytes_written")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    if outcome.get("finalized").and_then(|v| v.as_bool()) != Some(true) {
+        return Some(format!(
+            "the recording of {path} was still being written when the daemon answered"
+        ));
     }
-    match (status, ended_by) {
-        ("complete", Some("stop" | "duration" | "pane_exit")) => Ok(()),
-        ("complete", Some("daemon_shutdown")) => {
-            anyhow::bail!(
-                "the daemon shut down while recording; {bytes} bytes were saved to {path}"
-            )
-        }
+    match (status, outcome.get("ended_by").and_then(|v| v.as_str())) {
+        ("complete", Some("stop" | "duration" | "pane_exit")) => None,
+        ("complete", Some("daemon_shutdown")) => Some(format!(
+            "the daemon shut down while recording; {bytes} bytes were saved to {path}"
+        )),
         _ => {
             let why = outcome
                 .get("error")
                 .and_then(|v| v.as_str())
                 .unwrap_or("it did not end normally");
-            anyhow::bail!("the recording of {path} is {status}: {why}")
+            Some(format!("the recording of {path} is {status}: {why}"))
         }
     }
+}
+
+/// The text report: a tick only for a recording the command succeeds on.
+fn recorded_line(outcome: &serde_json::Value, ok: bool) -> String {
+    let field = |k: &str| outcome.get(k).and_then(|v| v.as_str()).unwrap_or("unknown");
+    let bytes = outcome
+        .get("bytes_written")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let mark = if ok {
+        crate::style::success("✓ recorded").to_string()
+    } else {
+        crate::style::warning("! recorded").to_string()
+    };
+    format!(
+        "{mark} {} bytes to {} ({}{})",
+        crate::style::bold(&bytes.to_string()),
+        crate::style::muted(field("path")),
+        field("status"),
+        outcome
+            .get("ended_by")
+            .and_then(|v| v.as_str())
+            .map(|c| format!(", {}", c.replace('_', " ")))
+            .unwrap_or_default(),
+    )
 }
 
 /// Handle the `shux pane kill` command.
@@ -1271,6 +1299,27 @@ mod tests {
                 "{status}/{ended_by}/{finalized} was reported as success"
             ));
             assert!(e.to_string().contains(says), "{status}/{ended_by}: {e:#}");
+        }
+    }
+
+    /// A recording the command fails on is not reported with a tick.
+    #[test]
+    fn only_a_normal_end_is_reported_with_a_tick() {
+        let outcome = |status: &str, ended_by: &str| {
+            serde_json::json!({"path": "/r.raw", "bytes_written": 3, "status": status,
+                "ended_by": ended_by, "finalized": true})
+        };
+        for (status, ended_by, ok) in [
+            ("complete", "stop", true),
+            ("complete", "pane_exit", true),
+            ("complete", "daemon_shutdown", false),
+            ("error", "stop", false),
+        ] {
+            let o = outcome(status, ended_by);
+            let failure = recording_failure(&o);
+            assert_eq!(failure.is_none(), ok, "{status}/{ended_by}");
+            let line = recorded_line(&o, failure.is_none());
+            assert_eq!(line.contains('✓'), ok, "{status}/{ended_by}: {line}");
         }
     }
 }
