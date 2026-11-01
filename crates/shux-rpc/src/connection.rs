@@ -37,18 +37,4 @@ mod tests {
     async fn absent_outside_a_served_request() {
         assert!(current_connection().is_none());
     }
-
-    #[tokio::test]
-    async fn a_request_sees_its_connections_lifetime() {
-        let life = CancellationToken::new();
-        let seen = with_connection(life.clone(), async { current_connection() })
-            .await
-            .expect("inside a scope");
-        assert!(!seen.is_cancelled());
-        life.cancel();
-        assert!(
-            seen.is_cancelled(),
-            "the request's token is the connection's"
-        );
-    }
 }

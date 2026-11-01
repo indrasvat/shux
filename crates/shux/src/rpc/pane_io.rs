@@ -11,10 +11,16 @@ use crate::lens_render::{
     glance_row_text, lens_pixel_budget_check, parse_glance_masks, render_lens_heat_png,
 };
 use crate::pane_io::{PaneIoState, ResizeRequest, diff_lookup_checkpoint};
-use crate::pane_record::{EndedBy, RecordFormat};
+use crate::pane_record::{EndedBy, requested_length};
 
 /// How long `pane.record.stop` waits for the file to be finished.
 const STOP_FINALIZE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The pane's PTY task still takes input: it closes that channel before it
+/// ends the pane's recordings, and drops its writer only later.
+fn pane_takes_input(state: &PaneIoState, pane: shux_core::model::PaneId) -> bool {
+    state.writers.get(&pane).is_some_and(|w| !w.is_closed())
+}
 
 fn recording_id_param(
     params: Option<&serde_json::Value>,
@@ -624,7 +630,7 @@ pub(crate) fn register_pane_io_methods(
                     };
                     let recordings = {
                         let state = io.lock().await;
-                        if !state.writers.contains_key(&pane_id) {
+                        if !pane_takes_input(&state, pane_id) {
                             return Err(shux_rpc::RpcError::not_found(
                                 "live pane PTY",
                                 &pane_id.to_string(),
@@ -632,46 +638,48 @@ pub(crate) fn register_pane_io_methods(
                         }
                         state.recordings.clone()
                     };
-                    let format = if cast {
-                        RecordFormat::Cast
-                    } else {
-                        RecordFormat::Raw
-                    };
                     let prepared = recordings
-                        .prepare(&path, overwrite, format, Some(pane_id))
+                        .prepare(&path, overwrite, Some(pane_id))
                         .await
                         .map_err(|e| e.to_rpc(pane_id))?;
-                    let recording_id = {
+                    // Checked and committed under one lock: either the pane's
+                    // input is seen closed here, or its PTY task, which needs
+                    // this lock to end the pane's recordings, ends this one.
+                    let (recording_id, path) = {
                         let state = io.lock().await;
-                        if !state.writers.contains_key(&pane_id) {
+                        if !pane_takes_input(&state, pane_id) {
                             return Err(shux_rpc::RpcError::not_found(
                                 "live pane PTY",
                                 &pane_id.to_string(),
                             ));
                         }
-                        // The header geometry is the pane's as output starts.
-                        let cast_size = match format {
-                            RecordFormat::Cast => {
-                                let vt = state.vts.get(&pane_id).ok_or_else(|| {
-                                    shux_rpc::RpcError::not_found("pane VT", &pane_id.to_string())
-                                })?;
-                                Some((vt.grid().cols() as u16, vt.grid().rows() as u16))
-                            }
-                            RecordFormat::Raw => None,
+                        // A cast's header geometry is the pane's as output starts.
+                        let cast_size = if cast {
+                            let vt = state.vts.get(&pane_id).ok_or_else(|| {
+                                shux_rpc::RpcError::not_found("pane VT", &pane_id.to_string())
+                            })?;
+                            Some((vt.grid().cols() as u16, vt.grid().rows() as u16))
+                        } else {
+                            None
                         };
                         prepared
                             .commit(pane_id, cast_size)
                             .map_err(|e| e.to_rpc(pane_id))?
                     };
                     if let Some(owner) = owner {
-                        recordings.end_with(recording_id, owner);
+                        recordings.end_when(
+                            recording_id,
+                            owner.cancelled_owned(),
+                            EndedBy::OwnerDisconnected,
+                        );
                     }
                     if let Some(ms) = duration_ms {
-                        recordings.end_after(recording_id, std::time::Duration::from_millis(ms));
+                        recordings.end_when(
+                            recording_id,
+                            requested_length(std::time::Duration::from_millis(ms)),
+                            EndedBy::Duration,
+                        );
                     }
-                    let (_, path) = recordings.watch(recording_id).ok_or_else(|| {
-                        shux_rpc::RpcError::internal("recording retired before it was reported")
-                    })?;
 
                     Ok(serde_json::json!({
                         "recording_id": recording_id.to_string(),
@@ -2036,6 +2044,72 @@ mod tests {
             b"admitted",
             "the stop overtook a chunk its tee had already admitted"
         );
+        harness.stop().await;
+    }
+
+    /// The PTY loop closes the pane's input, then ends its recordings, and
+    /// only later drops its writer: a start in that window is refused, not
+    /// left recording a pane nothing will ever tee or end again.
+    #[tokio::test]
+    async fn a_start_after_its_pane_ended_is_refused() {
+        let harness = RpcHarness::new();
+        let (_s, _w, pane_id) = harness.seed_session("record-gone").await;
+        let writer_rx = harness.seed_io(pane_id, b"ready\n").await;
+        drop(writer_rx);
+        crate::pane_record::finish_pane_recorders(&harness.io, pane_id, None).await;
+        assert!(harness.io.lock().await.writers.contains_key(&pane_id));
+        let dir = tempfile::tempdir().unwrap();
+        let err = dispatch_err(
+            &harness.router,
+            "pane.record.start",
+            serde_json::json!({
+                "pane_id": pane_id.to_string(),
+                "path": dir.path().join("gone.bin").display().to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(err.code, shux_rpc::ErrorCode::NotFound.code(), "{err:?}");
+        harness.stop().await;
+    }
+
+    /// A pane that ends while a start's file is still opening: the start is
+    /// told the pane is gone, not that the daemon is shutting down.
+    #[tokio::test]
+    async fn a_pane_ending_mid_start_refuses_it_as_gone() {
+        use crate::pane_record::testing::TestOpener;
+        let harness = RpcHarness::new();
+        let (_s, _w, pane_id) = harness.seed_session("record-mid").await;
+        let writer_rx = harness.seed_io(pane_id, b"ready\n").await;
+        let opener = TestOpener::new();
+        opener.set_open(false);
+        let recordings = crate::pane_record::Recordings::with_opener(
+            CancellationToken::new(),
+            opener.opener(1 << 16),
+            crate::pane_record::PANE_RECORD_CHANNEL_CAPACITY,
+        );
+        harness.io.lock().await.recordings = recordings.clone();
+        let dir = tempfile::tempdir().unwrap();
+        let start = {
+            let router = harness.router.clone();
+            let params = serde_json::json!({
+                "pane_id": pane_id.to_string(),
+                "path": dir.path().join("mid.bin").display().to_string(),
+            });
+            tokio::spawn(async move { router.dispatch("pane.record.start", Some(params)).await })
+        };
+        shux_testkit::wait_until_async("the start to reserve the pane", || {
+            let recordings = recordings.clone();
+            async move { !recordings.live().is_empty() }
+        })
+        .await;
+        drop(writer_rx);
+        crate::pane_record::finish_pane_recorders(&harness.io, pane_id, None).await;
+        opener.set_open(true);
+        let err = start
+            .await
+            .unwrap()
+            .expect_err("a start on an ended pane succeeded");
+        assert_eq!(err.code, shux_rpc::ErrorCode::NotFound.code(), "{err:?}");
         harness.stop().await;
     }
 

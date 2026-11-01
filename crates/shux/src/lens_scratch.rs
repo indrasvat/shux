@@ -1912,15 +1912,7 @@ async fn spawn_scratch_core(
     let cast_recorder = match p.cast {
         Some(cast_path) => {
             let recordings = io_state.lock().await.recordings.clone();
-            match recordings
-                .prepare(
-                    &cast_path,
-                    true,
-                    crate::pane_record::RecordFormat::Cast,
-                    None,
-                )
-                .await
-            {
+            match recordings.prepare(&cast_path, true, None).await {
                 Ok(rec) => Some(rec),
                 Err(e) => {
                     let _ = graph.destroy_session(session_id, None).await;

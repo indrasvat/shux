@@ -1678,12 +1678,7 @@ mod tests {
         let first_done = h.io.lock().await.pty_done.remove(&pane).unwrap();
         let recordings = h.io.lock().await.recordings.clone();
         let rec = recordings
-            .prepare(
-                &dir.path().join("s.cast"),
-                true,
-                crate::pane_record::RecordFormat::Cast,
-                None,
-            )
+            .prepare(&dir.path().join("s.cast"), true, None)
             .await
             .unwrap();
         let (outcome, _) = recordings.watch(rec.id()).unwrap();
@@ -1718,12 +1713,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let recordings = h.io.lock().await.recordings.clone();
         let rec = recordings
-            .prepare(
-                &dir.path().join("k.cast"),
-                true,
-                crate::pane_record::RecordFormat::Cast,
-                None,
-            )
+            .prepare(&dir.path().join("k.cast"), true, None)
             .await
             .unwrap();
         let (mut outcome, _) = recordings.watch(rec.id()).unwrap();

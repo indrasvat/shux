@@ -43,22 +43,15 @@ pub(crate) enum PaneRecordChunk {
     Resize { cols: u16, rows: u16, at: Instant },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RecordFormat {
-    /// The pane's bytes, unchanged.
-    Raw,
-    /// asciinema v2: timestamped output and resize events, UTF-8-boundary-safe.
-    Cast,
-}
-
 /// What the file holds. `Complete`: every admitted byte written and flushed.
 /// `Aborted`: admitted bytes were dropped. `Error`: a write or flush failed.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Declared in rising severity: a worse status replaces a lesser one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
 pub(crate) enum PaneRecordStatus {
     Recording,
     Complete,
-    Error,
     Aborted,
+    Error,
 }
 
 impl PaneRecordStatus {
@@ -68,15 +61,6 @@ impl PaneRecordStatus {
             PaneRecordStatus::Complete => "complete",
             PaneRecordStatus::Error => "error",
             PaneRecordStatus::Aborted => "aborted",
-        }
-    }
-
-    fn severity(self) -> u8 {
-        match self {
-            PaneRecordStatus::Recording => 0,
-            PaneRecordStatus::Complete => 1,
-            PaneRecordStatus::Aborted => 2,
-            PaneRecordStatus::Error => 3,
         }
     }
 }
@@ -159,7 +143,7 @@ impl Control {
             if o.finalized {
                 return;
             }
-            if status.severity() > o.status.severity() {
+            if status > o.status {
                 o.status = status;
             }
             o.error.get_or_insert_with(|| error.to_string());
@@ -173,7 +157,7 @@ impl Control {
                 Ok(()) => PaneRecordStatus::Complete,
                 Err(_) => PaneRecordStatus::Error,
             };
-            if status.severity() > o.status.severity() {
+            if status > o.status {
                 o.status = status;
             }
             if let Err(e) = writer {
@@ -250,7 +234,6 @@ struct Shared {
     /// Cancelled by [`Recordings::drain`]: stop waiting out retention.
     retire: CancellationToken,
     opener: Opener,
-    ttl: Duration,
     /// Chunks in flight per recording before its tee waits.
     channel: usize,
 }
@@ -258,6 +241,8 @@ struct Shared {
 #[derive(Debug)]
 pub(crate) enum RecordStartError {
     ShuttingDown,
+    /// The pane ended while the start was opening its file.
+    PaneGone,
     PaneBusy(uuid::Uuid),
     PathBusy(PathBuf),
     BadPath(String),
@@ -266,29 +251,35 @@ pub(crate) enum RecordStartError {
 
 impl RecordStartError {
     pub(crate) fn to_rpc(&self, pane: PaneId) -> shux_rpc::RpcError {
-        match self {
-            RecordStartError::ShuttingDown => {
-                shux_rpc::RpcError::internal("daemon is shutting down")
+        let conflict = |resource: &str, name: String, extra: serde_json::Value| {
+            let mut data = serde_json::json!({
+                "resource": resource,
+                "name": name,
+                "detail": self.to_string(),
+            });
+            if let (Some(d), Some(e)) = (data.as_object_mut(), extra.as_object()) {
+                d.extend(e.clone());
             }
-            RecordStartError::PaneBusy(running) => shux_rpc::RpcError::with_data(
-                shux_rpc::ErrorCode::NameConflict,
-                serde_json::json!({
-                    "resource": "pane recording",
-                    "name": pane.to_string(),
-                    "recording_id": running.to_string(),
-                    "detail": format!("a recording ({running}) is already running on pane {pane}"),
-                }),
+            shux_rpc::RpcError::with_data(shux_rpc::ErrorCode::NameConflict, data)
+        };
+        match self {
+            RecordStartError::PaneGone => {
+                shux_rpc::RpcError::not_found("live pane PTY", &pane.to_string())
+            }
+            RecordStartError::PaneBusy(running) => conflict(
+                "pane recording",
+                pane.to_string(),
+                serde_json::json!({ "recording_id": running.to_string() }),
             ),
-            RecordStartError::PathBusy(path) => shux_rpc::RpcError::with_data(
-                shux_rpc::ErrorCode::NameConflict,
-                serde_json::json!({
-                    "resource": "record file",
-                    "name": path.display().to_string(),
-                    "detail": format!("another recording is writing {}", path.display()),
-                }),
+            RecordStartError::PathBusy(path) => conflict(
+                "record file",
+                path.display().to_string(),
+                serde_json::Value::Null,
             ),
             RecordStartError::BadPath(e) => shux_rpc::RpcError::invalid_params(e),
-            RecordStartError::Open(e) => shux_rpc::RpcError::internal(e),
+            RecordStartError::ShuttingDown | RecordStartError::Open(_) => {
+                shux_rpc::RpcError::internal(&self.to_string())
+            }
         }
     }
 }
@@ -297,7 +288,10 @@ impl std::fmt::Display for RecordStartError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RecordStartError::ShuttingDown => f.write_str("daemon is shutting down"),
-            RecordStartError::PaneBusy(id) => write!(f, "a recording ({id}) is already running"),
+            RecordStartError::PaneGone => f.write_str("the pane ended"),
+            RecordStartError::PaneBusy(id) => {
+                write!(f, "a recording ({id}) is already running on this pane")
+            }
             RecordStartError::PathBusy(p) => {
                 write!(f, "another recording is writing {}", p.display())
             }
@@ -315,20 +309,10 @@ pub(crate) struct Recordings {
 impl Recordings {
     /// `root` is the daemon's shutdown token.
     pub(crate) fn new(root: CancellationToken) -> Self {
-        Self::with_opener(
-            root,
-            file_opener(),
-            PANE_RECORD_COMPLETED_TTL,
-            PANE_RECORD_CHANNEL_CAPACITY,
-        )
+        Self::with_opener(root, file_opener(), PANE_RECORD_CHANNEL_CAPACITY)
     }
 
-    pub(crate) fn with_opener(
-        root: CancellationToken,
-        opener: Opener,
-        ttl: Duration,
-        channel: usize,
-    ) -> Self {
+    pub(crate) fn with_opener(root: CancellationToken, opener: Opener, channel: usize) -> Self {
         Self {
             shared: Arc::new(Shared {
                 state: StdMutex::new(Registry {
@@ -339,7 +323,6 @@ impl Recordings {
                 root,
                 retire: CancellationToken::new(),
                 opener,
-                ttl,
                 channel,
             }),
         }
@@ -359,7 +342,6 @@ impl Recordings {
         &self,
         path: &Path,
         overwrite: bool,
-        format: RecordFormat,
         pane: Option<PaneId>,
     ) -> Result<Prepared, RecordStartError> {
         let key = path_key(path).await?;
@@ -396,7 +378,7 @@ impl Recordings {
             let this = self.clone();
             self.shared
                 .tracker
-                .spawn(async move { this.open(id, key, overwrite, format, control).await })
+                .spawn(async move { this.open(id, key, overwrite, control).await })
         };
         task.await
             .unwrap_or_else(|e| Err(RecordStartError::Open(format!("record open failed: {e}"))))
@@ -407,7 +389,6 @@ impl Recordings {
         id: uuid::Uuid,
         path: PathBuf,
         overwrite: bool,
-        format: RecordFormat,
         control: Arc<Control>,
     ) -> Result<Prepared, RecordStartError> {
         let opened =
@@ -432,7 +413,7 @@ impl Recordings {
         let writer = self
             .shared
             .tracker
-            .spawn(write_recording(rx, sink, format, control.clone()));
+            .spawn(write_recording(rx, sink, control.clone()));
         let this = self.clone();
         self.shared
             .tracker
@@ -440,6 +421,7 @@ impl Recordings {
         Ok(Prepared {
             recordings: self.clone(),
             id,
+            path,
             sink: Some(tx),
         })
     }
@@ -460,7 +442,7 @@ impl Recordings {
             entry.sink = None;
         }
         tokio::select! {
-            () = retention(self.shared.ttl) => {}
+            () = retention() => {}
             () = self.shared.retire.cancelled() => {}
         }
         self.lock().entries.remove(&id);
@@ -483,12 +465,11 @@ impl Recordings {
             .collect()
     }
 
-    /// Stop accepting output; returns the recording's outcome to wait on.
-    pub(crate) fn stop(&self, id: uuid::Uuid, cause: EndedBy) -> Option<watch::Receiver<Outcome>> {
-        let mut reg = self.lock();
-        let entry = reg.entries.get_mut(&id)?;
-        self.end(entry, cause);
-        Some(entry.control.outcome.subscribe())
+    /// Stop accepting output.
+    pub(crate) fn stop(&self, id: uuid::Uuid, cause: EndedBy) {
+        if let Some(entry) = self.lock().entries.get_mut(&id) {
+            self.end(entry, cause);
+        }
     }
 
     /// End every recording of `pane`.
@@ -526,8 +507,14 @@ impl Recordings {
         Some((entry.control.outcome.subscribe(), entry.path.clone()))
     }
 
-    /// End the recording when `owner` is cancelled first.
-    pub(crate) fn end_with(&self, id: uuid::Uuid, owner: CancellationToken) {
+    /// End the recording with `cause` once `trigger` completes, unless it
+    /// has ended first: the owner's connection closing, or its duration.
+    pub(crate) fn end_when(
+        &self,
+        id: uuid::Uuid,
+        trigger: impl std::future::Future<Output = ()> + Send + 'static,
+        cause: EndedBy,
+    ) {
         let Some((mut outcome, _)) = self.watch(id) else {
             return;
         };
@@ -535,26 +522,7 @@ impl Recordings {
         self.shared.tracker.spawn(async move {
             tokio::select! {
                 _ = outcome.wait_for(|o| o.finalized) => {}
-                () = owner.cancelled() => {
-                    this.stop(id, EndedBy::OwnerDisconnected);
-                }
-                () = this.shared.retire.cancelled() => {}
-            }
-        });
-    }
-
-    /// End the recording after `after`, if nothing ends it first.
-    pub(crate) fn end_after(&self, id: uuid::Uuid, after: Duration) {
-        let Some((mut outcome, _)) = self.watch(id) else {
-            return;
-        };
-        let this = self.clone();
-        self.shared.tracker.spawn(async move {
-            tokio::select! {
-                _ = outcome.wait_for(|o| o.finalized) => {}
-                () = requested_length(after) => {
-                    this.stop(id, EndedBy::Duration);
-                }
+                () = trigger => this.stop(id, cause),
                 () = this.shared.retire.cancelled() => {}
             }
         });
@@ -592,15 +560,6 @@ impl Recordings {
             .collect()
     }
 
-    #[cfg(test)]
-    pub(crate) fn live_on(&self, pane: PaneId) -> usize {
-        self.lock()
-            .entries
-            .values()
-            .filter(|e| e.live() && e.pane == Some(pane))
-            .count()
-    }
-
     /// Id, pane and path of every live recording.
     #[cfg(any(test, fuzzing))]
     pub(crate) fn live(&self) -> Vec<(uuid::Uuid, Option<PaneId>, PathBuf)> {
@@ -627,15 +586,15 @@ impl Recordings {
     clippy::disallowed_methods,
     reason = "a finished recording stays queryable for its TTL"
 )]
-async fn retention(ttl: Duration) {
-    tokio::time::sleep(ttl).await;
+async fn retention() {
+    tokio::time::sleep(PANE_RECORD_COMPLETED_TTL).await;
 }
 
 #[expect(
     clippy::disallowed_methods,
     reason = "duration_ms is the recording's requested length"
 )]
-async fn requested_length(after: Duration) {
+pub(crate) async fn requested_length(after: Duration) {
     tokio::time::sleep(after).await;
 }
 
@@ -666,6 +625,8 @@ async fn path_key(path: &Path) -> Result<PathBuf, RecordStartError> {
 pub(crate) struct Prepared {
     recordings: Recordings,
     id: uuid::Uuid,
+    /// The resolved path the file was opened at.
+    path: PathBuf,
     sink: Option<mpsc::Sender<PaneRecordChunk>>,
 }
 
@@ -681,7 +642,7 @@ impl Prepared {
         mut self,
         pane: PaneId,
         cast_size: Option<(u16, u16)>,
-    ) -> Result<uuid::Uuid, RecordStartError> {
+    ) -> Result<(uuid::Uuid, PathBuf), RecordStartError> {
         let recordings = self.recordings.clone();
         let mut reg = recordings.lock();
         if !reg.admitting {
@@ -699,8 +660,9 @@ impl Prepared {
                 "recording vanished before it started".into(),
             ));
         };
+        // Only the pane's end cancels a reservation while admission is open.
         if entry.phase != (Phase::Reserved { cancelled: false }) {
-            return Err(RecordStartError::ShuttingDown);
+            return Err(RecordStartError::PaneGone);
         }
         let sink = self
             .sink
@@ -717,7 +679,7 @@ impl Prepared {
         entry.pane = Some(pane);
         entry.sink = Some(sink);
         entry.phase = Phase::Accepting;
-        Ok(self.id)
+        Ok((self.id, self.path.clone()))
     }
 }
 
@@ -798,16 +760,13 @@ impl Drop for Admission {
 async fn write_recording(
     mut rx: mpsc::Receiver<PaneRecordChunk>,
     mut sink: RecordSink,
-    format: RecordFormat,
     control: Arc<Control>,
 ) -> Result<(), String> {
     let mut cast: Option<shux_vt::CastWriter> = None;
     while let Some(chunk) = rx.recv().await {
         let line = match chunk {
+            // Only a cast is sent a header; it makes the recording a cast.
             PaneRecordChunk::Begin { cols, rows, at } => {
-                if format != RecordFormat::Cast {
-                    continue;
-                }
                 let ts = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
@@ -1141,7 +1100,6 @@ mod tests {
         let rec = Recordings::with_opener(
             root.clone(),
             opener.opener(capacity),
-            Duration::from_secs(60),
             PANE_RECORD_CHANNEL_CAPACITY,
         );
         Rig {
@@ -1159,11 +1117,12 @@ mod tests {
 
         async fn start(&self, name: &str, pane: PaneId) -> uuid::Uuid {
             self.rec
-                .prepare(&self.path(name), true, RecordFormat::Raw, Some(pane))
+                .prepare(&self.path(name), true, Some(pane))
                 .await
                 .unwrap()
                 .commit(pane, None)
                 .unwrap()
+                .0
         }
 
         async fn send(&self, pane: PaneId, data: &[u8]) {
@@ -1211,23 +1170,29 @@ mod tests {
                 r.opener.fault.lock().unwrap().fail_after = Some(4);
             }
             if how == "rollback" {
-                let prepared = r
-                    .rec
-                    .prepare(&r.path("x"), true, RecordFormat::Raw, Some(pane))
-                    .await
-                    .unwrap();
+                let prepared = r.rec.prepare(&r.path("x"), true, Some(pane)).await.unwrap();
+                let id = prepared.id();
                 drop(prepared);
+                assert_eq!(r.ended(id).await.ended_by, None, "a rollback has no cause");
             } else {
                 let id = r.start("x", pane).await;
                 match how {
                     "stop" => {
                         r.rec.stop(id, EndedBy::Stop);
                     }
-                    "duration" => r.rec.end_after(id, Duration::from_millis(5)),
+                    "duration" => r.rec.end_when(
+                        id,
+                        requested_length(Duration::from_millis(5)),
+                        EndedBy::Duration,
+                    ),
                     "pane_exit" => r.rec.stop_pane(pane, EndedBy::PaneExit),
                     "owner" => {
                         let owner = CancellationToken::new();
-                        r.rec.end_with(id, owner.clone());
+                        r.rec.end_when(
+                            id,
+                            owner.clone().cancelled_owned(),
+                            EndedBy::OwnerDisconnected,
+                        );
                         owner.cancel();
                     }
                     "write_failure" => r.send(pane, b"more than four").await,
@@ -1258,7 +1223,11 @@ mod tests {
             r.start("b", b).await,
             r.start("c", c).await,
         );
-        r.rec.end_after(ia, Duration::from_millis(5));
+        r.rec.end_when(
+            ia,
+            requested_length(Duration::from_millis(5)),
+            EndedBy::Duration,
+        );
         r.root.cancel();
         r.rec.stop_pane(b, EndedBy::PaneExit);
         r.rec.stop(ic, EndedBy::Stop);
@@ -1365,20 +1334,17 @@ mod tests {
         let first = {
             let rec = r.rec.clone();
             let path = r.path("p");
-            tokio::spawn(async move { rec.prepare(&path, true, RecordFormat::Raw, Some(a)).await })
+            tokio::spawn(async move { rec.prepare(&path, true, Some(a)).await })
         };
         let rec = r.rec.clone();
         shux_testkit::wait_until_async("the first start to reserve", || {
             let rec = rec.clone();
-            async move { rec.live_on(a) == 1 }
+            async move { rec.live().iter().filter(|(_, p, _)| *p == Some(a)).count() == 1 }
         })
         .await;
         first.abort();
         let _ = first.await;
-        let second = r
-            .rec
-            .prepare(&r.path("p"), true, RecordFormat::Raw, Some(b))
-            .await;
+        let second = r.rec.prepare(&r.path("p"), true, Some(b)).await;
         assert!(
             matches!(second, Err(RecordStartError::PathBusy(_))),
             "a second start took the path while the first open was in flight: {:?}",
@@ -1387,15 +1353,10 @@ mod tests {
         r.opener.set_open(true);
         shux_testkit::wait_until_async("the abandoned start to roll back", || {
             let rec = rec.clone();
-            async move { rec.live_on(a) == 0 }
+            async move { rec.live().iter().filter(|(_, p, _)| *p == Some(a)).count() == 0 }
         })
         .await;
-        assert!(
-            r.rec
-                .prepare(&r.path("p"), true, RecordFormat::Raw, Some(b))
-                .await
-                .is_ok()
-        );
+        assert!(r.rec.prepare(&r.path("p"), true, Some(b)).await.is_ok());
         assert_eq!(
             r.opener.opens.lock().unwrap().len(),
             2,
@@ -1414,16 +1375,20 @@ mod tests {
             let rec = r.rec.clone();
             let path = r.path("late");
             tokio::spawn(async move {
-                let prepared = rec
-                    .prepare(&path, true, RecordFormat::Raw, Some(pane))
-                    .await?;
+                let prepared = rec.prepare(&path, true, Some(pane)).await?;
                 prepared.commit(pane, None)
             })
         };
         let rec = r.rec.clone();
         shux_testkit::wait_until_async("the start to reserve", || {
             let rec = rec.clone();
-            async move { rec.live_on(pane) == 1 }
+            async move {
+                rec.live()
+                    .iter()
+                    .filter(|(_, p, _)| *p == Some(pane))
+                    .count()
+                    == 1
+            }
         })
         .await;
         r.rec.close_admission();
@@ -1443,7 +1408,14 @@ mod tests {
             start.await.unwrap(),
             Err(RecordStartError::ShuttingDown)
         ));
-        assert_eq!(r.rec.live_on(pane), 0);
+        assert_eq!(
+            r.rec
+                .live()
+                .iter()
+                .filter(|(_, p, _)| *p == Some(pane))
+                .count(),
+            0
+        );
     }
 
     /// A writer that panics still finalizes, with the bytes it wrote.

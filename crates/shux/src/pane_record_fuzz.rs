@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::pane_record::testing::{Fault, TestOpener};
-use crate::pane_record::{EndedBy, Outcome, PaneRecordStatus, RecordFormat, Recordings};
+use crate::pane_record::{EndedBy, Outcome, PaneRecordStatus, Recordings, requested_length};
 
 const PANES: usize = 3;
 const PATHS: usize = 3;
@@ -106,12 +106,8 @@ impl Model {
     fn new() -> Self {
         let root = CancellationToken::new();
         let opener = TestOpener::new();
-        let rec = Recordings::with_opener(
-            root.clone(),
-            opener.opener(SINK_CAPACITY),
-            Duration::from_secs(60),
-            CHANNEL_CAPACITY,
-        );
+        let rec =
+            Recordings::with_opener(root.clone(), opener.opener(SINK_CAPACITY), CHANNEL_CAPACITY);
         let dir = tempfile::tempdir().expect("tempdir");
         let base = std::fs::canonicalize(dir.path()).expect("canonical tempdir");
         let paths = (0..PATHS).map(|i| base.join(format!("f{i}"))).collect();
@@ -280,10 +276,7 @@ impl Model {
         let refused = self.refused.clone();
         self.starts.spawn(async move {
             use crate::pane_record::RecordStartError::{PaneBusy, PathBusy};
-            let prepared = match rec
-                .prepare(&path_buf, true, RecordFormat::Raw, Some(pane_id))
-                .await
-            {
+            let prepared = match rec.prepare(&path_buf, true, Some(pane_id)).await {
                 Ok(p) => p,
                 Err(PaneBusy(_) | PathBusy(_)) => {
                     refused.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -291,7 +284,7 @@ impl Model {
                 }
                 Err(_) => return,
             };
-            let Ok(id) = prepared.commit(pane_id, None) else {
+            let Ok((id, _)) = prepared.commit(pane_id, None) else {
                 return;
             };
             let (outcome, _) = rec.watch(id).expect("a recording just committed");
@@ -300,10 +293,10 @@ impl Model {
                 .expect("started")
                 .push(Started { id, owner, outcome });
             if let Some(token) = owner_token {
-                rec.end_with(id, token);
+                rec.end_when(id, token.cancelled_owned(), EndedBy::OwnerDisconnected);
             }
             if let Some(after) = duration {
-                rec.end_after(id, after);
+                rec.end_when(id, requested_length(after), EndedBy::Duration);
             }
         });
     }
