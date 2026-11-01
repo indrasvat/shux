@@ -871,10 +871,13 @@ fn review_refuses_non_interactive() {
 
 /// [`gate`] with every file write failing (EFBIG): the trace file cannot grow. The JSON
 /// report goes to a pipe, which the limit does not touch.
-fn gate_with_files_full(h: &Harness, args: &[&str]) -> Gate {
+fn gate_with_files_full(h: &Harness, args: &[&str], stdout: Option<std::fs::File>) -> Gate {
     use std::os::unix::process::CommandExt;
     let mut cmd = h.shux();
     cmd.args(["lens", "gate"]).args(args).env_remove("CI");
+    if let Some(file) = stdout {
+        cmd.stdout(file);
+    }
     // SAFETY: setrlimit and signal are async-signal-safe and touch only the child.
     // SIGXFSZ ignored turns an over-limit write into EFBIG instead of a kill.
     unsafe {
@@ -931,6 +934,7 @@ fn a_lost_trace_turns_a_green_run_into_exit_4() {
             &gd,
             &scn,
         ],
+        None,
     );
     assert_eq!(
         out.exit, 4,
@@ -965,6 +969,7 @@ fn a_lost_trace_never_masks_a_regression() {
             &gd,
             &scn,
         ],
+        None,
     );
     assert_eq!(
         out.exit, 1,
@@ -1104,4 +1109,156 @@ fn a_failure_in_the_gate_itself_is_infra_not_a_regression() {
         "stderr must say it is not a regression:\n{}",
         out.stderr
     );
+}
+
+#[test]
+fn a_refused_alias_leaves_the_file_it_names_untouched() {
+    let h = Harness::new();
+    let d = tmp();
+    let scn = write_scenario(d.path(), "ut", &scenario("ut", "HI", None));
+    let kept = d.path().join("kept.json");
+    std::fs::write(&kept, "precious").unwrap();
+    let trace = d.path().join("t.ndjson");
+    std::fs::hard_link(&kept, &trace).unwrap();
+    let trace = trace.to_string_lossy().into_owned();
+    let out = gate(&h, &["--trace", &trace, "--cast", &trace, &scn], false);
+    assert_eq!(out.exit, 2, "stderr:\n{}", out.stderr);
+    assert_eq!(
+        std::fs::read_to_string(&kept).unwrap(),
+        "precious",
+        "a refused run must not truncate the file"
+    );
+}
+
+#[test]
+fn a_malformed_scenario_whose_report_is_its_trace_is_refused() {
+    let h = Harness::new();
+    let d = tmp();
+    let scn = write_scenario(d.path(), "bad", "name = \"bad\"\nnot toml [[[\n");
+    let trace = d.path().join("t.ndjson").to_string_lossy().into_owned();
+    let out = gate(&h, &["--trace", &trace, "--report", &trace, &scn], false);
+    assert_eq!(out.exit, 2, "stderr:\n{}", out.stderr);
+    assert!(
+        out.stderr.contains("same file as --trace"),
+        "stderr must say why:\n{}",
+        out.stderr
+    );
+}
+
+#[test]
+fn a_stdout_trace_redirected_onto_the_report_is_refused() {
+    let h = Harness::new();
+    let d = tmp();
+    let scn = write_scenario(d.path(), "so", &scenario("so", "HI", None));
+    let report = d.path().join("out.json");
+    let file = std::fs::File::create(&report).unwrap();
+    let out = h
+        .shux()
+        .args(["lens", "gate", "--trace", "-", "--report"])
+        .arg(&report)
+        .arg(&scn)
+        .env_remove("CI")
+        .stdout(file)
+        .output()
+        .expect("spawn shux lens gate");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr:\n{stderr}");
+    assert!(stderr.contains("same file as --trace"), "stderr:\n{stderr}");
+}
+
+#[test]
+fn a_stdout_trace_that_cannot_be_written_exits_4() {
+    let h = Harness::new();
+    let d = tmp();
+    let g = tmp();
+    let gd = g.path().to_string_lossy().into_owned();
+    bless_golden(&h, d.path(), &gd, "sf", "STDOUT242");
+    let scn = d.path().join("sf.toml").to_string_lossy().into_owned();
+    let stdout = std::fs::File::create(d.path().join("stdout.ndjson")).unwrap();
+    let out = gate_with_files_full(
+        &h,
+        &[
+            "--trace",
+            "-",
+            "--report",
+            "/dev/null",
+            "--golden-dir",
+            &gd,
+            &scn,
+        ],
+        Some(stdout),
+    );
+    assert_eq!(out.exit, 4, "stderr:\n{}", out.stderr);
+    assert!(
+        out.stderr.contains("could not write the trace stream"),
+        "stderr must name the trace:\n{}",
+        out.stderr
+    );
+    assert!(!out.stderr.contains("panicked"), "stderr:\n{}", out.stderr);
+}
+
+#[test]
+fn a_golden_write_failure_keeps_the_regression_and_its_report() {
+    let h = Harness::new();
+    let d = tmp();
+    let scn = write_scenario(d.path(), "gw", &scenario("gw", "HI", None));
+    let blocker = d.path().join("blocker");
+    std::fs::write(&blocker, "").unwrap();
+    let gd = blocker.join("goldens").to_string_lossy().into_owned();
+    let out = gate(
+        &h,
+        &[
+            "--on-missing",
+            "create",
+            "--report",
+            "-",
+            "--golden-dir",
+            &gd,
+            &scn,
+        ],
+        false,
+    );
+    assert_eq!(
+        out.exit, 1,
+        "a missing golden stays a regression; stderr:\n{}",
+        out.stderr
+    );
+    let report = out.report();
+    assert_eq!(report[0].status, GateStatus::MissingGolden);
+    let note = report[0].note.clone().unwrap_or_default();
+    assert!(note.contains("goldens not written"), "note {note:?}");
+}
+
+/// `review` refuses a non-TTY stdin, so it runs here with a pty as stdin.
+fn review_on_a_tty(h: &Harness, scn: &str, env: &[(&str, &str)]) -> (i32, String) {
+    let pty = nix::pty::openpty(None, None).expect("openpty");
+    let out = h
+        .shux()
+        .args(["lens", "gate", "review", scn])
+        .envs(env.iter().copied())
+        .env_remove("CI")
+        .stdin(std::process::Stdio::from(pty.slave))
+        .output()
+        .expect("spawn shux lens gate review");
+    drop(pty.master);
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn review_reports_a_bad_scenario_as_usage_and_its_own_failure_as_infra() {
+    let h = Harness::new();
+    let d = tmp();
+    let bad = write_scenario(d.path(), "bad", "name = \"bad\"\nnot toml [[[\n");
+    let (code, stderr) = review_on_a_tty(&h, &bad, &[]);
+    assert_eq!(code, 2, "a malformed scenario is usage; stderr:\n{stderr}");
+
+    let scn = write_scenario(d.path(), "rv", &scenario("rv", "HI", None));
+    assert!(h.cli(&["session", "list"]).status.success());
+    let tmpdir = d.path().join("no-such-tmp");
+    let (code, stderr) = review_on_a_tty(&h, &scn, &[("TMPDIR", &tmpdir.to_string_lossy())]);
+    assert_eq!(code, 3, "stderr:\n{stderr}");
+    assert!(stderr.contains("not a regression"), "stderr:\n{stderr}");
 }

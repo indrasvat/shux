@@ -889,21 +889,24 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     argv,
                 },
         }) => {
-            let code = match sub {
+            let ran = match sub {
                 Some(cli::GateSubcommand::Review {
                     scenario,
                     golden_dir,
                     out,
-                }) => gate::review::run_review(&socket_path, scenario, golden_dir, out).await?,
+                }) => gate::review::run_review(&socket_path, scenario, golden_dir, out).await,
                 Some(cli::GateSubcommand::Init { name, dir }) => {
-                    gate::init::run_init(&socket_path, name, dir).await?
+                    gate::init::run_init(&socket_path, name, dir).await
                 }
                 None => {
-                    let scenario_path = scenario.ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "lens gate: a SCENARIO is required (or use `review`/`init`)"
-                        )
-                    })?;
+                    let Some(scenario_path) = scenario else {
+                        style::print_error(
+                            "lens gate: a SCENARIO is required (or use `review`/`init`)",
+                        );
+                        std::process::exit(
+                            gate::vocab::GateStatus::ScenarioError.exit_code().into(),
+                        );
+                    };
                     let opts = gate::driver::GateRunOptions {
                         scenario_path,
                         golden_dir,
@@ -919,10 +922,10 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
                         argv,
                         format: args.format,
                     };
-                    gate::driver::run_gate(&socket_path, opts).await?
+                    gate::driver::run_gate(&socket_path, opts).await
                 }
             };
-            std::process::exit(code);
+            std::process::exit(ran.unwrap_or_else(|e| gate::driver::infra_failure(&e)));
         }
 
         Some(Command::Rpc {

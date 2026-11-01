@@ -41,7 +41,13 @@ pub async fn run_review(
         return Ok(GateStatus::UpdateRefused.exit_code() as i32);
     }
 
-    let scenario = scenario::load(&scenario_path)?;
+    let scenario = match scenario::load(&scenario_path) {
+        Ok(scenario) => scenario,
+        Err(e) => {
+            eprintln!("{}", style::error(format!("lens gate review: {e}")));
+            return Ok(GateStatus::ScenarioError.exit_code() as i32);
+        }
+    };
     let golden_dir = golden_dir_opt
         .clone()
         .unwrap_or_else(|| default_golden_dir(&scenario_path, &scenario));

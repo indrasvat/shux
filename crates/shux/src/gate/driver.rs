@@ -132,19 +132,22 @@ fn apply_refusal(reports: &mut [ScenarioReport], reason: &str) {
 /// "visual regression" and printed a bare errno. `4` is reserved for exactly this class
 /// (`shux_vt`'s `exit_code_never_returns_four` pins that no gate VERDICT can produce it),
 /// so it is unambiguous: the check itself did not fail, writing its output did.
-fn report_io_failure(opts: &GateRunOptions, e: &std::io::Error) -> i32 {
-    let target = match opts.report.as_deref() {
-        Some("-") | None => "the report stream".to_string(),
-        Some(p) => format!("the report file {p}"),
-    };
+fn report_io_failure(failure: &OutputFailure) -> i32 {
+    let OutputFailure { what, error } = failure;
     eprintln!(
         "{}",
         crate::style::error(format!(
-            "lens gate: could not write {target}: {e}. The scenario itself ran; only its \
+            "lens gate: could not write {what}: {error}. The scenario itself ran; only its \
              output could not be written (exit 4, not a regression)."
         ))
     );
     4
+}
+
+/// An output of the gate that could not be written, and which one.
+struct OutputFailure {
+    what: String,
+    error: std::io::Error,
 }
 
 #[cfg(test)]
@@ -190,36 +193,42 @@ mod ci_tests {
 /// Route `report.json` + the ASCII summary to the right streams. When the report goes to
 /// stdout (`--report -` or `--format json`), stdout carries ONLY the JSON and the summary
 /// moves to stderr so a `| tee report.json` stays valid.
-fn emit(opts: &GateRunOptions, reports: &[ScenarioReport]) -> std::io::Result<()> {
+fn emit(opts: &GateRunOptions, reports: &[ScenarioReport]) -> Result<(), OutputFailure> {
+    use std::io::Write;
     let stdout_is_json =
         matches!(opts.format, OutputFormat::Json) || opts.report.as_deref() == Some("-");
     let json = serde_json::to_string_pretty(reports).unwrap_or_else(|_| "[]".to_string());
-    let write_err = match opts.report.as_deref() {
-        Some("-") => {
-            println!("{json}");
-            None
+    let to_stdout = |what: &str, text: &str| {
+        let mut out = std::io::stdout().lock();
+        out.write_all(text.as_bytes())
+            .and_then(|()| out.flush())
+            .map_err(|e| OutputFailure {
+                what: what.to_string(),
+                error: e,
+            })
+    };
+    let report_err = match opts.report.as_deref() {
+        Some(path) if path != "-" => {
+            std::fs::write(path, format!("{json}\n"))
+                .err()
+                .map(|e| OutputFailure {
+                    what: format!("the report file {path}"),
+                    error: e,
+                })
         }
-        Some(path) => std::fs::write(path, format!("{json}\n")).err(),
-        None => {
-            if stdout_is_json {
-                println!("{json}");
-            }
-            None
-        }
+        _ if stdout_is_json => to_stdout("the report stream", &format!("{json}\n")).err(),
+        _ => None,
     };
     // The summary is emitted even when the report file could not be written (085 QA P2):
     // returning early left a user with an errno and NO verdict at all, on a run that had
     // actually completed and produced one. On that path it goes to stderr, since stdout
-    // may still be a JSON stream a consumer is reading.
+    // may still be a JSON stream a consumer is reading. stderr is best-effort.
     let table = summary::render(reports);
-    if stdout_is_json || write_err.is_some() {
-        eprint!("{table}");
+    if stdout_is_json || report_err.is_some() {
+        let _ = std::io::stderr().write_all(table.as_bytes());
+        report_err.map_or(Ok(()), Err)
     } else {
-        print!("{table}");
-    }
-    match write_err {
-        Some(e) => Err(e),
-        None => Ok(()),
+        to_stdout("the summary", &table)
     }
 }
 
@@ -231,15 +240,21 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
         Err(e) => {
             // Preserve the 081 trace contract: a malformed scenario still leaves a
             // greppable `parse_error` in the trace.
+            if let Some(code) = refuse_trace_alias(&opts, None) {
+                return Ok(code);
+            }
             let lost_trace =
                 runner::emit_parse_error_trace(trace_target(opts.trace.clone()), &e.to_string());
+            if let Some(code) = refuse_trace_alias(&opts, None) {
+                return Ok(code);
+            }
             eprintln!("{}", crate::style::error(format!("lens gate: {e}")));
             let mut reports = parse_error_report(&opts.scenario_path, &e.to_string());
             if let Some(why) = &lost_trace {
                 plumb_retry_notes(&mut reports, &[format!("trace incomplete: {why}")]);
             }
             if let Err(e) = emit(&opts, &reports) {
-                return Ok(report_io_failure(&opts, &e));
+                return Ok(report_io_failure(&e));
             }
             let code = GateStatus::ScenarioError.exit_code() as i32;
             return Ok(lost_trace.map_or(code, |why| trace_failure(&why, code)));
@@ -259,7 +274,7 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
             "CI mode: goldens are never self-minted here",
         );
         if let Err(e) = emit(&opts, &reports) {
-            return Ok(report_io_failure(&opts, &e));
+            return Ok(report_io_failure(&e));
         }
         return Ok(GateStatus::UpdateRefused.exit_code() as i32);
     }
@@ -284,7 +299,7 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
             "--trace - collides with the stdout JSON report",
         );
         if let Err(e) = emit(&opts, &reports) {
-            return Ok(report_io_failure(&opts, &e));
+            return Ok(report_io_failure(&e));
         }
         return Ok(GateStatus::ScenarioError.exit_code() as i32);
     }
@@ -319,11 +334,14 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
             "--cast path must not be inside the golden dir",
         );
         if let Err(e) = emit(&opts, &reports) {
-            return Ok(report_io_failure(&opts, &e));
+            return Ok(report_io_failure(&e));
         }
         return Ok(GateStatus::ScenarioError.exit_code() as i32);
     }
 
+    if let Some(code) = refuse_trace_alias(&opts, cast_path.as_deref()) {
+        return Ok(code);
+    }
     let mut trace = match Trace::open(trace_target(opts.trace.clone())) {
         Ok(trace) => trace,
         Err(why) => {
@@ -336,31 +354,11 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
             return Ok(4);
         }
     };
-    let report_file = opts.report.as_deref().filter(|r| *r != "-").map(Path::new);
-    for (flag, path) in [("--report", report_file), ("--cast", cast_path.as_deref())] {
-        if let Some(path) = path
-            && trace.is_file(path)
-        {
-            eprintln!(
-                "{}",
-                crate::style::error(format!(
-                    "lens gate: {flag} {} is the same file as --trace, so one would overwrite \
-                     the other. Give them different files.",
-                    path.display()
-                ))
-            );
-            let reports = parse_error_report(
-                &opts.scenario_path,
-                &format!("{flag} names the same file as --trace"),
-            );
-            if let Err(e) = emit(&opts, &reports) {
-                return Ok(report_io_failure(&opts, &e));
-            }
-            return Ok(GateStatus::ScenarioError.exit_code() as i32);
-        }
+    if let Some(code) = refuse_trace_alias(&opts, cast_path.as_deref()) {
+        return Ok(code);
     }
 
-    let outcome = match runner::drive_scenario(
+    let outcome = runner::drive_scenario(
         socket_path,
         &scenario,
         &runner::scenario_dir_of(&opts.scenario_path),
@@ -370,11 +368,7 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
         opts.retries.unwrap_or(0),
         cast_path.clone(),
     )
-    .await
-    {
-        Ok(outcome) => outcome,
-        Err(e) => return Ok(infra_failure(&e)),
-    };
+    .await?;
 
     // Fold the runner's per-frame retry audit notes (task 083 council #5) into the scenario note
     // BEFORE verdict rollup so a flake absorbed by a retry — or a non-deterministic frame that
@@ -398,6 +392,7 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
     // scenario STATUS, but the WRITE still happened: a child that crashed after the capture
     // produced `child_error: exit 9; blessed 1 golden(s)` with the golden on disk — a
     // baseline taken from a broken run (found by the 085 implementation council, reproduced).
+    let mut bless_failure = None;
     let floor = verdict::scenario_floor(&outcome);
     let blessing = opts.update.is_some() || opts.on_missing == crate::cli::OnMissing::Create;
     if blessing && !floor.is_green() {
@@ -409,33 +404,37 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
                 summary::status_label(floor)
             ),
         );
-    } else if let Some(selector) = &opts.update {
-        let blessed =
-            match bless::run_update(&scenario, &outcome, &reports, &golden_dir, selector, &opts) {
-                Ok(blessed) => blessed,
-                Err(e) => return Ok(infra_failure(&e)),
-            };
-        match blessed {
-            bless::BlessOutcome::Refused(reason) => {
-                apply_refusal(&mut reports, &reason);
-            }
-            bless::BlessOutcome::Blessed(manifest) => {
-                bless::apply_blessed(&mut reports, &manifest, verdict::scenario_floor(&outcome));
-            }
-        }
-    } else if opts.on_missing == crate::cli::OnMissing::Create {
-        let created = match bless::create_missing(&scenario, &outcome, &reports, &golden_dir, &opts)
-        {
-            Ok(created) => created,
-            Err(e) => return Ok(infra_failure(&e)),
+    } else {
+        let blessed = if let Some(selector) = &opts.update {
+            Some(bless::run_update(
+                &scenario,
+                &outcome,
+                &reports,
+                &golden_dir,
+                selector,
+                &opts,
+            ))
+        } else if opts.on_missing == crate::cli::OnMissing::Create {
+            Some(bless::create_missing(
+                &scenario,
+                &outcome,
+                &reports,
+                &golden_dir,
+                &opts,
+            ))
+        } else {
+            None
         };
-        match created {
-            bless::BlessOutcome::Refused(reason) => {
-                apply_refusal(&mut reports, &reason);
-            }
-            bless::BlessOutcome::Blessed(manifest) => {
+        match blessed {
+            Some(Ok(bless::BlessOutcome::Refused(reason))) => apply_refusal(&mut reports, &reason),
+            Some(Ok(bless::BlessOutcome::Blessed(manifest))) => {
                 bless::apply_blessed(&mut reports, &manifest, verdict::scenario_floor(&outcome));
             }
+            Some(Err(e)) => {
+                plumb_retry_notes(&mut reports, &[format!("goldens not written: {e:#}")]);
+                bless_failure = Some(e);
+            }
+            None => {}
         }
     }
 
@@ -471,10 +470,62 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
         plumb_retry_notes(&mut reports, &[format!("trace incomplete: {why}")]);
     }
     if let Err(e) = emit(&opts, &reports) {
-        return Ok(report_io_failure(&opts, &e));
+        if let Some(why) = &lost_trace {
+            trace_failure(why, 4);
+        }
+        return Ok(report_io_failure(&e));
     }
     let code = verdict::exit_code(&reports) as i32;
-    Ok(lost_trace.map_or(code, |why| trace_failure(&why, code)))
+    let code = lost_trace.map_or(code, |why| trace_failure(&why, code));
+    Ok(bless_failure.map_or(code, |e| bless_failure_exit(&e, code)))
+}
+
+/// Writing the goldens failed after the run: the report's verdict stands, and a run that
+/// was not a regression exits 3.
+fn bless_failure_exit(e: &anyhow::Error, code: i32) -> i32 {
+    eprintln!(
+        "{}",
+        crate::style::error(format!(
+            "lens gate: could not write the goldens: {e:#}. The verdict in the report stands; \
+             no golden was blessed."
+        ))
+    );
+    if code == GateStatus::Fail.exit_code() as i32 {
+        code
+    } else {
+        GateStatus::InfraError.exit_code() as i32
+    }
+}
+
+/// Refuses a `--report` or `--cast` naming the trace's file, before and again after the
+/// trace is created: one would silently overwrite the other.
+fn refuse_trace_alias(opts: &GateRunOptions, cast: Option<&Path>) -> Option<i32> {
+    use std::os::unix::fs::MetadataExt;
+    let trace = runner::trace_file_id(&trace_target(opts.trace.clone())?)?;
+    let report = opts.report.as_deref().filter(|r| *r != "-").map(Path::new);
+    let (flag, path) = [("--report", report), ("--cast", cast)]
+        .into_iter()
+        .find_map(|(flag, path)| {
+            let path = path?;
+            let meta = std::fs::metadata(path).ok()?;
+            ((meta.dev(), meta.ino()) == trace).then_some((flag, path))
+        })?;
+    eprintln!(
+        "{}",
+        crate::style::error(format!(
+            "lens gate: {flag} {} is the same file as --trace, so one would overwrite the \
+             other. Give them different files.",
+            path.display()
+        ))
+    );
+    let reports = parse_error_report(
+        &opts.scenario_path,
+        &format!("{flag} names the same file as --trace"),
+    );
+    Some(match emit(opts, &reports) {
+        Ok(()) => GateStatus::ScenarioError.exit_code() as i32,
+        Err(e) => report_io_failure(&e),
+    })
 }
 
 /// A trace that could not be written: exit 4, unless the run is a regression, which
@@ -494,7 +545,7 @@ fn trace_failure(why: &str, code: i32) -> i32 {
 }
 
 /// The gate's own machinery failed, so there is no verdict: exit 3, never 1.
-fn infra_failure(e: &anyhow::Error) -> i32 {
+pub fn infra_failure(e: &anyhow::Error) -> i32 {
     eprintln!(
         "{}",
         crate::style::error(format!(

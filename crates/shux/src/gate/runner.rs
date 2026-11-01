@@ -79,50 +79,37 @@ pub struct Trace {
     /// Every signal, retained for the provisional exit decision + a minimal summary.
     signals: Vec<RunnerSignal>,
     label: String,
-    /// Device and inode of a trace file, to refuse another output naming the same file.
-    file_id: Option<(u64, u64)>,
     failure: Option<std::io::Error>,
 }
 
 impl Trace {
     /// No trace: signals are only retained.
     pub fn none() -> Self {
-        Self::with_sink(None, String::new(), None)
+        Self::with_sink(None, String::new())
     }
 
     /// Err is a diagnostic naming the target.
     pub fn open(target: Option<TraceTarget>) -> Result<Self, String> {
-        use std::os::unix::fs::MetadataExt;
         Ok(match target {
             None => Self::none(),
             Some(TraceTarget::Stdout) => Self::with_sink(
                 Some(Box::new(std::io::stdout())),
                 "the trace stream".to_string(),
-                None,
             ),
             Some(TraceTarget::Path(p)) => {
                 let label = format!("the trace file {}", p.display());
                 let file = std::fs::File::create(&p)
                     .map_err(|e| format!("could not open {label}: {e}"))?;
-                let id = file
-                    .metadata()
-                    .map(|m| (m.dev(), m.ino()))
-                    .map_err(|e| format!("could not open {label}: {e}"))?;
-                Self::with_sink(Some(Box::new(file)), label, Some(id))
+                Self::with_sink(Some(Box::new(file)), label)
             }
         })
     }
 
-    fn with_sink(
-        sink: Option<Box<dyn std::io::Write + Send>>,
-        label: String,
-        file_id: Option<(u64, u64)>,
-    ) -> Self {
+    fn with_sink(sink: Option<Box<dyn std::io::Write + Send>>, label: String) -> Self {
         Self {
             sink,
             signals: Vec::new(),
             label,
-            file_id,
             failure: None,
         }
     }
@@ -142,12 +129,20 @@ impl Trace {
         let e = self.failure.as_ref()?;
         Some(format!("could not write {}: {e}", self.label))
     }
+}
 
-    /// Whether `path` resolves to this trace's file.
-    pub fn is_file(&self, path: &Path) -> bool {
-        use std::os::unix::fs::MetadataExt;
-        self.file_id.is_some()
-            && std::fs::metadata(path).is_ok_and(|m| Some((m.dev(), m.ino())) == self.file_id)
+/// The device and inode the trace would be written to, when that is a regular file.
+pub fn trace_file_id(target: &TraceTarget) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    match target {
+        TraceTarget::Path(p) => std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino())),
+        TraceTarget::Stdout => {
+            let st = nix::sys::stat::fstat(std::io::stdout()).ok()?;
+            use nix::sys::stat::SFlag;
+            let regular = st.st_mode & SFlag::S_IFMT.bits() == SFlag::S_IFREG.bits();
+            // Same widening as std's `MetadataExt::dev`/`ino`.
+            regular.then_some((st.st_dev as u64, st.st_ino as u64))
+        }
     }
 }
 
@@ -1473,7 +1468,7 @@ mod tests {
                 fail_flush,
                 calls: calls.clone(),
             };
-            let mut trace = Trace::with_sink(Some(Box::new(sink)), "the trace file t".into(), None);
+            let mut trace = Trace::with_sink(Some(Box::new(sink)), "the trace file t".into());
             assert_eq!(trace.failure(), None);
             while trace.failure().is_none() {
                 trace.emit(RunnerSignal::NoVisualCheck);
