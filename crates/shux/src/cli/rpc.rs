@@ -91,7 +91,9 @@ pub fn rpc_display_raw(code: i64, message: &str, data: Option<&serde_json::Value
         // through to the raw "RPC error -32007: name_conflict") and instead
         // rendered auth failures as name conflicts.
         -32007 => {
-            if let Some(name) = data.and_then(|d| d.get("name")).and_then(|v| v.as_str()) {
+            if let Some(detail) = data.and_then(|d| d.get("detail")).and_then(|v| v.as_str()) {
+                detail.to_string()
+            } else if let Some(name) = data.and_then(|d| d.get("name")).and_then(|v| v.as_str()) {
                 format!("{resource} name '{name}' already exists")
             } else {
                 format!("{resource} name_conflict")

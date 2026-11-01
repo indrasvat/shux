@@ -644,6 +644,7 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
                 } => {
                     cli::handle_pane_record(
                         &mut stream,
+                        &socket_path,
                         &session,
                         &pane,
                         &to,

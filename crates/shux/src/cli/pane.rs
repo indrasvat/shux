@@ -568,10 +568,17 @@ pub async fn handle_pane_watch(
     }
 }
 
-/// Handle `shux pane record` — start a daemon-side lossless recorder, wait for
-/// a bounded duration or Ctrl-C, then stop and report the byte count.
+/// Handle `shux pane record`: start a lossless recording owned by this
+/// command's connection, and report it when it ends.
+///
+/// It ends when its pane exits, `--duration-ms` passes, someone stops it, or
+/// this command gets SIGINT, SIGTERM or SIGHUP (which stop it and report).
+/// If this command dies any other way, the daemon ends the recording with its
+/// connection; if the daemon goes away, this command fails at once.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_pane_record(
     stream: &mut tokio::net::UnixStream,
+    socket_path: &std::path::Path,
     session_name: &str,
     pane_id: &str,
     to: &std::path::Path,
@@ -579,100 +586,181 @@ pub async fn handle_pane_record(
     duration_ms: Option<u64>,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
-    // Validate the reference early so typos don't create files. Resolving it
-    // here also means the recorder is started against the canonical id rather
-    // than whatever fragment the caller typed.
-    shux_core::idref::parse_ref(shux_core::idref::RefKind::Pane, pane_id)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let pane_id = &validate_pane_belongs_to_session(stream, session_name, pane_id).await?;
-
+    let mut signals = RecordSignals::new()?;
     let path = if to.is_absolute() {
         to.to_path_buf()
     } else {
         std::env::current_dir()?.join(to)
     };
 
-    let start = rpc_call(
-        stream,
-        "pane.record.start",
-        serde_json::json!({
-            "pane_id": pane_id,
-            "path": path,
-            "overwrite": force,
-            "duration_ms": duration_ms,
-        }),
-    )
-    .await?;
-    let recording_id = start
-        .get("recording_id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("daemon did not return recording_id"))?
-        .to_string();
+    let start = async {
+        // Validate the reference early so typos don't create files, and start
+        // against the canonical id rather than the fragment typed.
+        shux_core::idref::parse_ref(shux_core::idref::RefKind::Pane, pane_id)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let pane_id = validate_pane_belongs_to_session(stream, session_name, pane_id).await?;
+        let started = rpc_call(
+            stream,
+            "pane.record.start",
+            serde_json::json!({
+                "pane_id": pane_id,
+                "path": path,
+                "overwrite": force,
+                "duration_ms": duration_ms,
+                "owned_by_connection": true,
+            }),
+        )
+        .await?;
+        started
+            .get("recording_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("daemon did not return recording_id"))
+    };
+    // A signal before the reply drops the connection, and with it any
+    // recording the daemon had started.
+    let recording_id = tokio::select! {
+        id = start => id?,
+        sig = signals.next() => anyhow::bail!("{sig} before the recording started; nothing was recorded"),
+    };
+    eprintln!(
+        "{} recording lossless pane output; press Ctrl-C to stop",
+        crate::style::muted("..."),
+    );
 
-    match duration_ms {
-        Some(ms) => {
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "--duration is how long the user asked to record"
-            )]
-            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-        }
-        None => {
-            eprintln!(
-                "{} recording lossless pane output; press Ctrl-C to stop",
-                crate::style::muted("..."),
-            );
-            tokio::signal::ctrl_c().await?;
-        }
+    let ended = rpc_call(
+        stream,
+        "pane.record.wait",
+        serde_json::json!({ "recording_id": recording_id }),
+    );
+    let outcome = tokio::select! {
+        outcome = ended => match outcome {
+            Ok(outcome) => outcome,
+            Err(super::RpcClientError::Io(_)) => anyhow::bail!(
+                "the daemon went away while recording {}; the file holds what was written before",
+                path.display()
+            ),
+            Err(e) => return Err(e.into()),
+        },
+        _ = signals.next() => stop_recording(socket_path, &recording_id, &path).await?,
+    };
+    report_recording(&outcome, format)
+}
+
+/// SIGINT, SIGTERM and SIGHUP, watched from before the recording starts.
+struct RecordSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+    hangup: tokio::signal::unix::Signal,
+}
+
+impl RecordSignals {
+    fn new() -> anyhow::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+            hangup: signal(SignalKind::hangup())?,
+        })
     }
 
-    let stopped = rpc_call(
-        stream,
-        "pane.record.stop",
-        serde_json::json!({
-            "recording_id": recording_id,
-        }),
-    )
-    .await?;
+    async fn next(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.interrupt.recv() => "SIGINT",
+            _ = self.terminate.recv() => "SIGTERM",
+            _ = self.hangup.recv() => "SIGHUP",
+        }
+    }
+}
+
+/// Stop the recording over a second connection: the first is busy waiting,
+/// and stays open until this returns. Never starts a daemon.
+async fn stop_recording(
+    socket_path: &std::path::Path,
+    recording_id: &str,
+    path: &std::path::Path,
+) -> anyhow::Result<serde_json::Value> {
+    const STOP_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+    let stop = async {
+        let mut stream = tokio::net::UnixStream::connect(socket_path).await?;
+        rpc_call(
+            &mut stream,
+            "pane.record.stop",
+            serde_json::json!({ "recording_id": recording_id }),
+        )
+        .await
+        .map_err(anyhow::Error::from)
+    };
+    match tokio::time::timeout(STOP_BUDGET, stop).await {
+        Ok(Ok(outcome)) => Ok(outcome),
+        Ok(Err(e)) => Err(e.context(format!(
+            "could not stop the recording of {}; the daemon may have gone away",
+            path.display()
+        ))),
+        Err(_) => anyhow::bail!(
+            "the daemon did not stop the recording of {} within {}s",
+            path.display(),
+            STOP_BUDGET.as_secs()
+        ),
+    }
+}
+
+/// Print how a recording ended; fail unless it ended normally with every
+/// byte on disk.
+fn report_recording(outcome: &serde_json::Value, format: OutputFormat) -> anyhow::Result<()> {
+    let field = |k: &str| outcome.get(k).and_then(|v| v.as_str()).unwrap_or("unknown");
+    let path = field("path");
+    let status = field("status");
+    let ended_by = outcome.get("ended_by").and_then(|v| v.as_str());
+    let finalized = outcome.get("finalized").and_then(|v| v.as_bool()) == Some(true);
+    let bytes = outcome
+        .get("bytes_written")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
 
     match format {
         OutputFormat::Json => println!(
             "{}",
-            crate::style::json_safe(&serde_json::to_string_pretty(&stopped)?)
+            crate::style::json_safe(&serde_json::to_string_pretty(outcome)?)
         ),
         OutputFormat::Plain => {
-            let path = stopped.get("path").and_then(|v| v.as_str()).unwrap_or("?");
-            let bytes = stopped
-                .get("bytes_written")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let status = stopped
-                .get("status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            println!("recording\t{status}\t{path}\t{bytes}");
+            println!(
+                "recording\t{status}\t{path}\t{bytes}\t{}",
+                ended_by.unwrap_or("-")
+            );
         }
         OutputFormat::Text => {
-            let path = stopped.get("path").and_then(|v| v.as_str()).unwrap_or("?");
-            let bytes = stopped
-                .get("bytes_written")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let status = stopped
-                .get("status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
             println!(
-                "{} {} bytes to {} ({})",
+                "{} {} bytes to {} ({}{})",
                 crate::style::success("✓ recorded"),
                 crate::style::bold(&bytes.to_string()),
                 crate::style::muted(path),
                 status,
+                ended_by
+                    .map(|c| format!(", {}", c.replace('_', " ")))
+                    .unwrap_or_default(),
             );
         }
     }
 
-    Ok(())
+    if !finalized {
+        anyhow::bail!("the recording of {path} was still being written when the daemon answered");
+    }
+    match (status, ended_by) {
+        ("complete", Some("stop" | "duration" | "pane_exit")) => Ok(()),
+        ("complete", Some("daemon_shutdown")) => {
+            anyhow::bail!(
+                "the daemon shut down while recording; {bytes} bytes were saved to {path}"
+            )
+        }
+        _ => {
+            let why = outcome
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("it did not end normally");
+            anyhow::bail!("the recording of {path} is {status}: {why}")
+        }
+    }
 }
 
 /// Handle the `shux pane kill` command.
@@ -987,7 +1075,7 @@ mod tests {
             windows(),
             serde_json::json!([{"id": pane, "cwd": "/tmp", "command": "bash", "is_focused": true, "is_zoomed": false}]),
             serde_json::json!({"recording_id": "55555555-5555-4555-8555-555555555555", "pane_id": pane, "path": record_path.display().to_string(), "duration_ms": 0, "lossless": true, "backpressure": true}),
-            serde_json::json!({"recording_id": "55555555-5555-4555-8555-555555555555", "path": record_path.display().to_string(), "bytes_written": 0, "status": "complete", "lossless": true, "error": null}),
+            serde_json::json!({"recording_id": "55555555-5555-4555-8555-555555555555", "path": record_path.display().to_string(), "bytes_written": 0, "status": "complete", "lossless": true, "error": null, "ended_by": "duration", "finalized": true}),
             session(),
             windows(),
             serde_json::json!({"png_base64": png_b64, "width": 10, "height": 10}),
@@ -1059,6 +1147,7 @@ mod tests {
         .unwrap();
         handle_pane_record(
             &mut client,
+            std::path::Path::new("/nonexistent/no-daemon.sock"),
             "dev",
             pane,
             &record_path,
@@ -1126,6 +1215,11 @@ mod tests {
             r["method"] == "pane.record.start"
                 && r["params"]["pane_id"] == pane
                 && r["params"]["path"] == record_path.display().to_string()
+                && r["params"]["owned_by_connection"] == true
+        }));
+        assert!(requests.iter().any(|r| {
+            r["method"] == "pane.record.wait"
+                && r["params"]["recording_id"] == "55555555-5555-4555-8555-555555555555"
         }));
         assert!(requests.iter().any(|r| {
             r["method"] == "pane.list"
@@ -1135,5 +1229,48 @@ mod tests {
         assert!(requests.iter().any(|r| r["method"] == "pane.snapshot"));
         assert!(requests.iter().any(|r| r["method"] == "session.snapshot"));
         assert!(requests.iter().any(|r| r["method"] == "window.snapshot"));
+    }
+
+    /// A recording that did not end normally with every byte on disk fails
+    /// the command, after reporting what it wrote.
+    #[tokio::test]
+    async fn a_recording_that_did_not_end_normally_fails_the_command() {
+        let sid = "11111111-1111-4111-8111-111111111111";
+        let wid = "22222222-2222-4222-8222-222222222222";
+        let pane = "33333333-3333-4333-8333-333333333333";
+        let id = "55555555-5555-4555-8555-555555555555";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("e.raw");
+        let cases = [
+            ("error", "pane_exit", true, "is error"),
+            ("aborted", "stop", true, "is aborted"),
+            ("complete", "daemon_shutdown", true, "daemon shut down"),
+            ("complete", "owner_disconnected", true, "is complete"),
+            ("complete", "stop", false, "still being written"),
+        ];
+        for (status, ended_by, finalized, says) in cases {
+            let (mut client, _requests, _task) = spawn_rpc_script(vec![
+                session_list_response(sid, wid),
+                window_list_response(wid, pane),
+                serde_json::json!([{"id": pane, "cwd": "/tmp", "command": "bash", "is_focused": true, "is_zoomed": false}]),
+                serde_json::json!({"recording_id": id, "pane_id": pane, "path": path.display().to_string(), "duration_ms": 0, "lossless": true, "backpressure": true}),
+                serde_json::json!({"recording_id": id, "path": path.display().to_string(), "bytes_written": 3, "status": status, "lossless": false, "error": null, "ended_by": ended_by, "finalized": finalized}),
+            ]);
+            let r = handle_pane_record(
+                &mut client,
+                std::path::Path::new("/nonexistent/no-daemon.sock"),
+                "dev",
+                pane,
+                &path,
+                true,
+                Some(0),
+                OutputFormat::Json,
+            )
+            .await;
+            let e = r.expect_err(&format!(
+                "{status}/{ended_by}/{finalized} was reported as success"
+            ));
+            assert!(e.to_string().contains(says), "{status}/{ended_by}: {e:#}");
+        }
     }
 }
