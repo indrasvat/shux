@@ -1,3 +1,10 @@
+## [0.55.2](https://github.com/indrasvat/shux/compare/v0.55.1...v0.55.2) (2026-11-01)
+
+
+### Bug Fixes
+
+* **cli:** a closed stdout ends the command quietly, by SIGPIPE ([#241](https://github.com/indrasvat/shux/issues/241)) ([e837ff3](https://github.com/indrasvat/shux/commit/e837ff3937a95e4bbcdc58daecc7622df2349c45)), closes [#239](https://github.com/indrasvat/shux/issues/239) [#239](https://github.com/indrasvat/shux/issues/239)
+
 ## [0.55.1](https://github.com/indrasvat/shux/compare/v0.55.0...v0.55.1) (2026-11-01)
 
 
