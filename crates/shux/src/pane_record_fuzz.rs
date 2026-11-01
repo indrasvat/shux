@@ -79,6 +79,16 @@ struct Offer {
     sent: bool,
 }
 
+/// Sets its flag when dropped: a spawned start's way of saying it is over,
+/// however it ended.
+struct SetOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for SetOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 struct Model {
     root: CancellationToken,
     opener: TestOpener,
@@ -182,7 +192,7 @@ impl Model {
             };
             // Weighted: output and starts dominate, as they do in use.
             match kind % 20 {
-                0 | 1 if !self.shut_down => self.start(pane, usize::from(b) % PATHS, a, b),
+                0 | 1 if !self.shut_down => self.start(pane, usize::from(b) % PATHS, a, b).await,
                 2..=6 => {
                     seq += 1;
                     let mut chunk = vec![pane as u8, (seq >> 8) as u8, seq as u8];
@@ -264,7 +274,7 @@ impl Model {
         self.finish().await
     }
 
-    fn start(&mut self, pane: usize, path: usize, a: u8, b: u8) {
+    async fn start(&mut self, pane: usize, path: usize, a: u8, b: u8) {
         let rec = self.rec.clone();
         let (pane_id, path_buf) = (self.panes[pane], self.paths[path].clone());
         let owner = a.is_multiple_of(3).then(|| usize::from(b) % OWNERS);
@@ -274,7 +284,11 @@ impl Model {
             .then(|| Duration::from_millis(u64::from(a) * 10));
         let started = self.started.clone();
         let refused = self.refused.clone();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let finished = done.clone();
+        let reservations = self.rec.entry_count();
         self.starts.spawn(async move {
+            let _finished = SetOnDrop(finished);
             use crate::pane_record::RecordStartError::{PaneBusy, PathBusy};
             let prepared = match rec.prepare(&path_buf, true, Some(pane_id)).await {
                 Ok(p) => p,
@@ -299,6 +313,19 @@ impl Model {
                 rec.end_when(id, requested_length(after), EndedBy::Duration);
             }
         });
+        // Path resolution runs on a blocking thread; wait until this start
+        // has reserved or finished, so the run does not depend on how fast
+        // that thread is (bounded: a stuck start fails the run).
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !done.load(std::sync::atomic::Ordering::SeqCst)
+            && self.rec.entry_count() <= reservations
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a start neither reserved nor finished"
+            );
+            tokio::task::yield_now().await;
+        }
     }
 
     fn shutdown(&mut self) {
