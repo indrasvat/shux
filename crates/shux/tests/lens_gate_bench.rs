@@ -65,7 +65,13 @@ fn bench(n: usize) {
 #[test]
 fn lens_gate_throughput_10_100_1000() {
     eprintln!("── lens-gate capture/compare/render throughput (task 080 §6) ──");
-    for n in [10usize, 100, 1000] {
+    // The 1000-frame tier measures, so only `make bench-lens-gate` (optimised) runs it;
+    // in `make test`'s debug build it would only take minutes to say nothing.
+    let full = std::env::var_os("SHUX_LENS_BENCH_FULL").is_some();
+    for n in [10usize, 100, 1000]
+        .into_iter()
+        .filter(|&n| full || n < 1000)
+    {
         bench(n);
     }
 }

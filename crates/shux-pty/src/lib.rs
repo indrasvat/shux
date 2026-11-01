@@ -13,7 +13,7 @@ pub use capture::strip_ansi;
 pub use command::{CommandEngine, CommandResult, shell_escape_args, shell_quote_arg};
 pub use handle::{
     DECLARED_CELL_PIXELS, OUTER_TERMINAL_IDENTITY_PREFIXES, OUTER_TERMINAL_IDENTITY_VARS,
-    PtyConfig, PtyError, PtyHandle, PtyInputWriter, PtySize,
+    PtyConfig, PtyError, PtyHandle, PtyInputWriter, PtyOutputProbe, PtySize,
 };
 pub use manager::{PaneId, PtyEvent, PtyManager};
 pub use spawn::inherit_only_stdio;

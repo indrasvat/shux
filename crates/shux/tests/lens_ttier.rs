@@ -11,6 +11,11 @@ use lens_common::*;
 
 use std::process::Command;
 
+/// Cells of nidhi's 120x40 frame the environment decides, not shux: the header's
+/// nidhi and git versions, and the stash dates, which nidhi only shows relative to
+/// today ("6y ago" turns into "7y ago" with the calendar).
+const NIDHI_VOLATILE: [(u32, u32, u32, u32); 2] = [(80, 0, 120, 1), (104, 1, 120, 7)];
+
 /// Build the deterministic nidhi repo (pinned dates, exactly 3 stashes).
 fn build_nidhi_repo(h: &Harness) -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().expect("nidhi repo tmp");
@@ -106,9 +111,32 @@ fn t1_nidhi_golden() {
         !is_near_grayscale_png(&png),
         "T1: truecolor nidhi render came out near-grayscale — NO_COLOR poisoning"
     );
-    assert_png_golden(&h, &png, "t1_nidhi_nerd_color_120x40.png");
+    assert_png_golden_masked(
+        &h,
+        &png,
+        "t1_nidhi_nerd_color_120x40.png",
+        (120, 40),
+        &NIDHI_VOLATILE,
+    );
 
     h.rpc_raw("session.kill", serde_json::json!({ "id": r["session_id"] }));
+}
+
+/// Block until the pane's frame differs from checkpoint `since`: the key just
+/// sent has been drawn.
+fn wait_for_change(h: &Harness, pane: &str, since: u64, ctx: &str) {
+    assert!(
+        wait_until(BUDGET, || {
+            h.rpc_raw(
+                "pane.diff_since",
+                serde_json::json!({ "pane_id": pane, "since_revision": since }),
+            )
+            .expect_result(ctx)["cells_changed"]
+                .as_u64()
+                .is_some_and(|n| n > 0)
+        }),
+        "{ctx}: the key never changed the frame"
+    );
 }
 
 // T2 — nidhi keyboard truth (selection move confined to the stash rows).
@@ -140,8 +168,10 @@ fn t2_nidhi_keyboard_truth() {
         .as_u64()
         .expect("rev");
 
-    // `j` moves the selection down by one stash row.
+    // `j` moves the selection down by one stash row. A pane that has not
+    // drawn its answer yet is quiet too, so wait for the change, then settle.
     h.send_raw(&pane, "j");
+    wait_for_change(&h, &pane, c, "T2 j");
     settle(&h, &pane, "T2 settle after j");
     let d = h
         .rpc_raw(
@@ -162,7 +192,13 @@ fn t2_nidhi_keyboard_truth() {
     );
 
     // `k` returns to the original selection.
+    let after_j = h
+        .rpc_raw("pane.checkpoint", serde_json::json!({ "pane_id": pane }))
+        .expect_result("T2 checkpoint after j")["revision"]
+        .as_u64()
+        .expect("rev");
     h.send_raw(&pane, "k");
+    wait_for_change(&h, &pane, after_j, "T2 k");
     settle(&h, &pane, "T2 settle after k");
     let d = h
         .rpc_raw(
@@ -258,7 +294,7 @@ fn t3_nidhi_matrix() {
                 cell.golden
             );
         }
-        assert_png_golden(&h, &png, cell.golden);
+        assert_png_golden_masked(&h, &png, cell.golden, (120, 40), &NIDHI_VOLATILE);
         if cell.no_color {
             assert!(
                 is_near_grayscale_png(&png),
@@ -295,4 +331,68 @@ fn t4_vivecaka_help_card() {
         assert_png_golden(&h, &png, golden);
         h.rpc_raw("session.kill", serde_json::json!({ "id": r["session_id"] }));
     }
+}
+
+/// A git hook (the project's own `pre-push` runs `make test`) sets `GIT_DIR`, which
+/// overrides any repository a git command is pointed at. The fixture must build its
+/// repo in its target however it is invoked, and leave the hook's repository alone.
+#[test]
+fn the_nidhi_fixture_never_touches_the_callers_repository() {
+    let h = Harness::new();
+    let decoy = tempfile::tempdir().expect("decoy repo");
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(decoy.path())
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    git(&["init", "-q"]);
+    git(&[
+        "-c",
+        "user.name=d",
+        "-c",
+        "user.email=d@example.invalid",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "decoy",
+    ]);
+    let decoy_head = git(&["rev-parse", "HEAD"]);
+
+    let target = tempfile::tempdir().expect("nidhi repo tmp");
+    let out = Command::new("sh")
+        .arg(
+            h.repo_root()
+                .join(".shux/fixtures/lens/t/make_nidhi_repo.sh"),
+        )
+        .arg(target.path().join("repo"))
+        .env("GIT_DIR", decoy.path().join(".git"))
+        .env("GIT_WORK_TREE", decoy.path())
+        .output()
+        .expect("run make_nidhi_repo.sh");
+    assert!(out.status.success(), "make_nidhi_repo failed: {out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "3");
+    assert_eq!(
+        git(&["rev-parse", "HEAD"]),
+        decoy_head,
+        "the fixture committed to the caller's repo"
+    );
+    assert_eq!(
+        git(&["stash", "list"]),
+        "",
+        "the fixture stashed in the caller's repo"
+    );
+    assert!(
+        !std::fs::read_to_string(decoy.path().join(".git/config"))
+            .unwrap()
+            .contains("gpgsign"),
+        "the fixture configured the caller's repo"
+    );
 }

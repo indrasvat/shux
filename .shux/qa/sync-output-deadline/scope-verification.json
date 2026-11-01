@@ -1,0 +1,17 @@
+{
+  "head": "0ae920e23d00595fb0201207b7e0d758bee41846",
+  "prior_audit": "3c6bdffd5c797e773e5f9789d378e5c400560255",
+  "unchanged_paths": [
+    "crates/shux-pty",
+    "crates/shux/src/pane_spawn.rs",
+    "crates/shux/src/pane_io.rs",
+    "crates/shux/src/daemon_boot.rs",
+    ".shux/fixtures"
+  ],
+  "vt_lib_production_sha256": [
+    "a9be5502b2d10be6e9db0c32e784ae6362385dbc073a95d0c3090d8b9d6406fd",
+    "a9be5502b2d10be6e9db0c32e784ae6362385dbc073a95d0c3090d8b9d6406fd"
+  ],
+  "test_only_change": "ca9b0f7: 32 added, 6 removed; late-batch absorption plus two-terminals swept/unswept assertions",
+  "status": "pass"
+}

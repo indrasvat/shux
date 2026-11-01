@@ -1,6 +1,6 @@
 //! Task 082 — verdict / report.json / summary / xfail / bless / init (`shux lens gate`).
-//! GATE lane (`GATE-TEST-CHANGE:` to touch). `test = false` — run serially under the leak
-//! guard via `make test-lens-gate-verdict`, NEVER in the default parallel run.
+//! GATE lane (`GATE-TEST-CHANGE:` to touch). Runs in `make test`; `make
+//! test-lens-gate-verdict` runs it alone.
 //!
 //! Drives the REAL `shux` binary end-to-end (design D1). Asserts the OBSERVABLE 082
 //! contract: the frozen `report.json` schema + exit map, the ASCII summary, first-run
@@ -864,5 +864,911 @@ fn review_refuses_non_interactive() {
         out.status.code(),
         Some(6),
         "non-interactive review is refused"
+    );
+}
+
+// ── #242 a trace that cannot be written · #244 machinery failures ─────────────
+
+/// [`gate`] with every file write failing (EFBIG): the trace file cannot grow. The JSON
+/// report goes to a pipe, which the limit does not touch.
+fn gate_with_files_full(h: &Harness, args: &[&str], stdout: Option<std::fs::File>) -> Gate {
+    files_full(h, args, stdout, &[])
+}
+
+fn files_full(
+    h: &Harness,
+    args: &[&str],
+    stdout: Option<std::fs::File>,
+    env: &[(&str, &str)],
+) -> Gate {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = h.shux();
+    cmd.args(["lens", "gate"])
+        .args(args)
+        .envs(env.iter().copied())
+        .env_remove("CI");
+    if let Some(file) = stdout {
+        cmd.stdout(file);
+    }
+    // SAFETY: setrlimit and signal are async-signal-safe and touch only the child.
+    // SIGXFSZ ignored turns an over-limit write into EFBIG instead of a kill.
+    unsafe {
+        cmd.pre_exec(|| {
+            let none = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: libc::RLIM_INFINITY,
+            };
+            if libc::setrlimit(libc::RLIMIT_FSIZE, &none) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            Ok(())
+        });
+    }
+    let out = cmd.output().expect("spawn shux lens gate");
+    Gate {
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        exit: out.status.code().unwrap_or(-1),
+    }
+}
+
+fn assert_names_lost_trace(out: &Gate, trace: &str) {
+    assert!(
+        out.stderr.contains("could not write the trace file") && out.stderr.contains(trace),
+        "stderr must name the lost trace {trace}:\n{}",
+        out.stderr
+    );
+    let note = out.report()[0].note.clone().unwrap_or_default();
+    assert!(
+        note.contains("trace incomplete"),
+        "the report must say its trace is incomplete, got note {note:?}"
+    );
+}
+
+#[test]
+fn a_lost_trace_turns_a_green_run_into_exit_4() {
+    let h = Harness::new();
+    let d = tmp();
+    let g = tmp();
+    let gd = g.path().to_string_lossy().into_owned();
+    bless_golden(&h, d.path(), &gd, "tr", "TRACE242");
+    let scn = d.path().join("tr.toml").to_string_lossy().into_owned();
+    let trace = d.path().join("t.ndjson").to_string_lossy().into_owned();
+    let out = gate_with_files_full(
+        &h,
+        &[
+            "--report",
+            "-",
+            "--trace",
+            &trace,
+            "--golden-dir",
+            &gd,
+            &scn,
+        ],
+        None,
+    );
+    assert_eq!(
+        out.exit, 4,
+        "a lost trace is exit 4; stderr:\n{}",
+        out.stderr
+    );
+    assert_eq!(
+        out.report()[0].status,
+        GateStatus::Pass,
+        "the verdict itself still stands"
+    );
+    assert_names_lost_trace(&out, &trace);
+}
+
+#[test]
+fn a_lost_trace_never_masks_a_regression() {
+    let h = Harness::new();
+    let d = tmp();
+    let g = tmp();
+    let gd = g.path().to_string_lossy().into_owned();
+    bless_golden(&h, d.path(), &gd, "base", "ALPHA");
+    let scn = write_scenario(d.path(), "rg", &scenario("rg", "BRAVO", None));
+    let trace = d.path().join("t.ndjson").to_string_lossy().into_owned();
+    let out = gate_with_files_full(
+        &h,
+        &[
+            "--report",
+            "-",
+            "--trace",
+            &trace,
+            "--golden-dir",
+            &gd,
+            &scn,
+        ],
+        None,
+    );
+    assert_eq!(
+        out.exit, 1,
+        "a regression keeps exit 1 when its trace is lost; stderr:\n{}",
+        out.stderr
+    );
+    assert_eq!(out.report()[0].status, GateStatus::Fail);
+    assert_names_lost_trace(&out, &trace);
+}
+
+#[test]
+fn a_trace_that_cannot_be_opened_exits_4_without_running_the_scenario() {
+    let h = Harness::new();
+    let d = tmp();
+    let ran = d.path().join("ran");
+    let scn = write_scenario(
+        d.path(),
+        "nt",
+        &format!(
+            r#"name = "nt"
+command = ["/bin/sh", "-c", "/usr/bin/touch {}; exec cat"]
+[terminal]
+rows = 12
+cols = 40
+[[steps]]
+action = "expect_golden"
+name = "frame"
+tier = "cell"
+"#,
+            ran.display()
+        ),
+    );
+    let trace = d.path().join("no-such-dir/t.ndjson");
+    let trace = trace.to_string_lossy();
+    let out = gate(&h, &["--report", "-", "--trace", &trace, &scn], false);
+    assert_eq!(out.exit, 4, "stderr:\n{}", out.stderr);
+    assert!(
+        out.stderr.contains("could not open the trace file") && out.stderr.contains(&*trace),
+        "stderr must name the trace:\n{}",
+        out.stderr
+    );
+    assert!(!ran.exists(), "the scenario must not run without its trace");
+}
+
+#[test]
+fn a_malformed_scenario_with_an_unopenable_trace_exits_4() {
+    let h = Harness::new();
+    let d = tmp();
+    let scn = write_scenario(d.path(), "bad", "name = \"bad\"\nnot toml [[[\n");
+    let trace = d.path().join("no-such-dir/t.ndjson");
+    let trace = trace.to_string_lossy();
+    let out = gate(&h, &["--report", "-", "--trace", &trace, &scn], false);
+    assert_eq!(out.exit, 4, "stderr:\n{}", out.stderr);
+    let report = out.report();
+    assert_eq!(report[0].status, GateStatus::ScenarioError);
+    assert!(
+        out.stderr.contains("could not open the trace file") && out.stderr.contains(&*trace),
+        "stderr must name the trace:\n{}",
+        out.stderr
+    );
+}
+
+#[test]
+fn a_trace_sharing_a_file_with_another_output_is_refused() {
+    let h = Harness::new();
+    let d = tmp();
+    let scn = write_scenario(d.path(), "al", &scenario("al", "HI", None));
+    let trace = d.path().join("t.ndjson").to_string_lossy().into_owned();
+    let link = d.path().join("link.json").to_string_lossy().into_owned();
+    for (flag, other) in [
+        ("--report", &trace),
+        ("--cast", &trace),
+        ("--report", &link),
+    ] {
+        std::fs::write(&trace, "precious").unwrap();
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&trace, &link).unwrap();
+        let out = gate(&h, &["--trace", &trace, flag, other, &scn], false);
+        assert_eq!(
+            out.exit, 2,
+            "{flag} {other} aliasing the trace is a usage error; stderr:\n{}",
+            out.stderr
+        );
+        assert!(
+            out.stderr.contains("same file as --trace"),
+            "{flag}: stderr must say why:\n{}",
+            out.stderr
+        );
+        assert_eq!(
+            std::fs::read_to_string(&trace).unwrap(),
+            "precious",
+            "{flag} {other}: a refused run must write nothing"
+        );
+    }
+
+    // A refused run creates nothing: here `--report` is a link to the absent trace.
+    std::fs::remove_file(&trace).unwrap();
+    let out = gate(&h, &["--trace", &trace, "--report", &link, &scn], false);
+    assert_eq!(out.exit, 2, "stderr:\n{}", out.stderr);
+    assert!(
+        std::fs::symlink_metadata(&trace).is_err(),
+        "the refused run created the trace file"
+    );
+}
+
+#[test]
+fn a_trace_on_stdout_whose_reader_left_ends_by_sigpipe() {
+    use std::os::unix::process::ExitStatusExt;
+    let h = Harness::new();
+    let d = tmp();
+    let g = tmp();
+    let gd = g.path().to_string_lossy().into_owned();
+    bless_golden(&h, d.path(), &gd, "sp", "PIPE242");
+    let scn = d.path().join("sp.toml").to_string_lossy().into_owned();
+    let (read, write) = nix::unistd::pipe().expect("pipe");
+    drop(read);
+    let out = h
+        .shux()
+        .args(["lens", "gate", "--trace", "-", "--golden-dir", &gd, &scn])
+        .env_remove("CI")
+        .stdout(std::process::Stdio::from(write))
+        .output()
+        .expect("spawn shux lens gate");
+    assert_eq!(
+        out.status.signal(),
+        Some(libc::SIGPIPE),
+        "a trace reader that left ends the gate quietly; {out:?}"
+    );
+}
+
+#[test]
+fn a_failure_in_the_gate_itself_is_infra_not_a_regression() {
+    let h = Harness::new();
+    let d = tmp();
+    let scn = write_scenario(d.path(), "inf", &scenario("inf", "HI", None));
+    // The daemon starts here, so it does not inherit the broken TMPDIR below.
+    assert!(h.cli(&["session", "list"]).status.success());
+    let out = gate_with(
+        &h,
+        &["--report", "-", &scn],
+        false,
+        &[("TMPDIR", &d.path().join("no-such-tmp").to_string_lossy())],
+    );
+    assert_eq!(out.exit, 3, "stderr:\n{}", out.stderr);
+    assert!(
+        out.stderr.contains("not a regression"),
+        "stderr must say it is not a regression:\n{}",
+        out.stderr
+    );
+}
+
+#[test]
+fn a_refused_alias_leaves_the_file_it_names_untouched() {
+    let h = Harness::new();
+    let d = tmp();
+    let scn = write_scenario(d.path(), "ut", &scenario("ut", "HI", None));
+    let kept = d.path().join("kept.json");
+    std::fs::write(&kept, "precious").unwrap();
+    let trace = d.path().join("t.ndjson");
+    std::fs::hard_link(&kept, &trace).unwrap();
+    let trace = trace.to_string_lossy().into_owned();
+    let out = gate(&h, &["--trace", &trace, "--cast", &trace, &scn], false);
+    assert_eq!(out.exit, 2, "stderr:\n{}", out.stderr);
+    assert_eq!(
+        std::fs::read_to_string(&kept).unwrap(),
+        "precious",
+        "a refused run must not truncate the file"
+    );
+}
+
+#[test]
+fn a_malformed_scenario_whose_report_is_its_trace_is_refused() {
+    let h = Harness::new();
+    let d = tmp();
+    let scn = write_scenario(d.path(), "bad", "name = \"bad\"\nnot toml [[[\n");
+    let trace = d.path().join("t.ndjson").to_string_lossy().into_owned();
+    let out = gate(&h, &["--trace", &trace, "--report", &trace, &scn], false);
+    assert_eq!(out.exit, 2, "stderr:\n{}", out.stderr);
+    assert!(
+        out.stderr.contains("same file as --trace"),
+        "stderr must say why:\n{}",
+        out.stderr
+    );
+}
+
+#[test]
+fn a_stdout_trace_redirected_onto_the_report_is_refused() {
+    let h = Harness::new();
+    let d = tmp();
+    let scn = write_scenario(d.path(), "so", &scenario("so", "HI", None));
+    let report = d.path().join("out.json");
+    let file = std::fs::File::create(&report).unwrap();
+    let out = h
+        .shux()
+        .args(["lens", "gate", "--trace", "-", "--report"])
+        .arg(&report)
+        .arg(&scn)
+        .env_remove("CI")
+        .stdout(file)
+        .output()
+        .expect("spawn shux lens gate");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr:\n{stderr}");
+    assert!(stderr.contains("same file as --trace"), "stderr:\n{stderr}");
+}
+
+#[test]
+fn a_stdout_trace_that_cannot_be_written_exits_4() {
+    let h = Harness::new();
+    let d = tmp();
+    let g = tmp();
+    let gd = g.path().to_string_lossy().into_owned();
+    bless_golden(&h, d.path(), &gd, "sf", "STDOUT242");
+    let scn = d.path().join("sf.toml").to_string_lossy().into_owned();
+    let stdout = std::fs::File::create(d.path().join("stdout.ndjson")).unwrap();
+    let out = gate_with_files_full(
+        &h,
+        &[
+            "--trace",
+            "-",
+            "--report",
+            "/dev/null",
+            "--golden-dir",
+            &gd,
+            &scn,
+        ],
+        Some(stdout),
+    );
+    assert_eq!(out.exit, 4, "stderr:\n{}", out.stderr);
+    assert!(
+        out.stderr.contains("could not write the trace stream"),
+        "stderr must name the trace:\n{}",
+        out.stderr
+    );
+    assert!(!out.stderr.contains("panicked"), "stderr:\n{}", out.stderr);
+}
+
+#[test]
+fn a_golden_write_failure_keeps_the_regression_and_its_report() {
+    let h = Harness::new();
+    let d = tmp();
+    let scn = write_scenario(d.path(), "gw", &scenario("gw", "HI", None));
+    let blocker = d.path().join("blocker");
+    std::fs::write(&blocker, "").unwrap();
+    let gd = blocker.join("goldens").to_string_lossy().into_owned();
+    let out = gate(
+        &h,
+        &[
+            "--on-missing",
+            "create",
+            "--report",
+            "-",
+            "--golden-dir",
+            &gd,
+            &scn,
+        ],
+        false,
+    );
+    assert_eq!(
+        out.exit, 1,
+        "a missing golden stays a regression; stderr:\n{}",
+        out.stderr
+    );
+    let report = out.report();
+    assert_eq!(report[0].status, GateStatus::MissingGolden);
+    let note = report[0].note.clone().unwrap_or_default();
+    assert!(note.contains("goldens not written"), "note {note:?}");
+}
+
+/// `review` refuses a non-TTY stdin, so it runs here with a pty as stdin.
+fn review_on_a_tty(h: &Harness, scn: &str, env: &[(&str, &str)]) -> (i32, String) {
+    let pty = nix::pty::openpty(None, None).expect("openpty");
+    let out = h
+        .shux()
+        .args(["lens", "gate", "review", scn])
+        .envs(env.iter().copied())
+        .env_remove("CI")
+        .stdin(std::process::Stdio::from(pty.slave))
+        .output()
+        .expect("spawn shux lens gate review");
+    drop(pty.master);
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn review_reports_a_bad_scenario_as_usage_and_its_own_failure_as_infra() {
+    let h = Harness::new();
+    let d = tmp();
+    let bad = write_scenario(d.path(), "bad", "name = \"bad\"\nnot toml [[[\n");
+    let (code, stderr) = review_on_a_tty(&h, &bad, &[]);
+    assert_eq!(code, 2, "a malformed scenario is usage; stderr:\n{stderr}");
+
+    let scn = write_scenario(d.path(), "rv", &scenario("rv", "HI", None));
+    assert!(h.cli(&["session", "list"]).status.success());
+    let tmpdir = d.path().join("no-such-tmp");
+    let (code, stderr) = review_on_a_tty(&h, &scn, &[("TMPDIR", &tmpdir.to_string_lossy())]);
+    assert_eq!(code, 3, "stderr:\n{stderr}");
+    assert!(stderr.contains("not a regression"), "stderr:\n{stderr}");
+}
+
+#[test]
+fn a_malformed_scenario_whose_trace_is_its_cast_writes_nothing() {
+    let h = Harness::new();
+    let d = tmp();
+    let scn = write_scenario(d.path(), "bad", "name = \"bad\"\nnot toml [[[\n");
+    let kept = d.path().join("kept.json");
+    std::fs::write(&kept, "precious").unwrap();
+    let kept = kept.to_string_lossy().into_owned();
+    let out = gate(&h, &["--trace", &kept, "--cast", &kept, &scn], false);
+    assert_eq!(out.exit, 2, "stderr:\n{}", out.stderr);
+    assert!(
+        out.stderr.contains("same file as --trace"),
+        "stderr:\n{}",
+        out.stderr
+    );
+    assert_eq!(std::fs::read_to_string(&kept).unwrap(), "precious");
+}
+
+#[test]
+fn a_malformed_scenario_whose_trace_reader_left_still_writes_its_report() {
+    use std::os::unix::process::ExitStatusExt;
+    let h = Harness::new();
+    let d = tmp();
+    let scn = write_scenario(d.path(), "bad", "name = \"bad\"\nnot toml [[[\n");
+    let report = d.path().join("r.json");
+    let (read, write) = nix::unistd::pipe().expect("pipe");
+    drop(read);
+    let out = h
+        .shux()
+        .args(["lens", "gate", "--trace", "-", "--report"])
+        .arg(&report)
+        .arg(&scn)
+        .env_remove("CI")
+        .stdout(std::process::Stdio::from(write))
+        .output()
+        .expect("spawn shux lens gate");
+    assert_eq!(out.status.signal(), Some(libc::SIGPIPE), "{out:?}");
+    let written: Vec<ScenarioReport> =
+        serde_json::from_str(&std::fs::read_to_string(&report).expect("report written")).unwrap();
+    assert_eq!(written[0].status, GateStatus::ScenarioError);
+}
+
+/// The gate's own machinery fails after the trace has started: still exit 3, but the
+/// trace ends as it would have.
+#[test]
+fn a_machinery_failure_still_finishes_its_trace() {
+    use std::os::unix::process::ExitStatusExt;
+    let h = Harness::new();
+    let d = tmp();
+    let scn = write_scenario(d.path(), "mf", &scenario("mf", "HI", None));
+    let not_a_dir = d.path().join("not-a-dir");
+    std::fs::write(&not_a_dir, "").unwrap();
+    let runtime = not_a_dir.to_string_lossy().into_owned();
+
+    let (read, write) = nix::unistd::pipe().expect("pipe");
+    drop(read);
+    let out = h
+        .shux()
+        .args(["lens", "gate", "--trace", "-"])
+        .arg(&scn)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env_remove("CI")
+        .stdout(std::process::Stdio::from(write))
+        .output()
+        .expect("spawn shux lens gate");
+    assert_eq!(
+        out.status.signal(),
+        Some(libc::SIGPIPE),
+        "a trace reader that left ends the gate quietly; {out:?}"
+    );
+
+    let trace = d.path().join("t.ndjson").to_string_lossy().into_owned();
+    let out = files_full(
+        &h,
+        &["--trace", &trace, &scn],
+        None,
+        &[("XDG_RUNTIME_DIR", &runtime)],
+    );
+    assert_eq!(out.exit, 3, "stderr:\n{}", out.stderr);
+    assert!(
+        out.stderr.contains("could not write the trace file") && out.stderr.contains(&trace),
+        "stderr must name the lost trace:\n{}",
+        out.stderr
+    );
+}
+
+/// An alias is refused before any other refusal can write its report onto it.
+#[test]
+fn an_alias_is_refused_before_a_refusal_writes_its_report() {
+    let h = Harness::new();
+    let d = tmp();
+    let scn = write_scenario(d.path(), "ci", &scenario("ci", "HI", None));
+    let kept = d.path().join("kept.json");
+    std::fs::write(&kept, "precious").unwrap();
+    let kept = kept.to_string_lossy().into_owned();
+    let out = gate(
+        &h,
+        &[
+            "--on-missing",
+            "create",
+            "--trace",
+            &kept,
+            "--report",
+            &kept,
+            &scn,
+        ],
+        true,
+    );
+    assert_eq!(out.exit, 2, "stderr:\n{}", out.stderr);
+    assert_eq!(std::fs::read_to_string(&kept).unwrap(), "precious");
+}
+
+/// A trace through a link to a file that does not exist yet is refused before
+/// anything is created or written.
+#[test]
+fn a_refused_alias_through_a_dangling_link_leaves_nothing() {
+    let h = Harness::new();
+    let d = tmp();
+    let bad = write_scenario(d.path(), "bad", "name = \"bad\"\nnot toml [[[\n");
+    let target = d.path().join("absent.json");
+    let link = d.path().join("trace-link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let (target_s, link_s) = (
+        target.to_string_lossy().into_owned(),
+        link.to_string_lossy().into_owned(),
+    );
+    let out = gate(
+        &h,
+        &["--trace", &link_s, "--report", &target_s, &bad],
+        false,
+    );
+    assert_eq!(out.exit, 2, "stderr:\n{}", out.stderr);
+    assert!(!target.exists(), "the refused run left {target_s} behind");
+}
+
+/// stdout is an output too: redirected onto the trace's file, the run is refused
+/// before either is written.
+#[test]
+fn stdout_redirected_onto_the_trace_is_refused() {
+    let h = Harness::new();
+    let d = tmp();
+    let scn = write_scenario(d.path(), "so", &scenario("so", "HI", None));
+    let trace = d.path().join("t.ndjson");
+    for report in [Some("-"), None] {
+        std::fs::write(&trace, "precious").unwrap();
+        let stdout = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&trace)
+            .unwrap();
+        let mut cmd = h.shux();
+        cmd.args(["lens", "gate", "--trace"]).arg(&trace);
+        if let Some(r) = report {
+            cmd.args(["--report", r]);
+        }
+        let out = cmd
+            .arg(&scn)
+            .env_remove("CI")
+            .stdout(stdout)
+            .output()
+            .expect("spawn shux lens gate");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "report {report:?}; stderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("stdout already writes to"),
+            "stderr:\n{stderr}"
+        );
+        assert_eq!(std::fs::read_to_string(&trace).unwrap(), "precious");
+    }
+}
+
+/// The stdout collision holds for a malformed scenario too: stdout stays one
+/// parseable JSON report.
+#[test]
+fn a_malformed_scenario_cannot_mix_its_trace_into_the_json_report() {
+    let h = Harness::new();
+    let d = tmp();
+    let scn = write_scenario(d.path(), "bad", "name = \"bad\"\nnot toml [[[\n");
+    let out = gate(&h, &["--trace", "-", "--report", "-", &scn], false);
+    assert_eq!(out.exit, 2, "stderr:\n{}", out.stderr);
+    assert!(
+        out.stderr.contains("both write to stdout"),
+        "stderr:\n{}",
+        out.stderr
+    );
+    assert_eq!(out.report()[0].status, GateStatus::ScenarioError);
+}
+
+/// stderr is checked against the named outputs too, but never against stdout:
+/// `--trace t 2> t` is refused, `> log 2>&1` is not.
+#[test]
+fn stderr_onto_the_trace_is_refused_but_stdout_and_stderr_may_share_a_log() {
+    let h = Harness::new();
+    let d = tmp();
+    let scn = write_scenario(d.path(), "se", &scenario("se", "HI", None));
+    let trace = d.path().join("t.ndjson");
+    std::fs::write(&trace, "precious").unwrap();
+    let err = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&trace)
+        .unwrap();
+    let out = h
+        .shux()
+        .args(["lens", "gate", "--trace"])
+        .arg(&trace)
+        .arg(&scn)
+        .env_remove("CI")
+        .stderr(err)
+        .output()
+        .expect("spawn shux lens gate");
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    let kept = std::fs::read_to_string(&trace).unwrap();
+    assert!(
+        kept.starts_with("precious") && kept.contains("stderr already writes to"),
+        "{kept:?}"
+    );
+
+    let log = d.path().join("log");
+    let log_out = std::fs::File::create(&log).unwrap();
+    let log_err = log_out.try_clone().unwrap();
+    let trace2 = d.path().join("t2.ndjson");
+    let status = h
+        .shux()
+        .args(["lens", "gate", "--trace"])
+        .arg(&trace2)
+        .arg(&scn)
+        .env_remove("CI")
+        .stdout(log_out)
+        .stderr(log_err)
+        .status()
+        .expect("spawn shux lens gate");
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "a missing golden, not a refusal: {}",
+        std::fs::read_to_string(&log).unwrap()
+    );
+    assert!(
+        std::fs::read_to_string(&trace2)
+            .unwrap()
+            .contains("scenario_start")
+    );
+}
+
+/// A trace or report aimed into the golden tree would replace a golden; refused
+/// before anything is written.
+#[test]
+fn a_trace_or_report_inside_the_golden_dir_is_refused() {
+    let h = Harness::new();
+    let d = tmp();
+    let g = tmp();
+    let gd = g.path().to_string_lossy().into_owned();
+    bless_golden(&h, d.path(), &gd, "gg", "GOLD242");
+    let scn = d.path().join("gg.toml").to_string_lossy().into_owned();
+    let golden = std::fs::read_dir(g.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.to_string_lossy().ends_with(".capture.json"))
+        .expect("blessed capture golden");
+    let before = std::fs::read(&golden).unwrap();
+    for flag in ["--trace", "--report"] {
+        let out = gate(
+            &h,
+            &[flag, &golden.to_string_lossy(), "--golden-dir", &gd, &scn],
+            false,
+        );
+        assert_eq!(out.exit, 2, "{flag}: stderr:\n{}", out.stderr);
+        assert!(
+            out.stderr.contains("inside the golden dir"),
+            "{}",
+            out.stderr
+        );
+        assert_eq!(
+            std::fs::read(&golden).unwrap(),
+            before,
+            "{flag} replaced the golden"
+        );
+    }
+}
+
+/// The golden tree is protected before anything writes: on a malformed scenario's
+/// report path, and through a link outside the tree that points into it.
+#[test]
+fn the_golden_tree_is_protected_on_every_path() {
+    let h = Harness::new();
+    let d = tmp();
+    let g = tmp();
+    let gd = g.path().to_string_lossy().into_owned();
+    bless_golden(&h, d.path(), &gd, "gp", "GOLDPATH");
+    let golden = std::fs::read_dir(g.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.to_string_lossy().ends_with(".capture.json"))
+        .expect("blessed capture golden");
+    let before = std::fs::read(&golden).unwrap();
+
+    let bad = write_scenario(d.path(), "bad", "name = \"bad\"\nnot toml [[[\n");
+    let out = gate(
+        &h,
+        &[
+            "--report",
+            &golden.to_string_lossy(),
+            "--golden-dir",
+            &gd,
+            &bad,
+        ],
+        false,
+    );
+    assert_eq!(out.exit, 2, "stderr:\n{}", out.stderr);
+    assert_eq!(
+        std::fs::read(&golden).unwrap(),
+        before,
+        "a malformed run replaced the golden"
+    );
+
+    let link = d.path().join("outside-link.ndjson");
+    std::os::unix::fs::symlink(&golden, &link).unwrap();
+    let scn = d.path().join("gp.toml").to_string_lossy().into_owned();
+    let out = gate(
+        &h,
+        &[
+            "--trace",
+            &link.to_string_lossy(),
+            "--golden-dir",
+            &gd,
+            &scn,
+        ],
+        false,
+    );
+    assert_eq!(out.exit, 2, "stderr:\n{}", out.stderr);
+    assert!(
+        out.stderr.contains("inside the golden dir"),
+        "{}",
+        out.stderr
+    );
+    assert_eq!(
+        std::fs::read(&golden).unwrap(),
+        before,
+        "a link replaced the golden"
+    );
+}
+
+/// A link inside the golden tree is inside it wherever it points.
+#[test]
+fn a_link_inside_the_golden_dir_is_inside_it_wherever_it_points() {
+    let h = Harness::new();
+    let d = tmp();
+    let g = tmp();
+    let gd = g.path().to_string_lossy().into_owned();
+    let scn = write_scenario(d.path(), "lk", &scenario("lk", "HI", None));
+
+    let baseline = d.path().join("baseline.json");
+    std::fs::write(&baseline, "precious").unwrap();
+    let inward = g.path().join("points-out.json");
+    std::os::unix::fs::symlink(&baseline, &inward).unwrap();
+    let out = gate(
+        &h,
+        &[
+            "--report",
+            &inward.to_string_lossy(),
+            "--golden-dir",
+            &gd,
+            &scn,
+        ],
+        false,
+    );
+    assert_eq!(out.exit, 2, "stderr:\n{}", out.stderr);
+    assert_eq!(std::fs::read_to_string(&baseline).unwrap(), "precious");
+}
+
+/// Two spellings of one directory not made yet name one destination.
+#[test]
+fn two_spellings_of_an_unmade_directory_are_one_destination() {
+    let h = Harness::new();
+    let d = tmp();
+    let scn = write_scenario(d.path(), "sp", &scenario("sp", "HI", None));
+    let real = d.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::os::unix::fs::symlink(&real, d.path().join("link")).unwrap();
+    let via_real = real.join("new").join("out");
+    let via_link = d.path().join("link").join("new").join("out");
+    let out = gate(
+        &h,
+        &[
+            "--report",
+            &via_real.to_string_lossy(),
+            "--cast",
+            &via_link.to_string_lossy(),
+            &scn,
+        ],
+        false,
+    );
+    assert_eq!(out.exit, 2, "stderr:\n{}", out.stderr);
+    assert!(out.stderr.contains("same file as"), "{}", out.stderr);
+    assert!(
+        !real.join("new").exists(),
+        "a refused run made the directory"
+    );
+}
+
+/// `..` through a directory not made yet cannot be placed without making it, so such
+/// an output is refused rather than guessed at. The cast recorder makes missing
+/// directories, so a cast spelled this way would land in the golden tree.
+#[test]
+fn dot_dot_through_an_unmade_directory_cannot_reach_a_golden() {
+    let h = Harness::new();
+    let d = tmp();
+    let g = tmp();
+    let gd = g.path().to_string_lossy().into_owned();
+    bless_golden(&h, d.path(), &gd, "dd", "DOTDOT");
+    let scn = d.path().join("dd.toml").to_string_lossy().into_owned();
+    let golden = std::fs::read_dir(g.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.to_string_lossy().ends_with(".capture.json"))
+        .expect("blessed capture golden");
+    let before = std::fs::read(&golden).unwrap();
+    let link = d.path().join("L");
+    std::os::unix::fs::symlink(g.path(), &link).unwrap();
+    let sneaky = link
+        .join("new")
+        .join("..")
+        .join(golden.file_name().unwrap());
+    let out = gate(
+        &h,
+        &[
+            "--cast",
+            &sneaky.to_string_lossy(),
+            "--golden-dir",
+            &gd,
+            &scn,
+        ],
+        false,
+    );
+    assert_eq!(
+        std::fs::read(&golden).unwrap(),
+        before,
+        "the cast replaced the golden"
+    );
+    assert_eq!(out.exit, 2, "stderr:\n{}", out.stderr);
+}
+
+/// The same file spelled with `..` through a directory not made yet is refused.
+#[test]
+fn dot_dot_through_an_unmade_directory_is_refused() {
+    let h = Harness::new();
+    let d = tmp();
+    let scn = write_scenario(d.path(), "dz", &scenario("dz", "HI", None));
+    let plain = d.path().join("out");
+    let dotted = d.path().join("new").join("..").join("out");
+    let out = gate(
+        &h,
+        &[
+            "--report",
+            &plain.to_string_lossy(),
+            "--cast",
+            &dotted.to_string_lossy(),
+            &scn,
+        ],
+        false,
+    );
+    assert_eq!(out.exit, 2, "stderr:\n{}", out.stderr);
+    assert!(!plain.exists() && !d.path().join("new").exists());
+}
+
+/// Another scenario's goldens are still the golden tree: a cast aimed there is refused.
+#[test]
+fn a_cast_into_another_scenarios_goldens_is_refused() {
+    let h = Harness::new();
+    let d = tmp();
+    let scn = write_scenario(d.path(), "foo", &scenario("foo", "HI", None));
+    let cast = d.path().join("goldens").join("bar").join("x.cast");
+    let out = gate(&h, &["--cast", &cast.to_string_lossy(), &scn], false);
+    assert_eq!(out.exit, 2, "stderr:\n{}", out.stderr);
+    assert!(
+        out.stderr.contains("inside the golden dir"),
+        "{}",
+        out.stderr
+    );
+    assert!(
+        !d.path().join("goldens").exists(),
+        "the refused run made the golden tree"
     );
 }

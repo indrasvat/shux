@@ -1,0 +1,41 @@
+{
+  "merge_base": "0af07f3fe0d2521c99ac303bb5854557d3cc8d9b",
+  "cases": [
+    {
+      "case": "synthetic-sync-output",
+      "baseline": "../../goldens/073-vt-corpus/synthetic-sync-output-expected.png",
+      "git_blob": "b021fb2f80808497997893928a06d2a5e02e3f42",
+      "same_blob_at_merge_base": true
+    },
+    {
+      "case": "rich-tui-btop",
+      "baseline": "../../goldens/073-vt-corpus/rich-tui-btop-expected.png",
+      "git_blob": "05c20e609f0e0780949ad5321d425f7c1f7f1443",
+      "same_blob_at_merge_base": true
+    },
+    {
+      "case": "rich-tui-lazygit",
+      "baseline": "../../goldens/073-vt-corpus/rich-tui-lazygit-expected.png",
+      "git_blob": "c35de660b50acc9bdd957df8a9106b735e835859",
+      "same_blob_at_merge_base": true
+    },
+    {
+      "case": "rich-tui-nvim",
+      "baseline": "../../goldens/073-vt-corpus/rich-tui-nvim-expected.png",
+      "git_blob": "40574f1add4b8b170bfe1deb6c259ca6b06e4c9e",
+      "same_blob_at_merge_base": true
+    },
+    {
+      "case": "rich-tui-vicaya",
+      "baseline": "../../goldens/073-vt-corpus/rich-tui-vicaya-expected.png",
+      "git_blob": "e2c14e7a413e33941b42529a43e954112caeb1fc",
+      "same_blob_at_merge_base": true
+    },
+    {
+      "case": "rich-tui-vivecaka",
+      "baseline": "../../goldens/073-vt-corpus/rich-tui-vivecaka-expected.png",
+      "git_blob": "922a7c3ef9c1d6c122df77870bcf2ef23e1ec2e8",
+      "same_blob_at_merge_base": true
+    }
+  ]
+}

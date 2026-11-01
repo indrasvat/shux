@@ -5,8 +5,8 @@
 //! fails with `method_not_found (-32601)` — the red receipt — before any
 //! scratch is created.
 //!
-//! These are the ONLY tests that create scratch; they run serially under the
-//! leak guard (`make test-lens`).
+//! These are the ONLY tests that create scratch. Each harness has its own
+//! daemon, so the scratch quota is per test.
 
 mod lens_common;
 use lens_common::*;
@@ -249,8 +249,10 @@ fn r4_orphan_proof_and_waiter_drop() {
         wait_until(BUDGET, || h.count_fixture_procs("f1_static.sh") == 0),
         "R4(c): scratch must be reaped at max_runtime"
     );
+    // The reaper kills first and audits after, so the entry can trail the
+    // process's exit.
     assert!(
-        reaped_at_max_runtime(),
+        wait_until(BUDGET, reaped_at_max_runtime),
         "R4(c): audit reap(reason=max_runtime)"
     );
 }

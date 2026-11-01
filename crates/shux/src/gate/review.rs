@@ -14,7 +14,7 @@ use shux_raster::Rasterizer;
 use crate::gate::vocab::GateStatus;
 use shux_vt::FrameEnvelope;
 
-use super::runner::{default_golden_dir, drive_scenario};
+use super::runner::{Trace, default_golden_dir, drive_scenario};
 use super::scenario;
 use super::{bless, compare, verdict};
 use crate::cli::{OnMissing, OutputFormat};
@@ -41,7 +41,13 @@ pub async fn run_review(
         return Ok(GateStatus::UpdateRefused.exit_code() as i32);
     }
 
-    let scenario = scenario::load(&scenario_path)?;
+    let scenario = match scenario::load(&scenario_path) {
+        Ok(scenario) => scenario,
+        Err(e) => {
+            eprintln!("{}", style::error(format!("lens gate review: {e}")));
+            return Ok(GateStatus::ScenarioError.exit_code() as i32);
+        }
+    };
     let golden_dir = golden_dir_opt
         .clone()
         .unwrap_or_else(|| default_golden_dir(&scenario_path, &scenario));
@@ -55,7 +61,7 @@ pub async fn run_review(
         &super::runner::scenario_dir_of(&scenario_path),
         &scenario.command.clone(),
         &golden_dir,
-        None,
+        &mut Trace::none(),
         // `gate review` has no --retries flag; per-step `expect_golden.retries` still applies.
         0,
         // `gate review` does not record a cast.

@@ -686,24 +686,22 @@ pub(crate) async fn run_rpc_server(
                 _ = interval.tick() => {
                     let mut state = timeout_io.lock().await;
                     let _timed_out = state.cmd_engine.check_timeouts();
-                    // Issue #115: a pane that opened a synchronized-output
-                    // window (`CSI ?2026h`) and then went silent — an
-                    // application killed mid-redraw — shows the frame it froze
-                    // and nothing else, for ever. The VT enforces the deadline
-                    // itself on every batch of pane output, which covers every
-                    // pane that is still saying anything; this covers the one
-                    // that is not, because no output means nothing calls
-                    // `process`. Same critical section as the PTY write path,
-                    // so a revealed frame publishes its revision the same way.
-                    // Whatever the release reveals has to travel the SAME
-                    // routes the PTY read loop would have sent it down, or a
-                    // pane that went silent inside a window keeps a stale
-                    // title and stale checkpoints for ever. The alt flag and
-                    // the title are read on both sides of the release for
-                    // exactly that reason.
-                    let expired: Vec<_> = state
-                        .vts
+                    // The only time-based release of a synchronized-output
+                    // window (`CSI ?2026h`), for a pane that has not finished its
+                    // frame by the deadline: never one whose output is queued or
+                    // awaiting the parse. Same critical section as the PTY read
+                    // path, and whatever the release reveals travels the same
+                    // routes, or the pane keeps a stale title and stale
+                    // checkpoints; hence the alt flag and title read on both
+                    // sides of the release.
+                    let PaneIoState { vts, sync_gates, .. } = &mut *state;
+                    let expired: Vec<_> = vts
                         .iter_mut()
+                        .filter(|(pane_id, _)| {
+                            !sync_gates
+                                .get(pane_id)
+                                .is_some_and(shux_pty::PtyOutputProbe::output_pending)
+                        })
                         .filter_map(|(pane_id, vt)| {
                             let alt_before = vt.is_alternate_screen();
                             if !vt.release_expired_sync() {

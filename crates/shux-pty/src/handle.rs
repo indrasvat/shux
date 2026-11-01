@@ -1,7 +1,7 @@
 //! PtyHandle: per-pane PTY wrapper with async read/write/resize.
 
 use std::fs::File;
-use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -12,7 +12,7 @@ use tokio::io::unix::AsyncFd;
 use tracing::{debug, info};
 
 /// How often a read that is holding the slave fd open checks whether the child
-/// has exited — one `waitpid(WNOHANG)` plus one `FIONREAD` per tick.
+/// has exited — one `waitpid(WNOHANG)` plus one readiness poll per tick.
 ///
 /// Tight while the pane is young and slack afterwards, because the two costs
 /// pull in opposite directions and land on different panes. The tick bounds
@@ -501,9 +501,72 @@ impl PtyInputWriter {
     }
 }
 
+/// See [`PtyHandle::output_probe`].
+#[derive(Clone)]
+pub struct PtyOutputProbe(std::sync::Arc<ProbeState>);
+
+struct ProbeState {
+    /// A close-on-exec copy of the master, to poll without the handle.
+    master: OwnedFd,
+    /// Output read but not yet marked handled. Set under this lock with the
+    /// read itself, so no answer falls between the two.
+    unhandled: std::sync::Mutex<bool>,
+}
+
+impl PtyOutputProbe {
+    /// Whether output the child wrote has not been handed on yet: still queued
+    /// on the master, or read and not marked handled.
+    pub fn output_pending(&self) -> bool {
+        let unhandled = self.unhandled();
+        *unhandled || has_output(self.0.master.as_fd()).unwrap_or(false)
+    }
+
+    /// Everything read so far has been handed on.
+    pub fn mark_handled(&self) {
+        *self.unhandled() = false;
+    }
+
+    fn unhandled(&self) -> std::sync::MutexGuard<'_, bool> {
+        self.0
+            .unhandled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// One read, marked unhandled under the probe's lock when it returned output.
+fn read_marked(
+    fd: std::os::fd::RawFd,
+    buf: &mut [u8],
+    probe: Option<&PtyOutputProbe>,
+) -> std::io::Result<usize> {
+    let Some(probe) = probe else {
+        return drain_read(fd, buf);
+    };
+    let mut unhandled = probe.unhandled();
+    let n = drain_read(fd, buf)?;
+    if n > 0 {
+        *unhandled = true;
+    }
+    Ok(n)
+}
+
+/// Whether a PTY master has child output waiting. A readiness poll, not
+/// FIONREAD: on macOS FIONREAD on a PTY master reports 0 with output queued.
+fn has_output(fd: BorrowedFd<'_>) -> std::io::Result<bool> {
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    let mut fds = [PollFd::new(fd, PollFlags::POLLIN)];
+    poll(&mut fds, PollTimeout::ZERO)?;
+    Ok(fds[0]
+        .revents()
+        .is_some_and(|r| r.contains(PollFlags::POLLIN)))
+}
+
 /// A handle to a running PTY child process.
 pub struct PtyHandle {
     pty: AsyncFd<OwnedFd>,
+    /// Set by [`Self::output_probe`]; every read marks it.
+    probe: Option<PtyOutputProbe>,
     /// The parent's own slave fd, held open for as long as the child lives.
     ///
     /// A tty discards whatever is still queued when its **last** slave fd
@@ -856,6 +919,7 @@ impl PtyHandle {
 
         Ok(Self {
             pty,
+            probe: None,
             // Kept, not dropped: see the field's docs (issue #162).
             slave: Some(pty_pair.slave),
             child,
@@ -896,6 +960,7 @@ impl PtyHandle {
                 // and the release only happens with the queue empty, because
                 // on BSD/macOS that close discards whatever is still in it.
                 let poll = self.slave_release_poll();
+                let probe = self.probe.as_ref();
                 #[expect(
                     clippy::disallowed_methods,
                     reason = "an exited child sends no event while we hold the slave; poll for it"
@@ -905,7 +970,7 @@ impl PtyHandle {
 
                     guard = self.pty.readable_mut() => {
                         let mut guard = guard.map_err(PtyError::Read)?;
-                        match guard.try_io(|inner| drain_read(inner.get_ref().as_raw_fd(), buf)) {
+                        match guard.try_io(|inner| read_marked(inner.get_ref().as_raw_fd(), buf, probe)) {
                             Ok(result) => return result.map_err(PtyError::Read),
                             Err(_would_block) => false,
                         }
@@ -914,15 +979,16 @@ impl PtyHandle {
                 };
                 if exit_tick
                     && self.child_exited_unreaped()
-                    && self.pending_input_bytes().unwrap_or(0) == 0
+                    && !has_output(self.pty.get_ref().as_fd()).unwrap_or(false)
                 {
                     self.release_slave();
                 }
                 continue;
             }
 
+            let probe = self.probe.as_ref();
             let mut guard = self.pty.readable_mut().await.map_err(PtyError::Read)?;
-            match guard.try_io(|inner| drain_read(inner.get_ref().as_raw_fd(), buf)) {
+            match guard.try_io(|inner| read_marked(inner.get_ref().as_raw_fd(), buf, probe)) {
                 Ok(result) => return result.map_err(PtyError::Read),
                 Err(_would_block) => continue,
             }
@@ -1010,25 +1076,22 @@ impl PtyHandle {
         self.child.try_wait().map_err(PtyError::Child)
     }
 
-    /// Bytes the master can read right now.
-    ///
-    /// Used to decide when releasing the retained slave fd is safe: at zero
-    /// there is nothing left for the close to discard.
-    fn pending_input_bytes(&self) -> Result<usize, PtyError> {
-        let mut n: nix::libc::c_int = 0;
-        // SAFETY: `self.pty` owns the fd for the duration of the call, and
-        // FIONREAD writes a single c_int through the pointer we pass.
-        let rc = unsafe {
-            nix::libc::ioctl(
-                self.pty.get_ref().as_raw_fd(),
-                nix::libc::FIONREAD,
-                &mut n as *mut nix::libc::c_int,
-            )
-        };
-        if rc == -1 {
-            return Err(PtyError::Read(std::io::Error::last_os_error()));
-        }
-        Ok(n.max(0) as usize)
+    /// A probe, usable without this handle, for output the child wrote that
+    /// its reader has not handed on. Reads through this handle mark it; the
+    /// reader clears the mark with [`PtyOutputProbe::mark_handled`].
+    pub fn output_probe(&mut self) -> Result<PtyOutputProbe, PtyError> {
+        let master = self
+            .pty
+            .get_ref()
+            .as_fd()
+            .try_clone_to_owned()
+            .map_err(PtyError::Read)?;
+        let probe = PtyOutputProbe(std::sync::Arc::new(ProbeState {
+            master,
+            unhandled: std::sync::Mutex::new(false),
+        }));
+        self.probe = Some(probe.clone());
+        Ok(probe)
     }
 
     /// Has the child exited? Answered **without reaping it**.
@@ -1076,8 +1139,8 @@ impl PtyHandle {
 
     /// Drop the parent's slave fd, so a master read can reach EOF.
     ///
-    /// Only safe once the child is reaped and [`Self::pending_input_bytes`] is
-    /// zero: on BSD/macOS this close is what discards anything still queued.
+    /// Only safe once the child is reaped and the master has no output
+    /// waiting: on BSD/macOS this close is what discards anything still queued.
     /// Idempotent.
     fn release_slave(&mut self) {
         self.slave.take();

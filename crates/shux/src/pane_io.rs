@@ -87,6 +87,10 @@ pub struct PaneIoState {
     pub teardown_waiters: Vec<tokio::task::JoinHandle<()>>,
     /// Per-pane VirtualTerminal instances for capturing output.
     pub vts: HashMap<shux_core::model::PaneId, shux_vt::VirtualTerminal>,
+    /// Per live PTY, whether output it sent has not reached the VT: the sweep
+    /// releases a synchronized-output window on time only when none has. A pane
+    /// without one has no output to come.
+    pub sync_gates: HashMap<shux_core::model::PaneId, shux_pty::PtyOutputProbe>,
     /// Per-pane lens ContentRevision publishers (PRD §4, LENS-R-003). The
     /// single-writer PTY task publishes `(content_revision, last_mutation_ns)`
     /// here once per Class-A batch; `pane.wait_settled` (P3) subscribes. Same
@@ -188,6 +192,7 @@ impl PaneIoState {
             incarnations: HashMap::new(),
             teardown_waiters: Vec::new(),
             vts: HashMap::new(),
+            sync_gates: HashMap::new(),
             revisions: HashMap::new(),
             checkpoints: HashMap::new(),
             invalidations: HashMap::new(),
@@ -313,6 +318,7 @@ impl PaneIoState {
                 token.cancel();
             }
             self.writers.remove(pane_id);
+            self.sync_gates.remove(pane_id);
             self.resizers.remove(pane_id);
             if let Some(rx) = self.pty_done.remove(pane_id) {
                 done.push(rx);

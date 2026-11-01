@@ -50,8 +50,7 @@ deadline is ordered by the monotonic clock.
 ## Enforcement
 
 - `clippy.toml` disallows `std::thread::sleep`, `tokio::time::sleep`,
-  `tokio::time::sleep_until` and the `nix`/`libc` sleeps everywhere. `make clippy` (CI's Clippy step) also
-  lints the `test = false` lens lane, which `--all-targets` skips, and pins
+  `tokio::time::sleep_until` and the `nix`/`libc` sleeps everywhere. `make clippy` (CI's Clippy step) pins
   `CLIPPY_CONF_DIR` to the root: clippy reads the nearest `clippy.toml` and
   does not merge, so a crate-local one would drop the ban. `make check-darwin`
   runs the same lints over macOS-only code.

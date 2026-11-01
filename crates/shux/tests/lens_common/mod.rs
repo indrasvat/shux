@@ -85,6 +85,19 @@ pub struct Fixture {
 }
 
 /// Black-box harness: the built `shux` binary against an isolated XDG env.
+/// What a git hook exports to point git at its repository (the project's pre-push
+/// runs `make test`); each overrides the repository a git command names.
+pub const GIT_LOCATION_VARS: [&str; 8] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_PREFIX",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_QUARANTINE_PATH",
+    "GIT_COMMON_DIR",
+];
+
 pub struct Harness {
     bin: PathBuf,
     repo_root: PathBuf,
@@ -172,6 +185,13 @@ impl Harness {
             .env_remove("NO_COLOR")
             .env_remove("CLICOLOR")
             .env("SHELL", "/bin/sh");
+        // A git hook's repository must not reach the daemon, nor the panes it spawns.
+        for var in GIT_LOCATION_VARS {
+            cmd.env_remove(var);
+        }
+        // CI runners export `CI=true`, and the gate refuses to bless under it. A test
+        // that means to exercise CI sets it itself.
+        cmd.env_remove("CI");
         cmd
     }
 
@@ -271,15 +291,20 @@ impl Harness {
         format!(".shux/fixtures/lens/{name}")
     }
 
-    /// The repo-relative fixture path anchored at THIS harness's repo root
-    /// (p0-council-r3 item 1). Every fixture spawn uses this exact absolute
-    /// form so `count_fixture_procs` can match argv anchored at the start —
-    /// immune to co-tenant processes that merely mention a fixture filename.
+    /// THIS harness's absolute path to a fixture: a link in its own runtime dir.
+    /// Every fixture spawn uses it, so a spawned argv — and the
+    /// `count_fixture_procs` needle matched at its start — is unique to one
+    /// test, even with other tests running the same fixture in parallel.
     pub fn fixture_abs(&self, name: &str) -> String {
-        self.repo_root
-            .join(Self::fixture_rel(name))
-            .display()
-            .to_string()
+        let dir = self.runtime.path().join("fixtures");
+        let link = dir.join(name);
+        std::fs::create_dir_all(&dir).expect("create fixture link dir");
+        match std::os::unix::fs::symlink(self.repo_root.join(Self::fixture_rel(name)), &link) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => panic!("link fixture {name}: {e}"),
+        }
+        link.display().to_string()
     }
 
     /// Create an ordinary session, size the pane, `exec` the fixture over the
@@ -670,6 +695,19 @@ pub fn classify_frame_exact(rgba: (u8, u8, u8, u8), row: u32) -> char {
 /// Panics with a mint-me message when the golden is absent — the intended red
 /// state AFTER the method exists but BEFORE the golden is approved (§16.3).
 pub fn assert_png_golden(harness: &Harness, actual_png: &[u8], golden_rel: &str) {
+    assert_png_golden_masked(harness, actual_png, golden_rel, (1, 1), &[]);
+}
+
+/// [`assert_png_golden`], ignoring `masks`: cell rectangles `(col0, row0, col1, row1)`,
+/// end-exclusive, on a `grid` of `(cols, rows)`. Only for content the environment
+/// decides rather than shux, such as an installed tool's version.
+pub fn assert_png_golden_masked(
+    harness: &Harness,
+    actual_png: &[u8],
+    golden_rel: &str,
+    grid: (u32, u32),
+    masks: &[(u32, u32, u32, u32)],
+) {
     let golden = harness
         .repo_root()
         .join(".shux/goldens/lens")
@@ -685,14 +723,25 @@ pub fn assert_png_golden(harness: &Harness, actual_png: &[u8], golden_rel: &str)
     let script = harness
         .repo_root()
         .join(".claude/automations/pixel_verify.py");
-    let out = Command::new(&script)
-        .arg(&scratch)
-        .arg(&golden)
+    let img = decode_png(actual_png);
+    let (cw, ch) = (img.width() / grid.0, img.height() / grid.1);
+    let mut cmd = Command::new(&script);
+    cmd.arg(&scratch).arg(&golden);
+    for &(c0, r0, c1, r1) in masks {
+        cmd.arg("--mask")
+            .arg(format!("{},{},{},{}", c0 * cw, r0 * ch, c1 * cw, r1 * ch));
+    }
+    let out = cmd
         .output()
         .unwrap_or_else(|e| panic!("run pixel_verify.py: {e}"));
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let verdict: serde_json::Value = serde_json::from_str(stdout.trim())
-        .unwrap_or_else(|e| panic!("pixel_verify.py output not JSON: {e}\n{stdout}"));
+    let verdict: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "pixel_verify.py output not JSON ({e}); {}\nstdout:\n{stdout}\nstderr:\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
     assert_eq!(
         verdict.get("status").and_then(|v| v.as_str()),
         Some("pass"),

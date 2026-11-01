@@ -1,6 +1,6 @@
 //! Task 083 — `pane.wait_settled` frame-stability hardening (`hold_ms` / `stable_frames`).
-//! LENS lane (`LENS-TEST-CHANGE:` to touch). `test = false` — run serially under the leak guard
-//! via `make test-lens-settle-hardening`, NEVER in the default parallel `cargo test`/CI run.
+//! LENS lane (`LENS-TEST-CHANGE:` to touch). Runs in `make test`; `make
+//! test-lens-settle-hardening` runs it alone.
 //!
 //! These drive the REAL daemon through `pane.wait_settled` on real token-paced fixtures. The
 //! pure decision core (contiguous-revision reset, silence-tolerant hold, A→B→A alias defense) is

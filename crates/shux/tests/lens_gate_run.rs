@@ -1,6 +1,6 @@
 //! Task 081 — daemon-backed scenario runner (`shux lens gate`). GATE lane
-//! (`GATE-TEST-CHANGE:` to touch). `test = false` — run serially under the leak guard
-//! via `make test-lens-gate-run`, NEVER in the default parallel `cargo test`/CI run.
+//! (`GATE-TEST-CHANGE:` to touch). Runs in `make test`; `make test-lens-gate-run` runs it
+//! alone.
 //!
 //! These drive the REAL system through the built `shux` binary (design D1): parse →
 //! deny-by-default spawn → the agnostic step core → glance → compare, asserting on the
