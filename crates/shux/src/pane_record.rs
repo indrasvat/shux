@@ -222,6 +222,9 @@ fn file_opener() -> Opener {
     Arc::new(|_id: uuid::Uuid, path: PathBuf, overwrite: bool| {
         async move {
             use nix::fcntl::{FcntlArg, OFlag, fcntl};
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
             let mut options = tokio::fs::OpenOptions::new();
             // Non-blocking only for the open: a FIFO nobody reads fails at
             // once (ENXIO) instead of parking the open, and the start, forever.
@@ -677,23 +680,52 @@ pub(crate) async fn requested_length(after: Duration) {
 /// `path` with its parent resolved, which is how two spellings of one file
 /// are recognised. Creates the parent, as the open would.
 async fn path_key(path: &Path) -> Result<PathBuf, RecordStartError> {
-    let name = path
-        .file_name()
-        .ok_or_else(|| RecordStartError::BadPath(format!("{} names no file", path.display())))?;
-    let parent = match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-        _ => PathBuf::from("."),
+    use std::path::Component;
+    let path = std::path::absolute(path)
+        .map_err(|e| RecordStartError::BadPath(format!("{}: {e}", path.display())))?;
+    if path.file_name().is_none() {
+        return Err(RecordStartError::BadPath(format!(
+            "{} names no file",
+            path.display()
+        )));
+    }
+    // Resolve the deepest directory that exists; the rest does not exist
+    // yet, so it holds no links and is joined as written. Nothing is created
+    // here: a refused start leaves no trace.
+    let mut existing = path.parent().unwrap_or(Path::new("/")).to_path_buf();
+    let mut rest = vec![path.file_name().expect("checked above").to_owned()];
+    let base = loop {
+        match tokio::fs::canonicalize(&existing).await {
+            Ok(base) => break base,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let Some(name) = existing.file_name() else {
+                    return Err(RecordStartError::Open(format!(
+                        "failed to resolve {}: {e}",
+                        path.display()
+                    )));
+                };
+                rest.push(name.to_owned());
+                existing.pop();
+            }
+            Err(e) => {
+                return Err(RecordStartError::Open(format!(
+                    "failed to resolve {}: {e}",
+                    existing.display()
+                )));
+            }
+        }
     };
-    tokio::fs::create_dir_all(&parent).await.map_err(|e| {
-        RecordStartError::Open(format!(
-            "failed to create parent directory {}: {e}",
-            parent.display()
-        ))
-    })?;
-    let parent = tokio::fs::canonicalize(&parent).await.map_err(|e| {
-        RecordStartError::Open(format!("failed to resolve {}: {e}", parent.display()))
-    })?;
-    Ok(parent.join(name))
+    let mut key = base;
+    for part in rest.iter().rev() {
+        match Path::new(part).components().next() {
+            Some(Component::ParentDir) => {
+                key.pop();
+            }
+            Some(Component::CurDir) => {}
+            _ => key.push(part),
+        }
+    }
+    Ok(key)
 }
 
 /// An opened recording that admits nothing yet. Dropping it uncommitted

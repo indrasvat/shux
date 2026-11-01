@@ -615,11 +615,16 @@ pub(crate) fn register_pane_io_methods(
                     }
 
                     // Captured here: the connection's lifetime does not cross a spawn.
-                    let owner = if params
-                        .get("owned_by_connection")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false)
-                    {
+                    let owned = match params.get("owned_by_connection") {
+                        None | Some(serde_json::Value::Null) => false,
+                        Some(serde_json::Value::Bool(owned)) => *owned,
+                        Some(_) => {
+                            return Err(shux_rpc::RpcError::invalid_params(
+                                "owned_by_connection must be a boolean",
+                            ));
+                        }
+                    };
+                    let owner = if owned {
                         Some(shux_rpc::current_connection().ok_or_else(|| {
                             shux_rpc::RpcError::invalid_params(
                                 "owned_by_connection needs a socket connection to own the recording",
@@ -2110,6 +2115,65 @@ mod tests {
             .unwrap()
             .expect_err("a start on an ended pane succeeded");
         assert_eq!(err.code, shux_rpc::ErrorCode::NotFound.code(), "{err:?}");
+        harness.stop().await;
+    }
+
+    /// Ownership decides how long a recording lives; a value that is not a
+    /// boolean is refused, not read as "unowned".
+    #[tokio::test]
+    async fn a_non_boolean_owned_by_connection_is_refused() {
+        let harness = RpcHarness::new();
+        let (_s, _w, pane_id) = harness.seed_session("record-owned").await;
+        let _writer_rx = harness.seed_io(pane_id, b"ready\n").await;
+        let dir = tempfile::tempdir().unwrap();
+        let err = dispatch_err(
+            &harness.router,
+            "pane.record.start",
+            serde_json::json!({
+                "pane_id": pane_id.to_string(),
+                "path": dir.path().join("o.bin").display().to_string(),
+                "owned_by_connection": "true",
+            }),
+        )
+        .await;
+        assert_eq!(
+            err.code,
+            shux_rpc::ErrorCode::InvalidParams.code(),
+            "{err:?}"
+        );
+        harness.stop().await;
+    }
+
+    /// A refused start leaves nothing behind: not even the directory its
+    /// path named.
+    #[tokio::test]
+    async fn a_refused_start_creates_no_directory() {
+        let harness = RpcHarness::new();
+        let (_s, _w, pane_id) = harness.seed_session("record-nodir").await;
+        let _writer_rx = harness.seed_io(pane_id, b"ready\n").await;
+        let dir = tempfile::tempdir().unwrap();
+        dispatch_ok(
+            &harness.router,
+            "pane.record.start",
+            serde_json::json!({ "pane_id": pane_id.to_string(), "path": dir.path().join("first.bin").display().to_string() }),
+        )
+        .await;
+        let fresh = dir.path().join("never").join("made");
+        let err = dispatch_err(
+            &harness.router,
+            "pane.record.start",
+            serde_json::json!({ "pane_id": pane_id.to_string(), "path": fresh.join("second.bin").display().to_string() }),
+        )
+        .await;
+        assert_eq!(
+            err.code,
+            shux_rpc::ErrorCode::NameConflict.code(),
+            "{err:?}"
+        );
+        assert!(
+            !dir.path().join("never").exists(),
+            "a refused start created the directory its path named"
+        );
         harness.stop().await;
     }
 
