@@ -2910,28 +2910,6 @@ fn holds(rect: Rect, col: u16, row: u16) -> bool {
     col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
 }
 
-/// The pane the live layout puts under the pointer, for a client that names
-/// no frame still kept. `pane_at`, deliberately not `pane_under_pointer`: that
-/// helper falls back to the active pane whenever the hit-test misses, which
-/// would forward clicks on borders and the status bar into the focused pane.
-fn live_pane_hit(
-    graph: &GraphHandle,
-    attached: &AttachedSession,
-    viewport: Rect,
-    col: u16,
-    row: u16,
-) -> Option<PaneId> {
-    let snap = graph.snapshot();
-    let win = snap.windows.get(&attached.active_window_id)?;
-    if let Some(zoom) = &win.layout.zoom {
-        return Some(zoom.zoomed_pane);
-    }
-    if border_at(&win.layout.tree, viewport, col, row).is_some() {
-        return None;
-    }
-    pane_at(&win.layout.tree, viewport, col, row).map(|(pid, _)| pid)
-}
-
 /// Forward a press / drag / release to a mouse-aware app in the pane under the
 /// pointer.
 ///
@@ -2974,14 +2952,18 @@ async fn handle_app_mouse(
     // Resolve the pane under the pointer in the frame the client was shown: a
     // layout not drawn yet must not move a click into another pane. Views are
     // content rects, so borders, the outline and the status bar hit none.
-    let views = attached.shown.views(frame);
-    let pane_hit = match views {
-        Some(views) => views
-            .iter()
-            .find(|(_, view)| holds(view.rect, col, row))
-            .map(|(pid, _)| *pid),
-        None => live_pane_hit(graph, &attached, viewport, col, row),
+    let Some(views) = attached.shown.views(frame) else {
+        // A frame no longer kept names nothing; it must not fall through to a
+        // border drag or a selection at today's geometry either.
+        if action == ButtonAction::Release && matches!(*gesture, SelectionDrag::App { .. }) {
+            release_app_gesture(io_state, gesture).await;
+        }
+        return Ok(AppMouse::Consumed { redraw: false });
     };
+    let pane_hit = views
+        .iter()
+        .find(|(_, view)| holds(view.rect, col, row))
+        .map(|(pid, _)| *pid);
 
     // Modes are read from the pane the gesture already owns when there is one,
     // so an app that turns tracking off mid-drag still gets its release.
@@ -3032,13 +3014,16 @@ async fn handle_app_mouse(
     // it off-screen. Let the app know the button came up rather than letting
     // the gesture evaporate with it still held.
     let content = current_content_rect(client_size).await;
-    let Some(rect) = pane_rect_in(graph, &attached, content, viewport, pane_id) else {
+    // A pane closed, hidden by a zoom or in another window since the frame
+    // was drawn takes nothing more; a gesture it held is released.
+    if pane_rect_in(graph, &attached, content, viewport, pane_id).is_none() {
         release_app_gesture(io_state, gesture).await;
-        return Ok(AppMouse::NotHandled);
-    };
-    let shown = views.and_then(|views| views.get(&pane_id)).copied();
-    let drawn_at = shown.map_or(rect, |view| view.rect);
-    if !holds(drawn_at, col, row) && matches!(*gesture, SelectionDrag::None) {
+        return Ok(AppMouse::Consumed { redraw: false });
+    }
+    let shown = views.get(&pane_id).copied();
+    if !shown.is_some_and(|view| holds(view.rect, col, row))
+        && matches!(*gesture, SelectionDrag::None)
+    {
         return Ok(AppMouse::NotHandled);
     }
     // A press that opens a gesture names a cell or nothing. Once a gesture is
@@ -3164,8 +3149,7 @@ async fn select_pane_on_press(
     pane_id: PaneId,
 ) -> bool {
     let mut redraw = false;
-    if pane_id != active_pane_id {
-        let _ = graph.focus_pane(pane_id).await;
+    if pane_id != active_pane_id && graph.focus_pane(pane_id).await.is_ok() {
         session.lock().await.active_pane_id = pane_id;
         redraw = true;
     }
@@ -3334,35 +3318,16 @@ async fn handle_wheel(
         _ => return Ok(false),
     };
     let attached = session.lock().await.clone();
-    let viewport = current_viewport(client_size, config).await;
 
-    // Resolve the pane under the cursor in the frame the client was shown,
-    // else in the live layout (fallback: the active pane).
-    let views = attached.shown.views(frame);
-    let shown_hit = views.and_then(|views| {
-        views
-            .iter()
-            .find(|(_, view)| holds(view.rect, col, row))
-            .map(|(pid, _)| *pid)
-    });
-    let pane_id = match shown_hit {
-        Some(pid) => pid,
-        None => {
-            let snap = graph.snapshot();
-            match snap.windows.get(&attached.active_window_id) {
-                None => return Ok(true),
-                Some(win) => {
-                    if let Some(zoom) = &win.layout.zoom {
-                        zoom.zoomed_pane
-                    } else {
-                        pane_at(&win.layout.tree, viewport, col, row)
-                            .map(|(pid, _)| pid)
-                            .unwrap_or(attached.active_pane_id)
-                    }
-                }
-            }
-        }
+    // Resolve the pane under the cursor in the frame the client was shown
+    // (fallback: the active pane). A frame no longer kept names nothing.
+    let Some(views) = attached.shown.views(frame) else {
+        return Ok(true);
     };
+    let pane_id = views
+        .iter()
+        .find(|(_, view)| holds(view.rect, col, row))
+        .map_or(attached.active_pane_id, |(pid, _)| *pid);
     let Some(rect) = pane_rect_for(graph, &attached, client_size, config, pane_id).await else {
         return Ok(true);
     };
@@ -3391,7 +3356,7 @@ async fn handle_wheel(
     match route_wheel(mouse_on, alt, alt_scroll) {
         WheelRouting::ForwardMouse => {
             let cell = views
-                .and_then(|views| views.get(&pane_id))
+                .get(&pane_id)
                 .and_then(|view| shux_ui::viewport::pane_grid_cell(view, (col, row), false));
             // No grid cell under the pointer, or no truthful encoding for this
             // app's coordinate mode: sending nothing beats a tick aimed at a
@@ -8754,6 +8719,52 @@ mod tests {
             got, "\x1b[<0;1;55M\x1b[<0;1;55m",
             "clicked grid-row 55 as shown, before the swap was drawn"
         );
+        h.stop().await;
+    }
+
+    /// A press stamped with a frame no longer kept names nothing. It must not
+    /// fall through to today's layout, where the same point may be a border
+    /// and the drag that follows would resize the split.
+    #[tokio::test(start_paused = true)]
+    async fn a_press_from_a_frame_no_longer_kept_starts_no_border_drag() {
+        let mut h = InputHarness::new(64).await;
+        mouse_app_grid(&mut h, 60, 40).await;
+        let (_, y) = on_screen(&mut h, "grid-row 55").await;
+        let border = {
+            let grid = h.screen.grid();
+            let row = grid.visible_row(usize::from(y));
+            let bars: Vec<usize> = (0..row.len()).filter(|&c| row[c].ch == '│').collect();
+            // The outline's two sides bracket the separator between the panes.
+            assert_eq!(bars.len(), 3, "outline, separator, outline: {bars:?}");
+            bars[1] as u16
+        };
+        let layout = |h: &InputHarness| {
+            let snap = h.fixture.graph.snapshot();
+            format!("{:?}", snap.windows[&h.fixture.first_window].layout.tree)
+        };
+        let before = layout(&h);
+        for (kind, col) in [
+            (MouseKind::Down, border),
+            (MouseKind::Drag, border + 10),
+            (MouseKind::Up, border + 10),
+        ] {
+            h.send(&AttachClientFrame::Mouse {
+                kind,
+                button: ProtoMouseButton::Left,
+                col,
+                row: y,
+                shift: false,
+                alt: false,
+                ctrl: false,
+                frame: Some(0),
+            })
+            .await;
+        }
+        assert!(
+            pane_input(&mut h).await.is_empty(),
+            "the app was sent a report"
+        );
+        assert_eq!(layout(&h), before, "an expired press dragged the border");
         h.stop().await;
     }
 
