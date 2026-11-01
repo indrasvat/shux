@@ -621,3 +621,68 @@ fn a_signal_ends_a_client_whose_terminal_stopped_reading() {
         "got {status}"
     );
 }
+
+/// A terminal resized while the client is still handshaking: the daemon must
+/// hear the new size, or the client draws at a size nothing asked for until
+/// the next resize. A stand-in attach socket holds the client at that point.
+#[tokio::test]
+async fn a_resize_during_the_handshake_reaches_the_daemon() {
+    let h = Harness::new();
+    h.create_session("resize-handshake");
+    let sock = h.runtime_dir().join("shux").join("attach.sock");
+    std::fs::rename(&sock, sock.with_extension("real")).expect("move the real attach socket");
+    let listener = tokio::net::UnixListener::bind(&sock).expect("bind stand-in");
+
+    let client = AttachedClient::spawn(&h, "resize-handshake");
+    let (stream, _) = tokio::time::timeout(BUDGET, listener.accept())
+        .await
+        .expect("the client never connected")
+        .expect("accept");
+    let mut framed = Framed::new(stream, shux_rpc::create_codec());
+    let hello = tokio::time::timeout(BUDGET, framed.next())
+        .await
+        .expect("no hello")
+        .expect("closed before the hello")
+        .expect("read hello");
+    let hello: AttachHello = serde_json::from_slice(&hello).expect("parse hello");
+    assert_eq!(
+        (hello.cols, hello.rows),
+        (100, 30),
+        "the PTY's size at spawn"
+    );
+
+    let resized = nix::pty::Winsize {
+        ws_row: 40,
+        ws_col: 120,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: TIOCSWINSZ only reads `resized`, which outlives the call.
+    let rc = unsafe { libc::ioctl(client.master.as_raw_fd(), libc::TIOCSWINSZ, &resized) };
+    assert_eq!(rc, 0, "TIOCSWINSZ: {}", std::io::Error::last_os_error());
+
+    let ready = AttachReady::Ok {
+        session_id: "stand-in".into(),
+        session_name: "resize-handshake".into(),
+        active_window_id: "stand-in".into(),
+        active_pane_id: "stand-in".into(),
+        protocol: ATTACH_PROTOCOL_VERSION,
+    };
+    framed
+        .send(Bytes::from(serde_json::to_vec(&ready).unwrap()))
+        .await
+        .expect("send ready");
+
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    loop {
+        let frame = tokio::time::timeout_at(deadline, framed.next())
+            .await
+            .expect("the client never reported the size it was resized to")
+            .expect("the client hung up")
+            .expect("read frame");
+        if let Ok(AttachClientFrame::Resize { cols, rows }) = serde_json::from_slice(&frame) {
+            assert_eq!((cols, rows), (120, 40));
+            break;
+        }
+    }
+}

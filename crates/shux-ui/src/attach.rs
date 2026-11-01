@@ -89,6 +89,10 @@ fn terminal_can_draw_images() -> bool {
 pub async fn run_attach(socket_path: &Path, config: ClientConfig) -> Result<ExitReason> {
     terminal::install_panic_hook();
 
+    // Watched before the size is first read, so no resize falls between the
+    // two: the input thread's own resize events start only after the handshake.
+    let resized = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+        .context("watch for terminal resizes")?;
     let (cols, rows) = TerminalGuard::size().context("terminal size")?;
     let graphics = terminal_can_draw_images();
 
@@ -137,7 +141,7 @@ pub async fn run_attach(socket_path: &Path, config: ClientConfig) -> Result<Exit
     let mut signals = terminal::ShutdownSignals::install().context("install signal handlers")?;
     let mut guard = TerminalGuard::enter().context("enter raw mode")?;
     let result = tokio::select! {
-        r = run_loop(&mut framed, &config) => r,
+        r = run_loop(&mut framed, &config, resized, (cols, rows)) => r,
         signo = signals.recv() => Ok(ExitReason::Signal(signo)),
     };
     // A terminal that stopped reading blocks every write to it, so once a
@@ -197,6 +201,9 @@ fn terminal_hung_up(terminal: &OwnedFd) -> bool {
 async fn run_loop<S>(
     framed: &mut Framed<S, tokio_util::codec::LengthDelimitedCodec>,
     config: &ClientConfig,
+    mut resized: tokio::signal::unix::Signal,
+    // The size the hello reported.
+    mut last_size: (u16, u16),
 ) -> Result<ExitReason>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -207,7 +214,6 @@ where
     // True once we've sent a PrefixTapped frame for this attach.
     // One-shot — no need to spam the wire on every prefix-arm.
     let mut prefix_announced = false;
-    let mut last_size = TerminalGuard::size().unwrap_or((80, 24));
     let mut bindings = KeybindingRegistry::with_overrides(&config.prefix, &config.keybindings)
         .map_err(|e| anyhow::anyhow!("invalid keybinding config: {e:?}"))?;
     let reload = config
@@ -260,11 +266,6 @@ where
     });
 
     loop {
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "the periodic resize check, in case the OS missed a resize event"
-        )]
-        let resize_check = tokio::time::sleep(Duration::from_secs(5));
         tokio::select! {
             () = &mut reload_listener => {
                 reload_listener = Box::pin(reload.notified());
@@ -387,12 +388,7 @@ where
                             sink.send(Bytes::from(payload)).await.ok();
                         }
                     }
-                    Event::Resize(c, r) => {
-                        last_size = (c, r);
-                        let frame = AttachClientFrame::Resize { cols: c, rows: r };
-                        let bytes = serde_json::to_vec(&frame)?;
-                        sink.send(Bytes::from(bytes)).await.ok();
-                    }
+                    Event::Resize(..) => report_size(&mut sink, &mut last_size).await?,
                     Event::Mouse(m) => {
                         // Translate crossterm's MouseEvent into our protocol
                         // shape and forward. The daemon decides what each
@@ -447,18 +443,26 @@ where
                 }
             }
 
-            // Periodic resize check (in case the OS missed the resize event).
-            _ = resize_check => {
-                if let Ok((c, r)) = TerminalGuard::size()
-                    && (c, r) != last_size {
-                        last_size = (c, r);
-                        let frame = AttachClientFrame::Resize { cols: c, rows: r };
-                        let bytes = serde_json::to_vec(&frame)?;
-                        sink.send(Bytes::from(bytes)).await.ok();
-                    }
-            }
+            _ = resized.recv() => report_size(&mut sink, &mut last_size).await?,
         }
     }
+}
+
+/// Send the terminal's size if it differs from the last one sent. Read here
+/// rather than taken from the event, so a late event cannot report a stale size.
+async fn report_size<K>(sink: &mut K, last_size: &mut (u16, u16)) -> Result<()>
+where
+    K: futures::Sink<Bytes> + Unpin,
+{
+    if let Ok(size) = TerminalGuard::size()
+        && size != *last_size
+    {
+        *last_size = size;
+        let (cols, rows) = size;
+        let frame = serde_json::to_vec(&AttachClientFrame::Resize { cols, rows })?;
+        sink.send(Bytes::from(frame)).await.ok();
+    }
+    Ok(())
 }
 
 /// The bindings for the live config's keys when they differ from `keys`,
