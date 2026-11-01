@@ -1,0 +1,101 @@
+{
+ "aT-80x24": {
+  "identical": true,
+  "base": [
+   "a=T,f=24,o=z,t=d,i=H0,s=72,v=76,p=1,C=1,q=2,z=-1,y=0,w=72,h=76,c=8,r=4,m=1",
+   "a=T,f=24,o=z,t=d,i=H1,s=72,v=76,p=1,C=1,q=2,z=-1,y=0,w=72,h=76,c=8,r=4,m=1",
+   "a=T,f=24,o=z,t=d,i=H2,s=72,v=76,p=1,C=1,q=2,z=-1,y=0,w=72,h=76,c=8,r=4,m=1"
+  ],
+  "new": [
+   "a=T,f=24,o=z,t=d,i=H0,s=72,v=76,p=1,C=1,q=2,z=-1,y=0,w=72,h=76,c=8,r=4,m=1",
+   "a=T,f=24,o=z,t=d,i=H1,s=72,v=76,p=1,C=1,q=2,z=-1,y=0,w=72,h=76,c=8,r=4,m=1",
+   "a=T,f=24,o=z,t=d,i=H2,s=72,v=76,p=1,C=1,q=2,z=-1,y=0,w=72,h=76,c=8,r=4,m=1"
+  ]
+ },
+ "aT-120x40": {
+  "identical": true,
+  "base": [
+   "a=T,f=24,o=z,t=d,i=H0,s=72,v=76,p=1,C=1,q=2,z=-1,y=0,w=72,h=76,c=8,r=4,m=1",
+   "a=T,f=24,o=z,t=d,i=H1,s=72,v=76,p=1,C=1,q=2,z=-1,y=0,w=72,h=76,c=8,r=4,m=1",
+   "a=T,f=24,o=z,t=d,i=H2,s=72,v=76,p=1,C=1,q=2,z=-1,y=0,w=72,h=76,c=8,r=4,m=1"
+  ],
+  "new": [
+   "a=T,f=24,o=z,t=d,i=H0,s=72,v=76,p=1,C=1,q=2,z=-1,y=0,w=72,h=76,c=8,r=4,m=1",
+   "a=T,f=24,o=z,t=d,i=H1,s=72,v=76,p=1,C=1,q=2,z=-1,y=0,w=72,h=76,c=8,r=4,m=1",
+   "a=T,f=24,o=z,t=d,i=H2,s=72,v=76,p=1,C=1,q=2,z=-1,y=0,w=72,h=76,c=8,r=4,m=1"
+  ]
+ },
+ "aT-200x60": {
+  "identical": true,
+  "base": [
+   "a=T,f=24,o=z,t=d,i=H0,s=72,v=76,p=1,C=1,q=2,z=-1,y=0,w=72,h=76,c=8,r=4,m=1",
+   "a=T,f=24,o=z,t=d,i=H1,s=72,v=76,p=1,C=1,q=2,z=-1,y=0,w=72,h=76,c=8,r=4,m=1",
+   "a=T,f=24,o=z,t=d,i=H2,s=72,v=76,p=1,C=1,q=2,z=-1,y=0,w=72,h=76,c=8,r=4,m=1"
+  ],
+  "new": [
+   "a=T,f=24,o=z,t=d,i=H0,s=72,v=76,p=1,C=1,q=2,z=-1,y=0,w=72,h=76,c=8,r=4,m=1",
+   "a=T,f=24,o=z,t=d,i=H1,s=72,v=76,p=1,C=1,q=2,z=-1,y=0,w=72,h=76,c=8,r=4,m=1",
+   "a=T,f=24,o=z,t=d,i=H2,s=72,v=76,p=1,C=1,q=2,z=-1,y=0,w=72,h=76,c=8,r=4,m=1"
+  ]
+ },
+ "icat-120x40": {
+  "identical": true,
+  "base": [
+   "a=T,f=100,t=d,i=H0,s=32,v=32,p=1,C=1,q=2,z=-1,y=0,w=32,h=32,c=4,r=2,m=0",
+   "a=T,f=24,o=z,t=d,i=H1,s=720,v=540,p=1,C=1,q=2,z=-1,y=0,w=720,h=540,c=80,r=29,m=1"
+  ],
+  "new": [
+   "a=T,f=100,t=d,i=H0,s=32,v=32,p=1,C=1,q=2,z=-1,y=0,w=32,h=32,c=4,r=2,m=0",
+   "a=T,f=24,o=z,t=d,i=H1,s=720,v=540,p=1,C=1,q=2,z=-1,y=0,w=720,h=540,c=80,r=29,m=1"
+  ]
+ },
+ "icat-200x60": {
+  "identical": true,
+  "base": [
+   "a=T,f=100,t=d,i=H0,s=32,v=32,p=1,C=1,q=2,z=-1,y=0,w=32,h=32,c=4,r=2,m=0",
+   "a=T,f=24,o=z,t=d,i=H1,s=720,v=540,p=1,C=1,q=2,z=-1,y=0,w=720,h=540,c=80,r=29,m=1"
+  ],
+  "new": [
+   "a=T,f=100,t=d,i=H0,s=32,v=32,p=1,C=1,q=2,z=-1,y=0,w=32,h=32,c=4,r=2,m=0",
+   "a=T,f=24,o=z,t=d,i=H1,s=720,v=540,p=1,C=1,q=2,z=-1,y=0,w=720,h=540,c=80,r=29,m=1"
+  ]
+ },
+ "nonmultT-80x24": {
+  "identical": true,
+  "base": [
+   "a=T,f=24,o=z,t=d,i=H0,s=64,v=48,p=1,C=1,q=2,z=-1,y=0,w=64,h=48,c=8,r=3,m=1",
+   "a=T,f=100,t=d,i=H1,s=32,v=32,p=1,C=1,q=2,z=-1,y=0,w=32,h=32,c=4,r=2,m=0",
+   "a=T,f=24,o=z,t=d,i=H2,s=40,v=30,p=1,C=1,q=2,z=-1,y=0,w=40,h=30,c=5,r=2,m=0"
+  ],
+  "new": [
+   "a=T,f=24,o=z,t=d,i=H0,s=64,v=48,p=1,C=1,q=2,z=-1,y=0,w=64,h=48,c=8,r=3,m=1",
+   "a=T,f=100,t=d,i=H1,s=32,v=32,p=1,C=1,q=2,z=-1,y=0,w=32,h=32,c=4,r=2,m=0",
+   "a=T,f=24,o=z,t=d,i=H2,s=40,v=30,p=1,C=1,q=2,z=-1,y=0,w=40,h=30,c=5,r=2,m=0"
+  ]
+ },
+ "nonmultT-120x40": {
+  "identical": true,
+  "base": [
+   "a=T,f=24,o=z,t=d,i=H0,s=64,v=48,p=1,C=1,q=2,z=-1,y=0,w=64,h=48,c=8,r=3,m=1",
+   "a=T,f=100,t=d,i=H1,s=32,v=32,p=1,C=1,q=2,z=-1,y=0,w=32,h=32,c=4,r=2,m=0",
+   "a=T,f=24,o=z,t=d,i=H2,s=40,v=30,p=1,C=1,q=2,z=-1,y=0,w=40,h=30,c=5,r=2,m=0"
+  ],
+  "new": [
+   "a=T,f=24,o=z,t=d,i=H0,s=64,v=48,p=1,C=1,q=2,z=-1,y=0,w=64,h=48,c=8,r=3,m=1",
+   "a=T,f=100,t=d,i=H1,s=32,v=32,p=1,C=1,q=2,z=-1,y=0,w=32,h=32,c=4,r=2,m=0",
+   "a=T,f=24,o=z,t=d,i=H2,s=40,v=30,p=1,C=1,q=2,z=-1,y=0,w=40,h=30,c=5,r=2,m=0"
+  ]
+ },
+ "icat-80x24": {
+  "identical": false,
+  "base": [
+   "a=T,f=24,o=z,t=d,i=H0,s=720,v=540,p=1,C=1,q=2,z=-1,y=38,w=702,h=399,c=78,r=21,m=1"
+  ],
+  "new": [
+   "a=T,f=100,t=d,i=H0,s=32,v=32,p=1,C=1,q=2,z=-1,y=0,w=32,h=32,c=4,r=2,m=0",
+   "a=T,f=24,o=z,t=d,i=H1,s=720,v=540,p=1,C=1,q=2,z=-1,y=38,w=702,h=399,c=78,r=21,m=1",
+   "a=d,d=I,i=H0,q=2"
+  ]
+ },
+ "_note": "Kitty control keys the attach emitter wrote into the host pane (pane.record raw PTY bytes), host ids renumbered. icat-80x24 differs only by an intermediate frame (the 32x32 picture transmitted then deleted as the 720x540 one scrolls over it)."
+}

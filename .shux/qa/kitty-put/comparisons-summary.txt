@@ -1,0 +1,424 @@
+FAIL ab-alt-1-80x24 attachbody 5472
+FAIL ab-alt-1-80x24 pane1 5472
+FAIL ab-alt-1-80x24 ph2-attachbody 10944
+FAIL ab-alt-1-80x24 ph2-pane1 10944
+FAIL ab-alt-1-80x24 ph2-session 10944
+FAIL ab-alt-1-80x24 ph2-window 10944
+FAIL ab-alt-1-80x24 session 5472
+FAIL ab-alt-1-80x24 window 5472
+INFO expected-AB-difference alt-1-80x24
+PASS ab-alt-1-ref-120x40 attachbody
+PASS ab-alt-1-ref-120x40 pane1
+FAIL ab-alt-1-ref-120x40 ph2-attachbody 5472
+PASS ab-alt-1-ref-120x40 ph2-pane1
+PASS ab-alt-1-ref-120x40 ph2-session
+PASS ab-alt-1-ref-120x40 ph2-window
+PASS ab-alt-1-ref-120x40 session
+PASS ab-alt-1-ref-120x40 window
+PENDING-XP ab alt-1-ref-120x40
+PASS ab-alt-1-ref-200x60 attachbody
+PASS ab-alt-1-ref-200x60 pane1
+FAIL ab-alt-1-ref-200x60 ph2-attachbody 5472
+PASS ab-alt-1-ref-200x60 ph2-pane1
+PASS ab-alt-1-ref-200x60 ph2-session
+PASS ab-alt-1-ref-200x60 ph2-window
+PASS ab-alt-1-ref-200x60 session
+PASS ab-alt-1-ref-200x60 window
+PENDING-XP ab alt-1-ref-200x60
+PASS ab-alt-1-ref-80x24 attachbody
+PASS ab-alt-1-ref-80x24 pane1
+FAIL ab-alt-1-ref-80x24 ph2-attachbody 5472
+PASS ab-alt-1-ref-80x24 ph2-pane1
+PASS ab-alt-1-ref-80x24 ph2-session
+PASS ab-alt-1-ref-80x24 ph2-window
+PASS ab-alt-1-ref-80x24 session
+PASS ab-alt-1-ref-80x24 window
+PENDING-XP ab alt-1-ref-80x24
+PASS ab-aT-120x40 attachbody
+PASS ab-aT-120x40 pane1
+PASS ab-aT-120x40 session
+PASS ab-aT-120x40 window
+PASS ab-aT-200x60 attachbody
+PASS ab-aT-200x60 pane1
+PASS ab-aT-200x60 session
+PASS ab-aT-200x60 window
+PASS ab-aT-80x24 attachbody
+PASS ab-aT-80x24 pane1
+PASS ab-aT-80x24 session
+PASS ab-aT-80x24 window
+FAIL ab-del-80x24 attachbody 10944
+FAIL ab-del-80x24 pane1 10944
+FAIL ab-del-80x24 session 10944
+FAIL ab-del-80x24 window 10944
+INFO expected-AB-difference del-80x24
+PASS ab-del-ref-120x40 attachbody
+PASS ab-del-ref-120x40 pane1
+PASS ab-del-ref-120x40 session
+PASS ab-del-ref-120x40 window
+PASS ab-del-ref-200x60 attachbody
+PASS ab-del-ref-200x60 pane1
+PASS ab-del-ref-200x60 session
+PASS ab-del-ref-200x60 window
+PASS ab-del-ref-80x24 attachbody
+PASS ab-del-ref-80x24 pane1
+PASS ab-del-ref-80x24 session
+PASS ab-del-ref-80x24 window
+PASS ab-icat-120x40 attachbody
+PASS ab-icat-120x40 pane1
+PASS ab-icat-120x40 session
+PASS ab-icat-120x40 window
+PASS ab-icat-200x60 attachbody
+PASS ab-icat-200x60 pane1
+PASS ab-icat-200x60 session
+PASS ab-icat-200x60 window
+FAIL ab-icat-80x24 attachbody 45884
+PASS ab-icat-80x24 pane1
+PASS ab-icat-80x24 session
+PASS ab-icat-80x24 window
+PENDING-XP ab icat-80x24
+FAIL ab-img-last-120x40 attachbody 6320
+PASS ab-img-last-120x40 pane1
+PASS ab-img-last-120x40 session
+PASS ab-img-last-120x40 window
+INFO expected-AB-difference img-last-120x40
+FAIL ab-img-last-200x60 attachbody 3884
+PASS ab-img-last-200x60 pane1
+PASS ab-img-last-200x60 session
+PASS ab-img-last-200x60 window
+INFO expected-AB-difference img-last-200x60
+FAIL ab-img-last-80x24 attachbody 6320
+PASS ab-img-last-80x24 pane1
+PASS ab-img-last-80x24 session
+PASS ab-img-last-80x24 window
+INFO expected-AB-difference img-last-80x24
+FAIL ab-img-over-120x40 attachbody 6960
+PASS ab-img-over-120x40 pane1
+PASS ab-img-over-120x40 session
+PASS ab-img-over-120x40 window
+INFO expected-AB-difference img-over-120x40
+FAIL ab-img-over-200x60 attachbody 3884
+PASS ab-img-over-200x60 pane1
+PASS ab-img-over-200x60 session
+PASS ab-img-over-200x60 window
+INFO expected-AB-difference img-over-200x60
+FAIL ab-img-over-80x24 attachbody 6960
+PASS ab-img-over-80x24 pane1
+PASS ab-img-over-80x24 session
+PASS ab-img-over-80x24 window
+INFO expected-AB-difference img-over-80x24
+FAIL ab-nonmult-120x40 attachbody 9306
+FAIL ab-nonmult-120x40 pane1 4683
+FAIL ab-nonmult-120x40 session 4683
+FAIL ab-nonmult-120x40 window 4683
+INFO expected-AB-difference nonmult-120x40
+FAIL ab-nonmult-80x24 attachbody 9306
+FAIL ab-nonmult-80x24 pane1 4683
+FAIL ab-nonmult-80x24 session 4683
+FAIL ab-nonmult-80x24 window 4683
+INFO expected-AB-difference nonmult-80x24
+FAIL ab-nonmultT-120x40 attachbody 5819
+PASS ab-nonmultT-120x40 pane1
+PASS ab-nonmultT-120x40 session
+PASS ab-nonmultT-120x40 window
+INFO expected-AB-difference nonmultT-120x40
+FAIL ab-nonmultT-80x24 attachbody 5819
+PASS ab-nonmultT-80x24 pane1
+PASS ab-nonmultT-80x24 session
+PASS ab-nonmultT-80x24 window
+INFO expected-AB-difference nonmultT-80x24
+FAIL ab-put-80x24 attachbody 23256
+FAIL ab-put-80x24 pane1 23256
+FAIL ab-put-80x24 session 23256
+FAIL ab-put-80x24 window 23256
+INFO expected-AB-difference put-80x24
+PASS ab-put-ref-120x40 attachbody
+PASS ab-put-ref-120x40 pane1
+PASS ab-put-ref-120x40 session
+PASS ab-put-ref-120x40 window
+PASS ab-put-ref-200x60 attachbody
+PASS ab-put-ref-200x60 pane1
+PASS ab-put-ref-200x60 session
+PASS ab-put-ref-200x60 window
+PASS ab-put-ref-80x24 attachbody
+PASS ab-put-ref-80x24 pane1
+PASS ab-put-ref-80x24 session
+PASS ab-put-ref-80x24 window
+PASS ab-replay-btop-120x40 attachbody
+PASS ab-replay-btop-120x40 pane1
+PASS ab-replay-btop-120x40 session
+PASS ab-replay-btop-120x40 window
+PASS ab-replay-btop-200x60 attachbody
+PASS ab-replay-btop-200x60 pane1
+PASS ab-replay-btop-200x60 session
+PASS ab-replay-btop-200x60 window
+PASS ab-replay-lazygit-120x40 attachbody
+PASS ab-replay-lazygit-120x40 pane1
+PASS ab-replay-lazygit-120x40 session
+PASS ab-replay-lazygit-120x40 window
+PASS ab-replay-lazygit-200x60 attachbody
+PASS ab-replay-lazygit-200x60 pane1
+PASS ab-replay-lazygit-200x60 session
+PASS ab-replay-lazygit-200x60 window
+PASS ab-replay-nvim-120x40 attachbody
+PASS ab-replay-nvim-120x40 pane1
+PASS ab-replay-nvim-120x40 session
+PASS ab-replay-nvim-120x40 window
+PASS ab-replay-nvim-200x60 attachbody
+PASS ab-replay-nvim-200x60 pane1
+PASS ab-replay-nvim-200x60 session
+PASS ab-replay-nvim-200x60 window
+PASS ab-replay-vicaya-120x40 attachbody
+PASS ab-replay-vicaya-120x40 pane1
+PASS ab-replay-vicaya-120x40 session
+PASS ab-replay-vicaya-120x40 window
+PASS ab-replay-vicaya-200x60 attachbody
+PASS ab-replay-vicaya-200x60 pane1
+PASS ab-replay-vicaya-200x60 session
+PASS ab-replay-vicaya-200x60 window
+PASS ab-replay-vivecaka-120x40 attachbody
+PASS ab-replay-vivecaka-120x40 pane1
+PASS ab-replay-vivecaka-120x40 session
+PASS ab-replay-vivecaka-120x40 window
+PASS ab-replay-vivecaka-200x60 attachbody
+PASS ab-replay-vivecaka-200x60 pane1
+PASS ab-replay-vivecaka-200x60 session
+PASS ab-replay-vivecaka-200x60 window
+FAIL ab-scale-80x24 attachbody 22230
+FAIL ab-scale-80x24 pane1 22230
+FAIL ab-scale-80x24 session 22230
+FAIL ab-scale-80x24 window 22230
+INFO expected-AB-difference scale-80x24
+FAIL ab-sync-80x24 attachbody 5472
+FAIL ab-sync-80x24 pane1 5472
+FAIL ab-sync-80x24 session 5472
+FAIL ab-sync-80x24 window 5472
+INFO expected-AB-difference sync-80x24
+PASS ab-sync-ref-120x40 attachbody
+PASS ab-sync-ref-120x40 pane1
+PASS ab-sync-ref-120x40 session
+PASS ab-sync-ref-120x40 window
+PASS ab-sync-ref-200x60 attachbody
+PASS ab-sync-ref-200x60 pane1
+PASS ab-sync-ref-200x60 session
+PASS ab-sync-ref-200x60 window
+PASS ab-sync-ref-80x24 attachbody
+PASS ab-sync-ref-80x24 pane1
+PASS ab-sync-ref-80x24 session
+PASS ab-sync-ref-80x24 window
+PASS ab-tui-htop-120x40 attachbody
+PASS ab-tui-htop-120x40 pane1
+PASS ab-tui-htop-120x40 pane2
+PASS ab-tui-htop-120x40 session
+PASS ab-tui-htop-120x40 window
+PASS ab-tui-htop-80x24 attachbody
+PASS ab-tui-htop-80x24 pane1
+PASS ab-tui-htop-80x24 pane2
+PASS ab-tui-htop-80x24 session
+PASS ab-tui-htop-80x24 window
+PASS ab-tui-lazygit-120x40 attachbody
+PASS ab-tui-lazygit-120x40 pane1
+PASS ab-tui-lazygit-120x40 pane2
+PASS ab-tui-lazygit-120x40 session
+PASS ab-tui-lazygit-120x40 window
+PASS ab-tui-lazygit-80x24 attachbody
+PASS ab-tui-lazygit-80x24 pane1
+PASS ab-tui-lazygit-80x24 pane2
+PASS ab-tui-lazygit-80x24 session
+PASS ab-tui-lazygit-80x24 window
+PASS ab-tui-less-120x40 attachbody
+PASS ab-tui-less-120x40 pane1
+PASS ab-tui-less-120x40 pane2
+PASS ab-tui-less-120x40 session
+PASS ab-tui-less-120x40 window
+PASS ab-tui-less-80x24 attachbody
+PASS ab-tui-less-80x24 pane1
+PASS ab-tui-less-80x24 pane2
+PASS ab-tui-less-80x24 session
+PASS ab-tui-less-80x24 window
+PASS ab-tui-nvim-120x40 attachbody
+PASS ab-tui-nvim-120x40 pane1
+PASS ab-tui-nvim-120x40 pane2
+PASS ab-tui-nvim-120x40 session
+PASS ab-tui-nvim-120x40 window
+PASS ab-tui-nvim-80x24 attachbody
+PASS ab-tui-nvim-80x24 pane1
+PASS ab-tui-nvim-80x24 pane2
+PASS ab-tui-nvim-80x24 session
+PASS ab-tui-nvim-80x24 window
+PASS ab-tui-vim-120x40 attachbody
+PASS ab-tui-vim-120x40 pane1
+PASS ab-tui-vim-120x40 pane2
+PASS ab-tui-vim-120x40 session
+PASS ab-tui-vim-120x40 window
+PASS ab-tui-vim-80x24 attachbody
+PASS ab-tui-vim-80x24 pane1
+PASS ab-tui-vim-80x24 pane2
+PASS ab-tui-vim-80x24 session
+PASS ab-tui-vim-80x24 window
+PASS ref-put-80x24 attachbody
+PASS ref-put-80x24 pane1
+PASS ref-put-80x24 session
+PASS ref-put-80x24 window
+PASS ref-put-120x40 attachbody
+PASS ref-put-120x40 pane1
+PASS ref-put-120x40 session
+PASS ref-put-120x40 window
+PASS ref-put-200x60 attachbody
+PASS ref-put-200x60 pane1
+PASS ref-put-200x60 session
+PASS ref-put-200x60 window
+PASS ref-del-80x24 attachbody
+PASS ref-del-80x24 pane1
+PASS ref-del-80x24 session
+PASS ref-del-80x24 window
+PASS ref-del-120x40 attachbody
+PASS ref-del-120x40 pane1
+PASS ref-del-120x40 session
+PASS ref-del-120x40 window
+PASS ref-del-200x60 attachbody
+PASS ref-del-200x60 pane1
+PASS ref-del-200x60 session
+PASS ref-del-200x60 window
+PASS ref-sync-80x24 attachbody
+PASS ref-sync-80x24 pane1
+PASS ref-sync-80x24 session
+PASS ref-sync-80x24 window
+PASS ref-sync-120x40 attachbody
+PASS ref-sync-120x40 pane1
+PASS ref-sync-120x40 session
+PASS ref-sync-120x40 window
+PASS ref-sync-200x60 attachbody
+PASS ref-sync-200x60 pane1
+PASS ref-sync-200x60 session
+PASS ref-sync-200x60 window
+PASS ref-alt-1-80x24 attachbody
+PASS ref-alt-1-80x24 pane1
+FAIL ref-alt-1-80x24 ph2-attachbody 5472
+PASS ref-alt-1-80x24 ph2-pane1
+PASS ref-alt-1-80x24 ph2-session
+PASS ref-alt-1-80x24 ph2-window
+PASS ref-alt-1-80x24 session
+PASS ref-alt-1-80x24 window
+REQFAIL ref alt-1-80x24
+PASS ref-alt-1-120x40 attachbody
+PASS ref-alt-1-120x40 pane1
+FAIL ref-alt-1-120x40 ph2-attachbody 5472
+PASS ref-alt-1-120x40 ph2-pane1
+PASS ref-alt-1-120x40 ph2-session
+PASS ref-alt-1-120x40 ph2-window
+PASS ref-alt-1-120x40 session
+PASS ref-alt-1-120x40 window
+REQFAIL ref alt-1-120x40
+PASS ref-alt-1-200x60 attachbody
+PASS ref-alt-1-200x60 pane1
+FAIL ref-alt-1-200x60 ph2-attachbody 5472
+PASS ref-alt-1-200x60 ph2-pane1
+PASS ref-alt-1-200x60 ph2-session
+PASS ref-alt-1-200x60 ph2-window
+PASS ref-alt-1-200x60 session
+PASS ref-alt-1-200x60 window
+REQFAIL ref alt-1-200x60
+PASS xp base alt-1-80x24 attach-vs-pane1
+PASS xp base alt-1-80x24 ph2-attach-vs-pane1
+PASS xp base alt-1-ref-120x40 attach-vs-pane1
+FAIL xp base alt-1-ref-120x40 ph2-attach-vs-pane1 "changed_pixels": 5472
+PASS xp base alt-1-ref-200x60 attach-vs-pane1
+FAIL xp base alt-1-ref-200x60 ph2-attach-vs-pane1 "changed_pixels": 5472
+PASS xp base alt-1-ref-80x24 attach-vs-pane1
+FAIL xp base alt-1-ref-80x24 ph2-attach-vs-pane1 "changed_pixels": 5472
+PASS xp base aT-120x40 attach-vs-pane1
+PASS xp base aT-200x60 attach-vs-pane1
+PASS xp base aT-80x24 attach-vs-pane1
+PASS xp base del-80x24 attach-vs-pane1
+PASS xp base del-ref-120x40 attach-vs-pane1
+PASS xp base del-ref-200x60 attach-vs-pane1
+PASS xp base del-ref-80x24 attach-vs-pane1
+PASS xp base icat-120x40 attach-vs-pane1
+PASS xp base icat-200x60 attach-vs-pane1
+FAIL xp base icat-80x24 attach-vs-pane1 "changed_pixels": 28784
+PASS xp base nonmult-120x40 attach-vs-pane1
+PASS xp base nonmult-80x24 attach-vs-pane1
+PASS xp base nonmultT-120x40 attach-vs-pane1
+PASS xp base nonmultT-80x24 attach-vs-pane1
+PASS xp base put-80x24 attach-vs-pane1
+PASS xp base put-ref-120x40 attach-vs-pane1
+PASS xp base put-ref-200x60 attach-vs-pane1
+PASS xp base put-ref-80x24 attach-vs-pane1
+PASS xp base replay-btop-120x40 attach-vs-pane1
+PASS xp base replay-btop-200x60 attach-vs-pane1
+PASS xp base replay-lazygit-120x40 attach-vs-pane1
+PASS xp base replay-lazygit-200x60 attach-vs-pane1
+PASS xp base replay-nvim-120x40 attach-vs-pane1
+PASS xp base replay-nvim-200x60 attach-vs-pane1
+PASS xp base replay-vicaya-120x40 attach-vs-pane1
+PASS xp base replay-vicaya-200x60 attach-vs-pane1
+PASS xp base replay-vivecaka-120x40 attach-vs-pane1
+PASS xp base replay-vivecaka-200x60 attach-vs-pane1
+PASS xp base scale-80x24 attach-vs-pane1
+PASS xp base sync-80x24 attach-vs-pane1
+PASS xp base sync-ref-120x40 attach-vs-pane1
+PASS xp base sync-ref-200x60 attach-vs-pane1
+PASS xp base sync-ref-80x24 attach-vs-pane1
+PASS xp new alt-1-120x40 attach-vs-pane1
+PASS xp new alt-1-120x40 ph2-attach-vs-pane1
+PASS xp new alt-1-200x60 attach-vs-pane1
+PASS xp new alt-1-200x60 ph2-attach-vs-pane1
+PASS xp new alt-1-80x24 attach-vs-pane1
+PASS xp new alt-1-80x24 ph2-attach-vs-pane1
+PASS xp new alt-1-ref-120x40 attach-vs-pane1
+PASS xp new alt-1-ref-120x40 ph2-attach-vs-pane1
+PASS xp new alt-1-ref-200x60 attach-vs-pane1
+PASS xp new alt-1-ref-200x60 ph2-attach-vs-pane1
+PASS xp new alt-1-ref-80x24 attach-vs-pane1
+PASS xp new alt-1-ref-80x24 ph2-attach-vs-pane1
+PASS xp new aT-120x40 attach-vs-pane1
+PASS xp new aT-200x60 attach-vs-pane1
+PASS xp new aT-80x24 attach-vs-pane1
+PASS xp new del-120x40 attach-vs-pane1
+PASS xp new del-200x60 attach-vs-pane1
+PASS xp new del-80x24 attach-vs-pane1
+PASS xp new del-ref-120x40 attach-vs-pane1
+PASS xp new del-ref-200x60 attach-vs-pane1
+PASS xp new del-ref-80x24 attach-vs-pane1
+PASS xp new icat-120x40 attach-vs-pane1
+PASS xp new icat-200x60 attach-vs-pane1
+PASS xp new icat-80x24 attach-vs-pane1
+FAIL xp new nonmult-120x40 attach-vs-pane1 "changed_pixels": 5819
+PASS fit new nonmult-120x40 (re-scoped: ceil-footprint fit, same origin)
+FAIL xp new nonmult-80x24 attach-vs-pane1 "changed_pixels": 5819
+PASS fit new nonmult-80x24 (re-scoped: ceil-footprint fit, same origin)
+FAIL xp new nonmultT-120x40 attach-vs-pane1 "changed_pixels": 5819
+PASS fit new nonmultT-120x40 (re-scoped: ceil-footprint fit, same origin)
+FAIL xp new nonmultT-80x24 attach-vs-pane1 "changed_pixels": 5819
+PASS fit new nonmultT-80x24 (re-scoped: ceil-footprint fit, same origin)
+PASS xp new put-120x40 attach-vs-pane1
+PASS xp new put-200x60 attach-vs-pane1
+PASS xp new put-80x24 attach-vs-pane1
+PASS xp new put-ref-120x40 attach-vs-pane1
+PASS xp new put-ref-200x60 attach-vs-pane1
+PASS xp new put-ref-80x24 attach-vs-pane1
+PASS xp new replay-btop-120x40 attach-vs-pane1
+PASS xp new replay-btop-200x60 attach-vs-pane1
+PASS xp new replay-lazygit-120x40 attach-vs-pane1
+PASS xp new replay-lazygit-200x60 attach-vs-pane1
+PASS xp new replay-nvim-120x40 attach-vs-pane1
+PASS xp new replay-nvim-200x60 attach-vs-pane1
+PASS xp new replay-vicaya-120x40 attach-vs-pane1
+PASS xp new replay-vicaya-200x60 attach-vs-pane1
+PASS xp new replay-vivecaka-120x40 attach-vs-pane1
+PASS xp new replay-vivecaka-200x60 attach-vs-pane1
+PASS xp new scale-120x40 attach-vs-pane1
+PASS xp new scale-200x60 attach-vs-pane1
+PASS xp new scale-80x24 attach-vs-pane1
+PASS xp new sync-120x40 attach-vs-pane1
+PASS xp new sync-200x60 attach-vs-pane1
+PASS xp new sync-80x24 attach-vs-pane1
+PASS xp new sync-ref-120x40 attach-vs-pane1
+PASS xp new sync-ref-200x60 attach-vs-pane1
+PASS xp new sync-ref-80x24 attach-vs-pane1
+PASS xp new2 aT-80x24 attach-vs-pane1
+RESOLVED base-attach-defect alt-1-ref-120x40
+RESOLVED base-attach-defect alt-1-ref-200x60
+RESOLVED base-attach-defect alt-1-ref-80x24
+RESOLVED base-attach-defect icat-80x24
+required failures: 3

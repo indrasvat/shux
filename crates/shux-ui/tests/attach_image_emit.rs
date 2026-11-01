@@ -603,3 +603,35 @@ fn a_right_clipped_upscaled_put_still_sends_a_source_column() {
     assert_eq!(cmds.len(), 1, "the visible column was not sent: {cmds:?}");
     assert!(cmds[0].contains("w=1,"), "{}", cmds[0]);
 }
+
+/// What a host that honours `c,r` draws from the emitter: a picture that is
+/// not a whole number of cells keeps its origin and is fitted to its ceil
+/// footprint, at most one cell larger, never past it.
+#[test]
+fn a_host_draws_a_non_cell_multiple_picture_within_one_cell_of_its_size() {
+    let p = pane(1);
+    let layout = LayoutNode::leaf(p);
+    let mut vt = VirtualTerminal::new(10, 20);
+    vt.process(&kitty_rgb(64, 48, [200, 40, 40]));
+    let mut vts = HashMap::new();
+    vts.insert(p, &vt);
+    let mut c = make_compositor(20, 10);
+    c.render_multi_pane(frame(&layout, &vts, p)).unwrap();
+
+    let mut host = VirtualTerminal::new(10, 20);
+    host.process(drain(&mut c).as_bytes());
+    let inner = &vt.grid().placements()[0];
+    let outer = &host.grid().placements()[0];
+    assert_eq!(
+        (outer.abs_row, outer.col),
+        (inner.abs_row, inner.col),
+        "origin moved"
+    );
+    let (dw, dh) = shux_vt::DECLARED_CELL_PIXELS;
+    let (w, h) = outer.geometry.drawn_px(dw, dh);
+    assert_eq!((w, h), (72, 54), "64x48 fitted to its 8x3-cell footprint");
+    assert!(
+        w - 64 < dw && h - 48 < dh,
+        "more than a cell larger: {w}x{h}"
+    );
+}

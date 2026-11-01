@@ -1,0 +1,1 @@
+{"actual": "ab/new/sync-80x24/attachbody.png", "changed_pixels": 0, "diff": ".shux/out/kitty-put/diff/ref-sync-80x24-attachbody.png", "expected": "ab/base/sync-ref-80x24/attachbody.png", "max_mean_channel_delta": 0.0, "max_pixel_diff_ratio": 0.0, "mean_rgba_channel_delta": 0.0, "pixel_diff_ratio": 0.0, "size": [720, 437], "status": "pass", "total_pixels": 314640}

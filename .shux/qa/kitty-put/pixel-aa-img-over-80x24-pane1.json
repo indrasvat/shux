@@ -1,0 +1,1 @@
+{"actual": "ab/new2/img-over-80x24/pane1.png", "changed_pixels": 0, "diff": ".shux/out/kitty-put/diff/aa-img-over-80x24-pane1.png", "expected": "ab/new/img-over-80x24/pane1.png", "max_mean_channel_delta": 0.0, "max_pixel_diff_ratio": 0.0, "mean_rgba_channel_delta": 0.0, "pixel_diff_ratio": 0.0, "size": [702, 912], "status": "pass", "total_pixels": 640224}
