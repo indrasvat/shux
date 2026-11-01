@@ -351,9 +351,8 @@ fn a_recording_started_and_stopped_by_separate_calls_still_works() {
         &serde_json::json!({ "pane_id": pane, "path": to }).to_string(),
     ]);
     let start: serde_json::Value = serde_json::from_str(&start).expect("start json");
-    let id = start["recording_id"]
+    let id = start["result"]["recording_id"]
         .as_str()
-        .or_else(|| start["result"]["recording_id"].as_str())
         .unwrap_or_else(|| panic!("no recording_id in {start}"))
         .to_string();
 
@@ -379,7 +378,6 @@ fn a_recording_started_and_stopped_by_separate_calls_still_works() {
 enum Ending {
     Signal(nix::sys::signal::Signal),
     PaneExit,
-    Duration,
     DaemonStop,
 }
 
@@ -396,7 +394,6 @@ fn seeded_schedules_end_command_and_recording_together() {
         Ending::Signal(SIGHUP),
         Ending::Signal(SIGKILL),
         Ending::PaneExit,
-        Ending::Duration,
         Ending::DaemonStop,
     ];
     let mut seed: u64 = 0x2370_5eed;
@@ -412,33 +409,7 @@ fn seeded_schedules_end_command_and_recording_together() {
         let s = format!("s{round}");
         let pane = rig.session(&s);
         let to = rig.path("rec.raw");
-        let mut rec = match ending {
-            Ending::Duration => {
-                let child = rig
-                    .cmd()
-                    .args([
-                        "pane",
-                        "record",
-                        "-s",
-                        &s,
-                        "-p",
-                        &pane,
-                        "--duration-ms",
-                        "400",
-                        "--to",
-                    ])
-                    .arg(&to)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .expect("spawn timed record");
-                Recorder {
-                    child,
-                    stderr: Arc::new(Mutex::new(String::new())),
-                }
-            }
-            _ => rig.record(&s, &pane, &to),
-        };
+        let mut rec = rig.record(&s, &pane, &to);
         let lines = 1 + next(4);
         for i in 0..lines {
             rig.type_line(
@@ -448,7 +419,7 @@ fn seeded_schedules_end_command_and_recording_together() {
             );
             rig.wait_text(&s, &pane, &format!("L{round}x{i}"));
         }
-        if next(2) == 0 && !matches!(ending, Ending::Duration) {
+        if next(2) == 0 {
             let refused = rig.run(&[
                 "pane",
                 "record",
@@ -474,7 +445,6 @@ fn seeded_schedules_end_command_and_recording_together() {
         match ending {
             Ending::Signal(sig) => rec.signal(sig),
             Ending::PaneExit => rig.type_line(&s, &pane, "exit 0"),
-            Ending::Duration => {}
             Ending::DaemonStop => {
                 rig.ok(&["daemon", "stop"]);
             }

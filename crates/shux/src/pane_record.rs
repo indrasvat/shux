@@ -151,18 +151,12 @@ impl Control {
     }
 
     fn finalize(&self, writer: Result<(), String>) {
+        if let Err(e) = &writer {
+            self.degrade(PaneRecordStatus::Error, e);
+        }
         let written = self.progress.load(Ordering::SeqCst);
         self.outcome.send_modify(|o| {
-            let status = match &writer {
-                Ok(()) => PaneRecordStatus::Complete,
-                Err(_) => PaneRecordStatus::Error,
-            };
-            if status > o.status {
-                o.status = status;
-            }
-            if let Err(e) = writer {
-                o.error.get_or_insert(e);
-            }
+            o.status = o.status.max(PaneRecordStatus::Complete);
             o.bytes_written = written;
             o.finalized = true;
         });
@@ -719,13 +713,8 @@ impl Admission {
         shutdown: &CancellationToken,
     ) -> bool {
         tokio::select! {
+            // A failed send means the writer already failed; it reports why.
             sent = self.sink.send(PaneRecordChunk::Bytes { data, at }) => {
-                if sent.is_err() {
-                    self.control.degrade(
-                        PaneRecordStatus::Error,
-                        "pane recorder writer closed before accepting bytes",
-                    );
-                }
                 self.settled = true;
                 sent.is_ok()
             }
@@ -1195,13 +1184,24 @@ mod tests {
                         );
                         owner.cancel();
                     }
-                    "write_failure" => r.send(pane, b"more than four").await,
+                    "write_failure" => {
+                        // The second tee finds the writer gone; the outcome
+                        // must still name the writer's own failure.
+                        r.send(pane, b"more than four").await;
+                        r.send(pane, b"after").await;
+                    }
                     _ => unreachable!(),
                 }
                 let out = r.ended(id).await;
                 if how == "write_failure" {
                     assert_eq!(out.status, PaneRecordStatus::Error, "{out:?}");
                     assert_eq!(out.ended_by, None);
+                    assert!(
+                        out.error
+                            .as_deref()
+                            .is_some_and(|e| e.contains("injected write failure")),
+                        "the writer's own error was masked: {out:?}"
+                    );
                 }
             }
             assert!(
