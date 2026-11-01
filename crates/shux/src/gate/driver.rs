@@ -249,23 +249,34 @@ fn emit(opts: &GateRunOptions, reports: &[ScenarioReport]) -> Result<(), OutputF
 /// Run the gate on one scenario and return the frozen exit code (task §4). This is the
 /// 082 entry `main.rs` dispatches to for the default `shux lens gate <scenario>`.
 pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Result<i32> {
-    // Before anything is written, refusals included. A bare `--cast` is checked again
-    // once the scenario names its file.
-    if let Some(code) = refuse_shared_outputs(&opts, explicit_cast(&opts)) {
+    // Before anything is written. A bare `--cast` names its file only once the scenario
+    // does, and is checked then.
+    let cast = opts
+        .cast
+        .as_deref()
+        .filter(|c| !c.trim().is_empty())
+        .map(Path::new);
+    if let Some(code) = refuse_shared_outputs(&opts, cast) {
         return Ok(code);
     }
-    // The trace and report are output, never goldens: one written into the golden tree
-    // replaces a golden, and the run then reports the damage as a regression. Without
-    // `--golden-dir`, every default golden dir sits under `<scenario dir>/goldens`.
+    // Outputs are never goldens. Without `--golden-dir`, every default golden dir sits
+    // under `<scenario dir>/goldens`.
     let goldens = opts
         .golden_dir
         .clone()
         .unwrap_or_else(|| runner::scenario_dir_of(&opts.scenario_path).join("goldens"));
     for (flag, path) in [
-        ("--trace", opts.trace.as_deref()),
-        ("--report", opts.report.as_deref()),
+        (
+            "--trace",
+            opts.trace.as_deref().filter(|t| *t != "-").map(Path::new),
+        ),
+        (
+            "--report",
+            opts.report.as_deref().filter(|r| *r != "-").map(Path::new),
+        ),
+        ("--cast", cast),
     ] {
-        if let Some(path) = path.filter(|p| *p != "-").map(Path::new)
+        if let Some(path) = path
             && path_is_under(path, &goldens)
         {
             eprintln!(
@@ -557,14 +568,10 @@ fn bless_failure_exit(e: &anyhow::Error, code: i32) -> i32 {
     }
 }
 
-/// Refuses, before anything is written, a run in which two of its named outputs (the
-/// trace, the report, the cast) are the same file, or one of them is where stdout or
-/// stderr already goes: one would overwrite the other. Nothing is opened or created.
-/// An existing file is compared by identity, following links; an absent one by its
-/// deepest existing ancestor, resolved by the kernel, and the rest as spelled. A link to a file that does not exist is
-/// refused outright, since only creating its target would say where it leads. FIFOs
-/// and devices are never compared, and stdout and stderr are not compared with each
-/// other, so `> log 2>&1` stays legal.
+/// Refuses a run in which two named outputs (trace, report, cast) are one file, or one
+/// is where stdout or stderr already writes. Opens and creates nothing. A link to a
+/// file that does not exist is refused; FIFOs and devices are not compared, nor stdout
+/// with stderr, so `> log 2>&1` stays legal.
 fn refuse_shared_outputs(opts: &GateRunOptions, cast: Option<&Path>) -> Option<i32> {
     use std::os::fd::AsFd;
     use std::os::unix::fs::MetadataExt;
@@ -667,14 +674,6 @@ fn resolve_existing_prefix(path: &Path) -> Option<PathBuf> {
             _ => return None,
         }
     }
-}
-
-/// `--cast PATH` as given; a bare `--cast` names a file only once the scenario does.
-fn explicit_cast(opts: &GateRunOptions) -> Option<&Path> {
-    opts.cast
-        .as_deref()
-        .filter(|c| !c.trim().is_empty())
-        .map(Path::new)
 }
 
 /// A trace that could not be written: exit 4, unless the run is a regression, which

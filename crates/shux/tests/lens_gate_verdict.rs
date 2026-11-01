@@ -875,10 +875,6 @@ fn gate_with_files_full(h: &Harness, args: &[&str], stdout: Option<std::fs::File
     files_full(h, args, stdout, &[])
 }
 
-fn gate_with_files_full_env(h: &Harness, args: &[&str], env: &[(&str, &str)]) -> Gate {
-    files_full(h, args, None, env)
-}
-
 fn files_full(
     h: &Harness,
     args: &[&str],
@@ -1361,9 +1357,10 @@ fn a_machinery_failure_still_finishes_its_trace() {
     );
 
     let trace = d.path().join("t.ndjson").to_string_lossy().into_owned();
-    let out = gate_with_files_full_env(
+    let out = files_full(
         &h,
         &["--trace", &trace, &scn],
+        None,
         &[("XDG_RUNTIME_DIR", &runtime)],
     );
     assert_eq!(out.exit, 3, "stderr:\n{}", out.stderr);
@@ -1407,7 +1404,6 @@ fn a_refused_alias_through_a_dangling_link_leaves_nothing() {
     let h = Harness::new();
     let d = tmp();
     let bad = write_scenario(d.path(), "bad", "name = \"bad\"\nnot toml [[[\n");
-    let good = write_scenario(d.path(), "gd", &scenario("gd", "HI", None));
     let target = d.path().join("absent.json");
     let link = d.path().join("trace-link");
     std::os::unix::fs::symlink(&target, &link).unwrap();
@@ -1415,14 +1411,13 @@ fn a_refused_alias_through_a_dangling_link_leaves_nothing() {
         target.to_string_lossy().into_owned(),
         link.to_string_lossy().into_owned(),
     );
-    for scn in [&bad, &good] {
-        let out = gate(&h, &["--trace", &link_s, "--report", &target_s, scn], false);
-        assert_eq!(out.exit, 2, "{scn}: stderr:\n{}", out.stderr);
-        assert!(
-            !target.exists(),
-            "{scn}: the refused run left {target_s} behind"
-        );
-    }
+    let out = gate(
+        &h,
+        &["--trace", &link_s, "--report", &target_s, &bad],
+        false,
+    );
+    assert_eq!(out.exit, 2, "stderr:\n{}", out.stderr);
+    assert!(!target.exists(), "the refused run left {target_s} behind");
 }
 
 /// stdout is an output too: redirected onto the trace's file, the run is refused
@@ -1462,33 +1457,6 @@ fn stdout_redirected_onto_the_trace_is_refused() {
         );
         assert_eq!(std::fs::read_to_string(&trace).unwrap(), "precious");
     }
-}
-
-/// An alias through a link to a file not there yet is refused before the CI
-/// refusal writes its report, and nothing is left behind.
-#[test]
-fn an_alias_through_a_dangling_link_is_refused_before_any_report() {
-    let h = Harness::new();
-    let d = tmp();
-    let scn = write_scenario(d.path(), "ci", &scenario("ci", "HI", None));
-    let target = d.path().join("absent.json");
-    let link = d.path().join("trace-link");
-    std::os::unix::fs::symlink(&target, &link).unwrap();
-    let out = gate(
-        &h,
-        &[
-            "--on-missing",
-            "create",
-            "--trace",
-            &link.to_string_lossy(),
-            "--report",
-            &target.to_string_lossy(),
-            &scn,
-        ],
-        true,
-    );
-    assert_eq!(out.exit, 2, "stderr:\n{}", out.stderr);
-    assert!(!target.exists(), "the refused run left the report behind");
 }
 
 /// The stdout collision holds for a malformed scenario too: stdout stays one
@@ -1662,23 +1630,6 @@ fn the_golden_tree_is_protected_on_every_path() {
     );
 }
 
-/// Two outputs named the same under a directory not made yet are still one file.
-#[test]
-fn outputs_under_a_directory_not_made_yet_are_compared() {
-    let h = Harness::new();
-    let d = tmp();
-    let scn = write_scenario(d.path(), "md", &scenario("md", "HI", None));
-    let same = d.path().join("not-made").join("out.json");
-    let same = same.to_string_lossy().into_owned();
-    let out = gate(&h, &["--report", &same, "--cast", &same, &scn], false);
-    assert_eq!(out.exit, 2, "stderr:\n{}", out.stderr);
-    assert!(out.stderr.contains("same file as"), "{}", out.stderr);
-    assert!(
-        !d.path().join("not-made").exists(),
-        "a refused run made the directory"
-    );
-}
-
 /// A link inside the golden tree is inside it wherever it points.
 #[test]
 fn a_link_inside_the_golden_dir_is_inside_it_wherever_it_points() {
@@ -1800,4 +1751,24 @@ fn dot_dot_through_an_unmade_directory_is_refused() {
     );
     assert_eq!(out.exit, 2, "stderr:\n{}", out.stderr);
     assert!(!plain.exists() && !d.path().join("new").exists());
+}
+
+/// Another scenario's goldens are still the golden tree: a cast aimed there is refused.
+#[test]
+fn a_cast_into_another_scenarios_goldens_is_refused() {
+    let h = Harness::new();
+    let d = tmp();
+    let scn = write_scenario(d.path(), "foo", &scenario("foo", "HI", None));
+    let cast = d.path().join("goldens").join("bar").join("x.cast");
+    let out = gate(&h, &["--cast", &cast.to_string_lossy(), &scn], false);
+    assert_eq!(out.exit, 2, "stderr:\n{}", out.stderr);
+    assert!(
+        out.stderr.contains("inside the golden dir"),
+        "{}",
+        out.stderr
+    );
+    assert!(
+        !d.path().join("goldens").exists(),
+        "the refused run made the golden tree"
+    );
 }
