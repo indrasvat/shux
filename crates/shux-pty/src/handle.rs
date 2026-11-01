@@ -844,6 +844,7 @@ impl PtyHandle {
             });
         }
 
+        crate::spawn::inherit_only_stdio(&mut cmd);
         let child = cmd.spawn().map_err(PtyError::Spawn)?;
         let pid = child.id();
         // SAFETY: the master `OwnedFd` moves into the AsyncFd, which owns it

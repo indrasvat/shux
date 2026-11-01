@@ -542,6 +542,7 @@ impl PluginManager {
         if let Some(cwd) = &source.cwd {
             cmd.current_dir(cwd);
         }
+        shux_pty::inherit_only_stdio(cmd.as_std_mut());
         let mut child = cmd.spawn().map_err(|e| {
             PluginError::HandshakeFailed(format!("failed to spawn {}: {e}", source.path.display()))
         })?;

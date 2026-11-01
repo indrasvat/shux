@@ -1466,3 +1466,27 @@ done
         "some kills never delivered plugin.shutdown"
     );
 }
+
+/// A descriptor the daemon holds without close-on-exec must not reach a
+/// plugin: a plugin holding another pane's terminal or a client's socket keeps
+/// it open for as long as the plugin runs.
+#[tokio::test]
+async fn a_plugin_inherits_no_descriptor_beyond_its_stdio() {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = write_script(tmp.path(), "noop.sh", NOOP_PLUGIN);
+    let (read, write) = nix::unistd::pipe().expect("pipe");
+
+    let mgr = PluginManager::new(EventBus::new());
+    mgr.install(PluginSource::from_path(&script))
+        .await
+        .expect("install");
+    drop(write);
+
+    let closed = tokio::task::spawn_blocking(move || shux_testkit::pipe_closes(read))
+        .await
+        .expect("the EOF wait panicked");
+    let running = mgr.list().await.iter().any(|p| p.status == "running");
+    mgr.kill("noop").await.expect("kill");
+    assert!(running, "the plugin exited, so the pipe proves nothing");
+    assert!(closed, "the plugin still holds a pipe its host had open");
+}

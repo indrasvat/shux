@@ -629,14 +629,20 @@ struct AttachedSession {
     shown: ShownFrames,
 }
 
+/// Frames queued to one client before the render loop waits for it.
+const OUTBOUND_FRAMES: usize = 64;
+
 /// Pane views of the latest frames sent to one client, oldest first, each
 /// under the number its `Render { frame }` carried.
 #[derive(Debug, Clone, Default)]
 struct ShownFrames(std::collections::VecDeque<(u64, Arc<HashMap<PaneId, PaneView>>)>);
 
 impl ShownFrames {
-    /// Frames a client can trail the daemon by and still be mapped.
-    const KEPT: usize = 16;
+    /// Frames a client can trail the daemon by and still be mapped: the
+    /// outbound queue twice over. The socket's buffers hold bytes, not frames,
+    /// so small frames can still outrun this; a stamp past it falls back to
+    /// shux's own handling at the live layout (`handle_app_mouse`).
+    const KEPT: usize = 2 * OUTBOUND_FRAMES;
 
     fn push(&mut self, frame: u64, views: HashMap<PaneId, PaneView>) {
         if self.0.len() == Self::KEPT {
@@ -885,7 +891,7 @@ async fn run_attach_loop(
 ) -> anyhow::Result<()> {
     let (mut sink, mut stream) = framed.split();
 
-    let (out_tx, mut out_rx) = mpsc::channel::<AttachServerFrame>(64);
+    let (out_tx, mut out_rx) = mpsc::channel::<AttachServerFrame>(OUTBOUND_FRAMES);
 
     // Spawn the writer task: pulls from out_rx, frames + sends.
     let writer_cancel = cancel.clone();
@@ -1331,6 +1337,9 @@ async fn run_attach_loop(
                         ctrl,
                         frame,
                     } => {
+                        // Another client may have moved focus since this
+                        // one last heard: a click compares against it.
+                        sync_focus(&graph, &mut session, &render_session).await;
                         // Modal guard: swallow mouse events while the
                         // help overlay is visible. Otherwise a click or
                         // drag on the cheat sheet would leak through to
@@ -1482,20 +1491,7 @@ async fn run_attach_loop(
         // clobbered by a `*rs = session.clone()`. Keep the local
         // `session` in lockstep too so its `session_id` stays valid for
         // the next iteration's snapshot lookup.
-        let still_alive = {
-            let snap = graph.snapshot();
-            let live = snap.sessions.contains_key(&session.session_id);
-            if live && let Some(s) = snap.sessions.get(&session.session_id) {
-                session.active_window_id = s.active_window;
-                if let Some(w) = snap.windows.get(&s.active_window) {
-                    session.active_pane_id = w.active_pane;
-                }
-                let mut rs = render_session.lock().await;
-                rs.active_window_id = session.active_window_id;
-                rs.active_pane_id = session.active_pane_id;
-            }
-            live
-        };
+        let still_alive = sync_focus(&graph, &mut session, &render_session).await;
         if !still_alive {
             final_frame.get_or_insert(AttachServerFrame::SessionEnded {
                 reason: "session_destroyed".into(),
@@ -2906,6 +2902,10 @@ enum AppMouse {
     Consumed { redraw: bool },
 }
 
+fn holds(rect: Rect, col: u16, row: u16) -> bool {
+    col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
+}
+
 /// Forward a press / drag / release to a mouse-aware app in the pane under the
 /// pointer.
 ///
@@ -2943,24 +2943,65 @@ async fn handle_app_mouse(
     };
     let attached = session.lock().await.clone();
     let copy_active = attached.copy_mode.is_some() || attached.copy_menu.is_some();
-    let viewport = current_viewport(client_size, config).await;
 
-    // Resolve the pane under the pointer. `pane_at`, deliberately not
-    // `pane_under_pointer`: that helper falls back to the active pane whenever
-    // the hit-test misses, which would forward clicks on borders, the outline
-    // and the status bar into whatever pane happens to be focused.
-    let (pane_hit, on_border) = {
-        let snap = graph.snapshot();
-        match snap.windows.get(&attached.active_window_id) {
-            None => (None, false),
-            Some(win) if let Some(zoom) = &win.layout.zoom => (Some(zoom.zoomed_pane), false),
-            Some(win) => (
-                pane_at(&win.layout.tree, viewport, col, row).map(|(pid, _)| pid),
-                border_at(&win.layout.tree, viewport, col, row).is_some(),
-            ),
+    // Resolve the pane under the pointer in the frame the client was shown: a
+    // layout not drawn yet must not move a click into another pane. Views are
+    // content rects, so borders, the outline and the status bar hit none.
+    // A frame no longer kept cannot be mapped into an app: a client that far
+    // behind (small frames fill the socket's byte buffers) gets shux's own
+    // handling at the live layout, as before frames were stamped. A gesture
+    // an app holds still gets its release.
+    let Some(views) = attached.shown.views(frame) else {
+        if matches!(*gesture, SelectionDrag::App { .. }) {
+            if action == ButtonAction::Release {
+                release_app_gesture(io_state, gesture).await;
+            }
+            return Ok(AppMouse::Consumed { redraw: false });
         }
+        // Over a pane whose app reports the mouse, the press is not shux's to
+        // select with: it only focuses that pane.
+        if matches!(*gesture, SelectionDrag::None) && border_drag.is_none() && !shift {
+            let viewport = current_viewport(client_size, config).await;
+            let live = {
+                let snap = graph.snapshot();
+                snap.windows
+                    .get(&attached.active_window_id)
+                    .and_then(|win| match &win.layout.zoom {
+                        Some(zoom) => Some(zoom.zoomed_pane),
+                        None => pane_at(&win.layout.tree, viewport, col, row).map(|(p, _)| p),
+                    })
+            };
+            let tracked = match live {
+                Some(pid) => io_state
+                    .lock()
+                    .await
+                    .vts
+                    .get(&pid)
+                    .is_some_and(|vt| vt.modes().mouse_tracking != shux_vt::MouseMode::None),
+                None => false,
+            };
+            if let (Some(pid), true) = (live, tracked) {
+                let redraw = action == ButtonAction::Press
+                    && select_pane_on_press(graph, session, attached.active_pane_id, pid).await;
+                return Ok(AppMouse::Consumed { redraw });
+            }
+        }
+        return Ok(AppMouse::NotHandled);
     };
-    let pane_hit = if on_border { None } else { pane_hit };
+    let pane_hit = views
+        .iter()
+        .find(|(_, view)| holds(view.rect, col, row))
+        .map(|(pid, _)| *pid);
+    // A pane closed, hidden by a zoom or in another window since the frame
+    // was drawn takes nothing more: what shux would do there now is not what
+    // the user aimed at.
+    if let Some(pid) = pane_hit
+        && matches!(*gesture, SelectionDrag::None)
+        && border_drag.is_none()
+        && !pane_is_shown(graph, &attached, pid)
+    {
+        return Ok(AppMouse::Consumed { redraw: false });
+    }
 
     // Modes are read from the pane the gesture already owns when there is one,
     // so an app that turns tracking off mid-drag still gets its release.
@@ -3010,17 +3051,14 @@ async fn handle_app_mouse(
     // The pane can lose its rect mid-gesture: a window switch or a zoom leaves
     // it off-screen. Let the app know the button came up rather than letting
     // the gesture evaporate with it still held.
-    let content = current_content_rect(client_size).await;
-    let Some(rect) = pane_rect_in(graph, &attached, content, viewport, pane_id) else {
+    if !pane_is_shown(graph, &attached, pane_id) {
         release_app_gesture(io_state, gesture).await;
-        return Ok(AppMouse::NotHandled);
-    };
-    // While zoomed the pane's rect is the whole content area, so a click on the
-    // status bar would otherwise clamp into the pane's last row and be
-    // forwarded as a click the user never made.
-    let inside =
-        col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height;
-    if !inside && matches!(*gesture, SelectionDrag::None) {
+        return Ok(AppMouse::Consumed { redraw: false });
+    }
+    let shown = views.get(&pane_id).copied();
+    if !shown.is_some_and(|view| holds(view.rect, col, row))
+        && matches!(*gesture, SelectionDrag::None)
+    {
         return Ok(AppMouse::NotHandled);
     }
     // A press that opens a gesture names a cell or nothing. Once a gesture is
@@ -3028,11 +3066,6 @@ async fn handle_app_mouse(
     // drawn now (and below, within legacy encoding's reach), so the app sees
     // every press and every release names a button it holds.
     let pin = !matches!(*gesture, SelectionDrag::None);
-    let shown = attached
-        .shown
-        .views(frame)
-        .and_then(|views| views.get(&pane_id))
-        .copied();
     let view = match *gesture {
         SelectionDrag::App {
             row_offset, anchor, ..
@@ -3151,8 +3184,7 @@ async fn select_pane_on_press(
     pane_id: PaneId,
 ) -> bool {
     let mut redraw = false;
-    if pane_id != active_pane_id {
-        let _ = graph.focus_pane(pane_id).await;
+    if pane_id != active_pane_id && graph.focus_pane(pane_id).await.is_ok() {
         session.lock().await.active_pane_id = pane_id;
         redraw = true;
     }
@@ -3163,6 +3195,27 @@ async fn select_pane_on_press(
         redraw = true;
     }
     redraw
+}
+
+/// Copy the session's live focus into this client's cache. `false` once the
+/// session is gone.
+async fn sync_focus(
+    graph: &GraphHandle,
+    session: &mut AttachedSession,
+    render_session: &Arc<Mutex<AttachedSession>>,
+) -> bool {
+    let snap = graph.snapshot();
+    let Some(s) = snap.sessions.get(&session.session_id) else {
+        return false;
+    };
+    session.active_window_id = s.active_window;
+    if let Some(w) = snap.windows.get(&s.active_window) {
+        session.active_pane_id = w.active_pane;
+    }
+    let mut rs = render_session.lock().await;
+    rs.active_window_id = session.active_window_id;
+    rs.active_pane_id = session.active_pane_id;
+    true
 }
 
 /// Clear the released button from an app gesture, ending it once nothing is
@@ -3321,24 +3374,28 @@ async fn handle_wheel(
         _ => return Ok(false),
     };
     let attached = session.lock().await.clone();
-    let viewport = current_viewport(client_size, config).await;
 
-    // Resolve the pane under the cursor (fallback: the active pane).
-    let pane_id = {
-        let snap = graph.snapshot();
-        match snap.windows.get(&attached.active_window_id) {
-            None => return Ok(true),
-            Some(win) => {
-                if let Some(zoom) = &win.layout.zoom {
-                    zoom.zoomed_pane
-                } else {
-                    pane_at(&win.layout.tree, viewport, col, row)
-                        .map(|(pid, _)| pid)
-                        .unwrap_or(attached.active_pane_id)
-                }
-            }
+    // Resolve the pane under the cursor in the frame the client was shown,
+    // or the live layout for a frame no longer kept (fallback: the active
+    // pane). Only a shown frame can place a report in an app.
+    let views = attached.shown.views(frame);
+    let hit = match views {
+        Some(views) => views
+            .iter()
+            .find(|(_, view)| holds(view.rect, col, row))
+            .map(|(pid, _)| *pid),
+        None => {
+            let viewport = current_viewport(client_size, config).await;
+            let snap = graph.snapshot();
+            snap.windows
+                .get(&attached.active_window_id)
+                .and_then(|win| match &win.layout.zoom {
+                    Some(zoom) => Some(zoom.zoomed_pane),
+                    None => pane_at(&win.layout.tree, viewport, col, row).map(|(pid, _)| pid),
+                })
         }
     };
+    let pane_id = hit.unwrap_or(attached.active_pane_id);
     let Some(rect) = pane_rect_for(graph, &attached, client_size, config, pane_id).await else {
         return Ok(true);
     };
@@ -3366,9 +3423,7 @@ async fn handle_wheel(
 
     match route_wheel(mouse_on, alt, alt_scroll) {
         WheelRouting::ForwardMouse => {
-            let cell = attached
-                .shown
-                .views(frame)
+            let cell = views
                 .and_then(|views| views.get(&pane_id))
                 .and_then(|view| shux_ui::viewport::pane_grid_cell(view, (col, row), false));
             // No grid cell under the pointer, or no truthful encoding for this
@@ -3512,6 +3567,17 @@ async fn pane_rect_for(
 /// `pane_rect_for` with the geometry already resolved, so a caller that has
 /// already computed the viewport for this event hit-tests against that one
 /// rather than re-reading the live config and getting a second answer.
+/// Whether the client's active window draws `pane_id` now.
+fn pane_is_shown(graph: &GraphHandle, attached: &AttachedSession, pane_id: PaneId) -> bool {
+    let snap = graph.snapshot();
+    snap.windows
+        .get(&attached.active_window_id)
+        .is_some_and(|win| match &win.layout.zoom {
+            Some(zoom) => zoom.zoomed_pane == pane_id,
+            None => win.layout.tree.contains_pane(pane_id),
+        })
+}
+
 fn pane_rect_in(
     graph: &GraphHandle,
     attached: &AttachedSession,
@@ -6247,19 +6313,20 @@ mod tests {
         let offset = |views: Option<&HashMap<PaneId, PaneView>>| views.map(|v| v[&pane].row_offset);
         let mut shown = ShownFrames::default();
         assert_eq!(offset(shown.views(Some(1))), None, "nothing sent yet");
-        for n in 1..=20 {
+        let last = ShownFrames::KEPT as u64 + 4;
+        for n in 1..=last {
             shown.push(n, view(n as usize));
         }
         assert_eq!(offset(shown.views(Some(12))), Some(12), "the stamped frame");
         assert_eq!(
             offset(shown.views(None)),
-            Some(20),
+            Some(last as usize),
             "an unstamped event: the latest"
         );
         assert_eq!(
             offset(shown.views(Some(2))),
             None,
-            "a stamp older than any kept (5..=20) names nothing newer than it"
+            "a stamp older than any kept (5..=last) names nothing newer than it"
         );
     }
 
@@ -6346,6 +6413,169 @@ mod tests {
         s.shown.push(next, shown);
     }
 
+    /// A release whose frame is no longer kept still finishes a selection
+    /// shux owns: rejecting a stale point must not strand the gesture.
+    #[tokio::test]
+    async fn an_expired_release_still_finishes_a_shux_selection() {
+        let mut h = AppMouseHarness::new().await;
+        let _wr = seed_scrollback_pane(&h.fixture.io_state, h.fixture.first_pane, b"").await;
+        let (tx, _rx) = mpsc::channel(8);
+        assert_eq!(
+            h.send(MouseKind::Down, ProtoMouseButton::Left, 3, 3).await,
+            AppMouse::NotHandled
+        );
+        h.select(MouseKind::Down, &tx).await;
+        assert!(matches!(h.gesture, SelectionDrag::MouseSelection { .. }));
+        for _ in 0..ShownFrames::KEPT {
+            ship_frame(
+                &h.fixture.graph,
+                &h.fixture.io_state,
+                &h.session,
+                &h.client_size,
+            )
+            .await;
+        }
+        if h.send_stamped(MouseKind::Up, 3, 3, Some(1)).await == AppMouse::NotHandled {
+            h.select(MouseKind::Up, &tx).await;
+        }
+        h.fixture.stop();
+        assert_eq!(
+            h.gesture,
+            SelectionDrag::None,
+            "the selection was never finished"
+        );
+    }
+
+    /// A client as far behind as the outbound queue lets it fall still has
+    /// its clicks mapped: a busy pane on a slow link must not cost it the mouse.
+    #[tokio::test]
+    async fn a_client_a_full_queue_behind_still_has_its_clicks_handled() {
+        let mut h = AppMouseHarness::new().await;
+        let _wr = seed_scrollback_pane(&h.fixture.io_state, h.fixture.first_pane, b"").await;
+        ship_frame(
+            &h.fixture.graph,
+            &h.fixture.io_state,
+            &h.session,
+            &h.client_size,
+        )
+        .await;
+        let shown = h.session.lock().await.shown.0.back().map(|(n, _)| *n);
+        for _ in 0..OUTBOUND_FRAMES {
+            ship_frame(
+                &h.fixture.graph,
+                &h.fixture.io_state,
+                &h.session,
+                &h.client_size,
+            )
+            .await;
+        }
+        let route = h.send_stamped(MouseKind::Down, 3, 3, shown).await;
+        h.fixture.stop();
+        assert_eq!(
+            route,
+            AppMouse::NotHandled,
+            "the click was dropped, not handled"
+        );
+    }
+
+    /// A client further behind than every kept frame (small frames fill the
+    /// socket's byte buffers with far more than the queue's count) still has
+    /// shux's own mouse handling, as on base: only app reports need the frame.
+    #[tokio::test]
+    async fn a_client_behind_every_kept_frame_still_has_shux_handling() {
+        let mut h = AppMouseHarness::new().await;
+        let _wr = seed_scrollback_pane(&h.fixture.io_state, h.fixture.first_pane, b"").await;
+        ship_frame(
+            &h.fixture.graph,
+            &h.fixture.io_state,
+            &h.session,
+            &h.client_size,
+        )
+        .await;
+        let shown = h.session.lock().await.shown.0.back().map(|(n, _)| *n);
+        for _ in 0..ShownFrames::KEPT + 10 {
+            ship_frame(
+                &h.fixture.graph,
+                &h.fixture.io_state,
+                &h.session,
+                &h.client_size,
+            )
+            .await;
+        }
+        let route = h.send_stamped(MouseKind::Down, 3, 3, shown).await;
+        h.fixture.stop();
+        assert_eq!(
+            route,
+            AppMouse::NotHandled,
+            "the click was dropped, not handled"
+        );
+    }
+
+    /// Past every kept frame, a press over a pane whose app reports the mouse
+    /// is not shux's: it focuses that pane and goes no further, so a drag
+    /// cannot open a selection under the app and copy it on release.
+    #[tokio::test]
+    async fn a_press_from_a_frame_no_longer_kept_over_a_mouse_app_opens_no_selection() {
+        let mut h = AppMouseHarness::new().await;
+        let tracking = b"\x1b[?1000h\x1b[?1006h";
+        let _wr = seed_scrollback_pane(&h.fixture.io_state, h.fixture.first_pane, tracking).await;
+        ship_frame(
+            &h.fixture.graph,
+            &h.fixture.io_state,
+            &h.session,
+            &h.client_size,
+        )
+        .await;
+        let shown = h.session.lock().await.shown.0.back().map(|(n, _)| *n);
+        for _ in 0..ShownFrames::KEPT + 10 {
+            ship_frame(
+                &h.fixture.graph,
+                &h.fixture.io_state,
+                &h.session,
+                &h.client_size,
+            )
+            .await;
+        }
+        let route = h.send_stamped(MouseKind::Down, 3, 3, shown).await;
+        h.fixture.stop();
+        assert!(
+            matches!(route, AppMouse::Consumed { .. }),
+            "the press fell through to shux's selection: {route:?}"
+        );
+    }
+
+    /// A pane closed since the frame was drawn takes the click: it must not
+    /// fall through to shux's handling at today's layout.
+    #[tokio::test]
+    async fn a_click_on_a_shown_pane_closed_since_is_consumed() {
+        let mut h = AppMouseHarness::new().await;
+        let tracking = b"\x1b[?1000h\x1b[?1006h";
+        let _a = seed_scrollback_pane(&h.fixture.io_state, h.fixture.first_pane, tracking).await;
+        let _b = seed_scrollback_pane(&h.fixture.io_state, h.fixture.second_pane, tracking).await;
+        ship_frame(
+            &h.fixture.graph,
+            &h.fixture.io_state,
+            &h.session,
+            &h.client_size,
+        )
+        .await;
+        h.fixture
+            .graph
+            .destroy_pane(h.fixture.first_pane, None)
+            .await
+            .unwrap();
+        h.fixture
+            .io_state
+            .lock()
+            .await
+            .vts
+            .remove(&h.fixture.first_pane);
+        h.session.lock().await.active_pane_id = h.fixture.second_pane;
+        let route = h.send_stamped(MouseKind::Down, 3, 3, None).await;
+        h.fixture.stop();
+        assert_eq!(route, AppMouse::Consumed { redraw: false });
+    }
+
     /// Every argument `handle_app_mouse` takes but the event itself, so the
     /// tests below read as the scenario rather than as a call.
     struct AppMouseHarness {
@@ -6407,6 +6637,55 @@ mod tests {
                 alt,
                 ctrl,
                 None,
+                &self.fixture.graph,
+                &self.fixture.io_state,
+                &self.session,
+                &self.client_size,
+                &test_config(),
+                &self.border_drag,
+                &mut self.gesture,
+            )
+            .await
+            .expect("handle_app_mouse")
+        }
+
+        /// shux's own selection handling of a left-button event at (3, 3).
+        async fn select(&mut self, kind: MouseKind, tx: &mpsc::Sender<AttachServerFrame>) {
+            handle_mouse_selection(
+                kind,
+                ProtoMouseButton::Left,
+                3,
+                3,
+                &self.fixture.graph,
+                &self.fixture.io_state,
+                &self.session,
+                &self.client_size,
+                &test_config(),
+                tx,
+                &mut self.gesture,
+            )
+            .await
+            .expect("handle_mouse_selection");
+        }
+
+        /// A left-button event stamped with `frame`, shipping no new frame:
+        /// the client is looking at whatever it was last sent.
+        async fn send_stamped(
+            &mut self,
+            kind: MouseKind,
+            col: u16,
+            row: u16,
+            frame: Option<u64>,
+        ) -> AppMouse {
+            handle_app_mouse(
+                kind,
+                ProtoMouseButton::Left,
+                col,
+                row,
+                false,
+                false,
+                false,
+                frame,
                 &self.fixture.graph,
                 &self.fixture.io_state,
                 &self.session,
@@ -8709,6 +8988,131 @@ mod tests {
             got.ends_with(";55M"),
             "clicked grid-row 55 as shown; the app was told {got:?}"
         );
+        h.stop().await;
+    }
+
+    /// A layout change the client has not drawn yet: the click lands in the
+    /// pane the client shows under the pointer, not in whatever pane the new
+    /// layout puts there.
+    #[tokio::test(start_paused = true)]
+    async fn a_click_before_a_new_layout_is_drawn_reaches_the_pane_shown() {
+        let mut h = InputHarness::new(64).await;
+        mouse_app_grid(&mut h, 60, 40).await;
+        let (x, y) = on_screen(&mut h, "grid-row 55").await;
+        h.fixture
+            .graph
+            .swap_panes(h.fixture.first_pane, h.fixture.second_pane, None)
+            .await
+            .expect("swap panes");
+        mouse(&mut h, MouseKind::Down, x, y).await;
+        mouse(&mut h, MouseKind::Up, x, y).await;
+        let got = String::from_utf8_lossy(&pane_input(&mut h).await).into_owned();
+        assert_eq!(
+            got, "\x1b[<0;1;55M\x1b[<0;1;55m",
+            "clicked grid-row 55 as shown, before the swap was drawn"
+        );
+        h.stop().await;
+    }
+
+    /// A press stamped with a frame no longer kept is shux's to handle at the
+    /// live layout, as before frames were stamped: on a border it drags. Only
+    /// an app report needs the frame the client drew.
+    #[tokio::test(start_paused = true)]
+    async fn a_press_from_a_frame_no_longer_kept_is_handled_by_shux() {
+        let mut h = InputHarness::new(64).await;
+        mouse_app_grid(&mut h, 60, 40).await;
+        let (_, y) = on_screen(&mut h, "grid-row 55").await;
+        let border = {
+            let grid = h.screen.grid();
+            let row = grid.visible_row(usize::from(y));
+            let bars: Vec<usize> = (0..row.len()).filter(|&c| row[c].ch == '│').collect();
+            // The outline's two sides bracket the separator between the panes.
+            assert_eq!(bars.len(), 3, "outline, separator, outline: {bars:?}");
+            bars[1] as u16
+        };
+        let layout = |h: &InputHarness| {
+            let snap = h.fixture.graph.snapshot();
+            format!("{:?}", snap.windows[&h.fixture.first_window].layout.tree)
+        };
+        let before = layout(&h);
+        for (kind, col) in [
+            (MouseKind::Down, border),
+            (MouseKind::Drag, border + 10),
+            (MouseKind::Up, border + 10),
+        ] {
+            h.send(&AttachClientFrame::Mouse {
+                kind,
+                button: ProtoMouseButton::Left,
+                col,
+                row: y,
+                shift: false,
+                alt: false,
+                ctrl: false,
+                frame: Some(0),
+            })
+            .await;
+        }
+        assert!(
+            pane_input(&mut h).await.is_empty(),
+            "the app was sent a report"
+        );
+        assert_ne!(
+            layout(&h),
+            before,
+            "an expired press did not drag the border"
+        );
+        h.stop().await;
+    }
+
+    /// Another client moved focus away; this client's click on the pane it
+    /// last had active must still focus it, not be taken as already focused.
+    #[tokio::test(start_paused = true)]
+    async fn a_click_refocuses_a_pane_another_client_moved_focus_from() {
+        let mut h = InputHarness::new(64).await;
+        mouse_app_grid(&mut h, 60, 40).await;
+        let (x, y) = on_screen(&mut h, "grid-row 55").await;
+        h.fixture
+            .graph
+            .focus_pane(h.fixture.second_pane)
+            .await
+            .expect("focus the other pane, as a second client would");
+        mouse(&mut h, MouseKind::Down, x, y).await;
+        mouse(&mut h, MouseKind::Up, x, y).await;
+        let _ = pane_input(&mut h).await;
+        let active = h.fixture.graph.snapshot().windows[&h.fixture.first_window].active_pane;
+        assert_eq!(
+            active, h.fixture.first_pane,
+            "the click did not take focus back"
+        );
+        h.stop().await;
+    }
+
+    /// The wheel's half of the same: a tick before a swap is drawn scrolls the
+    /// pane the client shows under the pointer.
+    #[tokio::test(start_paused = true)]
+    async fn a_wheel_tick_before_a_new_layout_is_drawn_reaches_the_pane_shown() {
+        let mut h = InputHarness::new(64).await;
+        mouse_app_grid(&mut h, 60, 40).await;
+        let (x, y) = on_screen(&mut h, "grid-row 55").await;
+        h.fixture
+            .graph
+            .swap_panes(h.fixture.first_pane, h.fixture.second_pane, None)
+            .await
+            .expect("swap panes");
+        let frame = h.written_frame;
+        h.send(&AttachClientFrame::Mouse {
+            kind: MouseKind::ScrollUp,
+            button: ProtoMouseButton::None,
+            col: x,
+            row: y,
+            shift: false,
+            alt: false,
+            ctrl: false,
+            frame,
+        })
+        .await;
+        let got = String::from_utf8_lossy(&pane_input(&mut h).await).into_owned();
+        assert_eq!(got, "\x1b[<64;1;55M", "wheel over grid-row 55 as shown");
         h.stop().await;
     }
 

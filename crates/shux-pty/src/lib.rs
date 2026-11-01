@@ -7,6 +7,7 @@ pub mod capture;
 pub mod command;
 pub mod handle;
 pub mod manager;
+pub mod spawn;
 
 pub use capture::strip_ansi;
 pub use command::{CommandEngine, CommandResult, shell_escape_args, shell_quote_arg};
@@ -15,3 +16,4 @@ pub use handle::{
     PtyConfig, PtyError, PtyHandle, PtyInputWriter, PtySize,
 };
 pub use manager::{PaneId, PtyEvent, PtyManager};
+pub use spawn::inherit_only_stdio;

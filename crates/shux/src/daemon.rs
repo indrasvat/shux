@@ -412,7 +412,8 @@ impl InstanceLock {
 /// 2. setsid(): child becomes session leader (detaches from terminal)
 /// 3. Second fork: session leader exits, grandchild continues
 ///    (grandchild cannot accidentally acquire a controlling terminal)
-/// 4. Redirect stdin/stdout/stderr to /dev/null
+/// 4. Redirect stdin/stdout/stderr to /dev/null, and close every other
+///    descriptor the starter left open
 /// 5. Take the instance lock and record our pid in it
 /// 6. Write PID file
 ///
@@ -446,6 +447,7 @@ pub fn daemonize(socket: &Path) -> Result<Option<InstanceLock>, DaemonError> {
 
     // Redirect stdio to /dev/null
     redirect_stdio_to_devnull();
+    close_inherited_descriptors();
 
     ensure_runtime_dir()?;
     // Both checks come before anything that names this process as the daemon:
@@ -468,6 +470,24 @@ pub fn daemonize(socket: &Path) -> Result<Option<InstanceLock>, DaemonError> {
         socket: socket.to_path_buf(),
         file: std::sync::Mutex::new(lock),
     }))
+}
+
+/// Close every descriptor above stderr: a daemon outlives its starter and
+/// would hold, and hand every pane, whatever it left without close-on-exec.
+/// Nothing of the daemon's own is open yet.
+fn close_inherited_descriptors() {
+    use nix::libc;
+    let listed: Option<Vec<i32>> = fs::read_dir("/dev/fd").ok().map(|dir| {
+        dir.filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+            .collect()
+    });
+    // Unlistable: every number the limit allows.
+    // SAFETY: getdtablesize takes no arguments and only reads a limit.
+    let fds = listed.unwrap_or_else(|| (3..unsafe { libc::getdtablesize() }).collect());
+    for fd in fds.into_iter().filter(|fd| *fd > 2) {
+        // SAFETY: see above; no live handle owns a descriptor above 2.
+        unsafe { libc::close(fd) };
+    }
 }
 
 /// Redirect stdin, stdout, stderr to /dev/null.
