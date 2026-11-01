@@ -555,3 +555,13 @@ fn a_scaled_put_sends_its_cells_and_the_source_that_fills_them() {
     let cmd = emitted("a=p,i=5,c=4", 18, 38);
     assert!(cmd.contains("y=0,w=18,h=38,c=4,r=4"), "{cmd}");
 }
+
+/// A put letterboxed into a wider box is sent as the cells the picture covers,
+/// so a terminal that stretches into `c` x `r` (kitty 0.32) draws it as one
+/// that letterboxes does.
+#[test]
+fn a_letterboxed_put_sends_only_the_cells_its_picture_covers() {
+    // 9x38 px fitted into 6x4 cells: the height binds, the width is 2 cells.
+    let cmd = emitted("a=p,i=5,c=6,r=4", 9, 38);
+    assert!(cmd.contains("y=0,w=9,h=38,c=2,r=4"), "{cmd}");
+}

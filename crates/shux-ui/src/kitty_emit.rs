@@ -156,8 +156,14 @@ fn resolve(p: &ComposedPlacement) -> Option<Placed> {
     }
     let (cw, ch) = DECLARED_CELL_PIXELS;
     let clip_top = p.clip.row as i64;
-    let (nat_cols, nat_rows) = p.geometry.cells();
-    let (nat_cols, nat_rows) = (nat_cols as i64, nat_rows as i64);
+    // The cells the fitted picture covers, not the box it was fitted into:
+    // with both `c` and `r` kitty 0.32 stretches where the protocol now
+    // letterboxes, and a box of the picture's own shape is drawn alike by both.
+    let (dest_w, dest_h) = p.geometry.drawn_px(cw, ch);
+    let (nat_cols, nat_rows) = (
+        i64::from(dest_w.div_ceil(cw).max(1)),
+        i64::from(dest_h.div_ceil(ch).max(1)),
+    );
 
     let top = p.row.max(clip_top);
     let bottom = p
@@ -171,7 +177,6 @@ fn resolve(p: &ComposedPlacement) -> Option<Placed> {
         return None;
     }
 
-    let (dest_w, dest_h) = p.geometry.drawn_px(cw, ch);
     let (dest_w, dest_h) = (u64::from(dest_w), u64::from(dest_h));
     let vy0 = (top - p.row) as u64 * u64::from(ch);
     let vy1 = (vy0 + rows as u64 * u64::from(ch)).min(dest_h);
