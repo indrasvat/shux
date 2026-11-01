@@ -490,12 +490,9 @@ impl VirtualTerminal {
     /// Release a synchronized-output window that has outlived its deadline,
     /// reporting whether the presented frame moved.
     ///
-    /// The only release on time. Parsing never releases on time: a batch parsed
-    /// late may have been sent in time, and the daemon's own delay must not
-    /// tear a frame the pane finished. So the owner calls this only when the
-    /// pane has nothing queued and no output it has read waits to be parsed,
-    /// i.e. when the pane really has not finished its frame. Parsing still
-    /// releases a window that absorbs [`SYNC_UPDATE_MAX_BYTES`].
+    /// The only release on time; parsing releases only at [`SYNC_UPDATE_MAX_BYTES`],
+    /// since a batch parsed late may have been sent in time. Call it only when
+    /// none of the pane's output is pending.
     pub fn release_expired_sync(&mut self) -> bool {
         if !self.sync_window_expired() {
             return false;
@@ -2130,10 +2127,7 @@ mod tests {
     // Issue #115: a window cannot be held open for ever
     // -----------------------------------------------------------------
 
-    /// A batch parsed after the deadline may have been sent long before it, so
-    /// parsing never releases a window on time: on a loaded daemon that would
-    /// tear frames the pane finished (G1). Only the owner's sweep does, once
-    /// the pane has nothing left queued.
+    /// Parsed late is not sent late: a busy daemon must not tear a frame the pane finished.
     #[test]
     fn a_late_batch_never_releases_a_window_on_time() {
         let clock = test_clock::Frozen::new();

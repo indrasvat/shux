@@ -808,10 +808,11 @@ async fn a_pane_inherits_no_descriptor_beyond_its_terminal() {
     assert!(closed, "the pane still holds a pipe its spawner had open");
 }
 
-/// The output probe sees, from its own copy of the master fd, output the child
-/// wrote that nobody has read, and nothing once it has been read.
+/// The output probe answers whether child output has been handed on: pending
+/// while queued, still pending once read (until the reader marks it handled),
+/// and clear only after that.
 #[tokio::test]
-async fn the_output_probe_sees_unread_output() {
+async fn the_output_probe_tracks_output_until_it_is_handled() {
     const OUTPUT: &str = "queued-output";
     let config = PtyConfig::with_command(
         vec![
@@ -825,7 +826,7 @@ async fn the_output_probe_sees_unread_output() {
     let probe = handle.output_probe().unwrap();
 
     shux_testkit::wait_until_async("the child's output is queued", || async {
-        probe.has_output().unwrap()
+        probe.output_pending()
     })
     .await;
 
@@ -841,7 +842,9 @@ async fn the_output_probe_sees_unread_output() {
     .expect("read the queued output");
     assert_eq!(String::from_utf8_lossy(&got), OUTPUT);
     assert!(
-        !probe.has_output().unwrap(),
-        "read output is no longer queued"
+        probe.output_pending(),
+        "read but not handed on is still pending"
     );
+    probe.mark_handled();
+    assert!(!probe.output_pending(), "handed-on output is not pending");
 }
