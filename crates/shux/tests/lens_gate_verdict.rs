@@ -1,6 +1,6 @@
 //! Task 082 — verdict / report.json / summary / xfail / bless / init (`shux lens gate`).
-//! GATE lane (`GATE-TEST-CHANGE:` to touch). `test = false` — run serially under the leak
-//! guard via `make test-lens-gate-verdict`, NEVER in the default parallel run.
+//! GATE lane (`GATE-TEST-CHANGE:` to touch). Runs in `make test`; `make
+//! test-lens-gate-verdict` runs it alone.
 //!
 //! Drives the REAL `shux` binary end-to-end (design D1). Asserts the OBSERVABLE 082
 //! contract: the frozen `report.json` schema + exit map, the ASCII summary, first-run

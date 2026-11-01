@@ -196,6 +196,8 @@ jobs:
         run: make test-doc
       - name: Test-group membership
         run: make check-test-groups
+      - name: No integration test opts out of make test
+        run: make check-test-opt-out
       # Pull requests only, and deliberately so: the guard asks "did anything
       # that ran at the merge-base stop running here", and on a push to main
       # the merge-base IS the head, so it would compare a build against itself

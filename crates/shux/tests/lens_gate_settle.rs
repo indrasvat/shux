@@ -1,6 +1,6 @@
 //! Task 083 — settle hardening + cast at the GATE level (`shux lens gate`). GATE lane
-//! (`GATE-TEST-CHANGE:` to touch). `test = false` — run serially under the leak guard via
-//! `make test-lens-gate-settle`, NEVER in the default parallel `cargo test`/CI run.
+//! (`GATE-TEST-CHANGE:` to touch). Runs in `make test`; `make test-lens-gate-settle` runs it
+//! alone.
 //!
 //! Proves the SCENARIO wiring: a `stable_frames`/`hold_settle` step (and `expect_golden`'s own
 //! stability fields) drive the daemon settle modes; a genuine animation → `settle_never_stable`

@@ -3,9 +3,8 @@
 //! Proves the capture schema on REAL terminal workloads — a real subprocess's
 //! ANSI output driven through shux's own VT, captured to a `FrameEnvelope`, and
 //! cross-checked against shux's own rasterizer (the semantic capture must agree
-//! with the pixels). Run via `make test-lens-gate` (this file is `test = false`,
-//! so it stays out of `make check` / CI `nextest --workspace`, matching the lens
-//! suite regime). FROZEN — changes need a `GATE-TEST-CHANGE:` trailer.
+//! with the pixels). Runs in `make test`; `make test-lens-gate` runs it alone.
+//! FROZEN — changes need a `GATE-TEST-CHANGE:` trailer.
 //!
 //! Colour-probe mandate (CLAUDE.md): every captured frame carries truecolor AND
 //! 256-color AND basic-color content so a monochrome / NO_COLOR regression

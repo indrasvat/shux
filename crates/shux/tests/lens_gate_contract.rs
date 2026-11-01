@@ -2,12 +2,10 @@
 //!
 //! These tests pin the OBSERVABLE gate contract that task 078 owns — the closed
 //! status set, the exit-code map, and the `report.json` schema — by driving the
-//! (not-yet-built) `shux lens gate` verb and asserting its output conforms. They
-//! are RED today (the verb does not exist) and each is annotated with the task
-//! that will turn it GREEN **without editing it** (the freeze guard forbids
-//! weakening). This file is `test = false`, so it never runs in `make check` /
-//! CI `nextest --workspace`; run it explicitly with `make test-lens-gate-contract`
-//! (EXPECTED to fail until 081/082 land). FROZEN — GATE-TEST-CHANGE: trailer.
+//! `shux lens gate` verb and asserting its output conforms. Each is annotated with
+//! the task that turned it GREEN **without editing it** (the freeze guard forbids
+//! weakening). Runs in `make test`; `make test-lens-gate-contract` runs it alone.
+//! FROZEN — GATE-TEST-CHANGE: trailer.
 //!
 //! Retirement plan:
 //!

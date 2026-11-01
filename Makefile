@@ -167,6 +167,10 @@ check-darwin: ## Clippy the workspace for macOS — catches cfg-gated code a Lin
 check-test-groups: nextest-ready ## Assert every nextest test-group still matches the tests it bounds
 	@bash scripts/check-test-groups.sh
 
+.PHONY: check-test-opt-out
+check-test-opt-out: ## Assert no integration test declares test = false (so make test and CI run them all)
+	@bash scripts/check-test-opt-out.sh
+
 .PHONY: check-test-inventory
 check-test-inventory: nextest-ready ## Assert no test stopped being compiled since BASE_REF (default origin/main)
 	@bash scripts/check-test-inventory.sh
@@ -608,8 +612,8 @@ spike-libghostty-zig: ## Install spike-local Zig 0.15.2 under .local/tools
 # Lens (separate red-suite lane — PRD §12/§13/§16)
 # ══════════════════════════════════════════════════════════════════════════════
 
-# The lens integration suites carry `test = false` in crates/shux/Cargo.toml, so the default
-# `make test` / `make check` never run them; the targets below run them EXPLICITLY. Every suite
+# The lens integration suites run in `make test` like every other suite; the targets below
+# run one lane on its own, serially under the leak guard. Every suite
 # is the SAME nextest invocation — the only variance is the test set, whether a real daemon is
 # spawned (→ leak guard + serial `-j 1`), and a couple of extra flags — so that invocation lives
 # in ONE place. Adding a suite is a two-line target; the recipe never repeats.
@@ -726,7 +730,6 @@ clippy: ## Run clippy linter
 	@# CLIPPY_CONF_DIR: clippy reads the NEAREST clippy.toml and does not merge,
 	@# so a crate-local one would silently drop the root's sleep ban.
 	@CLIPPY_CONF_DIR="$(CURDIR)" cargo clippy --workspace --all-targets -- -D warnings
-	@CLIPPY_CONF_DIR="$(CURDIR)" bash scripts/clippy-lanes.sh
 	@echo "$(COLOR_GREEN)✓ Clippy passed$(COLOR_RESET)"
 
 .PHONY: clippy-beta
@@ -751,7 +754,7 @@ fmt: ## Format all code
 	@echo "$(COLOR_GREEN)✓ Formatting complete$(COLOR_RESET)"
 
 .PHONY: check-after-hygiene
-check-after-hygiene: lint shellcheck check-test-sleeps check-darwin test check-test-groups check-test-inventory check-ci-parity test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-lens-frozen check-no-bin-mods check-action-pins check-vt-corpus-scratch
+check-after-hygiene: lint shellcheck check-test-sleeps check-darwin test check-test-groups check-test-opt-out check-test-inventory check-ci-parity test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-lens-frozen check-no-bin-mods check-action-pins check-vt-corpus-scratch
 
 .PHONY: check
 check: hooks-check check-target-hygiene ## Run lint + test + process/QA guards (what pre-commit runs)

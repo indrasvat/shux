@@ -1,6 +1,6 @@
 //! Task 080 — daemon-backed `pane.glance --cells` capture emission (GATE lane;
-//! `GATE-TEST-CHANGE:` to touch). `test = false` → run via `make
-//! test-lens-gate-glance-cells` under the leak guard, serially.
+//! `GATE-TEST-CHANGE:` to touch). Runs in `make test`; `make
+//! test-lens-gate-glance-cells` runs it alone.
 //!
 //! Proves the L1-capture + L3-dogfood matrix rows: `pane.glance {include_cells:true}`
 //! (RPC + `--cells` CLI) emits the canonical task-078 `FrameEnvelope` for the live

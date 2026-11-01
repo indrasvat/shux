@@ -5,8 +5,8 @@
 //! fails with `method_not_found (-32601)` — the red receipt — before any
 //! scratch is created.
 //!
-//! These are the ONLY tests that create scratch; they run serially under the
-//! leak guard (`make test-lens`).
+//! These are the ONLY tests that create scratch. Each harness has its own
+//! daemon, so the scratch quota is per test.
 
 mod lens_common;
 use lens_common::*;
