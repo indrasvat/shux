@@ -1,3 +1,15 @@
+# [0.55.0](https://github.com/indrasvat/shux/compare/v0.54.14...v0.55.0) (2026-11-01)
+
+
+### Bug Fixes
+
+* attach resize at startup, stray descriptors in spawned processes, clicks during a layout change ([#235](https://github.com/indrasvat/shux/issues/235)) ([32ff081](https://github.com/indrasvat/shux/commit/32ff0813f0bde5b7f9f971f865857d5c56c3083c)), closes [#234](https://github.com/indrasvat/shux/issues/234)
+
+
+### Features
+
+* **vt:** place stored kitty images with a=p, cropped, fitted and deleted by target ([#236](https://github.com/indrasvat/shux/issues/236)) ([a0cb823](https://github.com/indrasvat/shux/commit/a0cb823105487daeaa4a58ee4c89859f92eb456b)), closes [#234](https://github.com/indrasvat/shux/issues/234)
+
 ## [0.54.14](https://github.com/indrasvat/shux/compare/v0.54.13...v0.54.14) (2026-10-31)
 
 
