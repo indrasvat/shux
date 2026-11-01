@@ -179,13 +179,24 @@ fn process_argv(pid: u32) -> Option<ProcessArgv> {
     (!argv.is_empty()).then_some(ProcessArgv::Exact(argv, cwd))
 }
 
+/// Run a process-table probe that inherits nothing but its stdio.
+#[cfg(not(target_os = "linux"))]
+fn probe(cmd: &mut std::process::Command) -> std::io::Result<std::process::Output> {
+    shux_pty::inherit_only_stdio(cmd);
+    cmd.output()
+}
+
 /// `-ww` is not optional: BSD `ps` truncates argv without it.
 #[cfg(not(target_os = "linux"))]
 fn process_argv(pid: u32) -> Option<ProcessArgv> {
-    let out = std::process::Command::new("ps")
-        .args(["-ww", "-p", &pid.to_string(), "-o", "uid=,args="])
-        .output()
-        .ok()?;
+    let out = probe(std::process::Command::new("ps").args([
+        "-ww",
+        "-p",
+        &pid.to_string(),
+        "-o",
+        "uid=,args=",
+    ]))
+    .ok()?;
     joined_if_ours(String::from_utf8_lossy(&out.stdout).trim())
 }
 
@@ -272,10 +283,16 @@ fn process_cwd(pid: u32) -> Option<PathBuf> {
 /// `ps` cannot report a cwd; `lsof` can, as the `n` field of the `cwd` fd.
 #[cfg(not(target_os = "linux"))]
 fn process_cwd(pid: u32) -> Option<PathBuf> {
-    let out = std::process::Command::new("lsof")
-        .args(["-a", "-w", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
-        .output()
-        .ok()?;
+    let out = probe(std::process::Command::new("lsof").args([
+        "-a",
+        "-w",
+        "-p",
+        &pid.to_string(),
+        "-d",
+        "cwd",
+        "-Fn",
+    ]))
+    .ok()?;
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .find_map(|line| line.strip_prefix('n'))
@@ -326,9 +343,7 @@ fn all_processes() -> Vec<(u32, ProcessArgv)> {
 /// One `ps` for the whole table: a `ps` per pid would cost a fork each.
 #[cfg(not(target_os = "linux"))]
 fn all_processes() -> Vec<(u32, ProcessArgv)> {
-    let Ok(out) = std::process::Command::new("ps")
-        .args(["-ww", "-Ao", "pid=,uid=,args="])
-        .output()
+    let Ok(out) = probe(std::process::Command::new("ps").args(["-ww", "-Ao", "pid=,uid=,args="]))
     else {
         return Vec::new();
     };

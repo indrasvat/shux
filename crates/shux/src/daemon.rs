@@ -477,18 +477,25 @@ pub fn daemonize(socket: &Path) -> Result<Option<InstanceLock>, DaemonError> {
 /// output) would otherwise stay open for the daemon's life and pass on to
 /// every pane. Nothing of the daemon's own is open yet.
 fn close_inherited_descriptors() {
-    let Ok(dir) = fs::read_dir("/dev/fd") else {
+    use nix::libc;
+    #[cfg(target_os = "linux")]
+    // SAFETY: close_range takes plain integers; nothing here owns a
+    // descriptor above 2 yet.
+    if unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32) } == 0 {
         return;
-    };
-    let fds: Vec<i32> = dir
-        .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
-        .filter(|fd| *fd > 2)
-        .collect();
-    // The listing's own descriptor is among them; it closed with `dir`.
-    for fd in fds {
+    }
+    let listed: Option<Vec<i32>> = fs::read_dir("/dev/fd").ok().map(|dir| {
+        dir.filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+            .collect()
+    });
+    // Unlistable: try every number the limit allows.
+    // SAFETY: getdtablesize takes no arguments and only reads a limit.
+    let fds = listed.unwrap_or_else(|| (3..unsafe { libc::getdtablesize() }).collect());
+    // The listing's own descriptor is among them; it closed with the listing.
+    for fd in fds.into_iter().filter(|fd| *fd > 2) {
         // SAFETY: nothing in this process owns a descriptor above 2 yet, so
         // closing one cannot pull it out from under a live handle.
-        unsafe { nix::libc::close(fd) };
+        unsafe { libc::close(fd) };
     }
 }
 

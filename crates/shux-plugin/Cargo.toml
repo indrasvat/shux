@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 shux-core = { path = "../shux-core" }
 shux-rpc = { path = "../shux-rpc" }
+shux-pty = { path = "../shux-pty" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

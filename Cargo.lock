@@ -1277,6 +1277,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "shux-core",
+ "shux-pty",
  "shux-rpc",
  "shux-testkit",
  "tempfile",

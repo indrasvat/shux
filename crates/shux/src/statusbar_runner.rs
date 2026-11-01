@@ -400,6 +400,7 @@ async fn run_segment_command(seg: &SegmentDef) -> std::io::Result<Vec<u8>> {
     for (k, v) in &seg.env {
         cmd.env(k, v);
     }
+    shux_pty::inherit_only_stdio(cmd.as_std_mut());
     let out = cmd.output().await?;
     if !out.status.success() {
         return Err(std::io::Error::other(format!(

@@ -77,14 +77,14 @@ fn detect_git_branch_within(cwd: &Path, budget: std::time::Duration) -> Option<S
     use std::time::Duration;
 
     let run = |args: &[&str]| -> Option<String> {
-        let mut child = Command::new("git")
-            .args(args)
+        let mut cmd = Command::new("git");
+        cmd.args(args)
             .current_dir(cwd)
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .stdin(Stdio::null())
-            .spawn()
-            .ok()?;
+            .stdin(Stdio::null());
+        shux_pty::inherit_only_stdio(&mut cmd);
+        let mut child = cmd.spawn().ok()?;
 
         let deadline = std::time::Instant::now() + budget;
         loop {
