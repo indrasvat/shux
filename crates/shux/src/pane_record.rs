@@ -14,6 +14,7 @@
 //! shutdown drains.
 
 use std::collections::HashMap;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -178,6 +179,9 @@ enum Phase {
 struct Entry {
     pane: Option<PaneId>,
     path: PathBuf,
+    /// The opened file's (device, inode): one file under two names is one
+    /// file, however its names differ.
+    file: Option<(u64, u64)>,
     phase: Phase,
     sink: Option<mpsc::Sender<PaneRecordChunk>>,
     control: Arc<Control>,
@@ -203,6 +207,10 @@ pub(crate) type RecordSink = Box<dyn AsyncWrite + Send + Unpin>;
 pub(crate) struct Opened {
     pub(crate) sink: RecordSink,
     pub(crate) landed: Option<Box<dyn Fn() -> Option<u64> + Send>>,
+    /// The sink's (device, inode), where it is a file.
+    pub(crate) file: Option<(u64, u64)>,
+    /// Empties the file; run only once no live recording holds it.
+    pub(crate) truncate: Option<Box<dyn FnOnce() -> std::io::Result<()> + Send>>,
 }
 
 /// Opens `path` for recording `id` (the id is for tests; files ignore it).
@@ -220,8 +228,10 @@ fn file_opener() -> Opener {
             options
                 .write(true)
                 .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+            // Overwriting truncates only after the registry has checked that
+            // no live recording holds this file under another name.
             if overwrite {
-                options.create(true).truncate(true);
+                options.create(true);
             } else {
                 options.create_new(true);
             }
@@ -234,9 +244,14 @@ fn file_opener() -> Opener {
             })?;
             let flags = OFlag::from_bits_retain(fcntl(&file, FcntlArg::F_GETFL)?);
             fcntl(&file, FcntlArg::F_SETFL(flags - OFlag::O_NONBLOCK))?;
-            // Its own descriptor, so the size is the open file's, whatever
-            // later happens to the path.
+            // Own descriptors, so they measure the open file, whatever later
+            // happens to the path.
             let probe = file.try_clone().await?.into_std().await;
+            let emptier = probe.try_clone()?;
+            let meta = probe.metadata()?;
+            let truncate: Option<Box<dyn FnOnce() -> std::io::Result<()> + Send>> = (overwrite
+                && meta.is_file())
+            .then(|| Box::new(move || emptier.set_len(0)) as Box<dyn FnOnce() -> _ + Send>);
             Ok(Opened {
                 sink: Box::new(file),
                 landed: Some(Box::new(move || {
@@ -246,6 +261,8 @@ fn file_opener() -> Opener {
                         .filter(|m| m.is_file())
                         .map(|m| m.len())
                 })),
+                file: Some((meta.dev(), meta.ino())),
+                truncate,
             })
         }
         .boxed()
@@ -394,6 +411,7 @@ impl Recordings {
                 Entry {
                     pane,
                     path: key.clone(),
+                    file: None,
                     phase: Phase::Reserved { cancelled: false },
                     sink: None,
                     control: control.clone(),
@@ -421,7 +439,7 @@ impl Recordings {
             std::panic::AssertUnwindSafe((self.shared.opener)(id, path.clone(), overwrite))
                 .catch_unwind()
                 .await;
-        let opened = match opened {
+        let mut opened = match opened {
             Ok(Ok(opened)) => opened,
             failed => {
                 self.lock().entries.remove(&id);
@@ -435,6 +453,31 @@ impl Recordings {
                 )));
             }
         };
+        {
+            let mut reg = self.lock();
+            let taken = opened.file.is_some()
+                && reg
+                    .entries
+                    .iter()
+                    .any(|(other, e)| *other != id && e.live() && e.file == opened.file);
+            if taken {
+                // Dropped untruncated: the live recording's file is untouched.
+                reg.entries.remove(&id);
+                return Err(RecordStartError::PathBusy(path));
+            }
+            if let Some(entry) = reg.entries.get_mut(&id) {
+                entry.file = opened.file;
+            }
+        }
+        if let Some(truncate) = opened.truncate.take()
+            && let Err(e) = truncate()
+        {
+            self.lock().entries.remove(&id);
+            return Err(RecordStartError::Open(format!(
+                "failed to empty record file {}: {e}",
+                path.display()
+            )));
+        }
         let (tx, rx) = mpsc::channel(self.shared.channel);
         let writer = self
             .shared
@@ -462,10 +505,15 @@ impl Recordings {
             Ok(result) => result,
             Err(e) => Err(format!("pane recorder task failed: {e}")),
         };
-        control.finalize(result);
-        if let Some(entry) = self.lock().entries.get_mut(&id) {
-            entry.phase = Phase::Finalized;
-            entry.sink = None;
+        // Under the lock a stop takes, so no stop can see this recording
+        // accepting once its outcome is final.
+        {
+            let mut reg = self.lock();
+            control.finalize(result);
+            if let Some(entry) = reg.entries.get_mut(&id) {
+                entry.phase = Phase::Finalized;
+                entry.sink = None;
+            }
         }
         tokio::select! {
             () = retention() => {}
@@ -518,7 +566,9 @@ impl Recordings {
                     cause
                 };
                 entry.control.outcome.send_modify(|o| {
-                    o.ended_by.get_or_insert(cause);
+                    if !o.finalized {
+                        o.ended_by.get_or_insert(cause);
+                    }
                 });
                 entry.sink = None;
                 entry.phase = Phase::Stopping;
@@ -783,7 +833,7 @@ async fn write_recording(
     opened: Opened,
     control: Arc<Control>,
 ) -> Result<(), String> {
-    let Opened { sink, landed } = opened;
+    let Opened { sink, landed, .. } = opened;
     let written = std::panic::AssertUnwindSafe(write_chunks(rx, sink, &control))
         .catch_unwind()
         .await
@@ -1082,6 +1132,8 @@ pub(crate) mod testing {
         let opened = Opened {
             sink: Box::new(sink),
             landed: Some(Box::new(move || Some(landed.load(Ordering::SeqCst)))),
+            file: None,
+            truncate: None,
         };
         (opened, state)
     }
@@ -1527,6 +1579,42 @@ mod tests {
             landed.bytes().len() as u64,
             "bytes_written counts bytes that never landed: {out:?}"
         );
+    }
+
+    /// A stop holding the registry lock while the writer fails on its own:
+    /// an outcome already published as final must not change under it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the test holds the registry lock across the writer's failure on purpose"
+    )]
+    async fn a_stop_cannot_change_an_outcome_already_final() {
+        let r = rig(1 << 16);
+        let pane = PaneId::new();
+        *r.opener.fault.lock().unwrap() = Fault {
+            fail_after: Some(0),
+            ..Fault::default()
+        };
+        let id = r.start("a", pane).await;
+        let (mut outcome, _) = r.rec.watch(id).unwrap();
+        let admitted = r.rec.admit(pane).pop().expect("accepting");
+        let mut reg = r.rec.lock();
+        admitted
+            .send_bytes(b"boom".to_vec(), Instant::now(), &CancellationToken::new())
+            .await;
+        // Bounded: on a correct registry nothing is final while the lock is held.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !outcome.borrow().finalized && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let seen = outcome.borrow().clone();
+        let entry = reg.entries.get_mut(&id).expect("entry");
+        r.rec.end(entry, EndedBy::Stop);
+        drop(reg);
+        let last = outcome.wait_for(|o| o.finalized).await.unwrap().clone();
+        if seen.finalized {
+            assert_eq!(seen, last, "a final outcome changed after it was published");
+        }
     }
 
     /// A writer that panics still finalizes, with the bytes it wrote.

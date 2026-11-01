@@ -592,3 +592,65 @@ fn a_stalled_reader_does_not_keep_the_daemon_alive() {
         panic!("the daemon outlived `daemon stop` behind a stalled recording");
     }
 }
+
+/// Two names for one file (a hard link, or a case alias where the volume
+/// ignores case): the second recording is refused and the first's file is
+/// left alone.
+fn a_second_name_for_a_live_recording_is_refused(alias: impl Fn(&Path) -> PathBuf) {
+    let rig = Rig::new();
+    let a = rig.session("alias-a");
+    let b = rig.session("alias-b");
+    let first = rig.path("Record.raw");
+    std::fs::write(&first, b"").expect("create");
+    let second = alias(&first);
+    let mut rec = rig.record("alias-a", &a, &first);
+    rig.type_line("alias-a", &a, &format!("printf '{COLOUR_PROBE}KE%s\\n' PT"));
+    rig.wait_text("alias-a", &a, "KEPT");
+
+    let out = rig.run(&[
+        "pane",
+        "record",
+        "-s",
+        "alias-b",
+        "-p",
+        &b,
+        "--force",
+        "--duration-ms",
+        "50",
+        "--to",
+        second.to_str().expect("utf-8"),
+    ]);
+    assert!(
+        !out.status.success(),
+        "a second recording of the same file was admitted"
+    );
+    let raw = String::from_utf8_lossy(&std::fs::read(&first).expect("recording")).into_owned();
+    assert!(
+        raw.contains("KEPT"),
+        "the live recording's file was truncated: {raw:?}"
+    );
+    rec.signal(nix::sys::signal::Signal::SIGINT);
+    let (status, stdout) = rec.exits().expect("the first recording never ended");
+    assert!(status.success(), "{}", rec.stderr());
+    assert!(stdout.contains("complete"), "{stdout}");
+}
+
+#[test]
+fn a_hard_link_to_a_live_recording_is_refused() {
+    a_second_name_for_a_live_recording_is_refused(|first| {
+        let link = first.with_file_name("link.raw");
+        std::fs::hard_link(first, &link).expect("hard link");
+        link
+    });
+}
+
+#[test]
+fn a_case_alias_of_a_live_recording_is_refused() {
+    let probe = tempfile::tempdir().expect("probe dir");
+    std::fs::write(probe.path().join("case"), b"").expect("probe");
+    if !probe.path().join("CASE").exists() {
+        eprintln!("this volume is case-sensitive: no case aliases to refuse");
+        return;
+    }
+    a_second_name_for_a_live_recording_is_refused(|first| first.with_file_name("record.RAW"));
+}
