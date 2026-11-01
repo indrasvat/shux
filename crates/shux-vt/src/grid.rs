@@ -609,10 +609,12 @@ pub struct Placement {
     pub abs_row: u64,
     pub col: usize,
     /// The client's `i=`, or 0 for none. Re-transmitting an id replaces that
-    /// image and its placements, so this is the identity `place` matches on.
+    /// image and its placements, so this is the identity `put` matches on.
     pub image_id: u32,
     /// The client's `p=`, or 0 for a placement nothing can address again.
     pub placement_id: u32,
+    /// The client's `z=`: drawing ignores it, a z-index delete matches it.
+    pub z: i32,
     pub geometry: ImageGeometry,
 }
 
@@ -778,7 +780,7 @@ impl Grid {
         self.placed_bytes = self.placed_bytes.saturating_sub(freed);
     }
 
-    /// Drop every placement -- `a=d,d=A`, the only target a real client sends.
+    /// Drop every placement, as RIS does.
     pub(crate) fn unplace_all(&mut self) {
         if self.placements.is_empty() {
             return;
@@ -2801,6 +2803,7 @@ mod placement_refusal_tests {
             col: 0,
             image_id: id,
             placement_id: 0,
+            z: 0,
             geometry: ImageGeometry::full(1, 1),
         }
     }

@@ -91,6 +91,11 @@ impl Assembler {
         (done.payload.len() as u64 == want).then_some((done, self.opening.clone()))
     }
 
+    /// Whether a transfer is in flight, so the next command continues it.
+    pub(crate) fn is_open(&self) -> bool {
+        self.open.is_some()
+    }
+
     pub(crate) fn abort(&mut self) {
         self.open = None;
     }

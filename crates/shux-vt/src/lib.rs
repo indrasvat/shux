@@ -664,17 +664,21 @@ impl VirtualTerminal {
         use graphics::kitty::Action;
         match cmd.action {
             Action::Transmit | Action::TransmitAndPlace => {
+                // "The existing image and all its placements must be deleted"
+                // as the re-transmit begins, whether or not it completes or is
+                // placed. An app that redraws under one id (terminal-browser
+                // sends `i=1` every frame) would otherwise spend a slot per
+                // frame.
+                if !self.graphics.assembler.is_open() && cmd.image_id != 0 {
+                    self.store().retain(|k| k != cmd.image_id);
+                    self.presented_grid().unplace_image(cmd.image_id, 0);
+                }
                 let Some((image, opening)) = self.graphics.assembler.feed(&cmd, payload) else {
                     return;
                 };
                 let image = std::sync::Arc::new(image);
-                // "The existing image and all its placements must be deleted",
-                // whether or not the new data is placed. An app that redraws
-                // under one id (terminal-browser sends `i=1` every frame)
-                // would otherwise spend a slot per frame.
                 if opening.image_id != 0 {
                     self.store().insert(opening.image_id, image.clone());
-                    self.presented_grid().unplace_image(opening.image_id, 0);
                 }
                 if opening.action == Action::TransmitAndPlace {
                     self.place_image(image, &opening);
@@ -726,10 +730,13 @@ impl VirtualTerminal {
         let rows = self.grid.rows() as u64;
         // `x,y` name a 1-based cell; a cell is (screen column, absolute row).
         let (x, y) = (cmd.src[0] as usize, cmd.src[1] as usize);
-        let cell = (x.wrapping_sub(1), first + y.saturating_sub(1) as u64);
+        // A 0 coordinate names no cell.
+        let cell = (
+            x.wrapping_sub(1),
+            y.checked_sub(1).map_or(u64::MAX, |y| first + y as u64),
+        );
         let cursor = (self.cursor.col, first + self.cursor.row as u64);
-        // shux draws every placement at z-index 0.
-        let at_z = cmd.z == 0;
+        let z = cmd.z;
         let covers = |p: &grid::Placement, col: Option<usize>, row: Option<u64>| {
             let (w, h) = p.geometry.cells();
             col.is_none_or(|c| (p.col..p.col + w).contains(&c))
@@ -744,15 +751,13 @@ impl VirtualTerminal {
             b'i' if id != 0 => {
                 Box::new(move |p| p.image_id == id && (pid == 0 || p.placement_id == pid))
             }
-            b'r' if x != 0 && x <= y => {
-                Box::new(move |p| (x as u32..=y as u32).contains(&p.image_id))
-            }
+            b'r' if x <= y => Box::new(move |p| (x as u32..=y as u32).contains(&p.image_id)),
             b'c' => Box::new(move |p| covers(p, Some(cursor.0), Some(cursor.1))),
             b'p' => Box::new(move |p| covers(p, Some(cell.0), Some(cell.1))),
-            b'q' => Box::new(move |p| at_z && covers(p, Some(cell.0), Some(cell.1))),
+            b'q' => Box::new(move |p| p.z == z && covers(p, Some(cell.0), Some(cell.1))),
             b'x' => Box::new(move |p| covers(p, Some(cell.0), None)),
             b'y' => Box::new(move |p| covers(p, None, Some(cell.1))),
-            b'z' => Box::new(move |_| at_z),
+            b'z' => Box::new(move |p| p.z == z),
             _ => {
                 self.graphics.refusals = self.graphics.refusals.saturating_add(1);
                 return;
@@ -760,10 +765,15 @@ impl VirtualTerminal {
         };
         let removed = self.presented_grid().unplace_where(hit);
         if target.is_ascii_uppercase() {
-            let named = (target == b'I').then_some(id);
+            // Named outright: an id with no placement given, or an id range.
+            let named = |k: u32| match target {
+                b'I' => pid == 0 && k == id,
+                b'R' => (x as u64..=y as u64).contains(&u64::from(k)),
+                _ => false,
+            };
             let grid = &self.grid;
             let store = &mut self.graphics.stores[usize::from(self.modes.alternate_screen)];
-            store.retain(|k| !(removed.contains(&k) || named == Some(k)) || grid.shows_image(k));
+            store.retain(|k| !(removed.contains(&k) || named(k)) || grid.shows_image(k));
         }
     }
 
@@ -806,6 +816,7 @@ impl VirtualTerminal {
             col,
             image_id: cmd.image_id,
             placement_id: cmd.placement_id,
+            z: cmd.z,
             geometry,
         };
         if !grid.put(placement) {

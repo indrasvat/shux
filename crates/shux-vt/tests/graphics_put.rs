@@ -344,3 +344,66 @@ fn the_alternate_screen_has_its_own_images() {
     vt.process(&apc("a=p,i=7,C=1"));
     assert!(vt.grid().placements().is_empty());
 }
+
+/// kitty drops an id's old image when a re-transmit of it begins, so one
+/// that then fails (a payload of the wrong size) leaves nothing behind.
+#[test]
+fn a_failed_re_transmit_still_drops_the_old_image() {
+    let mut vt = vt_with_image(7);
+    vt.process(&apc("a=p,i=7,C=1"));
+    vt.process(b"\x1b_Ga=T,f=24,s=30,v=60,i=7;AAAA\x1b\\");
+    assert!(
+        vt.grid().placements().is_empty(),
+        "the old picture stayed up"
+    );
+    vt.process(&apc("a=p,i=7"));
+    assert!(
+        vt.grid().placements().is_empty(),
+        "the old data is still stored"
+    );
+}
+
+/// A z-index delete matches the z-index each picture was put at.
+#[test]
+fn a_z_index_delete_matches_the_z_each_picture_was_put_at() {
+    let mut vt = vt_with_image(7);
+    vt.process(&apc("a=p,i=7,z=-1,C=1"));
+    vt.process(&apc("a=d,d=z,z=0"));
+    assert_eq!(
+        vt.grid().placements().len(),
+        1,
+        "z=0 removed a z=-1 picture"
+    );
+    vt.process(&apc("a=d,d=q,x=1,y=1,z=-1"));
+    assert!(vt.grid().placements().is_empty(), "z=-1 missed its picture");
+}
+
+/// Uppercase deletes by id or range free the images they name, placed or
+/// not; one that names a placement frees nothing it did not remove.
+#[test]
+fn an_uppercase_delete_by_id_or_range_frees_what_it_names() {
+    let mut vt = vt_with_image(7);
+    vt.process(&apc("a=d,d=R,x=0,y=7"));
+    vt.process(&apc("a=p,i=7,C=1"));
+    assert!(
+        vt.grid().placements().is_empty(),
+        "d=R kept unplaced image 7"
+    );
+
+    let mut vt = vt_with_image(7);
+    vt.process(&apc("a=p,i=7,C=1"));
+    vt.process(&apc("a=d,d=r,x=0,y=7"));
+    assert!(
+        vt.grid().placements().is_empty(),
+        "a range from 0 was refused"
+    );
+
+    let mut vt = vt_with_image(7);
+    vt.process(&apc("a=d,d=I,i=7,p=99"));
+    vt.process(&apc("a=p,i=7,C=1"));
+    assert_eq!(
+        vt.grid().placements().len(),
+        1,
+        "a missing placement freed 7"
+    );
+}

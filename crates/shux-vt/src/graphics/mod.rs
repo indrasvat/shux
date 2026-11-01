@@ -16,8 +16,7 @@ pub(crate) struct GraphicsSink {
     /// One chunked transmission in flight.
     pub(crate) assembler: image::Assembler,
     /// Transmitted images an `a=p` may place: the primary screen's, then the
-    /// alternate screen's, which lives and dies with that screen as kitty's
-    /// does.
+    /// alternate screen's.
     pub(crate) stores: [image::ImageStore; 2],
     /// Every command that reached the dispatcher. Test-only: the dispatcher
     /// has no other visible output, so a public-API test alone would pass on a
