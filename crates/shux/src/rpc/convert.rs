@@ -23,6 +23,9 @@ pub(crate) fn graph_error_to_rpc(e: shux_core::graph::GraphError) -> shux_rpc::R
         | GraphError::InvalidSessionName(_) => shux_rpc::RpcError::invalid_params(&e.to_string()),
         GraphError::EmptyWindowName
         | GraphError::WindowNameTooLong(_)
+        | GraphError::NumericWindowName(_)
+        | GraphError::SessionPaneBytes { .. }
+        | GraphError::SessionPaneLimit { .. }
         | GraphError::WindowIndexOutOfRange { .. } => {
             shux_rpc::RpcError::invalid_params(&e.to_string())
         }
@@ -70,7 +73,8 @@ pub(crate) fn session_to_json(
     })
 }
 
-/// Build window info JSON from a Window.
+/// Build window info JSON from a Window. `index` is its 0-based place in the
+/// session; the JSON carries its number, counted from 1 like `-w`.
 pub(crate) fn window_to_json(
     w: &shux_core::model::Window,
     index: usize,
@@ -84,7 +88,7 @@ pub(crate) fn window_to_json(
         "title": w.title,
         "pane_count": pane_count,
         "active_pane_id": w.active_pane.to_string(),
-        "index": index,
+        "index": index + 1,
         "is_active": is_active,
         "version": w.version,
     })

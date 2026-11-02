@@ -34,6 +34,9 @@ fn graph_error_to_rpc(e: shux_core::graph::GraphError) -> shux_rpc::RpcError {
         | GraphError::InvalidSessionName(_) => shux_rpc::RpcError::invalid_params(&e.to_string()),
         GraphError::EmptyWindowName
         | GraphError::WindowNameTooLong(_)
+        | GraphError::NumericWindowName(_)
+        | GraphError::SessionPaneBytes { .. }
+        | GraphError::SessionPaneLimit { .. }
         | GraphError::WindowIndexOutOfRange { .. } => {
             shux_rpc::RpcError::invalid_params(&e.to_string())
         }
@@ -68,7 +71,7 @@ fn window_to_json(
         "title": w.title,
         "pane_count": pane_count,
         "active_pane_id": w.active_pane.to_string(),
-        "index": index,
+        "index": index + 1,
         "is_active": is_active,
         "version": w.version,
     })
@@ -368,24 +371,11 @@ fn register_window_methods(
                     .parse()
                     .map_err(|_| shux_rpc::RpcError::invalid_params("invalid session_id format"))?;
                 let name = params.get("name").and_then(|v| v.as_str());
+                let cwd = PathBuf::from("/tmp");
                 let title = match name {
                     Some(n) => n.to_string(),
-                    None => {
-                        let snap = gh.snapshot();
-                        let session = snap.sessions.get(&session_id).ok_or_else(|| {
-                            shux_rpc::RpcError::not_found("session", session_id_str)
-                        })?;
-                        let mut idx = session.windows.len();
-                        loop {
-                            let candidate = format!("{idx}");
-                            if !snap.window_name_exists_in_session(&session_id, &candidate) {
-                                break candidate;
-                            }
-                            idx += 1;
-                        }
-                    }
+                    None => gh.snapshot().default_window_title(&session_id, &[], &cwd),
                 };
-                let cwd = PathBuf::from("/tmp");
                 let window_id = gh
                     .create_window(session_id, title, cwd)
                     .await
@@ -596,6 +586,7 @@ fn register_window_methods(
                     let new_index = params
                         .get("new_index")
                         .and_then(|v| v.as_u64())
+                        .and_then(|n| n.checked_sub(1))
                         .ok_or_else(|| {
                             shux_rpc::RpcError::invalid_params("missing 'new_index' parameter")
                         })? as usize;
@@ -2026,7 +2017,7 @@ async fn test_014_window_create_auto_name() {
 
     let session_id = create_session(&socket_path, "auto-win").await;
 
-    // Session already has window "0" (default). Creating without name should auto-name.
+    // Creating a window without a name gives it the default name.
     let resp = rpc_raw(
         &socket_path,
         "window.create",
@@ -2037,9 +2028,9 @@ async fn test_014_window_create_auto_name() {
         resp["error"].is_null(),
         "auto-name create should succeed: {resp}"
     );
-    let title = resp["result"]["title"].as_str().unwrap();
-    // Auto-name is index-based; first window is "0", new one should be "1"
-    assert!(!title.is_empty(), "auto-named window should have a title");
+    // Named after what it runs (a shell in /tmp), unique beside the first
+    // window, never a number (#142).
+    assert_eq!(resp["result"]["title"], "tmp-2");
 
     cancel.cancel();
 }
@@ -2262,18 +2253,18 @@ async fn test_014_window_reorder() {
     .await;
     let w2_id = create_resp["result"]["id"].as_str().unwrap().to_string();
 
-    // Move w2 to index 0
+    // Make w2 window 1
     let reorder_resp = rpc_raw(
         &socket_path,
         "window.reorder",
-        serde_json::json!({"id": w2_id, "new_index": 0}),
+        serde_json::json!({"id": w2_id, "new_index": 1}),
     )
     .await;
     assert!(
         reorder_resp["error"].is_null(),
         "window.reorder should succeed: {reorder_resp}"
     );
-    assert_eq!(reorder_resp["result"]["index"], 0);
+    assert_eq!(reorder_resp["result"]["index"], 1);
 
     cancel.cancel();
 }

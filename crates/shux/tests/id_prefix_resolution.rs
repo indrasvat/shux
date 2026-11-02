@@ -143,7 +143,7 @@ fn fixture(h: &Harness, tag: &str) -> Fixed {
     h.wait_for(&pane_b, PANE_B_PROMPT, 60_000)
         .expect("pane B never drew the prompt after its marker");
 
-    // A second window, so `-w 0` has something to be wrong about.
+    // A second window, so `-w 1` has something to be wrong about.
     let w2 = h.rpc_ok(
         "window.create",
         serde_json::json!({ "session_id": session_id, "name": "second" }),
@@ -651,23 +651,23 @@ fn window_list_prints_an_id_that_window_commands_accept() {
         );
     }
 
-    // The numeric index must keep winning, and with two windows present this
-    // can actually tell index-resolution apart from id-resolution.
-    let out = h.cli(&["--format", "json", "pane", "list", "-s", &f.name, "-w", "0"]);
+    // A window number must keep winning, and with two windows present this
+    // can actually tell number-resolution apart from id-resolution.
+    let out = h.cli(&["--format", "json", "pane", "list", "-s", &f.name, "-w", "1"]);
     assert!(
         out.status.success(),
-        "`-w 0` regressed: {}",
+        "`-w 1` regressed: {}",
         stderr_of(&out)
     );
     assert!(
         stdout_of(&out).contains(&f.pane_a),
-        "`-w 0` did not select window 0"
+        "`-w 1` did not select window 1"
     );
-    let out = h.cli(&["--format", "json", "pane", "list", "-s", &f.name, "-w", "1"]);
-    assert!(out.status.success(), "`-w 1` failed: {}", stderr_of(&out));
+    let out = h.cli(&["--format", "json", "pane", "list", "-s", &f.name, "-w", "2"]);
+    assert!(out.status.success(), "`-w 2` failed: {}", stderr_of(&out));
     assert!(
         !stdout_of(&out).contains(&f.pane_a),
-        "`-w 1` returned window 0's panes"
+        "`-w 2` returned window 1's panes"
     );
 
     h.kill_session(&f.session_id);
@@ -1062,4 +1062,74 @@ fn pane_b_marker_cannot_be_satisfied_by_the_echoed_line() {
         !PANE_B_LINE.contains(PANE_B_PROMPT),
         "the echo of {PANE_B_LINE:?} would satisfy the wait for its prompt"
     );
+}
+
+/// #142: a window's number is the one `window list`, the status bar and Alt+N
+/// show, counted from 1, and its name is a word. A window nobody named is
+/// called after what it runs, so `-w 1` can only mean window 1, and a name
+/// that is a number is refused.
+#[test]
+fn window_numbers_are_positions_and_default_names_are_words() {
+    let h = Harness::new();
+    let name = format!("w142-{}", unique());
+    let out = h.cli(&["session", "create", &name, "-d", "--", "sleep", "300"]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    let out = h.cli(&["window", "create", "-s", &name, "--", "sleep", "300"]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+
+    let sessions = h.rpc_ok("session.list", serde_json::json!({}));
+    let session_id = sessions["sessions"]
+        .as_array()
+        .expect("sessions")
+        .iter()
+        .find(|s| s["name"] == name.as_str())
+        .and_then(|s| s["id"].as_str())
+        .expect("session id")
+        .to_string();
+    let windows = h.rpc_ok(
+        "window.list",
+        serde_json::json!({ "session_id": session_id }),
+    );
+    let windows = windows.as_array().expect("windows");
+    let titles: Vec<&str> = windows.iter().filter_map(|w| w["title"].as_str()).collect();
+    assert_eq!(titles, ["sleep", "sleep-2"], "default window names");
+
+    // Window numbers count from 1, as `window list`, the status bar and
+    // Alt+N show them.
+    let numbers: Vec<u64> = windows.iter().filter_map(|w| w["index"].as_u64()).collect();
+    assert_eq!(numbers, [1, 2], "window list numbers");
+    for (spec, want) in [("1", &windows[0]), ("2", &windows[1])] {
+        let id = want["id"].as_str().expect("window id");
+        let out = h.cli(&[
+            "--format", "json", "window", "focus", "-s", &name, "-w", spec,
+        ]);
+        assert!(out.status.success(), "{}", stderr_of(&out));
+        assert!(
+            stdout_of(&out).contains(id),
+            "`-w {spec}` did not select window {spec}: {}",
+            stdout_of(&out)
+        );
+    }
+    let out = h.cli(&["window", "focus", "-s", &name, "-w", "0"]);
+    assert!(!out.status.success(), "`-w 0` selected a window");
+    assert!(
+        stderr_of(&out).contains("numbered from 1"),
+        "{}",
+        stderr_of(&out)
+    );
+
+    for args in [
+        vec!["window", "create", "-s", &name, "--name", "7"],
+        vec!["window", "rename", "-s", &name, "-w", "1", "--name", "3"],
+    ] {
+        let out = h.cli(&args);
+        assert!(!out.status.success(), "{args:?} accepted a numeric name");
+        assert!(
+            stderr_of(&out).contains("selects window number"),
+            "{args:?} did not say why: {}",
+            stderr_of(&out)
+        );
+    }
+
+    h.kill_session(&session_id);
 }

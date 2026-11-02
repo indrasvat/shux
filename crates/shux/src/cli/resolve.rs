@@ -251,7 +251,9 @@ pub fn ambiguous_ref_error(
     }
 }
 
-/// Resolve a window specifier (name or index) to (window_id, window_title).
+/// Resolve a window specifier to (window_id, window_title): digits are a
+/// window's number (from 1), anything else an exact name; failing that, an id
+/// or id prefix.
 pub async fn resolve_window_id(
     stream: &mut tokio::net::UnixStream,
     session_id: &str,
@@ -269,34 +271,46 @@ pub async fn resolve_window_id(
         data: None,
     })?;
 
-    // Try as numeric index first
-    if let Ok(idx) = window_spec.parse::<usize>()
-        && let Some(w) = windows.get(idx)
-    {
+    // Titles are stored sanitized (issue #104), so normalize the selector the
+    // same way — the operator types what they see in `window list`, but a
+    // script may pass the raw value straight from the template. Both have to
+    // land on the same window, and digits after sanitizing are a position.
+    let wanted = shux_core::model::sanitize_title(window_spec);
+    let position = shux_core::model::is_window_number(&wanted);
+    let found = if position {
+        // Numbered from 1, as `window list`, the status bar and Alt+N count.
+        wanted
+            .parse::<usize>()
+            .ok()
+            .and_then(|n| n.checked_sub(1))
+            .and_then(|idx| windows.get(idx))
+    } else {
+        windows
+            .iter()
+            .find(|w| w.get("title").and_then(|v| v.as_str()) == Some(wanted.as_str()))
+    };
+    if let Some(w) = found {
         let id = w.get("id").and_then(|v| v.as_str()).unwrap_or("?");
         let title = w.get("title").and_then(|v| v.as_str()).unwrap_or("?");
         return Ok((id.to_string(), title.to_string()));
     }
 
-    // Try as window name. Titles are stored sanitized (issue #104), so
-    // normalize the selector the same way — the operator types what they
-    // see in `window list`, but a script may pass the raw value straight
-    // from the template. Both have to land on the same window.
-    let wanted = shux_core::model::sanitize_title(window_spec);
-    for w in windows {
-        if w.get("title").and_then(|v| v.as_str()) == Some(wanted.as_str()) {
-            let id = w.get("id").and_then(|v| v.as_str()).unwrap_or("?");
-            let title = w.get("title").and_then(|v| v.as_str()).unwrap_or("?");
-            return Ok((id.to_string(), title.to_string()));
-        }
-    }
-
     // Finally, as an id — full UUID or the short form `window list` prints.
     // `--window`'s help has always said "window id or index"; before issue
     // #120 the id half of that promise was not implemented, so a UUID read
-    // out of `window list --format json` was rejected. Index and title are
-    // tried first, so no spec that resolved before resolves differently now.
-    resolve_window_id_by_id(windows, window_spec)
+    // out of `window list --format json` was rejected. Position and name are
+    // tried first.
+    resolve_window_id_by_id(windows, window_spec).map_err(|e| {
+        if position && wanted.bytes().all(|b| b == b'0') {
+            RpcClientError::Rpc {
+                code: -32004,
+                message: format!("there is no window {wanted}: windows are numbered from 1"),
+                data: None,
+            }
+        } else {
+            e
+        }
+    })
 }
 
 /// Match a window spec against the window ids in a `window.list` response.
@@ -720,8 +734,8 @@ mod tests {
     #[tokio::test]
     async fn window_specs_resolve_by_index_title_uuid_and_prefix() {
         let cases = [
-            ("0", "aaaa1111-1111-4111-8111-111111111111"),
-            ("1", "aaaa2222-2222-4222-8222-222222222222"),
+            ("1", "aaaa1111-1111-4111-8111-111111111111"),
+            ("2", "aaaa2222-2222-4222-8222-222222222222"),
             ("logs", "aaaa2222-2222-4222-8222-222222222222"),
             (
                 "aaaa2222-2222-4222-8222-222222222222",
@@ -763,6 +777,41 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not found"), "{err}");
+        finish_rpc_script(client, task, requests).await;
+    }
+
+    /// Digits are a position, never a name: a window still carrying a numeric
+    /// name from before #142 is reached by its position or its id (#142).
+    #[tokio::test]
+    async fn digits_never_select_a_window_by_name() {
+        let list = serde_json::json!([
+            {"id": "aaaa1111-1111-4111-8111-111111111111", "title": "5",
+             "index": 0, "pane_count": 1, "is_active": true, "version": 1},
+        ]);
+        // Names are compared sanitized, so digits that sanitize to the name are
+        // still a position.
+        for spec in ["5", "5 ", "\u{1b}5"] {
+            let (mut client, requests, task) = spawn_rpc_script(vec![list.clone()]);
+            let err = resolve_window_id(&mut client, "sid", spec)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("not found"), "{spec:?}: {err}");
+            finish_rpc_script(client, task, requests).await;
+        }
+    }
+
+    /// Digits that are no position may still be an id prefix: `window list`
+    /// prints short ids, and some are all digits. Positions and prefixes cannot
+    /// meet below 1000 windows, since a prefix is at least four characters.
+    #[tokio::test]
+    async fn digits_that_are_no_position_can_still_be_an_id_prefix() {
+        let list = serde_json::json!([
+            {"id": "12341111-1111-4111-8111-111111111111", "title": "build",
+             "index": 0, "pane_count": 1, "is_active": true, "version": 1},
+        ]);
+        let (mut client, requests, task) = spawn_rpc_script(vec![list]);
+        let (id, _) = resolve_window_id(&mut client, "sid", "1234").await.unwrap();
+        assert_eq!(id, "12341111-1111-4111-8111-111111111111");
         finish_rpc_script(client, task, requests).await;
     }
 

@@ -51,6 +51,8 @@ impl Env {
         };
         env.write_config(config_toml);
         env.host_pane = env.session_with_argv("host", &["/bin/sh"]);
+        // Wide enough that the status bar never truncates the pane count the
+        // wait below needs: it also carries the git branch and window name.
         env.ok(&[
             "pane", "set-size", "-s", "host", "--cols", "100", "--rows", "40",
         ]);
@@ -97,6 +99,16 @@ impl Env {
             .env("NO_COLOR", "1")
             .env("SHELL", "/bin/sh")
             .current_dir(self.root.path().join("work"));
+        // A git hook exports these, and the status bar's git segment would then
+        // describe this repository instead of the test's scratch directory.
+        for var in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_COMMON_DIR",
+        ] {
+            cmd.env_remove(var);
+        }
         cmd
     }
 

@@ -67,7 +67,8 @@ const MAX_ARG_BYTES: usize = 128 * 1024 - 1;
 /// few multi-megabyte argvs pushed `pane.list` past the 16 MB frame limit and
 /// every read of that session died with `early eof` — recoverable only by
 /// killing it. 256 KiB is two orders of magnitude past any real command line
-/// and two below the frame limit.
+/// and two below the frame limit. A session's total is bounded too:
+/// `shux_core::graph::MAX_SESSION_PANE_BYTES`.
 const MAX_ARGV_BYTES: usize = 256 * 1024;
 
 /// The shell that interprets a string-form `command`.

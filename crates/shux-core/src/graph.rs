@@ -71,7 +71,26 @@ pub enum GraphError {
     #[error("window name too long (max 128 characters): {}", .0.escape_debug())]
     WindowNameTooLong(String),
 
-    #[error("window index {index} out of range (session has {count} windows)")]
+    #[error(
+        "window name can't be a number: {} (`-w N` selects window number N)",
+        .0.escape_debug()
+    )]
+    NumericWindowName(String),
+
+    #[error(
+        "this session's panes already hold {used} bytes of commands and directories, and \
+         {adding} more would pass the {budget}-byte limit for one session"
+    )]
+    SessionPaneBytes {
+        used: usize,
+        adding: usize,
+        budget: usize,
+    },
+
+    #[error("a session holds at most {max} panes")]
+    SessionPaneLimit { max: usize },
+
+    #[error("window {} out of range (session has {count} windows, numbered from 1)", index + 1)]
     WindowIndexOutOfRange { index: usize, count: usize },
 
     #[error("cannot swap pane with itself")]
@@ -192,6 +211,24 @@ impl SessionGraphSnapshot {
     /// Check if a window name exists in a session.
     pub fn window_name_exists_in_session(&self, session_id: &SessionId, name: &str) -> bool {
         self.find_window_by_name(session_id, name).is_some()
+    }
+
+    /// The name a window gets when none is given: the title its first pane
+    /// starts with (the program, else the cwd), unique in the session as
+    /// `name-2`, `name-3`… A title that is not a valid name becomes `window`.
+    pub fn default_window_title(
+        &self,
+        session_id: &SessionId,
+        command: &[String],
+        cwd: &std::path::Path,
+    ) -> String {
+        let pane_title = Pane::with_command(WindowId::new(), cwd, command.to_vec()).title;
+        let base = SessionGraph::validate_window_title(&pane_title)
+            .unwrap_or_else(|_| "window".to_string());
+        std::iter::once(base.clone())
+            .chain((2u32..).map(|n| format!("{base}-{n}")))
+            .find(|t| !self.window_name_exists_in_session(session_id, t))
+            .unwrap_or(base)
     }
 }
 
@@ -707,6 +744,9 @@ impl SessionGraph {
         if cleaned.chars().count() > Self::MAX_WINDOW_TITLE_CHARS {
             return Err(GraphError::WindowNameTooLong(cleaned));
         }
+        if crate::model::is_window_number(&cleaned) {
+            return Err(GraphError::NumericWindowName(cleaned));
+        }
         Ok(cleaned)
     }
 
@@ -739,6 +779,7 @@ impl SessionGraph {
         if current.session_name_exists(&name) {
             return Err(GraphError::SessionNameExists(name));
         }
+        check_session_capacity(&current, SessionId::new(), &command, &cwd)?;
 
         let mut snapshot = (*current).clone();
         snapshot.version += 1;
@@ -753,7 +794,8 @@ impl SessionGraph {
         };
         pane.id = pane_id;
 
-        let mut window = Window::new(SessionId::new(), "1", pane_id);
+        let title = current.default_window_title(&SessionId::new(), &command, &pane.cwd);
+        let mut window = Window::new(SessionId::new(), &title, pane_id);
         window.id = window_id;
 
         let session_name = name.clone();
@@ -779,8 +821,8 @@ impl SessionGraph {
         self.fire(EventData::WindowCreated {
             window_id,
             session_id,
-            title: "1".into(),
-            index: 0,
+            title,
+            index: 1,
         });
         self.fire(EventData::PaneCreated {
             pane_id,
@@ -950,6 +992,10 @@ impl SessionGraph {
         if !current.sessions.contains_key(&session_id) {
             return Err(GraphError::SessionNotFound(session_id));
         }
+        if current.window_name_exists_in_session(&session_id, &title) {
+            return Err(GraphError::WindowNameConflict(title));
+        }
+        check_session_capacity(&current, session_id, &command, &cwd)?;
 
         let mut snapshot = (*current).clone();
         snapshot.version += 1;
@@ -976,7 +1022,7 @@ impl SessionGraph {
             s.windows.push(window_id);
             s.active_window = window_id;
             s.version += 1;
-            event_index = (s.windows.len() - 1) as u32;
+            event_index = s.windows.len() as u32;
         }
 
         self.commit_snapshot(snapshot);
@@ -1271,6 +1317,8 @@ impl SessionGraph {
         if !current.windows.contains_key(&window_id) {
             return Err(GraphError::WindowNotFound(window_id));
         }
+        let session = current.windows[&window_id].session_id;
+        check_session_capacity(&current, session, &command, &cwd)?;
 
         let mut snapshot = (*current).clone();
         snapshot.version += 1;
@@ -1366,8 +1414,9 @@ impl SessionGraph {
 
         snapshot.panes.remove(&id);
 
+        let mut unzoomed = None;
         if let Some(w) = snapshot.windows.get_mut(&window_id) {
-            // Remove from layout tree
+            unzoomed = zoomed_pane(&w.layout);
             w.layout.remove_pane(id);
 
             if w.active_pane == id {
@@ -1387,6 +1436,7 @@ impl SessionGraph {
         }
 
         self.commit_snapshot(snapshot);
+        self.fire_unzoomed(unzoomed, window_id, session_id);
         // Pane killed via explicit destroy: surface as PaneExited with no exit_status,
         // mirroring how subscribers consume both natural exits and forced kills.
         self.fire(EventData::PaneExited {
@@ -1787,6 +1837,12 @@ impl SessionGraph {
             .get(&target_pane)
             // Safe: find_pane_window just verified it exists
             .unwrap();
+        let session = current
+            .windows
+            .get(&window_id)
+            .ok_or(GraphError::WindowNotFound(window_id))?
+            .session_id;
+        check_session_capacity(&current, session, &command, &target.cwd)?;
 
         let mut snapshot = (*current).clone();
         snapshot.version += 1;
@@ -1803,6 +1859,7 @@ impl SessionGraph {
             .get_mut(&window_id)
             .ok_or(GraphError::WindowNotFound(window_id))?;
 
+        let unzoomed = zoomed_pane(&window.layout);
         let ok = window
             .layout
             .split_pane(target_pane, new_pane_id, direction, ratio);
@@ -1824,6 +1881,7 @@ impl SessionGraph {
             .ok_or(GraphError::WindowNotFound(window_id))?;
 
         self.commit_snapshot(snapshot);
+        self.fire_unzoomed(unzoomed, window_id, split_session_id);
         // Split spawns a brand-new pane: surface as PaneCreated so subscribers
         // tracking pane lifecycle see the new id arrive in the same event class
         // they got from `create_pane`.
@@ -1835,6 +1893,14 @@ impl SessionGraph {
         });
         info!(%new_pane_id, %target_pane, %window_id, "Pane split");
         Ok(new_pane_id)
+    }
+
+    /// Announce a zoom a layout change cleared. Fired after the commit and
+    /// before the event the change causes.
+    fn fire_unzoomed(&self, unzoomed: Option<PaneId>, window_id: WindowId, session_id: SessionId) {
+        if let Some(pane_id) = unzoomed {
+            self.fire(unzoom_event(pane_id, window_id, session_id));
+        }
     }
 
     /// Focus a specific pane. Returns the previously active pane (or None if already focused).
@@ -1953,10 +2019,9 @@ impl SessionGraph {
             .get_mut(&window_id)
             .ok_or(GraphError::WindowNotFound(window_id))?;
 
-        // Unzoom first if zoomed
-        if window.layout.is_zoomed()
-            && let Some(zoom) = window.layout.zoom.take()
-        {
+        let unzoomed = zoomed_pane(&window.layout);
+        let session_id = window.session_id;
+        if let Some(zoom) = window.layout.zoom.take() {
             window.layout.tree = zoom.saved_layout;
         }
 
@@ -1980,6 +2045,7 @@ impl SessionGraph {
                 }
             }
             self.commit_snapshot(snapshot);
+            self.fire_unzoomed(unzoomed, window_id, session_id);
             Ok(())
         } else {
             // No matching split direction — not an error, just a no-op
@@ -2021,8 +2087,13 @@ impl SessionGraph {
             .get_mut(&window_id)
             .ok_or(GraphError::WindowNotFound(window_id))?;
 
+        let was_zoomed = zoomed_pane(&window.layout);
         window.layout.toggle_zoom(id);
-        let is_zoomed = window.layout.is_zoomed();
+        let now_zoomed = zoomed_pane(&window.layout);
+        if was_zoomed == now_zoomed {
+            return Ok(now_zoomed.is_some());
+        }
+        let is_zoomed = now_zoomed.is_some();
         window.version += 1;
         // A zoom shows only `id`, so input goes to it (tmux does the same).
         let previous_focus = (is_zoomed && window.active_pane != id)
@@ -2044,12 +2115,15 @@ impl SessionGraph {
         }
 
         self.commit_snapshot(snapshot);
-        self.fire(EventData::PaneZoomed {
-            pane_id: id,
-            window_id,
-            session_id,
-            zoomed: is_zoomed,
-        });
+        self.fire_unzoomed(was_zoomed, window_id, session_id);
+        if let Some(pane_id) = now_zoomed {
+            self.fire(EventData::PaneZoomed {
+                pane_id,
+                window_id,
+                session_id,
+                zoomed: true,
+            });
+        }
         if let Some(previous) = previous_focus {
             self.fire(EventData::PaneFocused {
                 pane_id: id,
@@ -2127,10 +2201,9 @@ impl SessionGraph {
             .get_mut(&window_id)
             .ok_or(GraphError::WindowNotFound(window_id))?;
 
-        // Unzoom first if zoomed
-        if window.layout.is_zoomed()
-            && let Some(zoom) = window.layout.zoom.take()
-        {
+        let unzoomed = zoomed_pane(&window.layout);
+        let session_id = window.session_id;
+        if let Some(zoom) = window.layout.zoom.take() {
             window.layout.tree = zoom.saved_layout;
         }
 
@@ -2151,6 +2224,7 @@ impl SessionGraph {
                 }
             }
             self.commit_snapshot(snapshot);
+            self.fire_unzoomed(unzoomed, window_id, session_id);
             Ok(())
         } else {
             Err(GraphError::LayoutError("swap_panes failed".into()))
@@ -2179,6 +2253,7 @@ fn stage_create_session(
     if snapshot.session_name_exists(&name) {
         return Err(GraphError::SessionNameExists(name));
     }
+    check_session_capacity(snapshot, SessionId::new(), &initial_command, &cwd)?;
     snapshot.version += 1;
 
     let pane_id = PaneId::new();
@@ -2203,7 +2278,7 @@ fn stage_create_session(
     // that is the attack case, and it is rejected.
     let title = match initial_window_title {
         Some(raw) if !raw.is_empty() => SessionGraph::validate_window_title(&raw)?,
-        _ => "1".to_string(),
+        _ => snapshot.default_window_title(&SessionId::new(), &initial_command, &pane.cwd),
     };
     let mut window = Window::new(SessionId::new(), &title, pane_id);
     window.id = window_id;
@@ -2226,7 +2301,7 @@ fn stage_create_session(
             window_id,
             session_id,
             title,
-            index: 0,
+            index: 1,
         },
         EventData::PaneCreated {
             pane_id,
@@ -2252,6 +2327,10 @@ fn stage_create_window(
     }
     // Sanitize then validate — see `SessionGraph::validate_window_title`.
     let title = SessionGraph::validate_window_title(&title)?;
+    if snapshot.window_name_exists_in_session(&session_id, &title) {
+        return Err(GraphError::WindowNameConflict(title));
+    }
+    check_session_capacity(snapshot, session_id, &initial_command, &cwd)?;
     snapshot.version += 1;
 
     let pane_id = PaneId::new();
@@ -2275,7 +2354,7 @@ fn stage_create_window(
         s.windows.push(window_id);
         s.active_window = window_id;
         s.version += 1;
-        event_index = (s.windows.len() - 1) as u32;
+        event_index = s.windows.len() as u32;
     }
 
     let events = vec![
@@ -2293,6 +2372,63 @@ fn stage_create_window(
         },
     ];
     Ok((window_id, pane_id, events))
+}
+
+/// Every listing of a session's panes (`pane.list`, `session.export_template`)
+/// returns them in one response, which has to fit in one RPC frame (16 MiB). So
+/// a session holds at most this many panes, which also bounds layout depth...
+pub const MAX_PANES_PER_SESSION: usize = 1024;
+/// ...and at most this many bytes of commands and working directories, counted
+/// as the listings send them (JSON). A pane's other fields are bounded already.
+pub const MAX_SESSION_PANE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Refuse a pane that would take `session` past either bound. A session not yet
+/// in `snapshot` holds nothing.
+fn check_session_capacity(
+    snapshot: &SessionGraphSnapshot,
+    session: SessionId,
+    command: &[String],
+    cwd: &std::path::Path,
+) -> Result<(), GraphError> {
+    let bytes = |command: &[String], cwd: &std::path::Path| {
+        let argv = serde_json::to_string(command).map_or(usize::MAX, |s| s.len());
+        let dir = serde_json::to_string(&cwd).map_or(usize::MAX, |s| s.len());
+        argv.saturating_add(dir)
+    };
+    let (count, used) = snapshot
+        .panes
+        .values()
+        .filter(|p| snapshot.windows.get(&p.window_id).map(|w| w.session_id) == Some(session))
+        .fold((0usize, 0usize), |(n, b), p| {
+            (n + 1, b.saturating_add(bytes(&p.command, &p.cwd)))
+        });
+    if count >= MAX_PANES_PER_SESSION {
+        return Err(GraphError::SessionPaneLimit {
+            max: MAX_PANES_PER_SESSION,
+        });
+    }
+    let adding = bytes(command, cwd);
+    if used.saturating_add(adding) > MAX_SESSION_PANE_BYTES {
+        return Err(GraphError::SessionPaneBytes {
+            used,
+            adding,
+            budget: MAX_SESSION_PANE_BYTES,
+        });
+    }
+    Ok(())
+}
+
+fn zoomed_pane(layout: &crate::layout::WindowLayout) -> Option<PaneId> {
+    layout.zoom.as_ref().map(|z| z.zoomed_pane)
+}
+
+fn unzoom_event(pane_id: PaneId, window_id: WindowId, session_id: SessionId) -> EventData {
+    EventData::PaneZoomed {
+        pane_id,
+        window_id,
+        session_id,
+        zoomed: false,
+    }
 }
 
 /// Stage a SplitPane op against `snapshot`. Returns
@@ -2321,6 +2457,7 @@ fn stage_split_pane(
         .map(|w| w.session_id)
         .ok_or(GraphError::WindowNotFound(window_id))?;
 
+    check_session_capacity(snapshot, session_id, &command, &pane_cwd)?;
     snapshot.version += 1;
 
     let new_pane = if command.is_empty() {
@@ -2334,6 +2471,7 @@ fn stage_split_pane(
         .windows
         .get_mut(&window_id)
         .ok_or(GraphError::WindowNotFound(window_id))?;
+    let unzoomed = zoomed_pane(&window.layout);
     let ok = window
         .layout
         .split_pane(target_pane, new_pane_id, direction, ratio);
@@ -2345,12 +2483,16 @@ fn stage_split_pane(
 
     snapshot.panes.insert(new_pane_id, new_pane);
 
-    let events = vec![EventData::PaneCreated {
+    let mut events: Vec<EventData> = unzoomed
+        .map(|pane_id| unzoom_event(pane_id, window_id, session_id))
+        .into_iter()
+        .collect();
+    events.push(EventData::PaneCreated {
         pane_id: new_pane_id,
         window_id,
         session_id,
         command,
-    }];
+    });
     Ok((new_pane_id, window_id, session_id, events))
 }
 
@@ -3464,7 +3606,7 @@ mod tests {
         let w1 = state.load().sessions[&sid].windows[0];
         let a = state.load().windows[&w1].active_pane;
         let b = graph.split_pane(a, Direction::Vertical, 0.5).unwrap();
-        let w2 = graph.create_window(sid, "2".into(), home()).unwrap();
+        let w2 = graph.create_window(sid, "second".into(), home()).unwrap();
         let c = state.load().windows[&w2].active_pane;
 
         graph.destroy_pane_and_empty_parents(b).unwrap();
@@ -4194,7 +4336,192 @@ mod tests {
             }])
             .unwrap();
         let snap = state.load();
-        assert_eq!(snap.windows.values().next().unwrap().title, "1");
+        assert_eq!(snap.windows.values().next().unwrap().title, "test");
+    }
+
+    /// `-w N` selects window number N, so a name that is a number
+    /// would make `-w N` mean two windows (#142).
+    #[test]
+    fn a_window_name_cannot_be_a_number() {
+        for raw in ["3", "007", "\u{1b}12"] {
+            let err = SessionGraph::check_window_title(raw).unwrap_err();
+            assert!(
+                matches!(err, GraphError::NumericWindowName(_)),
+                "{raw:?}: {err:?}"
+            );
+        }
+        for ok in ["v2", "2a", "-1", "1.5"] {
+            assert!(SessionGraph::check_window_title(ok).is_ok(), "{ok:?}");
+        }
+    }
+
+    /// A window nobody named is called after what it runs, unique in its
+    /// session, and never a number (#142).
+    #[test]
+    fn an_unnamed_window_is_called_after_what_it_runs() {
+        let (graph, state) = SessionGraph::new();
+        let sid = graph
+            .create_session_with_command("s".into(), home(), vec!["nvim".into(), "a.rs".into()])
+            .unwrap();
+        let first = state.load().sessions[&sid].windows[0];
+        assert_eq!(state.load().windows[&first].title, "nvim");
+
+        let snap = state.load();
+        let cases = [
+            (vec!["nvim".to_string()], "/tmp", "nvim-2"),
+            (
+                vec!["/usr/bin/sleep".to_string(), "9".to_string()],
+                "/tmp",
+                "sleep",
+            ),
+            (vec![], "/work/shux", "shux"),
+            (vec![], "/work/2026", "window"),
+            (vec!["./42".to_string()], "/tmp", "window"),
+        ];
+        for (command, cwd, want) in cases {
+            let got = snap.default_window_title(&sid, &command, std::path::Path::new(cwd));
+            assert_eq!(got, want, "{command:?} in {cwd}");
+        }
+    }
+
+    /// A session's panes are bounded in number and in command and directory
+    /// bytes, so no listing of them can outgrow an RPC frame. Bytes are counted
+    /// as the listings send them, JSON-escaped (#140).
+    #[test]
+    fn a_session_refuses_panes_past_its_bounds() {
+        let (graph, state) = SessionGraph::new();
+        let sid = graph.create_session("s".into(), home()).unwrap();
+        let wid = state.load().sessions[&sid].windows[0];
+        let a = state.load().windows[&wid].active_pane;
+        let quarter = vec!["x".repeat(MAX_SESSION_PANE_BYTES / 4)];
+        for _ in 0..3 {
+            graph
+                .split_pane_with_command(a, Direction::Vertical, 0.5, quarter.clone())
+                .unwrap();
+        }
+        fn refused<T>(r: Result<T, GraphError>) -> bool {
+            matches!(r, Err(GraphError::SessionPaneBytes { .. }))
+        }
+        assert!(refused(graph.split_pane_with_command(
+            a,
+            Direction::Vertical,
+            0.5,
+            quarter.clone()
+        )));
+        assert!(
+            refused(graph.create_pane(wid, home(), quarter.clone())),
+            "create_pane"
+        );
+        assert!(
+            refused(graph.create_window_with_command(sid, "w".into(), home(), quarter.clone())),
+            "another window of the same session"
+        );
+        let long_cwd = PathBuf::from(format!("/{}", "c".repeat(MAX_SESSION_PANE_BYTES / 4)));
+        assert!(
+            refused(graph.create_pane(wid, long_cwd, vec![])),
+            "a directory counts too"
+        );
+
+        // A batch that crosses the bound applies none of its ops.
+        let version = state.load().version;
+        let split = |command: Vec<String>| crate::apply::Op::SplitPane {
+            target: crate::apply::PaneRef::Id(a),
+            direction: Direction::Vertical,
+            ratio: 0.5,
+            command,
+            cwd: None,
+        };
+        assert!(
+            graph
+                .apply_batch(vec![split(vec!["true".into()]), split(quarter)])
+                .is_err()
+        );
+        assert_eq!(state.load().version, version, "a refused batch committed");
+
+        // A control byte reaches the client as six bytes, so it costs six.
+        let escaped = vec!["\u{1}".repeat(MAX_SESSION_PANE_BYTES / 6 + 1)];
+        assert!(refused(graph.create_session_with_command(
+            "t".into(),
+            home(),
+            escaped
+        )));
+
+        // Pane count: the limit also bounds how deep repeated splits nest.
+        let sid = graph.create_session("u".into(), home()).unwrap();
+        let wid = state.load().sessions[&sid].windows[0];
+        let mut target = state.load().windows[&wid].active_pane;
+        for _ in 1..MAX_PANES_PER_SESSION {
+            target = graph.split_pane(target, Direction::Vertical, 0.5).unwrap();
+        }
+        let err = graph
+            .split_pane(target, Direction::Vertical, 0.5)
+            .unwrap_err();
+        assert!(
+            matches!(err, GraphError::SessionPaneLimit { .. }),
+            "{err:?}"
+        );
+    }
+
+    /// Zooming B while A is zoomed takes A's zoom away, so A's `true` is
+    /// retracted before B's is announced (#138).
+    #[test]
+    fn zooming_another_pane_retracts_the_first_zoom() {
+        let bus = crate::bus::EventBus::new();
+        let (graph, state) = SessionGraph::new_with_event_bus(Some(bus.clone()));
+        let sid = graph.create_session("w".into(), home()).unwrap();
+        let wid = state.load().sessions[&sid].windows[0];
+        let a = state.load().windows[&wid].active_pane;
+        let b = graph.split_pane(a, Direction::Vertical, 0.5).unwrap();
+        assert!(graph.zoom_pane(a, None).unwrap());
+        let before = bus.history(1000).len();
+        assert!(graph.zoom_pane(b, None).unwrap());
+        let after = bus.history(1000).split_off(before);
+        let zoomed = |pane: PaneId, on: bool| {
+            after.iter().position(|e| {
+                matches!(e.data, EventData::PaneZoomed { pane_id, zoomed, .. }
+                    if pane_id == pane && zoomed == on)
+            })
+        };
+        let seen: Vec<_> = after.iter().map(|e| e.data.event_type()).collect();
+        assert!(
+            matches!((zoomed(a, false), zoomed(b, true)), (Some(off), Some(on)) if off < on),
+            "{seen:?}"
+        );
+    }
+
+    /// Zooming the only pane of a window changes nothing, so it says nothing.
+    #[test]
+    fn zooming_a_lone_pane_publishes_nothing() {
+        let bus = crate::bus::EventBus::new();
+        let (graph, state) = SessionGraph::new_with_event_bus(Some(bus.clone()));
+        let sid = graph.create_session("w".into(), home()).unwrap();
+        let a = state.load().windows[&state.load().sessions[&sid].windows[0]].active_pane;
+        let before = bus.history(1000).len();
+        assert!(!graph.zoom_pane(a, None).unwrap());
+        assert_eq!(bus.history(1000).len(), before, "a no-op zoom published");
+    }
+
+    /// A window name is a lookup key, so a new window cannot take one in use
+    /// — not least a default name like `sleep` (#142).
+    #[test]
+    fn a_new_window_cannot_take_a_name_already_in_use() {
+        let (graph, _state) = SessionGraph::new();
+        let sid = graph
+            .create_session_with_command("s".into(), home(), vec!["sleep".into()])
+            .unwrap();
+        let err = graph
+            .create_window_with_command(sid, "sleep".into(), home(), vec!["cat".into()])
+            .unwrap_err();
+        assert!(matches!(err, GraphError::WindowNameConflict(_)), "{err:?}");
+        let err = graph
+            .apply_batch(vec![crate::apply::Op::CreateWindow {
+                session: crate::apply::SessionRef::Id(sid),
+                title: "sleep".into(),
+                cwd: None,
+                initial_command: vec![],
+            }])
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("WindowNameConflict"), "{err:?}");
     }
 
     /// The bound is in characters, matching what the error message says.
@@ -5131,6 +5458,85 @@ mod tests {
         let snap = state.load();
         assert_eq!(snap.windows[&wid].active_pane, a);
         assert!(!snap.windows[&wid].layout.is_zoomed());
+    }
+
+    /// Every mutation that clears a zoom announces it, before the event it
+    /// causes, so a subscriber tracking zoom from events never sees a `true`
+    /// that is never retracted (#138).
+    #[test]
+    fn every_mutation_that_clears_a_zoom_publishes_the_unzoom() {
+        type Clear = fn(&SessionGraph, PaneId, PaneId);
+        let cases: [(&str, Clear, &str); 6] = [
+            (
+                "split",
+                |g, z, _| {
+                    g.split_pane(z, Direction::Vertical, 0.5).unwrap();
+                },
+                "pane.created",
+            ),
+            (
+                "staged split",
+                |g, z, _| {
+                    g.apply_batch(vec![crate::apply::Op::SplitPane {
+                        target: crate::apply::PaneRef::Id(z),
+                        direction: Direction::Vertical,
+                        ratio: 0.5,
+                        command: vec![],
+                        cwd: None,
+                    }])
+                    .unwrap();
+                },
+                "pane.created",
+            ),
+            (
+                "kill a hidden pane",
+                |g, _, o| g.destroy_pane(o, None).unwrap(),
+                "pane.exited",
+            ),
+            (
+                "kill the zoomed pane",
+                |g, z, _| g.destroy_pane(z, None).unwrap(),
+                "pane.exited",
+            ),
+            (
+                "resize",
+                |g, z, _| {
+                    g.resize_pane(z, Direction::Vertical, 0.1, None).unwrap();
+                },
+                "",
+            ),
+            ("swap", |g, z, o| g.swap_panes(z, o, None).unwrap(), ""),
+        ];
+        let mut failures = Vec::new();
+        for (name, clear, then) in cases {
+            let bus = crate::bus::EventBus::new();
+            let (graph, state) = SessionGraph::new_with_event_bus(Some(bus.clone()));
+            let sid = graph.create_session("work".into(), home()).unwrap();
+            let wid = state.load().sessions[&sid].windows[0];
+            let a = state.load().windows[&wid].active_pane;
+            let b = graph.split_pane(a, Direction::Vertical, 0.5).unwrap();
+            assert!(graph.zoom_pane(a, None).unwrap());
+            let before = bus.history(1000).len();
+
+            clear(&graph, a, b);
+            assert!(
+                !state.load().windows[&wid].layout.is_zoomed(),
+                "{name}: still zoomed"
+            );
+            let after: Vec<_> = bus.history(1000).split_off(before);
+            let unzoom = after.iter().position(|e| {
+                matches!(e.data, EventData::PaneZoomed { pane_id, zoomed: false, .. } if pane_id == a)
+            });
+            let seen: Vec<_> = after.iter().map(|e| e.data.event_type()).collect();
+            match unzoom {
+                None => failures.push(format!("{name}: no unzoom, saw {seen:?}")),
+                Some(u) if !then.is_empty() && seen.iter().position(|t| *t == then) < Some(u) => {
+                    failures.push(format!("{name}: unzoom after {then}, saw {seen:?}"));
+                }
+                Some(_) => {}
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 
     /// While zoomed the layout is the zoomed pane alone, so directional focus
