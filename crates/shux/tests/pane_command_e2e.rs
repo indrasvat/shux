@@ -443,7 +443,7 @@ fn trailing_argv_is_exec_d_directly_with_no_shell_interpretation() {
     let pane = env.first_pane("argv");
     env.expect_screen("argv", &pane, "a b;c", &[]);
 
-    let panes = env.panes("argv", "0");
+    let panes = env.panes("argv", "1");
     assert_eq!(
         panes[0].1[0], "sh",
         "argv[0] should be the program, verbatim"
@@ -556,7 +556,7 @@ fn pane_split_accepts_a_shell_string_and_records_what_it_ran() {
     .to_string();
     env.rpc_ok("pane.split", &params);
 
-    let panes = env.panes("split", "0");
+    let panes = env.panes("split", "1");
     let split = panes
         .iter()
         .find(|(id, _)| *id != first)
@@ -663,7 +663,7 @@ fn an_empty_cmd_opens_the_default_shell() {
     let mut env = Env::new();
     env.ok(&["session", "create", "blank", "-d", "--cmd", ""]);
     env.sessions.push("blank".to_string());
-    let panes = env.panes("blank", "0");
+    let panes = env.panes("blank", "1");
     assert!(
         panes[0].1.is_empty(),
         "empty --cmd should leave the pane command unset, got {:?}",
@@ -703,7 +703,7 @@ fn the_pane_title_names_the_program_not_the_shell() {
 fn pane_list_reports_the_argv_that_is_actually_running() {
     let mut env = Env::new();
     env.session_with_cmd("listed", &format!("{}; echo LISTED", probe()));
-    let panes = env.panes("listed", "0");
+    let panes = env.panes("listed", "1");
     let cmd = &panes[0].1;
     assert_eq!(cmd[0], "/bin/sh", "{cmd:?}");
     assert_eq!(cmd[1], "-c", "{cmd:?}");
@@ -861,7 +861,7 @@ fn a_failed_spawn_leaves_no_phantom_window_or_pane() {
         .as_array()
         .map(Vec::len)
         .unwrap_or(0);
-    let panes_before = env.panes("host", "0").len();
+    let panes_before = env.panes("host", "1").len();
 
     let bad = serde_json::json!(["no-such-binary-xyz"]);
     for (method, extra) in [
@@ -889,7 +889,7 @@ fn a_failed_spawn_leaves_no_phantom_window_or_pane() {
         "a failed window spawn left a window behind"
     );
     assert_eq!(
-        env.panes("host", "0").len(),
+        env.panes("host", "1").len(),
         panes_before,
         "a failed split left a pane behind"
     );
@@ -937,7 +937,7 @@ fn pane_split_cli_accepts_a_shell_command_and_trailing_argv() {
         "--cmd",
         &format!("{}; echo 'split by cmd'{PARK}", probe()),
     ]);
-    let panes = env.panes("splitcli", "0");
+    let panes = env.panes("splitcli", "1");
     let split = panes
         .iter()
         .find(|(id, _)| *id != first)
@@ -1013,7 +1013,7 @@ fn a_cmd_starting_with_a_hyphen_is_taken_as_the_command_not_a_flag() {
     assert!(out.status.success(), "{joined}");
     env.sessions.push("hyphen".to_string());
 
-    let panes = env.panes("hyphen", "0");
+    let panes = env.panes("hyphen", "1");
     assert_eq!(
         panes[0].1.get(2).map(String::as_str),
         Some(script),

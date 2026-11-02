@@ -71,7 +71,7 @@ fn window_to_json(
         "title": w.title,
         "pane_count": pane_count,
         "active_pane_id": w.active_pane.to_string(),
-        "index": index,
+        "index": index + 1,
         "is_active": is_active,
         "version": w.version,
     })
@@ -586,6 +586,7 @@ fn register_window_methods(
                     let new_index = params
                         .get("new_index")
                         .and_then(|v| v.as_u64())
+                        .and_then(|n| n.checked_sub(1))
                         .ok_or_else(|| {
                             shux_rpc::RpcError::invalid_params("missing 'new_index' parameter")
                         })? as usize;
@@ -2252,18 +2253,18 @@ async fn test_014_window_reorder() {
     .await;
     let w2_id = create_resp["result"]["id"].as_str().unwrap().to_string();
 
-    // Move w2 to index 0
+    // Make w2 window 1
     let reorder_resp = rpc_raw(
         &socket_path,
         "window.reorder",
-        serde_json::json!({"id": w2_id, "new_index": 0}),
+        serde_json::json!({"id": w2_id, "new_index": 1}),
     )
     .await;
     assert!(
         reorder_resp["error"].is_null(),
         "window.reorder should succeed: {reorder_resp}"
     );
-    assert_eq!(reorder_resp["result"]["index"], 0);
+    assert_eq!(reorder_resp["result"]["index"], 1);
 
     cancel.cancel();
 }

@@ -100,8 +100,8 @@ RPC callers pick the field themselves per the shapes above.
 { "session_id": "<uuid>" } → [ {...}, ... ]
 
 // window.focus — takes the window's own id (strict UUID) only. Position/name
-// resolution is CLI-side sugar (`shux window focus -s S -w 2` is position 2,
-// counted from 0; window names are never numbers), not RPC.
+// resolution is CLI-side sugar (`shux window focus -s S -w 2` is window 2,
+// counted from 1 like `index` below; window names are never numbers), not RPC.
 { "id": "<window-uuid>", "expected_version": N }
 
 // window.kill — window id only (no session_id param)

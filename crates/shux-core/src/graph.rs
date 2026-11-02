@@ -72,7 +72,7 @@ pub enum GraphError {
     WindowNameTooLong(String),
 
     #[error(
-        "window name can't be a number: {} (`-w N` selects the window at position N)",
+        "window name can't be a number: {} (`-w N` selects window number N)",
         .0.escape_debug()
     )]
     NumericWindowName(String),
@@ -90,7 +90,7 @@ pub enum GraphError {
     #[error("a session holds at most {max} panes")]
     SessionPaneLimit { max: usize },
 
-    #[error("window index {index} out of range (session has {count} windows)")]
+    #[error("window {} out of range (session has {count} windows, numbered from 1)", index + 1)]
     WindowIndexOutOfRange { index: usize, count: usize },
 
     #[error("cannot swap pane with itself")]
@@ -744,7 +744,7 @@ impl SessionGraph {
         if cleaned.chars().count() > Self::MAX_WINDOW_TITLE_CHARS {
             return Err(GraphError::WindowNameTooLong(cleaned));
         }
-        if crate::model::is_window_position(&cleaned) {
+        if crate::model::is_window_number(&cleaned) {
             return Err(GraphError::NumericWindowName(cleaned));
         }
         Ok(cleaned)
@@ -822,7 +822,7 @@ impl SessionGraph {
             window_id,
             session_id,
             title,
-            index: 0,
+            index: 1,
         });
         self.fire(EventData::PaneCreated {
             pane_id,
@@ -1022,7 +1022,7 @@ impl SessionGraph {
             s.windows.push(window_id);
             s.active_window = window_id;
             s.version += 1;
-            event_index = (s.windows.len() - 1) as u32;
+            event_index = s.windows.len() as u32;
         }
 
         self.commit_snapshot(snapshot);
@@ -2301,7 +2301,7 @@ fn stage_create_session(
             window_id,
             session_id,
             title,
-            index: 0,
+            index: 1,
         },
         EventData::PaneCreated {
             pane_id,
@@ -2354,7 +2354,7 @@ fn stage_create_window(
         s.windows.push(window_id);
         s.active_window = window_id;
         s.version += 1;
-        event_index = (s.windows.len() - 1) as u32;
+        event_index = s.windows.len() as u32;
     }
 
     let events = vec![
@@ -4339,7 +4339,7 @@ mod tests {
         assert_eq!(snap.windows.values().next().unwrap().title, "test");
     }
 
-    /// `-w N` selects the window at position N, so a name that is a number
+    /// `-w N` selects window number N, so a name that is a number
     /// would make `-w N` mean two windows (#142).
     #[test]
     fn a_window_name_cannot_be_a_number() {

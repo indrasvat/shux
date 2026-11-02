@@ -73,7 +73,8 @@ pub(crate) fn session_to_json(
     })
 }
 
-/// Build window info JSON from a Window.
+/// Build window info JSON from a Window. `index` is its 0-based place in the
+/// session; the JSON carries its number, counted from 1 like `-w`.
 pub(crate) fn window_to_json(
     w: &shux_core::model::Window,
     index: usize,
@@ -87,7 +88,7 @@ pub(crate) fn window_to_json(
         "title": w.title,
         "pane_count": pane_count,
         "active_pane_id": w.active_pane.to_string(),
-        "index": index,
+        "index": index + 1,
         "is_active": is_active,
         "version": w.version,
     })

@@ -170,9 +170,9 @@ pub enum EventData {
         window_id: WindowId,
         session_id: SessionId,
         title: String,
-        /// Position in the session's window list at creation time.
-        /// Plugins use this to render `[index]` prefixes without
-        /// having to call `window.list` for round-trip context.
+        /// The window's number in its session at creation, counted from 1 as
+        /// `window list`, `-w` and the status bar count. Plugins use this to
+        /// render `[index]` prefixes without a `window.list` round trip.
         index: u32,
     },
 

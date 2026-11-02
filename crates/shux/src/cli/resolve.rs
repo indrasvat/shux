@@ -252,7 +252,8 @@ pub fn ambiguous_ref_error(
 }
 
 /// Resolve a window specifier to (window_id, window_title): digits are a
-/// position, anything else an exact name; failing that, an id or id prefix.
+/// window's number (from 1), anything else an exact name; failing that, an id
+/// or id prefix.
 pub async fn resolve_window_id(
     stream: &mut tokio::net::UnixStream,
     session_id: &str,
@@ -275,10 +276,13 @@ pub async fn resolve_window_id(
     // script may pass the raw value straight from the template. Both have to
     // land on the same window, and digits after sanitizing are a position.
     let wanted = shux_core::model::sanitize_title(window_spec);
-    let found = if shux_core::model::is_window_position(&wanted) {
+    let position = shux_core::model::is_window_number(&wanted);
+    let found = if position {
+        // Numbered from 1, as `window list`, the status bar and Alt+N count.
         wanted
             .parse::<usize>()
             .ok()
+            .and_then(|n| n.checked_sub(1))
             .and_then(|idx| windows.get(idx))
     } else {
         windows
@@ -296,7 +300,17 @@ pub async fn resolve_window_id(
     // #120 the id half of that promise was not implemented, so a UUID read
     // out of `window list --format json` was rejected. Position and name are
     // tried first.
-    resolve_window_id_by_id(windows, window_spec)
+    resolve_window_id_by_id(windows, window_spec).map_err(|e| {
+        if position && wanted.bytes().all(|b| b == b'0') {
+            RpcClientError::Rpc {
+                code: -32004,
+                message: format!("there is no window {wanted}: windows are numbered from 1"),
+                data: None,
+            }
+        } else {
+            e
+        }
+    })
 }
 
 /// Match a window spec against the window ids in a `window.list` response.
@@ -720,8 +734,8 @@ mod tests {
     #[tokio::test]
     async fn window_specs_resolve_by_index_title_uuid_and_prefix() {
         let cases = [
-            ("0", "aaaa1111-1111-4111-8111-111111111111"),
-            ("1", "aaaa2222-2222-4222-8222-222222222222"),
+            ("1", "aaaa1111-1111-4111-8111-111111111111"),
+            ("2", "aaaa2222-2222-4222-8222-222222222222"),
             ("logs", "aaaa2222-2222-4222-8222-222222222222"),
             (
                 "aaaa2222-2222-4222-8222-222222222222",
