@@ -1,3 +1,10 @@
+## [0.55.5](https://github.com/indrasvat/shux/compare/v0.55.4...v0.55.5) (2026-11-02)
+
+
+### Bug Fixes
+
+* one number per window, zoom events that match the zoom, and no early-eof wedge ([#247](https://github.com/indrasvat/shux/issues/247)) ([0eb3ef4](https://github.com/indrasvat/shux/commit/0eb3ef4fc7dffca39cbf52c1e67428f47954efc5)), closes [#138](https://github.com/indrasvat/shux/issues/138) [#142](https://github.com/indrasvat/shux/issues/142) [#140](https://github.com/indrasvat/shux/issues/140)
+
 ## [0.55.4](https://github.com/indrasvat/shux/compare/v0.55.3...v0.55.4) (2026-11-01)
 
 
