@@ -270,17 +270,17 @@ pub async fn resolve_window_id(
         data: None,
     })?;
 
-    let found = if shux_core::model::is_window_position(window_spec) {
-        window_spec
+    // Titles are stored sanitized (issue #104), so normalize the selector the
+    // same way — the operator types what they see in `window list`, but a
+    // script may pass the raw value straight from the template. Both have to
+    // land on the same window, and digits after sanitizing are a position.
+    let wanted = shux_core::model::sanitize_title(window_spec);
+    let found = if shux_core::model::is_window_position(&wanted) {
+        wanted
             .parse::<usize>()
             .ok()
             .and_then(|idx| windows.get(idx))
     } else {
-        // Titles are stored sanitized (issue #104), so normalize the selector
-        // the same way — the operator types what they see in `window list`,
-        // but a script may pass the raw value straight from the template.
-        // Both have to land on the same window.
-        let wanted = shux_core::model::sanitize_title(window_spec);
         windows
             .iter()
             .find(|w| w.get("title").and_then(|v| v.as_str()) == Some(wanted.as_str()))
@@ -774,12 +774,16 @@ mod tests {
             {"id": "aaaa1111-1111-4111-8111-111111111111", "title": "5",
              "index": 0, "pane_count": 1, "is_active": true, "version": 1},
         ]);
-        let (mut client, requests, task) = spawn_rpc_script(vec![list]);
-        let err = resolve_window_id(&mut client, "sid", "5")
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("not found"), "{err}");
-        finish_rpc_script(client, task, requests).await;
+        // Names are compared sanitized, so digits that sanitize to the name are
+        // still a position.
+        for spec in ["5", "5 ", "\u{1b}5"] {
+            let (mut client, requests, task) = spawn_rpc_script(vec![list.clone()]);
+            let err = resolve_window_id(&mut client, "sid", spec)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("not found"), "{spec:?}: {err}");
+            finish_rpc_script(client, task, requests).await;
+        }
     }
 
     /// A numeric index that is out of range must fall through to the title and

@@ -221,13 +221,7 @@ impl SessionGraphSnapshot {
     ) -> String {
         let pane_title = Pane::with_command(WindowId::new(), cwd, command.to_vec()).title;
         let base = SessionGraph::validate_window_title(&pane_title)
-            .ok()
-            .map(|t| {
-                t.chars()
-                    .take(SessionGraph::MAX_WINDOW_TITLE_CHARS - 8)
-                    .collect()
-            })
-            .unwrap_or_else(|| "window".to_string());
+            .unwrap_or_else(|_| "window".to_string());
         std::iter::once(base.clone())
             .chain((2u32..).map(|n| format!("{base}-{n}")))
             .find(|t| !self.window_name_exists_in_session(session_id, t))
@@ -1413,9 +1407,8 @@ impl SessionGraph {
 
         let mut unzoomed = None;
         if let Some(w) = snapshot.windows.get_mut(&window_id) {
-            let zoomed = zoomed_pane(&w.layout);
+            unzoomed = zoomed_pane(&w.layout);
             w.layout.remove_pane(id);
-            unzoomed = zoomed.filter(|_| !w.layout.is_zoomed());
 
             if w.active_pane == id {
                 // Pick a remaining pane from the layout tree first, then fallback to HashMap
@@ -1852,14 +1845,13 @@ impl SessionGraph {
             .get_mut(&window_id)
             .ok_or(GraphError::WindowNotFound(window_id))?;
 
-        let zoomed = zoomed_pane(&window.layout);
+        let unzoomed = zoomed_pane(&window.layout);
         let ok = window
             .layout
             .split_pane(target_pane, new_pane_id, direction, ratio);
         if !ok {
             return Err(GraphError::LayoutError("split_pane failed".into()));
         }
-        let unzoomed = zoomed.filter(|_| !window.layout.is_zoomed());
 
         window.active_pane = new_pane_id;
         window.version += 1;
@@ -2386,7 +2378,6 @@ fn check_window_argv_budget(
     Ok(())
 }
 
-/// The pane a window's zoom shows, if it is zoomed.
 fn zoomed_pane(layout: &crate::layout::WindowLayout) -> Option<PaneId> {
     layout.zoom.as_ref().map(|z| z.zoomed_pane)
 }
@@ -2440,14 +2431,13 @@ fn stage_split_pane(
         .windows
         .get_mut(&window_id)
         .ok_or(GraphError::WindowNotFound(window_id))?;
-    let zoomed = zoomed_pane(&window.layout);
+    let unzoomed = zoomed_pane(&window.layout);
     let ok = window
         .layout
         .split_pane(target_pane, new_pane_id, direction, ratio);
     if !ok {
         return Err(GraphError::LayoutError("split_pane failed".into()));
     }
-    let unzoomed = zoomed.filter(|_| !window.layout.is_zoomed());
     window.active_pane = new_pane_id;
     window.version += 1;
 
