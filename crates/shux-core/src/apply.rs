@@ -67,7 +67,8 @@ pub enum Op {
         /// subscribers see what the pane is actually running.
         #[serde(default)]
         initial_command: Vec<String>,
-        /// Title for the auto-created initial window. None → default `"1"`.
+        /// Title for the auto-created initial window. None → named after what
+        /// it runs (`SessionGraphSnapshot::default_window_title`).
         /// Lets template lowering fold `windows[0]` into the session so
         /// `shux apply foo.toml` doesn't leave a phantom default-shell
         /// window behind the user's actual first window.

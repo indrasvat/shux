@@ -379,7 +379,7 @@ mod tests {
         )
         .await
         .unwrap();
-        handle_window_focus(&mut client, "dev", "0", None, OutputFormat::Json)
+        handle_window_focus(&mut client, "dev", "1", None, OutputFormat::Json)
             .await
             .unwrap();
         handle_window_reorder(&mut client, "dev", "main", 0, Some(4), OutputFormat::Json)

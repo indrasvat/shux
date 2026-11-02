@@ -123,7 +123,7 @@ Selected payload fields by event type (the part nested under
 | `session.created` | `session_id`, `name` |
 | `session.killed` | `session_id`, `name` |
 | `session.renamed` | `session_id`, `old_name`, `new_name` |
-| `window.created` | `window_id`, `session_id`, `title`, `index` |
+| `window.created` | `window_id`, `session_id`, `title`, `index` (the window's number, from 1) |
 | `window.renamed` | `window_id`, `old_title`, `new_title` |
 | `window.killed` | `window_id`, `session_id` |
 | `window.activated` | `window_id`, `session_id`, `previous_window_id` |
@@ -357,7 +357,7 @@ daemon — if you find a drift, that is a bug, file it.
 |---|---|---|
 | `window.rename` | `{"id": "<window UUID>", "name": "<new title>"}` | Returns the full updated window object: `{id, title, index, pane_count, is_active, active_pane_id, session_id, version}`. `name` is required and must be a non-null string — pass `null` and you get `invalid_params: "missing 'name' parameter"`. (To clear a manual override use `pane.set_title --clear` on a pane; windows have no manual-override-clear path.) |
 | `window.focus` | `{"id": "<window UUID>"}` | `{...window, previous_window_id: <UUID or null>}`. |
-| `window.list` | `{"session_id": "<session UUID>"}` | **Bare array** `[{id, title, index, pane_count, is_active, active_pane_id, session_id, version}, ...]` — NOT wrapped in `{windows: [...]}`. The window UUID field is `id`, not `window_id`. |
+| `window.list` | `{"session_id": "<session UUID>"}` | **Bare array** `[{id, title, index, pane_count, is_active, active_pane_id, session_id, version}, ...]` — NOT wrapped in `{windows: [...]}`. `index` is the window's number, counted from 1: what `-w`, the status bar and Alt+N use. The window UUID field is `id`, not `window_id`. |
 | `pane.send_keys` | `{"pane_id": "<UUID>", "text": "..."}` — or `data: "<base64>"` for control bytes. Accepts `session_id` / `window_id` instead of `pane_id` to target the resolved active pane (see chain below). | `{bytes_written, pane_id}`. |
 | `pane.set_size` | `{"pane_id": "<UUID>", "cols": 200, "rows": 60}` | `{pane_id, cols, rows}`. Synchronous — the next snapshot reflects the new dims. |
 | `pane.snapshot` | `{"pane_id": "<UUID>"}` | `{pane_id, png_base64, format, width, height, cols, rows, cell_width, cell_height}`. Capped at 16M pixels. |

@@ -661,6 +661,12 @@ fn is_default_ignorable(c: char) -> bool {
 /// and a very long title squeezes out the rest of the chrome.
 pub const MAX_TITLE_CHARS: usize = 64;
 
+/// Whether a window selector is a window number. `-w N` means window N,
+/// counted from 1, so no window may be named with digits alone.
+pub fn is_window_number(spec: &str) -> bool {
+    !spec.is_empty() && spec.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// Neutralize a title: drop every [`is_title_hostile`] character, then
 /// trim.
 ///

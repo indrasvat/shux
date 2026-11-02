@@ -265,7 +265,7 @@ fn window_rename_with_escape_argument_prints_inert_confirmation() {
 
     let out = env
         .shux()
-        .args(["window", "rename", "-s", "wr", "-w", "0", "--name"])
+        .args(["window", "rename", "-s", "wr", "-w", "1", "--name"])
         .arg(OSC_PAYLOAD)
         .output()
         .expect("spawn");
@@ -291,7 +291,7 @@ fn window_focus_prints_inert_title() {
         "base",
         &hostile_template("wf", "\\u001B]0;PWNED\\u0007deploy"),
     );
-    let out = env.run(&["window", "focus", "-s", "wf", "-w", "0"]);
+    let out = env.run(&["window", "focus", "-s", "wf", "-w", "1"]);
     assert_output_inert("window focus", &out);
 }
 
@@ -308,7 +308,7 @@ fn title_that_sanitizes_to_empty_is_rejected_not_stored() {
     for hostile in ["\u{1b}\u{7}", "\u{9b}", "\u{202e}\u{2028}"] {
         let out = env
             .shux()
-            .args(["window", "rename", "-s", "empt", "-w", "0", "--name"])
+            .args(["window", "rename", "-s", "empt", "-w", "1", "--name"])
             .arg(hostile)
             .output()
             .expect("spawn");

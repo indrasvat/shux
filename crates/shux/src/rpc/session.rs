@@ -592,10 +592,10 @@ mod tests {
         let reordered = dispatch_ok(
             &harness.router,
             "window.reorder",
-            serde_json::json!({"id": second_window.to_string(), "new_index": 0}),
+            serde_json::json!({"id": second_window.to_string(), "new_index": 1}),
         )
         .await;
-        assert_eq!(reordered["index"], 0);
+        assert_eq!(reordered["index"], 1);
 
         let panes = dispatch_ok(
             &harness.router,

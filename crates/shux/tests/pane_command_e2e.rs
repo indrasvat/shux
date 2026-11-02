@@ -443,7 +443,7 @@ fn trailing_argv_is_exec_d_directly_with_no_shell_interpretation() {
     let pane = env.first_pane("argv");
     env.expect_screen("argv", &pane, "a b;c", &[]);
 
-    let panes = env.panes("argv", "0");
+    let panes = env.panes("argv", "1");
     assert_eq!(
         panes[0].1[0], "sh",
         "argv[0] should be the program, verbatim"
@@ -556,7 +556,7 @@ fn pane_split_accepts_a_shell_string_and_records_what_it_ran() {
     .to_string();
     env.rpc_ok("pane.split", &params);
 
-    let panes = env.panes("split", "0");
+    let panes = env.panes("split", "1");
     let split = panes
         .iter()
         .find(|(id, _)| *id != first)
@@ -663,7 +663,7 @@ fn an_empty_cmd_opens_the_default_shell() {
     let mut env = Env::new();
     env.ok(&["session", "create", "blank", "-d", "--cmd", ""]);
     env.sessions.push("blank".to_string());
-    let panes = env.panes("blank", "0");
+    let panes = env.panes("blank", "1");
     assert!(
         panes[0].1.is_empty(),
         "empty --cmd should leave the pane command unset, got {:?}",
@@ -703,7 +703,7 @@ fn the_pane_title_names_the_program_not_the_shell() {
 fn pane_list_reports_the_argv_that_is_actually_running() {
     let mut env = Env::new();
     env.session_with_cmd("listed", &format!("{}; echo LISTED", probe()));
-    let panes = env.panes("listed", "0");
+    let panes = env.panes("listed", "1");
     let cmd = &panes[0].1;
     assert_eq!(cmd[0], "/bin/sh", "{cmd:?}");
     assert_eq!(cmd[1], "-c", "{cmd:?}");
@@ -861,7 +861,7 @@ fn a_failed_spawn_leaves_no_phantom_window_or_pane() {
         .as_array()
         .map(Vec::len)
         .unwrap_or(0);
-    let panes_before = env.panes("host", "0").len();
+    let panes_before = env.panes("host", "1").len();
 
     let bad = serde_json::json!(["no-such-binary-xyz"]);
     for (method, extra) in [
@@ -889,7 +889,7 @@ fn a_failed_spawn_leaves_no_phantom_window_or_pane() {
         "a failed window spawn left a window behind"
     );
     assert_eq!(
-        env.panes("host", "0").len(),
+        env.panes("host", "1").len(),
         panes_before,
         "a failed split left a pane behind"
     );
@@ -937,7 +937,7 @@ fn pane_split_cli_accepts_a_shell_command_and_trailing_argv() {
         "--cmd",
         &format!("{}; echo 'split by cmd'{PARK}", probe()),
     ]);
-    let panes = env.panes("splitcli", "0");
+    let panes = env.panes("splitcli", "1");
     let split = panes
         .iter()
         .find(|(id, _)| *id != first)
@@ -1013,7 +1013,7 @@ fn a_cmd_starting_with_a_hyphen_is_taken_as_the_command_not_a_flag() {
     assert!(out.status.success(), "{joined}");
     env.sessions.push("hyphen".to_string());
 
-    let panes = env.panes("hyphen", "0");
+    let panes = env.panes("hyphen", "1");
     assert_eq!(
         panes[0].1.get(2).map(String::as_str),
         Some(script),
@@ -1554,8 +1554,8 @@ fn a_template_may_leave_its_first_window_title_blank() {
     let windows = env.json(&["window", "list", "-s", "blanktitle"]);
     assert_eq!(
         windows[0]["title"].as_str(),
-        Some("1"),
-        "a blank title should fall back to the default `1`: {windows}"
+        Some("sleep"),
+        "a blank title should fall back to what the window runs: {windows}"
     );
 }
 
@@ -1976,4 +1976,117 @@ fn state_apply_spawn_failures_carry_the_same_diagnosis_as_the_rpcs() {
         joined.contains("not an executable file"),
         "a directory as argv[0] got no useful diagnosis:\n{joined}"
     );
+}
+
+/// #140: `pane.list` echoes every pane's argv and cwd, and `state.apply` keeps
+/// a pane whose spawn failed, so enough large argvs or cwds pushed one
+/// window's listing past the 16 MiB frame and every read of it died with
+/// `early eof`. A session's commands and directories are now bounded in
+/// total: the apply that would cross the bound is refused, saying why, and
+/// the session stays readable.
+#[test]
+fn a_session_full_of_large_argvs_or_cwds_stays_listable() {
+    let mut env = Env::new();
+    let big = "x".repeat(130_000);
+    let long_dir = format!("/nonexistent/{}", "c".repeat(3_000_000));
+    let cases = [
+        (
+            "wedgeargv",
+            serde_json::json!({"command": ["no-such-binary-zzz", big, big]}),
+        ),
+        ("wedgecwd", serde_json::json!({"cwd": long_dir})),
+    ];
+    for (session, extra) in cases {
+        env.ok(&["session", "create", session, "-d", "--", "sleep", "900"]);
+        env.sessions.push(session.to_string());
+        let mut op = serde_json::json!({
+            "op": "split_pane", "target": env.first_pane(session),
+            "direction": "vertical", "ratio": 0.5,
+        });
+        op.as_object_mut()
+            .expect("op object")
+            .extend(extra.as_object().expect("extra object").clone());
+        let params = env.work().join(format!("{session}.json"));
+        std::fs::write(&params, serde_json::json!({"ops": [op]}).to_string()).unwrap();
+        let params = format!("@{}", params.display());
+
+        let refusals: Vec<String> = (0..70)
+            .map(|_| env.rpc("state.apply", &params))
+            .filter(|out| !out.status.success())
+            .map(|out| {
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                )
+            })
+            .collect();
+
+        let listed = env.run(&["--format", "json", "pane", "list", "-s", session]);
+        assert!(
+            listed.status.success(),
+            "{session}: pane list failed after 70 large applies: {}",
+            String::from_utf8_lossy(&listed.stderr)
+        );
+        let refusal = refusals.first().expect("every large apply was accepted");
+        assert!(
+            refusal.contains("limit for one session"),
+            "{session}: {refusal}"
+        );
+    }
+}
+
+/// A session's pane limit also bounds how deep repeated splits nest; past
+/// about 4,000 levels the daemon overflowed its stack and took every session
+/// down with it. At the limit, listing, snapshotting and saving still work.
+#[test]
+fn a_session_at_its_pane_limit_stays_usable() {
+    let mut env = Env::new();
+    env.ok(&["session", "create", "deep", "-d", "--", "sleep", "900"]);
+    env.sessions.push("deep".to_string());
+    let split = |target: serde_json::Value| {
+        serde_json::json!({"op": "split_pane", "target": target, "direction": "vertical",
+                           "ratio": 0.5, "command": ["no-such-binary-zzz"]})
+    };
+    let first = serde_json::json!(env.first_pane("deep"));
+    let ops: Vec<serde_json::Value> = std::iter::once(split(first))
+        .chain((0..1022).map(|i| split(serde_json::json!({"ref_op": i}))))
+        .collect();
+    let params = env.work().join("deep.json");
+    std::fs::write(&params, serde_json::json!({ "ops": ops }).to_string()).unwrap();
+    env.rpc_ok("state.apply", &format!("@{}", params.display()));
+
+    let panes = env.json(&["pane", "list", "-s", "deep"]);
+    assert_eq!(panes.as_array().map(Vec::len), Some(1024));
+    let last = panes
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|p| p["id"].as_str())
+        .next_back()
+        .unwrap()
+        .to_string();
+    let refused = env.rpc_rejected(
+        "pane.split",
+        &serde_json::json!({"pane_id": last, "command": ["true"]}).to_string(),
+    );
+    assert!(refused.contains("at most 1024 panes"), "{refused}");
+
+    env.ok(&[
+        "session",
+        "snapshot",
+        "-s",
+        "deep",
+        "--output",
+        env.work().join("deep.png").to_str().unwrap(),
+    ]);
+    env.ok(&[
+        "session",
+        "save",
+        "-s",
+        "deep",
+        "--output",
+        env.work().join("deep.toml").to_str().unwrap(),
+    ]);
+    env.ok(&["daemon", "status"]);
 }

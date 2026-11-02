@@ -332,11 +332,18 @@ pub(crate) fn register_window_methods(
                     let params = params.unwrap_or_default();
                     let window_id = resolve_window_ref(&gh, required_str(&params, "id")?, "id")?;
 
+                    // Windows are numbered from 1, so `new_index` is too.
                     let new_index = params
                         .get("new_index")
                         .and_then(|v| v.as_u64())
                         .ok_or_else(|| {
                             shux_rpc::RpcError::invalid_params("missing 'new_index' parameter")
+                        })?
+                        .checked_sub(1)
+                        .ok_or_else(|| {
+                            shux_rpc::RpcError::invalid_params(
+                                "'new_index' is a window number, counted from 1",
+                            )
                         })? as usize;
 
                     let expected_version = parse_expected_version(&params)?;

@@ -826,7 +826,7 @@ pub(crate) struct NewWindow {
 
 /// Creating a window focuses it, and destroying one focuses the session's
 /// first window, so a failed create has to hand focus back itself. `title`
-/// `None` takes the lowest index not already a window name in the session.
+/// `None` takes the session's default name for what the window runs.
 fn create_in(
     g: &shux_core::graph::SessionGraph,
     session: shux_core::model::SessionId,
@@ -835,13 +835,7 @@ fn create_in(
     command: Vec<String>,
 ) -> Result<NewWindow, shux_core::graph::GraphError> {
     let snap = g.current();
-    let title = title.unwrap_or_else(|| {
-        let count = snap.sessions.get(&session).map_or(0, |s| s.windows.len());
-        (count..)
-            .map(|idx| idx.to_string())
-            .find(|t| !snap.window_name_exists_in_session(&session, t))
-            .unwrap_or_default()
-    });
+    let title = title.unwrap_or_else(|| snap.default_window_title(&session, &command, &cwd));
     let prior_focus = snap.sessions.get(&session).map(|s| s.active_window);
     let window = g.create_window_with_command(session, title, cwd, command)?;
     let pane = g
@@ -2459,7 +2453,7 @@ mod tests {
         .await;
         let dup = dup.await.expect("create dup");
 
-        assert_eq!(titles(&h, session), ["1", "dup"]);
+        assert_eq!(titles(&h, session), ["bash", "dup"]);
         assert_eq!(ensured["created"], false);
         assert_eq!(ensured["id"], dup.to_string());
         h.stop().await;
@@ -2473,7 +2467,7 @@ mod tests {
         let (session, _, _) = h.seed_session("name-race").await;
         let taken = queue(h.graph.create_window_with_command(
             session,
-            "2".into(),
+            "true".into(),
             "/tmp".into(),
             Vec::new(),
         ))
@@ -2484,9 +2478,10 @@ mod tests {
             serde_json::json!({ "session_id": session.to_string(), "command": ["true"] }),
         )
         .await;
-        taken.await.expect("create 2");
+        taken.await.expect("create `true`");
 
-        assert_eq!(titles(&h, session), ["1", "2", "3"]);
+        let titles = titles(&h, session);
+        assert_eq!(titles, ["bash", "true", "true-2"]);
         h.stop().await;
     }
 

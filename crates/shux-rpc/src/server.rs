@@ -634,8 +634,9 @@ where
                     process_frame(data, &router),
                 ) => response,
             };
-            let response_bytes = serde_json::to_vec(&response)?;
-            framed_tx.send(Bytes::from(response_bytes)).await?;
+            framed_tx
+                .send(Bytes::from(encode_response(&response)?))
+                .await?;
         }
         Ok(())
     }
@@ -651,6 +652,26 @@ where
         let _ = task.await;
     }
     result
+}
+
+/// Serialize a response. One too big for a frame is replaced by an error with
+/// the same id, so the caller learns why instead of reading a bare EOF; the
+/// method has already run. A replacement that still cannot fit (an id near the
+/// frame limit) fails, which closes the connection.
+fn encode_response(
+    response: &JsonRpcResponse,
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let bytes = serde_json::to_vec(response)?;
+    if bytes.len() <= MAX_FRAME_SIZE {
+        return Ok(bytes);
+    }
+    warn!(size = bytes.len(), "response exceeds the frame limit");
+    let error = RpcError::response_too_large(bytes.len(), MAX_FRAME_SIZE);
+    let bytes = serde_json::to_vec(&JsonRpcResponse::error(response.id.clone(), error))?;
+    if bytes.len() > MAX_FRAME_SIZE {
+        return Err("response and its replacement error both exceed the frame limit".into());
+    }
+    Ok(bytes)
 }
 
 /// Process a single frame: parse JSON-RPC, dispatch, return response. The
@@ -1925,6 +1946,48 @@ mod tests {
              detection after a decode error (codex P3 round-5)",
             );
         assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), serve).await;
+    }
+
+    /// A response too big for one frame comes back as an error carrying the
+    /// request's id, and the connection stays usable — not a bare EOF (#140).
+    #[tokio::test]
+    async fn an_oversized_response_becomes_an_error_on_a_live_connection() {
+        let router = register_builtin_methods(Router::builder())
+            .register("test.huge", |_: Option<serde_json::Value>| async {
+                Ok(serde_json::json!("x".repeat(MAX_FRAME_SIZE)))
+            })
+            .register("test.small", |_: Option<serde_json::Value>| async {
+                Ok(serde_json::json!("ok"))
+            })
+            .build();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (client, server) = UnixStream::pair().unwrap();
+        let serve = spawn_monitorless_connection(server, router, cancel.clone());
+        let mut framed = Framed::new(client, create_codec());
+
+        let mut next = async |request: serde_json::Value| {
+            framed.send(frame_bytes(&request)).await.unwrap();
+            let frame = tokio::time::timeout(shux_testkit::BUDGET, framed.next())
+                .await
+                .expect("no response")
+                .expect("the server closed the connection")
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&frame).unwrap()
+        };
+        for id in [serde_json::json!(7), serde_json::json!("seven")] {
+            let resp =
+                next(serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "test.huge"})).await;
+            assert_eq!(resp["id"], id, "{resp}");
+            assert_eq!(resp["error"]["code"], -32001, "{resp}");
+            let detail = resp["error"]["data"]["detail"].as_str().unwrap_or_default();
+            assert!(detail.contains("response"), "{resp}");
+        }
+        let resp =
+            next(serde_json::json!({"jsonrpc": "2.0", "id": 8, "method": "test.small"})).await;
+        assert_eq!(resp["result"], "ok", "{resp}");
 
         cancel.cancel();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), serve).await;

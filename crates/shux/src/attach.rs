@@ -4062,17 +4062,10 @@ async fn new_window(
     session: &Arc<Mutex<AttachedSession>>,
 ) -> anyhow::Result<()> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
-    let snap = graph.snapshot();
-    let count = snap
-        .sessions
-        .get(&attached.session_id)
-        .map(|s| s.windows.len())
-        .unwrap_or(0);
-    let title = format!("window-{}", count + 1);
     let created = crate::pane_spawn::create_window_noting_focus(
         graph,
         attached.session_id,
-        Some(title),
+        None,
         cwd.clone(),
         Vec::new(),
     )

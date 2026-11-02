@@ -326,7 +326,7 @@ fn a_shell_wrapped_cmd_pane_prints_its_script_as_one_argument() {
 /// that returned on the echo. Pin both halves by execution, not by eye.
 #[test]
 fn the_completion_marker_cannot_be_satisfied_by_the_echoed_line() {
-    let typed = line_with_completion_marker("shux pane list -s s -w 0 --format text");
+    let typed = line_with_completion_marker("shux pane list -s s -w 1 --format text");
     assert!(
         !typed.contains(DONE_MARKER),
         "the echoed line contains {DONE_MARKER:?} verbatim, so the wait would \
@@ -357,11 +357,11 @@ fn text_plain_and_json_agree_about_every_pane() {
     // A window to read the text arm from, since text needs a real TTY.
     env.ok(&["window", "create", "-s", &s, "-n", "viewer"]);
 
-    let json = env.json(&["pane", "list", "-s", &s, "-w", "0"]);
+    let json = env.json(&["pane", "list", "-s", &s, "-w", "1"]);
     let panes = json.as_array().expect("array");
     assert_eq!(panes.len(), 2, "set-up: {json}");
 
-    let plain = env.ok(&["--format", "plain", "pane", "list", "-s", &s, "-w", "0"]);
+    let plain = env.ok(&["--format", "plain", "pane", "list", "-s", &s, "-w", "1"]);
     let rows = plain_rows(&plain);
     assert_eq!(rows.len(), panes.len());
 
@@ -385,7 +385,7 @@ fn text_plain_and_json_agree_about_every_pane() {
         "--rows",
         "24",
     ]);
-    let cmd = format!("{} pane list -s {s} -w 0 --format text", env.bin_str());
+    let cmd = format!("{} pane list -s {s} -w 1 --format text", env.bin_str());
     let screen = env.run_line_and_wait(&s, "viewer", &cmd);
     let header = screen
         .lines()
