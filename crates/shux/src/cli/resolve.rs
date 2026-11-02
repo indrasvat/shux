@@ -252,7 +252,7 @@ pub fn ambiguous_ref_error(
 }
 
 /// Resolve a window specifier to (window_id, window_title): digits are a
-/// position, anything else an exact name; either may also be an id.
+/// position, anything else an exact name; failing that, an id or id prefix.
 pub async fn resolve_window_id(
     stream: &mut tokio::net::UnixStream,
     session_id: &str,
@@ -784,6 +784,21 @@ mod tests {
             assert!(err.to_string().contains("not found"), "{spec:?}: {err}");
             finish_rpc_script(client, task, requests).await;
         }
+    }
+
+    /// Digits that are no position may still be an id prefix: `window list`
+    /// prints short ids, and some are all digits. Positions and prefixes cannot
+    /// meet below 1000 windows, since a prefix is at least four characters.
+    #[tokio::test]
+    async fn digits_that_are_no_position_can_still_be_an_id_prefix() {
+        let list = serde_json::json!([
+            {"id": "12341111-1111-4111-8111-111111111111", "title": "build",
+             "index": 0, "pane_count": 1, "is_active": true, "version": 1},
+        ]);
+        let (mut client, requests, task) = spawn_rpc_script(vec![list]);
+        let (id, _) = resolve_window_id(&mut client, "sid", "1234").await.unwrap();
+        assert_eq!(id, "12341111-1111-4111-8111-111111111111");
+        finish_rpc_script(client, task, requests).await;
     }
 
     /// A numeric index that is out of range must fall through to the title and

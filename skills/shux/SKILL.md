@@ -392,9 +392,10 @@ Full protocol — handshake, event payload shape, RPC-out direction,
   Every OTHER verb uses `-s/--session` (+ optional `-w/--window`, `-p/--pane`) and returns
   its payload **bare** — but "bare" still means each verb's own RPC shape, not one uniform
   list shape.
-  - `-w` digits are always a **position**, counted from 0 as `window list` prints it;
-    anything else is a window **name** or id. Names are never numbers: an unnamed window
-    is called after what it runs (`nvim`, then `nvim-2`), and `--name 3` is refused.
+  - `-w` digits are a **position**, counted from 0 as `window list` prints it, and never a
+    name; anything else is a window **name**. Either, failing that, may be an id or a 4+
+    character id prefix. Names are never numbers: an unnamed window is called after what it
+    runs (`nvim`, then `nvim-2`), and `--name 3` is refused.
   - `session create --format json` returns a session object: `jq -r .id` for the session,
     `jq -r .window_id` for the first window, `jq -r .pane_id` for the first pane. There is
     no `.session_id` field.
