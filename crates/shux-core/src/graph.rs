@@ -988,6 +988,9 @@ impl SessionGraph {
         if !current.sessions.contains_key(&session_id) {
             return Err(GraphError::SessionNotFound(session_id));
         }
+        if current.window_name_exists_in_session(&session_id, &title) {
+            return Err(GraphError::WindowNameConflict(title));
+        }
 
         let mut snapshot = (*current).clone();
         snapshot.version += 1;
@@ -2073,8 +2076,13 @@ impl SessionGraph {
             .get_mut(&window_id)
             .ok_or(GraphError::WindowNotFound(window_id))?;
 
+        let was_zoomed = zoomed_pane(&window.layout);
         window.layout.toggle_zoom(id);
-        let is_zoomed = window.layout.is_zoomed();
+        let now_zoomed = zoomed_pane(&window.layout);
+        if was_zoomed == now_zoomed {
+            return Ok(now_zoomed.is_some());
+        }
+        let is_zoomed = now_zoomed.is_some();
         window.version += 1;
         // A zoom shows only `id`, so input goes to it (tmux does the same).
         let previous_focus = (is_zoomed && window.active_pane != id)
@@ -2096,12 +2104,15 @@ impl SessionGraph {
         }
 
         self.commit_snapshot(snapshot);
-        self.fire(EventData::PaneZoomed {
-            pane_id: id,
-            window_id,
-            session_id,
-            zoomed: is_zoomed,
-        });
+        self.fire_unzoomed(was_zoomed, window_id, session_id);
+        if let Some(pane_id) = now_zoomed {
+            self.fire(EventData::PaneZoomed {
+                pane_id,
+                window_id,
+                session_id,
+                zoomed: true,
+            });
+        }
         if let Some(previous) = previous_focus {
             self.fire(EventData::PaneFocused {
                 pane_id: id,
@@ -2304,6 +2315,9 @@ fn stage_create_window(
     }
     // Sanitize then validate — see `SessionGraph::validate_window_title`.
     let title = SessionGraph::validate_window_title(&title)?;
+    if snapshot.window_name_exists_in_session(&session_id, &title) {
+        return Err(GraphError::WindowNameConflict(title));
+    }
     snapshot.version += 1;
 
     let pane_id = PaneId::new();
@@ -4399,6 +4413,68 @@ mod tests {
             matches!(err, GraphError::WindowArgvBudget { .. }),
             "{err:?}"
         );
+    }
+
+    /// Zooming B while A is zoomed takes A's zoom away, so A's `true` is
+    /// retracted before B's is announced (#138).
+    #[test]
+    fn zooming_another_pane_retracts_the_first_zoom() {
+        let bus = crate::bus::EventBus::new();
+        let (graph, state) = SessionGraph::new_with_event_bus(Some(bus.clone()));
+        let sid = graph.create_session("w".into(), home()).unwrap();
+        let wid = state.load().sessions[&sid].windows[0];
+        let a = state.load().windows[&wid].active_pane;
+        let b = graph.split_pane(a, Direction::Vertical, 0.5).unwrap();
+        assert!(graph.zoom_pane(a, None).unwrap());
+        let before = bus.history(1000).len();
+        assert!(graph.zoom_pane(b, None).unwrap());
+        let after = bus.history(1000).split_off(before);
+        let zoomed = |pane: PaneId, on: bool| {
+            after.iter().position(|e| {
+                matches!(e.data, EventData::PaneZoomed { pane_id, zoomed, .. }
+                    if pane_id == pane && zoomed == on)
+            })
+        };
+        let seen: Vec<_> = after.iter().map(|e| e.data.event_type()).collect();
+        assert!(
+            matches!((zoomed(a, false), zoomed(b, true)), (Some(off), Some(on)) if off < on),
+            "{seen:?}"
+        );
+    }
+
+    /// Zooming the only pane of a window changes nothing, so it says nothing.
+    #[test]
+    fn zooming_a_lone_pane_publishes_nothing() {
+        let bus = crate::bus::EventBus::new();
+        let (graph, state) = SessionGraph::new_with_event_bus(Some(bus.clone()));
+        let sid = graph.create_session("w".into(), home()).unwrap();
+        let a = state.load().windows[&state.load().sessions[&sid].windows[0]].active_pane;
+        let before = bus.history(1000).len();
+        assert!(!graph.zoom_pane(a, None).unwrap());
+        assert_eq!(bus.history(1000).len(), before, "a no-op zoom published");
+    }
+
+    /// A window name is a lookup key, so a new window cannot take one in use
+    /// — not least a default name like `sleep` (#142).
+    #[test]
+    fn a_new_window_cannot_take_a_name_already_in_use() {
+        let (graph, _state) = SessionGraph::new();
+        let sid = graph
+            .create_session_with_command("s".into(), home(), vec!["sleep".into()])
+            .unwrap();
+        let err = graph
+            .create_window_with_command(sid, "sleep".into(), home(), vec!["cat".into()])
+            .unwrap_err();
+        assert!(matches!(err, GraphError::WindowNameConflict(_)), "{err:?}");
+        let err = graph
+            .apply_batch(vec![crate::apply::Op::CreateWindow {
+                session: crate::apply::SessionRef::Id(sid),
+                title: "sleep".into(),
+                cwd: None,
+                initial_command: vec![],
+            }])
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("WindowNameConflict"), "{err:?}");
     }
 
     /// The bound is in characters, matching what the error message says.
