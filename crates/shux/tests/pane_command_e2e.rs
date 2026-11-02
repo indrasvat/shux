@@ -1978,42 +1978,115 @@ fn state_apply_spawn_failures_carry_the_same_diagnosis_as_the_rpcs() {
     );
 }
 
-/// #140: `pane.list` echoes every pane's argv, and `state.apply` keeps a pane
-/// whose spawn failed, so enough large argvs pushed one window's listing past
-/// the 16 MiB frame and every read of it died with `early eof`. A window's
-/// argvs are now bounded in total: the apply that would cross the bound is
-/// refused, saying why, and the window stays readable.
+/// #140: `pane.list` echoes every pane's argv and cwd, and `state.apply` keeps
+/// a pane whose spawn failed, so enough large argvs or cwds pushed one
+/// window's listing past the 16 MiB frame and every read of it died with
+/// `early eof`. A session's commands and directories are now bounded in
+/// total: the apply that would cross the bound is refused, saying why, and
+/// the session stays readable.
 #[test]
-fn a_window_full_of_large_argvs_stays_listable() {
+fn a_session_full_of_large_argvs_or_cwds_stays_listable() {
     let mut env = Env::new();
-    env.ok(&["session", "create", "wedge", "-d", "--", "sleep", "900"]);
-    env.sessions.push("wedge".to_string());
-    let first = env.first_pane("wedge");
     let big = "x".repeat(130_000);
-    let op = serde_json::json!({"ops": [{
-        "op": "split_pane", "target": first, "direction": "vertical", "ratio": 0.5,
-        "command": ["no-such-binary-zzz", big, big],
-    }]})
-    .to_string();
+    let long_dir = format!("/nonexistent/{}", "c".repeat(3_000_000));
+    let cases = [
+        (
+            "wedgeargv",
+            serde_json::json!({"command": ["no-such-binary-zzz", big, big]}),
+        ),
+        ("wedgecwd", serde_json::json!({"cwd": long_dir})),
+    ];
+    for (session, extra) in cases {
+        env.ok(&["session", "create", session, "-d", "--", "sleep", "900"]);
+        env.sessions.push(session.to_string());
+        let mut op = serde_json::json!({
+            "op": "split_pane", "target": env.first_pane(session),
+            "direction": "vertical", "ratio": 0.5,
+        });
+        op.as_object_mut()
+            .expect("op object")
+            .extend(extra.as_object().expect("extra object").clone());
+        let params = env.work().join(format!("{session}.json"));
+        std::fs::write(&params, serde_json::json!({"ops": [op]}).to_string()).unwrap();
+        let params = format!("@{}", params.display());
 
-    let refusals: Vec<String> = (0..70)
-        .map(|_| env.rpc("state.apply", &op))
-        .filter(|out| !out.status.success())
-        .map(|out| {
-            format!(
-                "{}{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            )
-        })
+        let refusals: Vec<String> = (0..70)
+            .map(|_| env.rpc("state.apply", &params))
+            .filter(|out| !out.status.success())
+            .map(|out| {
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                )
+            })
+            .collect();
+
+        let listed = env.run(&["--format", "json", "pane", "list", "-s", session]);
+        assert!(
+            listed.status.success(),
+            "{session}: pane list failed after 70 large applies: {}",
+            String::from_utf8_lossy(&listed.stderr)
+        );
+        let refusal = refusals.first().expect("every large apply was accepted");
+        assert!(
+            refusal.contains("limit for one session"),
+            "{session}: {refusal}"
+        );
+    }
+}
+
+/// A session's pane limit also bounds how deep repeated splits nest; past
+/// about 4,000 levels the daemon overflowed its stack and took every session
+/// down with it. At the limit, listing, snapshotting and saving still work.
+#[test]
+fn a_session_at_its_pane_limit_stays_usable() {
+    let mut env = Env::new();
+    env.ok(&["session", "create", "deep", "-d", "--", "sleep", "900"]);
+    env.sessions.push("deep".to_string());
+    let split = |target: serde_json::Value| {
+        serde_json::json!({"op": "split_pane", "target": target, "direction": "vertical",
+                           "ratio": 0.5, "command": ["no-such-binary-zzz"]})
+    };
+    let first = serde_json::json!(env.first_pane("deep"));
+    let ops: Vec<serde_json::Value> = std::iter::once(split(first))
+        .chain((0..1022).map(|i| split(serde_json::json!({"ref_op": i}))))
         .collect();
+    let params = env.work().join("deep.json");
+    std::fs::write(&params, serde_json::json!({ "ops": ops }).to_string()).unwrap();
+    env.rpc_ok("state.apply", &format!("@{}", params.display()));
 
-    let listed = env.run(&["--format", "json", "pane", "list", "-s", "wedge"]);
-    assert!(
-        listed.status.success(),
-        "pane list failed after 70 large-argv applies: {}",
-        String::from_utf8_lossy(&listed.stderr)
+    let panes = env.json(&["pane", "list", "-s", "deep"]);
+    assert_eq!(panes.as_array().map(Vec::len), Some(1024));
+    let last = panes
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|p| p["id"].as_str())
+        .next_back()
+        .unwrap()
+        .to_string();
+    let refused = env.rpc_rejected(
+        "pane.split",
+        &serde_json::json!({"pane_id": last, "command": ["true"]}).to_string(),
     );
-    let refusal = refusals.first().expect("every 260 KB argv was accepted");
-    assert!(refusal.contains("limit for one window"), "{refusal}");
+    assert!(refused.contains("at most 1024 panes"), "{refused}");
+
+    env.ok(&[
+        "session",
+        "snapshot",
+        "-s",
+        "deep",
+        "--output",
+        env.work().join("deep.png").to_str().unwrap(),
+    ]);
+    env.ok(&[
+        "session",
+        "save",
+        "-s",
+        "deep",
+        "--output",
+        env.work().join("deep.toml").to_str().unwrap(),
+    ]);
+    env.ok(&["daemon", "status"]);
 }

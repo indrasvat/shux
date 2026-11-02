@@ -217,7 +217,7 @@ impl RpcError {
                 "detail": format!("the response is {size} bytes, past the {max}-byte frame limit"),
                 "size": size,
                 "max_size": max,
-                "hint": "ask for less: one window, one pane, or fewer events"
+                "hint": "ask for less, e.g. fewer events with `events history -n`"
             }),
         )
     }

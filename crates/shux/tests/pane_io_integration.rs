@@ -145,7 +145,8 @@ fn graph_error_to_rpc(e: shux_core::graph::GraphError) -> shux_rpc::RpcError {
         GraphError::EmptyWindowName
         | GraphError::WindowNameTooLong(_)
         | GraphError::NumericWindowName(_)
-        | GraphError::WindowArgvBudget { .. }
+        | GraphError::SessionPaneBytes { .. }
+        | GraphError::SessionPaneLimit { .. }
         | GraphError::WindowIndexOutOfRange { .. } => {
             shux_rpc::RpcError::invalid_params(&e.to_string())
         }

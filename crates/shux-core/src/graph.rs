@@ -78,14 +78,17 @@ pub enum GraphError {
     NumericWindowName(String),
 
     #[error(
-        "this window's panes already hold {used} bytes of commands, and {adding} more would \
-         pass the {budget}-byte limit for one window; put this pane in a new window"
+        "this session's panes already hold {used} bytes of commands and directories, and \
+         {adding} more would pass the {budget}-byte limit for one session"
     )]
-    WindowArgvBudget {
+    SessionPaneBytes {
         used: usize,
         adding: usize,
         budget: usize,
     },
+
+    #[error("a session holds at most {max} panes")]
+    SessionPaneLimit { max: usize },
 
     #[error("window index {index} out of range (session has {count} windows)")]
     WindowIndexOutOfRange { index: usize, count: usize },
@@ -776,6 +779,7 @@ impl SessionGraph {
         if current.session_name_exists(&name) {
             return Err(GraphError::SessionNameExists(name));
         }
+        check_session_capacity(&current, SessionId::new(), &command, &cwd)?;
 
         let mut snapshot = (*current).clone();
         snapshot.version += 1;
@@ -991,6 +995,7 @@ impl SessionGraph {
         if current.window_name_exists_in_session(&session_id, &title) {
             return Err(GraphError::WindowNameConflict(title));
         }
+        check_session_capacity(&current, session_id, &command, &cwd)?;
 
         let mut snapshot = (*current).clone();
         snapshot.version += 1;
@@ -1312,7 +1317,8 @@ impl SessionGraph {
         if !current.windows.contains_key(&window_id) {
             return Err(GraphError::WindowNotFound(window_id));
         }
-        check_window_argv_budget(&current, window_id, &command)?;
+        let session = current.windows[&window_id].session_id;
+        check_session_capacity(&current, session, &command, &cwd)?;
 
         let mut snapshot = (*current).clone();
         snapshot.version += 1;
@@ -1825,13 +1831,18 @@ impl SessionGraph {
         command: Vec<String>,
     ) -> Result<PaneId, GraphError> {
         let (current, window_id) = self.find_pane_window(target_pane)?;
-        check_window_argv_budget(&current, window_id, &command)?;
 
         let target = current
             .panes
             .get(&target_pane)
             // Safe: find_pane_window just verified it exists
             .unwrap();
+        let session = current
+            .windows
+            .get(&window_id)
+            .ok_or(GraphError::WindowNotFound(window_id))?
+            .session_id;
+        check_session_capacity(&current, session, &command, &target.cwd)?;
 
         let mut snapshot = (*current).clone();
         snapshot.version += 1;
@@ -2242,6 +2253,7 @@ fn stage_create_session(
     if snapshot.session_name_exists(&name) {
         return Err(GraphError::SessionNameExists(name));
     }
+    check_session_capacity(snapshot, SessionId::new(), &initial_command, &cwd)?;
     snapshot.version += 1;
 
     let pane_id = PaneId::new();
@@ -2318,6 +2330,7 @@ fn stage_create_window(
     if snapshot.window_name_exists_in_session(&session_id, &title) {
         return Err(GraphError::WindowNameConflict(title));
     }
+    check_session_capacity(snapshot, session_id, &initial_command, &cwd)?;
     snapshot.version += 1;
 
     let pane_id = PaneId::new();
@@ -2361,32 +2374,45 @@ fn stage_create_window(
     Ok((window_id, pane_id, events))
 }
 
-/// Total bytes of the commands one window's panes may store, counted as
-/// `pane.list` sends them (JSON). That listing returns them all in one response,
-/// which has to fit in one RPC frame.
-pub const MAX_WINDOW_ARGV_BYTES: usize = 4 * 1024 * 1024;
+/// Every listing of a session's panes (`pane.list`, `session.export_template`)
+/// returns them in one response, which has to fit in one RPC frame (16 MiB). So
+/// a session holds at most this many panes, which also bounds layout depth...
+pub const MAX_PANES_PER_SESSION: usize = 1024;
+/// ...and at most this many bytes of commands and working directories, counted
+/// as the listings send them (JSON). A pane's other fields are bounded already.
+pub const MAX_SESSION_PANE_BYTES: usize = 4 * 1024 * 1024;
 
-fn check_window_argv_budget(
+/// Refuse a pane that would take `session` past either bound. A session not yet
+/// in `snapshot` holds nothing.
+fn check_session_capacity(
     snapshot: &SessionGraphSnapshot,
-    window_id: WindowId,
+    session: SessionId,
     command: &[String],
+    cwd: &std::path::Path,
 ) -> Result<(), GraphError> {
-    if command.is_empty() {
-        return Ok(());
-    }
-    let json_len = |argv: &[String]| serde_json::to_string(argv).map_or(usize::MAX, |s| s.len());
-    let used: usize = snapshot
+    let bytes = |command: &[String], cwd: &std::path::Path| {
+        let argv = serde_json::to_string(command).map_or(usize::MAX, |s| s.len());
+        let dir = serde_json::to_string(&cwd).map_or(usize::MAX, |s| s.len());
+        argv.saturating_add(dir)
+    };
+    let (count, used) = snapshot
         .panes
         .values()
-        .filter(|p| p.window_id == window_id && !p.command.is_empty())
-        .map(|p| json_len(&p.command))
-        .sum();
-    let adding = json_len(command);
-    if used.saturating_add(adding) > MAX_WINDOW_ARGV_BYTES {
-        return Err(GraphError::WindowArgvBudget {
+        .filter(|p| snapshot.windows.get(&p.window_id).map(|w| w.session_id) == Some(session))
+        .fold((0usize, 0usize), |(n, b), p| {
+            (n + 1, b.saturating_add(bytes(&p.command, &p.cwd)))
+        });
+    if count >= MAX_PANES_PER_SESSION {
+        return Err(GraphError::SessionPaneLimit {
+            max: MAX_PANES_PER_SESSION,
+        });
+    }
+    let adding = bytes(command, cwd);
+    if used.saturating_add(adding) > MAX_SESSION_PANE_BYTES {
+        return Err(GraphError::SessionPaneBytes {
             used,
             adding,
-            budget: MAX_WINDOW_ARGV_BYTES,
+            budget: MAX_SESSION_PANE_BYTES,
         });
     }
     Ok(())
@@ -2421,7 +2447,6 @@ fn stage_split_pane(
         .get(&target_pane)
         .ok_or(GraphError::PaneNotFound(target_pane))?;
     let window_id = target.window_id;
-    check_window_argv_budget(snapshot, window_id, &command)?;
     // Codex review of PR #10: honor a caller-supplied cwd; only inherit from
     // the target pane when no cwd is set on the op.
     let pane_cwd = cwd.unwrap_or_else(|| target.cwd.clone());
@@ -2432,6 +2457,7 @@ fn stage_split_pane(
         .map(|w| w.session_id)
         .ok_or(GraphError::WindowNotFound(window_id))?;
 
+    check_session_capacity(snapshot, session_id, &command, &pane_cwd)?;
     snapshot.version += 1;
 
     let new_pane = if command.is_empty() {
@@ -4358,34 +4384,45 @@ mod tests {
         }
     }
 
-    /// A window's stored argvs are bounded in total, so one window's
-    /// `pane.list` cannot outgrow an RPC frame however many panes it has.
-    /// Bytes are counted as `pane.list` sends them, JSON-escaped (#140).
+    /// A session's panes are bounded in number and in command and directory
+    /// bytes, so no listing of them can outgrow an RPC frame. Bytes are counted
+    /// as the listings send them, JSON-escaped (#140).
     #[test]
-    fn a_window_refuses_argvs_past_its_budget() {
+    fn a_session_refuses_panes_past_its_bounds() {
         let (graph, state) = SessionGraph::new();
         let sid = graph.create_session("s".into(), home()).unwrap();
         let wid = state.load().sessions[&sid].windows[0];
         let a = state.load().windows[&wid].active_pane;
-        let quarter = vec!["x".repeat(MAX_WINDOW_ARGV_BYTES / 4)];
+        let quarter = vec!["x".repeat(MAX_SESSION_PANE_BYTES / 4)];
         for _ in 0..3 {
             graph
                 .split_pane_with_command(a, Direction::Vertical, 0.5, quarter.clone())
                 .unwrap();
         }
-        let err = graph
-            .split_pane_with_command(a, Direction::Vertical, 0.5, quarter.clone())
-            .unwrap_err();
+        fn refused<T>(r: Result<T, GraphError>) -> bool {
+            matches!(r, Err(GraphError::SessionPaneBytes { .. }))
+        }
+        assert!(refused(graph.split_pane_with_command(
+            a,
+            Direction::Vertical,
+            0.5,
+            quarter.clone()
+        )));
         assert!(
-            matches!(err, GraphError::WindowArgvBudget { .. }),
-            "{err:?}"
+            refused(graph.create_pane(wid, home(), quarter.clone())),
+            "create_pane"
         );
         assert!(
-            graph.create_pane(wid, home(), quarter.clone()).is_err(),
-            "create_pane bypassed the budget"
+            refused(graph.create_window_with_command(sid, "w".into(), home(), quarter.clone())),
+            "another window of the same session"
+        );
+        let long_cwd = PathBuf::from(format!("/{}", "c".repeat(MAX_SESSION_PANE_BYTES / 4)));
+        assert!(
+            refused(graph.create_pane(wid, long_cwd, vec![])),
+            "a directory counts too"
         );
 
-        // A batch that crosses the budget applies none of its ops.
+        // A batch that crosses the bound applies none of its ops.
         let version = state.load().version;
         let split = |command: Vec<String>| crate::apply::Op::SplitPane {
             target: crate::apply::PaneRef::Id(a),
@@ -4402,15 +4439,25 @@ mod tests {
         assert_eq!(state.load().version, version, "a refused batch committed");
 
         // A control byte reaches the client as six bytes, so it costs six.
-        let sid = graph.create_session("t".into(), home()).unwrap();
+        let escaped = vec!["\u{1}".repeat(MAX_SESSION_PANE_BYTES / 6 + 1)];
+        assert!(refused(graph.create_session_with_command(
+            "t".into(),
+            home(),
+            escaped
+        )));
+
+        // Pane count: the limit also bounds how deep repeated splits nest.
+        let sid = graph.create_session("u".into(), home()).unwrap();
         let wid = state.load().sessions[&sid].windows[0];
-        let a = state.load().windows[&wid].active_pane;
-        let escaped = vec!["\u{1}".repeat(MAX_WINDOW_ARGV_BYTES / 6 + 1)];
+        let mut target = state.load().windows[&wid].active_pane;
+        for _ in 1..MAX_PANES_PER_SESSION {
+            target = graph.split_pane(target, Direction::Vertical, 0.5).unwrap();
+        }
         let err = graph
-            .split_pane_with_command(a, Direction::Vertical, 0.5, escaped)
+            .split_pane(target, Direction::Vertical, 0.5)
             .unwrap_err();
         assert!(
-            matches!(err, GraphError::WindowArgvBudget { .. }),
+            matches!(err, GraphError::SessionPaneLimit { .. }),
             "{err:?}"
         );
     }
