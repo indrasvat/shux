@@ -1366,9 +1366,11 @@ impl SessionGraph {
 
         snapshot.panes.remove(&id);
 
+        let mut unzoomed = None;
         if let Some(w) = snapshot.windows.get_mut(&window_id) {
-            // Remove from layout tree
+            let zoomed = zoomed_pane(&w.layout);
             w.layout.remove_pane(id);
+            unzoomed = zoomed.filter(|_| !w.layout.is_zoomed());
 
             if w.active_pane == id {
                 // Pick a remaining pane from the layout tree first, then fallback to HashMap
@@ -1387,6 +1389,7 @@ impl SessionGraph {
         }
 
         self.commit_snapshot(snapshot);
+        self.fire_unzoomed(unzoomed, window_id, session_id);
         // Pane killed via explicit destroy: surface as PaneExited with no exit_status,
         // mirroring how subscribers consume both natural exits and forced kills.
         self.fire(EventData::PaneExited {
@@ -1803,12 +1806,14 @@ impl SessionGraph {
             .get_mut(&window_id)
             .ok_or(GraphError::WindowNotFound(window_id))?;
 
+        let zoomed = zoomed_pane(&window.layout);
         let ok = window
             .layout
             .split_pane(target_pane, new_pane_id, direction, ratio);
         if !ok {
             return Err(GraphError::LayoutError("split_pane failed".into()));
         }
+        let unzoomed = zoomed.filter(|_| !window.layout.is_zoomed());
 
         window.active_pane = new_pane_id;
         window.version += 1;
@@ -1824,6 +1829,7 @@ impl SessionGraph {
             .ok_or(GraphError::WindowNotFound(window_id))?;
 
         self.commit_snapshot(snapshot);
+        self.fire_unzoomed(unzoomed, window_id, split_session_id);
         // Split spawns a brand-new pane: surface as PaneCreated so subscribers
         // tracking pane lifecycle see the new id arrive in the same event class
         // they got from `create_pane`.
@@ -1835,6 +1841,14 @@ impl SessionGraph {
         });
         info!(%new_pane_id, %target_pane, %window_id, "Pane split");
         Ok(new_pane_id)
+    }
+
+    /// Announce a zoom a layout change cleared. Fired after the commit and
+    /// before the event the change causes.
+    fn fire_unzoomed(&self, unzoomed: Option<PaneId>, window_id: WindowId, session_id: SessionId) {
+        if let Some(pane_id) = unzoomed {
+            self.fire(unzoom_event(pane_id, window_id, session_id));
+        }
     }
 
     /// Focus a specific pane. Returns the previously active pane (or None if already focused).
@@ -1953,10 +1967,9 @@ impl SessionGraph {
             .get_mut(&window_id)
             .ok_or(GraphError::WindowNotFound(window_id))?;
 
-        // Unzoom first if zoomed
-        if window.layout.is_zoomed()
-            && let Some(zoom) = window.layout.zoom.take()
-        {
+        let unzoomed = zoomed_pane(&window.layout);
+        let session_id = window.session_id;
+        if let Some(zoom) = window.layout.zoom.take() {
             window.layout.tree = zoom.saved_layout;
         }
 
@@ -1980,6 +1993,7 @@ impl SessionGraph {
                 }
             }
             self.commit_snapshot(snapshot);
+            self.fire_unzoomed(unzoomed, window_id, session_id);
             Ok(())
         } else {
             // No matching split direction — not an error, just a no-op
@@ -2127,10 +2141,9 @@ impl SessionGraph {
             .get_mut(&window_id)
             .ok_or(GraphError::WindowNotFound(window_id))?;
 
-        // Unzoom first if zoomed
-        if window.layout.is_zoomed()
-            && let Some(zoom) = window.layout.zoom.take()
-        {
+        let unzoomed = zoomed_pane(&window.layout);
+        let session_id = window.session_id;
+        if let Some(zoom) = window.layout.zoom.take() {
             window.layout.tree = zoom.saved_layout;
         }
 
@@ -2151,6 +2164,7 @@ impl SessionGraph {
                 }
             }
             self.commit_snapshot(snapshot);
+            self.fire_unzoomed(unzoomed, window_id, session_id);
             Ok(())
         } else {
             Err(GraphError::LayoutError("swap_panes failed".into()))
@@ -2295,6 +2309,20 @@ fn stage_create_window(
     Ok((window_id, pane_id, events))
 }
 
+/// The pane a window's zoom shows, if it is zoomed.
+fn zoomed_pane(layout: &crate::layout::WindowLayout) -> Option<PaneId> {
+    layout.zoom.as_ref().map(|z| z.zoomed_pane)
+}
+
+fn unzoom_event(pane_id: PaneId, window_id: WindowId, session_id: SessionId) -> EventData {
+    EventData::PaneZoomed {
+        pane_id,
+        window_id,
+        session_id,
+        zoomed: false,
+    }
+}
+
 /// Stage a SplitPane op against `snapshot`. Returns
 /// `(new_pane_id, window_id, session_id, events)`. `cwd: None` inherits
 /// from the target pane (matches tmux split-window default behavior).
@@ -2334,23 +2362,29 @@ fn stage_split_pane(
         .windows
         .get_mut(&window_id)
         .ok_or(GraphError::WindowNotFound(window_id))?;
+    let zoomed = zoomed_pane(&window.layout);
     let ok = window
         .layout
         .split_pane(target_pane, new_pane_id, direction, ratio);
     if !ok {
         return Err(GraphError::LayoutError("split_pane failed".into()));
     }
+    let unzoomed = zoomed.filter(|_| !window.layout.is_zoomed());
     window.active_pane = new_pane_id;
     window.version += 1;
 
     snapshot.panes.insert(new_pane_id, new_pane);
 
-    let events = vec![EventData::PaneCreated {
+    let mut events: Vec<EventData> = unzoomed
+        .map(|pane_id| unzoom_event(pane_id, window_id, session_id))
+        .into_iter()
+        .collect();
+    events.push(EventData::PaneCreated {
         pane_id: new_pane_id,
         window_id,
         session_id,
         command,
-    }];
+    });
     Ok((new_pane_id, window_id, session_id, events))
 }
 
@@ -5131,6 +5165,85 @@ mod tests {
         let snap = state.load();
         assert_eq!(snap.windows[&wid].active_pane, a);
         assert!(!snap.windows[&wid].layout.is_zoomed());
+    }
+
+    /// Every mutation that clears a zoom announces it, before the event it
+    /// causes, so a subscriber tracking zoom from events never sees a `true`
+    /// that is never retracted (#138).
+    #[test]
+    fn every_mutation_that_clears_a_zoom_publishes_the_unzoom() {
+        type Clear = fn(&SessionGraph, PaneId, PaneId);
+        let cases: [(&str, Clear, &str); 6] = [
+            (
+                "split",
+                |g, z, _| {
+                    g.split_pane(z, Direction::Vertical, 0.5).unwrap();
+                },
+                "pane.created",
+            ),
+            (
+                "staged split",
+                |g, z, _| {
+                    g.apply_batch(vec![crate::apply::Op::SplitPane {
+                        target: crate::apply::PaneRef::Id(z),
+                        direction: Direction::Vertical,
+                        ratio: 0.5,
+                        command: vec![],
+                        cwd: None,
+                    }])
+                    .unwrap();
+                },
+                "pane.created",
+            ),
+            (
+                "kill a hidden pane",
+                |g, _, o| g.destroy_pane(o, None).unwrap(),
+                "pane.exited",
+            ),
+            (
+                "kill the zoomed pane",
+                |g, z, _| g.destroy_pane(z, None).unwrap(),
+                "pane.exited",
+            ),
+            (
+                "resize",
+                |g, z, _| {
+                    g.resize_pane(z, Direction::Vertical, 0.1, None).unwrap();
+                },
+                "",
+            ),
+            ("swap", |g, z, o| g.swap_panes(z, o, None).unwrap(), ""),
+        ];
+        let mut failures = Vec::new();
+        for (name, clear, then) in cases {
+            let bus = crate::bus::EventBus::new();
+            let (graph, state) = SessionGraph::new_with_event_bus(Some(bus.clone()));
+            let sid = graph.create_session("work".into(), home()).unwrap();
+            let wid = state.load().sessions[&sid].windows[0];
+            let a = state.load().windows[&wid].active_pane;
+            let b = graph.split_pane(a, Direction::Vertical, 0.5).unwrap();
+            assert!(graph.zoom_pane(a, None).unwrap());
+            let before = bus.history(1000).len();
+
+            clear(&graph, a, b);
+            assert!(
+                !state.load().windows[&wid].layout.is_zoomed(),
+                "{name}: still zoomed"
+            );
+            let after: Vec<_> = bus.history(1000).split_off(before);
+            let unzoom = after.iter().position(|e| {
+                matches!(e.data, EventData::PaneZoomed { pane_id, zoomed: false, .. } if pane_id == a)
+            });
+            let seen: Vec<_> = after.iter().map(|e| e.data.event_type()).collect();
+            match unzoom {
+                None => failures.push(format!("{name}: no unzoom, saw {seen:?}")),
+                Some(u) if !then.is_empty() && seen.iter().position(|t| *t == then) < Some(u) => {
+                    failures.push(format!("{name}: unzoom after {then}, saw {seen:?}"));
+                }
+                Some(_) => {}
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 
     /// While zoomed the layout is the zoomed pane alone, so directional focus
