@@ -209,6 +209,19 @@ impl RpcError {
         )
     }
 
+    /// A response too big for one frame.
+    pub fn response_too_large(size: usize, max: usize) -> Self {
+        Self::with_data(
+            ErrorCode::FrameTooLarge,
+            serde_json::json!({
+                "detail": format!("the response is {size} bytes, past the {max}-byte frame limit"),
+                "size": size,
+                "max_size": max,
+                "hint": "ask for less: one window, one pane, or fewer events"
+            }),
+        )
+    }
+
     /// Version conflict error (optimistic concurrency).
     pub fn version_conflict(resource: &str, id: &str, expected: u64, actual: u64) -> Self {
         Self::with_data(

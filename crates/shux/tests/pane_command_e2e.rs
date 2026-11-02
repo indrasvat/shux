@@ -1977,3 +1977,43 @@ fn state_apply_spawn_failures_carry_the_same_diagnosis_as_the_rpcs() {
         "a directory as argv[0] got no useful diagnosis:\n{joined}"
     );
 }
+
+/// #140: `pane.list` echoes every pane's argv, and `state.apply` keeps a pane
+/// whose spawn failed, so enough large argvs pushed one window's listing past
+/// the 16 MiB frame and every read of it died with `early eof`. A window's
+/// argvs are now bounded in total: the apply that would cross the bound is
+/// refused, saying why, and the window stays readable.
+#[test]
+fn a_window_full_of_large_argvs_stays_listable() {
+    let mut env = Env::new();
+    env.ok(&["session", "create", "wedge", "-d", "--", "sleep", "900"]);
+    env.sessions.push("wedge".to_string());
+    let first = env.first_pane("wedge");
+    let big = "x".repeat(130_000);
+    let op = serde_json::json!({"ops": [{
+        "op": "split_pane", "target": first, "direction": "vertical", "ratio": 0.5,
+        "command": ["no-such-binary-zzz", big, big],
+    }]})
+    .to_string();
+
+    let refusals: Vec<String> = (0..70)
+        .map(|_| env.rpc("state.apply", &op))
+        .filter(|out| !out.status.success())
+        .map(|out| {
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )
+        })
+        .collect();
+
+    let listed = env.run(&["--format", "json", "pane", "list", "-s", "wedge"]);
+    assert!(
+        listed.status.success(),
+        "pane list failed after 70 large-argv applies: {}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let refusal = refusals.first().expect("every 260 KB argv was accepted");
+    assert!(refusal.contains("limit for one window"), "{refusal}");
+}

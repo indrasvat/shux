@@ -24,6 +24,7 @@ pub(crate) fn graph_error_to_rpc(e: shux_core::graph::GraphError) -> shux_rpc::R
         GraphError::EmptyWindowName
         | GraphError::WindowNameTooLong(_)
         | GraphError::NumericWindowName(_)
+        | GraphError::WindowArgvBudget { .. }
         | GraphError::WindowIndexOutOfRange { .. } => {
             shux_rpc::RpcError::invalid_params(&e.to_string())
         }

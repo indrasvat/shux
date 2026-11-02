@@ -77,6 +77,16 @@ pub enum GraphError {
     )]
     NumericWindowName(String),
 
+    #[error(
+        "this window's panes already hold {used} bytes of commands, and {adding} more would \
+         pass the {budget}-byte limit for one window; put this pane in a new window"
+    )]
+    WindowArgvBudget {
+        used: usize,
+        adding: usize,
+        budget: usize,
+    },
+
     #[error("window index {index} out of range (session has {count} windows)")]
     WindowIndexOutOfRange { index: usize, count: usize },
 
@@ -1305,6 +1315,7 @@ impl SessionGraph {
         if !current.windows.contains_key(&window_id) {
             return Err(GraphError::WindowNotFound(window_id));
         }
+        check_window_argv_budget(&current, window_id, &command)?;
 
         let mut snapshot = (*current).clone();
         snapshot.version += 1;
@@ -1818,6 +1829,7 @@ impl SessionGraph {
         command: Vec<String>,
     ) -> Result<PaneId, GraphError> {
         let (current, window_id) = self.find_pane_window(target_pane)?;
+        check_window_argv_budget(&current, window_id, &command)?;
 
         let target = current
             .panes
@@ -2343,6 +2355,37 @@ fn stage_create_window(
     Ok((window_id, pane_id, events))
 }
 
+/// Total bytes of the commands one window's panes may store, counted as
+/// `pane.list` sends them (JSON). That listing returns them all in one response,
+/// which has to fit in one RPC frame.
+pub const MAX_WINDOW_ARGV_BYTES: usize = 4 * 1024 * 1024;
+
+fn check_window_argv_budget(
+    snapshot: &SessionGraphSnapshot,
+    window_id: WindowId,
+    command: &[String],
+) -> Result<(), GraphError> {
+    if command.is_empty() {
+        return Ok(());
+    }
+    let json_len = |argv: &[String]| serde_json::to_string(argv).map_or(usize::MAX, |s| s.len());
+    let used: usize = snapshot
+        .panes
+        .values()
+        .filter(|p| p.window_id == window_id && !p.command.is_empty())
+        .map(|p| json_len(&p.command))
+        .sum();
+    let adding = json_len(command);
+    if used.saturating_add(adding) > MAX_WINDOW_ARGV_BYTES {
+        return Err(GraphError::WindowArgvBudget {
+            used,
+            adding,
+            budget: MAX_WINDOW_ARGV_BYTES,
+        });
+    }
+    Ok(())
+}
+
 /// The pane a window's zoom shows, if it is zoomed.
 fn zoomed_pane(layout: &crate::layout::WindowLayout) -> Option<PaneId> {
     layout.zoom.as_ref().map(|z| z.zoomed_pane)
@@ -2373,6 +2416,7 @@ fn stage_split_pane(
         .get(&target_pane)
         .ok_or(GraphError::PaneNotFound(target_pane))?;
     let window_id = target.window_id;
+    check_window_argv_budget(snapshot, window_id, &command)?;
     // Codex review of PR #10: honor a caller-supplied cwd; only inherit from
     // the target pane when no cwd is set on the op.
     let pane_cwd = cwd.unwrap_or_else(|| target.cwd.clone());
@@ -4308,6 +4352,63 @@ mod tests {
             let got = snap.default_window_title(&sid, &command, std::path::Path::new(cwd));
             assert_eq!(got, want, "{command:?} in {cwd}");
         }
+    }
+
+    /// A window's stored argvs are bounded in total, so one window's
+    /// `pane.list` cannot outgrow an RPC frame however many panes it has.
+    /// Bytes are counted as `pane.list` sends them, JSON-escaped (#140).
+    #[test]
+    fn a_window_refuses_argvs_past_its_budget() {
+        let (graph, state) = SessionGraph::new();
+        let sid = graph.create_session("s".into(), home()).unwrap();
+        let wid = state.load().sessions[&sid].windows[0];
+        let a = state.load().windows[&wid].active_pane;
+        let quarter = vec!["x".repeat(MAX_WINDOW_ARGV_BYTES / 4)];
+        for _ in 0..3 {
+            graph
+                .split_pane_with_command(a, Direction::Vertical, 0.5, quarter.clone())
+                .unwrap();
+        }
+        let err = graph
+            .split_pane_with_command(a, Direction::Vertical, 0.5, quarter.clone())
+            .unwrap_err();
+        assert!(
+            matches!(err, GraphError::WindowArgvBudget { .. }),
+            "{err:?}"
+        );
+        assert!(
+            graph.create_pane(wid, home(), quarter.clone()).is_err(),
+            "create_pane bypassed the budget"
+        );
+
+        // A batch that crosses the budget applies none of its ops.
+        let version = state.load().version;
+        let split = |command: Vec<String>| crate::apply::Op::SplitPane {
+            target: crate::apply::PaneRef::Id(a),
+            direction: Direction::Vertical,
+            ratio: 0.5,
+            command,
+            cwd: None,
+        };
+        assert!(
+            graph
+                .apply_batch(vec![split(vec!["true".into()]), split(quarter)])
+                .is_err()
+        );
+        assert_eq!(state.load().version, version, "a refused batch committed");
+
+        // A control byte reaches the client as six bytes, so it costs six.
+        let sid = graph.create_session("t".into(), home()).unwrap();
+        let wid = state.load().sessions[&sid].windows[0];
+        let a = state.load().windows[&wid].active_pane;
+        let escaped = vec!["\u{1}".repeat(MAX_WINDOW_ARGV_BYTES / 6 + 1)];
+        let err = graph
+            .split_pane_with_command(a, Direction::Vertical, 0.5, escaped)
+            .unwrap_err();
+        assert!(
+            matches!(err, GraphError::WindowArgvBudget { .. }),
+            "{err:?}"
+        );
     }
 
     /// The bound is in characters, matching what the error message says.
