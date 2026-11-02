@@ -3576,7 +3576,7 @@ mod tests {
         let w1 = state.load().sessions[&sid].windows[0];
         let a = state.load().windows[&w1].active_pane;
         let b = graph.split_pane(a, Direction::Vertical, 0.5).unwrap();
-        let w2 = graph.create_window(sid, "2".into(), home()).unwrap();
+        let w2 = graph.create_window(sid, "second".into(), home()).unwrap();
         let c = state.load().windows[&w2].active_pane;
 
         graph.destroy_pane_and_empty_parents(b).unwrap();

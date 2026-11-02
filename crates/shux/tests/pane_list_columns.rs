@@ -117,7 +117,7 @@ impl Env {
             .as_str()
             .expect("pane id")
             .to_string();
-        self.run_line_and_wait(name, "1", &format!("printf '{COLOUR_PROBE}\\n'"));
+        self.run_line_and_wait(name, "0", &format!("printf '{COLOUR_PROBE}\\n'"));
         pane
     }
 
@@ -441,7 +441,7 @@ fn text_plain_and_json_agree_about_every_pane() {
 fn the_listed_pane_still_renders_every_colour_class() {
     let mut env = Env::new();
     let s = env.session("t135e", &format!("printf '{COLOUR_PROBE}\\n'"));
-    env.wait_for(&s, "1", "TRUECOLOR");
+    env.wait_for(&s, "0", "TRUECOLOR");
     let pane = env.json(&["pane", "list", "-s", &s])[0]["id"]
         .as_str()
         .expect("pane id")
@@ -520,7 +520,7 @@ fn run_command_rejects_a_non_string_argument_instead_of_dropping_it() {
         "a null argument was not named in the error: {combined}"
     );
     assert!(
-        !env.capture(&s, "1").contains("[A][B]"),
+        !env.capture(&s, "0").contains("[A][B]"),
         "the null was dropped and the command ran anyway"
     );
 }
@@ -558,7 +558,7 @@ fn run_command_delivers_a_metacharacter_argument_whole_and_completes() {
             v["result"]["state"], "completed",
             "argument {arg:?} did not complete — the line the shell got was not parseable: {out}"
         );
-        let screen = env.wait_for(&s, "1", &format!("[{arg}]"));
+        let screen = env.wait_for(&s, "0", &format!("[{arg}]"));
         assert!(
             !screen.contains("uid="),
             "argument {arg:?} executed `id`:\n{screen}"
@@ -580,7 +580,7 @@ fn run_command_keeps_an_empty_argument() {
     })
     .to_string();
     env.ok(&["rpc", "call", "pane.run_command", "--params", &params]);
-    let screen = env.wait_for(&s, "1", "<A><><B>");
+    let screen = env.wait_for(&s, "0", "<A><><B>");
     assert!(screen.contains("<A><><B>"), "{screen}");
 }
 
@@ -642,7 +642,7 @@ fn a_control_byte_in_args_is_refused_and_leaves_the_pane_usable() {
         v["result"]["state"], "completed",
         "the pane was wedged by a rejected call: {out}"
     );
-    env.wait_for(&s, "1", "[STILL-ALIVE]");
+    env.wait_for(&s, "0", "[STILL-ALIVE]");
 }
 
 /// The box frame must be square on the RENDERED GRID, whatever the title holds.
@@ -680,7 +680,7 @@ fn the_box_frame_is_square_on_the_rendered_grid() {
     ]);
     env.run_line_and_wait(
         s,
-        "1",
+        "0",
         &format!("clear; {} --format text pane list -s {s}", env.bin_str()),
     );
 
