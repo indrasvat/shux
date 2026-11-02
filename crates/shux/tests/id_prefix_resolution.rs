@@ -1063,3 +1063,59 @@ fn pane_b_marker_cannot_be_satisfied_by_the_echoed_line() {
         "the echo of {PANE_B_LINE:?} would satisfy the wait for its prompt"
     );
 }
+
+/// #142: a window's number is its position in `window list`, and its name is a
+/// word. A window nobody named is called after what it runs, so `-w 1` can
+/// only ever mean the second row, and a name that is a number is refused.
+#[test]
+fn window_numbers_are_positions_and_default_names_are_words() {
+    let h = Harness::new();
+    let name = format!("w142-{}", unique());
+    let out = h.cli(&["session", "create", &name, "-d", "--", "sleep", "300"]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    let out = h.cli(&["window", "create", "-s", &name, "--", "sleep", "300"]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+
+    let sessions = h.rpc_ok("session.list", serde_json::json!({}));
+    let session_id = sessions["sessions"]
+        .as_array()
+        .expect("sessions")
+        .iter()
+        .find(|s| s["name"] == name.as_str())
+        .and_then(|s| s["id"].as_str())
+        .expect("session id")
+        .to_string();
+    let windows = h.rpc_ok(
+        "window.list",
+        serde_json::json!({ "session_id": session_id }),
+    );
+    let windows = windows.as_array().expect("windows");
+    let titles: Vec<&str> = windows.iter().filter_map(|w| w["title"].as_str()).collect();
+    assert_eq!(titles, ["sleep", "sleep-2"], "default window names");
+
+    let second = windows[1]["id"].as_str().expect("window id");
+    let out = h.cli(&[
+        "--format", "json", "window", "focus", "-s", &name, "-w", "1",
+    ]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert!(
+        stdout_of(&out).contains(second),
+        "`-w 1` did not select the window at position 1: {}",
+        stdout_of(&out)
+    );
+
+    for args in [
+        vec!["window", "create", "-s", &name, "--name", "7"],
+        vec!["window", "rename", "-s", &name, "-w", "0", "--name", "3"],
+    ] {
+        let out = h.cli(&args);
+        assert!(!out.status.success(), "{args:?} accepted a numeric name");
+        assert!(
+            stderr_of(&out).contains("position"),
+            "{args:?} did not say why: {}",
+            stderr_of(&out)
+        );
+    }
+
+    h.kill_session(&session_id);
+}

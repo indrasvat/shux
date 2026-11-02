@@ -1554,8 +1554,8 @@ fn a_template_may_leave_its_first_window_title_blank() {
     let windows = env.json(&["window", "list", "-s", "blanktitle"]);
     assert_eq!(
         windows[0]["title"].as_str(),
-        Some("1"),
-        "a blank title should fall back to the default `1`: {windows}"
+        Some("sleep"),
+        "a blank title should fall back to what the window runs: {windows}"
     );
 }
 

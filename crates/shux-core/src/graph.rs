@@ -71,6 +71,12 @@ pub enum GraphError {
     #[error("window name too long (max 128 characters): {}", .0.escape_debug())]
     WindowNameTooLong(String),
 
+    #[error(
+        "window name can't be a number: {} (`-w N` selects the window at position N)",
+        .0.escape_debug()
+    )]
+    NumericWindowName(String),
+
     #[error("window index {index} out of range (session has {count} windows)")]
     WindowIndexOutOfRange { index: usize, count: usize },
 
@@ -192,6 +198,30 @@ impl SessionGraphSnapshot {
     /// Check if a window name exists in a session.
     pub fn window_name_exists_in_session(&self, session_id: &SessionId, name: &str) -> bool {
         self.find_window_by_name(session_id, name).is_some()
+    }
+
+    /// The name a window gets when none is given: the title its first pane
+    /// starts with (the program, else the cwd), unique in the session as
+    /// `name-2`, `name-3`… A title that is not a valid name becomes `window`.
+    pub fn default_window_title(
+        &self,
+        session_id: &SessionId,
+        command: &[String],
+        cwd: &std::path::Path,
+    ) -> String {
+        let pane_title = Pane::with_command(WindowId::new(), cwd, command.to_vec()).title;
+        let base = SessionGraph::validate_window_title(&pane_title)
+            .ok()
+            .map(|t| {
+                t.chars()
+                    .take(SessionGraph::MAX_WINDOW_TITLE_CHARS - 8)
+                    .collect()
+            })
+            .unwrap_or_else(|| "window".to_string());
+        std::iter::once(base.clone())
+            .chain((2u32..).map(|n| format!("{base}-{n}")))
+            .find(|t| !self.window_name_exists_in_session(session_id, t))
+            .unwrap_or(base)
     }
 }
 
@@ -707,6 +737,9 @@ impl SessionGraph {
         if cleaned.chars().count() > Self::MAX_WINDOW_TITLE_CHARS {
             return Err(GraphError::WindowNameTooLong(cleaned));
         }
+        if crate::model::is_window_position(&cleaned) {
+            return Err(GraphError::NumericWindowName(cleaned));
+        }
         Ok(cleaned)
     }
 
@@ -753,7 +786,8 @@ impl SessionGraph {
         };
         pane.id = pane_id;
 
-        let mut window = Window::new(SessionId::new(), "1", pane_id);
+        let title = current.default_window_title(&SessionId::new(), &command, &pane.cwd);
+        let mut window = Window::new(SessionId::new(), &title, pane_id);
         window.id = window_id;
 
         let session_name = name.clone();
@@ -779,7 +813,7 @@ impl SessionGraph {
         self.fire(EventData::WindowCreated {
             window_id,
             session_id,
-            title: "1".into(),
+            title,
             index: 0,
         });
         self.fire(EventData::PaneCreated {
@@ -2217,7 +2251,7 @@ fn stage_create_session(
     // that is the attack case, and it is rejected.
     let title = match initial_window_title {
         Some(raw) if !raw.is_empty() => SessionGraph::validate_window_title(&raw)?,
-        _ => "1".to_string(),
+        _ => snapshot.default_window_title(&SessionId::new(), &initial_command, &pane.cwd),
     };
     let mut window = Window::new(SessionId::new(), &title, pane_id);
     window.id = window_id;
@@ -4228,7 +4262,52 @@ mod tests {
             }])
             .unwrap();
         let snap = state.load();
-        assert_eq!(snap.windows.values().next().unwrap().title, "1");
+        assert_eq!(snap.windows.values().next().unwrap().title, "test");
+    }
+
+    /// `-w N` selects the window at position N, so a name that is a number
+    /// would make `-w N` mean two windows (#142).
+    #[test]
+    fn a_window_name_cannot_be_a_number() {
+        for raw in ["3", "007", "\u{1b}12"] {
+            let err = SessionGraph::check_window_title(raw).unwrap_err();
+            assert!(
+                matches!(err, GraphError::NumericWindowName(_)),
+                "{raw:?}: {err:?}"
+            );
+        }
+        for ok in ["v2", "2a", "-1", "1.5"] {
+            assert!(SessionGraph::check_window_title(ok).is_ok(), "{ok:?}");
+        }
+    }
+
+    /// A window nobody named is called after what it runs, unique in its
+    /// session, and never a number (#142).
+    #[test]
+    fn an_unnamed_window_is_called_after_what_it_runs() {
+        let (graph, state) = SessionGraph::new();
+        let sid = graph
+            .create_session_with_command("s".into(), home(), vec!["nvim".into(), "a.rs".into()])
+            .unwrap();
+        let first = state.load().sessions[&sid].windows[0];
+        assert_eq!(state.load().windows[&first].title, "nvim");
+
+        let snap = state.load();
+        let cases = [
+            (vec!["nvim".to_string()], "/tmp", "nvim-2"),
+            (
+                vec!["/usr/bin/sleep".to_string(), "9".to_string()],
+                "/tmp",
+                "sleep",
+            ),
+            (vec![], "/work/shux", "shux"),
+            (vec![], "/work/2026", "window"),
+            (vec!["./42".to_string()], "/tmp", "window"),
+        ];
+        for (command, cwd, want) in cases {
+            let got = snap.default_window_title(&sid, &command, std::path::Path::new(cwd));
+            assert_eq!(got, want, "{command:?} in {cwd}");
+        }
     }
 
     /// The bound is in characters, matching what the error message says.

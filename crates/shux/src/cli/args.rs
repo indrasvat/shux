@@ -649,7 +649,7 @@ pub enum WindowCommand {
         #[arg(short, long)]
         session: String,
 
-        /// Window name (auto-generated if not provided)
+        /// Window name, not a number (default: what the window runs, e.g. `nvim`)
         #[arg(short, long)]
         name: Option<String>,
 
@@ -686,7 +686,7 @@ pub enum WindowCommand {
         #[arg(short, long)]
         session: String,
 
-        /// Window name, index, or id
+        /// Window position (digits, as `window list` numbers it), name, or id
         #[arg(short, long)]
         window: String,
 
@@ -702,11 +702,11 @@ pub enum WindowCommand {
         #[arg(short, long)]
         session: String,
 
-        /// Window name, index, or id (full UUID or short form)
+        /// Window position (digits, as `window list` numbers it), name, or id (full UUID or short form)
         #[arg(short, long)]
         window: String,
 
-        /// New window name
+        /// New window name, not a number
         #[arg(short, long)]
         name: String,
 
@@ -722,7 +722,7 @@ pub enum WindowCommand {
         #[arg(short, long)]
         session: String,
 
-        /// Window name, index, or id
+        /// Window position (digits, as `window list` numbers it), name, or id
         #[arg(short, long)]
         window: String,
 
@@ -738,7 +738,7 @@ pub enum WindowCommand {
         #[arg(short, long)]
         session: String,
 
-        /// Window name, index, or id
+        /// Window position (digits, as `window list` numbers it), name, or id
         #[arg(short, long)]
         window: String,
 
@@ -863,7 +863,7 @@ pub enum PaneCommand {
         #[arg(short, long)]
         session: String,
 
-        /// Window name, index, or id (uses active window if not provided)
+        /// Window position (digits, as `window list` numbers it), name, or id; default: the active window
         #[arg(short, long)]
         window: Option<String>,
     },
@@ -874,7 +874,7 @@ pub enum PaneCommand {
         #[arg(short, long)]
         session: String,
 
-        /// Window name, index, or id (uses active window if not provided)
+        /// Window position (digits, as `window list` numbers it), name, or id; default: the active window
         #[arg(short, long)]
         window: Option<String>,
 
@@ -912,7 +912,7 @@ pub enum PaneCommand {
         #[arg(short, long)]
         session: String,
 
-        /// Window name, index, or id (uses active window if not provided)
+        /// Window position (digits, as `window list` numbers it), name, or id; default: the active window
         #[arg(short, long)]
         window: Option<String>,
 
@@ -927,7 +927,7 @@ pub enum PaneCommand {
         #[arg(short, long)]
         session: String,
 
-        /// Window name, index, or id (uses active window if not provided)
+        /// Window position (digits, as `window list` numbers it), name, or id; default: the active window
         #[arg(short, long)]
         window: Option<String>,
 
@@ -942,7 +942,7 @@ pub enum PaneCommand {
         #[arg(short, long)]
         session: String,
 
-        /// Window name, index, or id (uses active window if not provided)
+        /// Window position (digits, as `window list` numbers it), name, or id; default: the active window
         #[arg(short, long)]
         window: Option<String>,
 
@@ -972,7 +972,7 @@ pub enum PaneCommand {
         #[arg(short, long)]
         session: String,
 
-        /// Window name, index, or id (uses active window if not provided)
+        /// Window position (digits, as `window list` numbers it), name, or id; default: the active window
         #[arg(short, long)]
         window: Option<String>,
 
@@ -993,7 +993,7 @@ pub enum PaneCommand {
         #[arg(short, long)]
         session: String,
 
-        /// Window name, index, or id (uses active window if not provided)
+        /// Window position (digits, as `window list` numbers it), name, or id; default: the active window
         #[arg(short, long)]
         window: Option<String>,
 
@@ -1017,7 +1017,7 @@ pub enum PaneCommand {
         #[arg(short, long)]
         session: String,
 
-        /// Window name, index, or id (uses active window if not provided)
+        /// Window position (digits, as `window list` numbers it), name, or id; default: the active window
         #[arg(short, long)]
         window: Option<String>,
 
@@ -1043,7 +1043,7 @@ pub enum PaneCommand {
         #[arg(short, long)]
         session: String,
 
-        /// Window name, index, or id (uses active window if not provided)
+        /// Window position (digits, as `window list` numbers it), name, or id; default: the active window
         #[arg(short, long)]
         window: Option<String>,
 
@@ -1136,7 +1136,7 @@ pub enum PaneCommand {
         #[arg(short, long)]
         session: String,
 
-        /// Window name, index, or id (uses active window if not provided)
+        /// Window position (digits, as `window list` numbers it), name, or id; default: the active window
         #[arg(short, long)]
         window: Option<String>,
 
@@ -1164,7 +1164,7 @@ pub enum PaneCommand {
         #[arg(short, long)]
         session: String,
 
-        /// Window name, index, or id (uses active window if not provided)
+        /// Window position (digits, as `window list` numbers it), name, or id; default: the active window
         #[arg(short, long)]
         window: Option<String>,
 
@@ -1206,7 +1206,7 @@ pub enum PaneCommand {
         #[arg(short, long)]
         session: String,
 
-        /// Window name, index, or id (uses active window if not provided)
+        /// Window position (digits, as `window list` numbers it), name, or id; default: the active window
         #[arg(short, long)]
         window: Option<String>,
 
@@ -1233,7 +1233,7 @@ pub enum PaneCommand {
         /// Session name or id (full UUID, or the short form `session list` prints)
         #[arg(short, long)]
         session: String,
-        /// Window name, index, or id (uses active window if not provided)
+        /// Window position (digits, as `window list` numbers it), name, or id; default: the active window
         #[arg(short, long)]
         window: Option<String>,
         /// Pane id — full UUID or the short form `pane list` prints
@@ -1428,7 +1428,7 @@ pub enum PaneCommand {
         /// Session name or id (full UUID, or the short form `session list` prints)
         #[arg(short, long)]
         session: String,
-        /// Window name, index, or id (uses active window if not provided)
+        /// Window position (digits, as `window list` numbers it), name, or id; default: the active window
         #[arg(short, long)]
         window: Option<String>,
         /// Pane id — full UUID or the short form `pane list` prints
@@ -1458,7 +1458,7 @@ pub enum PaneCommand {
         /// resolve a pane. With session alone, targets the active pane.
         #[arg(short, long)]
         session: Option<String>,
-        /// Window index, name, or id (full UUID or short form).
+        /// Window position (digits, as `window list` numbers it), name, or id (full UUID or short form).
         #[arg(short, long)]
         window: Option<String>,
         /// Explicit pane id — full UUID or short form. REQUIRED for multi-pane workspaces
