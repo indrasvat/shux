@@ -39,7 +39,7 @@ pub(crate) fn register_window_methods(
     let cancel_ensure = cancel.clone();
 
     builder
-        .register_with_policy(
+        .register_to_completion(
             "window.create",
             Policy::fixed(Sensitivity::OwnedMutation),
             move |params: Option<serde_json::Value>| {
@@ -151,7 +151,7 @@ pub(crate) fn register_window_methods(
                 }
             },
         )
-        .register_with_policy(
+        .register_to_completion(
             "window.ensure",
             Policy::fixed(Sensitivity::OwnedMutation),
             move |params: Option<serde_json::Value>| {
@@ -370,15 +370,13 @@ pub(crate) fn register_window_methods(
                 }
             },
         )
-        .register_with_policy(
+        .register_to_completion(
             "window.kill",
             Policy::fixed(Sensitivity::OwnedMutation),
             move |params: Option<serde_json::Value>| {
                 let gh = g7.clone();
                 let io = io_kill.clone();
-                // Graph first, then IO: a hang-up between them would leave
-                // the window's programs running with nothing left to reach them.
-                shux_rpc::run_to_completion(async move {
+                async move {
                     let params = params.unwrap_or_default();
                     let window_id = resolve_window_ref(&gh, required_str(&params, "id")?, "id")?;
 
@@ -409,7 +407,7 @@ pub(crate) fn register_window_methods(
                     }
 
                     Ok(serde_json::json!({ "killed": window_id.to_string() }))
-                })
+                }
             },
         )
 }

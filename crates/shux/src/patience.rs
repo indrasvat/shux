@@ -15,7 +15,7 @@ use std::time::Duration;
 pub const PEER_PATIENCE_ENV: &str = "SHUX_PEER_PATIENCE_MS";
 
 const DEFAULT: Duration = Duration::from_secs(30);
-const MAX: Duration = Duration::from_secs(3600);
+const MAX_MS: u64 = 3_600_000;
 
 static PATIENCE: OnceLock<Result<Duration, String>> = OnceLock::new();
 
@@ -47,17 +47,12 @@ fn load() -> Result<Duration, String> {
 }
 
 fn parse(raw: &str) -> Result<Duration, String> {
-    let ms = raw
-        .bytes()
-        .all(|b| b.is_ascii_digit())
-        .then(|| raw.parse::<u64>().ok())
-        .flatten()
-        .map(Duration::from_millis);
-    match ms {
-        Some(d) if !d.is_zero() && d <= MAX => Ok(d),
+    // `u64` parsing also takes a leading `+`.
+    match raw.parse::<u64>() {
+        Ok(ms @ 1..=MAX_MS) if !raw.starts_with('+') => Ok(Duration::from_millis(ms)),
         _ => Err(format!(
-            "{PEER_PATIENCE_ENV} must be a whole number of milliseconds from 1 to {}, got {raw:?}",
-            MAX.as_millis()
+            "{PEER_PATIENCE_ENV} must be a whole number of milliseconds from 1 to {MAX_MS}, \
+             got {raw:?}"
         )),
     }
 }

@@ -582,6 +582,7 @@ mod tests {
             matches!(waited, Err(ClientError::StartLockTimeout(..))),
             "{waited:?}"
         );
+        // The contract, spelled out: one stale daemon's replacement and a start.
         let bound = crate::patience::peer_patience() * 2 + CONNECT_BUDGET.deadline;
         assert!(
             took <= bound + Duration::from_secs(1),

@@ -1711,7 +1711,9 @@ async fn scratch_reaper(
 /// pane teardown. For a scratch this claims reap ownership (backing off if
 /// the timer reaper already owns it), cancels that reaper, waits for the PTY
 /// task to confirm its group ended, audits reason=explicit, and only then
-/// removes the registry row. It signals nothing itself.
+/// removes the registry row. It signals nothing itself. It owns the reap once
+/// called, so it must run to completion: its caller's route registers with
+/// `register_to_completion`.
 pub async fn on_session_killed(registry: &ScratchRegistry, session_id: SessionId) {
     let Some(claim) = registry.claim(&session_id) else {
         // Not a scratch session, or the timer reaper already owns the reap.
@@ -1800,47 +1802,20 @@ async fn handle_lens_run(
 ) -> Result<serde_json::Value, shux_rpc::RpcError> {
     let p = parse_lens_run_params(&params)?;
 
-    // ── Cancellation shield (P5 round-2 codex N1 ≡ claude round-2 major) ─
-    // The shux-rpc server DROPS in-flight handler futures on client
-    // disconnect (the P3 cancellable-execution contract). A disconnect
-    // between graph-session creation and registry commit used to leak an
-    // unregistered __scratch session + PTY: the reservation Drop-released,
-    // but nothing owned the session — no reaper, no registry row, no
-    // startup-reap coverage (the PTY task's own shutdown binds to the ROOT
-    // daemon token, never to the request, so handler-drop cannot cascade
-    // teardown either). Fix: the non-idempotent core (reserve → create
-    // session → spawn PTY → commit + arm reaper) runs in its OWN spawned
-    // task; the handler awaits its JoinHandle. Dropping a JoinHandle does
-    // NOT abort the task, so a disconnected client simply never reads the
-    // response while the composite completes — from commit onward the
-    // ttl/max_runtime reaper owns the scratch. Everything after the core
-    // (the `--wait` tail) stays freely cancellable per P3 semantics.
-    //
-    // The task-local caller identity does not cross `tokio::spawn`, so the
-    // core future is re-wrapped in the captured caller's scope (keeps
-    // scratch.create audit attribution truthful — LENS-R-052).
-    let caller = shux_rpc::current_caller();
-    let core = tokio::spawn(shux_rpc::with_caller(
-        caller,
-        spawn_scratch_core(
+    // The core (reserve, create the session, spawn its PTY, commit the row,
+    // arm the reaper) runs to completion: cut between those steps, it leaves
+    // an unregistered scratch that nothing reaps. The `--wait` tail below
+    // stays droppable.
+    let (session_id, pane_id, revision, wait_sub) =
+        shux_rpc::run_to_completion(spawn_scratch_core(
             p,
             graph.clone(),
             io_state.clone(),
             cancel,
             event_bus.clone(),
             registry,
-        ),
-    ));
-    let (session_id, pane_id, revision, wait_sub) = match core.await {
-        Ok(core_result) => core_result?,
-        Err(join_err) => {
-            // Only reachable on a core panic (never aborted). Repo law
-            // forbids panics; surface honestly instead of unwrapping.
-            return Err(shux_rpc::RpcError::internal(&format!(
-                "lens.run core task failed: {join_err}"
-            )));
-        }
-    };
+        ))
+        .await?;
 
     let mut result = json!({
         "session_id": session_id.to_string(),

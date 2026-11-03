@@ -178,6 +178,22 @@ impl RouterBuilder {
         self
     }
 
+    /// [`Self::register_with_policy`] for a method that changes state in
+    /// several steps: each call runs to completion even if its caller hangs
+    /// up (see [`crate::run_to_completion`]). Not for a method that waits, or
+    /// one that reads its connection's scope.
+    pub fn register_to_completion(
+        self,
+        method: impl Into<String>,
+        policy: Policy,
+        handler: impl Handler,
+    ) -> Self {
+        let handler = Arc::new(handler);
+        self.register_with_policy(method, policy, move |params: Option<Value>| {
+            crate::run_to_completion(handler.handle(params))
+        })
+    }
+
     /// Build the router.
     pub fn build(self) -> Router {
         Router {

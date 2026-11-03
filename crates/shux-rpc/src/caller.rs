@@ -41,14 +41,16 @@ pub async fn with_caller<F: Future>(caller: String, fut: F) -> F::Output {
     RPC_CALLER.scope(caller, fut).await
 }
 
-/// Run a handler body to completion even if its caller hangs up. The server
-/// drops a handler whose client disconnects, which is right for a wait and
-/// wrong for a change made in several steps: cut between them, it leaves the
-/// change half done. The body keeps the caller's identity; it runs outside
-/// the request's connection scope.
-pub async fn run_to_completion<F>(fut: F) -> Result<serde_json::Value, crate::RpcError>
+/// Run `fut` to completion even if its caller hangs up. The server drops a
+/// handler whose client disconnects, which is right for a wait and wrong for
+/// a change made in several steps: cut between them, it leaves the change half
+/// done. `fut` keeps the caller's identity; it runs outside the request's
+/// connection scope. Whole routes opt in with
+/// [`crate::RouterBuilder::register_to_completion`].
+pub async fn run_to_completion<T, F>(fut: F) -> Result<T, crate::RpcError>
 where
-    F: Future<Output = Result<serde_json::Value, crate::RpcError>> + Send + 'static,
+    T: Send + 'static,
+    F: Future<Output = Result<T, crate::RpcError>> + Send + 'static,
 {
     tokio::spawn(with_caller(current_caller(), fut))
         .await

@@ -581,6 +581,51 @@ while IFS= read -r _; do :; done
     );
 }
 
+/// A watched plugin's reload watcher does not hold a blocking-pool thread for
+/// its whole life: with a one-thread pool, another plugin's requests, which
+/// run on that pool, are still served.
+#[test]
+fn a_reload_watcher_leaves_the_blocking_pool_to_requests() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let tmp = tempfile::tempdir().unwrap();
+        let watched = write_script(tmp.path(), "watched.sh", NOOP_PLUGIN);
+        let resp = tmp.path().join("resp.jsonl");
+        let script = format!(
+            r#"#!/usr/bin/env bash
+set -u
+IFS= read -r _ || exit 1
+printf '%s\n' '{{"jsonrpc":"2.0","id":"init","result":{{"name":"asker","version":"0.1.0","subscribes":[],"provides":[],"capabilities":[]}}}}'
+printf '%s\n' '{{"jsonrpc":"2.0","method":"plugin.state.get","params":{{}},"id":1}}'
+while IFS= read -r line; do
+  case "$line" in
+    *'"plugin.shutdown"'*) exit 0 ;;
+    *'"id":1'*) printf '%s\n' "$line" >> {out} ;;
+  esac
+done
+"#,
+            out = resp.display()
+        );
+        let asker = write_script(tmp.path(), "asker.sh", &script);
+        let mgr = PluginManager::with_state_root(EventBus::new(), tmp.path().join("plugins"));
+        mgr.install(PluginSource::from_path(&watched).with_watch(true))
+            .await
+            .expect("install watched");
+        mgr.install(PluginSource::from_path(&asker))
+            .await
+            .expect("install asker");
+        // Never answered: the watcher holds the only blocking thread.
+        wait_for_lines(&resp, 1).await;
+        mgr.kill("asker").await.expect("kill asker");
+        mgr.kill("noop").await.expect("kill watched");
+    });
+}
+
 /// A plugin request whose file I/O stalls does not hold an async worker: on a
 /// one-worker runtime, other tasks still run while its state read blocks.
 #[tokio::test]

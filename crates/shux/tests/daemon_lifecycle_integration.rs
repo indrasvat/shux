@@ -1234,8 +1234,13 @@ fn a_patience_override_stays_with_the_client_that_set_it() {
         !env.contains("SHUX_PEER_PATIENCE_MS"),
         "a pane inherited the client's patience override"
     );
+    let daemon_env = String::from_utf8_lossy(&daemon_env.stdout);
     assert!(
-        !String::from_utf8_lossy(&daemon_env.stdout).contains("SHUX_PEER_PATIENCE_MS"),
+        daemon_env.contains("XDG_RUNTIME_DIR="),
+        "ps showed no environment for the daemon, so it proves nothing: {daemon_env}"
+    );
+    assert!(
+        !daemon_env.contains("SHUX_PEER_PATIENCE_MS"),
         "the daemon inherited the client's patience override"
     );
 }

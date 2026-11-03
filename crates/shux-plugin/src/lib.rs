@@ -1174,80 +1174,89 @@ fn spawn_reload_watcher(
     let stopping = mgr.stopping.clone();
     mgr.watchers.started.fetch_add(1, Ordering::SeqCst);
     let stopped = WatcherStopped(mgr.watchers.clone());
-    tokio::task::spawn_blocking(move || {
-        let name = watcher_name;
-        let cancel = watcher_cancel;
-        // Build the watcher inside the blocking thread so the notify
-        // backend's lifetime is tied to the watcher loop; dropping it
-        // tears down the OS-level handle. Watch the parent directory
-        // rather than the file itself — editors that atomic-rename
-        // (vim, neovim with `backupcopy=auto`) replace the inode
-        // entirely, which a file-level watcher would miss.
-        let parent = match path.parent() {
-            Some(p) => p.to_path_buf(),
-            None => {
-                warn!(plugin = %name, "watcher: path has no parent dir; disabling watch");
-                return;
-            }
-        };
-        let watched_name = match path.file_name().map(|s| s.to_owned()) {
-            Some(n) => n,
-            None => {
-                warn!(plugin = %name, "watcher: path has no filename; disabling watch");
-                return;
-            }
-        };
-
-        let watcher_tx = tx.clone();
-        let mut watcher =
-            match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-                let Ok(event) = res else { return };
-                // Only respawn on modify-ish events that touch our
-                // file. Skip Access events (open/close/read) which
-                // would otherwise fire on every `cat plugin.sh`.
-                let interesting = matches!(
-                    event.kind,
-                    EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
-                );
-                if !interesting {
-                    return;
-                }
-                let hits_us = event
-                    .paths
-                    .iter()
-                    .any(|p| p.file_name().map(|f| f == watched_name).unwrap_or(false));
-                if !hits_us {
-                    return;
-                }
-                // Non-blocking send — if the channel is full the
-                // debouncer is already going to reload, so this
-                // save folds into that pass.
-                let _ = watcher_tx.try_send(());
-            }) {
-                Ok(w) => w,
-                Err(e) => {
-                    warn!(plugin = %name, error = %e, "watcher: failed to create");
+    // Its own thread, not the blocking pool: it lives as long as the plugin,
+    // and plugin requests need that pool for their file I/O.
+    let watch_thread = std::thread::Builder::new()
+        .name(format!("shux-watch-{name}"))
+        .spawn(move || {
+            let name = watcher_name;
+            let cancel = watcher_cancel;
+            // Build the watcher inside this thread so the notify backend's
+            // lifetime is tied to the watcher loop; dropping it tears down the
+            // OS-level handle. Watch the parent directory
+            // rather than the file itself — editors that atomic-rename
+            // (vim, neovim with `backupcopy=auto`) replace the inode
+            // entirely, which a file-level watcher would miss.
+            let parent = match path.parent() {
+                Some(p) => p.to_path_buf(),
+                None => {
+                    warn!(plugin = %name, "watcher: path has no parent dir; disabling watch");
                     return;
                 }
             };
-        if let Err(e) = watcher.watch(&parent, RecursiveMode::NonRecursive) {
-            warn!(plugin = %name, error = %e, "watcher: failed to start");
-            return;
-        }
-        let _ = ready_tx.send(());
-        // Park until stopped — the watcher object itself holds the OS
-        // handle, dropping when this block exits.
-        while !cancel.load(Ordering::SeqCst) && !stopping.load(Ordering::SeqCst) && !tx.is_closed()
-        {
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "production: the watcher thread re-checks its stop flags between naps"
-            )]
-            std::thread::sleep(Duration::from_millis(200));
-        }
-        drop(watcher);
-        debug!(plugin = %name, "watcher: cancelled, exiting");
-    });
+            let watched_name = match path.file_name().map(|s| s.to_owned()) {
+                Some(n) => n,
+                None => {
+                    warn!(plugin = %name, "watcher: path has no filename; disabling watch");
+                    return;
+                }
+            };
+
+            let watcher_tx = tx.clone();
+            let mut watcher =
+                match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                    let Ok(event) = res else { return };
+                    // Only respawn on modify-ish events that touch our
+                    // file. Skip Access events (open/close/read) which
+                    // would otherwise fire on every `cat plugin.sh`.
+                    let interesting = matches!(
+                        event.kind,
+                        EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
+                    );
+                    if !interesting {
+                        return;
+                    }
+                    let hits_us = event
+                        .paths
+                        .iter()
+                        .any(|p| p.file_name().map(|f| f == watched_name).unwrap_or(false));
+                    if !hits_us {
+                        return;
+                    }
+                    // Non-blocking send — if the channel is full the
+                    // debouncer is already going to reload, so this
+                    // save folds into that pass.
+                    let _ = watcher_tx.try_send(());
+                }) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        warn!(plugin = %name, error = %e, "watcher: failed to create");
+                        return;
+                    }
+                };
+            if let Err(e) = watcher.watch(&parent, RecursiveMode::NonRecursive) {
+                warn!(plugin = %name, error = %e, "watcher: failed to start");
+                return;
+            }
+            let _ = ready_tx.send(());
+            // Park until stopped — the watcher object itself holds the OS
+            // handle, dropping when this block exits.
+            while !cancel.load(Ordering::SeqCst)
+                && !stopping.load(Ordering::SeqCst)
+                && !tx.is_closed()
+            {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "production: the watcher thread re-checks its stop flags between naps"
+                )]
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            drop(watcher);
+            debug!(plugin = %name, "watcher: cancelled, exiting");
+        });
+    if let Err(e) = watch_thread {
+        warn!(plugin = %name, error = %e, "watcher: could not start its thread");
+    }
 
     // Debouncer / reload trigger lives in the tokio runtime so the
     // reload itself can await the manager. If the plugin is currently
