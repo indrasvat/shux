@@ -13,9 +13,6 @@ use crate::lens_render::{
 use crate::pane_io::{PaneIoState, ResizeRequest, diff_lookup_checkpoint};
 use crate::pane_record::{EndedBy, requested_length};
 
-/// How long `pane.record.stop` waits for the file to be finished.
-const STOP_FINALIZE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
-
 /// The pane's PTY task still takes input: it closes that channel before it
 /// ends the pane's recordings, and drops its writer only later.
 fn pane_takes_input(state: &PaneIoState, pane: shux_core::model::PaneId) -> bool {
@@ -709,8 +706,10 @@ pub(crate) fn register_pane_io_methods(
                         .watch(id)
                         .ok_or_else(|| shux_rpc::RpcError::not_found("pane recording", &id.to_string()))?;
                     recordings.stop(id, EndedBy::Stop);
+                    // Half the caller's patience: room to reply `pending` (and
+                    // be waited on) before a caller gives up.
                     let finished = tokio::time::timeout(
-                        STOP_FINALIZE_BUDGET,
+                        crate::patience::peer_patience() / 2,
                         outcome.wait_for(|o| o.finalized),
                     )
                     .await
@@ -1113,7 +1112,8 @@ pub(crate) fn register_pane_io_methods(
                         "pane_id": pane_id.to_string(),
                         "revision": revision,
                         "bytes_returned": text.len() + png_decoded_len,
-                    }));
+                    }))
+                    .await;
 
                     let mut result = serde_json::json!({
                         "revision": revision,
@@ -1362,7 +1362,8 @@ pub(crate) fn register_pane_io_methods(
                         "pane_id": pane_id.to_string(),
                         "revision": revision,
                         "bytes_returned": 0,
-                    }));
+                    }))
+                    .await;
 
                     Ok(serde_json::json!({
                         "revision": revision,
@@ -1583,7 +1584,8 @@ pub(crate) fn register_pane_io_methods(
                         "from_revision": since_revision,
                         "to_revision": to_revision,
                         "bytes_returned": row_text_len + heat_decoded_len,
-                    }));
+                    }))
+                    .await;
 
                     let (bb_rs, bb_cs, bb_re, bb_ce) = diff.bounding_box;
                     Ok(serde_json::json!({
@@ -1804,14 +1806,7 @@ pub(crate) fn register_pane_io_methods(
                         })
                         .await
                         .map_err(|_| shux_rpc::RpcError::internal("pane resize channel closed"))?;
-                    tokio::time::timeout(std::time::Duration::from_secs(2), ack_rx)
-                        .await
-                        .map_err(|_| {
-                            shux_rpc::RpcError::internal("pane resize ack timed out after 2s")
-                        })?
-                        .map_err(|_| {
-                            shux_rpc::RpcError::internal("pane resize ack channel dropped")
-                        })?;
+                    resize_acked(ack_rx).await?;
                     Ok(serde_json::json!({
                         "pane_id": pane_id.to_string(),
                         "rows": rows,
@@ -1822,8 +1817,41 @@ pub(crate) fn register_pane_io_methods(
         )
 }
 
+/// Waits for the pane's PTY task to apply a queued resize.
+async fn resize_acked(ack: tokio::sync::oneshot::Receiver<()>) -> Result<(), shux_rpc::RpcError> {
+    let patience = crate::patience::peer_patience();
+    tokio::time::timeout(patience, ack)
+        .await
+        .map_err(|_| {
+            shux_rpc::RpcError::internal(&format!(
+                "the pane did not confirm the resize within {}; it is queued and may still apply",
+                crate::patience::describe(patience)
+            ))
+        })?
+        .map_err(|_| shux_rpc::RpcError::internal("pane resize ack channel dropped"))
+}
+
 #[cfg(test)]
 mod tests {
+    /// A PTY task slow to apply a resize under load is waited for: the
+    /// resize is reported done, not failed while it is still being applied.
+    #[tokio::test(start_paused = true)]
+    async fn a_resize_applied_late_is_reported_done() {
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        let applied = tokio::spawn(super::resize_acked(ack_rx));
+        // Let the wait start its clock before the clock moves.
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(6)).await;
+        // And let it see the clock before the ack arrives: `timeout` checks
+        // its inner future first, so an early ack would hide an expiry.
+        tokio::task::yield_now().await;
+        let _ = ack_tx.send(());
+        assert!(
+            applied.await.expect("resize wait").is_ok(),
+            "a resize applied after 6s was reported as failed"
+        );
+    }
+
     use super::*;
     use crate::pane_io::PaneRevision;
     use crate::pane_record::tee_pane_recorders;

@@ -1439,18 +1439,23 @@ async fn run_plugin_io(
                 match res {
                     Ok(Some(line)) if line.is_empty() => continue,
                     Ok(Some(line)) => {
-                        dispatch_plugin_frame(
-                            &name,
-                            &plugin_id,
-                            line,
-                            &router,
-                            &event_bus,
-                            &state_root,
-                            &perm_root,
-                            &graph,
-                            denial_hook.get().cloned(),
-                            resp_tx.clone(),
-                        );
+                        // Its permission check, audit and state methods do
+                        // file I/O: off the async workers, one frame at a time.
+                        let (plugin, id, router, bus) =
+                            (name.clone(), plugin_id, router.clone(), event_bus.clone());
+                        let (state_root, perm_root, graph) =
+                            (state_root.clone(), perm_root.clone(), graph.clone());
+                        let (hook, tx) = (denial_hook.get().cloned(), resp_tx.clone());
+                        let dispatched = tokio::task::spawn_blocking(move || {
+                            dispatch_plugin_frame(
+                                &plugin, &id, line, &router, &bus, &state_root, &perm_root,
+                                &graph, hook, tx,
+                            )
+                        })
+                        .await;
+                        if let Err(e) = dispatched {
+                            warn!(plugin = %name, "frame dispatch failed: {e}");
+                        }
                         continue;
                     }
                     Ok(None) => {

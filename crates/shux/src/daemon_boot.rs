@@ -486,10 +486,8 @@ pub(crate) fn handle_daemon_command(
                 nix::sys::signal::Signal::SIGTERM,
             );
             // Identity, not `kill(pid, 0)`: an exited daemon stays a zombie until
-            // its parent reaps it, which a subreaper may never do. The budget
-            // outlasts the daemon's 3s pane drain.
-            const STOP_TIMEOUT: std::time::Duration = crate::client::STALE_EXIT_TIMEOUT;
-            let deadline = std::time::Instant::now() + STOP_TIMEOUT;
+            // its parent reaps it, which a subreaper may never do.
+            let deadline = std::time::Instant::now() + crate::patience::peer_patience();
             let mut gone = !is_live_shux_daemon(p, socket);
             while !gone && std::time::Instant::now() < deadline {
                 #[expect(
@@ -513,8 +511,9 @@ pub(crate) fn handle_daemon_command(
             }
             if !gone {
                 anyhow::bail!(
-                    "daemon (pid {p}) did not exit within {}s",
-                    STOP_TIMEOUT.as_secs()
+                    "daemon (pid {p}) did not exit within {} of SIGTERM; it may be busy \
+                     draining its panes, stopped or wedged -- retry, or kill it",
+                    crate::patience::describe(crate::patience::peer_patience())
                 );
             }
             Ok(())
@@ -812,8 +811,10 @@ pub(crate) async fn run_rpc_server(
                 "pane.diff_since",
                 "lens.run",
             ];
+            // Runs inside the plugin's frame dispatch, which is on the
+            // blocking pool.
             if LENS_METHODS.contains(&method) {
-                audit.append(serde_json::json!({
+                audit.append_blocking(serde_json::json!({
                     "ts": lens_scratch::iso_now(),
                     "caller": format!("plugin:{uuid}"),
                     "method": method,

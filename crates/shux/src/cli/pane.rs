@@ -687,27 +687,30 @@ async fn stop_recording(
     recording_id: &str,
     path: &std::path::Path,
 ) -> anyhow::Result<serde_json::Value> {
-    const STOP_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+    let patience = crate::patience::peer_patience();
     let stop = async {
         let mut stream = tokio::net::UnixStream::connect(socket_path).await?;
-        rpc_call(
-            &mut stream,
-            "pane.record.stop",
-            serde_json::json!({ "recording_id": recording_id }),
-        )
-        .await
-        .map_err(anyhow::Error::from)
+        let params = serde_json::json!({ "recording_id": recording_id });
+        let outcome = rpc_call(&mut stream, "pane.record.stop", params.clone()).await?;
+        // Stopped, still writing out: wait for the file to be finished.
+        if outcome.get("pending").is_none() {
+            return Ok(outcome);
+        }
+        rpc_call(&mut stream, "pane.record.wait", params)
+            .await
+            .map_err(anyhow::Error::from)
     };
-    match tokio::time::timeout(STOP_BUDGET, stop).await {
+    match tokio::time::timeout(patience, stop).await {
         Ok(Ok(outcome)) => Ok(outcome),
         Ok(Err(e)) => Err(e.context(format!(
             "could not stop the recording of {}; the daemon may have gone away",
             path.display()
         ))),
         Err(_) => anyhow::bail!(
-            "the daemon did not stop the recording of {} within {}s",
+            "the daemon did not finish the recording of {} within {}; it may be busy, \
+             stopped or wedged",
             path.display(),
-            STOP_BUDGET.as_secs()
+            crate::patience::describe(patience)
         ),
     }
 }
@@ -1264,6 +1267,55 @@ mod tests {
         assert!(requests.iter().any(|r| r["method"] == "pane.snapshot"));
         assert!(requests.iter().any(|r| r["method"] == "session.snapshot"));
         assert!(requests.iter().any(|r| r["method"] == "window.snapshot"));
+    }
+
+    /// A stop the daemon answers while the file is still being written is
+    /// followed to the finished file, not reported as a failed recording.
+    #[tokio::test]
+    async fn a_stop_still_finishing_the_file_is_waited_on() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let id = "55555555-5555-4555-8555-555555555555";
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("d.sock");
+        let path = dir.path().join("e.raw");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let outcome = |finalized: bool| {
+            serde_json::json!({"recording_id": id, "path": path.display().to_string(),
+                "bytes_written": 3, "status": "complete", "lossless": true, "error": null,
+                "ended_by": "stop", "finalized": finalized})
+        };
+        let (pending, finished) = (outcome(false), outcome(true));
+        let server = tokio::spawn(async move {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            let mut len = [0u8; 4];
+            while conn.read_exact(&mut len).await.is_ok() {
+                let mut req = vec![0u8; u32::from_be_bytes(len) as usize];
+                conn.read_exact(&mut req).await.unwrap();
+                let req: serde_json::Value = serde_json::from_slice(&req).unwrap();
+                let result = if req["method"] == "pane.record.stop" {
+                    let mut r = pending.clone();
+                    r["pending"] = serde_json::json!("still finalizing");
+                    r
+                } else {
+                    finished.clone()
+                };
+                let resp = serde_json::to_vec(
+                    &serde_json::json!({"jsonrpc": "2.0", "id": req["id"], "result": result}),
+                )
+                .unwrap();
+                conn.write_all(&(resp.len() as u32).to_be_bytes())
+                    .await
+                    .unwrap();
+                conn.write_all(&resp).await.unwrap();
+            }
+        });
+        let ended = stop_recording(&socket, id, &path).await.unwrap();
+        server.abort();
+        assert_eq!(
+            recording_failure(&ended),
+            None,
+            "a stop still finishing the file was reported as a failed recording: {ended}"
+        );
     }
 
     /// A recording that did not end normally with every byte on disk fails

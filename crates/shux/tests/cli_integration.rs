@@ -514,7 +514,21 @@ async fn shux_version(
     socket: &std::path::Path,
     format: &str,
 ) -> (String, std::process::ExitStatus) {
-    let run = tokio::process::Command::new(env!("CARGO_BIN_EXE_shux"))
+    shux_version_patient(socket, format, None).await
+}
+
+/// `patience_ms` shortens how long the CLI waits for an answer, for a peer
+/// that never gives one.
+async fn shux_version_patient(
+    socket: &std::path::Path,
+    format: &str,
+    patience_ms: Option<&str>,
+) -> (String, std::process::ExitStatus) {
+    let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_shux"));
+    if let Some(ms) = patience_ms {
+        cmd.env("SHUX_PEER_PATIENCE_MS", ms);
+    }
+    let run = cmd
         .args([
             "--format",
             format,
@@ -650,7 +664,7 @@ async fn version_does_not_hang_on_a_daemon_that_never_answers() {
             conns.push(conn);
         }
     });
-    let (stdout, status) = shux_version(&socket, "json").await;
+    let (stdout, status) = shux_version_patient(&socket, "json", Some("2000")).await;
     assert!(status.success(), "{stdout}");
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(

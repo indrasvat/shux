@@ -1180,12 +1180,13 @@ fn a_client_reports_a_daemon_that_does_not_answer() {
     let mut client = h
         .shux()
         .args(["session", "list"])
+        .env("SHUX_PEER_PATIENCE_MS", "2000")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn shux");
-    // The client gives up after its own 5s version-check timeout; the budget
-    // only decides when a client that never does counts as hung.
+    // The client gives up after its 2s patience; the budget only decides
+    // when a client that never does counts as hung.
     let hung = !shux_testkit::poll_until(shux_testkit::BUDGET, || {
         client.try_wait().expect("poll client").is_some()
     });
