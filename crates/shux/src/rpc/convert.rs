@@ -116,6 +116,7 @@ pub(crate) fn pane_to_json(
         "cwd": p.cwd.to_string_lossy(),
         "command": p.command,
         "exit_status": p.exit_status,
+        "exit_signal": p.exit_signal,
         "is_focused": is_focused,
         "is_zoomed": is_zoomed,
         "version": p.version,

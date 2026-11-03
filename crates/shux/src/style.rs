@@ -1961,6 +1961,83 @@ pub fn print_pane_wait_status(result: &serde_json::Value, states: &[String]) {
     }
 }
 
+/// `pane wait-exit --format plain`: `OUTCOME\tPANE_ID\tEXIT_CODE\tSIGNAL`, the
+/// signal by name when it has one; absent fields are empty.
+pub fn print_pane_wait_exit_plain(result: &serde_json::Value) {
+    let s = |p: &str| result.pointer(p).and_then(|v| v.as_str()).unwrap_or("");
+    let n = |p: &str| result.pointer(p).map(|v| v.to_string()).unwrap_or_default();
+    let signal = match s("/signal_name") {
+        "" => n("/signal"),
+        name => name.to_string(),
+    };
+    println!(
+        "{}\t{}\t{}\t{}",
+        s("/outcome"),
+        s("/pane_id"),
+        n("/exit_code"),
+        signal
+    );
+}
+
+/// Print `pane wait-exit`'s outcome.
+pub fn print_pane_wait_exit(result: &serde_json::Value) {
+    let pane_id = short_id(result.get("pane_id").and_then(|v| v.as_str()).unwrap_or(""));
+    match result.get("outcome").and_then(|v| v.as_str()).unwrap_or("") {
+        "exited" => {
+            if let Some(code) = result.get("exit_code").and_then(|v| v.as_i64()) {
+                let code_text = code.to_string();
+                println!(
+                    "{} pane {} exited {}",
+                    success("✓"),
+                    muted(pane_id),
+                    if code == 0 {
+                        success(&code_text).to_string()
+                    } else {
+                        error(&code_text).to_string()
+                    }
+                );
+            } else {
+                let signal = result
+                    .get("signal_name")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .or_else(|| result.get("signal").map(|v| format!("signal {v}")))
+                    .unwrap_or_default();
+                let by = if result.get("by_shux").and_then(|v| v.as_bool()) == Some(true) {
+                    " (sent by shux)"
+                } else {
+                    ""
+                };
+                println!(
+                    "{} pane {} was ended by {}{}",
+                    success("✓"),
+                    muted(pane_id),
+                    error(&signal),
+                    muted(by)
+                );
+            }
+        }
+        "timeout" => println!("{} pane {} is still running", warning("✗"), muted(pane_id)),
+        "killed" => println!(
+            "{} pane {} was killed before its program exited",
+            warning("✗"),
+            muted(pane_id)
+        ),
+        "not_started" => println!(
+            "{} pane {} has never run a program",
+            warning("✗"),
+            muted(pane_id)
+        ),
+        "unknown" => println!(
+            "{} pane {} ended, but its exit could not be observed ({})",
+            warning("✗"),
+            muted(pane_id),
+            result.get("reason").and_then(|v| v.as_str()).unwrap_or("?")
+        ),
+        other => println!("{} pane {} {}", warning("✗"), muted(pane_id), other),
+    }
+}
+
 /// Print a `pane checkpoint` summary (lens PRD §7/§10): the keyed revision
 /// and, when a 5th checkpoint evicted the FIFO-oldest, the evicted revision.
 pub fn print_pane_checkpoint(pane_id: &str, revision: u64, evicted: Option<u64>) {

@@ -28,6 +28,12 @@ pub(crate) fn register_program_status_methods(
     io_state: Arc<Mutex<PaneIoState>>,
     bus: EventBus,
 ) -> shux_rpc::RouterBuilder {
+    let builder = crate::rpc::wait_exit::register_wait_exit_method(
+        builder,
+        graph.clone(),
+        io_state.clone(),
+        bus.clone(),
+    );
     let (g1, io1) = (graph.clone(), io_state);
     let (g2, io2) = (graph, io1.clone());
     builder
@@ -192,9 +198,14 @@ fn decide(
     });
     // An exited pane's last status was committed with its exit; that is final.
     if let Some(code) = pane.exit_status {
-        return Some(matched.unwrap_or_else(
-            || json!({"outcome": "pane_gone", "pane_id": pane_id.to_string(), "exit_status": code}),
-        ));
+        return Some(matched.unwrap_or_else(|| {
+            let mut gone =
+                json!({"outcome": "pane_gone", "pane_id": pane_id.to_string(), "exit_status": code});
+            if let Some(signal) = pane.exit_signal {
+                gone["exit_signal"] = signal.into();
+            }
+            gone
+        }));
     }
     if terminal_enabled == Some(false) {
         return Some(json!({"outcome": "disabled", "pane_id": pane_id.to_string()}));

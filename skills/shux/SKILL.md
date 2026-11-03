@@ -111,6 +111,31 @@ command = ["vivecaka", "--repo", "cli/cli"]
 shux state apply spec.toml      # atomic — all or nothing
 ```
 
+## Run a batch job and get its exit code
+
+For a test suite, a build or a migration, give a pane the program itself and
+wait for it to exit. Don't type the command into a live shell and wait for a
+sentinel string: that is where multi-line pastes, a stray `exit` and a marker
+matching its own echo go wrong.
+
+```bash
+R=$(shux --format json session create job --wait -- make test)   # runs in your current directory
+echo "$R" | jq -e '.result.outcome == "exited" and .result.exit_code == 0'
+P=$(echo "$R" | jq -r .result.pane_id)
+shux pane capture -s job -p "$P"                                  # the output is still there
+shux session kill job
+
+shux pane wait-exit "$P" --timeout 10m                            # or wait on a pane you already have
+```
+
+`pane split --wait` runs in the source pane's directory and `window create
+--wait` in the daemon's unless you pass `--cwd`. `shux`'s own exit code says
+whether the *wait* worked — 0 exited, 1 timeout, 2 no such pane or a bad
+create, 3 daemon gone or nothing to observe, 4 pane killed first — never the
+program's. The program's result is `exit_code`, or `signal` + `signal_name`
+when a signal ended it. A program that reports `done` over OSC 7501 and keeps
+running has not exited.
+
 ## Leave nothing running
 
 shux is a daemon plus long-lived PTY children. Anything you spawn outlives your
@@ -246,7 +271,7 @@ reports the CLI's build and the daemon's side by side). All RPCs accept JSON in,
 | Session  | `session.create` · `session.list` · `session.rename` · `session.kill` · `session.ensure` |
 | Window   | `window.create` · `window.list` · `window.focus` · `window.kill` · `window.ensure` |
 | Pane I/O | `pane.send_keys` · `pane.set_size` · `pane.snapshot` · `pane.capture` · `pane.output.watch` · `pane.record.start` · `pane.record.stop` |
-| Pane mgmt| `pane.split` · `pane.focus` · `pane.zoom` · `pane.swap` · `pane.kill` · `pane.set_title` |
+| Pane mgmt| `pane.split` · `pane.focus` · `pane.zoom` · `pane.swap` · `pane.kill` · `pane.set_title` · `pane.wait_exit` |
 | Window snap | `window.snapshot` · `session.snapshot` (composed multi-pane PNG)            |
 | Lens (verify loop) | `lens.run` · `pane.wait_settled` · `pane.glance` · `pane.checkpoint` · `pane.diff_since` — [references/lens.md](references/lens.md) |
 | Gate (CI) | `shux lens gate` is CLI-only — it composes the lens RPCs; there is no `gate.*` method — [references/gate.md](references/gate.md) |
@@ -286,6 +311,8 @@ Need plain text of the screen?     → pane.capture    (shux pane capture)
 Need to block until text appears?  → pane.wait_for   (shux pane wait-for --text|--regex)
 Need to know when an agent in a
 pane is blocked on you or done?    → pane.wait_status (shux pane wait-status <PANE> --state blocked,done)
+Need a program's exit code (a
+test run, a build)?                → pane.wait_exit  (shux pane split --wait -- <argv>, or pane wait-exit <PANE>)
 Need live sampled PTY output?      → pane.output.watch (sealed data-plane, sampled)
 Need a byte-exact transcript?      → shux pane record --to FILE (lossless recorder)
 Need repeatable TUI QA evidence?   → Sightline verifier; read references/sightline.md

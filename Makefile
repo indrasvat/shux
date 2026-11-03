@@ -264,6 +264,12 @@ test-pane-command: nextest-ready ## Run pane command / exited-pane e2e tests; op
 	@.shux/scripts/no_leak_guard.sh $(NEXTEST_RUN) -p shux --test pane_command_e2e $(FILTER)
 	@echo "$(COLOR_GREEN)✓ Pane command e2e tests passed$(COLOR_RESET)"
 
+.PHONY: test-pane-wait-exit
+test-pane-wait-exit: nextest-ready ## Run `pane wait-exit` / `--wait` e2e tests; optionally pass FILTER=<test-name>
+	@echo "$(COLOR_BLUE)▶ Running pane wait-exit e2e tests...$(COLOR_RESET)"
+	@.shux/scripts/no_leak_guard.sh $(NEXTEST_RUN) -p shux --test pane_wait_exit_e2e $(FILTER)
+	@echo "$(COLOR_GREEN)✓ Pane wait-exit e2e tests passed$(COLOR_RESET)"
+
 .PHONY: test-window-snapshot-border-style
 test-window-snapshot-border-style: nextest-ready ## Run the `window snapshot` border-style cross-path test; optionally pass FILTER=<test-name>
 	@echo "$(COLOR_BLUE)▶ Running window snapshot border-style tests...$(COLOR_RESET)"

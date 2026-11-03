@@ -18,6 +18,7 @@ pub mod rpc;
 pub mod session;
 pub mod state;
 pub mod system;
+pub mod wait_exit;
 pub mod window;
 
 #[cfg(test)]
@@ -37,4 +38,5 @@ pub use rpc::*;
 pub use session::*;
 pub use state::*;
 pub use system::*;
+pub use wait_exit::*;
 pub use window::*;

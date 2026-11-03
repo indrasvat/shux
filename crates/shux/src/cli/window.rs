@@ -80,6 +80,7 @@ pub async fn handle_window_new(
     cmd: Option<String>,
     argv: Vec<String>,
     ensure: bool,
+    wait: WaitArgs,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
     let session_id = resolve_session_id(stream, session_name).await?;
@@ -123,6 +124,8 @@ pub async fn handle_window_new(
     let result = rpc_call(stream, method, serde_json::Value::Object(params)).await?;
 
     match format {
+        // `--wait` prints one document, with this under `created`.
+        OutputFormat::Json if wait.wait => {}
         OutputFormat::Json => {
             println!(
                 "{}",
@@ -137,6 +140,10 @@ pub async fn handle_window_new(
             let index = result.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
             crate::style::print_window_created(title, index)?;
         }
+    }
+    if wait.wait {
+        return super::wait_after_create(stream, result, "/pane_id", wait.wait_timeout, format)
+            .await;
     }
 
     Ok(())
@@ -362,6 +369,7 @@ mod tests {
             Some("echo hi".to_string()),
             vec![],
             false,
+            WaitArgs::default(),
             OutputFormat::Json,
         )
         .await
@@ -397,6 +405,7 @@ mod tests {
             Some(0.4),
             Some("echo split".to_string()),
             Vec::new(),
+            WaitArgs::default(),
             OutputFormat::Json,
         )
         .await

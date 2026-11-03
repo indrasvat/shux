@@ -47,7 +47,10 @@ pub(crate) struct RpcHarness {
 
 impl RpcHarness {
     pub(crate) fn new() -> Self {
-        let bus = shux_core::bus::EventBus::new();
+        Self::with_bus(shux_core::bus::EventBus::new())
+    }
+
+    pub(crate) fn with_bus(bus: shux_core::bus::EventBus) -> Self {
         let (graph, state) = SessionGraph::new_with_event_bus(Some(bus.clone()));
         let (cmd_tx, cmd_rx) = mpsc::channel(128);
         let cancel = CancellationToken::new();

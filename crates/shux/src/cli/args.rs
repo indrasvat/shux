@@ -230,7 +230,7 @@ pub enum SessionCommand {
         session: Option<String>,
 
         /// Create-if-missing semantics (maps to `session.ensure`).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "wait")]
         ensure: bool,
 
         /// Do not attach after creating the session.
@@ -263,6 +263,9 @@ pub enum SessionCommand {
         /// splitting, no expansion). Takes precedence over `--cmd`.
         #[arg(last = true, num_args = 0..)]
         argv: Vec<String>,
+
+        #[command(flatten)]
+        wait: WaitArgs,
     },
 
     /// List sessions.
@@ -670,7 +673,7 @@ pub enum WindowCommand {
         cmd: Option<String>,
 
         /// Create-if-missing semantics (maps to window.ensure)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "wait")]
         ensure: bool,
 
         /// Trailing argv for the initial pane. Anything after `--`
@@ -678,6 +681,9 @@ pub enum WindowCommand {
         /// Takes precedence over `--cmd`.
         #[arg(last = true, num_args = 0..)]
         argv: Vec<String>,
+
+        #[command(flatten)]
+        wait: WaitArgs,
     },
 
     /// Kill a window
@@ -904,6 +910,9 @@ pub enum PaneCommand {
         /// splitting, no expansion). Takes precedence over `--cmd`.
         #[arg(last = true, num_args = 0..)]
         argv: Vec<String>,
+
+        #[command(flatten)]
+        wait: WaitArgs,
     },
 
     /// Focus a specific pane by id (full UUID or short form)
@@ -1377,6 +1386,25 @@ pub enum PaneCommand {
         /// Deadline. Human duration (`30s`, `500ms`); at most 600s.
         #[arg(long, default_value = "30s", value_parser = parse_duration_ms)]
         timeout: u64,
+    },
+
+    /// Block until a pane's program exits, and report how: its exit code, or
+    /// the signal that ended it. Returns at once for a program that already
+    /// exited. Mirrors `pane.wait_exit`. Exit 0 the program exited (whatever
+    /// its own code — read `exit_code` / `signal`), 1 timeout (still
+    /// running), 2 bad arguments or no such pane, 3 the daemon went away, the
+    /// pane never ran a program, or its exit could not be observed, 4 the pane
+    /// was killed before its program exited.
+    #[command(name = "wait-exit")]
+    WaitExit {
+        /// Pane id — full UUID or a unique prefix of 4 or more characters.
+        #[arg(value_name = "PANE")]
+        pane: String,
+
+        /// Deadline (`30s`, `10m`, `500ms`). Omitted waits as long as the
+        /// program runs; `0` checks once.
+        #[arg(long, value_parser = parse_duration_ms)]
+        timeout: Option<u64>,
     },
 
     /// Capture the pane's current visible frame as a checkpoint for a later
@@ -1864,6 +1892,7 @@ mod tests {
                         title,
                         cmd,
                         argv,
+                        ..
                     },
             }) => {
                 assert!(name.is_none());
@@ -2286,6 +2315,7 @@ mod tests {
                         cmd,
                         ensure,
                         argv,
+                        ..
                     },
             }) => {
                 assert_eq!(session, "work");
@@ -2548,4 +2578,20 @@ mod tests {
         assert!(help.contains("unfiltered"), "{help}");
         assert!(!help.contains("filtered to"), "{help}");
     }
+}
+
+/// `--wait` for the verbs that start a program in a new pane.
+#[derive(clap::Args, Debug, Clone, Default)]
+pub struct WaitArgs {
+    /// Wait for the new pane's program to exit and print how it ended, as
+    /// `pane wait-exit` does, with the same exit codes — a failed create
+    /// included. Without a command it waits for the shell to exit.
+    /// `session create --wait` does not attach.
+    #[arg(long)]
+    pub wait: bool,
+
+    /// Deadline for `--wait` (`30s`, `10m`); omitted waits as long as the
+    /// program runs.
+    #[arg(long = "wait-timeout", requires = "wait", value_parser = parse_duration_ms)]
+    pub wait_timeout: Option<u64>,
 }

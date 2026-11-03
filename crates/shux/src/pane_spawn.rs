@@ -491,25 +491,29 @@ async fn run_pane_pty_task(
     // proper wait, while the channel-close and shutdown paths require
     // an explicit kill before waiting will return. Bound both stages
     // with timeouts so a wedged child can't stall pane teardown.
-    let exit_code = if task_exit == PtyTaskExit::RequestedTeardown {
+    // The signals shux sent the child before it ended.
+    let mut sent = Vec::new();
+    let exit = if task_exit == PtyTaskExit::RequestedTeardown {
         let _ = handle.terminate();
+        sent.push(libc::SIGHUP);
         match tokio::time::timeout(std::time::Duration::from_millis(500), handle.wait()).await {
-            Ok(Ok(status)) => status.code(),
+            Ok(Ok(status)) => Some(status),
             Ok(Err(e)) => {
                 tracing::warn!(%pane_id, error = %e, "PTY child wait after teardown failed");
                 None
             }
             Err(_) => {
                 let _ = handle.kill();
+                sent.push(libc::SIGKILL);
                 match tokio::time::timeout(std::time::Duration::from_secs(1), handle.wait()).await {
-                    Ok(Ok(status)) => status.code(),
+                    Ok(Ok(status)) => Some(status),
                     _ => None,
                 }
             }
         }
     } else {
         match tokio::time::timeout(std::time::Duration::from_secs(2), handle.wait()).await {
-            Ok(Ok(status)) => status.code(),
+            Ok(Ok(status)) => Some(status),
             Ok(Err(e)) => {
                 tracing::warn!(%pane_id, error = %e, "PTY child wait failed");
                 None
@@ -518,16 +522,18 @@ async fn run_pane_pty_task(
                 // Still alive after 2s — send a PTY-style hangup to the
                 // process group, then escalate if it refuses to exit.
                 let _ = handle.terminate();
+                sent.push(libc::SIGHUP);
                 match tokio::time::timeout(std::time::Duration::from_millis(500), handle.wait())
                     .await
                 {
-                    Ok(Ok(status)) => status.code(),
+                    Ok(Ok(status)) => Some(status),
                     _ => {
                         let _ = handle.kill();
+                        sent.push(libc::SIGKILL);
                         match tokio::time::timeout(std::time::Duration::from_secs(1), handle.wait())
                             .await
                         {
-                            Ok(Ok(status)) => status.code(),
+                            Ok(Ok(status)) => Some(status),
                             _ => None,
                         }
                     }
@@ -536,17 +542,21 @@ async fn run_pane_pty_task(
         }
     };
 
-    // Propagate the exit so the daemon's PaneExited event fires — set_pane_exit_status
-    // both updates the pane and fires the lifecycle event. A SIGNAL death (or a wait
-    // failure) has no POSIX code (`status.code()` is None); we still fire, with the
-    // lens sentinel `-1` (the same value `lens.run --wait` already reports for a
-    // signalled child). This is load-bearing for the lens-gate runner (task 081, adv
-    // BLOCKER): its `ExitMonitor` watches `pane.exited`, and a crash that fires no exit
-    // event would let the runner compare the crash frame instead of short-circuiting.
-    // The reaper and `--wait` also key on this event, so a signalled child is now reaped
-    // promptly rather than lingering to `max-runtime`.
+    // Every exit fires `pane.exited`, the lens-gate `ExitMonitor` and the reaper
+    // key on it. A signal death or a failed wait has no code: `exit_status` is
+    // the lens sentinel `-1`, and a signal rides beside it.
     // The graph applies this only if `incarnation` still owns the pane.
-    let exit_status = exit_code.unwrap_or(-1);
+    let exit = match exit {
+        Some(status) => {
+            let signal = std::os::unix::process::ExitStatusExt::signal(&status);
+            shux_core::model::ProgramExit {
+                status: status.code().unwrap_or(-1),
+                signal,
+                by_shux: signal.is_some_and(|signal| sent.contains(&signal)),
+            }
+        }
+        None => shux_core::model::ProgramExit::code(-1),
+    };
     // The process is gone: end its live records and send the final status
     // with the exit, so status_changed precedes exited. One lock hold decides
     // ownership and reads the terminal; a successor's records are not ours.
@@ -573,7 +583,7 @@ async fn run_pane_pty_task(
         }
     };
     if let Err(e) = graph
-        .set_pane_exit_status_owned(pane_id, exit_status, incarnation, final_status)
+        .set_pane_exit_status_owned(pane_id, exit, incarnation, final_status)
         .await
     {
         tracing::debug!(%pane_id, error = %e, "set_pane_exit_status failed (pane may already be gone)");
@@ -982,11 +992,23 @@ pub(crate) async fn spawn_pane_pty_with_recorder(
         cast_recorder,
     )
     .await;
+    // Recorded before the ticket goes, so a waiter never sees neither.
+    if spawned.is_err() {
+        let mut state = io_state.lock().await;
+        if !state.incarnations.contains_key(&pane_id) {
+            state.failed_spawns.insert(pane_id);
+        }
+    }
     ticket.ok = spawned.is_ok();
     spawned
 }
 
 type SpawnOutcome = tokio::sync::watch::Receiver<Option<bool>>;
+
+/// A spawn of `pane_id` is under way.
+pub(crate) fn spawn_in_flight(pane_id: shux_core::model::PaneId) -> bool {
+    spawning().contains_key(&pane_id)
+}
 
 /// Spawns in flight, by pane. Its own lock, never held across an await:
 /// spawns must not queue behind the io lock to learn they are redundant.
@@ -1104,6 +1126,7 @@ async fn spawn_pane_pty_unshared(
         let status = vt.program_status_publication();
         let status_generation = status.generation;
         state.incarnations.insert(pane_id, incarnation);
+        state.failed_spawns.remove(&pane_id);
         state.writers.insert(pane_id, write_tx);
         match &probe {
             Ok(probe) => {

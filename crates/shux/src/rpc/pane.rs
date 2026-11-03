@@ -99,13 +99,16 @@ pub(crate) fn register_pane_methods(
                 // noticed after the graph had already grown a pane, leaving a
                 // half-made split behind on an error path (issue #125).
                 let command = pane_command::parse_pane_command(&params)?;
-                let cwd = params
-                    .get("cwd")
-                    .and_then(|v| v.as_str())
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| {
-                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"))
-                    });
+                // Default: where the graph puts the new pane, the source's cwd.
+                let cwd = match params.get("cwd").and_then(|v| v.as_str()) {
+                    Some(cwd) => PathBuf::from(cwd),
+                    None => gh
+                        .snapshot()
+                        .panes
+                        .get(&pane_id)
+                        .map(|p| p.cwd.clone())
+                        .ok_or_else(|| shux_rpc::RpcError::not_found("pane", &pane_id.to_string()))?,
+                };
 
                 // `_with_command` persists the argv on the new pane, so
                 // `pane list` and the `PaneCreated` event report what is
