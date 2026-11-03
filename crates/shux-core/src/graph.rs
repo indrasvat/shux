@@ -350,7 +350,7 @@ pub enum GraphCommand {
     },
     SetPaneExitStatusOwned {
         id: PaneId,
-        exit_status: i32,
+        exit: ProgramExit,
         incarnation: u64,
         final_status: Option<PaneStatusUpdate>,
         reply: tokio::sync::oneshot::Sender<Result<(), GraphError>>,
@@ -894,6 +894,8 @@ impl SessionGraph {
                 window_id: *wid,
                 session_id: id,
                 exit_status: None,
+                signal: None,
+                by_shux: false,
                 command: command.clone(),
             });
         }
@@ -1120,6 +1122,8 @@ impl SessionGraph {
                 window_id: id,
                 session_id: killed_session_id,
                 exit_status: None,
+                signal: None,
+                by_shux: false,
                 command: command.clone(),
             });
         }
@@ -1444,6 +1448,8 @@ impl SessionGraph {
             window_id,
             session_id,
             exit_status: None,
+            signal: None,
+            by_shux: false,
             command: killed_command,
         });
         Ok(())
@@ -1477,6 +1483,8 @@ impl SessionGraph {
         snapshot.version += 1;
         if let Some(p) = snapshot.panes.get_mut(&id) {
             p.exit_status = None;
+            p.exit_signal = None;
+            p.exit_by_shux = false;
             p.version += 1;
         }
         self.commit_snapshot(snapshot);
@@ -1496,7 +1504,7 @@ impl SessionGraph {
     pub fn set_pane_exit_status_owned(
         &self,
         id: PaneId,
-        exit_status: i32,
+        exit: ProgramExit,
         incarnation: u64,
         final_status: Option<PaneStatusUpdate>,
     ) -> Result<(), GraphError> {
@@ -1506,10 +1514,14 @@ impl SessionGraph {
         if let Some(status) = final_status {
             self.set_pane_program_status(id, status)?;
         }
-        self.set_pane_exit_status(id, exit_status)
+        self.set_pane_exit(id, exit)
     }
 
     pub fn set_pane_exit_status(&self, id: PaneId, exit_status: i32) -> Result<(), GraphError> {
+        self.set_pane_exit(id, ProgramExit::code(exit_status))
+    }
+
+    fn set_pane_exit(&self, id: PaneId, exit: ProgramExit) -> Result<(), GraphError> {
         let current = self.current();
 
         let exited_pane = current.panes.get(&id).ok_or(GraphError::PaneNotFound(id))?;
@@ -1525,7 +1537,9 @@ impl SessionGraph {
         snapshot.version += 1;
 
         if let Some(p) = snapshot.panes.get_mut(&id) {
-            p.exit_status = Some(exit_status);
+            p.exit_status = Some(exit.status);
+            p.exit_signal = exit.signal;
+            p.exit_by_shux = exit.by_shux;
             p.version += 1;
         }
 
@@ -1534,7 +1548,9 @@ impl SessionGraph {
             pane_id: id,
             window_id: exited_window_id,
             session_id: exited_session_id,
-            exit_status: Some(exit_status),
+            exit_status: Some(exit.status),
+            signal: exit.signal,
+            by_shux: exit.by_shux,
             command: exited_command,
         });
         Ok(())
@@ -2613,8 +2629,8 @@ pub async fn run_graph_loop(
                     Some(GraphCommand::ClaimPanePty { id, incarnation, reply }) => {
                         let _ = reply.send(graph.claim_pane_pty(id, incarnation));
                     }
-                    Some(GraphCommand::SetPaneExitStatusOwned { id, exit_status, incarnation, final_status, reply }) => {
-                        let _ = reply.send(graph.set_pane_exit_status_owned(id, exit_status, incarnation, final_status));
+                    Some(GraphCommand::SetPaneExitStatusOwned { id, exit, incarnation, final_status, reply }) => {
+                        let _ = reply.send(graph.set_pane_exit_status_owned(id, exit, incarnation, final_status));
                     }
                     Some(GraphCommand::SplitPane { target_pane, direction, ratio, command, reply }) => {
                         let _ = reply.send(graph.split_pane_with_command(target_pane, direction, ratio, command));
@@ -3040,7 +3056,7 @@ impl GraphHandle {
     pub async fn set_pane_exit_status_owned(
         &self,
         id: PaneId,
-        exit_status: i32,
+        exit: ProgramExit,
         incarnation: u64,
         final_status: Option<PaneStatusUpdate>,
     ) -> Result<(), GraphError> {
@@ -3048,7 +3064,7 @@ impl GraphHandle {
         self.cmd_tx
             .send(GraphCommand::SetPaneExitStatusOwned {
                 id,
-                exit_status,
+                exit,
                 incarnation,
                 final_status,
                 reply: tx,
@@ -5082,13 +5098,17 @@ mod tests {
         let pid = state.load().windows[&state.load().sessions[&sid].windows[0]].active_pane;
         graph.claim_pane_pty(pid, 1).unwrap();
         graph.claim_pane_pty(pid, 2).unwrap();
-        graph.set_pane_exit_status_owned(pid, -1, 1, None).unwrap();
+        graph
+            .set_pane_exit_status_owned(pid, ProgramExit::code(-1), 1, None)
+            .unwrap();
         assert_eq!(
             state.load().panes[&pid].exit_status,
             None,
             "stale exit applied"
         );
-        graph.set_pane_exit_status_owned(pid, 0, 2, None).unwrap();
+        graph
+            .set_pane_exit_status_owned(pid, ProgramExit::code(0), 2, None)
+            .unwrap();
         assert_eq!(state.load().panes[&pid].exit_status, Some(0));
     }
 
@@ -5100,7 +5120,9 @@ mod tests {
         let pid = state.load().windows[&state.load().sessions[&sid].windows[0]].active_pane;
         graph.claim_pane_pty(pid, 1).unwrap();
         // The old task's exit committed before the new task's claim.
-        graph.set_pane_exit_status_owned(pid, -1, 1, None).unwrap();
+        graph
+            .set_pane_exit_status_owned(pid, ProgramExit::code(-1), 1, None)
+            .unwrap();
         graph.claim_pane_pty(pid, 2).unwrap();
         assert_eq!(state.load().panes[&pid].exit_status, None);
         let respawned = bus
@@ -5121,7 +5143,7 @@ mod tests {
         let pid = state.load().windows[&state.load().sessions[&sid].windows[0]].active_pane;
         let _ = graph.claim_pane_pty(pid, 2);
         let _ = graph.claim_pane_pty(pid, 1);
-        let _ = graph.set_pane_exit_status_owned(pid, 0, 2, None);
+        let _ = graph.set_pane_exit_status_owned(pid, ProgramExit::code(0), 2, None);
         assert_eq!(
             state.load().panes[&pid].exit_status,
             Some(0),
@@ -5145,7 +5167,9 @@ mod tests {
         let (graph, state) = SessionGraph::new_with_event_bus(None);
         let sid = graph.create_session("work".into(), home()).unwrap();
         let pid = state.load().windows[&state.load().sessions[&sid].windows[0]].active_pane;
-        graph.set_pane_exit_status_owned(pid, 9, 99, None).unwrap();
+        graph
+            .set_pane_exit_status_owned(pid, ProgramExit::code(9), 99, None)
+            .unwrap();
         assert_eq!(state.load().panes[&pid].exit_status, None);
     }
 
@@ -5158,7 +5182,12 @@ mod tests {
         let pid = state.load().windows[&state.load().sessions[&sid].windows[0]].active_pane;
         graph.claim_pane_pty(pid, 1).unwrap();
         graph
-            .set_pane_exit_status_owned(pid, 0, 1, Some(upd(5, Some(status(State::Done)), true)))
+            .set_pane_exit_status_owned(
+                pid,
+                ProgramExit::code(0),
+                1,
+                Some(upd(5, Some(status(State::Done)), true)),
+            )
             .unwrap();
         // A publication racing the exit (e.g. a config reload) lands after it.
         graph
@@ -5201,7 +5230,12 @@ mod tests {
         graph.claim_pane_pty(pid, 2).unwrap();
 
         graph
-            .set_pane_exit_status_owned(pid, 3, 1, Some(upd(5, Some(status(State::Error)), true)))
+            .set_pane_exit_status_owned(
+                pid,
+                ProgramExit::code(3),
+                1,
+                Some(upd(5, Some(status(State::Error)), true)),
+            )
             .unwrap();
         assert_eq!(
             state.load().panes[&pid].program_status,
@@ -5211,7 +5245,12 @@ mod tests {
         assert_eq!(state.load().panes[&pid].exit_status, None);
 
         graph
-            .set_pane_exit_status_owned(pid, 0, 2, Some(upd(6, Some(status(State::Done)), true)))
+            .set_pane_exit_status_owned(
+                pid,
+                ProgramExit::code(0),
+                2,
+                Some(upd(6, Some(status(State::Done)), true)),
+            )
             .unwrap();
         let pane = &state.load().panes[&pid];
         assert_eq!(

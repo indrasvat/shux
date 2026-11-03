@@ -274,6 +274,12 @@ pub enum EventData {
         window_id: WindowId,
         session_id: SessionId,
         exit_status: Option<i32>,
+        /// The signal that ended the program; `exit_status` is then `-1`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signal: Option<i32>,
+        /// shux sent `signal`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        by_shux: bool,
         command: Vec<String>,
     },
 
@@ -687,6 +693,8 @@ mod tests {
                 window_id: wid,
                 session_id: sid,
                 exit_status: Some(0),
+                signal: None,
+                by_shux: false,
                 command: vec!["bash".into()],
             }
             .event_type(),

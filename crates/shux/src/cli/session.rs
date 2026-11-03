@@ -112,6 +112,7 @@ pub struct SessionCreateOptions {
     pub cmd: Option<String>,
     pub argv: Vec<String>,
     pub ensure: bool,
+    pub wait: WaitArgs,
 }
 
 pub async fn handle_new(
@@ -133,6 +134,8 @@ pub async fn handle_new(
     let result = rpc_call(stream, method, serde_json::Value::Object(params)).await?;
 
     match format {
+        // `--wait` prints one document, with this under `created`.
+        OutputFormat::Json if opts.wait.wait => {}
         OutputFormat::Json => {
             println!(
                 "{}",
@@ -147,6 +150,16 @@ pub async fn handle_new(
             let id = result.get("id").and_then(|v| v.as_str()).unwrap_or("?");
             style::print_session_created(name, id, opts.ensure)?;
         }
+    }
+    if opts.wait.wait {
+        super::wait_after_create(
+            stream,
+            result.clone(),
+            "/pane_id",
+            opts.wait.wait_timeout,
+            format,
+        )
+        .await?;
     }
 
     Ok(result)
@@ -643,6 +656,7 @@ mod tests {
                 cmd: Some("ignored".to_string()),
                 argv: vec!["vim".to_string(), "main.rs".to_string()],
                 ensure: true,
+                wait: WaitArgs::default(),
             },
             OutputFormat::Json,
         )

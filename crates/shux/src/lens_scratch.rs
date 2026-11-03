@@ -1474,23 +1474,32 @@ fn parse_lens_run_params(params: &serde_json::Value) -> Result<LensRunParams, sh
 /// Wait for the next `pane.exited` event matching `pane_id`. Event-driven
 /// (§16.1 guardrail 3 — no polling): the caller MUST have subscribed before
 /// the pane's PTY was spawned so the event can't be published-and-missed
-/// before this task starts listening.
-async fn wait_for_pane_exit(mut sub: shux_core::bus::Subscription, pane_id: PaneId) -> Option<i32> {
+/// before this task starts listening. After a gap the graph says whether it
+/// exited; a pane absent from the graph keeps the wait going, so a ghost
+/// pane's reap stays on its deadline.
+async fn wait_for_pane_exit(
+    mut sub: shux_core::bus::Subscription,
+    pane_id: PaneId,
+    graph: &GraphHandle,
+) {
     loop {
         match sub.recv().await {
             Some(SubscriptionEvent::Event(ev)) => {
-                if let EventData::PaneExited {
-                    pane_id: pid,
-                    exit_status,
-                    ..
-                } = ev.data
-                    && pid == pane_id
-                {
-                    return exit_status;
+                if matches!(ev.data, EventData::PaneExited { pane_id: pid, .. } if pid == pane_id) {
+                    return;
                 }
             }
-            Some(SubscriptionEvent::Lagged(_)) => continue,
-            None => return None,
+            Some(SubscriptionEvent::Lagged(_)) => {
+                let snap = graph.snapshot();
+                if snap
+                    .panes
+                    .get(&pane_id)
+                    .is_some_and(|p| p.exit_status.is_some())
+                {
+                    return;
+                }
+            }
+            None => return,
         }
     }
 }
@@ -1596,8 +1605,7 @@ async fn scratch_reaper(
         _ = deadline => {
             deadline_reason
         }
-        exit_status = wait_for_pane_exit(exit_sub, pane_id) => {
-            let _ = exit_status;
+        () = wait_for_pane_exit(exit_sub, pane_id, &graph) => {
             #[expect(
                 clippy::disallowed_methods,
                 reason = "an exited scratch is kept for its post-exit TTL, never past its deadline"
@@ -1770,7 +1778,14 @@ async fn handle_lens_run(
     let caller = shux_rpc::current_caller();
     let core = tokio::spawn(shux_rpc::with_caller(
         caller,
-        spawn_scratch_core(p, graph, io_state, cancel, event_bus, registry),
+        spawn_scratch_core(
+            p,
+            graph.clone(),
+            io_state.clone(),
+            cancel,
+            event_bus.clone(),
+            registry,
+        ),
     ));
     let (session_id, pane_id, revision, wait_sub) = match core.await {
         Ok(core_result) => core_result?,
@@ -1790,8 +1805,17 @@ async fn handle_lens_run(
     });
 
     if let Some(sub) = wait_sub {
-        let exit_code = wait_for_pane_exit(sub, pane_id).await.unwrap_or(-1);
-        result["exit_code"] = json!(exit_code);
+        // `-1` for anything but a code: a signal (named beside it), a pane
+        // killed first, an exit that could not be observed, or a daemon
+        // shutting down under the wait.
+        let exit =
+            crate::rpc::wait_exit::wait_exit(&graph, &io_state, &event_bus, sub, pane_id, None)
+                .await
+                .unwrap_or_default();
+        result["exit_code"] = exit.get("exit_code").cloned().unwrap_or(json!(-1));
+        if let Some(signal) = exit.get("signal") {
+            result["signal"] = signal.clone();
+        }
     }
 
     Ok(result)
@@ -2062,8 +2086,43 @@ impl ScratchRegistry {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// A bus this small drops an exit behind a handful of later events.
+    pub(crate) fn lagging_bus() -> EventBus {
+        EventBus::with_config(shux_core::bus::EventBusConfig {
+            broadcast_capacity: 2,
+            ..Default::default()
+        })
+    }
+
+    /// Buries everything before it under events the waiter filters out.
+    pub(crate) fn flood(bus: &EventBus, pane: PaneId) {
+        for _ in 0..8 {
+            bus.publish(EventData::PaneBell {
+                pane_id: pane,
+                window_id: shux_core::model::WindowId::new(),
+                session_id: SessionId::new(),
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn an_exit_lost_to_a_lagging_subscription_is_still_seen() {
+        let h = crate::rpc::test_harness::RpcHarness::with_bus(lagging_bus());
+        let (_s, _w, pane) = h.seed_session("lagged-exit").await;
+        let sub = h.bus.subscribe_filtered(vec!["pane.exited".to_string()]);
+        h.graph.set_pane_exit_status(pane, 7).await.unwrap();
+        flood(&h.bus, pane);
+        tokio::time::timeout(
+            shux_testkit::BUDGET,
+            wait_for_pane_exit(sub, pane, &h.graph),
+        )
+        .await
+        .expect("an exit the subscription lagged past was never seen");
+        h.stop().await;
+    }
 
     fn tmpdir() -> tempfile::TempDir {
         tempfile::tempdir().expect("tempdir")

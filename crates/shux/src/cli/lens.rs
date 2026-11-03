@@ -315,6 +315,18 @@ pub fn lens_emit_error_and_exit(
     data: Option<serde_json::Value>,
     exit_code: i32,
 ) -> ! {
+    emit_error(format, verb, code, message, data);
+    std::process::exit(exit_code);
+}
+
+/// The printing half of [`lens_emit_error_and_exit`].
+pub fn emit_error(
+    format: OutputFormat,
+    verb: &str,
+    code: i64,
+    message: &str,
+    data: Option<serde_json::Value>,
+) {
     match format {
         OutputFormat::Json => {
             let mut err_obj = serde_json::json!({ "code": code, "message": message });
@@ -335,7 +347,6 @@ pub fn lens_emit_error_and_exit(
             ));
         }
     }
-    std::process::exit(exit_code);
 }
 
 /// `shux pane checkpoint` — capture a checkpoint via `pane.checkpoint` RPC

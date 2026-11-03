@@ -212,6 +212,44 @@ Both methods are `ContentRead`, and grants match the exact method: for
 panes it does not own, a plugin needs `shux plugin grant <name> pane.status`
 to read status and `shux plugin grant <name> pane.wait_status` to wait on it.
 
+### `pane.wait_exit`
+
+Block until a pane's program exits and say how it ended; returns at once
+for one that already has. OSC 7501 status plays no part: a program that
+reports `done` and keeps running has not exited.
+
+```json
+pane.wait_exit { "pane_id": "uuid", "timeout_ms": 600000 }   // timeout_ms omitted: no deadline; 0: check once
+  → { "outcome": "exited", "pane_id": "uuid", "exit_code": 7 }
+  | { "outcome": "exited", "pane_id": "uuid", "signal": 15, "signal_name": "SIGTERM", "by_shux": true }
+  | { "outcome": "timeout" | "killed" | "not_started", "pane_id": "uuid" }
+  | { "outcome": "unknown", "pane_id": "uuid", "reason": "not_reaped" | "events_lost" }
+```
+
+`exited` carries exactly one of `exit_code` and `signal`. `signal_name` is
+`null` for a signal with no name; `by_shux` appears when the signal that
+ended the program is one shux sent — the pane was torn down, or the program
+kept running after its terminal closed. `killed`: the pane was removed
+before its program's exit was recorded. `not_started`: the pane's program
+failed to spawn and no retry is under way; a pane still waiting for its
+first spawn is waited on. `unknown`: the child could not be reaped, or the
+events that would say how a removed pane ended are gone. A pane id the
+daemon has never seen is a `-32004` not-found error; a pane removed since is
+answered from event history when named by its full id. `Public`, like
+`pane.list`.
+
+CLI: `shux pane wait-exit <PANE> [--timeout D]` exits with its own code,
+not the program's: 0 exited (read `exit_code` / `signal`), 1 timeout,
+2 bad arguments or no such pane, 3 daemon gone, `not_started` or
+`unknown`, 4 killed. JSON is `{"result": …}` or `{"error": …}`.
+
+`session create`, `window create` and `pane split` take `--wait`
+[`--wait-timeout D`]: spawn, wait, and print the wait's payload with the
+create response under `created` (text and plain print the create line,
+then the outcome), under the same exit codes — a failed create is 2 or 3,
+never 1. `session create --wait` does not attach; `--wait` does not combine
+with `--ensure`.
+
 ### `window.snapshot` / `session.snapshot`
 
 Rasterize an entire window (all panes + borders + titles + focus highlight)
@@ -251,8 +289,11 @@ session's ACTIVE window is used — not every window of the session; iterate
 { "session_id": "<uuid>" }               // panes of the session's ACTIVE window
   → [ { "id": "...", "window_id": "...", "title": "...",
         "command": [...], "cwd": "...",
-        "exit_status": null|0, "version": N }, ... ]
+        "exit_status": null|0, "exit_signal": null|15, "version": N }, ... ]
 ```
+
+`exit_signal` is set when a signal ended the program; `exit_status` is then
+`-1`.
 
 ### `pane.output.watch`
 

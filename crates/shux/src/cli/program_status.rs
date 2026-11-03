@@ -2,7 +2,7 @@
 
 use super::{args::*, rpc::*};
 
-fn print_json(result: &serde_json::Value) -> anyhow::Result<()> {
+pub(super) fn print_json(result: &serde_json::Value) -> anyhow::Result<()> {
     let envelope = serde_json::json!({ "result": result });
     println!(
         "{}",
@@ -55,8 +55,9 @@ pub async fn handle_pane_wait_status(
     }
 }
 
-/// Exits 3: the daemon could not be reached.
-pub fn wait_status_unreachable(err: anyhow::Error, format: OutputFormat) -> ! {
+/// Exits 3: the daemon could not be reached. For the verbs that keep 1 for a
+/// timeout.
+pub fn wait_unreachable(verb: &str, err: anyhow::Error, format: OutputFormat) -> ! {
     match format {
         OutputFormat::Json => {
             if let Err(e) = print_json_error(&format!("{err:#}")) {
@@ -64,7 +65,7 @@ pub fn wait_status_unreachable(err: anyhow::Error, format: OutputFormat) -> ! {
             }
         }
         OutputFormat::Text | OutputFormat::Plain => {
-            crate::style::print_error(&format!("wait-status could not reach the daemon: {err:#}"))
+            crate::style::print_error(&format!("{verb} could not reach the daemon: {err:#}"))
         }
     }
     std::process::exit(3)

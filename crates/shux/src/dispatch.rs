@@ -213,7 +213,10 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
                 title,
                 cmd,
                 argv,
+                wait,
             } => {
+                // `--wait` never attaches.
+                let detached = detached || wait.wait;
                 // Before creating: a refusal that left the session behind would
                 // report failure for something that half happened.
                 if !detached && !shux_ui::attach::terminal_available() {
@@ -223,10 +226,18 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
                          `--detached` (`-d`) to create the session without attaching."
                     );
                 }
-                let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
+                let waiting = wait.wait;
+                let mut stream = cli::or_wait_failed(
+                    client::ensure_daemon_running_at(&socket_path)
+                        .await
+                        .map_err(Into::into),
+                    waiting,
+                    "session create",
+                    args.format,
+                )?;
                 let resolved = name.or(session);
                 let session_name = resolved.clone().unwrap_or_else(default_session_name);
-                let _ = cli::handle_new(
+                let created = cli::handle_new(
                     &mut stream,
                     cli::SessionCreateOptions {
                         session_name: resolved,
@@ -235,10 +246,12 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
                         cmd,
                         argv,
                         ensure,
+                        wait,
                     },
                     args.format,
                 )
-                .await?;
+                .await;
+                cli::or_wait_failed(created, waiting, "session create", args.format)?;
                 drop(stream);
                 if !detached {
                     run_attach(&socket_path, session_name).await
@@ -357,7 +370,15 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
         },
 
         Some(Command::Window { command }) => {
-            let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
+            let mut stream = match client::ensure_daemon_running_at(&socket_path).await {
+                Ok(stream) => stream,
+                Err(e) => match &command {
+                    WindowCommand::Create { wait, .. } if wait.wait => {
+                        cli::wait_unreachable("window create", e.into(), args.format)
+                    }
+                    _ => return Err(e.into()),
+                },
+            };
             match command {
                 WindowCommand::List { session } => {
                     cli::handle_window_list(&mut stream, &session, args.format).await
@@ -369,8 +390,10 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     cmd,
                     ensure,
                     argv,
+                    wait,
                 } => {
-                    cli::handle_window_new(
+                    let waiting = wait.wait;
+                    let created = cli::handle_window_new(
                         &mut stream,
                         &session,
                         name,
@@ -378,9 +401,11 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
                         cmd,
                         argv,
                         ensure,
+                        wait,
                         args.format,
                     )
-                    .await
+                    .await;
+                    cli::or_wait_failed(created, waiting, "window create", args.format)
                 }
                 WindowCommand::Kill {
                     session,
@@ -466,11 +491,19 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
         Some(Command::Pane { command }) => {
             let mut stream = match client::ensure_daemon_running_at(&socket_path).await {
                 Ok(stream) => stream,
-                // wait-status keeps exit 1 for a timeout, so it reports this itself.
-                Err(e) if matches!(command, PaneCommand::WaitStatus { .. }) => {
-                    cli::wait_status_unreachable(e.into(), args.format)
-                }
-                Err(e) => return Err(e.into()),
+                // The waits keep exit 1 for a timeout, so they report this themselves.
+                Err(e) => match &command {
+                    PaneCommand::WaitStatus { .. } => {
+                        cli::wait_unreachable("wait-status", e.into(), args.format)
+                    }
+                    PaneCommand::WaitExit { .. } => {
+                        cli::wait_unreachable("wait-exit", e.into(), args.format)
+                    }
+                    PaneCommand::Split { wait, .. } if wait.wait => {
+                        cli::wait_unreachable("pane split", e.into(), args.format)
+                    }
+                    _ => return Err(e.into()),
+                },
             };
             match command {
                 PaneCommand::List { session, window } => {
@@ -485,8 +518,10 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     ratio,
                     cmd,
                     argv,
+                    wait,
                 } => {
-                    cli::handle_pane_split(
+                    let waiting = wait.wait;
+                    let split = cli::handle_pane_split(
                         &mut stream,
                         &session,
                         window.as_deref(),
@@ -495,9 +530,11 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
                         ratio,
                         cmd,
                         argv,
+                        wait,
                         args.format,
                     )
-                    .await
+                    .await;
+                    cli::or_wait_failed(split, waiting, "pane split", args.format)
                 }
                 PaneCommand::Focus {
                     session,
@@ -810,6 +847,9 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
                         args.format,
                     )
                     .await
+                }
+                PaneCommand::WaitExit { pane, timeout } => {
+                    cli::handle_pane_wait_exit(&mut stream, &pane, timeout, args.format).await
                 }
                 PaneCommand::Checkpoint { pane } => {
                     cli::handle_pane_checkpoint(&mut stream, &pane, args.format).await

@@ -114,7 +114,7 @@ instead, not the child's code.
 **Signal death has no POSIX exit code.** If the process is killed by
 `--max-runtime`, an explicit `session kill`, or anything else that never
 lets it report its own status, the RPC's `exit_code` field comes back `-1`
-— and because a Unix process exit truncates to its low 8 bits, the
+(with `signal` beside it when a signal ended it) — and because a Unix process exit truncates to its low 8 bits, the
 shell-visible `$?` after `shux lens run --wait` is **255**, not `-1`. Treat
 255 as "never exited on its own", not as a literal exit-code-255 from the
 child:

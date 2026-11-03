@@ -136,6 +136,7 @@ pub async fn handle_pane_split(
     ratio: Option<f64>,
     cmd: Option<String>,
     argv: Vec<String>,
+    wait: WaitArgs,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
     let (session_id, window_id) = resolve_pane_window_id(stream, session_name, window_spec).await?;
@@ -168,6 +169,8 @@ pub async fn handle_pane_split(
     let result = rpc_call(stream, "pane.split", params).await?;
 
     match format {
+        // `--wait` prints one document, with this under `created`.
+        OutputFormat::Json if wait.wait => {}
         OutputFormat::Json => {
             println!(
                 "{}",
@@ -183,6 +186,10 @@ pub async fn handle_pane_split(
             let dir_label = direction.unwrap_or("vertical");
             crate::style::print_pane_split(pane_id, dir_label)?;
         }
+    }
+    if wait.wait {
+        return super::wait_after_create(stream, result, "/pane/id", wait.wait_timeout, format)
+            .await;
     }
 
     Ok(())

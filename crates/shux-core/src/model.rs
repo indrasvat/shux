@@ -171,6 +171,26 @@ impl Window {
     }
 }
 
+/// How a pane's program ended, as its reaper saw it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProgramExit {
+    /// The exit code, or `-1` when there is none.
+    pub status: i32,
+    pub signal: Option<i32>,
+    /// shux sent `signal`.
+    pub by_shux: bool,
+}
+
+impl ProgramExit {
+    pub fn code(status: i32) -> Self {
+        Self {
+            status,
+            signal: None,
+            by_shux: false,
+        }
+    }
+}
+
 /// A pane is a terminal viewport running a child process (PRD 5.1).
 ///
 /// Title resolution priority (highest first), exposed via
@@ -207,6 +227,13 @@ pub struct Pane {
     pub cwd: PathBuf,
     pub command: Vec<String>,
     pub exit_status: Option<i32>,
+    /// The signal that ended the program; `exit_status` is then `-1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_signal: Option<i32>,
+    /// shux sent that signal: the pane was torn down, or the program kept
+    /// running after its terminal closed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub exit_by_shux: bool,
     pub restart: RestartPolicy,
     pub theme: Option<ThemeRef>,
     pub tags: Tags,
@@ -238,6 +265,8 @@ impl Pane {
             cwd: cwd.into(),
             command: Vec::new(),
             exit_status: None,
+            exit_signal: None,
+            exit_by_shux: false,
             restart: RestartPolicy::default(),
             theme: None,
             tags: HashMap::new(),
