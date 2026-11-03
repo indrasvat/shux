@@ -620,6 +620,26 @@ mod tests {
             serde_json::json!({"name": "made", "command": sleeper, "cwd": "/tmp"}),
         )
         .await;
+        hang_up_after_the_graph_grows(
+            &h,
+            "window.ensure",
+            serde_json::json!({"session_id": session_id.to_string(), "name": "ensured",
+                "command": sleeper, "cwd": "/tmp"}),
+        )
+        .await;
+        hang_up_after_the_graph_grows(
+            &h,
+            "session.ensure",
+            serde_json::json!({"name": "ensured", "command": sleeper, "cwd": "/tmp"}),
+        )
+        .await;
+        hang_up_after_the_graph_grows(
+            &h,
+            "state.apply",
+            serde_json::json!({"ops": [{"op": "create_session", "name": "applied",
+                "cwd": "/tmp", "initial_command": sleeper}]}),
+        )
+        .await;
         let _ = h.io.lock().await.teardown_panes(
             &h.graph.snapshot().panes.keys().copied().collect::<Vec<_>>(),
             true,

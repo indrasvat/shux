@@ -128,7 +128,7 @@ pub(crate) fn register_plugin_methods(
                 Ok(serde_json::json!({ "killed": name }))
             }
         })
-        .register_with_policy("plugin.reload", Policy::fixed(Sensitivity::PluginsForbidden), move |params: Option<serde_json::Value>| {
+        .register_to_completion("plugin.reload", Policy::fixed(Sensitivity::PluginsForbidden), move |params: Option<serde_json::Value>| {
             let mgr = p4.clone();
             async move {
                 let params = params.unwrap_or_default();
@@ -215,6 +215,63 @@ pub(crate) fn register_plugin_methods(
 mod tests {
     use super::*;
     use crate::rpc::test_harness::{dispatch_err, dispatch_ok, write_plugin_script};
+
+    /// A reload stops the plugin, then starts it again. A caller that hangs up
+    /// between the two must not leave the plugin stopped for good.
+    #[tokio::test]
+    async fn a_reload_whose_caller_hangs_up_still_restarts_the_plugin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = write_plugin_script(
+            tmp.path(),
+            "noop.sh",
+            r#"#!/usr/bin/env bash
+set -u
+IFS= read -r _ || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":"init","result":{"name":"noop","version":"0.1.0","subscribes":[],"provides":[],"capabilities":[]}}'
+while IFS= read -r line; do
+  case "$line" in *'"plugin.shutdown"'*) exit 0 ;; esac
+done
+"#,
+        );
+        let manager = shux_plugin::PluginManager::with_state_root(
+            shux_core::bus::EventBus::new(),
+            tmp.path().join("plugins"),
+        );
+        let router = register_plugin_methods(shux_rpc::Router::builder(), manager.clone()).build();
+        manager
+            .install(shux_plugin::PluginSource::from_path(&script))
+            .await
+            .expect("install");
+        let listed = |m: shux_plugin::PluginManager| async move {
+            m.list().await.iter().any(|p| p.name == "noop")
+        };
+
+        let mut call =
+            Box::pin(router.dispatch("plugin.reload", Some(serde_json::json!({"name": "noop"}))));
+        let deadline = std::time::Instant::now() + shux_testkit::BUDGET;
+        while listed(manager.clone()).await {
+            assert!(
+                tokio::time::timeout(std::time::Duration::ZERO, &mut call)
+                    .await
+                    .is_err(),
+                "the reload finished before it stopped the plugin"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the reload never stopped the plugin"
+            );
+            tokio::task::yield_now().await;
+        }
+        drop(call);
+        while !listed(manager.clone()).await {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a reload whose caller hung up left the plugin stopped"
+            );
+            tokio::task::yield_now().await;
+        }
+        manager.kill("noop").await.expect("kill");
+    }
 
     #[tokio::test]
     async fn production_plugin_router_covers_install_grants_audit_reload_and_kill() {

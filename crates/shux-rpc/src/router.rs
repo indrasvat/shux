@@ -188,7 +188,6 @@ impl RouterBuilder {
         policy: Policy,
         handler: impl Handler,
     ) -> Self {
-        let handler = Arc::new(handler);
         self.register_with_policy(method, policy, move |params: Option<Value>| {
             crate::run_to_completion(handler.handle(params))
         })

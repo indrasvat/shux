@@ -613,17 +613,53 @@ done
         );
         let asker = write_script(tmp.path(), "asker.sh", &script);
         let mgr = PluginManager::with_state_root(EventBus::new(), tmp.path().join("plugins"));
-        mgr.install(PluginSource::from_path(&watched).with_watch(true))
+        let info = mgr
+            .install(PluginSource::from_path(&watched).with_watch(true))
             .await
             .expect("install watched");
+        assert!(info.watching, "no watcher started, so this proves nothing");
         mgr.install(PluginSource::from_path(&asker))
             .await
             .expect("install asker");
-        // Never answered: the watcher holds the only blocking thread.
         wait_for_lines(&resp, 1).await;
         mgr.kill("asker").await.expect("kill asker");
         mgr.kill("noop").await.expect("kill watched");
     });
+}
+
+/// A plugin's name is its own: one holding a NUL byte installs with a reload
+/// watcher like any other, rather than panicking the install.
+#[tokio::test]
+async fn a_watched_plugin_with_a_nul_in_its_name_installs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = write_script(
+        tmp.path(),
+        "nul.sh",
+        r#"#!/usr/bin/env bash
+set -u
+IFS= read -r _ || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":"init","result":{"name":"a\u0000b","version":"0.1.0","subscribes":[],"provides":[],"capabilities":[]}}'
+while IFS= read -r line; do
+  case "$line" in *'"plugin.shutdown"'*) exit 0 ;; esac
+done
+"#,
+    );
+    let mgr = PluginManager::with_state_root(EventBus::new(), tmp.path().join("plugins"));
+    let installed = tokio::spawn({
+        let mgr = mgr.clone();
+        async move {
+            mgr.install(PluginSource::from_path(&script).with_watch(true))
+                .await
+        }
+    })
+    .await;
+    let info = match installed {
+        Ok(Ok(info)) => info,
+        Ok(Err(e)) => panic!("install refused the plugin: {e}"),
+        Err(e) => panic!("install panicked: {e}"),
+    };
+    assert!(info.watching);
+    mgr.kill(&info.name).await.expect("kill");
 }
 
 /// A plugin request whose file I/O stalls does not hold an async worker: on a

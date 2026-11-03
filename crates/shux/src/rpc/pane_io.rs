@@ -701,11 +701,17 @@ pub(crate) fn register_pane_io_methods(
                 let io = io12.clone();
                 async move {
                     let id = recording_id_param(params.as_ref())?;
-                    let recordings = io.lock().await.recordings.clone();
-                    let (mut outcome, path) = recordings
-                        .watch(id)
-                        .ok_or_else(|| shux_rpc::RpcError::not_found("pane recording", &id.to_string()))?;
-                    recordings.stop(id, EndedBy::Stop);
+                    // The stop is the caller's request and runs to completion;
+                    // the wait for the finished file below is the caller's alone.
+                    let (mut outcome, path) = shux_rpc::run_to_completion(async move {
+                        let recordings = io.lock().await.recordings.clone();
+                        let watched = recordings.watch(id).ok_or_else(|| {
+                            shux_rpc::RpcError::not_found("pane recording", &id.to_string())
+                        })?;
+                        recordings.stop(id, EndedBy::Stop);
+                        Ok(watched)
+                    })
+                    .await?;
                     // Half this process's patience, the caller's too when both
                     // read the same environment: room to reply `pending` (and be
                     // waited on) before a caller gives up.
@@ -1906,6 +1912,53 @@ mod tests {
         assert!(ok["png_base64"].is_null());
         assert!(ok["text"].as_str().unwrap().contains("budget probe"));
 
+        harness.stop().await;
+    }
+
+    /// A stop whose caller hangs up before it reaches the recording still
+    /// stops it; only the wait for the finished file is the caller's.
+    #[tokio::test]
+    async fn a_record_stop_whose_caller_hangs_up_still_stops_the_recording() {
+        let harness = RpcHarness::new();
+        let (_session_id, _window_id, pane_id) = harness.seed_session("record").await;
+        let _writer_rx = harness.seed_io(pane_id, b"ready\n").await;
+        let dir = tempfile::tempdir().unwrap();
+        let started = dispatch_ok(
+            &harness.router,
+            "pane.record.start",
+            serde_json::json!({
+                "pane_id": pane_id.to_string(),
+                "path": dir.path().join("raw.bin").display().to_string(),
+            }),
+        )
+        .await;
+        let id = started["recording_id"].clone();
+
+        let held = harness.io.lock().await;
+        let mut call = Box::pin(harness.router.dispatch(
+            "pane.record.stop",
+            Some(serde_json::json!({"recording_id": id})),
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::ZERO, &mut call)
+                .await
+                .is_err(),
+            "the stop finished while the pane IO lock was held"
+        );
+        drop(call);
+        drop(held);
+
+        let ended = tokio::time::timeout(
+            shux_testkit::BUDGET,
+            harness.router.dispatch(
+                "pane.record.wait",
+                Some(serde_json::json!({"recording_id": id})),
+            ),
+        )
+        .await
+        .expect("a stop whose caller hung up never stopped the recording")
+        .expect("record.wait");
+        assert_eq!(ended["ended_by"], "stop", "{ended}");
         harness.stop().await;
     }
 

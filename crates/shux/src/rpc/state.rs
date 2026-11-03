@@ -28,7 +28,7 @@ pub(crate) fn register_state_methods(
     io_state: Arc<Mutex<PaneIoState>>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> shux_rpc::RouterBuilder {
-    builder.register_with_policy(
+    builder.register_to_completion(
         "state.apply",
         Policy::fixed(Sensitivity::Grantable),
         move |params: Option<serde_json::Value>| {
