@@ -451,15 +451,17 @@ fn a_scratch_ended_at_max_runtime_is_marked_as_ended_by_shux() {
     );
 }
 
-/// A scratch cleans up after itself: what its program leaves in its group
-/// when it exits by itself is ended then, not left running until the TTL.
+/// A scratch cleans up after itself: what its program leaves in its group,
+/// detached from the terminal, is ended when the program exits by itself,
+/// not left running until the TTL. (One still holding the terminal keeps the
+/// pane open, so the TTL or `--max-runtime` ends it.)
 #[test]
 fn a_scratch_that_exits_takes_its_leftovers_with_it() {
     let env = Env::new();
     let mut s = Survivor::new(&env, "scratch");
     let script = format!(
-        "sh -c 'trap \"\" HUP TERM; echo $$ > {pidfile}; exec sleep {needle}' & \
-         until [ -s {pidfile} ]; do sleep 0.01; done",
+        "sh -c 'trap \"\" HUP TERM; echo $$ > {pidfile}; exec sleep {needle}' \
+         </dev/null >/dev/null 2>&1 & until [ -s {pidfile} ]; do sleep 0.01; done",
         pidfile = s.pidfile.display(),
         needle = s.needle
     );
