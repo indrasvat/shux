@@ -706,8 +706,9 @@ pub(crate) fn register_pane_io_methods(
                         .watch(id)
                         .ok_or_else(|| shux_rpc::RpcError::not_found("pane recording", &id.to_string()))?;
                     recordings.stop(id, EndedBy::Stop);
-                    // Half the caller's patience: room to reply `pending` (and
-                    // be waited on) before a caller gives up.
+                    // Half this process's patience, the caller's too when both
+                    // read the same environment: room to reply `pending` (and be
+                    // waited on) before a caller gives up.
                     let finished = tokio::time::timeout(
                         crate::patience::peer_patience() / 2,
                         outcome.wait_for(|o| o.finalized),
@@ -1824,8 +1825,7 @@ async fn resize_acked(ack: tokio::sync::oneshot::Receiver<()>) -> Result<(), shu
         .await
         .map_err(|_| {
             shux_rpc::RpcError::internal(&format!(
-                "the pane did not confirm the resize within {}; it is queued and may still apply",
-                crate::patience::describe(patience)
+                "the pane did not confirm the resize within {patience:?}; it is queued and may still apply"
             ))
         })?
         .map_err(|_| shux_rpc::RpcError::internal("pane resize ack channel dropped"))

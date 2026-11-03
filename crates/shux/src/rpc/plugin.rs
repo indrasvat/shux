@@ -189,13 +189,7 @@ pub(crate) fn register_plugin_methods(
                     .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'plugin'"))?.to_string();
                 let tail = p.get("tail").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
                 let path = mgr.audit_path(&plugin).await.map_err(plugin_error_to_rpc)?;
-                let read = {
-                    let path = path.clone();
-                    tokio::task::spawn_blocking(move || std::fs::read_to_string(path))
-                        .await
-                        .map_err(|e| shux_rpc::RpcError::internal(&format!("read audit log: {e}")))?
-                };
-                let body = match read {
+                let body = match std::fs::read_to_string(&path) {
                     Ok(s) => s,
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
                     Err(e) => return Err(shux_rpc::RpcError::internal(&format!("read audit log {}: {e}", path.display()))),

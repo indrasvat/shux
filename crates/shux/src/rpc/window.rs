@@ -376,7 +376,9 @@ pub(crate) fn register_window_methods(
             move |params: Option<serde_json::Value>| {
                 let gh = g7.clone();
                 let io = io_kill.clone();
-                async move {
+                // Graph first, then IO: a hang-up between them would leave
+                // the window's programs running with nothing left to reach them.
+                shux_rpc::run_to_completion(async move {
                     let params = params.unwrap_or_default();
                     let window_id = resolve_window_ref(&gh, required_str(&params, "id")?, "id")?;
 
@@ -407,7 +409,7 @@ pub(crate) fn register_window_methods(
                     }
 
                     Ok(serde_json::json!({ "killed": window_id.to_string() }))
-                }
+                })
             },
         )
 }

@@ -1613,8 +1613,7 @@ async fn reap_scratch(
 
 /// Whether the scratch's PTY task confirmed its group ended: its leader
 /// reaped and nothing left in it. A task that ended without saying, never
-/// said, or no channel at all is unconfirmed. Bounded by the shared patience:
-/// a task slow to answer under load is waited for.
+/// said, or no channel at all is unconfirmed.
 async fn group_ended(ended: Option<tokio::sync::watch::Receiver<Option<bool>>>) -> bool {
     #[cfg(test)]
     if TEST_FORCE_UNCONFIRMED_KILL.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1719,40 +1718,30 @@ pub async fn on_session_killed(registry: &ScratchRegistry, session_id: SessionId
         return;
     };
     claim.explicit_kill.cancel();
-    // This kill now owns the reap and nothing else will retry it, so the
-    // rest runs on its own task: a caller that hangs up cannot drop it
-    // half-done and strand the row.
-    let registry = registry.clone();
-    let caller = shux_rpc::current_caller();
-    let finish = tokio::spawn(async move {
-        // Unconfirmed (P5 round-2 codex N3): the row stays, still claimed and
-        // persisted, for the next daemon's startup reap; nothing is audited.
-        if !group_ended(claim.ended.clone()).await {
-            tracing::error!(
-                pgid = claim.pgid,
-                session_id = %session_id,
-                "explicit scratch kill: PTY task did not confirm its group ended; \
-                 leaving the registry row for the next daemon's startup reap"
-            );
-            return;
-        }
-        registry
-            .audit
-            .append(json!({
-                "ts": iso_now(),
-                "caller": caller,
-                "method": "scratch.reap",
-                "reason": "explicit",
-                "session_id": session_id.to_string(),
-                "pane_id": claim.pane_id.to_string(),
-                "pgid": claim.pgid,
-            }))
-            .await;
-        registry.remove(&session_id);
-    });
-    if let Err(e) = finish.await {
-        tracing::error!(error = %e, session_id = %session_id, "explicit scratch kill task failed");
+    // Unconfirmed: the row stays, still claimed and persisted, for the next
+    // daemon's startup reap; nothing is audited.
+    if !group_ended(claim.ended).await {
+        tracing::error!(
+            pgid = claim.pgid,
+            session_id = %session_id,
+            "explicit scratch kill: PTY task did not confirm its group ended; \
+             leaving the registry row for the next daemon's startup reap"
+        );
+        return;
     }
+    registry
+        .audit
+        .append(json!({
+            "ts": iso_now(),
+            "caller": shux_rpc::current_caller(),
+            "method": "scratch.reap",
+            "reason": "explicit",
+            "session_id": session_id.to_string(),
+            "pane_id": claim.pane_id.to_string(),
+            "pgid": claim.pgid,
+        }))
+        .await;
+    registry.remove(&session_id);
 }
 
 // ── lens.run RPC (LENS-R-040/041/045/046) ────────────────────────────────
@@ -2508,40 +2497,6 @@ pub(crate) mod tests {
             ended.is_none(),
             "the explicit kill signalled a group that is not the scratch's: {ended:?}"
         );
-    }
-
-    /// A client that hangs up mid-kill does not strand the scratch: once the
-    /// kill owns the reap, it finishes it, and the row and its quota slot go.
-    #[tokio::test]
-    async fn an_explicit_kill_finishes_after_its_caller_hangs_up() {
-        let dir = tmpdir();
-        let reg = test_registry(dir.path());
-        let id = SessionId::new();
-        let (ended_tx, ended_rx) = tokio::sync::watch::channel(None);
-        let mut state = dummy_state(1);
-        state.ended = Some(ended_rx);
-        reg.try_reserve().expect("reserve").commit(id, state);
-
-        let mut kill = Box::pin(on_session_killed(&reg, id));
-        assert!(
-            tokio::time::timeout(Duration::ZERO, &mut kill)
-                .await
-                .is_err(),
-            "the kill finished before its PTY task said the group ended"
-        );
-        drop(kill);
-        ended_tx
-            .send(Some(true))
-            .expect("the kill dropped its receiver");
-
-        let deadline = std::time::Instant::now() + shux_testkit::BUDGET;
-        while reg.lock_inner().rows.contains_key(&id) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "a kill whose caller hung up left the row claimed for good"
-            );
-            tokio::task::yield_now().await;
-        }
     }
 
     /// A PTY task slow to confirm its group ended, as on a loaded machine,

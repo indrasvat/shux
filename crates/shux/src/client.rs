@@ -47,12 +47,10 @@ const CONNECT_BUDGET: ConnectBudget = ConnectBudget {
 /// own could keep producing more.
 const MAX_STALE_STOPS: u32 = 8;
 
-/// How long to wait for another client to finish starting the daemon: every
-/// step the holder may take under the lock, each a probe and an exit wait per
-/// stale daemon it stops, then the connect deadline.
+/// How long to wait for another client to finish starting the daemon: one
+/// stale daemon's replacement (a probe and its exit) and the start.
 fn start_lock_timeout() -> Duration {
-    let patience = crate::patience::peer_patience();
-    patience * 2 * (MAX_STALE_STOPS + 1) + CONNECT_BUDGET.deadline
+    crate::patience::peer_patience() * 2 + CONNECT_BUDGET.deadline
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -69,9 +67,9 @@ pub enum ClientError {
     )]
     StaleDaemonAlive(u32),
     #[error(
-        "a daemon for this socket{} is still running but has not served it for {}; \
+        "a daemon for this socket{} is still running but has not served it for {:?}; \
          run `shux daemon stop` and retry",
-        .0, crate::patience::describe(crate::patience::peer_patience())
+        .0, crate::patience::peer_patience()
     )]
     DaemonNotServing(String),
     #[error(
@@ -81,9 +79,9 @@ pub enum ClientError {
     )]
     DaemonNotStarted(String),
     #[error(
-        "the daemon serving {}{} did not answer the version check within {}; it may be \
+        "the daemon serving {}{} did not answer the version check within {:?}; it may be \
          busy, stopped or wedged -- retry, and if it persists run `shux daemon stop`",
-        .1.display(), .0, crate::patience::describe(crate::patience::peer_patience())
+        .1.display(), .0, crate::patience::peer_patience()
     )]
     DaemonUnresponsive(String, std::path::PathBuf),
     #[error(
@@ -97,7 +95,11 @@ pub enum ClientError {
         .0.display()
     )]
     StaleDaemonUnidentified(std::path::PathBuf),
-    #[error("timed out waiting for another shux client to start the daemon (lock {})", .0.display())]
+    #[error(
+        "waited {:?} for another shux client to start the daemon (lock {}); if no other shux \
+         command is running, retry",
+        start_lock_timeout(), .0.display()
+    )]
     StartLockTimeout(std::path::PathBuf),
 }
 
@@ -453,6 +455,9 @@ fn start_daemon_process(socket_path: &Path) -> Result<std::process::Child, Clien
 
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("__daemon");
+    // The override is the starting client's; the daemon and its panes keep
+    // the default.
+    cmd.env_remove(crate::patience::PEER_PATIENCE_ENV);
 
     // Tell the daemon which socket to serve, explicitly: `--socket` is a
     // client-side flag and `SHUX_SOCKET` may be unset. Pass the endpoint,
@@ -534,18 +539,14 @@ mod tests {
         let mut req = vec![0u8; u32::from_be_bytes(len) as usize];
         conn.read_exact(&mut req).await.unwrap();
 
-        // The client is now parked on the reply. While a blocking task runs,
-        // the paused clock moves only on `advance`.
+        // The client is now parked on the reply; let it see the clock move
+        // before the reply exists.
         tokio::time::pause();
-        let (hold, held) = std::sync::mpsc::channel::<()>();
-        let holder = tokio::task::spawn_blocking(move || held.recv());
         tokio::time::advance(Duration::from_secs(6)).await;
         for _ in 0..8 {
             tokio::task::yield_now().await;
         }
         tokio::time::resume();
-        drop(hold);
-        let _ = holder.await;
 
         let resp = serde_json::to_vec(&serde_json::json!({
             "jsonrpc": "2.0",
@@ -563,6 +564,29 @@ mod tests {
             }
             _ => panic!("the stub's answer was not read as a version"),
         }
+    }
+
+    /// A client stuck holding the start lock (stopped mid-start, say) is given
+    /// up on in about the time one daemon replacement takes, not minutes.
+    #[tokio::test(start_paused = true)]
+    async fn a_stuck_start_lock_holder_is_given_up_on_promptly() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("d.sock");
+        let lock_path = daemon::start_lock_path_for(&socket).unwrap();
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        let _held = daemon::try_lock_file(&lock_path).unwrap().expect("lock");
+        let started = tokio::time::Instant::now();
+        let waited = acquire_start_lock(&socket).await;
+        let took = started.elapsed();
+        assert!(
+            matches!(waited, Err(ClientError::StartLockTimeout(..))),
+            "{waited:?}"
+        );
+        let bound = crate::patience::peer_patience() * 2 + CONNECT_BUDGET.deadline;
+        assert!(
+            took <= bound + Duration::from_secs(1),
+            "a stuck lock holder held this client for {took:?}, past {bound:?}"
+        );
     }
 
     const QUICK: ConnectBudget = ConnectBudget {

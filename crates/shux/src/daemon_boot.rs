@@ -511,9 +511,9 @@ pub(crate) fn handle_daemon_command(
             }
             if !gone {
                 anyhow::bail!(
-                    "daemon (pid {p}) did not exit within {} of SIGTERM; it may be busy \
+                    "daemon (pid {p}) did not exit within {:?} of SIGTERM; it may be busy \
                      draining its panes, stopped or wedged -- retry, or kill it",
-                    crate::patience::describe(crate::patience::peer_patience())
+                    crate::patience::peer_patience()
                 );
             }
             Ok(())

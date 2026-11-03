@@ -311,7 +311,9 @@ pub(crate) fn register_pane_methods(
         .register_with_policy("pane.kill", Policy::fixed(Sensitivity::OwnedMutation), move |params: Option<serde_json::Value>| {
             let gh = g8.clone();
             let io = io_kill.clone();
-            async move {
+            // Graph first, then IO: a hang-up between them would leave the
+            // pane's program running with nothing left to reach it.
+            shux_rpc::run_to_completion(async move {
                 let params = params.unwrap_or_default();
                 let pane_id = resolve_pane_ref(&gh, required_str(&params, "pane_id")?)?;
 
@@ -337,7 +339,7 @@ pub(crate) fn register_pane_methods(
                 }
 
                 Ok(serde_json::json!({ "killed": pane_id.to_string() }))
-            }
+            })
         })
         .register_with_policy(
             "pane.set_title",

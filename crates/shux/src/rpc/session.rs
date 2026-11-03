@@ -210,7 +210,10 @@ pub(crate) fn register_session_methods(
                 let io = io_kill.clone();
                 let meta = meta_kill.clone();
                 let registry = scratch_kill.clone();
-                async move {
+                // Graph, IO, metadata, then the scratch reap: a hang-up between
+                // them would leave the session's programs running, or a
+                // scratch's row and quota slot held, with nothing to reach them.
+                shux_rpc::run_to_completion(async move {
                     let params = params.unwrap_or_default();
 
                     // Accept name or id — try UUID parse first, fall back to name lookup
@@ -297,7 +300,7 @@ pub(crate) fn register_session_methods(
                     lens_scratch::on_session_killed(&registry, session_id).await;
 
                     Ok(serde_json::json!({ "killed": name }))
-                }
+                })
             },
         )
         .register_with_policy(
@@ -505,6 +508,90 @@ mod tests {
                 .collect();
             assert_eq!(listed, names, "{name}");
         }
+    }
+
+    /// Dispatches `method` while the pane IO lock is held, so the handler
+    /// parks between its graph change and its IO teardown; hangs up there;
+    /// then asserts the teardown still happens.
+    async fn hang_up_after_the_graph_change(
+        h: &RpcHarness,
+        method: &str,
+        params: serde_json::Value,
+        pane: shux_core::model::PaneId,
+    ) {
+        let held = h.io.lock().await;
+        let mut call = Box::pin(h.router.dispatch(method, Some(params)));
+        let deadline = std::time::Instant::now() + shux_testkit::BUDGET;
+        while h.graph.snapshot().panes.contains_key(&pane) {
+            assert!(
+                tokio::time::timeout(std::time::Duration::ZERO, &mut call)
+                    .await
+                    .is_err(),
+                "{method} finished while its IO teardown was blocked"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{method} never changed the graph"
+            );
+            tokio::task::yield_now().await;
+        }
+        drop(call);
+        drop(held);
+        while h.io.lock().await.vts.contains_key(&pane) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{method} whose caller hung up left its pane's IO, and program, behind"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_kill_whose_caller_hangs_up_still_tears_its_panes_down() {
+        let h = RpcHarness::new();
+        let (session_id, _, first_pane) = h.seed_session("keep").await;
+        let split = h
+            .graph
+            .split_pane(first_pane, Direction::Vertical, 0.5)
+            .await
+            .unwrap();
+        let _split_rx = h.seed_io(split, b"split\n").await;
+        hang_up_after_the_graph_change(
+            &h,
+            "pane.kill",
+            serde_json::json!({"pane_id": split.to_string()}),
+            split,
+        )
+        .await;
+
+        let window = h
+            .graph
+            .create_window(
+                session_id,
+                "w".to_string(),
+                std::path::PathBuf::from("/tmp"),
+            )
+            .await
+            .unwrap();
+        let window_pane = h.graph.snapshot().windows[&window].active_pane;
+        let _window_rx = h.seed_io(window_pane, b"window\n").await;
+        hang_up_after_the_graph_change(
+            &h,
+            "window.kill",
+            serde_json::json!({"id": window.to_string()}),
+            window_pane,
+        )
+        .await;
+
+        let (gone, _, gone_pane) = h.seed_session("gone").await;
+        let _gone_rx = h.seed_io(gone_pane, b"gone\n").await;
+        hang_up_after_the_graph_change(
+            &h,
+            "session.kill",
+            serde_json::json!({"id": gone.to_string()}),
+            gone_pane,
+        )
+        .await;
     }
 
     #[tokio::test]

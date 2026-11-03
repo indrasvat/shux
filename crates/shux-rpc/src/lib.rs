@@ -19,7 +19,7 @@ pub use attach::{
     ATTACH_PROTOCOL_VERSION, ActionArgs, ActionKind, AttachClientFrame, AttachHello, AttachReady,
     AttachServerFrame, MouseButton, MouseKind,
 };
-pub use caller::{current_caller, with_caller};
+pub use caller::{current_caller, run_to_completion, with_caller};
 pub use codec::{MAX_FRAME_SIZE, create_codec};
 pub use connection::current_connection;
 pub use error::{ErrorCode, RpcError};

@@ -84,8 +84,8 @@ pub async fn handle_version(
             Some(Err((
                 "unresponsive",
                 format!(
-                    "it did not answer within {}; it may be busy, stopped or wedged",
-                    crate::patience::describe(crate::patience::peer_patience())
+                    "it did not answer within {:?}; it may be busy, stopped or wedged",
+                    crate::patience::peer_patience()
                 ),
             ))),
             None,

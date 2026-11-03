@@ -9,11 +9,13 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
-/// Overrides [`peer_patience`], in milliseconds. A test that builds a peer
-/// which never answers sets it, so the test does not wait out the default.
+/// Overrides [`peer_patience`], in milliseconds, for this process only: a
+/// daemon it starts does not inherit it. A test that builds a peer which never
+/// answers sets it, so the test does not wait out the default.
 pub const PEER_PATIENCE_ENV: &str = "SHUX_PEER_PATIENCE_MS";
 
 const DEFAULT: Duration = Duration::from_secs(30);
+const MAX: Duration = Duration::from_secs(3600);
 
 static PATIENCE: OnceLock<Result<Duration, String>> = OnceLock::new();
 
@@ -34,17 +36,6 @@ pub fn peer_patience() -> Duration {
     *PATIENCE.get_or_init(load).as_ref().unwrap_or(&DEFAULT)
 }
 
-/// A duration as a person reads it: `30s`, `2.5s`, `750ms`.
-pub fn describe(d: Duration) -> String {
-    if d.subsec_millis() == 0 {
-        format!("{}s", d.as_secs())
-    } else if d < Duration::from_secs(1) {
-        format!("{}ms", d.as_millis())
-    } else {
-        format!("{:.1}s", d.as_secs_f64())
-    }
-}
-
 fn load() -> Result<Duration, String> {
     match std::env::var(PEER_PATIENCE_ENV) {
         Err(std::env::VarError::NotPresent) => Ok(DEFAULT),
@@ -56,11 +47,18 @@ fn load() -> Result<Duration, String> {
 }
 
 fn parse(raw: &str) -> Result<Duration, String> {
-    match raw.parse::<u64>() {
-        Ok(0) | Err(_) => Err(format!(
-            "{PEER_PATIENCE_ENV} must be a whole number of milliseconds above 0, got {raw:?}"
+    let ms = raw
+        .bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| raw.parse::<u64>().ok())
+        .flatten()
+        .map(Duration::from_millis);
+    match ms {
+        Some(d) if !d.is_zero() && d <= MAX => Ok(d),
+        _ => Err(format!(
+            "{PEER_PATIENCE_ENV} must be a whole number of milliseconds from 1 to {}, got {raw:?}",
+            MAX.as_millis()
         )),
-        Ok(ms) => Ok(Duration::from_millis(ms)),
     }
 }
 
@@ -71,19 +69,13 @@ mod tests {
     #[test]
     fn an_override_is_whole_positive_milliseconds() {
         assert_eq!(parse("2000"), Ok(Duration::from_secs(2)));
-        for bad in ["0", "", "2s", "-5", "1.5", " 100"] {
+        assert_eq!(parse("3600000"), Ok(Duration::from_secs(3600)));
+        for bad in ["0", "", "2s", "-5", "1.5", " 100", "+100", "3600001"] {
             let err = parse(bad).expect_err(bad);
             assert!(
                 err.contains(PEER_PATIENCE_ENV),
                 "{bad:?}: the error names the variable"
             );
         }
-    }
-
-    #[test]
-    fn a_duration_reads_as_a_person_says_it() {
-        assert_eq!(describe(Duration::from_secs(30)), "30s");
-        assert_eq!(describe(Duration::from_millis(750)), "750ms");
-        assert_eq!(describe(Duration::from_millis(2500)), "2.5s");
     }
 }

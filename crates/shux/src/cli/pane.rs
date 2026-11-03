@@ -707,10 +707,10 @@ async fn stop_recording(
             path.display()
         ))),
         Err(_) => anyhow::bail!(
-            "the daemon did not finish the recording of {} within {}; it may be busy, \
-             stopped or wedged",
+            "the recording of {} was not finished within {:?}: the daemon may be busy, \
+             stopped or wedged, or whatever reads the file is not keeping up",
             path.display(),
-            crate::patience::describe(patience)
+            patience
         ),
     }
 }
