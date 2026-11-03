@@ -1,3 +1,10 @@
+## [0.56.1](https://github.com/indrasvat/shux/compare/v0.56.0...v0.56.1) (2026-11-03)
+
+
+### Bug Fixes
+
+* **pty:** end a pane's whole process group, and signal nothing once its leader is reaped ([#258](https://github.com/indrasvat/shux/issues/258)) ([b7f146d](https://github.com/indrasvat/shux/commit/b7f146d185b76281c8891ca030f124fad6c028ea)), closes [#255](https://github.com/indrasvat/shux/issues/255)
+
 # [0.56.0](https://github.com/indrasvat/shux/compare/v0.55.5...v0.56.0) (2026-11-03)
 
 
