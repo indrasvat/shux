@@ -152,14 +152,15 @@ fn wait_exit_reports_a_signal_death_as_the_signal() {
     );
 }
 
-/// Lets go of its terminal and keeps running: macOS needs the tty revoked,
-/// Linux only needs the last slave fd closed.
+/// Revokes its terminal and keeps running, so shux sees the PTY close under
+/// a live program and has to end it. Only `revoke(2)` can do that: shux holds
+/// a slave fd while the child lives, so closing stdio is not enough.
+#[cfg(target_os = "macos")]
 const OUTLIVES_ITS_TERMINAL: &str = r#"
 import ctypes, os, signal, sys, time
-if sys.platform == "darwin":
-    signal.signal(signal.SIGHUP, signal.SIG_IGN)
-    ctypes.CDLL(None).revoke(os.ttyname(0).encode())
-    signal.signal(signal.SIGHUP, signal.SIG_DFL)
+signal.signal(signal.SIGHUP, signal.SIG_IGN)
+ctypes.CDLL(None).revoke(os.ttyname(0).encode())
+signal.signal(signal.SIGHUP, signal.SIG_DFL)
 null = os.open("/dev/null", os.O_RDWR)
 for fd in (0, 1, 2):
     os.dup2(null, fd)
@@ -168,6 +169,7 @@ if sys.argv[1:] == ["term-on-hup"]:
 time.sleep(30)
 "#;
 
+#[cfg(target_os = "macos")]
 #[test]
 fn a_program_shux_had_to_end_is_marked_as_ended_by_shux() {
     let env = Env::new();
@@ -194,6 +196,7 @@ fn a_program_shux_had_to_end_is_marked_as_ended_by_shux() {
     );
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn a_signal_the_program_raised_itself_is_not_put_on_shux() {
     let env = Env::new();
