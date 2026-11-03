@@ -14,12 +14,11 @@
 //!   calls can never overshoot 16 (P5 convergence round 1, codex B1).
 //! - per-scratch reap timers (`post_exit_ttl_ms` / `max_runtime_ms`,
 //!   LENS-R-042), event-driven off the same `pane.exited` bus event the
-//!   daemon already fires (no polling — §16.1 guardrail 3). The reap
-//!   itself performs the LENS-R-042 sequence directly — killpg(SIGTERM) →
-//!   500 ms grace → killpg(SIGKILL) → confirm dead → close PTY → remove
-//!   session → audit — and the registry row is removed only AFTER the
-//!   group is confirmed dead (codex B3: a daemon crash mid-reap must
-//!   leave the row for the next incarnation's startup reap).
+//!   daemon already fires (no polling — §16.1 guardrail 3). The reap has
+//!   the pane's PTY task end the group SIGTERM-first (LENS-R-042), and
+//!   removes the registry row only once that task confirms the group is
+//!   gone (codex B3: a daemon crash mid-reap must leave the row for the
+//!   next incarnation's startup reap).
 //! - the `lens.run` RPC handler (LENS-R-040/041/045/046).
 //! - the daemon-level lens audit log (`LensAuditLog`, LENS-R-052):
 //!   sha256-chained NDJSON at `$XDG_STATE_HOME/shux/lens-audit.ndjson`,
@@ -604,6 +603,11 @@ struct ScratchState {
     /// Cancelled by `on_session_killed` (explicit `session.kill`) so the
     /// reaper task returns immediately instead of racing its own reap.
     explicit_kill: CancellationToken,
+    /// Recovered from a previous daemon: no PTY task here owns its group.
+    inherited: bool,
+    /// What this scratch's PTY task published when it finished ending its
+    /// group: `Some(true)` only if it was confirmed empty. None when inherited.
+    ended: Option<tokio::sync::watch::Receiver<Option<bool>>>,
     /// Reap-ownership guard (P5 round-1 claude N6): whoever flips this via
     /// `claim()` owns the kill/audit/remove sequence; the loser backs off.
     /// Prevents a timer-reap and an explicit kill double-auditing the same
@@ -644,6 +648,9 @@ struct RegistryInner {
 struct ClaimedScratch {
     pane_id: PaneId,
     pgid: u32,
+    start_time: u64,
+    inherited: bool,
+    ended: Option<tokio::sync::watch::Receiver<Option<bool>>>,
     explicit_kill: CancellationToken,
 }
 
@@ -744,6 +751,9 @@ impl ScratchRegistry {
         Some(ClaimedScratch {
             pane_id: state.pane_id,
             pgid: state.pgid,
+            start_time: state.start_time,
+            inherited: state.inherited,
+            ended: state.ended.clone(),
             explicit_kill: state.explicit_kill.clone(),
         })
     }
@@ -852,33 +862,7 @@ impl ScratchRegistry {
         let mut killed = 0usize;
         let mut unresolved: Vec<RegistryRow> = Vec::new();
         for row in rows {
-            let should_kill = match (row.start_time, process_start_token(row.pgid)) {
-                (0, _) => {
-                    tracing::warn!(
-                        pgid = row.pgid,
-                        "scratch-registry: row has no recorded start token; \
-                         falling back to liveness-only reap"
-                    );
-                    true
-                }
-                (recorded, Some(current)) if recorded == current => true,
-                (_, Some(_)) => {
-                    tracing::info!(
-                        pgid = row.pgid,
-                        "scratch-registry: pgid alive but start token mismatch \
-                         (recycled PID) — not killing"
-                    );
-                    false
-                }
-                // Leader gone (codex N2): kill the group if any member
-                // still lives — the sequence's own probe decides.
-                (_, None) => true,
-            };
-            let outcome = if should_kill {
-                kill_pgid_lens_sequence(row.pgid).await
-            } else {
-                KillOutcome::AlreadyDead
-            };
+            let outcome = kill_pgid_lens_sequence(row.pgid, row.start_time).await;
             let was_killed = match outcome {
                 KillOutcome::Died => true,
                 KillOutcome::AlreadyDead => false,
@@ -978,6 +962,8 @@ impl ScratchRegistry {
                                 start_time: row.start_time,
                                 created_at_unix_ms: row.created_at,
                                 max_runtime_deadline_unix_ms: row.max_runtime_deadline,
+                                inherited: true,
+                                ended: None,
                                 explicit_kill: explicit_kill.clone(),
                                 claimed: false,
                             },
@@ -1032,7 +1018,7 @@ impl ScratchRegistry {
 
         // ── PASS 2b: resolve the opaque rows inline. ──
         for row in opaque {
-            let outcome = kill_with_retry(row.pgid).await;
+            let outcome = kill_with_retry(row.pgid, row.start_time).await;
             if outcome == KillOutcome::Unconfirmed {
                 tracing::error!(
                     session_id = %row.session_id,
@@ -1134,6 +1120,27 @@ pub(crate) static TEST_FORCE_UNCONFIRMED_KILL: std::sync::atomic::AtomicBool =
 #[cfg(test)]
 pub(crate) static TEST_FORCE_UNCONFIRMED_PGID: StdMutex<Option<u32>> = StdMutex::new(None);
 
+/// Whether `pgid` still names the scratch's group. While any member lives
+/// the kernel keeps the id from being reissued, so a process holding the
+/// leader's pid with a different start token proves the group is gone and
+/// the id belongs to someone else. No process on the pid: liveness alone
+/// decides.
+fn group_is_ours(pgid: u32, start_time: u64) -> bool {
+    match (start_time, process_start_token(pgid)) {
+        (_, None) => true,
+        (recorded, Some(current)) => {
+            let ours = recorded == current;
+            if !ours {
+                tracing::info!(
+                    pgid,
+                    "scratch reap: pgid now names another process (start token mismatch); not signalling"
+                );
+            }
+            ours
+        }
+    }
+}
+
 /// The LENS-R-042 kill sequence: probe → killpg(SIGTERM) → 500 ms grace
 /// (polling for group death — the only "wait for a process group to die"
 /// primitive Unix offers a non-parent; deadline-bounded, never a sync-on-
@@ -1149,7 +1156,7 @@ pub(crate) static TEST_FORCE_UNCONFIRMED_PGID: StdMutex<Option<u32>> = StdMutex:
 /// parent reap normally lands within the bounded loops, at which point
 /// the probe flips to `Gone`; if it never lands, the outcome is honestly
 /// `Unconfirmed` and the registry row survives for the next startup reap.
-async fn kill_pgid_lens_sequence(pgid: u32) -> KillOutcome {
+async fn kill_pgid_lens_sequence(pgid: u32, start_time: u64) -> KillOutcome {
     use nix::sys::signal::{Signal, killpg};
     use nix::unistd::Pid;
     #[cfg(test)]
@@ -1188,6 +1195,17 @@ async fn kill_pgid_lens_sequence(pgid: u32) -> KillOutcome {
         }
         GroupProbe::Alive => {}
     }
+    // A live group nothing proves is ours: never signal it, never drop it.
+    if start_time == 0 {
+        tracing::warn!(
+            pgid,
+            "scratch reap: no start token recorded; leaving the row"
+        );
+        return KillOutcome::Unconfirmed;
+    }
+    if !group_is_ours(pgid, start_time) {
+        return KillOutcome::AlreadyDead;
+    }
     let _ = killpg(pid, Signal::SIGTERM);
     let grace_deadline = Instant::now() + Duration::from_millis(500);
     while Instant::now() < grace_deadline {
@@ -1203,6 +1221,9 @@ async fn kill_pgid_lens_sequence(pgid: u32) -> KillOutcome {
             reason = "re-probes the group through SIGTERM's grace period"
         )]
         tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    if !group_is_ours(pgid, start_time) {
+        return KillOutcome::Died;
     }
     let _ = killpg(pid, Signal::SIGKILL);
     let confirm_deadline = Instant::now() + Duration::from_secs(2);
@@ -1261,8 +1282,8 @@ pub(crate) static TEST_FORCE_PROBE_DENIED: StdMutex<Option<u32>> = StdMutex::new
 /// unconfirmed first pass (P5 round-2 codex N3's optional retry — covers
 /// the transient case where a zombie leader's reap lands just past the
 /// first confirmation window). Returns the FINAL outcome.
-async fn kill_with_retry(pgid: u32) -> KillOutcome {
-    let first = kill_pgid_lens_sequence(pgid).await;
+async fn kill_with_retry(pgid: u32, start_time: u64) -> KillOutcome {
+    let first = kill_pgid_lens_sequence(pgid, start_time).await;
     if first != KillOutcome::Unconfirmed {
         return first;
     }
@@ -1275,15 +1296,15 @@ async fn kill_with_retry(pgid: u32) -> KillOutcome {
         reason = "backoff before the one retry, for a zombie leader's reap to land"
     )]
     tokio::time::sleep(Duration::from_millis(500)).await;
-    kill_pgid_lens_sequence(pgid).await
+    kill_pgid_lens_sequence(pgid, start_time).await
 }
 
 /// Kill the group and require CONFIRMED death (retry included). `false`
 /// means the caller must leave the registry row in place for the next
 /// daemon's startup reap.
-async fn kill_confirmed(pgid: u32) -> bool {
+async fn kill_confirmed(pgid: u32, start_time: u64) -> bool {
     matches!(
-        kill_with_retry(pgid).await,
+        kill_with_retry(pgid, start_time).await,
         KillOutcome::AlreadyDead | KillOutcome::Died
     )
 }
@@ -1504,18 +1525,16 @@ async fn wait_for_pane_exit(
     }
 }
 
-/// Reap a claimed scratch session per LENS-R-042's exact sequence:
-/// killpg(SIGTERM) → 500 ms grace → killpg(SIGKILL) → confirm dead → close
-/// PTY (pane teardown) → remove session → audit. The registry row is NOT
-/// touched here — the caller removes it only after this returns `true`
-/// (codex B3: the row must survive any crash window so the next daemon's
-/// startup reap can finish the job; the kill is idempotent).
+/// Reap a claimed scratch session: end its group, remove the session, audit.
+/// A live scratch is ended by its PTY task, SIGTERM-first (LENS-R-042); one
+/// inherited from a previous daemon by the startup sequence. The registry
+/// row is NOT touched here — the caller removes it only after this returns
+/// `true` (codex B3: the row must survive any crash window so the next
+/// daemon's startup reap can finish the job).
 ///
-/// Returns `false` when the group's death could NOT be confirmed (P5
-/// round-2 codex N3) — in that case NOTHING else happens (no teardown, no
-/// session destroy, no reap audit): the scratch stays visible and its row
-/// stays persisted so the startup reap of the next daemon incarnation owns
-/// the retry. The caller must log/propagate accordingly.
+/// Returns `false` when the group's end could NOT be confirmed (P5 round-2
+/// codex N3): the row stays persisted, so the next daemon's startup reap
+/// owns the retry.
 ///
 /// `reason` is one of exit|max_runtime|explicit (audited; R1/R4/R7 assert
 /// on it).
@@ -1527,27 +1546,39 @@ async fn reap_scratch(
     audit: &LensAuditLog,
     reason: &str,
 ) -> bool {
-    // 1. Kill the process group directly (LENS-R-042's own signal
-    //    contract: SIGTERM → grace → SIGKILL, not the PTY task's
-    //    SIGHUP-flavored teardown escalation) and CONFIRM it dead before
-    //    anything else (one bounded retry inside kill_confirmed).
-    if !kill_confirmed(claim.pgid).await {
-        tracing::error!(
-            pgid = claim.pgid,
-            session_id = %session_id,
-            "scratch reap: group death UNCONFIRMED after retry; leaving the \
-             registry row (and the session) for the next daemon's startup reap"
-        );
-        return false;
+    if claim.inherited {
+        // No PTY task here holds the group: the startup sequence, by pgid
+        // and start token, is the only way to end it.
+        if !kill_confirmed(claim.pgid, claim.start_time).await {
+            tracing::error!(
+                pgid = claim.pgid,
+                session_id = %session_id,
+                "scratch reap: inherited group's death UNCONFIRMED after retry; \
+                 leaving the registry row for the next daemon's startup reap"
+            );
+            return false;
+        }
+        let _ = graph.destroy_session(session_id, None).await;
+    } else {
+        // Cancelled, the pane's PTY task ends the group SIGTERM-first
+        // (LENS-R-042). Its writer stays until the exit commits, or attach
+        // would read the pane as never spawned and run it again. One whose
+        // program already exited swept its group then.
+        if let Some(token) = io_state.lock().await.shutdowns.remove(&claim.pane_id) {
+            token.cancel();
+        }
+        if !group_ended(claim.ended.clone()).await {
+            tracing::error!(
+                pgid = claim.pgid,
+                session_id = %session_id,
+                "scratch reap: PTY task did not confirm its group ended; \
+                 leaving the registry row (and the session) for the next \
+                 daemon's startup reap"
+            );
+            return false;
+        }
+        let _ = graph.destroy_session(session_id, None).await;
     }
-
-    // 2. Remove the session from the graph — before IO teardown, like every
-    //    other destroy, so a spawn racing it cannot install after teardown.
-    let _ = graph.destroy_session(session_id, None).await;
-
-    // 3. Close the PTY / free the VT. The group is already dead, so the
-    //    pane's PTY task sees EOF and exits promptly; teardown also clears
-    //    writers/resizers/checkpoints.
     {
         let mut state = io_state.lock().await;
         let pulse = state.teardown_panes(&[claim.pane_id], true);
@@ -1555,7 +1586,6 @@ async fn reap_scratch(
         pulse.bump();
     }
 
-    // 4. Audit (LENS-R-052).
     audit.append(json!({
         "ts": iso_now(),
         "caller": shux_rpc::current_caller(),
@@ -1566,6 +1596,21 @@ async fn reap_scratch(
         "pgid": claim.pgid,
     }));
     true
+}
+
+/// Whether the scratch's PTY task confirmed its group ended: its leader
+/// reaped and nothing left in it. A timeout, a task that ended without
+/// saying, or no channel at all is unconfirmed.
+async fn group_ended(ended: Option<tokio::sync::watch::Receiver<Option<bool>>>) -> bool {
+    #[cfg(test)]
+    if TEST_FORCE_UNCONFIRMED_KILL.load(std::sync::atomic::Ordering::SeqCst) {
+        return false;
+    }
+    let Some(mut ended) = ended else {
+        return false;
+    };
+    let outcome = tokio::time::timeout(Duration::from_secs(5), ended.wait_for(Option::is_some));
+    matches!(outcome.await, Ok(Ok(v)) if *v == Some(true))
 }
 
 /// Per-scratch reap timer (LENS-R-042 a/b): races `max_runtime_ms` against
@@ -1646,47 +1691,27 @@ async fn scratch_reaper(
     }
 }
 
-/// Hook for `session.kill` (LENS-R-042c: explicit kill reaps immediately).
-/// The session.kill handler has already destroyed the graph session and
-/// started the pane teardown by the time this runs; this claims reap
-/// ownership (backing off if the timer reaper already owns it), cancels
-/// the reaper, enforces the LENS-R-042 group-kill + death confirmation,
-/// audits reason=explicit, and only then removes the registry row.
-pub async fn on_session_killed(
-    registry: &ScratchRegistry,
-    io_state: &Arc<Mutex<PaneIoState>>,
-    session_id: SessionId,
-) {
+/// The session.kill handler has destroyed the graph session and started the
+/// pane teardown. For a scratch this claims reap ownership (backing off if
+/// the timer reaper already owns it), cancels that reaper, waits for the PTY
+/// task to confirm its group ended, audits reason=explicit, and only then
+/// removes the registry row. It signals nothing itself.
+pub async fn on_session_killed(registry: &ScratchRegistry, session_id: SessionId) {
     let Some(claim) = registry.claim(&session_id) else {
         // Not a scratch session, or the timer reaper already owns the reap.
         return;
     };
     claim.explicit_kill.cancel();
-    // session.kill's own teardown escalates via the PTY task (SIGHUP →
-    // SIGKILL); this enforces the LENS-R-042 SIGTERM contract on the whole
-    // group and, more importantly, CONFIRMS death before the registry row
-    // disappears. Signals to an already-dead group are no-ops.
-    //
-    // Unconfirmed death (P5 round-2 codex N3): do NOT remove the row and
-    // do NOT audit a reap that didn't complete — the row (still claimed,
-    // still persisted) is exactly what the next daemon's startup reap
-    // needs to finish the job.
-    if !kill_confirmed(claim.pgid).await {
+    // Unconfirmed (P5 round-2 codex N3): the row stays, still claimed and
+    // persisted, for the next daemon's startup reap; nothing is audited.
+    if !group_ended(claim.ended.clone()).await {
         tracing::error!(
             pgid = claim.pgid,
             session_id = %session_id,
-            "explicit scratch kill: group death UNCONFIRMED after retry; \
+            "explicit scratch kill: PTY task did not confirm its group ended; \
              leaving the registry row for the next daemon's startup reap"
         );
         return;
-    }
-    // Belt-and-suspenders teardown: normally a no-op (session.kill already
-    // tore the pane down); covers any future caller of this hook.
-    {
-        let mut state = io_state.lock().await;
-        let pulse = state.teardown_panes(&[claim.pane_id], true);
-        drop(state);
-        pulse.bump();
     }
     registry.audit.append(json!({
         "ts": iso_now(),
@@ -1948,6 +1973,8 @@ async fn spawn_scratch_core(
         }
         None => None,
     };
+    let (ended_tx, ended) = tokio::sync::watch::channel(None);
+    io_state.lock().await.scratch_ends.insert(pane_id, ended_tx);
     let spawn_result = crate::pane_spawn::spawn_pane_pty_with_recorder(
         pane_id,
         cwd,
@@ -1966,6 +1993,7 @@ async fn spawn_scratch_core(
         // LENS-R-040/045: SPAWN_FAILED rolls back the allocation completely
         // — no session, no pane, no PTY, absent from `--include-scratch`
         // (and the quota reservation releases via Drop).
+        io_state.lock().await.scratch_ends.remove(&pane_id);
         let _ = graph.destroy_session(session_id, None).await;
         return Err(shux_rpc::RpcError::spawn_failed(&e.to_string()));
     }
@@ -2021,6 +2049,8 @@ async fn spawn_scratch_core(
             start_time,
             created_at_unix_ms,
             max_runtime_deadline_unix_ms,
+            inherited: false,
+            ended: Some(ended),
             explicit_kill: explicit_kill.clone(),
             claimed: false,
         },
@@ -2140,6 +2170,8 @@ pub(crate) mod tests {
             start_time: 12345,
             created_at_unix_ms: 1,
             max_runtime_deadline_unix_ms: 2,
+            inherited: false,
+            ended: None,
             explicit_kill: CancellationToken::new(),
             claimed: false,
         }
@@ -2419,6 +2451,53 @@ pub(crate) mod tests {
         let _ = child.wait();
     }
 
+    /// The live reap path holds the same line as the startup reap: once the
+    /// scratch's leader is reaped, its pid may lead someone else's group. A
+    /// process on that pid with another start token is never signalled.
+    #[tokio::test]
+    async fn an_explicit_kill_spares_a_group_that_reused_the_scratch_pgid() {
+        let dir = tmpdir();
+        let reg = test_registry(dir.path());
+        let mut stranger = spawn_group_leader();
+        let pid = stranger.id();
+        let token = process_start_token(pid).expect("start token of live child");
+        let id = SessionId::new();
+        let mut state = dummy_state(pid);
+        state.start_time = token + 1;
+        reg.try_reserve().expect("reserve").commit(id, state);
+        on_session_killed(&reg, id).await;
+
+        // Our own child: a signalled one is a zombie that still answers kill(0).
+        let ended = stranger.try_wait().expect("try_wait");
+        let _ = stranger.kill();
+        let _ = stranger.wait();
+        assert!(
+            ended.is_none(),
+            "the explicit kill signalled a group that is not the scratch's: {ended:?}"
+        );
+    }
+
+    /// A row with no recorded start token proves nothing about whose group
+    /// its pgid now names, so the startup reap never signals it.
+    #[tokio::test]
+    async fn startup_reap_never_signals_a_row_with_no_start_token() {
+        let dir = tmpdir();
+        let mut child = spawn_group_leader();
+        write_registry_row(dir.path(), child.id(), 0);
+        let audit = LensAuditLog::open(dir.path());
+        let (killed, unresolved) = ScratchRegistry::startup_reap(dir.path(), &audit).await;
+        // Our own child: a signalled one is a zombie that still answers kill(0).
+        let ended = child.try_wait().expect("try_wait");
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!((killed, ended), (0, None), "a tokenless row was signalled");
+        assert_eq!(
+            unresolved.len(),
+            1,
+            "a live group nothing proves is ours was dropped as resolved"
+        );
+    }
+
     #[tokio::test]
     async fn startup_reap_kills_on_matching_start_token() {
         let dir = tmpdir();
@@ -2514,7 +2593,10 @@ pub(crate) mod tests {
         // killpg(0) would signal OUR own process group; the guard must
         // refuse before any signal is sent (the test surviving IS the
         // assertion). AlreadyDead = "nothing this caller may kill".
-        assert_eq!(kill_pgid_lens_sequence(0).await, KillOutcome::AlreadyDead);
+        assert_eq!(
+            kill_pgid_lens_sequence(0, 0).await,
+            KillOutcome::AlreadyDead
+        );
     }
 
     // ── N3 (round 2): honest kill confirmation ──────────────────────────
@@ -2524,13 +2606,13 @@ pub(crate) mod tests {
         use std::sync::atomic::Ordering;
         TEST_FORCE_UNCONFIRMED_KILL.store(true, Ordering::SeqCst);
         assert_eq!(
-            kill_pgid_lens_sequence(12345).await,
+            kill_pgid_lens_sequence(12345, 0).await,
             KillOutcome::Unconfirmed,
             "forced path reports Unconfirmed, never a false kill"
         );
         // kill_confirmed retries once, stays honest, returns false.
         assert!(
-            !kill_confirmed(12345).await,
+            !kill_confirmed(12345, 0).await,
             "unconfirmed death must not read as confirmed"
         );
         TEST_FORCE_UNCONFIRMED_KILL.store(false, Ordering::SeqCst);
@@ -2745,7 +2827,7 @@ pub(crate) mod tests {
         });
         *TEST_FORCE_PROBE_DENIED.lock().unwrap() = Some(pgid);
         assert_eq!(
-            kill_pgid_lens_sequence(pgid).await,
+            kill_pgid_lens_sequence(pgid, process_start_token(pgid).expect("token")).await,
             KillOutcome::Unconfirmed,
             "denied probe must map to Unconfirmed (row survives), never AlreadyDead"
         );
@@ -3344,7 +3426,7 @@ mod production_route_tests {
             serde_json::to_vec_pretty(&serde_json::json!([{
                 "session_id": seeded_sid,
                 "pgid": pgid,
-                "start_time": 0,
+                "start_time": 1, // the gone leader's token: any but 0
                 "created_at": 1,
                 "max_runtime_deadline": 2,
             }]))
@@ -3462,7 +3544,7 @@ mod production_route_tests {
             serde_json::to_vec_pretty(&serde_json::json!([{
                 "session_id": raw_id,
                 "pgid": pgid,
-                "start_time": 0,
+                "start_time": 1, // the gone leader's token: any but 0
                 "created_at": 1,
                 "max_runtime_deadline": 2,
             }]))
@@ -3569,7 +3651,7 @@ mod production_route_tests {
             serde_json::to_vec_pretty(&serde_json::json!([{
                 "session_id": raw_id,
                 "pgid": pgid,
-                "start_time": 0,
+                "start_time": 1, // the gone leader's token: any but 0
                 "created_at": 1,
                 "max_runtime_deadline": 2,
             }]))
@@ -3668,7 +3750,7 @@ mod production_route_tests {
         let uuid_c = shux_core::model::SessionId::new().to_string();
         let row = |sid: &str, pgid: u32| {
             serde_json::json!({
-                "session_id": sid, "pgid": pgid, "start_time": 0,
+                "session_id": sid, "pgid": pgid, "start_time": 1, // the gone leader's token: any but 0
                 "created_at": 1, "max_runtime_deadline": 2,
             })
         };

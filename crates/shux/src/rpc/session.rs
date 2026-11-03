@@ -291,10 +291,10 @@ pub(crate) fn register_session_methods(
                     // LENS-R-042c: explicit session.kill reaps a scratch
                     // session IMMEDIATELY (no post_exit_ttl_ms wait) — this
                     // is a no-op for ordinary sessions (registry lookup
-                    // misses). For scratch it enforces the LENS-R-042 kill
-                    // sequence + death confirmation before the registry row
-                    // is dropped (P5 round-1 codex B3).
-                    lens_scratch::on_session_killed(&registry, &io, session_id).await;
+                    // misses). For scratch it waits for the teardown to have
+                    // ended the group before the registry row is dropped
+                    // (P5 round-1 codex B3).
+                    lens_scratch::on_session_killed(&registry, session_id).await;
 
                     Ok(serde_json::json!({ "killed": name }))
                 }

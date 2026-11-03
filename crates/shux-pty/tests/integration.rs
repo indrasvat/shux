@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use shux_pty::{PtyConfig, PtyHandle, PtySize};
+use shux_testkit::{is_zombie, running};
 
 fn test_cwd() -> PathBuf {
     std::env::temp_dir()
@@ -256,7 +257,9 @@ async fn the_read_loop_leaves_the_child_reapable_for_teardown() {
     let pid = Pid::from_raw(handle.pid() as i32);
 
     // The exit polls only mean something once there is an exit to see.
-    shux_testkit::wait_until("the pane's leader to exit", || is_zombie(handle.pid()));
+    shux_testkit::wait_until("the pane's leader to exit", || {
+        is_zombie(handle.pid() as i32)
+    });
     // The clock is paused, so this second is fifty exit polls, each run
     // against the zombie. The read cannot return: the descendant holds the
     // tty open and writes nothing.
@@ -275,18 +278,6 @@ async fn the_read_loop_leaves_the_child_reapable_for_teardown() {
         "the read loop reaped the child, so teardown lost its handle on a \
          process group that is still alive"
     );
-}
-
-/// Whether `pid` has exited and is waiting to be reaped.
-fn is_zombie(pid: u32) -> bool {
-    std::process::Command::new("ps")
-        .args(["-o", "stat=", "-p", &pid.to_string()])
-        .output()
-        .is_ok_and(|out| {
-            String::from_utf8_lossy(&out.stdout)
-                .trim_start()
-                .starts_with('Z')
-        })
 }
 
 /// A pane child must not inherit the *outer* terminal's identity: a pane still
@@ -670,6 +661,163 @@ async fn dropping_a_live_handle_kills_and_reaps_its_child() {
     shux_testkit::wait_until("the dropped handle's child to be reaped", || {
         nix::sys::signal::kill(pid, None).is_err()
     });
+}
+
+/// A leader that has exited, by running `ending`, leaving `survivor` behind in
+/// its process group: a shell holding the tty that survives SIGHUP but records
+/// it in `hup`, and answers SIGUSR1 by writing `pong`.
+struct LeftBehind {
+    handle: PtyHandle,
+    leader: i32,
+    survivor: i32,
+    needle: String,
+    hup: std::path::PathBuf,
+    pong: std::path::PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+impl LeftBehind {
+    fn spawn(ending: &str) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("survivor.pid");
+        let hup = dir.path().join("hup");
+        let pong = dir.path().join("pong");
+        let needle = format!("left-behind-{}", std::process::id());
+        let script = format!(
+            "sh -c 'trap \"echo hup > {hup}\" HUP; trap \"echo pong > {pong}\" USR1; \
+             echo $$ > {pidfile}; while :; do sleep 1 & wait; done' {needle} & \
+             until [ -s {pidfile} ]; do sleep 0.01; done; {ending}",
+            hup = hup.display(),
+            pong = pong.display(),
+            pidfile = pidfile.display(),
+        );
+        let config = PtyConfig::with_command(vec!["sh".into(), "-c".into(), script], test_cwd());
+        let handle = PtyHandle::spawn(&config).unwrap();
+        let survivor = shux_testkit::wait_for("the survivor's pidfile", || {
+            std::fs::read_to_string(&pidfile)
+                .ok()?
+                .trim()
+                .parse()
+                .ok()
+                .filter(|&pid| running(pid, &needle))
+        });
+        let leader = handle.pid() as i32;
+        shux_testkit::wait_until("the leader to exit", || is_zombie(leader));
+        let left = Self {
+            handle,
+            leader,
+            survivor,
+            needle,
+            hup,
+            pong,
+            _dir: dir,
+        };
+        // The leader's exit hung up the terminal: let that SIGHUP land first.
+        assert!(left.survivor_answers(), "the survivor did not settle");
+        let _ = std::fs::remove_file(&left.hup);
+        left
+    }
+
+    fn survivor_alive(&self) -> bool {
+        running(self.survivor, &self.needle)
+    }
+
+    /// Whether the survivor still answers. A killed one never does; and its
+    /// shell runs every pending trap before it waits again, so by a second
+    /// answer, every signal sent before the first ping has been handled.
+    fn survivor_answers(&self) -> bool {
+        (0..2).all(|_| {
+            let _ = std::fs::remove_file(&self.pong);
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(self.survivor),
+                nix::sys::signal::Signal::SIGUSR1,
+            );
+            shux_testkit::poll_until(shux_testkit::BUDGET, || self.pong.exists())
+        })
+    }
+
+    #[track_caller]
+    fn assert_untouched(&self, why: &str) {
+        assert!(
+            self.survivor_answers(),
+            "SIGKILL reached the survivor: {why}"
+        );
+        assert!(!self.hup.exists(), "SIGHUP reached the survivor: {why}");
+    }
+}
+
+impl Drop for LeftBehind {
+    fn drop(&mut self) {
+        // While the survivor lives, the leader's pid is still its group's id.
+        if self.survivor_alive() {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(self.leader),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+    }
+}
+
+/// Once the leader is reaped, here or behind the handle's back, its pid (the
+/// group id) is no longer this pane's: no signal goes out, even while the
+/// group lives.
+#[tokio::test]
+async fn a_leader_reaped_elsewhere_signals_no_process_group() {
+    let mut left = LeftBehind::spawn("exit 0");
+    nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(left.leader), None).unwrap();
+    let _ = left.handle.terminate();
+    let _ = left.handle.kill();
+    left.assert_untouched("its leader was reaped elsewhere");
+}
+
+/// Ending the group of a leader that already died of a SIGHUP nobody here
+/// sent ends the survivor, and does not claim that SIGHUP as its own.
+#[tokio::test]
+async fn ending_a_group_claims_only_the_signals_its_leader_lived_to_get() {
+    use std::os::unix::process::ExitStatusExt;
+    let mut left = LeftBehind::spawn("kill -HUP $$");
+    let ended = left
+        .handle
+        .end_group(nix::sys::signal::Signal::SIGHUP, Duration::from_millis(50))
+        .await;
+    assert_eq!(
+        ended.status.and_then(|s| s.signal()),
+        Some(nix::libc::SIGHUP)
+    );
+    assert!(
+        !ended.sent.contains(&nix::libc::SIGHUP),
+        "a SIGHUP sent to a dead leader's group was put on shux: {:?}",
+        ended.sent
+    );
+    assert!(
+        shux_testkit::poll_until(shux_testkit::BUDGET, || !left.survivor_alive()),
+        "the group's survivor outlived end_group"
+    );
+}
+
+/// The exit status read without reaping is exactly the one the reap returns.
+#[tokio::test]
+async fn an_exit_read_without_reaping_matches_the_reap() {
+    for script in ["exit 3", "kill -TERM $$"] {
+        let argv = vec!["sh".into(), "-c".into(), script.into()];
+        let mut handle = PtyHandle::spawn(&PtyConfig::with_command(argv, test_cwd())).unwrap();
+        let unreaped = handle.wait_exited(shux_testkit::BUDGET).await;
+        let reaped = handle.wait().await.unwrap();
+        assert_eq!(unreaped, Some(reaped), "{script}");
+    }
+}
+
+/// A handle dropped after its leader exited but before the reap ends the
+/// leader's whole group, not only the leader.
+#[tokio::test]
+async fn dropping_a_handle_whose_leader_exited_ends_its_group() {
+    let mut left = LeftBehind::spawn("exit 0");
+    let unused = PtyHandle::spawn(&PtyConfig::with_command(vec!["true".into()], test_cwd()));
+    drop(std::mem::replace(&mut left.handle, unused.unwrap()));
+    assert!(
+        shux_testkit::poll_until(shux_testkit::BUDGET, || !left.survivor_alive()),
+        "the dropped handle left its group's survivor running"
+    );
 }
 
 /// A pane's process must hold its own terminal on 0-2 and nothing else of the

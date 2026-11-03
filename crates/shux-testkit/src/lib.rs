@@ -194,8 +194,30 @@ fn terminate_within(pid: i32, grace: Duration) -> bool {
     false
 }
 
+/// `pid` is live, not a zombie, and its command line ends with `needle`. A
+/// per-run needle keeps a reused pid or another suite's process from answering.
+/// Panics if `ps` cannot run: an absence check must never pass by default.
+pub fn running(pid: i32, needle: &str) -> bool {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "stat=,command=", "-p", &pid.to_string()])
+        .output()
+        .expect("ps");
+    let line = String::from_utf8_lossy(&out.stdout);
+    // `ps -p` of an absent pid exits 1 and prints nothing; anything else is
+    // a scan that failed, not an answer.
+    assert!(
+        out.status.success()
+            || (out.status.code() == Some(1) && line.trim().is_empty() && out.stderr.is_empty()),
+        "ps failed: {:?} {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let line = line.trim();
+    !line.starts_with('Z') && line.ends_with(needle)
+}
+
 /// An exited process its parent has not reaped still answers `kill(pid, 0)`.
-fn is_zombie(pid: i32) -> bool {
+pub fn is_zombie(pid: i32) -> bool {
     #[cfg(target_os = "linux")]
     let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
         .ok()
