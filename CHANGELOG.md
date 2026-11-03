@@ -1,3 +1,10 @@
+# [0.56.0](https://github.com/indrasvat/shux/compare/v0.55.5...v0.56.0) (2026-11-03)
+
+
+### Features
+
+* **pane:** wait-exit — wait for a pane's program to exit and say how ([#256](https://github.com/indrasvat/shux/issues/256)) ([45cc7a7](https://github.com/indrasvat/shux/commit/45cc7a7201ebadae98e8a6e0e93f9f482c8a08d8)), closes [#250](https://github.com/indrasvat/shux/issues/250) [#162](https://github.com/indrasvat/shux/issues/162)
+
 ## [0.55.5](https://github.com/indrasvat/shux/compare/v0.55.4...v0.55.5) (2026-11-02)
 
 
