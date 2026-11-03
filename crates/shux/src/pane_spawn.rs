@@ -18,6 +18,31 @@ use crate::pane_record::{
     Prepared, finish_pane_recorders, tee_pane_recorders, tee_pane_resize_recorders,
 };
 
+/// Whether the process group `pgid` is gone, its leader already reaped. Only
+/// a probe: signal 0 delivers nothing, so a reused id costs a wrong `false`,
+/// never a stray signal. Polled, as a member killed during the sweep can
+/// linger as a zombie until init reaps it.
+async fn group_emptied(pgid: u32) -> bool {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+    loop {
+        let probe = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pgid as i32), None);
+        if probe == Err(nix::errno::Errno::ESRCH) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "re-probes a reaped group until init has reaped its zombies"
+        )]
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// How long a process group shux is ending gets between SIGHUP and SIGKILL.
+const TEARDOWN_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PtyTaskExit {
     Natural,
@@ -484,63 +509,51 @@ async fn run_pane_pty_task(
 
     finish_pane_recorders(&io_state, pane_id, Some(incarnation)).await;
 
-    // Reap the child cleanly so plugins and `events.history` see the
-    // real exit code on `pane.exited`. The loop exits for several
-    // reasons (EOF, read error, channel close, shutdown cancel); only
-    // the EOF / read-error paths leave a still-alive child needing a
-    // proper wait, while the channel-close and shutdown paths require
-    // an explicit kill before waiting will return. Bound both stages
-    // with timeouts so a wedged child can't stall pane teardown.
-    // The signals shux sent the child before it ended.
-    let mut sent = Vec::new();
-    let exit = if task_exit == PtyTaskExit::RequestedTeardown {
-        let _ = handle.terminate();
-        sent.push(libc::SIGHUP);
-        match tokio::time::timeout(std::time::Duration::from_millis(500), handle.wait()).await {
-            Ok(Ok(status)) => Some(status),
-            Ok(Err(e)) => {
-                tracing::warn!(%pane_id, error = %e, "PTY child wait after teardown failed");
-                None
-            }
-            Err(_) => {
-                let _ = handle.kill();
-                sent.push(libc::SIGKILL);
-                match tokio::time::timeout(std::time::Duration::from_secs(1), handle.wait()).await {
-                    Ok(Ok(status)) => Some(status),
-                    _ => None,
-                }
-            }
-        }
+    // Reap the child so `pane.exited` carries its real exit. Teardown ends the
+    // program's whole process group; so does a program still running 2 s
+    // after its terminal closed. One that exits by itself is only reaped,
+    // unless it ran in a lens scratch, whose group is swept too.
+    let scratch = io_state.lock().await.scratch_ends.remove(&pane_id);
+    let first = if scratch.is_some() {
+        nix::sys::signal::Signal::SIGTERM
     } else {
-        match tokio::time::timeout(std::time::Duration::from_secs(2), handle.wait()).await {
-            Ok(Ok(status)) => Some(status),
-            Ok(Err(e)) => {
-                tracing::warn!(%pane_id, error = %e, "PTY child wait failed");
-                None
-            }
-            Err(_) => {
-                // Still alive after 2s — send a PTY-style hangup to the
-                // process group, then escalate if it refuses to exit.
-                let _ = handle.terminate();
-                sent.push(libc::SIGHUP);
-                match tokio::time::timeout(std::time::Duration::from_millis(500), handle.wait())
-                    .await
-                {
-                    Ok(Ok(status)) => Some(status),
-                    _ => {
-                        let _ = handle.kill();
-                        sent.push(libc::SIGKILL);
-                        match tokio::time::timeout(std::time::Duration::from_secs(1), handle.wait())
-                            .await
-                        {
-                            Ok(Ok(status)) => Some(status),
-                            _ => None,
-                        }
+        nix::sys::signal::Signal::SIGHUP
+    };
+    let natural = if task_exit == PtyTaskExit::Natural && scratch.is_none() {
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle.wait())
+            .await
+            .ok()
+    } else {
+        None
+    };
+    // A scratch whose program exited by itself: its exit is recorded now, and
+    // what it left in its group is swept after, while the unreaped zombie
+    // still pins the group.
+    let mut sweep_after = false;
+    let ended = match natural {
+        Some(waited) => shux_pty::GroupEnd {
+            status: waited
+                .inspect_err(|e| tracing::warn!(%pane_id, error = %e, "PTY child wait failed"))
+                .ok(),
+            sent: Vec::new(),
+        },
+        None if task_exit == PtyTaskExit::Natural => {
+            match handle.wait_exited(std::time::Duration::from_secs(2)).await {
+                Some(status) => {
+                    sweep_after = true;
+                    shux_pty::GroupEnd {
+                        status: Some(status),
+                        sent: Vec::new(),
                     }
                 }
+                None => handle.end_group(first, TEARDOWN_GRACE).await,
             }
         }
+        None => handle.end_group(first, TEARDOWN_GRACE).await,
     };
+    let pgid = handle.pid();
+    let reaped_now = ended.status.is_some();
+    let shux_pty::GroupEnd { status: exit, sent } = ended;
 
     // Every exit fires `pane.exited`, the lens-gate `ExitMonitor` and the reaper
     // key on it. A signal death or a failed wait has no code: `exit_status` is
@@ -587,6 +600,18 @@ async fn run_pane_pty_task(
         .await
     {
         tracing::debug!(%pane_id, error = %e, "set_pane_exit_status failed (pane may already be gone)");
+    }
+    if let Some(tx) = scratch {
+        let reaped = if sweep_after {
+            handle
+                .end_group(first, TEARDOWN_GRACE)
+                .await
+                .status
+                .is_some()
+        } else {
+            reaped_now
+        };
+        tx.send_replace(Some(reaped && group_emptied(pgid).await));
     }
 
     // Drop only the PTY-bound handles. The VT (grid + scrollback) stays

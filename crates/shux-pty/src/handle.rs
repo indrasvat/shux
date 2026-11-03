@@ -9,7 +9,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use nix::pty::{OpenptyResult, Winsize};
 use tokio::io::unix::AsyncFd;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// How often a read that is holding the slave fd open checks whether the child
 /// has exited — one `waitpid(WNOHANG)` plus one readiness poll per tick.
@@ -562,6 +562,28 @@ fn has_output(fd: BorrowedFd<'_>) -> std::io::Result<bool> {
         .is_some_and(|r| r.contains(PollFlags::POLLIN)))
 }
 
+/// SIGKILL sweeps of a pinned group after the first, at most.
+const GROUP_SWEEPS: usize = 10;
+
+/// How [`PtyHandle::end_group`] left the leader.
+#[derive(Debug)]
+pub struct GroupEnd {
+    /// The leader's exit, or `None` if it could not be reaped in time.
+    pub status: Option<ExitStatus>,
+    /// The signals sent to the group while the leader was alive.
+    pub sent: Vec<i32>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Leader {
+    Running,
+    /// Exited, not reaped: its pid still pins the group.
+    Exited,
+    /// Reaped, or its state unknown. Its pid may now name another group, so
+    /// nothing is signalled.
+    Gone,
+}
+
 /// A handle to a running PTY child process.
 pub struct PtyHandle {
     pty: AsyncFd<OwnedFd>,
@@ -579,6 +601,8 @@ pub struct PtyHandle {
     slave: Option<OwnedFd>,
     child: Child,
     pid: u32,
+    /// Reaped here or by someone else: see [`Leader::Gone`].
+    reaped: bool,
     /// When the child was spawned — only used to slacken the exit poll above.
     spawned_at: std::time::Instant,
     initial_cwd: PathBuf,
@@ -591,12 +615,13 @@ pub struct PtyHandle {
 /// its pid may already belong to someone else.
 impl Drop for PtyHandle {
     fn drop(&mut self) {
-        if !matches!(self.child.try_wait(), Ok(None)) {
+        if self.leader() == Leader::Gone {
             return;
         }
         let _ = self.kill();
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
-        while matches!(self.child.try_wait(), Ok(None)) && std::time::Instant::now() < deadline {
+        while matches!(self.try_wait(), Ok(None)) && std::time::Instant::now() < deadline {
+            self.discard_output();
             #[expect(
                 clippy::disallowed_methods,
                 reason = "Drop cannot await; a bounded reap of a SIGKILLed child"
@@ -713,6 +738,21 @@ fn resolve_pane_term() -> &'static str {
 /// grid, so an agent's `PaneExited` → `pane.capture` loop captured nothing.
 fn is_pty_eof_errno(errno: nix::errno::Errno) -> bool {
     errno == nix::errno::Errno::EIO
+}
+
+/// The wait status `waitid` described in `info`, as `waitpid` would give it.
+fn siginfo_exit_status(info: &nix::libc::siginfo_t) -> ExitStatus {
+    use std::os::unix::process::ExitStatusExt;
+    #[cfg(target_os = "linux")]
+    // SAFETY: as for `siginfo_pid`: a siginfo `waitid` just filled in.
+    let status = unsafe { info.si_status() };
+    #[cfg(not(target_os = "linux"))]
+    let status = info.si_status;
+    ExitStatus::from_raw(match info.si_code {
+        nix::libc::CLD_EXITED => (status & 0xff) << 8,
+        nix::libc::CLD_DUMPED => status | 0x80,
+        _ => status,
+    })
 }
 
 /// `si_pid`, which libc exposes as a plain field on BSD/macOS and behind an
@@ -924,6 +964,7 @@ impl PtyHandle {
             slave: Some(pty_pair.slave),
             child,
             pid,
+            reaped: false,
             spawned_at: std::time::Instant::now(),
             initial_cwd: config.cwd.clone(),
             size: config.size,
@@ -978,7 +1019,7 @@ impl PtyHandle {
                     _ = tokio::time::sleep(poll) => true,
                 };
                 if exit_tick
-                    && self.child_exited_unreaped()
+                    && self.leader() != Leader::Running
                     && !has_output(self.pty.get_ref().as_fd()).unwrap_or(false)
                 {
                     self.release_slave();
@@ -1058,8 +1099,11 @@ impl PtyHandle {
     }
 
     /// Wait for the child process to exit.
+    /// Queued output is dropped meanwhile: an exiting leader can wait on
+    /// it, and every caller has stopped reading.
     pub async fn wait(&mut self) -> Result<ExitStatus, PtyError> {
         loop {
+            self.discard_output();
             if let Some(status) = self.try_wait()? {
                 info!(pid = self.pid, ?status, "PTY child exited");
                 return Ok(status);
@@ -1073,7 +1117,108 @@ impl PtyHandle {
     }
 
     pub fn try_wait(&mut self) -> Result<Option<ExitStatus>, PtyError> {
-        self.child.try_wait().map_err(PtyError::Child)
+        let status = self.child.try_wait().map_err(PtyError::Child)?;
+        self.reaped |= status.is_some();
+        Ok(status)
+    }
+
+    /// End the child's whole process group: send it `first`, give the group
+    /// `grace` to exit, SIGKILL whatever is left, then reap the leader.
+    ///
+    /// Only this handle may signal the group: the daemon reaps a pane's child
+    /// nowhere else, so while the leader is unreaped here its pid is ours.
+    ///
+    /// The leader is held unreaped until the SIGKILL has been sent, so the
+    /// group id cannot have been handed to anyone else when it is.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the grace is a fixed deadline the group gets to exit by; std::process::Child has no async wait"
+    )]
+    pub async fn end_group(
+        &mut self,
+        first: nix::sys::signal::Signal,
+        grace: std::time::Duration,
+    ) -> GroupEnd {
+        let deadline = tokio::time::Instant::now() + grace;
+        let mut sent = Vec::new();
+        match self.leader() {
+            Leader::Gone => {}
+            leader => {
+                if leader == Leader::Running {
+                    sent.push(first as i32);
+                }
+                let _ = self.signal_process_group(first);
+            }
+        }
+        let leader = loop {
+            let early = tokio::time::Instant::now() < deadline;
+            match self.leader() {
+                leader if early && leader != Leader::Gone => {
+                    self.discard_output();
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                leader => break leader,
+            }
+        };
+        if leader == Leader::Running {
+            sent.push(nix::libc::SIGKILL);
+        }
+        let _ = self.kill();
+        // A member mid-fork can hand its child past one SIGKILL; the group is
+        // pinned, so sweep again until it is empty or the sweeps run out.
+        for _ in 0..GROUP_SWEEPS {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            if self.leader() == Leader::Gone
+                || self
+                    .signal_process_group(nix::sys::signal::Signal::SIGKILL)
+                    .is_err()
+            {
+                break;
+            }
+        }
+        let status =
+            match tokio::time::timeout(std::time::Duration::from_secs(1), self.wait()).await {
+                Ok(Ok(status)) => Some(status),
+                Ok(Err(e)) => {
+                    warn!(pid = self.pid, error = %e, "PTY child wait after teardown failed");
+                    None
+                }
+                Err(_) => None,
+            };
+        GroupEnd { status, sent }
+    }
+
+    /// Wait, without reaping it, until the leader has exited or `timeout`
+    /// passes; its exit status, if it has. Queued output is dropped meanwhile.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "std::process::Child has no async wait; poll its exit"
+    )]
+    pub async fn wait_exited(&mut self, timeout: std::time::Duration) -> Option<ExitStatus> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            self.discard_output();
+            match self.exit_unreaped() {
+                Some(None) => {}
+                exited => return exited.flatten(),
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Read and drop whatever the child has queued on the terminal, bounded
+    /// so a program still writing cannot hold the caller.
+    fn discard_output(&self) {
+        let mut buf = [0u8; 4096];
+        for _ in 0..64 {
+            match nix::unistd::read(self.pty.get_ref(), &mut buf) {
+                Ok(n) if n > 0 => {}
+                _ => return,
+            }
+        }
     }
 
     /// A probe, usable without this handle, for output the child wrote that
@@ -1094,20 +1239,31 @@ impl PtyHandle {
         Ok(probe)
     }
 
-    /// Has the child exited? Answered **without reaping it**.
+    /// The leader's state, answered **without reaping it**.
     ///
-    /// `Child::try_wait` would reap, and reaping frees the pid — which is also
-    /// this pane's process *group* id, since the child is a session leader.
-    /// A pane whose child exits while a descendant keeps the tty open is still
-    /// a live group that teardown has to be able to signal, and a freed pgid is
-    /// one an unrelated process can be handed. `WNOWAIT` leaves the zombie in
-    /// place, so the group stays allocated and the real reap stays exactly
-    /// where it always was: `wait()`, after the read loop ends.
-    fn child_exited_unreaped(&self) -> bool {
+    /// Reaping frees the pid, which is also this pane's process *group* id, as
+    /// the child is a session leader. A pane whose child exits while a
+    /// descendant keeps the tty open is still a live group that teardown has
+    /// to be able to signal, and a freed pgid is one an unrelated process can
+    /// be handed. `WNOWAIT` leaves the zombie in place, so the group stays
+    /// allocated until [`Self::wait`] reaps it.
+    fn leader(&mut self) -> Leader {
+        match self.exit_unreaped() {
+            Some(Some(_)) => Leader::Exited,
+            Some(None) => Leader::Running,
+            None => Leader::Gone,
+        }
+    }
+
+    /// The leader's exit status, read without reaping it: `Some(None)` while
+    /// it runs, `None` once it is [`Leader::Gone`].
+    fn exit_unreaped(&mut self) -> Option<Option<ExitStatus>> {
+        if self.reaped {
+            return None;
+        }
         // libc directly, because nix's `waitid` wrapper is not compiled for
-        // Apple targets — and macOS is the platform this whole fix exists for.
-        // POSIX idiom: zero the struct first, since a `WNOHANG` call that finds
-        // nothing waitable returns 0 and leaves `si_pid` untouched.
+        // Apple targets. Zeroed first: a `WNOHANG` call that finds nothing
+        // waitable returns 0 and leaves `si_pid` untouched.
         let mut info: nix::libc::siginfo_t = unsafe { std::mem::zeroed() };
         // SAFETY: `info` is a live, correctly-typed `siginfo_t` for the whole
         // call, and it is the only thing `waitid` writes through the pointer.
@@ -1120,12 +1276,16 @@ impl PtyHandle {
             )
         };
         if rc == -1 {
-            // ECHILD: not ours to wait on any more, so it is certainly gone.
+            // ECHILD or unknown: never signal an unknown pid.
             let e = std::io::Error::last_os_error();
             debug!(pid = self.pid, error = %e, "PTY child waitid failed");
-            return true;
+            self.reaped = true;
+            return None;
         }
-        siginfo_pid(&info) != 0
+        if siginfo_pid(&info) == 0 {
+            return Some(None);
+        }
+        Some(Some(siginfo_exit_status(&info)))
     }
 
     /// The current exit-poll interval — see the constants.
@@ -1153,6 +1313,9 @@ impl PtyHandle {
     /// for interactive shells: the foreground TUI may be a child of the shell,
     /// and killing only the shell can leave that foreground process alive.
     pub fn terminate(&mut self) -> Result<(), PtyError> {
+        if self.leader() == Leader::Gone {
+            return Ok(());
+        }
         #[cfg(unix)]
         {
             if self
@@ -1166,6 +1329,9 @@ impl PtyHandle {
     }
 
     pub fn kill(&mut self) -> Result<(), PtyError> {
+        if self.leader() == Leader::Gone {
+            return Ok(());
+        }
         #[cfg(unix)]
         {
             if self

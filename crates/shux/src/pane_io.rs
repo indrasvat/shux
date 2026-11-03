@@ -76,6 +76,11 @@ pub struct PaneIoState {
     /// Per-pane completion receivers used by daemon shutdown to wait until
     /// PTY tasks have actually signalled and reaped their children.
     pub pty_done: HashMap<shux_core::model::PaneId, oneshot::Receiver<()>>,
+    /// Lens scratch panes, set before their spawn. Their PTY task ends the
+    /// group SIGTERM-first (LENS-R-042), also sweeps it when the program
+    /// exits by itself, then takes the sender and publishes whether the
+    /// group was confirmed empty once the leader was reaped.
+    pub scratch_ends: HashMap<shux_core::model::PaneId, tokio::sync::watch::Sender<Option<bool>>>,
     /// Which PTY task currently owns each pane. A pane spawned again while
     /// its previous task is still winding down belongs to the newer task; the
     /// older one must not touch its VT, handles or exit status.
@@ -191,6 +196,7 @@ impl PaneIoState {
             resizers: HashMap::new(),
             shutdowns: HashMap::new(),
             pty_done: HashMap::new(),
+            scratch_ends: HashMap::new(),
             incarnations: HashMap::new(),
             failed_spawns: Default::default(),
             teardown_waiters: Vec::new(),
