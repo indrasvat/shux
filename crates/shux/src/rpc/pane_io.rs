@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 use crate::lens_render::{
     glance_row_text, lens_pixel_budget_check, parse_glance_masks, render_lens_heat_png,
 };
-use crate::pane_io::{PaneIoState, ResizeRequest, diff_lookup_checkpoint};
+use crate::pane_io::{CommandStart, PaneIoState, ResizeRequest, diff_lookup_checkpoint};
 use crate::pane_record::{EndedBy, requested_length};
 
 /// The pane's PTY task still takes input: it closes that channel before it
@@ -60,8 +60,14 @@ async fn send_to_pane(
         .reserve(bytes.len())
         .await
         .map_err(|_| shux_rpc::RpcError::internal("PTY write channel closed"))?;
-    io.lock().await.send_outside_paste(pane_id, permit, bytes);
-    Ok(())
+    if io.lock().await.send_outside_paste(pane_id, permit, bytes) {
+        Ok(())
+    } else {
+        Err(shux_rpc::RpcError::not_found(
+            "pane PTY",
+            &pane_id.to_string(),
+        ))
+    }
 }
 
 /// Register pane I/O methods (send_keys, run_command, command_status, command_cancel, capture).
@@ -291,20 +297,22 @@ pub(crate) fn register_pane_io_methods(
                         .await
                         .map_err(|_| pane_input_full(timeout))?
                         .map_err(|_| shux_rpc::RpcError::internal("PTY write channel closed"))?;
-                    let command_id = {
-                        let mut state = io.lock().await;
-                        if !state.is_current_writer(pane_id, &permit) {
+                    let start = io.lock().await.start_command(
+                        pane_id,
+                        permit,
+                        prepared,
+                        timeout,
+                        completion_tx,
+                    );
+                    let command_id = match start {
+                        CommandStart::Started(id) => id,
+                        CommandStart::Busy(running) => return Err(pane_busy(running)),
+                        CommandStart::PaneGone => {
                             return Err(shux_rpc::RpcError::not_found(
                                 "pane PTY",
                                 &pane_id.to_string(),
                             ));
                         }
-                        let (id, line) = state
-                            .cmd_engine
-                            .register(pane_id.0, prepared, timeout, completion_tx)
-                            .map_err(pane_busy)?;
-                        state.send_outside_paste(pane_id, permit, line.into_bytes());
-                        id
                     };
 
                     if is_async {

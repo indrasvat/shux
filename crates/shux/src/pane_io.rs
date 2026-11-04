@@ -57,6 +57,15 @@ pub(crate) struct PaneCheckpoint {
     default_colors: shux_vt::TerminalDefaultColors,
 }
 
+/// How [`PaneIoState::start_command`] went.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CommandStart {
+    Started(uuid::Uuid),
+    /// The pane is still running this command.
+    Busy(uuid::Uuid),
+    PaneGone,
+}
+
 /// Shared state for pane I/O operations (PTY writes, VT state, command tracking).
 ///
 /// This is the bridge between the RPC handlers and the per-pane PTY read loops.
@@ -281,18 +290,48 @@ impl PaneIoState {
     }
 
     /// Sends `bytes` to `pane_id` through `permit`, ending an open paste
-    /// first so they cannot land inside it.
+    /// first so they cannot land inside it. `false` when the pane is gone.
     pub(crate) fn send_outside_paste(
         &mut self,
         pane_id: shux_core::model::PaneId,
         permit: InputPermit,
         bytes: Vec<u8>,
-    ) {
+    ) -> bool {
         if self.is_current_writer(pane_id, &permit) && self.open_paste(pane_id).is_some() {
             self.open_pastes.remove(&pane_id);
-            permit.send([PASTE_END, &bytes].concat());
+            permit.send([PASTE_END, &bytes].concat())
         } else {
-            permit.send(bytes);
+            permit.send(bytes)
+        }
+    }
+
+    /// Track `prepared` as `pane_id`'s running command and queue its line
+    /// through `permit`, both under this one lock.
+    pub(crate) fn start_command(
+        &mut self,
+        pane_id: shux_core::model::PaneId,
+        permit: InputPermit,
+        prepared: shux_pty::PreparedCommand,
+        timeout: std::time::Duration,
+        completion_tx: Option<tokio::sync::oneshot::Sender<shux_pty::CommandResult>>,
+    ) -> CommandStart {
+        if !self.is_current_writer(pane_id, &permit) {
+            return CommandStart::PaneGone;
+        }
+        match self
+            .cmd_engine
+            .register(pane_id.0, prepared, timeout, completion_tx)
+        {
+            Err(running) => CommandStart::Busy(running),
+            Ok((id, line)) => {
+                if self.send_outside_paste(pane_id, permit, line.into_bytes()) {
+                    CommandStart::Started(id)
+                } else {
+                    // The PTY task stopped reading before its `forget_pane`.
+                    self.cmd_engine.forget_pane(pane_id.0);
+                    CommandStart::PaneGone
+                }
+            }
         }
     }
 
@@ -308,7 +347,13 @@ impl PaneIoState {
             .writers
             .get(&pane_id)?
             .try_reserve_in(bytes.len(), lane);
-        Some(permit.map(|permit| self.send_outside_paste(pane_id, permit, bytes)))
+        Some(permit.and_then(|permit| {
+            if self.send_outside_paste(pane_id, permit, bytes) {
+                Ok(())
+            } else {
+                Err(mpsc::error::TrySendError::Closed(()))
+            }
+        }))
     }
 
     /// Whether `incarnation` is still the PTY task that owns `pane_id`.
@@ -536,6 +581,34 @@ pub(crate) fn diff_lookup_checkpoint(
 mod tests {
     use super::*;
     use futures::FutureExt as _;
+
+    /// The PTY task stops reading after a command reserved room but before it
+    /// queued its line: the command must not be left running, its line lost.
+    #[tokio::test]
+    async fn a_command_whose_pane_ends_before_its_line_is_queued_is_not_left_running() {
+        let mut state = PaneIoState::new();
+        let pane_id = shux_core::model::PaneId::new();
+        let (writer, input) = crate::pane_input::channel();
+        state.writers.insert(pane_id, writer.clone());
+        let prepared = shux_pty::CommandEngine::prepare("echo hi", &[]);
+        let permit = writer.reserve(prepared.line().len()).await.unwrap();
+        // What the PTY task does on its way out: stop reading, then answer
+        // whatever was running.
+        drop(input);
+        state.cmd_engine.forget_pane(pane_id.0);
+
+        let timeout = std::time::Duration::from_secs(30);
+        let start = state.start_command(pane_id, permit, prepared, timeout, None);
+        assert_eq!(start, CommandStart::PaneGone);
+        let next = shux_pty::CommandEngine::prepare("true", &[]);
+        assert!(
+            state
+                .cmd_engine
+                .register(pane_id.0, next, timeout, None)
+                .is_ok(),
+            "the pane was left busy with a command it never received"
+        );
+    }
 
     #[test]
     fn one_bump_reaches_every_subscriber() {
