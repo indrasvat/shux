@@ -25,7 +25,7 @@ fn path(id: u8, depth: u8) -> String {
 
 fuzz_target!(|ops: Vec<Op>| {
     let mut table = StatusTable::new();
-    for op in ops {
+    for (stamp, op) in (1u64..).zip(ops) {
         let rev = table.revision();
         match op {
             Op::Report { id, depth, state, app, extra } => {
@@ -43,7 +43,7 @@ fuzz_target!(|ops: Vec<Op>| {
                 let mut bytes = p.into_bytes();
                 bytes.extend(extra.into_iter().take(32));
                 if let Ok(Message::Report(r)) = decode(&bytes) {
-                    table.apply(r);
+                    table.apply(r, stamp);
                 }
             }
             Op::Clear { id } => {
@@ -52,7 +52,7 @@ fuzz_target!(|ops: Vec<Op>| {
                     None => "state=clear".to_owned(),
                 };
                 if let Ok(Message::Report(r)) = decode(p.as_bytes()) {
-                    table.apply(r);
+                    table.apply(r, stamp);
                 }
             }
             Op::Prompt => table.on_prompt_start(),

@@ -82,6 +82,39 @@ fn strip_status_replies(responses: &[Vec<u8>]) -> Vec<Vec<u8>> {
         .collect()
 }
 
+/// Per record: its state, then for each state the rank of its stamp among
+/// every stamp the table holds (`None` for never). Checks each record's
+/// `reported_generation` is its newest per-state stamp.
+type StampShape = Vec<(State, Vec<Option<usize>>)>;
+
+fn stamp_shape(vt: &VirtualTerminal) -> Result<Option<StampShape>, TestCaseError> {
+    let Some(r) = vt.program_status_records() else {
+        return Ok(None);
+    };
+    let mut all: Vec<u64> = r
+        .records
+        .iter()
+        .flat_map(|v| v.reported_in)
+        .filter(|&s| s != 0)
+        .collect();
+    all.sort_unstable();
+    all.dedup();
+    let mut shape = Vec::new();
+    for v in &r.records {
+        let newest = State::ALL.iter().map(|&s| v.last_reported(s)).max();
+        prop_assert_eq!(Some(v.reported_generation), newest, "{:?}", v);
+        let ranks = State::ALL
+            .iter()
+            .map(|&s| {
+                let stamp = v.last_reported(s);
+                (stamp != 0).then(|| all.binary_search(&stamp).unwrap_or(usize::MAX))
+            })
+            .collect();
+        shape.push((v.state, ranks));
+    }
+    Ok(Some(shape))
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(600))]
 
@@ -113,8 +146,34 @@ proptest! {
         let whole = enabled(&stream);
         let singles: Vec<&[u8]> = stream.chunks(1).collect();
         let (_, bytewise) = drive(&singles, true);
-        let records = |vt: &VirtualTerminal| vt.program_status_records().map(|r| (r.seen, r.records));
+        // Stamps are process-global, so two runs never share them.
+        let records = |vt: &VirtualTerminal| {
+            vt.program_status_records().map(|r| {
+                let unstamped: Vec<_> = r
+                    .records
+                    .into_iter()
+                    .map(|v| shux_program_status::RecordView {
+                        reported_generation: 0,
+                        reported_in: Default::default(),
+                        ..v
+                    })
+                    .collect();
+                (r.seen, unstamped)
+            })
+        };
         prop_assert_eq!(records(&whole), records(&bytewise));
+    }
+
+    /// Stamps are process-global, so two runs share no values; what must not
+    /// depend on chunking is their shape: which states of which record carry a
+    /// stamp, and their order. Each record's newest stamp is its last report.
+    #[test]
+    fn stamp_shape_does_not_depend_on_chunking(pieces in prop::collection::vec(piece(), 0..30)) {
+        let stream = pieces.concat();
+        let whole = enabled(&stream);
+        let singles: Vec<&[u8]> = stream.chunks(1).collect();
+        let (_, bytewise) = drive(&singles, true);
+        prop_assert_eq!(stamp_shape(&whole)?, stamp_shape(&bytewise)?);
     }
 
     /// Every query is answered at its own stream position, so replies come

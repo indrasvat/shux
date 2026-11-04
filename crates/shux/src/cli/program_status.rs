@@ -41,15 +41,23 @@ pub async fn handle_pane_status(
     Ok(())
 }
 
+/// What `pane wait-status` waits for.
+pub struct StatusWait<'a> {
+    pub states: &'a [String],
+    /// Sent only when given, so the daemon's default applies otherwise.
+    pub matching: Option<&'a str>,
+    pub id: Option<&'a str>,
+    pub after: Option<u64>,
+    pub timeout_ms: u64,
+}
+
 pub async fn handle_pane_wait_status(
     stream: &mut tokio::net::UnixStream,
     pane: &str,
-    states: &[String],
-    matching: &str,
-    timeout_ms: u64,
+    wait: &StatusWait<'_>,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
-    match wait_status_exit_code(stream, pane, states, matching, timeout_ms, format).await? {
+    match wait_status_exit_code(stream, pane, wait, format).await? {
         0 => Ok(()),
         code => std::process::exit(code),
     }
@@ -71,30 +79,45 @@ pub fn wait_unreachable(verb: &str, err: anyhow::Error, format: OutputFormat) ->
     std::process::exit(3)
 }
 
+fn unique(states: &[String]) -> Vec<&String> {
+    let mut seen: Vec<&String> = Vec::new();
+    for s in states {
+        if !seen.contains(&s) {
+            seen.push(s);
+        }
+    }
+    seen
+}
+
+/// `pane.wait_status`'s params: `match`, `id` and `after` only when given.
+fn wait_status_params(pane: &str, states: &[&String], wait: &StatusWait<'_>) -> serde_json::Value {
+    let mut params = serde_json::json!({
+        "pane_id": pane,
+        "state": states,
+        "timeout_ms": wait.timeout_ms,
+    });
+    if let Some(m) = wait.matching {
+        params["match"] = m.into();
+    }
+    if let Some(id) = wait.id {
+        params["id"] = id.into();
+    }
+    if let Some(after) = wait.after {
+        params["after"] = after.into();
+    }
+    params
+}
+
 /// Exit code: 0 matched, 1 timeout, 2 bad arguments, 3 anything else. Only a
 /// timeout may be 1: scripts branch on it.
 pub(crate) async fn wait_status_exit_code(
     stream: &mut tokio::net::UnixStream,
     pane: &str,
-    states: &[String],
-    matching: &str,
-    timeout_ms: u64,
+    wait: &StatusWait<'_>,
     format: OutputFormat,
 ) -> anyhow::Result<i32> {
-    let mut unique: Vec<&String> = Vec::new();
-    for s in states {
-        if !unique.contains(&s) {
-            unique.push(s);
-        }
-    }
-    let states: Vec<String> = unique.into_iter().cloned().collect();
-    let states = states.as_slice();
-    let params = serde_json::json!({
-        "pane_id": pane,
-        "state": states,
-        "match": matching,
-        "timeout_ms": timeout_ms,
-    });
+    let states = unique(wait.states);
+    let params = wait_status_params(pane, &states, wait);
     let result = match rpc_call(stream, "pane.wait_status", params).await {
         Ok(result) => result,
         Err(RpcClientError::Rpc {
@@ -122,7 +145,7 @@ pub(crate) async fn wait_status_exit_code(
     };
     match format {
         OutputFormat::Json => print_json(&result)?,
-        OutputFormat::Text => crate::style::print_pane_wait_status(&result, states),
+        OutputFormat::Text => crate::style::print_pane_wait_status(&result, &states, wait.id),
         OutputFormat::Plain => crate::style::print_pane_wait_status_plain(&result),
     }
     Ok(match result.get("outcome").and_then(|v| v.as_str()) {
@@ -147,16 +170,43 @@ mod tests {
             daemon.read_exact(&mut body).await.unwrap();
             // Hang up without answering.
         });
-        let code = wait_status_exit_code(
-            &mut client,
-            "abcd",
-            &["done".into()],
-            "top",
-            1_000,
-            OutputFormat::Json,
-        )
-        .await
-        .unwrap();
+        let states = ["done".to_string()];
+        let wait = StatusWait {
+            states: &states,
+            matching: Some("top"),
+            id: None,
+            after: None,
+            timeout_ms: 1_000,
+        };
+        let code = wait_status_exit_code(&mut client, "abcd", &wait, OutputFormat::Json)
+            .await
+            .unwrap();
         assert_eq!(code, 3, "a broken stream must not read as a timeout");
+    }
+
+    /// The daemon rejects `id` beside an explicit `match`, so the CLI must not
+    /// send its own default: an `--id` wait would always be refused.
+    #[test]
+    fn match_is_sent_only_when_given() {
+        let states = ["done".to_string(), "done".to_string()];
+        let mut wait = StatusWait {
+            states: &states,
+            matching: None,
+            id: Some("job"),
+            after: Some(7),
+            timeout_ms: 500,
+        };
+        let params = wait_status_params("p", &unique(wait.states), &wait);
+        assert_eq!(
+            params,
+            serde_json::json!({"pane_id": "p", "state": ["done"], "timeout_ms": 500, "id": "job", "after": 7})
+        );
+        wait.matching = Some("any");
+        wait.id = None;
+        wait.after = None;
+        assert_eq!(
+            wait_status_params("p", &unique(wait.states), &wait)["match"],
+            "any"
+        );
     }
 }

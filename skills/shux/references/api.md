@@ -199,11 +199,37 @@ reported has `seen: false`.
 ```json
 pane.status      { "pane_id": "uuid" }
   → { "enabled": true, "seen": true, "summary": { "state": "blocked", "kind": "permission", ... },
-      "records": [ { "id": "perm", "state": "blocked", "title": "...", "msg": "..." } ] }
+      "records": [ { "id": "perm", "state": "blocked", "title": "...", "msg": "...",
+                     "reported_generation": 41 } ],
+      "as_of": 42 }
 
 pane.wait_status { "pane_id": "uuid", "state": ["blocked", "error"], "match": "top", "timeout_ms": 30000 }
   → { "outcome": "matched" | "timeout" | "pane_gone" | "disabled", "summary": { ... } }
+
+pane.wait_status { "pane_id": "uuid", "state": ["done", "error"], "id": "job", "after": 42 }
+  → { "outcome": "matched", "reported": { "state": "done", "generation": 57 },
+      "record": { "id": "job", "state": "idle", ... }, "summary": { ... } }
 ```
+
+- **`id`** waits on the one record with exactly that id. It ignores every
+  other record, including a `done` an earlier command left. It cannot be
+  combined with `match`.
+- **An id wait asks whether that record has reported a waited state,** not
+  whether it is in one now. `reported` is the report that matched. A `done`
+  the record left at once for `idle` still counts; `record` shows where it is
+  now.
+- **`after`** (needs `id`) counts only a report stamped above it. Pass `as_of`
+  from a `pane.status` read after the previous command with that id finished
+  and before the next is sent.
+  - Every report is stamped, even one identical to the last, so a reused id
+    works.
+  - Stamps are valid for one daemon's lifetime, and a floor above every stamp
+    issued so far is refused.
+- **Lost reports:** a report is lost if, before the wait reads it, the record
+  is cleared, reset (RIS) or evicted. It is also lost if the record moves on to
+  a state the next prompt removes (`idle`, `working`, `blocked`) and that
+  prompt starts. `done` and `error` survive a prompt.
+- **`summary`** describes the pane's most urgent record, read with `record`.
 
 CLI exit codes for `shux pane wait-status`: 0 matched, 1 timeout,
 2 bad arguments, 3 pane gone, feature off, or any other error.
@@ -211,6 +237,26 @@ CLI exit codes for `shux pane wait-status`: 0 matched, 1 timeout,
 Both methods are `ContentRead`, and grants match the exact method: for
 panes it does not own, a plugin needs `shux plugin grant <name> pane.status`
 to read status and `shux plugin grant <name> pane.wait_status` to wait on it.
+
+### `pane.run_command` / `pane.command_status` / `pane.command_cancel`
+
+Run one command in a pane's live shell and return what it wrote. The CLI is
+`shux pane run -s S -c CMD [--async] [--timeout SECS]`.
+
+```json
+pane.run_command    { "pane_id": "uuid", "command": "ls", "args": ["-la"], "timeout": 30, "async": false }
+  → { "command_id": "uuid", "state": "completed" | "timed_out" | "cancelled" | "pane_gone",
+      "exit_code": 0, "stdout": "...", "truncated": false, "runtime_ms": 12 }
+pane.command_status { "command_id": "uuid" } → the same result, once finished
+pane.command_cancel { "command_id": "uuid" } → { "command_id": "uuid", "state": "..." }  (sends Ctrl-C)
+```
+
+- `stdout` is the bytes between two markers that the shell prints around the
+  command, ANSI stripped, up to 1 MiB (`truncated` says if more was dropped).
+- One command per pane. A second is refused with `ResourceExhausted`, plus
+  `running_command_id` and `running_command_state`.
+- A `timed_out` command keeps its pane until its program ends or it is
+  cancelled.
 
 ### `pane.wait_exit`
 

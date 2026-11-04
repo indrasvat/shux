@@ -165,6 +165,19 @@ pub struct RecordView {
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub msg: Option<String>,
+    /// The stamp of the last report naming this record, identical or not.
+    pub reported_generation: u64,
+    /// The stamp of the last report that put this record in each state, in
+    /// [`State::ALL`] order; 0 for never. A wait reads it, so a state the
+    /// record has already left still counts.
+    #[serde(skip)]
+    pub reported_in: [u64; State::ALL.len()],
+}
+
+impl RecordView {
+    pub fn last_reported(&self, state: State) -> u64 {
+        self.reported_in[state as usize]
+    }
 }
 
 #[cfg(test)]
