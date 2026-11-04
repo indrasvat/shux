@@ -222,6 +222,23 @@ fn a_start_after_ignored_control_bytes_counts_however_it_is_read() {
     }
 }
 
+/// Ignored C0 bytes inside an end: vte stores none of them, so the exit
+/// code it carries is read, whole or a byte at a time.
+#[test]
+fn an_end_padded_with_ignored_control_bytes_keeps_its_exit_code() {
+    let stream = [C, b"\x1b]133;D;7", &[0u8; 5000], b"\x07"].concat();
+    for bytewise in [false, true] {
+        let mut vt = vt();
+        let floor = shux_vt::program_status_as_of();
+        feed(&mut vt, &stream, bytewise);
+        assert_eq!(
+            exits(&ended_after(&vt, floor)),
+            [Some(7)],
+            "bytewise={bytewise}"
+        );
+    }
+}
+
 /// An exit code is a decimal number, optionally negative: nothing else.
 #[test]
 fn only_a_plain_decimal_is_an_exit_code() {

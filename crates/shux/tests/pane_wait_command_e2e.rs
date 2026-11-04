@@ -402,6 +402,26 @@ fn a_child_of_an_allexport_shell_installs_cleanly() {
     );
 }
 
+/// A child of an allexport shell inherits the hook functions but sets its
+/// own PROMPT_COMMAND in its rc: sourcing the integration must still hook it.
+#[test]
+fn an_allexport_child_with_its_own_prompt_command_is_hooked() {
+    let bash = modern_bash().expect("no bash 4.4+ installed");
+    let out = Command::new(&bash)
+        .env("SHUX_BIN", env!("CARGO_BIN_EXE_shux"))
+        .env("CHILD_BASH", &bash)
+        .args(["--noprofile", "--norc", "-i", "-c"])
+        .arg(r#"set -a; eval "$("$SHUX_BIN" shell-integration bash)"; "$CHILD_BASH" --noprofile --norc -i -c 'PROMPT_COMMAND="history -a"; eval "$("$SHUX_BIN" shell-integration bash)"; printf "%s" "$PROMPT_COMMAND"'; true"#)
+        .output()
+        .expect("bash");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "__shux_osc133_precmd; history -a",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// Under allexport bash exports the hook functions too: a child bash that
 /// never sources the integration inherits the prompt hook and the "started a
 /// command" flag, and its first prompt must not end its parent's command.

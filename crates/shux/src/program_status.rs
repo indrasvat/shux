@@ -955,6 +955,87 @@ mod tests {
         finish(h).await;
     }
 
+    /// A wait begun before the pane's program is up waits for it: the first
+    /// program to start is the one the wait is about, not a respawn.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_command_wait_on_a_pane_still_starting_waits_for_its_program() {
+        let h = RpcHarness::new();
+        let (_s, _w, pane) = h.seed_session("command-starting").await;
+        let floor = shux_vt::program_status_as_of();
+        let waiter = {
+            let router = h.router.clone();
+            tokio::spawn(async move {
+                dispatch_ok(
+                    &router,
+                    "pane.wait_command",
+                    json!({"pane_id": pane.to_string(), "after": floor, "timeout_ms": 20_000}),
+                )
+                .await
+            })
+        };
+        let io = h.io.clone();
+        // Or finished: a wait that gives up on the pane fails the asserts.
+        shux_testkit::wait_until_async("the waiter to subscribe", || {
+            let io = io.clone();
+            let done = waiter.is_finished();
+            async move { done || io.lock().await.commands_ended.receiver_count() >= 1 }
+        })
+        .await;
+        spawn_sh(
+            &h,
+            pane,
+            r"printf '\033]133;C\007\033]133;D;5\007'; sleep 30",
+        )
+        .await;
+        let waited = waiter.await.expect("waiter");
+        assert_eq!(waited["outcome"], "completed", "{waited}");
+        assert_eq!(waited["exit_code"], 5, "{waited}");
+        finish(h).await;
+    }
+
+    /// A kill that lands between the RPC finding the pane and the wait's
+    /// first look is a kill, not a pane that never started.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_command_wait_whose_pane_is_killed_before_it_looks_says_killed() {
+        let h = RpcHarness::new();
+        let (session, _w, pane) = h.seed_session("command-killed-early").await;
+        spawn_sh(&h, pane, "sleep 30").await;
+        dispatch_ok(
+            &h.router,
+            "session.kill",
+            json!({"id": session.to_string()}),
+        )
+        .await;
+        let waited = crate::rpc::wait_command::wait_command(
+            &h.graph,
+            &h.io,
+            pane,
+            None,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("wait");
+        assert_eq!(waited["reason"], "killed", "{waited}");
+        finish(h).await;
+    }
+
+    /// A pane whose spawn failed, with none under way, never started.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_command_wait_whose_spawn_failed_says_not_started() {
+        let h = RpcHarness::new();
+        let (_s, _w, pane) = h.seed_session("command-failed-spawn").await;
+        h.io.lock().await.failed_spawns.insert(pane);
+        let waited = dispatch_ok(
+            &h.router,
+            "pane.wait_command",
+            json!({"pane_id": pane.to_string(), "timeout_ms": 5_000}),
+        )
+        .await;
+        assert_eq!(waited["outcome"], "pane_gone", "{waited}");
+        assert_eq!(waited["reason"], "not_started", "{waited}");
+        finish(h).await;
+    }
+
     /// A spawn whose future is dropped mid-flight (an RPC client hung up)
     /// must not leave the pane unspawnable.
     #[tokio::test(flavor = "multi_thread")]

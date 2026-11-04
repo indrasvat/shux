@@ -296,11 +296,12 @@ impl OscStatusScanner {
     fn finish(&mut self, end: usize, bel: bool, cuts: &mut Vec<StatusCut>) {
         let action = if self.poisoned || self.raw_len > MAX_SEQUENCE_BYTES {
             // Only a command boundary survives; a D's exit counts only when
-            // its field ended inside the prefix.
+            // its field ended inside the prefix. A body short of the prefix
+            // was not cut: the excess was ignored control bytes.
             match classify(&self.body, bel) {
                 Some(CutAction::CommandStart) => Some(CutAction::CommandStart),
                 Some(CutAction::CommandEnd { .. }) => Some(CutAction::CommandEnd {
-                    exit_code: exit_field(&self.body, true),
+                    exit_code: exit_field(&self.body, self.body.len() >= POISONED_PREFIX),
                 }),
                 _ => None,
             }

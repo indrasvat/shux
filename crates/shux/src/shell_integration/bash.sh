@@ -11,7 +11,8 @@ __shux_osc133_install() {
   # A shell reading its rc has started no command. Inherited (allexport
   # exports it), the flag would make its first prompt end its parent's.
   __shux_osc133_ran=
-  declare -F __shux_osc133_keep >/dev/null && return 0
+  # Each hook below is added only if absent, so sourcing twice adds none. No
+  # function guard: allexport exports functions, and a child would skip.
   if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4))); then
     printf 'shux shell-integration: bash %s has no PS0; command boundaries need bash 4.4 or newer\n' \
       "$BASH_VERSION" >&2
@@ -36,9 +37,9 @@ __shux_osc133_install() {
       printf '\e]133;A\a'
       __shux_osc133_keep "$ec"
     }
-    blehook PREEXEC+=__shux_osc133_start
-    blehook POSTEXEC+=__shux_osc133_end
-    blehook PRECMD+=__shux_osc133_prompt
+    blehook PREEXEC!=__shux_osc133_start
+    blehook POSTEXEC!=__shux_osc133_end
+    blehook PRECMD!=__shux_osc133_prompt
     return 0
   fi
   # PS0 is expanded in this shell, not a subshell: the arithmetic marks that

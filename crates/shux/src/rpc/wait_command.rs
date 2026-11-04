@@ -41,7 +41,7 @@ pub(crate) fn register_wait_command_method(
     )
 }
 
-async fn wait_command(
+pub(crate) async fn wait_command(
     graph: &GraphHandle,
     io: &Mutex<PaneIoState>,
     pane_id: PaneId,
@@ -54,7 +54,9 @@ async fn wait_command(
     let deadline = tokio::time::Instant::now() + timeout;
     // The floor and the incarnation are read in one hold, so the wait is
     // about this shell, and a later respawn ends it instead of answering it.
-    let (floor, incarnation, mut wake) = {
+    // A pane still starting has none yet: its first program is pinned when
+    // it comes up.
+    let (floor, mut incarnation, mut wake) = {
         let state = io.lock().await;
         (
             after.unwrap_or_else(shux_vt::program_status_as_of),
@@ -70,24 +72,29 @@ async fn wait_command(
             Some(p) if p.exit_status.is_some() => Some("exited"),
             Some(_) => None,
         };
-        let (lookup, seen) = {
+        let looked = {
             let state = io.lock().await;
-            // Torn down: the pane's program and terminal go together. A
-            // different program in the pane is a respawn.
-            let (Some(now), Some(vt)) = (state.incarnations.get(&pane_id), state.vts.get(&pane_id))
-            else {
-                return gone(if incarnation.is_some() {
-                    "killed"
-                } else {
-                    "not_started"
-                });
-            };
-            if Some(*now) != incarnation {
-                return gone("respawned");
-            }
             wake.borrow_and_update();
-            (vt.command_after(floor), vt.commands_seen())
+            // The pane's program and terminal go together.
+            match (state.incarnations.get(&pane_id), state.vts.get(&pane_id)) {
+                (Some(&now), Some(vt)) => {
+                    if *incarnation.get_or_insert(now) != now {
+                        return gone("respawned");
+                    }
+                    Some((vt.command_after(floor), vt.commands_seen()))
+                }
+                _ if ended.is_some() || incarnation.is_some() => {
+                    return gone(ended.unwrap_or("killed"));
+                }
+                _ if state.failed_spawns.contains(&pane_id)
+                    && !crate::pane_spawn::spawn_in_flight(pane_id) =>
+                {
+                    return gone("not_started");
+                }
+                _ => None,
+            }
         };
+        let (lookup, seen) = looked.unwrap_or((CommandLookup::Pending, false));
         match lookup {
             CommandLookup::Found(c) => {
                 return Ok(json!({
