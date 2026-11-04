@@ -308,26 +308,7 @@ pub(crate) fn register_pane_io_methods(
                             shux_rpc::RpcError::internal("command completion channel dropped")
                         })?;
 
-                    // Capture text from VT
-                    let stdout = {
-                        let state = io.lock().await;
-                        state
-                            .vts
-                            .get(&pane_id)
-                            .map(|vt| {
-                                let text = vt.capture_text(Some(50));
-                                shux_pty::strip_ansi(&text)
-                            })
-                            .unwrap_or_default()
-                    };
-
-                    Ok(serde_json::json!({
-                        "command_id": result.command_id.to_string(),
-                        "state": result.state,
-                        "exit_code": result.exit_code,
-                        "stdout": stdout,
-                        "runtime_ms": result.runtime_ms,
-                    }))
+                    Ok(command_result_json(&result))
                 }
             },
         )
@@ -355,12 +336,7 @@ pub(crate) fn register_pane_io_methods(
                         .get_status(command_id)
                         .ok_or_else(|| shux_rpc::RpcError::not_found("command", cmd_id_str))?;
 
-                    Ok(serde_json::json!({
-                        "command_id": result.command_id.to_string(),
-                        "state": result.state,
-                        "exit_code": result.exit_code,
-                        "runtime_ms": result.runtime_ms,
-                    }))
+                    Ok(command_result_json(&result))
                 }
             },
         )
@@ -1822,6 +1798,19 @@ pub(crate) fn register_pane_io_methods(
                 }
             },
         )
+}
+
+/// A command's result as `pane.run_command` and `pane.command_status` report
+/// it: the same frozen fields from both.
+fn command_result_json(result: &shux_pty::CommandResult) -> serde_json::Value {
+    serde_json::json!({
+        "command_id": result.command_id.to_string(),
+        "state": result.state,
+        "exit_code": result.exit_code,
+        "stdout": result.stdout,
+        "truncated": result.truncated,
+        "runtime_ms": result.runtime_ms,
+    })
 }
 
 /// Waits for the pane's PTY task to apply a queued resize.

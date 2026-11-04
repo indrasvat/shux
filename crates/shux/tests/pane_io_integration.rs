@@ -60,8 +60,7 @@ async fn run_pane_pty_task(
                             } else {
                                 Vec::new()
                             };
-                            let output = String::from_utf8_lossy(data);
-                            let _completed = state.cmd_engine.process_output(pane_id.0, &output);
+                            let _completed = state.cmd_engine.process_output(pane_id.0, data);
                             terminal_responses
                         };
                         for response in &terminal_responses {

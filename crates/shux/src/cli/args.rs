@@ -1167,7 +1167,9 @@ pub enum PaneCommand {
         data: Option<String>,
     },
 
-    /// Run a command in a pane and capture output
+    /// Run a command in a pane's shell; print its exit code and exactly what it
+    /// wrote (stdout and stderr as the terminal received them, ANSI-stripped,
+    /// first 1 MiB)
     Run {
         /// Session name or id (full UUID, or the short form `session list` prints)
         #[arg(short, long)]

@@ -10,7 +10,9 @@ pub mod manager;
 pub mod spawn;
 
 pub use capture::strip_ansi;
-pub use command::{CommandEngine, CommandResult, shell_escape_args, shell_quote_arg};
+pub use command::{
+    CAPTURE_LIMIT, CommandEngine, CommandResult, shell_escape_args, shell_quote_arg,
+};
 pub use handle::{
     DECLARED_CELL_PIXELS, GroupEnd, OUTER_TERMINAL_IDENTITY_PREFIXES, OUTER_TERMINAL_IDENTITY_VARS,
     PtyConfig, PtyError, PtyHandle, PtyInputWriter, PtyOutputProbe, PtySize,

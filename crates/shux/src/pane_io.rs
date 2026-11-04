@@ -327,6 +327,9 @@ impl PaneIoState {
                 token.cancel();
             }
             self.writers.remove(pane_id);
+            // A command still running in the pane is answered now, not at
+            // its timeout.
+            self.cmd_engine.forget_pane(pane_id.0);
             self.sync_gates.remove(pane_id);
             self.resizers.remove(pane_id);
             if let Some(rx) = self.pty_done.remove(pane_id) {
