@@ -1,0 +1,50 @@
+{
+  "scope": "issue-261-osc133-command-boundaries",
+  "audit": "shux-vt-solid-qa gate for issue #261 (OSC 133 C/D command boundaries); independent run",
+  "commit_under_audit": "e9aafe0",
+  "binaries_built_at": "db271d1",
+  "source_identity": "git diff db271d1..e9aafe0 touches no VT_PATHS file and nothing under crates/shux-pty/src, crates/shux-vt/src, crates/shux-raster or crates/shux-ui; pane run layer rerun with e9aafe0's shell-integration scripts",
+  "base": "8410f2f",
+  "solid_qa_report": "SOLID-QA.md",
+  "dootsabha_design": "council-design.json",
+  "dootsabha_implementation": "council-impl-r4.json",
+  "dootsabha_implementation_rounds": [
+    "council-impl-r1.json",
+    "council-impl-r2.json",
+    "council-impl-r3.json",
+    "council-impl-r4.json"
+  ],
+  "screenshots": [],
+  "pixel_metrics": [
+    "pixel-ab-live-off-w1-pane-snapshot-120x40.json",
+    "pixel-ab-live-off-w1c-pane-snapshot-120x40.json",
+    "pixel-ab-live-off-w1c-pane-snapshot-200x60.json",
+    "pixel-ab-live-off-w1c-pane-snapshot-80x24.json",
+    "pixel-ab-live-off-w1c-window-snapshot-120x40.json",
+    "pixel-ab-live-off-w2-pane-snapshot-80x24.json",
+    "pixel-ab-live-off-w4-lazygit-pane-snapshot-120x36.json",
+    "pixel-ab-live-off-w5-window-snapshot-120x40.json",
+    "pixel-ab-live-off-w6-window-snapshot-120x40.json",
+    "pixel-ab-live-on-w1-pane-snapshot-120x40.json",
+    "pixel-ab-live-on-w1c-pane-snapshot-120x40.json",
+    "pixel-ab-live-on-w1c-pane-snapshot-200x60.json",
+    "pixel-ab-live-on-w1c-pane-snapshot-80x24.json",
+    "pixel-ab-live-on-w1c-window-snapshot-120x40.json",
+    "pixel-ab-live-on-w2-pane-snapshot-80x24.json",
+    "pixel-ab-live-on-w4-lazygit-pane-snapshot-120x36.json",
+    "pixel-ab-live-on-w5-window-snapshot-120x40.json",
+    "pixel-ab-live-on-w6-window-snapshot-120x40.json",
+    "pixel-ab-live-tui-off-lazygit-window-snapshot-120x40.json",
+    "pixel-ab-live-tui-off-nvim-window-snapshot-120x40.json",
+    "pixel-ab-live-tui-on-lazygit-window-snapshot-120x40.json",
+    "pixel-ab-live-tui-on-nvim-window-snapshot-120x40.json"
+  ],
+  "screenshots_note": "No PNG is committed. Each pixel-ab-live-* metric compares a live shux pane or window snapshot on db271d1 (actual) with the same byte stream on 8410f2f (expected). Both are untracked scratch files under .shux/out/issue-261/{live,tui}/, so each metric stands alone. The baseline comparison against the committed goldens .shux/goldens/073-vt-corpus/rich-tui-*-expected.png (20 metrics, 0/0) is kept in scratch at .shux/out/issue-261/replay-golden/. Committing it would also require committing its *-actual.png, and this scope holds JSON only.",
+  "scratch_evidence_root": ".shux/out/issue-261/",
+  "scratch_evidence": {
+    "live_ab": "live/ (db271d1 vs 8410f2f PNG pairs and diffs)",
+    "live_tui": "tui/ (nvim, lazygit window pairs; htop window)",
+    "replay_golden": "replay-golden/ (20 actual PNGs, diffs and metrics vs committed goldens)",
+    "earlier_shas": "93a2cc9-run/, f5a003c-scratch/ (checkpoint and f5a003c FAIL draft)"
+  }
+}
