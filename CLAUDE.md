@@ -62,6 +62,8 @@ already doing it. Applies hardest to defects in verification machinery.
 Then **re-run the gates the fix falls under** (`make check`, plus `make check-vt-qa` if
 it touched VT rendering) and say what you fixed in the commit and the PR — that is where
 the record lives now.
+Once a PR's review budget is spent (*Review budget*), "fix every defect" narrows to
+P0/P1, and everything else is recorded in the PR instead: that is the one exception.
 
 **Reproduce before believing — including your own findings.** Every report is a
 hypothesis: review agent, QA gate, dogfood, council, or you. A/B against a worktree of
@@ -220,9 +222,9 @@ call it proof.
 
 Every feature/fix PR.
 
-1. **Council on the design, before coding.** `dootsabha council --json`; iterate until
-   converged. Config from `~/.config/dootsabha/config.yaml`; no CLI agent/chair/model
-   overrides. **`dootsabha` unavailable → the council step is not skipped.** Spawn
+1. **Council on the design, before coding.** `dootsabha council --json`; at most two
+   rounds (*Review budget*). Config from `~/.config/dootsabha/config.yaml`; no CLI
+   agent/chair/model overrides. **`dootsabha` unavailable → the council step is not skipped.** Spawn
    context-appropriate parallel adversarial agents on disjoint surfaces instead and say
    in the PR that you did. See *Tooling fallbacks*.
 2. **Build with tests** — unit + integration for every new path.
@@ -240,9 +242,8 @@ Every feature/fix PR.
    findings are addressed or explicitly declined in the PR; correctness findings fall
    under *Correctness is never a scope question* and cannot be declined. On #170 it
    found a shipping security defect that two bot reviews and a QA gate had passed.
-   **The threshold re-arms**: another ~200 added lines since the last pass → run it
-   again before the next push, and name the reviewed SHA in the PR. On #174 one pass
-   left 650 later lines — the reactive fix commits, the densest in the diff — unreviewed.
+   Run it once, on the finished implementation, and name the reviewed SHA in the PR.
+   Commits made to fix review findings do not re-arm it; the closure round covers them.
 
    **5, 6 and 7 run before the first push, before the PR exists.** A finding that
    lands after the push arrives as churn on an open PR.
@@ -252,6 +253,7 @@ Every feature/fix PR.
    `Cargo.toml` change silently made a benchmark incomparable (#166) and a docs-only
    diff shipped two P1s (#168). Size does not predict defects. Every PR merged in the
    2026-08-15..17 run skipped this step; every one had a real defect found after push.
+   One round; its fixes get the closure round, not a second council.
 8. **Capture evidence for every relevant (render path × config state) cell**, named
    `v<N>_<render-path>_<width>_<config-state>.png`. Render path is mandatory in the name
    or two cells collide silently. One default-state screenshot is not the matrix — drift
@@ -289,9 +291,10 @@ Paste into every feature PR:
 
 ```
 ## Verification matrix
-- [ ] dootsabha council on design — converged
+- [ ] review budget — rounds used N/5, listed by reviewer; the gate ran once, after review froze
+- [ ] dootsabha council on design — at most two rounds
 - [ ] adversarial review — parallel agents drove the real system; findings fixed + regression-tested
-- [ ] simplification review (`shux-simplify-architect`) — diff >~200 added lines; re-run if another ~200 landed since the last pass; reviewed SHA named; findings addressed, or tidiness ones declined with reason
+- [ ] simplification review (`shux-simplify-architect`) — diff >~200 added lines; one pass on the finished implementation; reviewed SHA named; findings addressed, or tidiness ones declined with reason
 - [ ] implementation diff reviewed before push — `dootsabha council`, or parallel adversarial agents on disjoint surfaces; findings addressed
 - [ ] every render path touched
 - [ ] config states: default · init · feature-maxed · malformed · hot-reload
@@ -304,6 +307,36 @@ Paste into every feature PR:
 ```
 
 Unfillable cell → explicit callout. **Empty cells without explanation are gaps.**
+
+## Review budget
+
+**At most 5 review rounds per PR, counted across every reviewer:** design council,
+adversarial agents, simplification, implementation council, cold-context reviewers.
+Bot reviews and CI on the open PR are not rounds. The default spend:
+
+1. design council. A second design round, if the first does not converge, comes out of
+   the same 5: the closure round is then the one dropped.
+2. adversarial review (step 5) and simplification (step 6), run together, each one round
+3. implementation council (step 7)
+4. **closure round**: reviews only the fix commits since round 3, asking whether each
+   fix closes its finding and what it broke. It is not asked to find new bugs.
+
+Why: each round's fixes are new code, and a reviewer asked for new bugs always finds an
+edge one step further out. On #261 that ran to 2 + 5 council rounds, 3 simplification
+passes and 5 VT-gate re-audits; the last round's suggestion broke an existing test.
+
+- **The QA gate starts once, after review freezes**, never alongside it: its scope is
+  the diff up to `HEAD`, so every commit during an audit restarts it. A FAIL's fixes,
+  or a fix after PASS, re-run only the layers they touch, at most twice; PASS is still
+  required to merge, and the PR says which layers were re-run.
+- **Past the cap, fix only P0/P1**, judged by severity wherever it lands: a crash, a
+  hang, data loss, a wrong result, a security hole. Each still ships with a test seen
+  failing first, and opens no new review round. Everything else goes in the PR's
+  "Found, not fixed" list, and the user decides at merge. Bot review threads on the
+  open PR follow the same rule: every thread is answered and resolved, but only a
+  P0/P1 changes code.
+- **Skip the closure round when round 3 found no P0/P1.** Rounds 1–3 are not skippable.
+- **No follow-up issues are filed unasked**; "Found, not fixed" is the record.
 
 ## Tooling fallbacks
 
