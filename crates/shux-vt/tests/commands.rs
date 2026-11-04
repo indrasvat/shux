@@ -24,6 +24,17 @@ fn ended_after(vt: &VirtualTerminal, mut floor: u64) -> Vec<CommandRecord> {
     out
 }
 
+/// The whole stream in one read, or a byte per read.
+fn feed(vt: &mut VirtualTerminal, stream: &[u8], bytewise: bool) {
+    if bytewise {
+        for b in stream {
+            vt.process_with_responses(std::slice::from_ref(b));
+        }
+    } else {
+        vt.process_with_responses(stream);
+    }
+}
+
 fn exits(records: &[CommandRecord]) -> Vec<Option<i32>> {
     records.iter().map(|c| c.exit_code).collect()
 }
@@ -163,13 +174,7 @@ fn a_long_sequence_is_classified_the_same_whole_or_bytewise() {
         for bytewise in [false, true] {
             let mut vt = vt();
             let floor = shux_vt::program_status_as_of();
-            if bytewise {
-                for b in &stream {
-                    vt.process_with_responses(std::slice::from_ref(b));
-                }
-            } else {
-                vt.process_with_responses(&stream);
-            }
+            feed(&mut vt, &stream, bytewise);
             assert_eq!(
                 exits(&ended_after(&vt, floor)),
                 want,
@@ -187,13 +192,7 @@ fn a_long_end_keeps_its_own_exit_code() {
         let mut vt = vt();
         let floor = shux_vt::program_status_as_of();
         let stream = [C, long_d.as_bytes()].concat();
-        if bytewise {
-            for b in &stream {
-                vt.process_with_responses(std::slice::from_ref(b));
-            }
-        } else {
-            vt.process_with_responses(&stream);
-        }
+        feed(&mut vt, &stream, bytewise);
         let ended = ended_after(&vt, floor);
         assert_eq!(exits(&ended), [Some(7)], "bytewise={bytewise}");
         assert_eq!(ended[0].ended_by, EndedBy::End, "bytewise={bytewise}");
@@ -214,13 +213,7 @@ fn a_start_after_ignored_control_bytes_counts_however_it_is_read() {
     for bytewise in [false, true] {
         let mut vt = vt();
         let floor = shux_vt::program_status_as_of();
-        if bytewise {
-            for b in &stream {
-                vt.process_with_responses(std::slice::from_ref(b));
-            }
-        } else {
-            vt.process_with_responses(&stream);
-        }
+        feed(&mut vt, &stream, bytewise);
         assert_eq!(
             exits(&ended_after(&vt, floor)),
             [Some(1)],

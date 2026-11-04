@@ -44,7 +44,7 @@ __shux_osc133_install() {
   # PS0 is expanded in this shell, not a subshell: the arithmetic marks that
   # this shell started the command, and rides harmlessly as a C parameter.
   # shellcheck disable=SC2016  # expanded at each prompt, not now
-  [[ $PS0 == *'133;C;shux='* ]] || PS0+='\e]133;C;shux=$((__shux_osc133_ran = 1))\a'
+  [[ ${PS0-} == *'133;C;shux='* ]] || PS0+='\e]133;C;shux=$((__shux_osc133_ran = 1))\a'
   __shux_osc133_precmd() {
     local ec=$?
     # Only a command this shell started ends here: a new shell's first

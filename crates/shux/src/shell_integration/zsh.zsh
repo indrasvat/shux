@@ -27,6 +27,8 @@ __shux_osc133_install() {
     [[ -o errexit ]] && return 0
     return $ec
   }
+  # Declared first: under NO_UNSET an unset array cannot be read.
+  typeset -ga preexec_functions precmd_functions
   # First, so they run before any other hook touches the status.
   preexec_functions=(__shux_osc133_preexec $preexec_functions)
   precmd_functions=(__shux_osc133_precmd $precmd_functions)

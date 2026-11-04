@@ -275,10 +275,15 @@ fn a_nested_shell_does_not_report_a_fake_success(shell: &str) {
             .output()
             .expect("spawn shux"),
     );
-    assert_ne!(
-        (r["exit_code"].as_i64(), r["ended_by"].as_str()),
-        (Some(0), Some("end")),
-        "{shell}: the inner shell's first prompt reported the outer command as a success: {r}"
+    // No exit code is known: the inner prompt only closes the command.
+    assert_eq!(
+        (
+            r["outcome"].as_str(),
+            r["ended_by"].as_str(),
+            r["exit_code"].as_i64()
+        ),
+        (Some("completed"), Some("prompt"), None),
+        "{shell}: the inner shell's first prompt reported the outer command as ended: {r}"
     );
     type_line(&env, "exit");
 }
@@ -318,22 +323,8 @@ fn the_hooks_do_not_end_a_shell_running_with_errexit() {
         type_line(&env, errexit);
         type_line(&env, "[[ -f /nonexistent ]] && echo never");
         type_line(&env, "echo AL\"\"IVE");
-        let alive = env.run(&[
-            "pane",
-            "wait-for",
-            "-s",
-            "ws",
-            "-p",
-            &pane,
-            "--text",
-            "ALIVE",
-            "--timeout-ms",
-            "10000",
-        ]);
-        assert!(
-            alive.status.success(),
-            "{shell}: the hooks ended a shell running with errexit"
-        );
+        // Panics with the screen if the hooks ended the shell.
+        env.wait_for("ws", &pane, "ALIVE");
     }
 }
 
@@ -435,4 +426,36 @@ fn a_bash_with_promptvars_off_still_reports_exit_codes() {
             .expect("spawn shux"),
     );
     assert_eq!(r["exit_code"], 7, "{r}");
+}
+
+/// `set -u` before the integration is sourced: an unset PS0,
+/// PROMPT_COMMAND or zsh hook array must not stop it installing.
+#[test]
+fn the_script_installs_under_nounset() {
+    let bash = modern_bash().expect("no bash 4.4+ installed");
+    let out = Command::new(&bash)
+        .env("SHUX_BIN", env!("CARGO_BIN_EXE_shux"))
+        .args(["--noprofile", "--norc", "-i", "-c"])
+        .arg(r#"set -u; unset PS0 PROMPT_COMMAND; eval "$("$SHUX_BIN" shell-integration bash)"; printf '%s' "${PROMPT_COMMAND-}""#)
+        .output()
+        .expect("bash");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("__shux_osc133_precmd"),
+        "bash: the hook was not installed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if !has("zsh") {
+        return;
+    }
+    let out = Command::new("zsh")
+        .env("SHUX_BIN", env!("CARGO_BIN_EXE_shux"))
+        .args(["-f", "-i", "-c"])
+        .arg(r#"setopt nounset; unset preexec_functions precmd_functions; eval "$("$SHUX_BIN" shell-integration zsh)"; print -r -- "${precmd_functions[*]}""#)
+        .output()
+        .expect("zsh");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("__shux_osc133_precmd"),
+        "zsh: the hook was not installed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

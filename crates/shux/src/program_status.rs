@@ -897,8 +897,9 @@ mod tests {
         finish(h).await;
     }
 
-    /// A command that ends as its pane exits is a completed command, not a
-    /// pane that went away.
+    /// A command whose pane then exits is a completed command, not a pane that
+    /// went away. Its pane exits before the wait starts, so this pins the
+    /// outcome; the order of the reads (snapshot first) has no seam to force.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_command_that_ends_as_its_pane_exits_is_completed() {
         let h = RpcHarness::new();
@@ -936,7 +937,12 @@ mod tests {
                 .await
             })
         };
-        tokio::task::yield_now().await;
+        let io = h.io.clone();
+        shux_testkit::wait_until_async("the waiter to subscribe", || {
+            let io = io.clone();
+            async move { io.lock().await.commands_ended.receiver_count() >= 1 }
+        })
+        .await;
         dispatch_ok(
             &h.router,
             "session.kill",
@@ -945,7 +951,7 @@ mod tests {
         .await;
         let waited = waiter.await.expect("waiter");
         assert_eq!(waited["outcome"], "pane_gone", "{waited}");
-        assert_ne!(waited["reason"], "respawned", "{waited}");
+        assert_eq!(waited["reason"], "killed", "{waited}");
         finish(h).await;
     }
 

@@ -200,7 +200,7 @@ pane.wait_command { "pane_id": "uuid", "after": 41, "timeout_ms": 30000 }
   → { "outcome": "completed", "exit_code": 1, "started": 57, "ended": 58, "ended_by": "end" }
   | { "outcome": "timeout", "no_integration": false }
   | { "outcome": "overrun", "kept": 32 }
-  | { "outcome": "pane_gone", "reason": "exited" | "killed" | "respawned" }
+  | { "outcome": "pane_gone", "reason": "exited" | "killed" | "respawned" | "not_started" }
 ```
 
 - **`after`** is `as_of` from `pane.status`, read before the command was

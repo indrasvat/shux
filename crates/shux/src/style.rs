@@ -2083,6 +2083,7 @@ pub fn print_pane_wait_command(result: &serde_json::Value) {
             match result.get("reason").and_then(|v| v.as_str()) {
                 Some("respawned") => "was respawned before the command ended",
                 Some("killed") => "was killed before the command ended",
+                Some("not_started") => "has no program running yet",
                 Some("exited") => "exited before the command ended",
                 _ => other,
             }

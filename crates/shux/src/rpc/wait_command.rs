@@ -65,18 +65,22 @@ async fn wait_command(
     loop {
         // Before the lookup: output is drained before an exit is recorded,
         // so a pane seen exited here has no command still to arrive.
-        let exited = graph
-            .snapshot()
-            .panes
-            .get(&pane_id)
-            .is_none_or(|p| p.exit_status.is_some());
+        let ended = match graph.snapshot().panes.get(&pane_id) {
+            None => Some("killed"),
+            Some(p) if p.exit_status.is_some() => Some("exited"),
+            Some(_) => None,
+        };
         let (lookup, seen) = {
             let state = io.lock().await;
             // Torn down: the pane's program and terminal go together. A
             // different program in the pane is a respawn.
             let (Some(now), Some(vt)) = (state.incarnations.get(&pane_id), state.vts.get(&pane_id))
             else {
-                return gone("killed");
+                return gone(if incarnation.is_some() {
+                    "killed"
+                } else {
+                    "not_started"
+                });
             };
             if Some(*now) != incarnation {
                 return gone("respawned");
@@ -104,8 +108,8 @@ async fn wait_command(
             }
             CommandLookup::Pending => {}
         }
-        if exited {
-            return gone("exited");
+        if let Some(why) = ended {
+            return gone(why);
         }
         if tokio::time::Instant::now() >= deadline {
             return Ok(json!({
