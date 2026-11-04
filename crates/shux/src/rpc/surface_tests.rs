@@ -48,6 +48,7 @@ const EXPECTED_SURFACE: &[&str] = &[
     "pane.status => ContentRead",
     "pane.split => OwnedMutation",
     "pane.swap => OwnedMutation",
+    "pane.wait_command => ContentRead",
     "pane.wait_exit => Public",
     "pane.wait_for => ContentRead",
     "pane.wait_settled => ContentRead",

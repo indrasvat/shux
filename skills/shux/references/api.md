@@ -189,6 +189,50 @@ the viewport is entirely blank.
 { "pane_id": "uuid", "lines": 50 } → { "text": "...", "lines": 50 }
 ```
 
+### `pane.wait_command`
+
+A command typed into a pane's shell, ended, as the shell reports it over OSC
+133 (`C` start, `D;<exit>` end). The shell must emit the marks:
+`eval "$(shux shell-integration bash|zsh)"` in its rc file.
+
+```json
+pane.wait_command { "pane_id": "uuid", "after": 41, "timeout_ms": 30000 }
+  → { "outcome": "completed", "exit_code": 1, "started": 57, "ended": 58, "ended_by": "end" }
+  | { "outcome": "timeout", "no_integration": false }
+  | { "outcome": "overrun", "kept": 32 }
+  | { "outcome": "pane_gone", "reason": "exited" | "killed" | "respawned" | "not_started" }
+```
+
+- **`after`** is `as_of` from `pane.status`, read before the command was
+  sent, or a previous `started`. The earliest command that *started* above it
+  is returned. Omitted, it is now, which misses a command already sent.
+- **`exit_code`** is null when the end carried none, or when the end was
+  inferred: `ended_by: "prompt"` (for example after `exec bash`) or
+  `"next_command"`.
+- **A nested shell that also reports boundaries** (`bash`, `ssh`,
+  `docker exec -it` into an integrated shell) ends the outer command at its
+  first prompt, with `ended_by: "prompt"` and no exit code. Its own commands
+  are then reported as they run.
+- **`overrun`:** more than 32 commands ended after the floor. Read a new
+  `as_of`.
+- **`no_integration`:** the pane's shell has never sent a command start, so
+  this timeout was never going to be met.
+- **Lifecycle:** the wait ends `pane_gone` if the pane exits or is
+  respawned.
+- **Program status:** boundaries are tracked whether or not program status is
+  enabled, and RIS does not reset them.
+- `pane.status` reports `commands: { seen, running }`.
+- **The boundaries are in-band.** Output the command itself prints, such as a
+  file `cat`'d that contains `ESC ] 133;D;0 BEL`, is read as a boundary too, as
+  it is by every terminal's shell integration. Trust `exit_code` only as far as
+  you trust what the pane prints.
+
+CLI: `shux pane wait-command <PANE> [--after AS_OF] [--timeout 30s]`.
+- Exit 0: the command ended, whatever its own code (read `exit_code`).
+- Exit 1: timeout.
+- Exit 2: bad arguments.
+- Exit 3: pane gone, overrun, or the daemon gone.
+
 ### `pane.status` / `pane.wait_status`
 
 What a pane's program reports about itself over OSC 7501 (Claude Code

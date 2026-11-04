@@ -162,6 +162,17 @@ pub enum Command {
         dir: Option<std::path::PathBuf>,
     },
 
+    /// Print the hooks that make a shell report where each command starts
+    /// and how it ends (OSC 133), for `shux pane wait-command`.
+    ///
+    /// Add `eval "$(shux shell-integration bash)"` to ~/.bashrc (or `zsh` to
+    /// ~/.zshrc), after ble.sh and your prompt. bash needs 4.4 or newer.
+    #[command(name = "shell-integration")]
+    ShellIntegration {
+        #[arg(value_parser = ["bash", "zsh"])]
+        shell: String,
+    },
+
     /// Internal: start the daemon (used by auto-start, not for users)
     #[command(name = "__daemon", hide = true)]
     #[allow(non_camel_case_types)]
@@ -1400,6 +1411,37 @@ pub enum PaneCommand {
         /// Only a report of `--id` newer than this `as_of` (from
         /// `shux --format json pane status`) counts.
         #[arg(long, value_name = "AS_OF", requires = "id")]
+        after: Option<u64>,
+
+        /// Deadline. Human duration (`30s`, `500ms`); at most 600s.
+        #[arg(long, default_value = "30s", value_parser = parse_duration_ms)]
+        timeout: u64,
+    },
+
+    /// Block until a command typed into a pane's shell ends, and report its
+    /// exit code. Needs the shell to report command boundaries (OSC 133):
+    /// see `shux shell-integration`. Mirrors `pane.wait_command`. Exit 0 the
+    /// command ended (whatever its own code: read `exit_code`), 1 timeout,
+    /// 2 bad arguments, 3 the pane went away or respawned, the floor is
+    /// older than the commands kept, or the daemon went away.
+    ///
+    /// Read `.result.as_of` from `shux --format json pane status` before
+    /// sending the command, and pass it as `--after`: the first command that
+    /// started after it is the one waited for. To wait for the next one, pass
+    /// the returned `started`.
+    ///
+    /// The boundaries travel in the pane's own output, so output that prints
+    /// an OSC 133 sequence is read as one: trust `exit_code` as far as you
+    /// trust what the pane prints.
+    #[command(name = "wait-command")]
+    WaitCommand {
+        /// Pane id — full UUID or a unique prefix of 4 or more characters.
+        #[arg(value_name = "PANE")]
+        pane: String,
+
+        /// Floor: `as_of` from `pane status`, or a previous `started`.
+        /// Default: now, which misses a command already sent.
+        #[arg(long, value_name = "AS_OF")]
         after: Option<u64>,
 
         /// Deadline. Human duration (`30s`, `500ms`); at most 600s.

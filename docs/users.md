@@ -149,6 +149,19 @@ fi
 
 `shux config init` prints this snippet for you to copy into your bashrc.
 
+### Shell integration (command boundaries)
+
+Add one line, last in your rc file, and your shell tells shux where each
+command starts and how it ended (OSC 133). Scripts and agents can then wait
+for a typed command with `shux pane wait-command`:
+
+```bash
+eval "$(shux shell-integration bash)"   # ~/.bashrc, after ble.sh and starship (bash 4.4+)
+eval "$(shux shell-integration zsh)"    # ~/.zshrc
+```
+
+Nothing is drawn, and your prompt and existing hooks are left as they were.
+
 ## When something goes wrong
 
 ```bash

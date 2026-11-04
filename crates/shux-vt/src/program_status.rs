@@ -19,7 +19,7 @@ use shux_program_status::{RecordView, StatusSummary, StatusTable};
 /// a disable is always older than anything that follows it.
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 
-fn next_generation() -> u64 {
+pub(crate) fn next_generation() -> u64 {
     GENERATION.fetch_add(1, Ordering::Relaxed) + 1
 }
 
@@ -152,7 +152,15 @@ pub(crate) enum CutAction {
     Report { payload: Vec<u8>, bel: bool },
     /// OSC 133 `A`: a new shell prompt.
     PromptStart,
+    /// OSC 133 `C`: a typed command started.
+    CommandStart,
+    /// OSC 133 `D[;exit]`: it ended; `None` when no exit code came with it.
+    CommandEnd { exit_code: Option<i32> },
 }
+
+/// Body bytes kept past [`MAX_SEQUENCE_BYTES`]: enough to know a `133;C` or
+/// a `133;D;<exit>;` whose later parameters are long.
+const POISONED_PREFIX: usize = 24;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum ScanState {
@@ -166,7 +174,7 @@ enum ScanState {
     OscEsc,
 }
 
-/// Locates OSC 7501 and OSC 133;A sequences across arbitrarily-chunked
+/// Locates OSC 7501 and OSC 133 A/C/D sequences across arbitrarily-chunked
 /// reads, following vte 0.15's string grammar exactly.
 #[derive(Debug, Default)]
 pub(crate) struct OscStatusScanner {
@@ -269,23 +277,38 @@ impl OscStatusScanner {
     /// storing them (`advance_osc_string`); they still count on the wire.
     fn take_body(&mut self, span: &[u8]) {
         self.raw_len = self.raw_len.saturating_add(span.len());
+        let kept = span
+            .iter()
+            .copied()
+            .filter(|&b| !matches!(b, 0x00..=0x06 | 0x08..=0x17 | 0x19 | 0x1c..=0x1f));
         if self.poisoned || self.raw_len > MAX_SEQUENCE_BYTES {
+            // Filled up to the prefix whatever the reads: the same bytes
+            // classify the same way however they were cut.
+            self.body.truncate(POISONED_PREFIX);
+            let room = POISONED_PREFIX - self.body.len();
+            self.body.extend(kept.take(room));
             self.poisoned = true;
-            self.body.clear();
             return;
         }
-        self.body.extend(
-            span.iter()
-                .copied()
-                .filter(|&b| !matches!(b, 0x00..=0x06 | 0x08..=0x17 | 0x19 | 0x1c..=0x1f)),
-        );
+        self.body.extend(kept);
     }
 
     fn finish(&mut self, end: usize, bel: bool, cuts: &mut Vec<StatusCut>) {
-        if !self.poisoned
-            && self.raw_len <= MAX_SEQUENCE_BYTES
-            && let Some(action) = classify(&self.body, bel)
-        {
+        let action = if self.poisoned || self.raw_len > MAX_SEQUENCE_BYTES {
+            // Only a command boundary survives; a D's exit counts only when
+            // its field ended inside the prefix. A body short of the prefix
+            // was not cut: the excess was ignored control bytes.
+            match classify(&self.body, bel) {
+                Some(CutAction::CommandStart) => Some(CutAction::CommandStart),
+                Some(CutAction::CommandEnd { .. }) => Some(CutAction::CommandEnd {
+                    exit_code: exit_field(&self.body, self.body.len() >= POISONED_PREFIX),
+                }),
+                _ => None,
+            }
+        } else {
+            classify(&self.body, bel)
+        };
+        if let Some(action) = action {
             cuts.push(StatusCut { end, action });
         }
         self.reset(ScanState::Ground);
@@ -302,8 +325,36 @@ fn classify(body: &[u8], bel: bool) -> Option<CutAction> {
             bel,
         });
     }
-    let rest = body.strip_prefix(b"133;A")?;
-    (rest.is_empty() || rest.starts_with(b";")).then_some(CutAction::PromptStart)
+    let rest = body.strip_prefix(b"133;")?;
+    let (mark, params) = rest.split_first()?;
+    if !(params.is_empty() || params.starts_with(b";")) {
+        return None;
+    }
+    match mark {
+        b'A' => Some(CutAction::PromptStart),
+        b'C' => Some(CutAction::CommandStart),
+        b'D' => Some(CutAction::CommandEnd {
+            exit_code: exit_field(body, false),
+        }),
+        _ => None,
+    }
+}
+
+/// A `133;D` body's exit code: its first field, a plain decimal number,
+/// optionally negative. `truncated`: the body is a prefix, so the field
+/// counts only if it ended within it.
+fn exit_field(body: &[u8], truncated: bool) -> Option<i32> {
+    let rest = body.strip_prefix(b"133;D;")?;
+    let end = rest.iter().position(|&b| b == b';');
+    if truncated && end.is_none() {
+        return None;
+    }
+    let field = &rest[..end.unwrap_or(rest.len())];
+    let digits = field.strip_prefix(b"-").unwrap_or(field);
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(field).ok()?.parse().ok()
 }
 
 /// The scanner and its vte reference, for the differential tests and the

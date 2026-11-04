@@ -149,6 +149,40 @@ echo "$R" | jq -e '.exit_code == 0'
   it, until the program ends or you cancel it.
 - Keep `-c` to one line: no trailing `&`, `#` comment or heredoc.
 
+## Wait for a typed command to end, with its exit code
+
+A shell that reports its command boundaries (OSC 133) tells shux where each
+command starts and how it ends. Then waiting for a typed command needs nothing
+printed and no marker: read the floor, send the command, wait.
+
+```bash
+# Once, in ~/.bashrc (after ble.sh and starship) or ~/.zshrc:
+eval "$(shux shell-integration bash)"        # or: zsh. bash needs 4.4+
+
+AS_OF=$(shux --format json pane status "$P" | jq .result.as_of)
+shux pane send-keys -s dev --text 'make test' && shux pane send-keys -s dev --data Cg==   # C-j
+R=$(shux --format json pane wait-command "$P" --after "$AS_OF" --timeout 10m)
+echo "$R" | jq .result.exit_code                # that command's own exit code
+```
+
+- **The first command that started after the floor** is the one returned.
+  One already running when you read the floor is never taken for it.
+- **To wait for the next command,** pass the returned `.result.started` as
+  `--after`. Commands typed back to back are each returned, in order.
+- **A timeout with `no_integration: true`** means the shell has never
+  reported a command: source the integration, or use a route below.
+- **Under ble.sh,** submit with C-j (`--data Cg==`), not Enter: ble.sh can
+  take scripted keystrokes for a paste and wait in `-- MULTILINE --`.
+
+**Which route when:**
+
+| You want | Use |
+|---|---|
+| A command's output, from a shell that exists | `pane run` |
+| A typed command's end and exit code, no marker | `pane wait-command` (needs the integration) |
+| A program to say when it is done or blocked | `pane wait-status --id` (OSC 7501) |
+| A program you start to finish | `session create --wait` / `pane wait-exit` |
+
 ## Wait for one command's own report
 
 A command can report its own end over OSC 7501. Nothing is drawn, so no echo
@@ -359,6 +393,8 @@ Need one command's output from a
 shell that already exists?         → pane.run_command (shux pane run -s S -c '<cmd>')
 Need to wait for one command typed
 into a shell, by its own report?   → pane.wait_status (shux pane wait-status <PANE> --id <ID> --state done,error)
+Need a typed command's end and
+exit code, with no marker at all?  → pane.wait_command (shux pane wait-command <PANE> --after <AS_OF>)
 Need a program's exit code (a
 test run, a build)?                → pane.wait_exit  (shux pane split --wait -- <argv>, or pane wait-exit <PANE>)
 Need live sampled PTY output?      → pane.output.watch (sealed data-plane, sampled)

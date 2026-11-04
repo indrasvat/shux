@@ -8,6 +8,7 @@ mod capture;
 mod cast;
 mod cell;
 mod charset;
+mod commands;
 mod cursor;
 mod diff;
 mod graphics;
@@ -28,6 +29,7 @@ pub use cell::{
     Cell, CellFlags, CellStyle, Color, ExtendedAttrs, Rgb, TerminalDefaultColors, UnderlineStyle,
 };
 pub use charset::{CharsetSlot, TerminalCharset, TerminalCharsets};
+pub use commands::{CommandLookup, CommandRecord, EndedBy, KEEP_ENDED as COMMANDS_KEPT};
 pub use cursor::{Cursor, CursorShape, SavedCursor};
 pub use diff::{
     CellGridView, CellRef, CursorState, FrameDiff, FrameView, GridFrame, LensRowSpan, diff_frames,
@@ -119,9 +121,10 @@ pub struct VirtualTerminal {
     apc_scanner: graphics::apc::ApcScanner,
     /// False only in the differential oracle; see [`Self::set_apc_cut_slicing`].
     apc_cut_slicing: bool,
-    /// Frames OSC 7501 / OSC 133;A from raw bytes. Runs even while program
+    /// Frames OSC 7501 / OSC 133 from raw bytes. Runs even while program
     /// status is disabled, so enabling mid-sequence cannot misparse.
     status_scanner: program_status::OscStatusScanner,
+    commands: commands::CommandBoundaries,
     /// `None` while program status is disabled.
     program_status: Option<program_status::VtProgramStatus>,
     /// Generation of the last disable, or of construction.
@@ -311,6 +314,7 @@ impl VirtualTerminal {
             apc_scanner: graphics::apc::ApcScanner::default(),
             apc_cut_slicing: true,
             status_scanner: program_status::OscStatusScanner::default(),
+            commands: commands::CommandBoundaries::default(),
             program_status: None,
             status_disabled_generation: program_status::disabled_generation(),
             graphics: graphics::GraphicsSink::default(),
@@ -568,11 +572,20 @@ impl VirtualTerminal {
         action: program_status::CutAction,
         responses: &mut Vec<Vec<u8>>,
     ) {
-        let Some(ps) = self.program_status.as_mut() else {
-            return;
-        };
+        use program_status::CutAction;
         match action {
-            program_status::CutAction::Report { payload, bel } => {
+            CutAction::CommandStart => self.commands.on_start(),
+            CutAction::CommandEnd { exit_code } => self.commands.on_end(exit_code),
+            CutAction::PromptStart => {
+                self.commands.on_prompt();
+                if let Some(ps) = self.program_status.as_mut() {
+                    ps.on_prompt_start();
+                }
+            }
+            CutAction::Report { payload, bel } => {
+                let Some(ps) = self.program_status.as_mut() else {
+                    return;
+                };
                 let terminator: &[u8] = if bel { b"\x07" } else { b"\x1b\\" };
                 if let Some(reply) = ps.on_report(&payload, terminator)
                     && responses.len() < parser::MAX_RESPONSES_PER_BATCH
@@ -580,8 +593,28 @@ impl VirtualTerminal {
                     responses.push(reply);
                 }
             }
-            program_status::CutAction::PromptStart => ps.on_prompt_start(),
         }
+    }
+
+    /// Whether this terminal has seen a command start (`133;C`): its shell
+    /// sends command boundaries. Never reset by RIS.
+    pub fn commands_seen(&self) -> bool {
+        self.commands.seen()
+    }
+
+    /// A command has started and not yet ended.
+    pub fn command_running(&self) -> bool {
+        self.commands.running()
+    }
+
+    /// The earliest ended command that started above `floor`.
+    pub fn command_after(&self, floor: u64) -> CommandLookup {
+        self.commands.first_after(floor)
+    }
+
+    /// The newest command end's stamp, or 0: it moves exactly when one ends.
+    pub fn last_command_end(&self) -> u64 {
+        self.commands.last_end()
     }
 
     /// Turn OSC 7501 program status on or off. Off answers no probe and
@@ -906,12 +939,10 @@ impl VirtualTerminal {
         };
         // Program-status cuts slice the same way, so a reply queues at the
         // query's stream position: before the DA1 that follows it.
-        let status_cuts = self.status_scanner.scan(bytes);
-        let status_cuts = if self.program_status.is_some() {
-            status_cuts
-        } else {
-            Vec::new()
-        };
+        let mut status_cuts = self.status_scanner.scan(bytes);
+        if self.program_status.is_none() {
+            status_cuts.retain(|c| !matches!(c.action, program_status::CutAction::Report { .. }));
+        }
         if apc_cuts.is_empty() && status_cuts.is_empty() {
             self.advance_slice(bytes, &mut responses);
         } else {

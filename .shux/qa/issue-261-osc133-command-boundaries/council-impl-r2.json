@@ -1,0 +1,41 @@
+{
+  "dispatch": [
+    {
+      "provider": "codex",
+      "model": "gpt-6.1-sol",
+      "content": "**BLOCK**\n\n- **P1 — `pane run` can terminate the shell under errexit.** At [command.rs:139](crates/shux-pty/src/command.rs#L139), the trailing `eval` turns a nonfatal AND-list failure into an errexit-triggering command. With `set -eu`, run `[ -f /nonexistent ] \u0026\u0026 echo never`: the result marker prints, then the shell exits. Reproduced in bash, zsh, dash and sh; the base wrapper keeps each shell alive.\n\n- **P2 — disabling `promptvars` silently loses every bash command’s exit code.** At [bash.sh:45](crates/shux/src/shell_integration/bash.sh#L45), `shopt -u promptvars` prevents the arithmetic assignment from executing. C still prints, but `__shux_osc133_ran` remains unset, so the hook suppresses D. `(exit 7)` therefore ends through A with an unknown exit instead of 7. Reproduced against both revisions: base emits `D;7`; this delta emits no D.",
+      "duration_ms": 219156,
+      "cost_usd": 0,
+      "tokens_in": 939796,
+      "tokens_out": 6022
+    },
+    {
+      "provider": "agy",
+      "model": "",
+      "content": "",
+      "duration_ms": 0,
+      "cost_usd": 0,
+      "tokens_in": 0,
+      "tokens_out": 0,
+      "error": "invoke agy: agy: Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 154h24m42s."
+    }
+  ],
+  "reviews": null,
+  "synthesis": {
+    "chair": "claude",
+    "chair_fallback": "codex",
+    "content": "**BLOCK** — two shell integration regressions need fixes:\n\n- **P1: `pane run` can terminate shells with `errexit` enabled.** In `crates/shux-pty/src/command.rs:139`, the trailing `eval` makes a previously nonfatal AND-list failure trigger shell exit. With `set -eu`, running `[ -f /nonexistent ] \u0026\u0026 echo never` prints the result marker, then terminates the shell. Reproduced in bash, zsh, dash, and sh; the base wrapper preserves the shell.\n\n- **P2: Bash loses command exit codes when `promptvars` is disabled.** In `crates/shux/src/shell_integration/bash.sh:45`, `shopt -u promptvars` prevents the arithmetic assignment from setting `__shux_osc133_ran`. The hook emits C but suppresses D, so `(exit 7)` finishes through A with an unknown status. The base revision correctly emits `D;7`.\n\nRestore both behaviors and add regression coverage before merging."
+  },
+  "meta": {
+    "schema_version": 1,
+    "strategy": "council",
+    "duration_ms": 231828,
+    "total_cost_usd": 0,
+    "total_tokens_in": 969752,
+    "total_tokens_out": 6280,
+    "providers": {
+      "agy": "error",
+      "codex": "ok"
+    }
+  }
+}

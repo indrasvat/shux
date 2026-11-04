@@ -21,7 +21,7 @@ const WAIT_MAX_MS: u64 = 600_000;
 /// Re-read even without an event: installing a VT that matches the graph's
 /// defaults (a disabled pane) changes nothing the graph would announce, and
 /// neither does an identical report, which an id wait with a floor needs.
-const WAIT_REPOLL: Duration = Duration::from_millis(250);
+pub(crate) const WAIT_REPOLL: Duration = Duration::from_millis(250);
 
 pub(crate) fn register_program_status_methods(
     builder: shux_rpc::RouterBuilder,
@@ -34,6 +34,11 @@ pub(crate) fn register_program_status_methods(
         graph.clone(),
         io_state.clone(),
         bus.clone(),
+    );
+    let builder = crate::rpc::wait_command::register_wait_command_method(
+        builder,
+        graph.clone(),
+        io_state.clone(),
     );
     let (g1, io1) = (graph.clone(), io_state);
     let (g2, io2) = (graph, io1.clone());
@@ -64,8 +69,13 @@ pub(crate) fn register_program_status_methods(
                         "generation": publication.generation,
                         "summary": publication.summary,
                         "records": records,
-                        // Read in the same hold: a later report is stamped above it.
+                        // Read in the same hold: a later report or command is
+                        // stamped above it.
                         "as_of": shux_vt::program_status_as_of(),
+                        "commands": {
+                            "seen": vt.commands_seen(),
+                            "running": vt.command_running(),
+                        },
                     }))
                 }
             },
@@ -140,24 +150,11 @@ impl WaitParams {
             })?),
             Some(_) => return Err(RpcError::invalid_params("id must be a string")),
         };
-        let after =
-            match params.get("after") {
-                None | Some(Value::Null) => None,
-                Some(v) => Some(v.as_u64().ok_or_else(|| {
-                    RpcError::invalid_params("after must be a non-negative integer")
-                })?),
-            };
+        let after = parse_after(params)?;
         if after.is_some() && id.is_none() {
             return Err(RpcError::invalid_params(
                 "after needs id: it bounds the reports of one record",
             ));
-        }
-        if let Some(after) = after
-            && after > shux_vt::program_status_as_of()
-        {
-            return Err(RpcError::invalid_params(&format!(
-                "after {after} is above every stamp this daemon has issued: read as_of from pane.status"
-            )));
         }
         let matching = match params.get("match") {
             None | Some(Value::Null) => Match::Top,
@@ -174,23 +171,12 @@ impl WaitParams {
                 )));
             }
         };
-        let timeout_ms = match params.get("timeout_ms") {
-            None | Some(Value::Null) => WAIT_DEFAULT_MS,
-            Some(v) => v.as_u64().ok_or_else(|| {
-                RpcError::invalid_params("timeout_ms must be a non-negative integer")
-            })?,
-        };
-        if timeout_ms > WAIT_MAX_MS {
-            return Err(RpcError::invalid_params(&format!(
-                "timeout_ms must be at most {WAIT_MAX_MS}"
-            )));
-        }
         Ok(Self {
             states,
             matching,
             id,
             after,
-            timeout: Duration::from_millis(timeout_ms),
+            timeout: parse_wait_timeout(params)?,
         })
     }
 
@@ -212,6 +198,38 @@ impl WaitParams {
             Match::Any => self.states.iter().any(|s| count(summary, *s) > 0),
         }
     }
+}
+
+/// `after`: a stamp floor, never above every stamp this daemon has issued.
+pub(crate) fn parse_after(params: &Value) -> Result<Option<u64>, RpcError> {
+    let Some(v) = params.get("after").filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let after = v
+        .as_u64()
+        .ok_or_else(|| RpcError::invalid_params("after must be a non-negative integer"))?;
+    if after > shux_vt::program_status_as_of() {
+        return Err(RpcError::invalid_params(&format!(
+            "after {after} is above every stamp this daemon has issued: read as_of from pane.status"
+        )));
+    }
+    Ok(Some(after))
+}
+
+/// `timeout_ms`: 30 s by default, at most 600 s.
+pub(crate) fn parse_wait_timeout(params: &Value) -> Result<Duration, RpcError> {
+    let timeout_ms = match params.get("timeout_ms") {
+        None | Some(Value::Null) => WAIT_DEFAULT_MS,
+        Some(v) => v
+            .as_u64()
+            .ok_or_else(|| RpcError::invalid_params("timeout_ms must be a non-negative integer"))?,
+    };
+    if timeout_ms > WAIT_MAX_MS {
+        return Err(RpcError::invalid_params(&format!(
+            "timeout_ms must be at most {WAIT_MAX_MS}"
+        )));
+    }
+    Ok(Duration::from_millis(timeout_ms))
 }
 
 fn parse_state(s: &str) -> Result<State, RpcError> {

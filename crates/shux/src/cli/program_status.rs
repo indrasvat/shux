@@ -89,6 +89,41 @@ fn unique(states: &[String]) -> Vec<&String> {
     seen
 }
 
+/// A wait RPC's result, or `Err` with the exit code once its failure is
+/// reported: a refused request exits here, a lost daemon is 3.
+pub(super) async fn call_wait(
+    stream: &mut tokio::net::UnixStream,
+    method: &str,
+    verb: &str,
+    params: serde_json::Value,
+    format: OutputFormat,
+) -> anyhow::Result<Result<serde_json::Value, i32>> {
+    match rpc_call(stream, method, params).await {
+        Ok(result) => Ok(Ok(result)),
+        Err(RpcClientError::Rpc {
+            code,
+            message,
+            data,
+        }) => super::lens::lens_emit_error_and_exit(
+            format,
+            verb,
+            code,
+            &message,
+            data,
+            super::lens::lens_checkpoint_exit_code(code),
+        ),
+        Err(other) => {
+            match format {
+                OutputFormat::Json => print_json_error(&other.to_string())?,
+                OutputFormat::Text | OutputFormat::Plain => crate::style::print_error(&format!(
+                    "{verb} lost the daemon connection ({other}); is the daemon still running?"
+                )),
+            }
+            Ok(Err(3))
+        }
+    }
+}
+
 /// `pane.wait_status`'s params: `match`, `id` and `after` only when given.
 fn wait_status_params(pane: &str, states: &[&String], wait: &StatusWait<'_>) -> serde_json::Value {
     let mut params = serde_json::json!({
@@ -118,30 +153,9 @@ pub(crate) async fn wait_status_exit_code(
 ) -> anyhow::Result<i32> {
     let states = unique(wait.states);
     let params = wait_status_params(pane, &states, wait);
-    let result = match rpc_call(stream, "pane.wait_status", params).await {
+    let result = match call_wait(stream, "pane.wait_status", "wait-status", params, format).await? {
         Ok(result) => result,
-        Err(RpcClientError::Rpc {
-            code,
-            message,
-            data,
-        }) => super::lens::lens_emit_error_and_exit(
-            format,
-            "wait-status",
-            code,
-            &message,
-            data,
-            super::lens::lens_checkpoint_exit_code(code),
-        ),
-        // The daemon went away or the stream broke.
-        Err(other) => {
-            match format {
-                OutputFormat::Json => print_json_error(&other.to_string())?,
-                OutputFormat::Text | OutputFormat::Plain => crate::style::print_error(&format!(
-                    "wait-status lost the daemon connection ({other}); is the daemon still running?"
-                )),
-            }
-            return Ok(3);
-        }
+        Err(code) => return Ok(code),
     };
     match format {
         OutputFormat::Json => print_json(&result)?,

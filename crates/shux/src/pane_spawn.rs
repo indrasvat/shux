@@ -282,6 +282,7 @@ async fn run_pane_pty_task(
                                 task_exit = PtyTaskExit::RequestedTeardown;
                                 break;
                             }
+                            let commands_ended = state.commands_ended.clone();
                             let (vt_title, terminal_responses, rev_state, alt_switched, status) =
                                 if let Some(vt) = state.vts.get_mut(&pane_id) {
                                     // LENS-R-032/DEC-4: detect an alt-screen
@@ -293,7 +294,11 @@ async fn run_pane_pty_task(
                                     // one batch leaves the flag equal → no switch,
                                     // matching §4.2's "nets to no bump".
                                     let alt_before = vt.is_alternate_screen();
+                                    let ended_before = vt.last_command_end();
                                     let responses = vt.process_with_responses(data);
+                                    if vt.last_command_end() != ended_before {
+                                        commands_ended.send_modify(|n| *n += 1);
+                                    }
                                     if let Some(probe) = &probe {
                                         probe.mark_handled();
                                     }

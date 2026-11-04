@@ -1,0 +1,41 @@
+{
+  "dispatch": [
+    {
+      "provider": "codex",
+      "model": "gpt-6.1-sol",
+      "content": "**SHIP-WITH-CHANGES**\n\nOne merge-blocking defect:\n\n- **Poisoned OSC classification depends on read boundaries** — `crates/shux-vt/src/program_status.rs:284–291`.\n\n  Feed `ESC ] 133;C`, 5,000 NUL bytes, then `X BEL`, followed by `OSC 133;D;7 BEL`. In one chunk, the malformed `CX` start is correctly rejected. Bytewise, it produces `CommandStart` and `CommandEnd(7)`, allowing `wait-command` to report a phantom completion.\n\n  Once poisoned, `take_body` stops collecting even when the retained classification prefix is incomplete. The inverse also fails: `ESC ] 133;`, 5,000 NULs, then `C BEL` is recognized whole but lost bytewise.\n\n  Reproduced using the extracted scanner with scratch `rustc` programs; the malformed-start regression is absent on `origin/main`. Existing tests miss this intersection: the long-C test uses one chunk, and chunking tests use short sequences.\n\n  Continue collecting the bounded filtered prefix after poisoning, and add whole-versus-bytewise regressions for both streams.",
+      "duration_ms": 135952,
+      "cost_usd": 0,
+      "tokens_in": 757426,
+      "tokens_out": 4919
+    },
+    {
+      "provider": "agy",
+      "model": "",
+      "content": "",
+      "duration_ms": 0,
+      "cost_usd": 0,
+      "tokens_in": 0,
+      "tokens_out": 0,
+      "error": "invoke agy: agy: Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 154h42m38s."
+    }
+  ],
+  "reviews": null,
+  "synthesis": {
+    "chair": "claude",
+    "chair_fallback": "codex",
+    "content": "**SHIP WITH CHANGES — fix one merge blocker before merging.**\n\nIn `crates/shux-vt/src/program_status.rs:284–291`, poisoned OSC classification depends on input chunk boundaries:\n\n- `ESC ] 133;C` + 5,000 NULs + `X BEL`, followed by `OSC 133;D;7 BEL`, is correctly rejected in one chunk. Bytewise, it emits `CommandStart` and `CommandEnd(7)`, allowing `wait-command` to report a phantom completion.\n- Conversely, `ESC ] 133;` + 5,000 NULs + `C BEL` is recognized whole but lost bytewise.\n\nAfter poisoning, `take_body` stops collecting before the retained classification prefix is complete. Continue collecting the bounded, filtered prefix after poisoning, and add whole-versus-bytewise regression tests for both streams.\n\nThe reviewer reproduced this with extracted-scanner `rustc` programs and reports that the malformed-start regression is absent on `origin/main`. Existing tests cover long sequences and chunking separately, but miss their intersection."
+  },
+  "meta": {
+    "schema_version": 1,
+    "strategy": "council",
+    "duration_ms": 149684,
+    "total_cost_usd": 0,
+    "total_tokens_in": 787395,
+    "total_tokens_out": 5183,
+    "providers": {
+      "agy": "error",
+      "codex": "ok"
+    }
+  }
+}
