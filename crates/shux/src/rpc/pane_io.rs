@@ -288,6 +288,7 @@ pub(crate) fn register_pane_io_methods(
                     // Room in the pane's input is reserved first, so tracking
                     // the command and queueing its line happen under one lock:
                     // nothing tracked was never sent, nothing sent is untracked.
+                    let requested_at = std::time::Instant::now();
                     let prepared = shux_pty::CommandEngine::prepare(command, &args);
                     drop(params);
                     let writer = io.lock().await.writers.get(&pane_id).cloned().ok_or_else(
@@ -301,14 +302,13 @@ pub(crate) fn register_pane_io_methods(
                         pane_id,
                         permit,
                         prepared,
-                        timeout,
+                        (requested_at, timeout),
                         completion_tx,
                     );
                     let command_id = match start {
                         CommandStart::Started(id) => id,
-                        CommandStart::Busy(running) => {
-                            let state = io.lock().await.cmd_engine.get_status(running);
-                            return Err(pane_busy(running, state.map(|r| r.state)));
+                        CommandStart::Busy(running, state) => {
+                            return Err(pane_busy(running, &state));
                         }
                         CommandStart::PaneGone => {
                             return Err(shux_rpc::RpcError::not_found(
@@ -1829,8 +1829,7 @@ pub(crate) fn register_pane_io_methods(
 
 /// `state` is the holder's own: once it has timed out, waiting cannot free
 /// the pane, only its program ending or a cancel can.
-fn pane_busy(running: uuid::Uuid, state: Option<String>) -> shux_rpc::RpcError {
-    let state = state.unwrap_or_else(|| "running".to_string());
+fn pane_busy(running: uuid::Uuid, state: &str) -> shux_rpc::RpcError {
     let (message, hint) = if state == "running" {
         (
             format!("the pane is still running command {running}"),

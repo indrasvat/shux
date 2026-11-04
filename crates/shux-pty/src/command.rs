@@ -276,9 +276,11 @@ impl CommandEngine {
         let pane = cmd.pane_id;
         let held = self.pending.get(&pane).cloned().unwrap_or_default();
         // Ended some other way than its END marker: the bytes held back in
-        // case they began a marker were the command's own output.
+        // case they began a marker were the command's own output, up to any
+        // END marker already begun.
         if state != CommandState::Completed && cmd.begun {
-            cmd.keep(&held);
+            let end = format!("SHUX_MARKER{}EXIT", cmd.marker).into_bytes();
+            cmd.keep(&held[..find(&held, &end).unwrap_or(held.len())]);
         }
         cmd.state = state;
         let capture = std::mem::take(&mut cmd.capture);
@@ -742,6 +744,24 @@ mod tests {
                 .start_command(pane, "echo hi", &[], Duration::from_secs(10), None)
                 .is_ok()
         );
+    }
+
+    /// A timeout that lands between two reads of the END line: the part of the
+    /// marker already read is not the command's output.
+    #[test]
+    fn a_timeout_mid_marker_keeps_the_marker_out_of_stdout() {
+        let mut engine = CommandEngine::new();
+        let pane = Uuid::new_v4();
+        let (id, _) = engine
+            .start_command(pane, "cmd", &[], Duration::ZERO, None)
+            .unwrap();
+        let marker = engine.commands[&id].marker.clone();
+        engine.process_output(
+            pane,
+            format!("SHUX_BEGIN{marker}\r\nout\r\nSHUX_MARKER{marker}EXIT0").as_bytes(),
+        );
+        assert_eq!(engine.check_timeouts().len(), 1);
+        assert_eq!(engine.get_status(id).unwrap().stdout, "out\n");
     }
 
     #[test]
