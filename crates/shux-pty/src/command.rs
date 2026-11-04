@@ -4,8 +4,8 @@
 //! The typed line frames the command between two markers the shell prints:
 //!
 //! ```text
-//! printf 'SHUX_BE''GIN%s\n' <id>; CMD; __shux_ec=$?;
-//! printf 'SHUX_MAR''KER%sEXIT%sSHUX_END\n' <id> "$__shux_ec"; unset __shux_ec
+//! command -p printf 'SHUX_BE''GIN%s\n' <id>; CMD; __shux_ec=$?;
+//! command -p printf 'SHUX_MAR''KER%sEXIT%sSHUX_END\n' <id> "$__shux_ec"; unset __shux_ec
 //! ```
 //!
 //! The marker text never appears contiguously in the typed line, so the
@@ -23,6 +23,21 @@ use uuid::Uuid;
 pub const CAPTURE_LIMIT: usize = 1 << 20;
 /// Finished commands whose results stay queryable; older ones are forgotten.
 const KEEP_FINISHED: usize = 64;
+
+/// A command framed for a pane but not yet tracked.
+pub struct PreparedCommand {
+    id: Uuid,
+    command: String,
+    marker: String,
+    line: String,
+}
+
+impl PreparedCommand {
+    /// The line to type into the pane.
+    pub fn line(&self) -> &str {
+        &self.line
+    }
+}
 
 /// A command tracked by the execution engine.
 pub struct TrackedCommand {
@@ -103,42 +118,55 @@ impl CommandEngine {
         }
     }
 
-    /// Start tracking a new command: its ID and the full line to send to the
-    /// PTY, or `Err` with the ID of the command still running in the pane.
-    pub fn start_command(
+    /// Frame `command` for the pane: its ID and the line to type.
+    pub fn prepare(command: &str, args: &[String]) -> PreparedCommand {
+        let id = Uuid::new_v4();
+        let marker = format!("__SHUX_CMD_{}__", id.as_simple());
+        let command = if args.is_empty() {
+            command.to_string()
+        } else {
+            format!("{} {}", command, shell_escape_args(args))
+        };
+        // `command -p` skips shell functions and searches the default PATH, not
+        // the pane's: zsh's `command` never runs the builtin. `$?` is read
+        // straight after the command.
+        let line = format!(
+            "command -p printf 'SHUX_BE''GIN%s\\n' {marker}; {command}; __shux_ec=$?; \
+             command -p printf 'SHUX_MAR''KER%sEXIT%sSHUX_END\\n' {marker} \"$__shux_ec\"; \
+             unset __shux_ec\n",
+        );
+        PreparedCommand {
+            id,
+            command,
+            marker,
+            line,
+        }
+    }
+
+    /// Track a prepared command as the one running in `pane_id`: its ID and
+    /// the line to send, or `Err` with the ID of the command already running.
+    pub fn register(
         &mut self,
         pane_id: Uuid,
-        command: &str,
-        args: &[String],
+        prepared: PreparedCommand,
         timeout: Duration,
         completion_tx: Option<tokio::sync::oneshot::Sender<CommandResult>>,
     ) -> Result<(Uuid, String), Uuid> {
         if let Some(&running) = self.active.get(&pane_id) {
             return Err(running);
         }
-        let command_id = Uuid::new_v4();
-        let marker = format!("__SHUX_CMD_{}__", command_id.as_simple());
-
-        let full_cmd = if args.is_empty() {
-            command.to_string()
-        } else {
-            format!("{} {}", command, shell_escape_args(args))
-        };
-
-        // The shell's builtin printf, never a PATH lookup: zsh's `command`
-        // skips builtins. `$?` is read straight after the command.
-        let pty_command = format!(
-            "printf 'SHUX_BE''GIN%s\\n' {marker}; {full_cmd}; __shux_ec=$?; \
-             printf 'SHUX_MAR''KER%sEXIT%sSHUX_END\\n' {marker} \"$__shux_ec\"; \
-             unset __shux_ec\n",
-        );
-
+        let PreparedCommand {
+            id,
+            command,
+            marker,
+            line,
+        } = prepared;
         self.commands.insert(
-            command_id,
+            id,
             TrackedCommand {
-                id: command_id,
+                id,
                 pane_id,
-                command: full_cmd,
+                command,
                 marker,
                 started_at: Instant::now(),
                 timeout,
@@ -150,9 +178,25 @@ impl CommandEngine {
                 result: None,
             },
         );
-        self.active.insert(pane_id, command_id);
+        self.active.insert(pane_id, id);
+        Ok((id, line))
+    }
 
-        Ok((command_id, pty_command))
+    /// [`Self::prepare`] then [`Self::register`].
+    pub fn start_command(
+        &mut self,
+        pane_id: Uuid,
+        command: &str,
+        args: &[String],
+        timeout: Duration,
+        completion_tx: Option<tokio::sync::oneshot::Sender<CommandResult>>,
+    ) -> Result<(Uuid, String), Uuid> {
+        self.register(
+            pane_id,
+            Self::prepare(command, args),
+            timeout,
+            completion_tx,
+        )
     }
 
     /// Feed a pane's PTY output. Returns the command it completed, if any.
@@ -286,16 +330,6 @@ impl CommandEngine {
         let pane = self.commands.get(&command_id)?.pane_id;
         self.finish(command_id, CommandState::Cancelled, None)
             .map(|_| pane)
-    }
-
-    /// Forget a command whose line never reached the pane: it never ran.
-    pub fn abandon(&mut self, command_id: Uuid) {
-        if let Some(cmd) = self.commands.remove(&command_id)
-            && self.active.get(&cmd.pane_id) == Some(&command_id)
-        {
-            self.active.remove(&cmd.pane_id);
-            self.pending.remove(&cmd.pane_id);
-        }
     }
 
     /// The pane is gone: finish its running command, so no caller waits out
@@ -601,8 +635,8 @@ mod tests {
         assert_eq!(engine.get_status(a).unwrap().stdout, "first\n");
     }
 
-    /// The markers come from the shell's builtin printf, never a PATH lookup:
-    /// zsh's `command printf` skips builtins, so a pane whose PATH is broken
+    /// The markers never depend on the pane's PATH: zsh's `command printf`
+    /// skips builtins, so a pane whose PATH is broken
     /// (a stray `/etc/zshenv` will do it) never completed a command.
     #[test]
     fn the_markers_need_no_printf_on_path() {
@@ -638,6 +672,49 @@ mod tests {
             "zsh said: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    /// A pane's own `printf` function must not swallow the END marker, in any
+    /// shell the pane might run, even with PATH broken as well.
+    #[test]
+    fn a_printf_function_cannot_swallow_the_markers() {
+        let mut ran = 0;
+        for shell in ["bash", "zsh", "dash", "sh"] {
+            let Ok(out) = std::process::Command::new(shell)
+                .arg("-c")
+                .arg("true")
+                .output()
+            else {
+                continue;
+            };
+            assert!(out.status.success(), "{shell} -c true failed");
+            ran += 1;
+            let mut engine = CommandEngine::new();
+            let pane = Uuid::new_v4();
+            let (_, line) = engine
+                .start_command(
+                    pane,
+                    "PATH=/nowhere; printf() { :; }; echo ok",
+                    &[],
+                    Duration::from_secs(5),
+                    None,
+                )
+                .unwrap();
+            let out = std::process::Command::new(shell)
+                .arg("-c")
+                .arg(&line)
+                .output()
+                .expect("shell");
+            let done = engine.process_output(pane, &out.stdout);
+            assert_eq!(
+                done.first().map(|r| r.stdout.as_str()),
+                Some("ok\n"),
+                "{shell} wrote {:?}, stderr {:?}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        assert!(ran > 0, "no shell found to run the markers in");
     }
 
     /// A pane runs one command at a time: a line typed while another runs
@@ -687,23 +764,6 @@ mod tests {
             .unwrap();
         let done = engine.process_output(pane, &framed(&engine, next, &l2, b"hi\r\n", 0));
         assert_eq!(done[0].stdout, "hi\n");
-    }
-
-    /// A line that never reached the pane never ran: forgetting it frees the pane.
-    #[test]
-    fn an_abandoned_command_frees_its_pane() {
-        let mut engine = CommandEngine::new();
-        let pane = Uuid::new_v4();
-        let (id, _) = engine
-            .start_command(pane, "a", &[], Duration::from_secs(10), None)
-            .unwrap();
-        engine.abandon(id);
-        assert!(engine.get_status(id).is_none());
-        assert!(
-            engine
-                .start_command(pane, "b", &[], Duration::from_secs(10), None)
-                .is_ok()
-        );
     }
 
     /// A command that ends some other way than its END marker keeps what it

@@ -128,12 +128,21 @@ fn pane_run_returns_only_what_the_command_wrote() {
     assert_ne!(second["exit_code"], 0, "{second}");
 }
 
-/// A command started while another runs in the same pane is refused: its
-/// typed line would be echoed into the running command's output.
+/// A command started while another runs in the same pane is refused, naming
+/// the one running: its typed line would be echoed into that command's output.
+/// Once the first finishes, the same command is accepted.
 #[test]
-fn a_second_command_waits_its_turn_instead_of_polluting_the_first() {
+fn a_second_command_is_refused_while_the_first_runs_then_accepted() {
     let env = Env::new();
     let rc = env.root.path().join("rc");
+    let gate = env.root.path().join("gate");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&gate)
+            .status()
+            .expect("mkfifo")
+            .success()
+    );
     assert!(
         env.shux()
             .args([
@@ -169,19 +178,13 @@ fn a_second_command_waits_its_turn_instead_of_polluting_the_first() {
             .success()
     );
 
+    // The first command blocks reading the gate until the test opens it.
     let started = env
         .shux()
         .args([
-            "--format",
-            "json",
-            "pane",
-            "run",
-            "-s",
-            "pr",
-            "--async",
-            "-c",
-            "sleep 1; echo first",
+            "--format", "json", "pane", "run", "-s", "pr", "--async", "-c",
         ])
+        .arg(format!("read -r _ < '{}'; echo first", gate.display()))
         .output()
         .expect("spawn shux");
     let started: serde_json::Value = serde_json::from_slice(&started.stdout).expect("json");
@@ -190,24 +193,35 @@ fn a_second_command_waits_its_turn_instead_of_polluting_the_first() {
         .expect("command id")
         .to_string();
 
-    let second = env
-        .shux()
-        .args([
-            "--format",
-            "json",
-            "pane",
-            "run",
-            "-s",
-            "pr",
-            "--timeout",
-            "10",
-            "-c",
-            "echo second",
-        ])
-        .output()
-        .expect("spawn shux");
+    let run_second = || {
+        env.shux()
+            .args([
+                "--format",
+                "json",
+                "pane",
+                "run",
+                "-s",
+                "pr",
+                "--timeout",
+                "30",
+                "-c",
+                "echo second",
+            ])
+            .output()
+            .expect("spawn shux")
+    };
+    let refused = run_second();
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(
+        !refused.status.success() && said.contains("still running") && said.contains(&first_id),
+        "the second command was not refused as busy with {first_id}: {said}"
+    );
 
-    // The first command's own result, once it has finished.
+    std::fs::write(&gate, "go\n").expect("open the gate");
     let params = serde_json::json!({ "command_id": first_id }).to_string();
     let deadline = std::time::Instant::now() + shux_testkit::BUDGET;
     let first = loop {
@@ -239,9 +253,13 @@ fn a_second_command_waits_its_turn_instead_of_polluting_the_first() {
         first["stdout"], "first\n",
         "the first command's output was polluted: {first}"
     );
+
+    let accepted = run_second();
     assert!(
-        !second.status.success(),
-        "a second command was accepted while the first ran: {}",
-        String::from_utf8_lossy(&second.stdout)
+        accepted.status.success(),
+        "the retry was refused: {}",
+        String::from_utf8_lossy(&accepted.stderr)
     );
+    let accepted: serde_json::Value = serde_json::from_slice(&accepted.stdout).expect("json");
+    assert_eq!(accepted["stdout"], "second\n", "{accepted}");
 }

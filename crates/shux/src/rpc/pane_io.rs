@@ -279,21 +279,33 @@ pub(crate) fn register_pane_io_methods(
                         (None, None)
                     };
 
-                    let (command_id, pty_command) = {
-                        let mut state = io.lock().await;
-                        state
-                            .cmd_engine
-                            .start_command(pane_id.0, command, &args, timeout, completion_tx)
-                            .map_err(pane_busy)?
-                    };
-
+                    // Room in the pane's input is reserved first, so tracking
+                    // the command and queueing its line happen under one lock:
+                    // nothing tracked was never sent, nothing sent is untracked.
+                    let prepared = shux_pty::CommandEngine::prepare(command, &args);
                     drop(params);
-                    // A line that never reached the pane never ran: it must not
-                    // hold the pane busy until its timeout.
-                    if let Err(e) = send_to_pane(&io, pane_id, pty_command.into_bytes()).await {
-                        io.lock().await.cmd_engine.abandon(command_id);
-                        return Err(e);
-                    }
+                    let writer = io.lock().await.writers.get(&pane_id).cloned().ok_or_else(
+                        || shux_rpc::RpcError::not_found("pane PTY", &pane_id.to_string()),
+                    )?;
+                    let permit = tokio::time::timeout(timeout, writer.reserve(prepared.line().len()))
+                        .await
+                        .map_err(|_| pane_input_full(timeout))?
+                        .map_err(|_| shux_rpc::RpcError::internal("PTY write channel closed"))?;
+                    let command_id = {
+                        let mut state = io.lock().await;
+                        if !state.is_current_writer(pane_id, &permit) {
+                            return Err(shux_rpc::RpcError::not_found(
+                                "pane PTY",
+                                &pane_id.to_string(),
+                            ));
+                        }
+                        let (id, line) = state
+                            .cmd_engine
+                            .register(pane_id.0, prepared, timeout, completion_tx)
+                            .map_err(pane_busy)?;
+                        state.send_outside_paste(pane_id, permit, line.into_bytes());
+                        id
+                    };
 
                     if is_async {
                         return Ok(serde_json::json!({
@@ -1816,6 +1828,14 @@ fn pane_busy(running: uuid::Uuid) -> shux_rpc::RpcError {
     )
 }
 
+fn pane_input_full(timeout: Duration) -> shux_rpc::RpcError {
+    shux_rpc::RpcError::with_message_and_data(
+        shux_rpc::ErrorCode::ResourceExhausted,
+        format!("the pane took no input for {}s", timeout.as_secs()),
+        serde_json::json!({ "resource": "pane input", "timeout_secs": timeout.as_secs() }),
+    )
+}
+
 /// A command's result as `pane.run_command` and `pane.command_status` report
 /// it: every field, serialized from the one frozen result.
 fn command_result_json(result: &shux_pty::CommandResult) -> serde_json::Value {
@@ -2404,6 +2424,56 @@ mod tests {
         )
         .await;
         assert_eq!(writer_rx.recv().await.unwrap(), b"\x1b[201~\x03");
+        harness.stop().await;
+    }
+
+    /// A pane whose input is full: the command gives up within its own
+    /// timeout, leaves the pane free, and a later command's line is the next
+    /// thing the pane receives.
+    #[tokio::test]
+    async fn a_command_that_cannot_reach_a_stalled_pane_leaves_it_free() {
+        let harness = RpcHarness::new();
+        let (_, _, pane_id) = harness.seed_session("stalled").await;
+        let mut writer_rx = harness.seed_io(pane_id, b"").await;
+        let mut queued = 0;
+        while harness
+            .io
+            .lock()
+            .await
+            .try_send_outside_paste(pane_id, b"x".to_vec(), crate::pane_input::Lane::Main)
+            .is_some_and(|sent| sent.is_ok())
+        {
+            queued += 1;
+        }
+        assert!(queued > 0, "the pane's input never filled");
+
+        let run = |command: &'static str, is_async: bool| {
+            harness.router.dispatch(
+                "pane.run_command",
+                Some(serde_json::json!({
+                    "pane_id": pane_id.to_string(),
+                    "command": command,
+                    "timeout": 1,
+                    "async": is_async,
+                })),
+            )
+        };
+        let stalled = tokio::time::timeout(Duration::from_secs(20), run("true", false))
+            .await
+            .expect("run_command outlived its timeout waiting on a stalled pane")
+            .expect_err("a command that never reached the pane reported success");
+        assert_eq!(stalled.code, shux_rpc::ErrorCode::ResourceExhausted.code());
+
+        for _ in 0..queued {
+            assert_eq!(writer_rx.recv().await.unwrap(), b"x");
+        }
+        let next = run("echo next", true).await.expect("the pane stayed busy");
+        let line = String::from_utf8(writer_rx.recv().await.unwrap()).unwrap();
+        let id = next["command_id"].as_str().unwrap().replace('-', "");
+        assert!(
+            line.contains(&id) && line.contains("echo next"),
+            "the pane received {line:?}, not the later command"
+        );
         harness.stop().await;
     }
 
