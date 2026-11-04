@@ -640,6 +640,16 @@ mod tests {
                 "cwd": "/tmp", "initial_command": sleeper}]}),
         )
         .await;
+        // `state.apply` has no undo: its pane must stay, with a PTY.
+        let snap = h.graph.snapshot();
+        let applied = snap
+            .find_session_by_name("applied")
+            .expect("applied session kept");
+        let pane = snap.windows[&applied.windows[0]].active_pane;
+        assert!(
+            h.io.lock().await.vts.contains_key(&pane),
+            "the applied pane has no PTY"
+        );
         let _ = h.io.lock().await.teardown_panes(
             &h.graph.snapshot().panes.keys().copied().collect::<Vec<_>>(),
             true,
