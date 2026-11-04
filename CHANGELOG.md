@@ -1,3 +1,10 @@
+# [0.57.0](https://github.com/indrasvat/shux/compare/v0.56.4...v0.57.0) (2026-11-04)
+
+
+### Features
+
+* **pane:** wait for a typed command's end and exit code (OSC 133) ([#269](https://github.com/indrasvat/shux/issues/269)) ([b2457f5](https://github.com/indrasvat/shux/commit/b2457f5f46a18462583cff07ac0a02c9002750c8))
+
 ## [0.56.4](https://github.com/indrasvat/shux/compare/v0.56.3...v0.56.4) (2026-11-04)
 
 
