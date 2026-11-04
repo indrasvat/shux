@@ -100,6 +100,8 @@ shux --format json pane run -s build -c 'cargo test' | jq '{exit_code, stdout}'
 # The CLI's own exit status is not the command's: read `exit_code`.
 # A pane runs one command at a time: while one runs, another `pane run` is
 # refused with the running command's id (wait for it, or cancel it, then retry).
+# A command that timed out still holds the pane until its program ends: cancel
+# it (Ctrl-C) to take the pane back.
 # `--async` results stay queryable with `shux rpc call pane.command_status`
 # for the daemon's last 64 finished commands.
 

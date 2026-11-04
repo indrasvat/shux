@@ -330,7 +330,7 @@ pub(crate) fn register_pane_io_methods(
                             shux_rpc::RpcError::internal("command completion channel dropped")
                         })?;
 
-                    Ok(command_result_json(&result))
+                    command_result_json(&result)
                 }
             },
         )
@@ -358,7 +358,7 @@ pub(crate) fn register_pane_io_methods(
                         .get_status(command_id)
                         .ok_or_else(|| shux_rpc::RpcError::not_found("command", cmd_id_str))?;
 
-                    Ok(command_result_json(&result))
+                    command_result_json(&result)
                 }
             },
         )
@@ -1822,8 +1822,6 @@ pub(crate) fn register_pane_io_methods(
         )
 }
 
-/// A pane already running a command takes no second one: a line typed while
-/// another runs is echoed into that command's output.
 fn pane_busy(running: uuid::Uuid) -> shux_rpc::RpcError {
     shux_rpc::RpcError::with_message_and_data(
         shux_rpc::ErrorCode::ResourceExhausted,
@@ -1846,10 +1844,10 @@ fn pane_input_full(timeout: Duration) -> shux_rpc::RpcError {
 
 /// A command's result as `pane.run_command` and `pane.command_status` report
 /// it: every field, serialized from the one frozen result.
-fn command_result_json(result: &shux_pty::CommandResult) -> serde_json::Value {
-    serde_json::to_value(result).unwrap_or_else(
-        |e| serde_json::json!({ "command_id": result.command_id, "error": e.to_string() }),
-    )
+fn command_result_json(
+    result: &shux_pty::CommandResult,
+) -> Result<serde_json::Value, shux_rpc::RpcError> {
+    serde_json::to_value(result).map_err(|e| shux_rpc::RpcError::internal(&e.to_string()))
 }
 
 /// Waits for the pane's PTY task to apply a queued resize.

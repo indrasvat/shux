@@ -249,9 +249,8 @@ impl CommandEngine {
                 }
                 EndMarker::Exit(code) => {
                     cmd.keep(&buf[..at]);
-                    if let Some(result) = self.finish(id, CommandState::Completed, Some(code)) {
-                        completed.push(result);
-                    }
+                    completed.extend(self.finish(id, CommandState::Completed, Some(code)));
+                    self.release(id);
                     return completed;
                 }
             }
@@ -260,8 +259,9 @@ impl CommandEngine {
         completed
     }
 
-    /// Finish a running command: freeze its result, answer its waiter, free
-    /// its pane, and let the oldest finished results go.
+    /// Finish a running command: freeze its result and answer its waiter. A
+    /// timed-out command's program may still be reading the pane, so it keeps
+    /// the pane until its END marker, a cancel, or the pane going.
     fn finish(
         &mut self,
         id: Uuid,
@@ -273,7 +273,7 @@ impl CommandEngine {
             return None;
         }
         let pane = cmd.pane_id;
-        let held = self.pending.remove(&pane).unwrap_or_default();
+        let held = self.pending.get(&pane).cloned().unwrap_or_default();
         // Ended some other way than its END marker: the bytes held back in
         // case they began a marker were the command's own output.
         if state != CommandState::Completed && cmd.begun {
@@ -294,16 +294,28 @@ impl CommandEngine {
         if let Some(tx) = cmd.completion_tx.take() {
             let _ = tx.send(result.clone());
         }
-        if self.active.get(&pane) == Some(&id) {
-            self.active.remove(&pane);
+        if state != CommandState::TimedOut {
+            self.release(id);
         }
+        Some(result)
+    }
+
+    /// Free the pane `id` holds, and let the oldest finished results go.
+    fn release(&mut self, id: Uuid) {
+        let Some(pane) = self.commands.get(&id).map(|c| c.pane_id) else {
+            return;
+        };
+        if self.active.get(&pane) != Some(&id) {
+            return;
+        }
+        self.active.remove(&pane);
+        self.pending.remove(&pane);
         self.finished.push_back(id);
         while self.finished.len() > KEEP_FINISHED {
             if let Some(old) = self.finished.pop_front() {
                 self.commands.remove(&old);
             }
         }
-        Some(result)
     }
 
     /// Check for timed-out commands. Returns their results and pane IDs.
@@ -325,11 +337,16 @@ impl CommandEngine {
             .collect()
     }
 
-    /// Cancel a running command. Returns the pane_id if found and cancelled.
+    /// Cancel the command holding its pane, timed out or not. Returns the
+    /// pane_id if it held one.
     pub fn cancel_command(&mut self, command_id: Uuid) -> Option<Uuid> {
         let pane = self.commands.get(&command_id)?.pane_id;
-        self.finish(command_id, CommandState::Cancelled, None)
-            .map(|_| pane)
+        if self.active.get(&pane) != Some(&command_id) {
+            return None;
+        }
+        self.finish(command_id, CommandState::Cancelled, None);
+        self.release(command_id);
+        Some(pane)
     }
 
     /// The pane is gone: finish its running command, so no caller waits out
@@ -337,6 +354,7 @@ impl CommandEngine {
     pub fn forget_pane(&mut self, pane_id: Uuid) {
         if let Some(&id) = self.active.get(&pane_id) {
             self.finish(id, CommandState::PaneGone, None);
+            self.release(id);
         }
         self.pending.remove(&pane_id);
     }
@@ -358,6 +376,9 @@ impl CommandEngine {
 impl TrackedCommand {
     /// Keep payload bytes up to [`CAPTURE_LIMIT`]; note any dropped.
     fn keep(&mut self, payload: &[u8]) {
+        if self.result.is_some() {
+            return;
+        }
         let room = CAPTURE_LIMIT.saturating_sub(self.capture.len());
         if payload.len() > room {
             self.truncated = true;
@@ -635,47 +656,6 @@ mod tests {
         assert_eq!(engine.get_status(a).unwrap().stdout, "first\n");
     }
 
-    /// The markers never depend on the pane's PATH: zsh's `command printf`
-    /// skips builtins, so a pane whose PATH is broken
-    /// (a stray `/etc/zshenv` will do it) never completed a command.
-    #[test]
-    fn the_markers_need_no_printf_on_path() {
-        if std::process::Command::new("zsh")
-            .arg("-c")
-            .arg("true")
-            .status()
-            .is_err()
-        {
-            return; // no zsh here; bash's `command` already finds builtins
-        }
-        let mut engine = CommandEngine::new();
-        let pane = Uuid::new_v4();
-        let (_, line) = engine
-            .start_command(
-                pane,
-                "PATH=/nowhere; echo ok",
-                &[],
-                Duration::from_secs(5),
-                None,
-            )
-            .unwrap();
-        let out = std::process::Command::new("zsh")
-            .arg("-f")
-            .arg("-c")
-            .arg(&line)
-            .output()
-            .expect("zsh");
-        let done = engine.process_output(pane, &out.stdout);
-        assert_eq!(
-            done.first().map(|r| r.stdout.as_str()),
-            Some("ok\n"),
-            "zsh said: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    /// A pane's own `printf` function must not swallow the END marker, in any
-    /// shell the pane might run, even with PATH broken as well.
     #[test]
     fn a_printf_function_cannot_swallow_the_markers() {
         let mut ran = 0;
@@ -717,8 +697,55 @@ mod tests {
         assert!(ran > 0, "no shell found to run the markers in");
     }
 
-    /// A pane runs one command at a time: a line typed while another runs
-    /// would be echoed into the running command's output.
+    /// A timeout answers the caller but leaves the program running, reading
+    /// the pane: a second command typed now would be its input. The pane stays
+    /// busy until the program ends (its END marker) or is cancelled.
+    #[test]
+    fn a_timed_out_command_holds_its_pane_until_it_ends_or_is_cancelled() {
+        let mut engine = CommandEngine::new();
+        let pane = Uuid::new_v4();
+        let timed_out = |engine: &mut CommandEngine| {
+            let (id, line) = engine
+                .start_command(pane, "read -r x", &[], Duration::ZERO, None)
+                .unwrap();
+            let mut begun = line.replace('\n', "\r\n").into_bytes();
+            begun.extend_from_slice(
+                format!("SHUX_BEGIN{}\r\n", engine.commands[&id].marker).as_bytes(),
+            );
+            engine.process_output(pane, &begun);
+            assert_eq!(engine.check_timeouts().len(), 1);
+            assert_eq!(engine.get_status(id).unwrap().state, "timed_out");
+            assert_eq!(
+                engine.start_command(pane, "echo hi", &[], Duration::from_secs(10), None),
+                Err(id),
+                "a second command was typed into the timed-out one"
+            );
+            id
+        };
+
+        let id = timed_out(&mut engine);
+        let marker = engine.commands[&id].marker.clone();
+        engine.process_output(
+            pane,
+            format!("SHUX_MARKER{marker}EXIT0SHUX_END\r\n").as_bytes(),
+        );
+        assert_eq!(engine.get_status(id).unwrap().state, "timed_out");
+        assert!(
+            engine
+                .start_command(pane, "echo hi", &[], Duration::from_secs(10), None)
+                .is_ok()
+        );
+
+        let mut engine = CommandEngine::new();
+        let id = timed_out(&mut engine);
+        assert_eq!(engine.cancel_command(id), Some(pane));
+        assert!(
+            engine
+                .start_command(pane, "echo hi", &[], Duration::from_secs(10), None)
+                .is_ok()
+        );
+    }
+
     #[test]
     fn a_busy_pane_refuses_a_second_command() {
         let mut engine = CommandEngine::new();
