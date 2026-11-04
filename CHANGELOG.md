@@ -1,3 +1,10 @@
+## [0.56.4](https://github.com/indrasvat/shux/compare/v0.56.3...v0.56.4) (2026-11-04)
+
+
+### Bug Fixes
+
+* **pane:** wait-status can wait for one named report, newer than one already seen ([#267](https://github.com/indrasvat/shux/issues/267)) ([e972e66](https://github.com/indrasvat/shux/commit/e972e661675da2cf2d9e6ad6726f57908087285b)), closes [#260](https://github.com/indrasvat/shux/issues/260)
+
 ## [0.56.3](https://github.com/indrasvat/shux/compare/v0.56.2...v0.56.3) (2026-11-04)
 
 
