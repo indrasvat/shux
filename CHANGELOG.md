@@ -1,3 +1,10 @@
+## [0.56.3](https://github.com/indrasvat/shux/compare/v0.56.2...v0.56.3) (2026-11-04)
+
+
+### Bug Fixes
+
+* **pane:** pane run returns exactly what the command wrote ([#266](https://github.com/indrasvat/shux/issues/266)) ([ba30986](https://github.com/indrasvat/shux/commit/ba3098657f682b11eceb703e0c46446cf084b7dc)), closes [#259](https://github.com/indrasvat/shux/issues/259)
+
 ## [0.56.2](https://github.com/indrasvat/shux/compare/v0.56.1...v0.56.2) (2026-11-04)
 
 
