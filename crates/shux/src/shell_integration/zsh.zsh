@@ -23,9 +23,9 @@ __shux_osc133_install() {
       __shux_osc133_ran=
     fi
     print -n '\e]133;A\a'
-    # With ERR_EXIT on, a non-zero return would end the shell.
-    [[ -o errexit ]] && return 0
-    return $ec
+    # zsh gives every hook, and the prompt, the command's own status, so a
+    # non-zero return would only run ZERR again or trip ERR_EXIT.
+    return 0
   }
   # Declared first: under NO_UNSET an unset array cannot be read.
   typeset -ga preexec_functions precmd_functions

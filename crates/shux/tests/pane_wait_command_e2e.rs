@@ -226,7 +226,7 @@ fn the_script_installs_once_and_old_bash_is_told_why_not() {
         .expect("bash");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "__shux_osc133_precmd; echo mine|\\e]133;C;shux=$((__shux_osc133_ran[0] = $$))\\a",
+        "__shux_osc133_precmd && :; echo mine|\\e]133;C;shux=$((__shux_osc133_ran[0] = $$))\\a",
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -328,6 +328,38 @@ fn the_hooks_do_not_end_a_shell_running_with_errexit() {
     }
 }
 
+/// A user's ERR trap fires once for a failing command typed at the prompt,
+/// as it does without the integration: the hooks hand the status on, but
+/// must not fail a second time doing so.
+#[test]
+fn a_users_err_trap_fires_once_per_failing_command() {
+    let bash = modern_bash().expect("no bash 4.4+ installed");
+    for shell in [bash.as_str(), "zsh"] {
+        if !has(shell) {
+            continue;
+        }
+        let env = Env::new(80, 24);
+        let rc = tempfile::tempdir().expect("rc dir");
+        let pane = start(&env, &rc, shell, true);
+        // Spelled apart, so the typed line cannot match the count.
+        let trap = if shell.ends_with("zsh") {
+            "TRAPZERR() { echo ERR-\"TR\"AP; }"
+        } else {
+            "trap 'echo ERR-\"TR\"AP' ERR"
+        };
+        type_line(&env, trap);
+        type_line(&env, "false");
+        type_line(&env, "echo DO\"\"NE");
+        env.wait_for("ws", &pane, "DONE");
+        let screen = env.capture("ws", &pane);
+        assert_eq!(
+            screen.matches("ERR-TRAP").count(),
+            1,
+            "{shell}: the ERR trap ran more than once for one failure:\n{screen}"
+        );
+    }
+}
+
 /// A `pane run` line is one command to the shell: its own exit code, not the
 /// status of the wrapper's last statement.
 #[test]
@@ -416,7 +448,7 @@ fn an_allexport_child_with_its_own_prompt_command_is_hooked() {
         .expect("bash");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "__shux_osc133_precmd; history -a",
+        "__shux_osc133_precmd && :; history -a",
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );

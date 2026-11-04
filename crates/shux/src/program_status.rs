@@ -898,8 +898,7 @@ mod tests {
     }
 
     /// A command whose pane then exits is a completed command, not a pane that
-    /// went away. Its pane exits before the wait starts, so this pins the
-    /// outcome; the order of the reads (snapshot first) has no seam to force.
+    /// went away. Its pane exits before the wait starts: this pins the outcome.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_command_that_ends_as_its_pane_exits_is_completed() {
         let h = RpcHarness::new();

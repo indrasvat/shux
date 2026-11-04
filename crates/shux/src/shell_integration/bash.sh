@@ -57,17 +57,19 @@ __shux_osc133_install() {
       __shux_osc133_ran=()
     fi
     printf '\e]133;A\a'
-    __shux_osc133_keep "$ec"
+    return "$ec"
   }
   [[ ${PROMPT_COMMAND[*]-} == *__shux_osc133_precmd* ]] && return 0
-  # First, so it reads the command's status before any other hook runs.
+  # First, so it reads the command's status before any other hook runs. It
+  # hands that status on; heading an `&&` list, a non-zero one neither runs
+  # the ERR trap a second time nor trips errexit.
   # An array runs every element only from bash 5.1; before, only the first.
   if ((BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] >= 501)) &&
     [[ $(declare -p PROMPT_COMMAND 2>/dev/null) == "declare -a"* ]]; then
-    PROMPT_COMMAND=(__shux_osc133_precmd "${PROMPT_COMMAND[@]}")
+    PROMPT_COMMAND=("__shux_osc133_precmd && :" "${PROMPT_COMMAND[@]}")
   else
     # shellcheck disable=SC2178,SC2128  # this branch runs only when it is not an array
-    PROMPT_COMMAND="__shux_osc133_precmd${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
+    PROMPT_COMMAND="__shux_osc133_precmd && :${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
   fi
 }
 __shux_osc133_install
