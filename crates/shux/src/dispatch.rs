@@ -81,6 +81,10 @@ pub(crate) async fn run_attach(
     let cfg_path = shux_core::config::default_config_path();
     let live_config = shux_core::config::ConfigHandle::load_or_default(&cfg_path);
     let cfg_snapshot = live_config.current();
+    // Held before the watcher starts: it logs as soon as it runs, on any
+    // worker, and that line must not land on the terminal the UI takes over.
+    // Dropped after the outcome line, so held logs follow it.
+    let hold_logs = crate::client_log::hold();
     let stop_reload = tokio_util::sync::CancellationToken::new();
     tokio::spawn(shux_core::config::run_hot_reload(
         cfg_path,
@@ -88,8 +92,6 @@ pub(crate) async fn run_attach(
         stop_reload.clone(),
     ));
     let _stop_reload = stop_reload.drop_guard();
-    // Dropped after the outcome line, so held logs follow it.
-    let hold_logs = crate::client_log::hold();
     let cfg = shux_ui::ClientConfig {
         socket_path: attach_path.to_string_lossy().to_string(),
         session_name: session_name.clone(),
