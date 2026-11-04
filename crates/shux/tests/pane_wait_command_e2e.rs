@@ -322,9 +322,13 @@ fn the_hooks_do_not_end_a_shell_running_with_errexit() {
         };
         type_line(&env, errexit);
         type_line(&env, "[[ -f /nonexistent ]] && echo never");
-        type_line(&env, "echo AL\"\"IVE");
+        type_line(
+            &env,
+            &format!("printf '{}\\n'; echo AL\"\"IVE", pane_e2e::COLOUR_PROBE),
+        );
         // Panics with the screen if the hooks ended the shell.
         env.wait_for("ws", &pane, "ALIVE");
+        env.assert_colour_probe(&pane);
     }
 }
 
@@ -349,8 +353,12 @@ fn a_users_err_trap_fires_once_per_failing_command() {
         };
         type_line(&env, trap);
         type_line(&env, "false");
-        type_line(&env, "echo DO\"\"NE");
+        type_line(
+            &env,
+            &format!("printf '{}\\n'; echo DO\"\"NE", pane_e2e::COLOUR_PROBE),
+        );
         env.wait_for("ws", &pane, "DONE");
+        env.assert_colour_probe(&pane);
         let screen = env.capture("ws", &pane);
         assert_eq!(
             screen.matches("ERR-TRAP").count(),
