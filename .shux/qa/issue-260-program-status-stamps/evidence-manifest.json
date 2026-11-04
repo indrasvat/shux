@@ -1,0 +1,51 @@
+{
+  "scope": "issue-260-program-status-stamps",
+  "audit": "shux-vt-solid-qa gate for issue #260 (per-report OSC 7501 stamps); independent re-run, VERDICT PASS",
+  "commit_under_audit": "f0c646b8fd9481d6b56a1ea603f22df11bd8bed9",
+  "base": "d479e608ba14731b60dc177daa7f997cc813b5c1",
+  "solid_qa_report": "SOLID-QA.md",
+  "dootsabha_design": "council-design.json",
+  "dootsabha_implementation": "council-impl.json",
+  "dootsabha_implementation_rounds": [
+    "council-impl.json",
+    "council-r2.json"
+  ],
+  "screenshots": [
+    "replay-status-on-chunked-120x36-btop-actual.png",
+    "replay-status-on-chunked-120x36-lazygit-actual.png",
+    "replay-status-on-chunked-120x36-nvim-actual.png",
+    "replay-status-on-chunked-120x36-vicaya-actual.png",
+    "replay-status-on-chunked-120x36-vivecaka-actual.png",
+    "replay-status-on-chunked-120x36-btop-diff.png",
+    "replay-status-on-chunked-120x36-lazygit-diff.png",
+    "replay-status-on-chunked-120x36-nvim-diff.png",
+    "replay-status-on-chunked-120x36-vicaya-diff.png",
+    "replay-status-on-chunked-120x36-vivecaka-diff.png"
+  ],
+  "pixel_metrics": [
+    "pixel-replay-btop.json",
+    "pixel-replay-lazygit.json",
+    "pixel-replay-nvim.json",
+    "pixel-replay-vicaya.json",
+    "pixel-replay-vivecaka.json",
+    "pixel-ab-live-lazygit-status-traffic-window-120x40.json",
+    "pixel-ab-live-nvim-status-traffic-window-120x40.json",
+    "pixel-ab-live-w1-split-sgr-status-pane-120x40.json",
+    "pixel-ab-live-w1-split-sgr-status-pane-200x60.json",
+    "pixel-ab-live-w1-split-sgr-status-pane-80x24.json",
+    "pixel-ab-live-w1c-colour-status-pane-120x40.json",
+    "pixel-ab-live-w1c-colour-status-pane-200x60.json",
+    "pixel-ab-live-w1c-colour-status-pane-80x24.json",
+    "pixel-ab-live-w1c-colour-status-window-120x40.json",
+    "pixel-ab-live-w2-query-pane-80x24.json",
+    "pixel-ab-live-w3-identical-report-pane-80x24.json"
+  ],
+  "screenshots_note": "Each *-actual.png is a fresh shux-vt render on f0c646b with program status ON, the committed recording .shux/fixtures/vt-corpus/rich-tui/<app>.raw carrying OSC 7501 / 133;A reports injected before every 5th CSI, fed in seeded 1..32-byte chunks, rasterized with the corpus-harness options. Each is compared at exact 0/0 against the committed golden .shux/goldens/073-vt-corpus/rich-tui-<app>-expected.png, which this branch does not touch. The pixel-ab-* metrics compare live shux pane/window snapshots of identical byte streams on f0c646b (actual) against d479e60 (expected); both PNG sets have no committed baseline and stay in scratch, so those metrics stand alone.",
+  "scratch_evidence_root": ".shux/out/issue-260-program-status-stamps/",
+  "scratch_evidence": {
+    "live_ab": "live4/ (head-*/base-* .txt .png -status.json, w2 reply bytes), metrics in live4/metrics/",
+    "live_tui": "tui/ (nvim, lazygit, htop with tty-injected 7501), metrics in tui-metrics/",
+    "replay": "replay/ (head and base chunked status-on replays)",
+    "checkpoint": "SOLID-QA.md"
+  }
+}
