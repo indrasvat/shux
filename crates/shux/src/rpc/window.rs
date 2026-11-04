@@ -39,7 +39,7 @@ pub(crate) fn register_window_methods(
     let cancel_ensure = cancel.clone();
 
     builder
-        .register_with_policy(
+        .register_to_completion(
             "window.create",
             Policy::fixed(Sensitivity::OwnedMutation),
             move |params: Option<serde_json::Value>| {
@@ -151,7 +151,7 @@ pub(crate) fn register_window_methods(
                 }
             },
         )
-        .register_with_policy(
+        .register_to_completion(
             "window.ensure",
             Policy::fixed(Sensitivity::OwnedMutation),
             move |params: Option<serde_json::Value>| {
@@ -370,7 +370,7 @@ pub(crate) fn register_window_methods(
                 }
             },
         )
-        .register_with_policy(
+        .register_to_completion(
             "window.kill",
             Policy::fixed(Sensitivity::OwnedMutation),
             move |params: Option<serde_json::Value>| {

@@ -130,13 +130,20 @@ impl LensAuditLog {
         Self::open(&xdg_state_home())
     }
 
-    /// Append one chained NDJSON line. `entry` must be a JSON object and
-    /// must NOT set `prev_hash`/`hash` — both are computed here, under the
-    /// serializing lock.
-    pub fn append(&self, entry: serde_json::Value) {
-        // The lock is std::sync (never held across an await); the file I/O
-        // under it is one small append — the same tradeoff the per-plugin
-        // audit log makes on the hot path of every plugin RPC.
+    /// Append one chained NDJSON line, on the blocking pool: the write
+    /// serializes on a lock and does file I/O, and one stalled writer must not
+    /// park the async workers every RPC is served on. Returns once written.
+    pub async fn append(self: &Arc<Self>, entry: serde_json::Value) {
+        let log = self.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || log.append_blocking(entry)).await {
+            tracing::warn!(error = %e, "lens-audit: the append task failed");
+        }
+    }
+
+    /// [`Self::append`] for a caller already off the async workers. `entry`
+    /// must be a JSON object and must NOT set `prev_hash`/`hash` — both are
+    /// computed here, under the serializing lock.
+    pub fn append_blocking(&self, entry: serde_json::Value) {
         let mut last = match self.last_hash.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
@@ -834,7 +841,7 @@ impl ScratchRegistry {
     /// would clobber them before the next restart could retry.
     pub async fn startup_reap(
         runtime_dir: &Path,
-        audit: &LensAuditLog,
+        audit: &Arc<LensAuditLog>,
     ) -> (usize, Vec<RegistryRow>) {
         let path = runtime_dir.join("scratch-registry.json");
         let Ok(text) = std::fs::read_to_string(&path) else {
@@ -882,15 +889,17 @@ impl ScratchRegistry {
             if was_killed {
                 killed += 1;
             }
-            audit.append(json!({
-                "ts": iso_now(),
-                "caller": shux_rpc::current_caller(),
-                "method": "scratch.reap",
-                "reason": "registry",
-                "session_id": row.session_id,
-                "pgid": row.pgid,
-                "killed": was_killed,
-            }));
+            audit
+                .append(json!({
+                    "ts": iso_now(),
+                    "caller": shux_rpc::current_caller(),
+                    "method": "scratch.reap",
+                    "reason": "registry",
+                    "session_id": row.session_id,
+                    "pgid": row.pgid,
+                    "killed": was_killed,
+                }))
+                .await;
         }
         // persist_rows_atomic removes the file when the list is empty —
         // deletion happens ONLY when every row resolved. The unresolved
@@ -1034,15 +1043,17 @@ impl ScratchRegistry {
             // dropped (P5 round-6 codex — startup_reap re-persisted this
             // row to disk, so without an immediate persist a restart in
             // the window would reprocess it and duplicate the audit).
-            self.audit.append(json!({
-                "ts": iso_now(),
-                "caller": shux_rpc::current_caller(),
-                "method": "scratch.reap",
-                "reason": "registry",
-                "session_id": row.session_id,
-                "pgid": row.pgid,
-                "killed": outcome == KillOutcome::Died,
-            }));
+            self.audit
+                .append(json!({
+                    "ts": iso_now(),
+                    "caller": shux_rpc::current_caller(),
+                    "method": "scratch.reap",
+                    "reason": "registry",
+                    "session_id": row.session_id,
+                    "pgid": row.pgid,
+                    "killed": outcome == KillOutcome::Died,
+                }))
+                .await;
             let mut inner = self.lock_inner();
             inner
                 .opaque_unresolved
@@ -1543,7 +1554,7 @@ async fn reap_scratch(
     session_id: SessionId,
     graph: &GraphHandle,
     io_state: &Arc<Mutex<PaneIoState>>,
-    audit: &LensAuditLog,
+    audit: &Arc<LensAuditLog>,
     reason: &str,
 ) -> bool {
     if claim.inherited {
@@ -1586,21 +1597,23 @@ async fn reap_scratch(
         pulse.bump();
     }
 
-    audit.append(json!({
-        "ts": iso_now(),
-        "caller": shux_rpc::current_caller(),
-        "method": "scratch.reap",
-        "reason": reason,
-        "session_id": session_id.to_string(),
-        "pane_id": claim.pane_id.to_string(),
-        "pgid": claim.pgid,
-    }));
+    audit
+        .append(json!({
+            "ts": iso_now(),
+            "caller": shux_rpc::current_caller(),
+            "method": "scratch.reap",
+            "reason": reason,
+            "session_id": session_id.to_string(),
+            "pane_id": claim.pane_id.to_string(),
+            "pgid": claim.pgid,
+        }))
+        .await;
     true
 }
 
 /// Whether the scratch's PTY task confirmed its group ended: its leader
-/// reaped and nothing left in it. A timeout, a task that ended without
-/// saying, or no channel at all is unconfirmed.
+/// reaped and nothing left in it. A task that ended without saying, never
+/// said, or no channel at all is unconfirmed.
 async fn group_ended(ended: Option<tokio::sync::watch::Receiver<Option<bool>>>) -> bool {
     #[cfg(test)]
     if TEST_FORCE_UNCONFIRMED_KILL.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1609,8 +1622,11 @@ async fn group_ended(ended: Option<tokio::sync::watch::Receiver<Option<bool>>>) 
     let Some(mut ended) = ended else {
         return false;
     };
-    let outcome = tokio::time::timeout(Duration::from_secs(5), ended.wait_for(Option::is_some));
-    matches!(outcome.await, Ok(Ok(v)) if *v == Some(true))
+    let said = tokio::time::timeout(
+        crate::patience::peer_patience(),
+        ended.wait_for(Option::is_some),
+    );
+    matches!(said.await, Ok(Ok(v)) if *v == Some(true))
 }
 
 /// Per-scratch reap timer (LENS-R-042 a/b): races `max_runtime_ms` against
@@ -1695,16 +1711,18 @@ async fn scratch_reaper(
 /// pane teardown. For a scratch this claims reap ownership (backing off if
 /// the timer reaper already owns it), cancels that reaper, waits for the PTY
 /// task to confirm its group ended, audits reason=explicit, and only then
-/// removes the registry row. It signals nothing itself.
+/// removes the registry row. It signals nothing itself. It owns the reap once
+/// called, so it must run to completion: its caller's route registers with
+/// `register_to_completion`.
 pub async fn on_session_killed(registry: &ScratchRegistry, session_id: SessionId) {
     let Some(claim) = registry.claim(&session_id) else {
         // Not a scratch session, or the timer reaper already owns the reap.
         return;
     };
     claim.explicit_kill.cancel();
-    // Unconfirmed (P5 round-2 codex N3): the row stays, still claimed and
-    // persisted, for the next daemon's startup reap; nothing is audited.
-    if !group_ended(claim.ended.clone()).await {
+    // Unconfirmed: the row stays, still claimed and persisted, for the next
+    // daemon's startup reap; nothing is audited.
+    if !group_ended(claim.ended).await {
         tracing::error!(
             pgid = claim.pgid,
             session_id = %session_id,
@@ -1713,15 +1731,18 @@ pub async fn on_session_killed(registry: &ScratchRegistry, session_id: SessionId
         );
         return;
     }
-    registry.audit.append(json!({
-        "ts": iso_now(),
-        "caller": shux_rpc::current_caller(),
-        "method": "scratch.reap",
-        "reason": "explicit",
-        "session_id": session_id.to_string(),
-        "pane_id": claim.pane_id.to_string(),
-        "pgid": claim.pgid,
-    }));
+    registry
+        .audit
+        .append(json!({
+            "ts": iso_now(),
+            "caller": shux_rpc::current_caller(),
+            "method": "scratch.reap",
+            "reason": "explicit",
+            "session_id": session_id.to_string(),
+            "pane_id": claim.pane_id.to_string(),
+            "pgid": claim.pgid,
+        }))
+        .await;
     registry.remove(&session_id);
 }
 
@@ -1781,47 +1802,20 @@ async fn handle_lens_run(
 ) -> Result<serde_json::Value, shux_rpc::RpcError> {
     let p = parse_lens_run_params(&params)?;
 
-    // ── Cancellation shield (P5 round-2 codex N1 ≡ claude round-2 major) ─
-    // The shux-rpc server DROPS in-flight handler futures on client
-    // disconnect (the P3 cancellable-execution contract). A disconnect
-    // between graph-session creation and registry commit used to leak an
-    // unregistered __scratch session + PTY: the reservation Drop-released,
-    // but nothing owned the session — no reaper, no registry row, no
-    // startup-reap coverage (the PTY task's own shutdown binds to the ROOT
-    // daemon token, never to the request, so handler-drop cannot cascade
-    // teardown either). Fix: the non-idempotent core (reserve → create
-    // session → spawn PTY → commit + arm reaper) runs in its OWN spawned
-    // task; the handler awaits its JoinHandle. Dropping a JoinHandle does
-    // NOT abort the task, so a disconnected client simply never reads the
-    // response while the composite completes — from commit onward the
-    // ttl/max_runtime reaper owns the scratch. Everything after the core
-    // (the `--wait` tail) stays freely cancellable per P3 semantics.
-    //
-    // The task-local caller identity does not cross `tokio::spawn`, so the
-    // core future is re-wrapped in the captured caller's scope (keeps
-    // scratch.create audit attribution truthful — LENS-R-052).
-    let caller = shux_rpc::current_caller();
-    let core = tokio::spawn(shux_rpc::with_caller(
-        caller,
-        spawn_scratch_core(
+    // The core (reserve, create the session, spawn its PTY, commit the row,
+    // arm the reaper) runs to completion: cut between those steps, it leaves
+    // an unregistered scratch that nothing reaps. The `--wait` tail below
+    // stays droppable.
+    let (session_id, pane_id, revision, wait_sub) =
+        shux_rpc::run_to_completion(spawn_scratch_core(
             p,
             graph.clone(),
             io_state.clone(),
             cancel,
             event_bus.clone(),
             registry,
-        ),
-    ));
-    let (session_id, pane_id, revision, wait_sub) = match core.await {
-        Ok(core_result) => core_result?,
-        Err(join_err) => {
-            // Only reachable on a core panic (never aborted). Repo law
-            // forbids panics; surface honestly instead of unwrapping.
-            return Err(shux_rpc::RpcError::internal(&format!(
-                "lens.run core task failed: {join_err}"
-            )));
-        }
-    };
+        ))
+        .await?;
 
     let mut result = json!({
         "session_id": session_id.to_string(),
@@ -2072,17 +2066,20 @@ async fn spawn_scratch_core(
         "max_runtime",
     ));
 
-    registry.audit.append(json!({
-        "ts": iso_now(),
-        "caller": shux_rpc::current_caller(),
-        "method": "scratch.create",
-        "session_id": session_id.to_string(),
-        "pane_id": pane_id.to_string(),
-        "pgid": pgid,
-        "argv": p.argv,
-        "cols": p.cols,
-        "rows": p.rows,
-    }));
+    registry
+        .audit
+        .append(json!({
+            "ts": iso_now(),
+            "caller": shux_rpc::current_caller(),
+            "method": "scratch.create",
+            "session_id": session_id.to_string(),
+            "pane_id": pane_id.to_string(),
+            "pgid": pgid,
+            "argv": p.argv,
+            "cols": p.cols,
+            "rows": p.rows,
+        }))
+        .await;
 
     let revision = {
         let state = io_state.lock().await;
@@ -2477,6 +2474,38 @@ pub(crate) mod tests {
         );
     }
 
+    /// A PTY task slow to confirm its group ended, as on a loaded machine,
+    /// still has the scratch reaped once it does: the row is not stranded.
+    #[tokio::test]
+    async fn an_explicit_kill_confirmed_late_still_reaps_the_row() {
+        let dir = tmpdir();
+        let reg = test_registry(dir.path());
+        let id = SessionId::new();
+        let (ended_tx, ended_rx) = tokio::sync::watch::channel(None);
+        let mut state = dummy_state(1);
+        state.ended = Some(ended_rx);
+        reg.try_reserve().expect("reserve").commit(id, state);
+
+        let kill = tokio::spawn({
+            let reg = reg.clone();
+            async move { on_session_killed(&reg, id).await }
+        });
+        tokio::task::yield_now().await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(6)).await;
+        // Let the kill see the clock before the confirmation arrives.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::resume();
+        let _ = ended_tx.send(Some(true));
+        kill.await.expect("kill task");
+        assert!(
+            !reg.lock_inner().rows.contains_key(&id),
+            "a group confirmed ended after 6s left its row stranded"
+        );
+    }
+
     /// A row with no recorded start token proves nothing about whose group
     /// its pgid now names, so the startup reap never signals it.
     #[tokio::test]
@@ -2858,7 +2887,7 @@ pub(crate) mod tests {
         let dir = tmpdir();
         let audit = LensAuditLog::open(dir.path());
         for i in 0..5 {
-            audit.append(
+            audit.append_blocking(
                 json!({"ts": iso_now(), "caller": "uds", "method": "scratch.create", "i": i}),
             );
         }
@@ -2883,7 +2912,7 @@ pub(crate) mod tests {
         let dir = tmpdir();
         let audit = LensAuditLog::open(dir.path());
         for i in 0..5 {
-            audit.append(
+            audit.append_blocking(
                 json!({"ts": iso_now(), "caller": "uds", "method": "scratch.create", "i": i}),
             );
         }
@@ -2907,6 +2936,43 @@ pub(crate) mod tests {
         assert!(err.contains("unjustified chain anchor"), "{err}");
     }
 
+    /// An append waiting on the audit lock does not hold an async worker: on
+    /// a one-worker runtime, another task still runs while the lock is held.
+    #[tokio::test]
+    async fn an_audit_append_waiting_on_its_lock_leaves_the_worker_free() {
+        let dir = tmpdir();
+        let audit = LensAuditLog::open(dir.path());
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (ran_tx, ran_rx) = std::sync::mpsc::channel::<()>();
+        let held = audit.clone();
+        // An OS thread, so the verdict and the release never need the worker.
+        let holder = std::thread::spawn(move || {
+            let _guard = held.last_hash.lock().expect("audit lock");
+            locked_tx.send(()).expect("test gone");
+            ran_rx.recv_timeout(shux_testkit::BUDGET).is_ok()
+        });
+        locked_rx.recv().expect("holder never locked");
+
+        let writer = audit.clone();
+        let append = tokio::spawn(async move {
+            writer
+                .append(json!({"ts": iso_now(), "caller": "uds", "method": "scratch.create"}))
+                .await;
+        });
+        tokio::spawn(async move {
+            let _ = ran_tx.send(());
+        });
+        let worker_was_free = tokio::task::spawn_blocking(move || holder.join())
+            .await
+            .expect("join task")
+            .expect("holder panicked");
+        append.await.expect("append task");
+        assert!(
+            worker_was_free,
+            "an append blocked on the audit lock held the only async worker"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn audit_concurrent_appends_never_fork_the_chain() {
         let dir = tmpdir();
@@ -2915,7 +2981,7 @@ pub(crate) mod tests {
         for i in 0..24 {
             let a = audit.clone();
             handles.push(tokio::task::spawn_blocking(move || {
-                a.append(
+                a.append_blocking(
                     json!({"ts": iso_now(), "caller": "uds", "method": "scratch.create", "n": i}),
                 );
             }));
@@ -2934,14 +3000,14 @@ pub(crate) mod tests {
         let pad = "x".repeat(16 * 1024);
         let mut i = 0usize;
         while std::fs::metadata(live).map(|m| m.len()).unwrap_or(0) <= AUDIT_ROTATE_AT_BYTES {
-            audit.append(json!({
+            audit.append_blocking(json!({
                 "ts": iso_now(), "caller": "uds", "method": "scratch.create",
                 "tag": tag, "n": i, "pad": pad,
             }));
             i += 1;
         }
         // One more append rotates (the size check runs BEFORE the write).
-        audit.append(json!({
+        audit.append_blocking(json!({
             "ts": iso_now(), "caller": "uds", "method": "scratch.create",
             "tag": tag, "n": i, "pad": pad,
         }));

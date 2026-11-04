@@ -23,7 +23,9 @@ fn main() {
     let matches = cmd.try_get_matches().unwrap_or_else(|e| exit_from_clap(&e));
     let args = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
-    let result = if matches!(args.command, Some(Command::__daemon)) {
+    let result = if let Err(e) = shux::patience::init() {
+        Err(e)
+    } else if matches!(args.command, Some(Command::__daemon)) {
         // Internal daemon subcommand — called by auto-start. `--socket` is a
         // global arg, so the re-exec'd daemon sees whatever the client saw.
         run_daemon(args.socket.clone())

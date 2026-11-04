@@ -1180,12 +1180,13 @@ fn a_client_reports_a_daemon_that_does_not_answer() {
     let mut client = h
         .shux()
         .args(["session", "list"])
+        .env("SHUX_PEER_PATIENCE_MS", "2000")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn shux");
-    // The client gives up after its own 5s version-check timeout; the budget
-    // only decides when a client that never does counts as hung.
+    // The client gives up after its 2s patience; the budget only decides
+    // when a client that never does counts as hung.
     let hung = !shux_testkit::poll_until(shux_testkit::BUDGET, || {
         client.try_wait().expect("poll client").is_some()
     });
@@ -1201,6 +1202,46 @@ fn a_client_reports_a_daemon_that_does_not_answer() {
             && stderr.contains(&pid.to_string()),
         "the error must name the daemon ({}): {stderr}",
         out.status
+    );
+}
+
+/// The patience override is the starting client's alone: the daemon it starts,
+/// and every program in that daemon's panes, keep the default.
+#[test]
+fn a_patience_override_stays_with_the_client_that_set_it() {
+    let h = ShuxHarness::new();
+    let out = h.runtime_dir().join("pane-env");
+    let script = format!("env > {}.tmp && mv {0}.tmp {0}; sleep 60", out.display());
+    let created = h
+        .shux()
+        .env("SHUX_PEER_PATIENCE_MS", "2000")
+        .args(["session", "create", "env", "-d", "--", "sh", "-c", &script])
+        .output()
+        .expect("run shux");
+    assert!(created.status.success(), "session create failed");
+    assert!(
+        shux_testkit::poll_until(shux_testkit::BUDGET, || out.exists()),
+        "the pane never wrote its environment"
+    );
+    let env = std::fs::read_to_string(&out).expect("pane env");
+    let pid = h.daemon_pid().expect("daemon pidfile");
+    let daemon_env = Command::new("ps")
+        .args(["eww", "-o", "command=", "-p", &pid.to_string()])
+        .output()
+        .expect("ps");
+    let _ = h.shux().args(["daemon", "stop"]).output();
+    assert!(
+        !env.contains("SHUX_PEER_PATIENCE_MS"),
+        "a pane inherited the client's patience override"
+    );
+    let daemon_env = String::from_utf8_lossy(&daemon_env.stdout);
+    assert!(
+        daemon_env.contains("XDG_RUNTIME_DIR="),
+        "ps showed no environment for the daemon, so it proves nothing: {daemon_env}"
+    );
+    assert!(
+        !daemon_env.contains("SHUX_PEER_PATIENCE_MS"),
+        "the daemon inherited the client's patience override"
     );
 }
 

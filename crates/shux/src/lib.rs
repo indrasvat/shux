@@ -42,6 +42,7 @@ pub mod pane_record;
 #[cfg(any(test, fuzzing))]
 pub mod pane_record_fuzz;
 pub mod pane_spawn;
+pub mod patience;
 pub mod program_status;
 pub mod rpc;
 pub mod session_meta;

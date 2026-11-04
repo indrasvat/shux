@@ -42,22 +42,16 @@ const CONNECT_BUDGET: ConnectBudget = ConnectBudget {
     deadline: Duration::from_secs(30),
 };
 
-/// How long a daemon gets to exit after it stops serving. It drains panes for
-/// up to 3s before it releases the instance lock.
-pub(crate) const STALE_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// How long a daemon gets to answer the version handshake. One that does not is
-/// stopped or wedged: it is reported, never replaced.
-pub(crate) const VERSION_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
-
 /// How many stale daemons one client stops before giving up: each stop ends an
 /// identified process, so only clients of another build racing to start their
 /// own could keep producing more.
 const MAX_STALE_STOPS: u32 = 8;
 
-/// How long to wait for another client to finish starting the daemon. Covers
-/// the holder's drain and full connect deadline after a few stale-daemon stops.
-const START_LOCK_TIMEOUT: Duration = Duration::from_secs(90);
+/// How long to wait for another client to finish starting the daemon: one
+/// stale daemon's replacement (a probe and its exit) and the start.
+fn start_lock_timeout() -> Duration {
+    crate::patience::peer_patience() * 2 + CONNECT_BUDGET.deadline
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -73,9 +67,9 @@ pub enum ClientError {
     )]
     StaleDaemonAlive(u32),
     #[error(
-        "a daemon for this socket{} is still running but has not served it for {}s; \
+        "a daemon for this socket{} is still running but has not served it for {:?}; \
          run `shux daemon stop` and retry",
-        .0, STALE_EXIT_TIMEOUT.as_secs()
+        .0, crate::patience::peer_patience()
     )]
     DaemonNotServing(String),
     #[error(
@@ -85,9 +79,9 @@ pub enum ClientError {
     )]
     DaemonNotStarted(String),
     #[error(
-        "the daemon serving {}{} did not answer within {}s; it may be stopped or \
-         wedged -- run `shux daemon stop`, or kill it",
-        .1.display(), .0, VERSION_CHECK_TIMEOUT.as_secs()
+        "the daemon serving {}{} did not answer the version check within {:?}; it may be \
+         busy, stopped or wedged -- retry, and if it persists run `shux daemon stop`",
+        .1.display(), .0, crate::patience::peer_patience()
     )]
     DaemonUnresponsive(String, std::path::PathBuf),
     #[error(
@@ -101,7 +95,11 @@ pub enum ClientError {
         .0.display()
     )]
     StaleDaemonUnidentified(std::path::PathBuf),
-    #[error("timed out waiting for another shux client to start the daemon (lock {})", .0.display())]
+    #[error(
+        "waited {:?} for another shux client to start the daemon (lock {}); if no other shux \
+         command is running, retry",
+        start_lock_timeout(), .0.display()
+    )]
     StartLockTimeout(std::path::PathBuf),
 }
 
@@ -132,7 +130,7 @@ pub(crate) enum DaemonAnswer {
     /// It answered without saying which build it is.
     Unreadable,
     /// It accepted the connection and did not answer within
-    /// [`VERSION_CHECK_TIMEOUT`].
+    /// [`crate::patience::peer_patience`].
     Unresponsive,
     /// Connecting failed, and not because nothing is listening.
     Unreachable(io::Error),
@@ -145,7 +143,8 @@ pub(crate) async fn ask_daemon_version(socket_path: &Path) -> DaemonAnswer {
         Err(e) if is_connection_refused_or_not_found(&e) => return DaemonAnswer::Absent,
         Err(e) => return DaemonAnswer::Unreachable(e),
     };
-    match tokio::time::timeout(VERSION_CHECK_TIMEOUT, check_daemon_version(&mut stream)).await {
+    let patience = crate::patience::peer_patience();
+    match tokio::time::timeout(patience, check_daemon_version(&mut stream)).await {
         Err(_) => DaemonAnswer::Unresponsive,
         Ok(None) => DaemonAnswer::Unreadable,
         Ok(Some(dv)) => DaemonAnswer::Answered(dv),
@@ -205,7 +204,7 @@ async fn stop_stale_daemon(socket: &Path) -> Result<(), ClientError> {
         {
             info!(pid, "Sent SIGTERM to stale daemon");
         }
-        let deadline = tokio::time::Instant::now() + STALE_EXIT_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + crate::patience::peer_patience();
         while crate::daemon_boot::is_live_shux_daemon(pid, socket) {
             if tokio::time::Instant::now() >= deadline {
                 return Err(ClientError::StaleDaemonAlive(pid));
@@ -218,7 +217,8 @@ async fn stop_stale_daemon(socket: &Path) -> Result<(), ClientError> {
         }
         return Ok(());
     }
-    for _ in 0..20 {
+    let deadline = tokio::time::Instant::now() + crate::patience::peer_patience();
+    while tokio::time::Instant::now() < deadline {
         if probe_socket(socket).await.is_err() {
             return Ok(());
         }
@@ -260,10 +260,10 @@ async fn probe_daemon(socket_path: &Path) -> Result<Probe, ClientError> {
                 git_sha = CLIENT_GIT_SHA,
                 "Daemon version matches"
             );
-            // Need a fresh connection since we consumed the first one for version check
+            // A fresh connection, not the probe's: one that fails here is a
+            // daemon that stopped serving after it answered, and is replaced.
             match probe_socket(socket_path).await {
                 Ok(stream) => Ok(Probe::Current(stream)),
-                // It stopped serving in between.
                 Err(e) if is_connection_refused_or_not_found(&e) => Ok(Probe::Absent),
                 Err(e) => Err(ClientError::Io(e)),
             }
@@ -293,7 +293,7 @@ async fn probe_daemon(socket_path: &Path) -> Result<Probe, ClientError> {
 /// unlinked rebinds it, and is found by the next probe.
 async fn claim_socket(socket: &Path) -> Result<Option<UnixStream>, ClientError> {
     let lock_path = daemon::instance_lock_path_for(socket)?;
-    let mut deadline = tokio::time::Instant::now() + STALE_EXIT_TIMEOUT;
+    let mut deadline = tokio::time::Instant::now() + crate::patience::peer_patience();
     let mut stops = 0;
     loop {
         match probe_daemon(socket).await? {
@@ -310,7 +310,7 @@ async fn claim_socket(socket: &Path) -> Result<Option<UnixStream>, ClientError> 
             Probe::Stale => {
                 stops += 1;
                 stop_stale_daemon(socket).await?;
-                deadline = tokio::time::Instant::now() + STALE_EXIT_TIMEOUT;
+                deadline = tokio::time::Instant::now() + crate::patience::peer_patience();
                 continue;
             }
             Probe::Absent => {
@@ -337,7 +337,7 @@ async fn claim_socket(socket: &Path) -> Result<Option<UnixStream>, ClientError> 
 async fn acquire_start_lock(socket: &Path) -> Result<std::fs::File, ClientError> {
     daemon::ensure_runtime_dir()?;
     let path = daemon::start_lock_path_for(socket)?;
-    let deadline = tokio::time::Instant::now() + START_LOCK_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + start_lock_timeout();
     loop {
         if let Some(lock) = daemon::try_lock_file(&path)? {
             return Ok(lock);
@@ -455,6 +455,9 @@ fn start_daemon_process(socket_path: &Path) -> Result<std::process::Child, Clien
 
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("__daemon");
+    // The override is the starting client's; the daemon and its panes keep
+    // the default.
+    cmd.env_remove(crate::patience::PEER_PATIENCE_ENV);
 
     // Tell the daemon which socket to serve, explicitly: `--socket` is a
     // client-side flag and `SHUX_SOCKET` may be unset. Pass the endpoint,
@@ -519,6 +522,72 @@ mod tests {
         });
         assert!(matches!(probe_daemon(&socket).await, Ok(Probe::Absent)));
         server.await.unwrap();
+    }
+
+    /// A daemon too busy to answer the version check for 6s is waited for,
+    /// not reported as stopped or wedged.
+    #[tokio::test]
+    async fn a_daemon_slow_to_answer_the_version_check_is_waited_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("d.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let path = socket.clone();
+        let client = tokio::spawn(async move { ask_daemon_version(&path).await });
+        let (mut conn, _) = listener.accept().await.unwrap();
+        let mut len = [0u8; 4];
+        conn.read_exact(&mut len).await.unwrap();
+        let mut req = vec![0u8; u32::from_be_bytes(len) as usize];
+        conn.read_exact(&mut req).await.unwrap();
+
+        // The client is now parked on the reply; let it see the clock move
+        // before the reply exists.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(6)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::resume();
+
+        let resp = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "version-check",
+            "result": {"version": CLIENT_VERSION, "git_sha": CLIENT_GIT_SHA},
+        }))
+        .unwrap();
+        // A client that already gave up has closed its end.
+        let _ = conn.write_all(&(resp.len() as u32).to_be_bytes()).await;
+        let _ = conn.write_all(&resp).await;
+        match client.await.unwrap() {
+            DaemonAnswer::Answered(dv) => assert!(dv.is_current()),
+            DaemonAnswer::Unresponsive => {
+                panic!("a daemon that answered after 6s was reported unresponsive")
+            }
+            _ => panic!("the stub's answer was not read as a version"),
+        }
+    }
+
+    /// A client stuck holding the start lock (stopped mid-start, say) is given
+    /// up on in about the time one daemon replacement takes, not minutes.
+    #[tokio::test(start_paused = true)]
+    async fn a_stuck_start_lock_holder_is_given_up_on_promptly() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("d.sock");
+        let lock_path = daemon::start_lock_path_for(&socket).unwrap();
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        let _held = daemon::try_lock_file(&lock_path).unwrap().expect("lock");
+        let started = tokio::time::Instant::now();
+        let waited = acquire_start_lock(&socket).await;
+        let took = started.elapsed();
+        assert!(
+            matches!(waited, Err(ClientError::StartLockTimeout(..))),
+            "{waited:?}"
+        );
+        // The contract, spelled out: one stale daemon's replacement and a start.
+        let bound = crate::patience::peer_patience() * 2 + CONNECT_BUDGET.deadline;
+        assert!(
+            took <= bound + Duration::from_secs(1),
+            "a stuck lock holder held this client for {took:?}, past {bound:?}"
+        );
     }
 
     const QUICK: ConnectBudget = ConnectBudget {

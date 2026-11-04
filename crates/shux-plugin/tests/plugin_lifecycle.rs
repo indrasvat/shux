@@ -581,6 +581,159 @@ while IFS= read -r _; do :; done
     );
 }
 
+/// A watched plugin's reload watcher does not hold a blocking-pool thread for
+/// its whole life: with a one-thread pool, another plugin's requests, which
+/// run on that pool, are still served.
+#[test]
+fn a_reload_watcher_leaves_the_blocking_pool_to_requests() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let tmp = tempfile::tempdir().unwrap();
+        let watched = write_script(tmp.path(), "watched.sh", NOOP_PLUGIN);
+        let resp = tmp.path().join("resp.jsonl");
+        let script = format!(
+            r#"#!/usr/bin/env bash
+set -u
+IFS= read -r _ || exit 1
+printf '%s\n' '{{"jsonrpc":"2.0","id":"init","result":{{"name":"asker","version":"0.1.0","subscribes":[],"provides":[],"capabilities":[]}}}}'
+printf '%s\n' '{{"jsonrpc":"2.0","method":"plugin.state.get","params":{{}},"id":1}}'
+while IFS= read -r line; do
+  case "$line" in
+    *'"plugin.shutdown"'*) exit 0 ;;
+    *'"id":1'*) printf '%s\n' "$line" >> {out} ;;
+  esac
+done
+"#,
+            out = resp.display()
+        );
+        let asker = write_script(tmp.path(), "asker.sh", &script);
+        let mgr = PluginManager::with_state_root(EventBus::new(), tmp.path().join("plugins"));
+        let info = mgr
+            .install(PluginSource::from_path(&watched).with_watch(true))
+            .await
+            .expect("install watched");
+        assert!(info.watching, "no watcher started, so this proves nothing");
+        mgr.install(PluginSource::from_path(&asker))
+            .await
+            .expect("install asker");
+        wait_for_lines(&resp, 1).await;
+        mgr.kill("asker").await.expect("kill asker");
+        mgr.kill("noop").await.expect("kill watched");
+    });
+}
+
+/// A plugin's name is its own: one holding a NUL byte installs with a reload
+/// watcher like any other, rather than panicking the install.
+#[tokio::test]
+async fn a_watched_plugin_with_a_nul_in_its_name_installs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = write_script(
+        tmp.path(),
+        "nul.sh",
+        r#"#!/usr/bin/env bash
+set -u
+IFS= read -r _ || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":"init","result":{"name":"a\u0000b","version":"0.1.0","subscribes":[],"provides":[],"capabilities":[]}}'
+while IFS= read -r line; do
+  case "$line" in *'"plugin.shutdown"'*) exit 0 ;; esac
+done
+"#,
+    );
+    let mgr = PluginManager::with_state_root(EventBus::new(), tmp.path().join("plugins"));
+    let installed = tokio::spawn({
+        let mgr = mgr.clone();
+        async move {
+            mgr.install(PluginSource::from_path(&script).with_watch(true))
+                .await
+        }
+    })
+    .await;
+    let info = match installed {
+        Ok(Ok(info)) => info,
+        Ok(Err(e)) => panic!("install refused the plugin: {e}"),
+        Err(e) => panic!("install panicked: {e}"),
+    };
+    assert!(info.watching);
+    mgr.kill(&info.name).await.expect("kill");
+}
+
+/// A plugin request whose file I/O stalls does not hold an async worker: on a
+/// one-worker runtime, other tasks still run while its state read blocks.
+#[tokio::test]
+async fn a_plugin_request_stalled_on_disk_leaves_the_worker_free() {
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let state_root = tmp.path().join("plugins");
+    let go = tmp.path().join("go");
+    std::fs::create_dir_all(state_root.join("stall")).unwrap();
+    // A FIFO: reading it blocks until a writer opens it, then until data.
+    let state = state_root.join("stall").join("state.json");
+    nix::unistd::mkfifo(&state, nix::sys::stat::Mode::S_IRWXU).unwrap();
+    let script = format!(
+        r#"#!/usr/bin/env bash
+set -u
+IFS= read -r _ || exit 1
+printf '%s\n' '{{"jsonrpc":"2.0","id":"init","result":{{"name":"stall","version":"0.1.0","subscribes":[],"provides":[],"capabilities":[]}}}}'
+while [ ! -e {go} ]; do sleep 0.05; done
+printf '%s\n' '{{"jsonrpc":"2.0","method":"plugin.state.get","params":{{}},"id":1}}'
+while IFS= read -r line; do
+  case "$line" in *'"plugin.shutdown"'*) exit 0 ;; esac
+done
+"#,
+        go = go.display()
+    );
+    let script_path = write_script(tmp.path(), "stall.sh", &script);
+    let mgr = PluginManager::with_state_root(EventBus::new(), state_root);
+    mgr.install(PluginSource::from_path(&script_path))
+        .await
+        .expect("install");
+
+    let (blocked_tx, blocked_rx) = tokio::sync::oneshot::channel::<()>();
+    let (ran_tx, ran_rx) = std::sync::mpsc::channel::<()>();
+    // An OS thread, so neither the verdict nor the release needs the worker.
+    let judge = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + BUDGET;
+        // A non-blocking writer opens only once the reader is blocked in
+        // open(); holding it open without writing keeps the read blocked.
+        let writer = loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits())
+                .open(&state)
+            {
+                Ok(w) => break w,
+                Err(_) if std::time::Instant::now() < deadline => std::thread::yield_now(),
+                Err(e) => panic!("the plugin never read its state: {e}"),
+            }
+        };
+        let _ = blocked_tx.send(());
+        let free = ran_rx.recv_timeout(BUDGET).is_ok();
+        drop(writer);
+        free
+    });
+    std::fs::write(&go, b"").unwrap();
+    let ran = tokio::spawn(async move {
+        if blocked_rx.await.is_ok() {
+            let _ = ran_tx.send(());
+        }
+    });
+    let worker_was_free = tokio::task::spawn_blocking(move || judge.join())
+        .await
+        .expect("join task")
+        .expect("judge panicked");
+    let _ = ran.await;
+    mgr.kill("stall").await.expect("kill");
+    assert!(
+        worker_was_free,
+        "a plugin request blocked on disk held the only async worker"
+    );
+}
+
 /// `plugin.state.set` followed by `plugin.state.get` round-trips a
 /// value through the on-disk store. The first `get` (before any
 /// `set`) returns `null` rather than an error.

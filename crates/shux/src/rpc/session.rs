@@ -85,7 +85,7 @@ pub(crate) fn register_session_methods(
                 }
             },
         )
-        .register_with_policy(
+        .register_to_completion(
             "session.create",
             Policy::fixed(Sensitivity::OwnedMutation),
             move |params: Option<serde_json::Value>| {
@@ -202,7 +202,7 @@ pub(crate) fn register_session_methods(
                 }
             },
         )
-        .register_with_policy(
+        .register_to_completion(
             "session.kill",
             Policy::fixed(Sensitivity::OwnedMutation),
             move |params: Option<serde_json::Value>| {
@@ -300,7 +300,7 @@ pub(crate) fn register_session_methods(
                 }
             },
         )
-        .register_with_policy(
+        .register_to_completion(
             "session.ensure",
             Policy::fixed(Sensitivity::OwnedMutation),
             move |params: Option<serde_json::Value>| {
@@ -505,6 +505,203 @@ mod tests {
                 .collect();
             assert_eq!(listed, names, "{name}");
         }
+    }
+
+    /// Dispatches `method` while the pane IO lock is held, so the handler
+    /// parks between its graph change and its IO teardown; hangs up there;
+    /// then asserts the teardown still happens.
+    async fn hang_up_after_the_graph_change(
+        h: &RpcHarness,
+        method: &str,
+        params: serde_json::Value,
+        pane: shux_core::model::PaneId,
+    ) {
+        let held = h.io.lock().await;
+        let mut call = Box::pin(h.router.dispatch(method, Some(params)));
+        let deadline = std::time::Instant::now() + shux_testkit::BUDGET;
+        while h.graph.snapshot().panes.contains_key(&pane) {
+            assert!(
+                tokio::time::timeout(std::time::Duration::ZERO, &mut call)
+                    .await
+                    .is_err(),
+                "{method} finished while its IO teardown was blocked"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{method} never changed the graph"
+            );
+            tokio::task::yield_now().await;
+        }
+        drop(call);
+        drop(held);
+        while h.io.lock().await.vts.contains_key(&pane) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{method} whose caller hung up left its pane's IO, and program, behind"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Dispatches `method` while the pane IO lock is held, so the handler
+    /// parks between adding a pane to the graph and starting its PTY; hangs
+    /// up there; then asserts every pane ends up with a PTY or out of the
+    /// graph, never listed with nothing behind it.
+    async fn hang_up_after_the_graph_grows(
+        h: &RpcHarness,
+        method: &str,
+        params: serde_json::Value,
+    ) {
+        let before: std::collections::HashSet<_> =
+            h.graph.snapshot().panes.keys().copied().collect();
+        let held = h.io.lock().await;
+        let mut call = Box::pin(h.router.dispatch(method, Some(params)));
+        let deadline = std::time::Instant::now() + shux_testkit::BUDGET;
+        let added = loop {
+            let added: Vec<_> = h
+                .graph
+                .snapshot()
+                .panes
+                .keys()
+                .copied()
+                .filter(|p| !before.contains(p))
+                .collect();
+            if !added.is_empty() {
+                break added;
+            }
+            assert!(
+                tokio::time::timeout(std::time::Duration::ZERO, &mut call)
+                    .await
+                    .is_err(),
+                "{method} finished while its PTY start was blocked"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{method} never changed the graph"
+            );
+            tokio::task::yield_now().await;
+        };
+        drop(call);
+        drop(held);
+        for pane in added {
+            while h.graph.snapshot().panes.contains_key(&pane)
+                && !h.io.lock().await.vts.contains_key(&pane)
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{method} whose caller hung up left a pane in the graph with no PTY"
+                );
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_create_whose_caller_hangs_up_leaves_no_phantom_pane() {
+        let h = RpcHarness::new();
+        let (session_id, _, first_pane) = h.seed_session("base").await;
+        let _first_rx = h.seed_io(first_pane, b"base\n").await;
+        let sleeper = serde_json::json!(["sleep", "300"]);
+        hang_up_after_the_graph_grows(
+            &h,
+            "pane.split",
+            serde_json::json!({"pane_id": first_pane.to_string(), "command": sleeper, "cwd": "/tmp"}),
+        )
+        .await;
+        hang_up_after_the_graph_grows(
+            &h,
+            "window.create",
+            serde_json::json!({"session_id": session_id.to_string(), "command": sleeper, "cwd": "/tmp"}),
+        )
+        .await;
+        hang_up_after_the_graph_grows(
+            &h,
+            "session.create",
+            serde_json::json!({"name": "made", "command": sleeper, "cwd": "/tmp"}),
+        )
+        .await;
+        hang_up_after_the_graph_grows(
+            &h,
+            "window.ensure",
+            serde_json::json!({"session_id": session_id.to_string(), "name": "ensured",
+                "command": sleeper, "cwd": "/tmp"}),
+        )
+        .await;
+        hang_up_after_the_graph_grows(
+            &h,
+            "session.ensure",
+            serde_json::json!({"name": "ensured", "command": sleeper, "cwd": "/tmp"}),
+        )
+        .await;
+        hang_up_after_the_graph_grows(
+            &h,
+            "state.apply",
+            serde_json::json!({"ops": [{"op": "create_session", "name": "applied",
+                "cwd": "/tmp", "initial_command": sleeper}]}),
+        )
+        .await;
+        // `state.apply` has no undo: its pane must stay, with a PTY.
+        let snap = h.graph.snapshot();
+        let applied = snap
+            .find_session_by_name("applied")
+            .expect("applied session kept");
+        let pane = snap.windows[&applied.windows[0]].active_pane;
+        assert!(
+            h.io.lock().await.vts.contains_key(&pane),
+            "the applied pane has no PTY"
+        );
+        let _ = h.io.lock().await.teardown_panes(
+            &h.graph.snapshot().panes.keys().copied().collect::<Vec<_>>(),
+            true,
+        );
+    }
+
+    #[tokio::test]
+    async fn a_kill_whose_caller_hangs_up_still_tears_its_panes_down() {
+        let h = RpcHarness::new();
+        let (session_id, _, first_pane) = h.seed_session("keep").await;
+        let split = h
+            .graph
+            .split_pane(first_pane, Direction::Vertical, 0.5)
+            .await
+            .unwrap();
+        let _split_rx = h.seed_io(split, b"split\n").await;
+        hang_up_after_the_graph_change(
+            &h,
+            "pane.kill",
+            serde_json::json!({"pane_id": split.to_string()}),
+            split,
+        )
+        .await;
+
+        let window = h
+            .graph
+            .create_window(
+                session_id,
+                "w".to_string(),
+                std::path::PathBuf::from("/tmp"),
+            )
+            .await
+            .unwrap();
+        let window_pane = h.graph.snapshot().windows[&window].active_pane;
+        let _window_rx = h.seed_io(window_pane, b"window\n").await;
+        hang_up_after_the_graph_change(
+            &h,
+            "window.kill",
+            serde_json::json!({"id": window.to_string()}),
+            window_pane,
+        )
+        .await;
+
+        let (gone, _, gone_pane) = h.seed_session("gone").await;
+        let _gone_rx = h.seed_io(gone_pane, b"gone\n").await;
+        hang_up_after_the_graph_change(
+            &h,
+            "session.kill",
+            serde_json::json!({"id": gone.to_string()}),
+            gone_pane,
+        )
+        .await;
     }
 
     #[tokio::test]

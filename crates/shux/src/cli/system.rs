@@ -61,7 +61,7 @@ pub async fn handle_version(
     socket_path: &std::path::Path,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
-    use crate::client::{DaemonAnswer, VERSION_CHECK_TIMEOUT};
+    use crate::client::DaemonAnswer;
 
     let cli = (env!("CARGO_PKG_VERSION"), env!("SHUX_GIT_SHA"));
     // `daemon`: `None` when no daemon serves the socket, `Err` when one is
@@ -84,8 +84,8 @@ pub async fn handle_version(
             Some(Err((
                 "unresponsive",
                 format!(
-                    "it did not answer within {}s",
-                    VERSION_CHECK_TIMEOUT.as_secs()
+                    "it did not answer within {:?}; it may be busy, stopped or wedged",
+                    crate::patience::peer_patience()
                 ),
             ))),
             None,

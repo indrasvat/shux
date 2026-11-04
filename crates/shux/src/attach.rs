@@ -145,10 +145,6 @@ fn clamp_client_dims(cols: u16, rows: u16) -> (u16, u16) {
     )
 }
 
-/// Total time the daemon will wait for the AttachHello frame before
-/// dropping the connection. Prevents slowloris-style blocking.
-const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
-
 /// How often the daemon pings the client to detect dead peers.
 const PING_INTERVAL: Duration = Duration::from_secs(15);
 
@@ -444,9 +440,10 @@ async fn handle_attach_connection(
 ) -> anyhow::Result<()> {
     let mut framed = Framed::new(stream, create_codec());
 
-    // Step 1: Receive the hello frame, bounded to HELLO_TIMEOUT so a
-    // hung peer cannot tie up a worker forever.
-    let first = match tokio::time::timeout(HELLO_TIMEOUT, framed.next()).await {
+    // Step 1: Receive the hello frame, bounded so a hung peer cannot hold
+    // the connection forever.
+    let patience = crate::patience::peer_patience();
+    let first = match tokio::time::timeout(patience, framed.next()).await {
         Ok(Some(Ok(buf))) => buf,
         Ok(Some(Err(e))) => {
             warn!(error = %e, "attach: bad first frame");

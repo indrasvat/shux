@@ -41,6 +41,22 @@ pub async fn with_caller<F: Future>(caller: String, fut: F) -> F::Output {
     RPC_CALLER.scope(caller, fut).await
 }
 
+/// Run `fut` to completion even if its caller hangs up. The server drops a
+/// handler whose client disconnects, which is right for a wait and wrong for
+/// a change made in several steps: cut between them, it leaves the change half
+/// done. `fut` keeps the caller's identity; it runs outside the request's
+/// connection scope. Whole routes opt in with
+/// [`crate::RouterBuilder::register_to_completion`].
+pub async fn run_to_completion<T, F>(fut: F) -> Result<T, crate::RpcError>
+where
+    T: Send + 'static,
+    F: Future<Output = Result<T, crate::RpcError>> + Send + 'static,
+{
+    tokio::spawn(with_caller(current_caller(), fut))
+        .await
+        .map_err(|e| crate::RpcError::internal(&format!("handler task failed: {e}")))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,6 +83,20 @@ mod tests {
         assert_eq!(
             spawned, "uds",
             "tokio::spawn starts a fresh task without the scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_body_run_to_completion_keeps_its_caller() {
+        let seen = with_caller(
+            "plugin:abc-123".to_string(),
+            run_to_completion(async { Ok(serde_json::json!(current_caller())) }),
+        )
+        .await
+        .expect("body");
+        assert_eq!(
+            seen, "plugin:abc-123",
+            "the audit would name the wrong caller"
         );
     }
 }

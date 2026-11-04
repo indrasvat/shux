@@ -61,7 +61,7 @@ pub(crate) fn register_pane_methods(
                 Ok(serde_json::json!(panes))
             }
         })
-        .register_with_policy("pane.split", Policy::fixed(Sensitivity::OwnedMutation), move |params: Option<serde_json::Value>| {
+        .register_to_completion("pane.split", Policy::fixed(Sensitivity::OwnedMutation), move |params: Option<serde_json::Value>| {
             let gh = g2.clone();
             let io = io_split.clone();
             let ct = cancel_split.clone();
@@ -308,7 +308,7 @@ pub(crate) fn register_pane_methods(
                 }))
             }
         })
-        .register_with_policy("pane.kill", Policy::fixed(Sensitivity::OwnedMutation), move |params: Option<serde_json::Value>| {
+        .register_to_completion("pane.kill", Policy::fixed(Sensitivity::OwnedMutation), move |params: Option<serde_json::Value>| {
             let gh = g8.clone();
             let io = io_kill.clone();
             async move {

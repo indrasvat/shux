@@ -1174,10 +1174,10 @@ fn spawn_reload_watcher(
     let stopping = mgr.stopping.clone();
     mgr.watchers.started.fetch_add(1, Ordering::SeqCst);
     let stopped = WatcherStopped(mgr.watchers.clone());
-    tokio::task::spawn_blocking(move || {
+    let watch = move || {
         let name = watcher_name;
         let cancel = watcher_cancel;
-        // Build the watcher inside the blocking thread so the notify
+        // Build the watcher inside its thread so the notify
         // backend's lifetime is tied to the watcher loop; dropping it
         // tears down the OS-level handle. Watch the parent directory
         // rather than the file itself — editors that atomic-rename
@@ -1247,7 +1247,16 @@ fn spawn_reload_watcher(
         }
         drop(watcher);
         debug!(plugin = %name, "watcher: cancelled, exiting");
-    });
+    };
+    // Its own thread, not the blocking pool: it lives as long as the plugin,
+    // and plugin requests need that pool for their file I/O. A fixed name: a
+    // plugin's own name may hold bytes a thread name cannot.
+    if let Err(e) = std::thread::Builder::new()
+        .name("shux-plugin-watch".into())
+        .spawn(watch)
+    {
+        warn!(plugin = %name, error = %e, "watcher: could not start its thread");
+    }
 
     // Debouncer / reload trigger lives in the tokio runtime so the
     // reload itself can await the manager. If the plugin is currently
@@ -1439,18 +1448,23 @@ async fn run_plugin_io(
                 match res {
                     Ok(Some(line)) if line.is_empty() => continue,
                     Ok(Some(line)) => {
-                        dispatch_plugin_frame(
-                            &name,
-                            &plugin_id,
-                            line,
-                            &router,
-                            &event_bus,
-                            &state_root,
-                            &perm_root,
-                            &graph,
-                            denial_hook.get().cloned(),
-                            resp_tx.clone(),
-                        );
+                        // Its permission check, audit and state methods do
+                        // file I/O: off the async workers, one frame at a time.
+                        let (plugin, id, router, bus) =
+                            (name.clone(), plugin_id, router.clone(), event_bus.clone());
+                        let (state_root, perm_root, graph) =
+                            (state_root.clone(), perm_root.clone(), graph.clone());
+                        let (hook, tx) = (denial_hook.get().cloned(), resp_tx.clone());
+                        let dispatched = tokio::task::spawn_blocking(move || {
+                            dispatch_plugin_frame(
+                                &plugin, &id, line, &router, &bus, &state_root, &perm_root,
+                                &graph, hook, tx,
+                            )
+                        })
+                        .await;
+                        if let Err(e) = dispatched {
+                            warn!(plugin = %name, "frame dispatch failed: {e}");
+                        }
                         continue;
                     }
                     Ok(None) => {
