@@ -207,17 +207,27 @@ pane.wait_status { "pane_id": "uuid", "state": ["blocked", "error"], "match": "t
   → { "outcome": "matched" | "timeout" | "pane_gone" | "disabled", "summary": { ... } }
 
 pane.wait_status { "pane_id": "uuid", "state": ["done", "error"], "id": "job", "after": 42 }
-  → { "outcome": "matched", "summary": { ... }, "record": { "id": "job", "state": "done", ... } }
+  → { "outcome": "matched", "reported": { "state": "done", "generation": 57 },
+      "record": { "id": "job", "state": "idle", ... }, "summary": { ... } }
 ```
 
-`id` waits on the one record with exactly that id, and ignores every other
-record, including a `done` an earlier command left. It cannot be combined
-with `match`. `after` (needs `id`) counts only a report of that record
-stamped above it: pass `as_of` from a `pane.status` read before the command
-was sent. Every report is stamped, even one identical to the last, so a
-reused id works. Stamps are valid for one daemon's lifetime. `record` is
-the record that matched; `summary` still describes the pane's most urgent
-one.
+- **`id`** waits on the one record with exactly that id. It ignores every
+  other record, including a `done` an earlier command left. It cannot be
+  combined with `match`.
+- **An id wait asks whether that record has reported a waited state,** not
+  whether it is in one now. `reported` is the report that matched. A `done`
+  the record left at once for `idle` still counts; `record` shows where it is
+  now.
+- **`after`** (needs `id`) counts only a report stamped above it. Pass `as_of`
+  from a `pane.status` read after the previous command with that id finished
+  and before the next is sent.
+  - Every report is stamped, even one identical to the last, so a reused id
+    works.
+  - Stamps are valid for one daemon's lifetime, and a floor above every stamp
+    issued so far is refused.
+- **Lost reports:** a report cleared, reset (RIS) or evicted before the wait
+  reads it is lost.
+- **`summary`** describes the pane's most urgent record, read with `record`.
 
 CLI exit codes for `shux pane wait-status`: 0 matched, 1 timeout,
 2 bad arguments, 3 pane gone, feature off, or any other error.

@@ -1920,11 +1920,11 @@ pub fn print_pane_status_plain(result: &serde_json::Value) {
     }
 }
 
-/// The state an outcome matched on: an `--id` wait's own record, which may
-/// not be the pane's most urgent one.
+/// The state an outcome matched on: for an `--id` wait, the report that
+/// matched, which the record may since have left.
 fn wait_status_state(result: &serde_json::Value) -> Option<&str> {
     result
-        .pointer("/record/state")
+        .pointer("/reported/state")
         .or_else(|| result.pointer("/summary/state"))
         .and_then(|v| v.as_str())
 }
@@ -1941,10 +1941,14 @@ pub fn print_pane_wait_status_plain(result: &serde_json::Value) {
 }
 
 /// Print `pane wait-status`'s outcome.
-pub fn print_pane_wait_status(result: &serde_json::Value, states: &[String]) {
+pub fn print_pane_wait_status(result: &serde_json::Value, states: &[&String], id: Option<&str>) {
     let pane_id = short_id(result.get("pane_id").and_then(|v| v.as_str()).unwrap_or(""));
-    match result.get("outcome").and_then(|v| v.as_str()).unwrap_or("") {
-        "matched" => {
+    let states: Vec<&str> = states.iter().map(|s| s.as_str()).collect();
+    match (
+        result.get("outcome").and_then(|v| v.as_str()).unwrap_or(""),
+        id,
+    ) {
+        ("matched", None) => {
             let state = wait_status_state(result).unwrap_or("?");
             println!(
                 "{} pane {} is {}",
@@ -1953,18 +1957,35 @@ pub fn print_pane_wait_status(result: &serde_json::Value, states: &[String]) {
                 status_state(state)
             );
         }
-        "timeout" => println!(
+        ("matched", Some(id)) => {
+            let state = wait_status_state(result).unwrap_or("?");
+            println!(
+                "{} pane {}: {} reported {}",
+                success("✓"),
+                muted(pane_id),
+                accent(id),
+                status_state(state)
+            );
+        }
+        ("timeout", None) => println!(
             "{} pane {} did not reach {} in time",
             warning("✗"),
             muted(pane_id),
             states.join("|"),
         ),
-        "disabled" => println!(
+        ("timeout", Some(id)) => println!(
+            "{} pane {}: {} did not report {} in time",
+            warning("✗"),
+            muted(pane_id),
+            accent(id),
+            states.join("|"),
+        ),
+        ("disabled", _) => println!(
             "{} pane {} has program status off ([program_status] enabled = false)",
             warning("✗"),
             muted(pane_id),
         ),
-        other => println!(
+        (other, _) => println!(
             "{} pane {} {}",
             warning("✗"),
             muted(pane_id),

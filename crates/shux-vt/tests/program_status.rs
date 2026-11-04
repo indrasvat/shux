@@ -119,7 +119,11 @@ proptest! {
                 let unstamped: Vec<_> = r
                     .records
                     .into_iter()
-                    .map(|v| shux_program_status::RecordView { reported_generation: 0, ..v })
+                    .map(|v| shux_program_status::RecordView {
+                        reported_generation: 0,
+                        reported_in: Default::default(),
+                        ..v
+                    })
                     .collect();
                 (r.seen, unstamped)
             })

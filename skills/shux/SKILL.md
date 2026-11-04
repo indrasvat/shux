@@ -156,14 +156,21 @@ can match it. Give each command its own id, and wait on exactly that id:
 a plain `--state done` also matches the `done` an earlier command left.
 
 ```bash
-shux pane send-keys -s dev --text 'make deploy; printf "\033]7501;state=done:id=deploy-7\033\\"'
+shux pane send-keys -s dev --text 'make deploy && s=done || s=error; printf "\033]7501;state=$s:id=deploy-7\033\\"'
 shux pane send-keys -s dev --data DQ==
-shux pane wait-status "$P" --id deploy-7 --state done,error --timeout 10m
+R=$(shux --format json pane wait-status "$P" --id deploy-7 --state done,error --timeout 10m)
+echo "$R" | jq -r .result.reported.state      # done, or error if make failed
 ```
 
-Reusing an id? Read the floor first, and only a newer report counts:
-`AS_OF=$(shux --format json pane status "$P" | jq .result.as_of)`, send the command,
-then `shux pane wait-status "$P" --id deploy --after "$AS_OF" --state done,error`.
+The wait counts a report even if the record moves on at once (`done`, then
+`idle`). Reusing an id? Once the previous command with that id has finished,
+read the floor, send the command, and pass it: only a newer report counts.
+
+```bash
+AS_OF=$(shux --format json pane status "$P" | jq .result.as_of)
+# ...send the command as above...
+shux pane wait-status "$P" --id deploy-7 --after "$AS_OF" --state done,error
+```
 
 `pane split --wait` runs in the source pane's directory and `window create
 --wait` in the daemon's unless you pass `--cwd`. `shux`'s own exit code says

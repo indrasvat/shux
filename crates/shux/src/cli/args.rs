@@ -1374,7 +1374,8 @@ pub enum PaneCommand {
     /// To wait for one command typed into a shell, have it report under its
     /// own id and wait on that: `--id ID` ignores every other record,
     /// including a `done` an earlier command left behind. Reusing an id?
-    /// Read `as_of` from `pane status` before sending the command, then pass
+    /// Read `.result.as_of` from `shux --format json pane status` once the
+    /// previous command with that id has finished, then pass
     /// `--after AS_OF` so only a newer report counts.
     #[command(name = "wait-status")]
     WaitStatus {
@@ -1396,8 +1397,8 @@ pub enum PaneCommand {
         #[arg(long)]
         id: Option<String>,
 
-        /// Only a report of `--id` newer than this `as_of` (from `pane status`)
-        /// counts.
+        /// Only a report of `--id` newer than this `as_of` (from
+        /// `shux --format json pane status`) counts.
         #[arg(long, value_name = "AS_OF", requires = "id")]
         after: Option<u64>,
 

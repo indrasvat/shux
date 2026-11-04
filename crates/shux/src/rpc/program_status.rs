@@ -134,7 +134,8 @@ impl WaitParams {
         let id = match params.get("id") {
             None | Some(Value::Null) => None,
             Some(Value::String(s)) => Some(RecordId::parse(s).ok_or_else(|| {
-                RpcError::invalid_params(&format!("id {s:?} is not a valid record id"))
+                let shown: String = s.chars().take(64).collect();
+                RpcError::invalid_params(&format!("id {shown:?} is not a valid record id"))
             })?),
             Some(_) => return Err(RpcError::invalid_params("id must be a string")),
         };
@@ -150,14 +151,20 @@ impl WaitParams {
                 "after needs id: it bounds the reports of one record",
             ));
         }
-        let explicit_match = !matches!(params.get("match"), None | Some(Value::Null));
-        if id.is_some() && explicit_match {
-            return Err(RpcError::invalid_params(
-                "id and match cannot be combined: id names the one record to wait on",
-            ));
+        if let Some(after) = after
+            && after > shux_vt::program_status_as_of()
+        {
+            return Err(RpcError::invalid_params(&format!(
+                "after {after} is above every stamp this daemon has issued: read as_of from pane.status"
+            )));
         }
         let matching = match params.get("match") {
             None | Some(Value::Null) => Match::Top,
+            Some(_) if id.is_some() => {
+                return Err(RpcError::invalid_params(
+                    "id and match cannot be combined: id names the one record to wait on",
+                ));
+            }
             Some(Value::String(m)) if m == "top" => Match::Top,
             Some(Value::String(m)) if m == "any" => Match::Any,
             Some(other) => {
@@ -186,12 +193,16 @@ impl WaitParams {
         })
     }
 
-    /// For an id wait: whether `record`, the one with that id, satisfies it.
-    fn matches_record(&self, record: &RecordView) -> bool {
-        self.states.contains(&record.state)
-            && self
-                .after
-                .is_none_or(|after| record.reported_generation > after)
+    /// For an id wait: the newest report that put `record` in a waited
+    /// state above the floor, as `(state, stamp)`. A state the record has
+    /// since left still counts: a `done` followed at once by `idle` is not lost.
+    fn reported_match(&self, record: &RecordView) -> Option<(State, u64)> {
+        let floor = self.after.unwrap_or(0);
+        self.states
+            .iter()
+            .map(|&s| (s, record.last_reported(s)))
+            .filter(|&(_, stamp)| stamp > floor)
+            .max_by_key(|&(_, stamp)| stamp)
     }
 
     fn matches(&self, summary: &StatusSummary) -> bool {
@@ -225,12 +236,13 @@ fn count(summary: &StatusSummary, state: State) -> u16 {
 /// the graph's flag is only set once the first publication lands, and a pane
 /// that has not published yet is not a disabled one.
 ///
-/// `snap` is taken before `record` is read from the terminal, so a final
-/// report and exit cannot pair a stale record with a newer exit.
+/// `snap` is taken before `hit` is read from the terminal, so a final
+/// report and exit cannot pair a stale record with a newer exit. `hit` is
+/// an id wait's record and the summary read with it, under one lock.
 fn decide(
     snap: &shux_core::graph::SessionGraphSnapshot,
     terminal_enabled: Option<bool>,
-    record: Option<RecordView>,
+    hit: Option<(RecordView, Option<StatusSummary>)>,
     pane_id: PaneId,
     wait: &WaitParams,
 ) -> Option<Value> {
@@ -238,13 +250,15 @@ fn decide(
         return Some(json!({"outcome": "pane_gone", "pane_id": pane_id.to_string()}));
     };
     let matched = if wait.id.is_some() {
-        record.filter(|r| wait.matches_record(r)).map(|record| {
-            json!({
+        hit.and_then(|(record, summary)| {
+            let (state, stamp) = wait.reported_match(&record)?;
+            Some(json!({
                 "outcome": "matched",
                 "pane_id": pane_id.to_string(),
-                "summary": pane.program_status,
+                "summary": summary,
                 "record": record,
-            })
+                "reported": {"state": state, "generation": stamp},
+            }))
         })
     } else {
         pane.program_status.as_ref().filter(|s| wait.matches(s)).map(|summary| {
@@ -283,18 +297,21 @@ async fn wait_status(
     let deadline = tokio::time::Instant::now() + wait.timeout;
     loop {
         let snap = graph.snapshot();
-        let (terminal_enabled, record) = {
+        let (terminal_enabled, hit) = {
             let state = io.lock().await;
             let vt = state.vts.get(&pane_id);
-            let record = wait.id.as_ref().and_then(|id| {
-                vt?.program_status_records()?
+            let hit = wait.id.as_ref().and_then(|id| {
+                let vt = vt?;
+                let record = vt
+                    .program_status_records()?
                     .records
                     .into_iter()
-                    .find(|r| r.id.as_ref() == Some(id))
+                    .find(|r| r.id.as_ref() == Some(id))?;
+                Some((record, vt.program_status_publication().summary))
             });
-            (vt.map(|vt| vt.program_status_enabled()), record)
+            (vt.map(|vt| vt.program_status_enabled()), hit)
         };
-        if let Some(outcome) = decide(&snap, terminal_enabled, record, pane_id, wait) {
+        if let Some(outcome) = decide(&snap, terminal_enabled, hit, pane_id, wait) {
             return Ok(outcome);
         }
         if tokio::time::Instant::now() >= deadline {
@@ -373,8 +390,9 @@ mod tests {
             "an explicit match beside id"
         );
         assert!(params(json!({"state": "done", "id": "job", "after": -1})).is_err());
-        let p = params(json!({"state": "done", "id": "job", "after": 5})).unwrap();
-        let record = |state, reported_generation| RecordView {
+        let p = params(json!({"state": ["done", "error"], "id": "job", "after": 0})).unwrap();
+        // `reported_in` is in `State::ALL` order: idle, working, done, blocked, error.
+        let record = |state, reported_in| RecordView {
             id: RecordId::parse("job"),
             state,
             kind: None,
@@ -382,14 +400,36 @@ mod tests {
             app: None,
             title: None,
             msg: None,
-            reported_generation,
+            reported_generation: 0,
+            reported_in,
         };
-        assert!(
-            !p.matches_record(&record(State::Done, 5)),
+        let floor5 = WaitParams {
+            after: Some(5),
+            ..p
+        };
+        assert_eq!(
+            floor5.reported_match(&record(State::Done, [0, 0, 5, 0, 0])),
+            None,
             "a report at the floor"
         );
-        assert!(p.matches_record(&record(State::Done, 6)));
-        assert!(!p.matches_record(&record(State::Working, 6)));
+        assert_eq!(
+            floor5.reported_match(&record(State::Working, [0, 7, 6, 0, 0])),
+            Some((State::Done, 6)),
+            "a done the record has since left was lost"
+        );
+        assert_eq!(
+            floor5.reported_match(&record(State::Error, [0, 0, 6, 0, 8])),
+            Some((State::Error, 8)),
+            "the newest waited report wins"
+        );
+        assert_eq!(
+            floor5.reported_match(&record(State::Working, [0, 9, 0, 0, 0])),
+            None
+        );
+        assert!(
+            params(json!({"state": "done", "id": "job", "after": u64::MAX})).is_err(),
+            "a floor no stamp can pass"
+        );
     }
 
     #[test]

@@ -107,11 +107,13 @@ shux --format json pane run -s build -c 'cargo test' | jq '{exit_code, stdout}'
 
 # Or wait for a command typed into the shell by its own OSC 7501 report. Give
 # it an id of its own: a plain `--state done` also matches an earlier command's.
-shux pane send-keys -s build --text 'make; printf "\033]7501;state=done:id=b7\033\\"'
+shux pane send-keys -s build --text 'make && s=done || s=error; printf "\033]7501;state=$s:id=b7\033\\"'
 shux pane send-keys -s build --data DQ==
-shux pane wait-status "$PANE" --id b7 --state done,error --timeout 10m
-# Reusing an id: read `.result.as_of` from `shux --format json pane status "$PANE"`
-# before sending, then add `--after "$AS_OF"`.
+shux --format json pane wait-status "$PANE" --id b7 --state done,error --timeout 10m \
+  | jq -r .result.reported.state      # done, or error if make failed
+# Reusing an id: once the previous command with it has finished, read
+# `.result.as_of` from `shux --format json pane status "$PANE"`, send the
+# command, then add `--after "$AS_OF"`.
 
 # Capture the last N lines of pane output:
 shux pane capture -s build --lines 50 --format json

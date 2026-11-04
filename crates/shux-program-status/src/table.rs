@@ -1,5 +1,5 @@
 use crate::limits::MAX_RECORDS;
-use crate::model::{Record, RecordId, RecordView, Report};
+use crate::model::{Record, RecordId, RecordView, Report, State};
 use crate::rank::order_key;
 use crate::summary::{StateCounts, StatusSummary};
 
@@ -21,6 +21,8 @@ struct Entry {
     updated: u64,
     /// The caller's stamp for the last report naming this record.
     stamp: u64,
+    /// ...and for the last one in each state.
+    stamp_in: [u64; State::ALL.len()],
 }
 
 impl StatusTable {
@@ -103,6 +105,7 @@ impl StatusTable {
         if let Some(e) = self.entries.iter_mut().find(|e| e.id == id) {
             e.reported = seq;
             e.stamp = stamp;
+            e.stamp_in[record.state as usize] = stamp;
             if e.record != record {
                 e.record = record;
                 e.updated = seq;
@@ -120,12 +123,15 @@ impl StatusTable {
         {
             self.entries.swap_remove(oldest);
         }
+        let mut stamp_in = [0; State::ALL.len()];
+        stamp_in[record.state as usize] = stamp;
         self.entries.push(Entry {
             id,
             record,
             reported: seq,
             updated: seq,
             stamp,
+            stamp_in,
         });
         self.revision += 1;
     }
@@ -169,6 +175,7 @@ impl StatusTable {
             title: e.record.title.clone(),
             msg: e.record.msg.clone(),
             reported_generation: e.stamp,
+            reported_in: e.stamp_in,
         }
     }
 }
@@ -177,14 +184,18 @@ impl StatusTable {
 mod tests {
     use super::*;
     use crate::limits::MAX_RECORDS;
-    use crate::model::{Kind, State};
+    use crate::model::Kind;
     use crate::wire::{Message, decode};
 
-    fn apply(t: &mut StatusTable, payload: &str) {
+    fn apply_at(t: &mut StatusTable, payload: &str, stamp: u64) {
         match decode(payload.as_bytes()) {
-            Ok(Message::Report(r)) => t.apply(r, 0),
+            Ok(Message::Report(r)) => t.apply(r, stamp),
             other => panic!("{payload:?}: {other:?}"),
         }
+    }
+
+    fn apply(t: &mut StatusTable, payload: &str) {
+        apply_at(t, payload, 0)
     }
 
     fn ids(t: &StatusTable) -> Vec<Option<String>> {
@@ -195,27 +206,37 @@ mod tests {
     }
 
     /// A repeated report changes nothing a reader is told about, but it is
-    /// still a report: its stamp moves, so a wait for a newer one can see it.
+    /// still a report: its stamp moves, so a wait for a newer one can see it,
+    /// and a state the record has since left keeps the stamp it was reported at.
     #[test]
     fn every_report_restamps_its_record_without_moving_the_revision() {
         let mut t = StatusTable::new();
-        let report = |p: &str| match decode(p.as_bytes()) {
-            Ok(Message::Report(r)) => r,
-            other => panic!("{p:?}: {other:?}"),
-        };
-        t.apply(report("state=done:id=job"), 7);
-        t.apply(report("state=working:id=other"), 8);
+        apply_at(&mut t, "state=done:id=job", 7);
+        apply_at(&mut t, "state=working:id=other", 8);
         let rev = t.revision();
-        t.apply(report("state=done:id=job"), 9);
+        apply_at(&mut t, "state=done:id=job", 9);
         assert_eq!(t.revision(), rev, "an identical report moved the revision");
-        let stamp = |id: &str| {
+        apply_at(&mut t, "state=working:id=job", 10);
+        let view = |id: &str| {
             t.records()
                 .into_iter()
                 .find(|r| r.id.as_ref().is_some_and(|i| i.as_str() == id))
-                .map(|r| r.reported_generation)
+                .unwrap()
         };
-        assert_eq!(stamp("job"), Some(9));
-        assert_eq!(stamp("other"), Some(8), "a report restamped another record");
+        let job = view("job");
+        assert_eq!(job.reported_generation, 10);
+        assert_eq!(
+            job.last_reported(State::Done),
+            9,
+            "the done it left lost its stamp"
+        );
+        assert_eq!(job.last_reported(State::Working), 10);
+        assert_eq!(job.last_reported(State::Error), 0);
+        assert_eq!(
+            view("other").reported_generation,
+            8,
+            "a report restamped another record"
+        );
     }
 
     #[test]

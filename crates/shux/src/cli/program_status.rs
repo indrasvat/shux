@@ -79,15 +79,18 @@ pub fn wait_unreachable(verb: &str, err: anyhow::Error, format: OutputFormat) ->
     std::process::exit(3)
 }
 
-/// `pane.wait_status`'s params: each state once, and `match`, `id`, `after`
-/// only when given.
-fn wait_status_params(pane: &str, wait: &StatusWait<'_>) -> serde_json::Value {
-    let mut states: Vec<&String> = Vec::new();
-    for s in wait.states {
-        if !states.contains(&s) {
-            states.push(s);
+fn unique(states: &[String]) -> Vec<&String> {
+    let mut seen: Vec<&String> = Vec::new();
+    for s in states {
+        if !seen.contains(&s) {
+            seen.push(s);
         }
     }
+    seen
+}
+
+/// `pane.wait_status`'s params: `match`, `id` and `after` only when given.
+fn wait_status_params(pane: &str, states: &[&String], wait: &StatusWait<'_>) -> serde_json::Value {
     let mut params = serde_json::json!({
         "pane_id": pane,
         "state": states,
@@ -113,14 +116,8 @@ pub(crate) async fn wait_status_exit_code(
     wait: &StatusWait<'_>,
     format: OutputFormat,
 ) -> anyhow::Result<i32> {
-    let params = wait_status_params(pane, wait);
-    let states: Vec<String> = params["state"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|s| s.as_str().map(str::to_owned))
-        .collect();
-    let states = states.as_slice();
+    let states = unique(wait.states);
+    let params = wait_status_params(pane, &states, wait);
     let result = match rpc_call(stream, "pane.wait_status", params).await {
         Ok(result) => result,
         Err(RpcClientError::Rpc {
@@ -148,7 +145,7 @@ pub(crate) async fn wait_status_exit_code(
     };
     match format {
         OutputFormat::Json => print_json(&result)?,
-        OutputFormat::Text => crate::style::print_pane_wait_status(&result, states),
+        OutputFormat::Text => crate::style::print_pane_wait_status(&result, &states, wait.id),
         OutputFormat::Plain => crate::style::print_pane_wait_status_plain(&result),
     }
     Ok(match result.get("outcome").and_then(|v| v.as_str()) {
@@ -199,7 +196,7 @@ mod tests {
             after: Some(7),
             timeout_ms: 500,
         };
-        let params = wait_status_params("p", &wait);
+        let params = wait_status_params("p", &unique(wait.states), &wait);
         assert_eq!(
             params,
             serde_json::json!({"pane_id": "p", "state": ["done"], "timeout_ms": 500, "id": "job", "after": 7})
@@ -207,7 +204,9 @@ mod tests {
         wait.matching = Some("any");
         wait.id = None;
         wait.after = None;
-        assert_eq!(wait_status_params("p", &wait)["match"], "any");
-        assert!(wait_status_params("p", &wait).get("id").is_none());
+        assert_eq!(
+            wait_status_params("p", &unique(wait.states), &wait)["match"],
+            "any"
+        );
     }
 }
