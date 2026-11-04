@@ -19,7 +19,8 @@ use crate::rpc::params::resolve_pane_id_from_params;
 const WAIT_DEFAULT_MS: u64 = 30_000;
 const WAIT_MAX_MS: u64 = 600_000;
 /// Re-read even without an event: installing a VT that matches the graph's
-/// defaults (a disabled pane) changes nothing the graph would announce.
+/// defaults (a disabled pane) changes nothing the graph would announce, and
+/// neither does an identical report, which an id wait with a floor needs.
 const WAIT_REPOLL: Duration = Duration::from_millis(250);
 
 pub(crate) fn register_program_status_methods(

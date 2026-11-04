@@ -225,8 +225,10 @@ pane.wait_status { "pane_id": "uuid", "state": ["done", "error"], "id": "job", "
     works.
   - Stamps are valid for one daemon's lifetime, and a floor above every stamp
     issued so far is refused.
-- **Lost reports:** a report cleared, reset (RIS) or evicted before the wait
-  reads it is lost.
+- **Lost reports:** a report is lost if, before the wait reads it, the record
+  is cleared, reset (RIS) or evicted. It is also lost if the record moves on to
+  a state the next prompt removes (`idle`, `working`, `blocked`) and that
+  prompt starts. `done` and `error` survive a prompt.
 - **`summary`** describes the pane's most urgent record, read with `record`.
 
 CLI exit codes for `shux pane wait-status`: 0 matched, 1 timeout,
