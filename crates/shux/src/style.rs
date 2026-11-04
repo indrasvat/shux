@@ -1706,11 +1706,21 @@ pub fn print_run_command(result: &serde_json::Value, is_async: bool) {
             ("completed", Some(code)) => format!("{}", error(&format!("✗ exit {code}"))),
             ("timed_out", _) => format!("{}", warning("⏱ timed out")),
             ("cancelled", _) => format!("{}", warning("⊘ cancelled")),
+            ("pane_gone", _) => format!("{}", warning("⊘ the pane ended first")),
             _ => format!("{}", muted(state)),
         };
         println!("{status} {}", muted(&format!("({runtime_ms}ms)")));
         if !stdout.is_empty() {
             print!("{stdout}");
+        }
+        if result.get("truncated").and_then(|v| v.as_bool()) == Some(true) {
+            println!(
+                "{}",
+                warning(&format!(
+                    "… output past {} MiB was dropped",
+                    shux_pty::CAPTURE_LIMIT >> 20
+                ))
+            );
         }
     }
 }

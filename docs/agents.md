@@ -71,7 +71,7 @@ print(rpc(s, "system.version"))
 | `window.list` / `.create` / `.kill` / `.focus` / `.rename` / `.reorder` / `.ensure` | Window CRUD | `shux window <verb>` |
 | `pane.list` / `.split` / `.focus` / `.focus_dir` / `.resize` / `.zoom` / `.swap` / `.kill` / `.ensure` | Pane CRUD + layout ops | `shux pane <verb>` |
 | `pane.send_keys` | Forward keystrokes to a pane | `shux pane send-keys -t "..."` |
-| `pane.run` | Run a command, await exit | `shux pane run -- ...` |
+| `pane.run_command` | Run a command in the pane's shell; returns its exit code and exactly what it wrote | `shux pane run -c '...'` |
 | `pane.capture` | Read VT-rendered text from a pane | `shux pane capture` |
 
 ## Identifying things
@@ -93,9 +93,17 @@ shux session create build --ensure
 # Pin the initial pane's border label when app OSC titles are noisy:
 shux session create agent --title agent -- codex --yolo
 
-# Run a command, get exit code:
-shux pane run -s build -- cargo test
-echo $?   # 0 on success, exit code of cargo test on failure
+# Run a command in the pane's shell; get its exit code and its output:
+shux --format json pane run -s build -c 'cargo test' | jq '{exit_code, stdout}'
+# stdout is what the command wrote (stdout and stderr, as the terminal got
+# them, ANSI-stripped, first 1 MiB; `truncated` says if more was dropped).
+# The CLI's own exit status is not the command's: read `exit_code`.
+# A pane runs one command at a time: while one runs, another `pane run` is
+# refused with the running command's id (wait for it, or cancel it, then retry).
+# A command that timed out still holds the pane until its program ends: cancel
+# it (Ctrl-C) to take the pane back.
+# `--async` results stay queryable with `shux rpc call pane.command_status`
+# for the daemon's last 64 finished commands.
 
 # Capture the last N lines of pane output:
 shux pane capture -s build --lines 50 --format json
@@ -144,9 +152,9 @@ keystrokes), there are three flavors of input:
    ```bash
    shux pane send-keys -s work --data $(echo -n $'\x1b[A' | base64)  # up arrow
    ```
-3. **`pane.run`** — fire-and-forget; returns when the command exits:
+3. **`pane.run_command`**: runs in the pane's shell, returns when the command exits:
    ```bash
-   shux pane run -s work -- bash -c 'echo done'
+   shux --format json pane run -s work -c 'echo done'   # stdout: "done\n"
    ```
 
 To read what's currently on the pane's VT (think: a stable, ANSI-stripped

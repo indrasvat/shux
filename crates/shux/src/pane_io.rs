@@ -57,6 +57,16 @@ pub(crate) struct PaneCheckpoint {
     default_colors: shux_vt::TerminalDefaultColors,
 }
 
+/// How [`PaneIoState::start_command`] went.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CommandStart {
+    Started(uuid::Uuid),
+    /// The pane is held by this command, in this state (`running` or
+    /// `timed_out`).
+    Busy(uuid::Uuid, String),
+    PaneGone,
+}
+
 /// Shared state for pane I/O operations (PTY writes, VT state, command tracking).
 ///
 /// This is the bridge between the RPC handlers and the per-pane PTY read loops.
@@ -281,18 +291,53 @@ impl PaneIoState {
     }
 
     /// Sends `bytes` to `pane_id` through `permit`, ending an open paste
-    /// first so they cannot land inside it.
+    /// first so they cannot land inside it. `false` when the pane is gone.
     pub(crate) fn send_outside_paste(
         &mut self,
         pane_id: shux_core::model::PaneId,
         permit: InputPermit,
         bytes: Vec<u8>,
-    ) {
+    ) -> bool {
         if self.is_current_writer(pane_id, &permit) && self.open_paste(pane_id).is_some() {
             self.open_pastes.remove(&pane_id);
-            permit.send([PASTE_END, &bytes].concat());
+            permit.send([PASTE_END, &bytes].concat())
         } else {
-            permit.send(bytes);
+            permit.send(bytes)
+        }
+    }
+
+    /// Track `prepared` as `pane_id`'s running command and queue its line
+    /// through `permit`, both under this one lock. Its timeout counts from
+    /// `requested_at`, so time spent waiting for the permit is not given twice.
+    pub(crate) fn start_command(
+        &mut self,
+        pane_id: shux_core::model::PaneId,
+        permit: InputPermit,
+        prepared: shux_pty::PreparedCommand,
+        (requested_at, timeout): (std::time::Instant, std::time::Duration),
+        completion_tx: Option<tokio::sync::oneshot::Sender<shux_pty::CommandResult>>,
+    ) -> CommandStart {
+        if !self.is_current_writer(pane_id, &permit) {
+            return CommandStart::PaneGone;
+        }
+        let left = timeout.saturating_sub(requested_at.elapsed());
+        match self
+            .cmd_engine
+            .register(pane_id.0, prepared, left, completion_tx)
+        {
+            Err(running) => {
+                let state = self.cmd_engine.get_status(running).map(|r| r.state);
+                CommandStart::Busy(running, state.unwrap_or_else(|| "running".into()))
+            }
+            Ok((id, line)) => {
+                if self.send_outside_paste(pane_id, permit, line.into_bytes()) {
+                    CommandStart::Started(id)
+                } else {
+                    // The PTY task stopped reading before its `forget_pane`.
+                    self.cmd_engine.forget_pane(pane_id.0);
+                    CommandStart::PaneGone
+                }
+            }
         }
     }
 
@@ -308,7 +353,13 @@ impl PaneIoState {
             .writers
             .get(&pane_id)?
             .try_reserve_in(bytes.len(), lane);
-        Some(permit.map(|permit| self.send_outside_paste(pane_id, permit, bytes)))
+        Some(permit.and_then(|permit| {
+            if self.send_outside_paste(pane_id, permit, bytes) {
+                Ok(())
+            } else {
+                Err(mpsc::error::TrySendError::Closed(()))
+            }
+        }))
     }
 
     /// Whether `incarnation` is still the PTY task that owns `pane_id`.
@@ -327,6 +378,9 @@ impl PaneIoState {
                 token.cancel();
             }
             self.writers.remove(pane_id);
+            // A command still running in the pane is answered now, not at
+            // its timeout.
+            self.cmd_engine.forget_pane(pane_id.0);
             self.sync_gates.remove(pane_id);
             self.resizers.remove(pane_id);
             if let Some(rx) = self.pty_done.remove(pane_id) {
@@ -533,6 +587,93 @@ pub(crate) fn diff_lookup_checkpoint(
 mod tests {
     use super::*;
     use futures::FutureExt as _;
+
+    /// The PTY task stops reading after a command reserved room but before it
+    /// queued its line: the command must not be left running, its line lost.
+    #[tokio::test]
+    async fn a_command_whose_pane_ends_before_its_line_is_queued_is_not_left_running() {
+        let mut state = PaneIoState::new();
+        let pane_id = shux_core::model::PaneId::new();
+        let (writer, input) = crate::pane_input::channel();
+        state.writers.insert(pane_id, writer.clone());
+        let prepared = shux_pty::CommandEngine::prepare("echo hi", &[]);
+        let permit = writer.reserve(prepared.line().len()).await.unwrap();
+        // What the PTY task does on its way out: stop reading, then answer
+        // whatever was running.
+        drop(input);
+        state.cmd_engine.forget_pane(pane_id.0);
+
+        let timeout = std::time::Duration::from_secs(30);
+        let start = state.start_command(
+            pane_id,
+            permit,
+            prepared,
+            (std::time::Instant::now(), timeout),
+            None,
+        );
+        assert_eq!(start, CommandStart::PaneGone);
+        let next = shux_pty::CommandEngine::prepare("true", &[]);
+        assert!(
+            state
+                .cmd_engine
+                .register(pane_id.0, next, timeout, None)
+                .is_ok(),
+            "the pane was left busy with a command it never received"
+        );
+    }
+
+    /// Time spent waiting for room counts against the command's timeout: a
+    /// caller asking for 1 s is not given another full second after the wait.
+    #[tokio::test]
+    async fn waiting_for_room_counts_against_the_timeout() {
+        let mut state = PaneIoState::new();
+        let pane_id = shux_core::model::PaneId::new();
+        let (writer, _input) = crate::pane_input::channel();
+        state.writers.insert(pane_id, writer.clone());
+        let prepared = shux_pty::CommandEngine::prepare("sleep 60", &[]);
+        let permit = writer.reserve(prepared.line().len()).await.unwrap();
+        // unwrap: any running machine has been up for more than 2 s.
+        let asked = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(2))
+            .unwrap();
+        let timeout = std::time::Duration::from_secs(1);
+        let start = state.start_command(pane_id, permit, prepared, (asked, timeout), None);
+        assert!(matches!(start, CommandStart::Started(_)), "{start:?}");
+        assert_eq!(
+            state.cmd_engine.check_timeouts().len(),
+            1,
+            "the command was given its whole timeout again after waiting for room"
+        );
+    }
+
+    /// The refusal names the holder's state from the same lock that refused,
+    /// so it cannot describe a command that finished in between.
+    #[tokio::test]
+    async fn a_refusal_names_the_holders_state() {
+        let mut state = PaneIoState::new();
+        let pane_id = shux_core::model::PaneId::new();
+        let (writer, _input) = crate::pane_input::channel();
+        state.writers.insert(pane_id, writer.clone());
+        let now = std::time::Instant::now();
+        let start = |state: &mut PaneIoState, timeout| {
+            let prepared = shux_pty::CommandEngine::prepare("read -r x", &[]);
+            let permit = writer.try_reserve(prepared.line().len()).unwrap();
+            state.start_command(pane_id, permit, prepared, (now, timeout), None)
+        };
+        let CommandStart::Started(first) = start(&mut state, std::time::Duration::ZERO) else {
+            panic!("the first command did not start");
+        };
+        let long = std::time::Duration::from_secs(30);
+        assert_eq!(
+            start(&mut state, long),
+            CommandStart::Busy(first, "running".into())
+        );
+        state.cmd_engine.check_timeouts();
+        assert_eq!(
+            start(&mut state, long),
+            CommandStart::Busy(first, "timed_out".into())
+        );
+    }
 
     #[test]
     fn one_bump_reaches_every_subscriber() {

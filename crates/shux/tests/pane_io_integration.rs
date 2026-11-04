@@ -60,8 +60,7 @@ async fn run_pane_pty_task(
                             } else {
                                 Vec::new()
                             };
-                            let output = String::from_utf8_lossy(data);
-                            let _completed = state.cmd_engine.process_output(pane_id.0, &output);
+                            let _completed = state.cmd_engine.process_output(pane_id.0, data);
                             terminal_responses
                         };
                         for response in &terminal_responses {
@@ -400,13 +399,12 @@ fn register_pane_io_methods(
 
                     let (command_id, pty_command) = {
                         let mut state = io.lock().await;
-                        state.cmd_engine.start_command(
-                            pane_id.0,
-                            command,
-                            &args,
-                            timeout,
-                            completion_tx,
-                        )
+                        state
+                            .cmd_engine
+                            .start_command(pane_id.0, command, &args, timeout, completion_tx)
+                            .map_err(|busy| {
+                                shux_rpc::RpcError::internal(&format!("pane busy with {busy}"))
+                            })?
                     };
 
                     {

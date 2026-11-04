@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 use crate::lens_render::{
     glance_row_text, lens_pixel_budget_check, parse_glance_masks, render_lens_heat_png,
 };
-use crate::pane_io::{PaneIoState, ResizeRequest, diff_lookup_checkpoint};
+use crate::pane_io::{CommandStart, PaneIoState, ResizeRequest, diff_lookup_checkpoint};
 use crate::pane_record::{EndedBy, requested_length};
 
 /// The pane's PTY task still takes input: it closes that channel before it
@@ -60,8 +60,14 @@ async fn send_to_pane(
         .reserve(bytes.len())
         .await
         .map_err(|_| shux_rpc::RpcError::internal("PTY write channel closed"))?;
-    io.lock().await.send_outside_paste(pane_id, permit, bytes);
-    Ok(())
+    if io.lock().await.send_outside_paste(pane_id, permit, bytes) {
+        Ok(())
+    } else {
+        Err(shux_rpc::RpcError::not_found(
+            "pane PTY",
+            &pane_id.to_string(),
+        ))
+    }
 }
 
 /// Register pane I/O methods (send_keys, run_command, command_status, command_cancel, capture).
@@ -279,19 +285,38 @@ pub(crate) fn register_pane_io_methods(
                         (None, None)
                     };
 
-                    let (command_id, pty_command) = {
-                        let mut state = io.lock().await;
-                        state.cmd_engine.start_command(
-                            pane_id.0,
-                            command,
-                            &args,
-                            timeout,
-                            completion_tx,
-                        )
-                    };
-
+                    // Room in the pane's input is reserved first, so tracking
+                    // the command and queueing its line happen under one lock:
+                    // nothing tracked was never sent, nothing sent is untracked.
+                    let requested_at = std::time::Instant::now();
+                    let prepared = shux_pty::CommandEngine::prepare(command, &args);
                     drop(params);
-                    send_to_pane(&io, pane_id, pty_command.into_bytes()).await?;
+                    let writer = io.lock().await.writers.get(&pane_id).cloned().ok_or_else(
+                        || shux_rpc::RpcError::not_found("pane PTY", &pane_id.to_string()),
+                    )?;
+                    let permit = tokio::time::timeout(timeout, writer.reserve(prepared.line().len()))
+                        .await
+                        .map_err(|_| pane_input_full(timeout))?
+                        .map_err(|_| shux_rpc::RpcError::internal("PTY write channel closed"))?;
+                    let start = io.lock().await.start_command(
+                        pane_id,
+                        permit,
+                        prepared,
+                        (requested_at, timeout),
+                        completion_tx,
+                    );
+                    let command_id = match start {
+                        CommandStart::Started(id) => id,
+                        CommandStart::Busy(running, state) => {
+                            return Err(pane_busy(running, &state));
+                        }
+                        CommandStart::PaneGone => {
+                            return Err(shux_rpc::RpcError::not_found(
+                                "pane PTY",
+                                &pane_id.to_string(),
+                            ));
+                        }
+                    };
 
                     if is_async {
                         return Ok(serde_json::json!({
@@ -308,26 +333,7 @@ pub(crate) fn register_pane_io_methods(
                             shux_rpc::RpcError::internal("command completion channel dropped")
                         })?;
 
-                    // Capture text from VT
-                    let stdout = {
-                        let state = io.lock().await;
-                        state
-                            .vts
-                            .get(&pane_id)
-                            .map(|vt| {
-                                let text = vt.capture_text(Some(50));
-                                shux_pty::strip_ansi(&text)
-                            })
-                            .unwrap_or_default()
-                    };
-
-                    Ok(serde_json::json!({
-                        "command_id": result.command_id.to_string(),
-                        "state": result.state,
-                        "exit_code": result.exit_code,
-                        "stdout": stdout,
-                        "runtime_ms": result.runtime_ms,
-                    }))
+                    command_result_json(&result)
                 }
             },
         )
@@ -355,12 +361,7 @@ pub(crate) fn register_pane_io_methods(
                         .get_status(command_id)
                         .ok_or_else(|| shux_rpc::RpcError::not_found("command", cmd_id_str))?;
 
-                    Ok(serde_json::json!({
-                        "command_id": result.command_id.to_string(),
-                        "state": result.state,
-                        "exit_code": result.exit_code,
-                        "runtime_ms": result.runtime_ms,
-                    }))
+                    command_result_json(&result)
                 }
             },
         )
@@ -398,11 +399,13 @@ pub(crate) fn register_pane_io_methods(
                     ) {
                         tracing::warn!(%pane_id, "pane is gone; Ctrl-C not delivered");
                     }
+                    // A timed-out command keeps its frozen `timed_out`.
+                    let cancelled = state.cmd_engine.get_status(command_id).map(|r| r.state);
                     drop(state);
 
                     Ok(serde_json::json!({
                         "command_id": cmd_id_str,
-                        "state": "cancelled",
+                        "state": cancelled,
                     }))
                 }
             },
@@ -1824,6 +1827,50 @@ pub(crate) fn register_pane_io_methods(
         )
 }
 
+/// `state` is the holder's own: once it has timed out, waiting cannot free
+/// the pane, only its program ending or a cancel can.
+fn pane_busy(running: uuid::Uuid, state: &str) -> shux_rpc::RpcError {
+    let (message, hint) = if state == "running" {
+        (
+            format!("the pane is still running command {running}"),
+            "wait for it (pane.command_status) or cancel it (pane.command_cancel), then retry",
+        )
+    } else {
+        (
+            format!(
+                "the pane is still held by command {running} ({state}): its program may still be running; cancel it (pane.command_cancel) to take the pane back"
+            ),
+            "cancel it (pane.command_cancel) to stop its program, then retry",
+        )
+    };
+    shux_rpc::RpcError::with_message_and_data(
+        shux_rpc::ErrorCode::ResourceExhausted,
+        message,
+        serde_json::json!({
+            "resource": "pane command",
+            "running_command_id": running.to_string(),
+            "running_command_state": state,
+            "hint": hint,
+        }),
+    )
+}
+
+fn pane_input_full(timeout: Duration) -> shux_rpc::RpcError {
+    shux_rpc::RpcError::with_message_and_data(
+        shux_rpc::ErrorCode::ResourceExhausted,
+        format!("the pane took no input for {}s", timeout.as_secs()),
+        serde_json::json!({ "resource": "pane input", "timeout_secs": timeout.as_secs() }),
+    )
+}
+
+/// A command's result as `pane.run_command` and `pane.command_status` report
+/// it: every field, serialized from the one frozen result.
+fn command_result_json(
+    result: &shux_pty::CommandResult,
+) -> Result<serde_json::Value, shux_rpc::RpcError> {
+    serde_json::to_value(result).map_err(|e| shux_rpc::RpcError::internal(&e.to_string()))
+}
+
 /// Waits for the pane's PTY task to apply a queued resize.
 async fn resize_acked(ack: tokio::sync::oneshot::Receiver<()>) -> Result<(), shux_rpc::RpcError> {
     let patience = crate::patience::peer_patience();
@@ -2404,6 +2451,56 @@ mod tests {
         )
         .await;
         assert_eq!(writer_rx.recv().await.unwrap(), b"\x1b[201~\x03");
+        harness.stop().await;
+    }
+
+    /// A pane whose input is full: the command gives up within its own
+    /// timeout, leaves the pane free, and a later command's line is the next
+    /// thing the pane receives.
+    #[tokio::test]
+    async fn a_command_that_cannot_reach_a_stalled_pane_leaves_it_free() {
+        let harness = RpcHarness::new();
+        let (_, _, pane_id) = harness.seed_session("stalled").await;
+        let mut writer_rx = harness.seed_io(pane_id, b"").await;
+        let mut queued = 0;
+        while harness
+            .io
+            .lock()
+            .await
+            .try_send_outside_paste(pane_id, b"x".to_vec(), crate::pane_input::Lane::Main)
+            .is_some_and(|sent| sent.is_ok())
+        {
+            queued += 1;
+        }
+        assert!(queued > 0, "the pane's input never filled");
+
+        let run = |command: &'static str, is_async: bool| {
+            harness.router.dispatch(
+                "pane.run_command",
+                Some(serde_json::json!({
+                    "pane_id": pane_id.to_string(),
+                    "command": command,
+                    "timeout": 1,
+                    "async": is_async,
+                })),
+            )
+        };
+        let stalled = tokio::time::timeout(Duration::from_secs(20), run("true", false))
+            .await
+            .expect("run_command outlived its timeout waiting on a stalled pane")
+            .expect_err("a command that never reached the pane reported success");
+        assert_eq!(stalled.code, shux_rpc::ErrorCode::ResourceExhausted.code());
+
+        for _ in 0..queued {
+            assert_eq!(writer_rx.recv().await.unwrap(), b"x");
+        }
+        let next = run("echo next", true).await.expect("the pane stayed busy");
+        let line = String::from_utf8(writer_rx.recv().await.unwrap()).unwrap();
+        let id = next["command_id"].as_str().unwrap().replace('-', "");
+        assert!(
+            line.contains(&id) && line.contains("echo next"),
+            "the pane received {line:?}, not the later command"
+        );
         harness.stop().await;
     }
 

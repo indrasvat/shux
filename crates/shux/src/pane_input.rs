@@ -247,16 +247,18 @@ impl PaneWriter {
 }
 
 impl InputPermit {
-    /// Queues `bytes`, or drops them if the pane is gone.
-    pub fn send(self, bytes: Vec<u8>) {
+    /// Queues `bytes`; `false` when the pane is gone and they were dropped.
+    pub fn send(self, bytes: Vec<u8>) -> bool {
         let input = PaneInput {
             bytes,
             budget: self.budget,
         };
-        let _ = self.tx.send(Queued {
-            input,
-            _slot: self.slot,
-        });
+        self.tx
+            .send(Queued {
+                input,
+                _slot: self.slot,
+            })
+            .is_ok()
     }
 
     /// Whether this is room in `writer`'s channel.

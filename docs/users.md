@@ -78,7 +78,7 @@ Useful for scripts and agents that drive an attached session:
 
 ```bash
 shux pane send-keys -s work -t "git status\n"   # types "git status<Enter>"
-shux pane run -s work cargo test                # runs cargo test, waits for completion
+shux pane run -s work -c 'cargo test'           # runs it in the pane's shell, prints its output
 shux pane capture -s work --lines 50            # captures last 50 lines as text
 shux pane record -s work -p <pane-id> --to pane.raw --duration-ms 10000
 ```
