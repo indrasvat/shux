@@ -836,17 +836,18 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     pane,
                     states,
                     matching,
+                    id,
+                    after,
                     timeout,
                 } => {
-                    cli::handle_pane_wait_status(
-                        &mut stream,
-                        &pane,
-                        &states,
-                        &matching,
-                        timeout,
-                        args.format,
-                    )
-                    .await
+                    let wait = cli::StatusWait {
+                        states: &states,
+                        matching: matching.as_deref(),
+                        id: id.as_deref(),
+                        after,
+                        timeout_ms: timeout,
+                    };
+                    cli::handle_pane_wait_status(&mut stream, &pane, &wait, args.format).await
                 }
                 PaneCommand::WaitExit { pane, timeout } => {
                     cli::handle_pane_wait_exit(&mut stream, &pane, timeout, args.format).await

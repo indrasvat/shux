@@ -165,6 +165,9 @@ pub struct RecordView {
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub msg: Option<String>,
+    /// The stamp of the last report naming this record, identical or not.
+    #[serde(default)]
+    pub reported_generation: u64,
 }
 
 #[cfg(test)]

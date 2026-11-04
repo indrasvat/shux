@@ -113,7 +113,17 @@ proptest! {
         let whole = enabled(&stream);
         let singles: Vec<&[u8]> = stream.chunks(1).collect();
         let (_, bytewise) = drive(&singles, true);
-        let records = |vt: &VirtualTerminal| vt.program_status_records().map(|r| (r.seen, r.records));
+        // Stamps are process-global, so two runs never share them.
+        let records = |vt: &VirtualTerminal| {
+            vt.program_status_records().map(|r| {
+                let unstamped: Vec<_> = r
+                    .records
+                    .into_iter()
+                    .map(|v| shux_program_status::RecordView { reported_generation: 0, ..v })
+                    .collect();
+                (r.seen, unstamped)
+            })
+        };
         prop_assert_eq!(records(&whole), records(&bytewise));
     }
 

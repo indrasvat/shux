@@ -1370,6 +1370,12 @@ pub enum PaneCommand {
     /// or time out. Mirrors `pane.wait_status`. Exit 0 matched, 1 timeout,
     /// 2 bad arguments, 3 the pane exited, program status is off, the
     /// daemon went away, or any other error.
+    ///
+    /// To wait for one command typed into a shell, have it report under its
+    /// own id and wait on that: `--id ID` ignores every other record,
+    /// including a `done` an earlier command left behind. Reusing an id?
+    /// Read `as_of` from `pane status` before sending the command, then pass
+    /// `--after AS_OF` so only a newer report counts.
     #[command(name = "wait-status")]
     WaitStatus {
         /// Pane id — full UUID or any unambiguous prefix.
@@ -1381,9 +1387,19 @@ pub enum PaneCommand {
         #[arg(long = "state", value_delimiter = ',', required = true)]
         states: Vec<String>,
 
-        /// `top`: the most urgent record is in the set. `any`: some record is.
-        #[arg(long = "match", default_value = "top", value_parser = ["top", "any"])]
-        matching: String,
+        /// `top` (default): the most urgent record is in the set. `any`: some
+        /// record is. Not with `--id`.
+        #[arg(long = "match", value_parser = ["top", "any"], conflicts_with = "id")]
+        matching: Option<String>,
+
+        /// Only the record with exactly this id counts.
+        #[arg(long)]
+        id: Option<String>,
+
+        /// Only a report of `--id` newer than this `as_of` (from `pane status`)
+        /// counts.
+        #[arg(long, value_name = "AS_OF", requires = "id")]
+        after: Option<u64>,
 
         /// Deadline. Human duration (`30s`, `500ms`); at most 600s.
         #[arg(long, default_value = "30s", value_parser = parse_duration_ms)]

@@ -19,6 +19,8 @@ struct Entry {
     reported: u64,
     /// Last time the content changed; drives display order.
     updated: u64,
+    /// The caller's stamp for the last report naming this record.
+    stamp: u64,
 }
 
 impl StatusTable {
@@ -40,9 +42,12 @@ impl StatusTable {
         self.entries.is_empty()
     }
 
-    pub fn apply(&mut self, report: Report) {
+    /// `stamp` marks the record a `Set` names, even when it changes nothing,
+    /// so a reader can tell a repeated report from no report. It never moves
+    /// the revision.
+    pub fn apply(&mut self, report: Report, stamp: u64) {
         match report {
-            Report::Set { id, record } => self.set(id, record),
+            Report::Set { id, record } => self.set(id, record, stamp),
             Report::Clear { id: None } => self.retain(|_| false),
             Report::Clear { id: Some(id) } => {
                 self.retain(|e| !e.id.as_ref().is_some_and(|eid| eid.is_within(&id)))
@@ -92,11 +97,12 @@ impl StatusTable {
         })
     }
 
-    fn set(&mut self, id: Option<RecordId>, record: Record) {
+    fn set(&mut self, id: Option<RecordId>, record: Record, stamp: u64) {
         self.seq += 1;
         let seq = self.seq;
         if let Some(e) = self.entries.iter_mut().find(|e| e.id == id) {
             e.reported = seq;
+            e.stamp = stamp;
             if e.record != record {
                 e.record = record;
                 e.updated = seq;
@@ -119,6 +125,7 @@ impl StatusTable {
             record,
             reported: seq,
             updated: seq,
+            stamp,
         });
         self.revision += 1;
     }
@@ -161,6 +168,7 @@ impl StatusTable {
             app: self.effective_app(e).map(str::to_owned),
             title: e.record.title.clone(),
             msg: e.record.msg.clone(),
+            reported_generation: e.stamp,
         }
     }
 }
@@ -174,7 +182,7 @@ mod tests {
 
     fn apply(t: &mut StatusTable, payload: &str) {
         match decode(payload.as_bytes()) {
-            Ok(Message::Report(r)) => t.apply(r),
+            Ok(Message::Report(r)) => t.apply(r, 0),
             other => panic!("{payload:?}: {other:?}"),
         }
     }
@@ -184,6 +192,30 @@ mod tests {
             .into_iter()
             .map(|r| r.id.map(|i| i.as_str().to_owned()))
             .collect()
+    }
+
+    /// A repeated report changes nothing a reader is told about, but it is
+    /// still a report: its stamp moves, so a wait for a newer one can see it.
+    #[test]
+    fn every_report_restamps_its_record_without_moving_the_revision() {
+        let mut t = StatusTable::new();
+        let report = |p: &str| match decode(p.as_bytes()) {
+            Ok(Message::Report(r)) => r,
+            other => panic!("{p:?}: {other:?}"),
+        };
+        t.apply(report("state=done:id=job"), 7);
+        t.apply(report("state=working:id=other"), 8);
+        let rev = t.revision();
+        t.apply(report("state=done:id=job"), 9);
+        assert_eq!(t.revision(), rev, "an identical report moved the revision");
+        let stamp = |id: &str| {
+            t.records()
+                .into_iter()
+                .find(|r| r.id.as_ref().is_some_and(|i| i.as_str() == id))
+                .map(|r| r.reported_generation)
+        };
+        assert_eq!(stamp("job"), Some(9));
+        assert_eq!(stamp("other"), Some(8), "a report restamped another record");
     }
 
     #[test]

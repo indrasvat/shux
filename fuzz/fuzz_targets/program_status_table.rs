@@ -43,7 +43,7 @@ fuzz_target!(|ops: Vec<Op>| {
                 let mut bytes = p.into_bytes();
                 bytes.extend(extra.into_iter().take(32));
                 if let Ok(Message::Report(r)) = decode(&bytes) {
-                    table.apply(r);
+                    table.apply(r, 0);
                 }
             }
             Op::Clear { id } => {
@@ -52,7 +52,7 @@ fuzz_target!(|ops: Vec<Op>| {
                     None => "state=clear".to_owned(),
                 };
                 if let Ok(Message::Report(r)) = decode(p.as_bytes()) {
-                    table.apply(r);
+                    table.apply(r, 0);
                 }
             }
             Op::Prompt => table.on_prompt_start(),

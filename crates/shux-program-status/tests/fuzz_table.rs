@@ -178,7 +178,7 @@ fn run(ops: &[Op]) -> Result<(), TestCaseError> {
     for (step, op) in ops.iter().enumerate() {
         let rev = table.revision();
         match to_report(op) {
-            Some(r) => table.apply(r),
+            Some(r) => table.apply(r, step as u64),
             None => match op {
                 Op::Prompt => table.on_prompt_start(),
                 Op::Exit => table.on_process_exit(),

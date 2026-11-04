@@ -1920,6 +1920,15 @@ pub fn print_pane_status_plain(result: &serde_json::Value) {
     }
 }
 
+/// The state an outcome matched on: an `--id` wait's own record, which may
+/// not be the pane's most urgent one.
+fn wait_status_state(result: &serde_json::Value) -> Option<&str> {
+    result
+        .pointer("/record/state")
+        .or_else(|| result.pointer("/summary/state"))
+        .and_then(|v| v.as_str())
+}
+
 /// `pane wait-status --format plain`: `OUTCOME\tPANE_ID\tSTATE`.
 pub fn print_pane_wait_status_plain(result: &serde_json::Value) {
     let s = |p: &str| result.pointer(p).and_then(|v| v.as_str()).unwrap_or("");
@@ -1927,7 +1936,7 @@ pub fn print_pane_wait_status_plain(result: &serde_json::Value) {
         "{}\t{}\t{}",
         s("/outcome"),
         s("/pane_id"),
-        s("/summary/state")
+        wait_status_state(result).unwrap_or("")
     );
 }
 
@@ -1936,10 +1945,7 @@ pub fn print_pane_wait_status(result: &serde_json::Value, states: &[String]) {
     let pane_id = short_id(result.get("pane_id").and_then(|v| v.as_str()).unwrap_or(""));
     match result.get("outcome").and_then(|v| v.as_str()).unwrap_or("") {
         "matched" => {
-            let state = result
-                .pointer("/summary/state")
-                .and_then(|v| v.as_str())
-                .unwrap_or("?");
+            let state = wait_status_state(result).unwrap_or("?");
             println!(
                 "{} pane {} is {}",
                 success("✓"),

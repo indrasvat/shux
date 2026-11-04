@@ -23,6 +23,13 @@ fn next_generation() -> u64 {
     GENERATION.fetch_add(1, Ordering::Relaxed) + 1
 }
 
+/// The newest stamp handed out so far. Read under the lock that orders a
+/// pane's reports, every record it can see is stamped at or below it, and
+/// every report accepted afterwards above it.
+pub fn as_of() -> u64 {
+    GENERATION.load(Ordering::Relaxed)
+}
+
 /// A fresh generation for a terminal whose program status is off.
 pub(crate) fn disabled_generation() -> u64 {
     next_generation()
@@ -101,8 +108,9 @@ impl VtProgramStatus {
         match wire::decode(payload) {
             Ok(Message::Query) => Some(wire::query_reply(terminator)),
             Ok(Message::Report(report)) => {
+                let stamp = next_generation();
                 self.change(|t, seen| {
-                    t.apply(report);
+                    t.apply(report, stamp);
                     *seen = true;
                 });
                 None

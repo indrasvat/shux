@@ -846,6 +846,25 @@ mod tests {
         finish(h).await;
     }
 
+    /// A program that reports and exits at once: a wait for that report's id
+    /// sees the report, not just the exit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_wait_for_a_final_report_matches_after_the_exit() {
+        let h = RpcHarness::new();
+        let (_s, _w, pane) = h.seed_session("status-final-id").await;
+        spawn_sh(&h, pane, r"printf '\033]7501;state=error:id=final\033\\'").await;
+        wait_exited(&h, pane).await;
+        let waited = dispatch_ok(
+            &h.router,
+            "pane.wait_status",
+            json!({"pane_id": pane.to_string(), "state": ["done", "error"], "id": "final", "timeout_ms": 1_000}),
+        )
+        .await;
+        assert_eq!(waited["outcome"], "matched", "{waited}");
+        assert_eq!(waited["record"]["state"], "error", "{waited}");
+        finish(h).await;
+    }
+
     /// A spawn whose future is dropped mid-flight (an RPC client hung up)
     /// must not leave the pane unspawnable.
     #[tokio::test(flavor = "multi_thread")]

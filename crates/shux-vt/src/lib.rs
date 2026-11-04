@@ -41,7 +41,7 @@ pub use parser::{MouseMode, ScrollRegion, TerminalModes, VtHandler};
 #[cfg(any(test, fuzzing))]
 #[doc(hidden)]
 pub use program_status::fuzzing;
-pub use program_status::{StatusPublication, StatusRecords};
+pub use program_status::{StatusPublication, StatusRecords, as_of as program_status_as_of};
 pub use settle::{FrameStability, frame_stability_hash};
 
 /// Pixel size of one cell as DECLARED to pane children through

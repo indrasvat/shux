@@ -128,6 +128,43 @@ shux session kill job
 shux pane wait-exit "$P" --timeout 10m                            # or wait on a pane you already have
 ```
 
+## Run a command in a live shell and get its output
+
+When the command must run in a shell that already exists (its cwd, its env,
+a venv it activated), use `pane run`. It returns exactly what the command
+wrote, and its exit code, with no prompt, no echoed line and no marker of
+yours to grep for:
+
+```bash
+R=$(shux --format json pane run -s dev --timeout 60 -c 'cargo test -q')
+echo "$R" | jq -r .stdout          # the command's own output (stdout and stderr, merged)
+echo "$R" | jq -e '.exit_code == 0'
+```
+
+- **One command per pane.** While one runs, another `pane run` is refused,
+  naming the running `command_id`. Wait for it (`--async`, then
+  `shux rpc call pane.command_status`), or cancel it with `pane.command_cancel`.
+- **A timeout returns `timed_out`, but the program may still be running.** The
+  pane stays held, and the next command is refused rather than typed into
+  it, until the program ends or you cancel it.
+- Keep `-c` to one line: no trailing `&`, `#` comment or heredoc.
+
+## Wait for one command's own report
+
+A command can report its own end over OSC 7501. Nothing is drawn, so no echo
+can match it. Give each command its own id, and wait on exactly that id:
+a plain `--state done` also matches the `done` an earlier command left.
+
+```bash
+shux pane send-keys -s dev --text 'make deploy; printf "\033]7501;state=done:id=deploy-7\033\\"'
+shux pane send-keys -s dev --data DQ==
+shux pane wait-status "$P" --id deploy-7 --state done,error --timeout 10m
+```
+
+Reusing an id? Read the floor first, and only a newer report counts:
+`AS_OF=$(shux --format json pane status "$P" | jq .result.as_of)`, send the command,
+then `shux pane wait-status "$P" --id deploy --after "$AS_OF" --state done,error`.
+
 `pane split --wait` runs in the source pane's directory and `window create
 --wait` in the daemon's unless you pass `--cwd`. `shux`'s own exit code says
 whether the *wait* worked — 0 exited, 1 timeout, 2 no such pane or a bad
@@ -311,6 +348,10 @@ Need plain text of the screen?     → pane.capture    (shux pane capture)
 Need to block until text appears?  → pane.wait_for   (shux pane wait-for --text|--regex)
 Need to know when an agent in a
 pane is blocked on you or done?    → pane.wait_status (shux pane wait-status <PANE> --state blocked,done)
+Need one command's output from a
+shell that already exists?         → pane.run_command (shux pane run -s S -c '<cmd>')
+Need to wait for one command typed
+into a shell, by its own report?   → pane.wait_status (shux pane wait-status <PANE> --id <ID> --state done,error)
 Need a program's exit code (a
 test run, a build)?                → pane.wait_exit  (shux pane split --wait -- <argv>, or pane wait-exit <PANE>)
 Need live sampled PTY output?      → pane.output.watch (sealed data-plane, sampled)
