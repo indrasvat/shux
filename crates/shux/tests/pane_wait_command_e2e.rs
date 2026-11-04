@@ -226,7 +226,7 @@ fn the_script_installs_once_and_old_bash_is_told_why_not() {
         .expect("bash");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "__shux_osc133_precmd; echo mine|\\e]133;C;shux=$((__shux_osc133_ran = $$))\\a",
+        "__shux_osc133_precmd; echo mine|\\e]133;C;shux=$((__shux_osc133_ran[0] = $$))\\a",
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -445,6 +445,26 @@ fn an_allexport_child_that_does_not_source_the_integration_reports_nothing() {
     assert!(
         got.contains("133;A") && !got.contains("133;D"),
         "the child's prompt ended its parent's command: {got:?} {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `exec bash` under allexport keeps the PID and inherits the hook: the new
+/// shell's first prompt must not report `exec` as ended with exit 0.
+#[test]
+fn an_allexport_exec_of_bash_reports_no_made_up_end() {
+    let bash = modern_bash().expect("no bash 4.4+ installed");
+    let out = Command::new(&bash)
+        .env("SHUX_BIN", env!("CARGO_BIN_EXE_shux"))
+        .env("CHILD_BASH", &bash)
+        .args(["--noprofile", "--norc", "-i", "-c"])
+        .arg(r#"set -a; eval "$("$SHUX_BIN" shell-integration bash)"; : "${PS0@P}"; exec "$CHILD_BASH" --noprofile --norc -c '__shux_osc133_precmd'"#)
+        .output()
+        .expect("bash");
+    let got = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        got.contains("133;A") && !got.contains("133;D"),
+        "the exec'd shell's prompt made up an end: {got:?} {}",
         String::from_utf8_lossy(&out.stderr)
     );
 }

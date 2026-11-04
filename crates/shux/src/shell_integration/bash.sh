@@ -8,9 +8,10 @@
 #   eval "$(shux shell-integration bash)"
 __shux_osc133_install() {
   [[ $- == *i* ]] || return 0
-  # A shell reading its rc has started no command. Inherited (allexport
-  # exports it), the flag would make its first prompt end its parent's.
-  __shux_osc133_ran=
+  # A shell reading its rc has started no command. The flag is an array
+  # because bash never exports one: not to a child, not across `exec`, even
+  # under allexport, so no other shell's prompt can read it as its own.
+  __shux_osc133_ran=()
   # Each hook below is added only if absent, so sourcing twice adds none. No
   # function guard: allexport exports functions, and a child would skip.
   if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4))); then
@@ -43,18 +44,17 @@ __shux_osc133_install() {
     return 0
   fi
   # PS0 is expanded in this shell, not a subshell: the arithmetic marks that
-  # this shell (by PID: allexport hands the flag to children) started the
-  # command, and rides harmlessly as a C parameter.
+  # this shell started the command, and rides harmlessly as a C parameter.
   # shellcheck disable=SC2016  # expanded at each prompt, not now
-  [[ ${PS0-} == *'133;C;shux='* ]] || PS0+='\e]133;C;shux=$((__shux_osc133_ran = $$))\a'
+  [[ ${PS0-} == *'133;C;shux='* ]] || PS0+='\e]133;C;shux=$((__shux_osc133_ran[0] = $$))\a'
   __shux_osc133_precmd() {
     local ec=$?
     # Only a command this shell started ends here: a new shell's first
     # prompt (`bash`, `sudo -i` typed into this one) must not end its parent's.
     # With promptvars off PS0 cannot mark that, so every prompt reports.
-    if [[ ${__shux_osc133_ran-} == "$$" ]] || ! shopt -q promptvars; then
+    if [[ ${__shux_osc133_ran[0]-} == "$$" ]] || ! shopt -q promptvars; then
       printf '\e]133;D;%s\a' "$ec"
-      __shux_osc133_ran=
+      __shux_osc133_ran=()
     fi
     printf '\e]133;A\a'
     __shux_osc133_keep "$ec"
