@@ -2047,8 +2047,8 @@ pub fn print_pane_wait_command(result: &serde_json::Value) {
     match result.get("outcome").and_then(|v| v.as_str()).unwrap_or("") {
         "completed" => {
             let code = match result.get("exit_code").and_then(|v| v.as_i64()) {
-                Some(0) => success("0").to_string(),
-                Some(c) => error(&c.to_string()).to_string(),
+                Some(0) => format!("with exit code {}", success("0")),
+                Some(c) => format!("with exit code {}", error(&c.to_string())),
                 None => muted("with no exit code").to_string(),
             };
             println!(

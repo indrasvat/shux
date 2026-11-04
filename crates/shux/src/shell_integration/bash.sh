@@ -42,15 +42,16 @@ __shux_osc133_install() {
     return 0
   fi
   # PS0 is expanded in this shell, not a subshell: the arithmetic marks that
-  # this shell started the command, and rides harmlessly as a C parameter.
+  # this shell (by PID: allexport hands the flag to children) started the
+  # command, and rides harmlessly as a C parameter.
   # shellcheck disable=SC2016  # expanded at each prompt, not now
-  [[ ${PS0-} == *'133;C;shux='* ]] || PS0+='\e]133;C;shux=$((__shux_osc133_ran = 1))\a'
+  [[ ${PS0-} == *'133;C;shux='* ]] || PS0+='\e]133;C;shux=$((__shux_osc133_ran = $$))\a'
   __shux_osc133_precmd() {
     local ec=$?
     # Only a command this shell started ends here: a new shell's first
     # prompt (`bash`, `sudo -i` typed into this one) must not end its parent's.
     # With promptvars off PS0 cannot mark that, so every prompt reports.
-    if [[ -n ${__shux_osc133_ran-} ]] || ! shopt -q promptvars; then
+    if [[ ${__shux_osc133_ran-} == "$$" ]] || ! shopt -q promptvars; then
       printf '\e]133;D;%s\a' "$ec"
       __shux_osc133_ran=
     fi

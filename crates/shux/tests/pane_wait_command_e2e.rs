@@ -226,7 +226,7 @@ fn the_script_installs_once_and_old_bash_is_told_why_not() {
         .expect("bash");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "__shux_osc133_precmd; echo mine|\\e]133;C;shux=$((__shux_osc133_ran = 1))\\a",
+        "__shux_osc133_precmd; echo mine|\\e]133;C;shux=$((__shux_osc133_ran = $$))\\a",
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -399,6 +399,33 @@ fn a_child_of_an_allexport_shell_installs_cleanly() {
         fields[2].matches("__shux_osc133_precmd").count(),
         1,
         "PROMPT_COMMAND got a second hook: {got:?}"
+    );
+}
+
+/// Under allexport bash exports the hook functions too: a child bash that
+/// never sources the integration inherits the prompt hook and the "started a
+/// command" flag, and its first prompt must not end its parent's command.
+#[test]
+fn an_allexport_child_that_does_not_source_the_integration_reports_nothing() {
+    let bash = modern_bash().expect("no bash 4.4+ installed");
+    let out = Command::new(&bash)
+        .env("SHUX_BIN", env!("CARGO_BIN_EXE_shux"))
+        .env("CHILD_BASH", &bash)
+        .args(["--noprofile", "--norc", "-i", "-c"])
+        // `: "${PS0@P}"` expands PS0 as bash does before running a command;
+        // `; true` keeps bash from exec'ing the child in its own PID.
+        .arg(r#"set -a; eval "$("$SHUX_BIN" shell-integration bash)"; : "${PS0@P}"; "$CHILD_BASH" --noprofile --norc -c 'declare -F __shux_osc133_precmd >/dev/null || echo NOT-INHERITED; __shux_osc133_precmd'; true"#)
+        .output()
+        .expect("bash");
+    let got = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !got.contains("NOT-INHERITED"),
+        "the premise failed: {got:?}"
+    );
+    assert!(
+        got.contains("133;A") && !got.contains("133;D"),
+        "the child's prompt ended its parent's command: {got:?} {}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
