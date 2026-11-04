@@ -4,7 +4,7 @@
 //! The typed line frames the command between two markers the shell prints:
 //!
 //! ```text
-//! command -p printf 'SHUX_BE''GIN%s\n' <id>; CMD; __shux_ec=$?;
+//! __shux_ec=$?; command -p printf 'SHUX_BE''GIN%s\n' <id>; (exit "$__shux_ec"); CMD; __shux_ec=$?;
 //! command -p printf 'SHUX_MAR''KER%sEXIT%sSHUX_END\n' <id> "$__shux_ec"; unset __shux_ec
 //! ```
 //!
@@ -128,10 +128,12 @@ impl CommandEngine {
             format!("{} {}", command, shell_escape_args(args))
         };
         // `command -p` skips shell functions and searches the default PATH, not
-        // the pane's: zsh's `command` never runs the builtin. `$?` is read
-        // straight after the command.
+        // the pane's: zsh's `command` never runs the builtin. The pane's `$?`
+        // is restored before the command, and the command's read straight
+        // after it.
         let line = format!(
-            "command -p printf 'SHUX_BE''GIN%s\\n' {marker}; {command}; __shux_ec=$?; \
+            "__shux_ec=$?; command -p printf 'SHUX_BE''GIN%s\\n' {marker}; \
+             (exit \"$__shux_ec\"); {command}; __shux_ec=$?; \
              command -p printf 'SHUX_MAR''KER%sEXIT%sSHUX_END\\n' {marker} \"$__shux_ec\"; \
              unset __shux_ec\n",
         );
@@ -692,6 +694,41 @@ mod tests {
                 "{shell} wrote {:?}, stderr {:?}",
                 String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        assert!(ran > 0, "no shell found to run the markers in");
+    }
+
+    /// Framing does not change what the command sees: `$?` is still the
+    /// status of whatever the pane ran last.
+    #[test]
+    fn the_command_sees_the_shells_previous_status() {
+        let mut ran = 0;
+        for shell in ["bash", "zsh", "dash", "sh"] {
+            if std::process::Command::new(shell)
+                .arg("-c")
+                .arg("true")
+                .output()
+                .is_err()
+            {
+                continue;
+            }
+            ran += 1;
+            let mut engine = CommandEngine::new();
+            let pane = Uuid::new_v4();
+            let (_, line) = engine
+                .start_command(pane, "echo \"was:$?\"", &[], Duration::from_secs(5), None)
+                .unwrap();
+            let out = std::process::Command::new(shell)
+                .arg("-c")
+                .arg(format!("false; {line}"))
+                .output()
+                .expect("shell");
+            let done = engine.process_output(pane, &out.stdout);
+            assert_eq!(
+                done.first().map(|r| r.stdout.as_str()),
+                Some("was:1\n"),
+                "{shell}: the framing reset $? before the command ran"
             );
         }
         assert!(ran > 0, "no shell found to run the markers in");
