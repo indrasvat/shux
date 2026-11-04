@@ -1,0 +1,269 @@
+//! `pane wait-command`: a command typed into a real shell that sources
+//! `shux shell-integration` is waited for by its own end, with its exit code,
+//! and no marker of the caller's (issue #261).
+
+mod pane_e2e;
+
+use pane_e2e::Env;
+use std::process::{Command, Output, Stdio};
+
+const PROMPT: &str = "wait-command-prompt";
+
+/// A bash that has PS0 (4.4+), if one is installed.
+fn modern_bash() -> Option<String> {
+    [
+        "bash",
+        "/opt/homebrew/bin/bash",
+        "/usr/local/bin/bash",
+        "/bin/bash",
+    ]
+    .into_iter()
+    .find(|b| {
+        Command::new(b)
+            .args(["-c", "((BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] >= 404))"])
+            .status()
+            .is_ok_and(|s| s.success())
+    })
+    .map(str::to_string)
+}
+
+fn has(shell: &str) -> bool {
+    Command::new(shell)
+        .args(["-c", "true"])
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// A session `ws` running `shell` with an rc that sets a known prompt and,
+/// when `integrate`, sources the shell integration. Returns the pane id.
+fn start(env: &Env, rc: &tempfile::TempDir, shell: &str, integrate: bool) -> String {
+    let bin = env!("CARGO_BIN_EXE_shux");
+    let zsh = shell.ends_with("zsh");
+    let hook = if integrate {
+        format!(
+            "eval \"$('{bin}' shell-integration {})\"\n",
+            if zsh { "zsh" } else { "bash" }
+        )
+    } else {
+        String::new()
+    };
+    let rcfile = rc.path().join("rc");
+    let prompt = if zsh {
+        format!("PROMPT='{PROMPT} %# '\n")
+    } else {
+        format!("PS1='{PROMPT} $ '\n")
+    };
+    // zsh reads /etc/zshenv however it is started, and a broken one sets
+    // PATH: the rc restores this process's own.
+    let path = std::env::var("PATH").expect("PATH");
+    std::fs::write(&rcfile, format!("export PATH='{path}'\n{prompt}{hook}")).expect("rcfile");
+    let mut create = env.shux();
+    create.args(["session", "create", "ws", "-d", "--"]);
+    if zsh {
+        // `-f`: none of the user's rc files; the rc is sourced as the first
+        // command instead.
+        create.args([shell, "-f", "-i"]);
+    } else {
+        create
+            .args([shell, "--noprofile", "--rcfile"])
+            .arg(&rcfile)
+            .arg("-i");
+    }
+    let created = create.output().expect("spawn shux");
+    assert!(
+        created.status.success(),
+        "session create failed: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    if zsh {
+        env.ok(&[
+            "pane",
+            "wait-for",
+            "-s",
+            "ws",
+            "--text",
+            "%",
+            "--timeout-ms",
+            "30000",
+        ]);
+        type_line(env, &format!("source '{}'", rcfile.display()));
+    }
+    env.ok(&[
+        "pane",
+        "wait-for",
+        "-s",
+        "ws",
+        "--text",
+        PROMPT,
+        "--timeout-ms",
+        "30000",
+    ]);
+    let panes: serde_json::Value =
+        serde_json::from_str(&env.ok(&["--format", "json", "pane", "list", "-s", "ws"]))
+            .expect("json");
+    panes[0]["id"].as_str().expect("pane id").to_string()
+}
+
+fn type_line(env: &Env, line: &str) {
+    env.ok(&["pane", "send-keys", "-s", "ws", "--text", line]);
+    env.ok(&["pane", "send-keys", "-s", "ws", "--data", "DQ=="]);
+}
+
+fn as_of(env: &Env, pane: &str) -> u64 {
+    let status: serde_json::Value =
+        serde_json::from_str(&env.ok(&["--format", "json", "pane", "status", pane])).expect("json");
+    status["result"]["as_of"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("no as_of: {status}"))
+}
+
+fn wait(env: &Env, pane: &str, after: u64, timeout: &str) -> Command {
+    let mut cmd = env.shux();
+    cmd.args(["--format", "json", "pane", "wait-command", pane, "--after"])
+        .arg(after.to_string())
+        .args(["--timeout", timeout]);
+    cmd
+}
+
+fn result(out: &Output) -> serde_json::Value {
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "not json ({e}): {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    v.get("result").cloned().unwrap_or(v)
+}
+
+/// Every command's own exit code, in order, with no marker printed: waited
+/// one at a time, typed back to back, and with the wait started first.
+fn commands_report_their_own_ends(shell: &str) {
+    let env = Env::new(80, 24);
+    let rc = tempfile::tempdir().expect("rc dir");
+    let pane = start(&env, &rc, shell, true);
+
+    let floor = as_of(&env, &pane);
+    type_line(&env, "false");
+    let out = wait(&env, &pane, floor, "20s")
+        .output()
+        .expect("spawn shux");
+    let first = result(&out);
+    assert_eq!(first["outcome"], "completed", "{shell}: {first}");
+    assert_eq!(first["exit_code"], 1, "{shell}: {first}");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{shell}: a failed command is a completed wait"
+    );
+
+    // Typed back to back: chaining from each `started` loses none of them.
+    type_line(&env, "(exit 7)");
+    type_line(&env, "true");
+    let mut after = first["started"].as_u64().expect("started");
+    let mut codes = Vec::new();
+    for _ in 0..2 {
+        let r = result(
+            &wait(&env, &pane, after, "20s")
+                .output()
+                .expect("spawn shux"),
+        );
+        assert_eq!(r["outcome"], "completed", "{shell}: {r}");
+        codes.push(r["exit_code"].clone());
+        after = r["started"].as_u64().expect("started");
+    }
+    assert_eq!(
+        codes,
+        [7, 0],
+        "{shell}: a back-to-back command was lost or reordered"
+    );
+
+    // The wait first, then the command: only the new command answers it.
+    let waiter = wait(&env, &pane, after, "20s")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn shux");
+    type_line(&env, "sh -c 'exit 3'");
+    let r = result(&waiter.wait_with_output().expect("waiter"));
+    assert_eq!(
+        (r["outcome"].as_str(), r["exit_code"].as_i64()),
+        (Some("completed"), Some(3)),
+        "{shell}: {r}"
+    );
+}
+
+#[test]
+fn bash_commands_report_their_own_ends() {
+    let bash = modern_bash().expect("no bash 4.4+ installed: the integration cannot be tested");
+    commands_report_their_own_ends(&bash);
+}
+
+#[test]
+fn zsh_commands_report_their_own_ends() {
+    if !has("zsh") {
+        // zsh is optional on Linux; bash covers the protocol there.
+        eprintln!("zsh not installed: skipped");
+        return;
+    }
+    commands_report_their_own_ends("zsh");
+}
+
+/// A shell that reports nothing: the timeout says so, instead of only
+/// timing out.
+#[test]
+fn a_shell_without_integration_is_reported_as_such() {
+    let env = Env::new(80, 24);
+    let rc = tempfile::tempdir().expect("rc dir");
+    let bash = modern_bash().expect("no bash 4.4+ installed");
+    let pane = start(&env, &rc, &bash, false);
+    let floor = as_of(&env, &pane);
+    type_line(&env, "true");
+    let out = wait(&env, &pane, floor, "1500ms")
+        .output()
+        .expect("spawn shux");
+    let r = result(&out);
+    assert_eq!(r["outcome"], "timeout", "{r}");
+    assert_eq!(r["no_integration"], true, "{r}");
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
+fn the_script_installs_once_and_old_bash_is_told_why_not() {
+    let bin = env!("CARGO_BIN_EXE_shux");
+    let bash = modern_bash().expect("no bash 4.4+ installed");
+    // Sourced twice, PROMPT_COMMAND gains the hook once, ahead of the rest.
+    let out = Command::new(&bash)
+        .args(["--noprofile", "--norc", "-i", "-c"])
+        .arg(format!(
+            "PROMPT_COMMAND='echo mine'; eval \"$('{bin}' shell-integration bash)\"; \
+             eval \"$('{bin}' shell-integration bash)\"; printf '%s|%s' \"$PROMPT_COMMAND\" \"$PS0\""
+        ))
+        .output()
+        .expect("bash");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "__shux_osc133_precmd; echo mine|\\e]133;C\\a",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if Command::new("/bin/bash")
+        .args(["-c", "((BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] < 404))"])
+        .status()
+        .is_ok_and(|s| s.success())
+    {
+        let out = Command::new("/bin/bash")
+            .args(["--noprofile", "--norc", "-i", "-c"])
+            .arg(format!(
+                "eval \"$('{bin}' shell-integration bash)\"; printf '%s' \"${{PS0-}}\""
+            ))
+            .output()
+            .expect("bash");
+        assert!(out.stdout.is_empty(), "old bash got hooks it cannot run");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("need bash 4.4 or newer"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}

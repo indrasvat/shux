@@ -19,7 +19,7 @@ use shux_program_status::{RecordView, StatusSummary, StatusTable};
 /// a disable is always older than anything that follows it.
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 
-fn next_generation() -> u64 {
+pub(crate) fn next_generation() -> u64 {
     GENERATION.fetch_add(1, Ordering::Relaxed) + 1
 }
 
@@ -152,7 +152,15 @@ pub(crate) enum CutAction {
     Report { payload: Vec<u8>, bel: bool },
     /// OSC 133 `A`: a new shell prompt.
     PromptStart,
+    /// OSC 133 `C`: a typed command started.
+    CommandStart,
+    /// OSC 133 `D[;exit]`: it ended; `None` when no exit code came with it.
+    CommandEnd { exit_code: Option<i32> },
 }
+
+/// Body bytes kept past [`MAX_SEQUENCE_BYTES`]: enough to know a `133;C`
+/// whose `cmdline=` parameter is long.
+const POISONED_PREFIX: usize = 8;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum ScanState {
@@ -269,23 +277,30 @@ impl OscStatusScanner {
     /// storing them (`advance_osc_string`); they still count on the wire.
     fn take_body(&mut self, span: &[u8]) {
         self.raw_len = self.raw_len.saturating_add(span.len());
+        let kept = span
+            .iter()
+            .copied()
+            .filter(|&b| !matches!(b, 0x00..=0x06 | 0x08..=0x17 | 0x19 | 0x1c..=0x1f));
         if self.poisoned || self.raw_len > MAX_SEQUENCE_BYTES {
+            if !self.poisoned {
+                let room = POISONED_PREFIX.saturating_sub(self.body.len());
+                self.body.extend(kept.take(room));
+                self.body.truncate(POISONED_PREFIX);
+            }
             self.poisoned = true;
-            self.body.clear();
             return;
         }
-        self.body.extend(
-            span.iter()
-                .copied()
-                .filter(|&b| !matches!(b, 0x00..=0x06 | 0x08..=0x17 | 0x19 | 0x1c..=0x1f)),
-        );
+        self.body.extend(kept);
     }
 
     fn finish(&mut self, end: usize, bel: bool, cuts: &mut Vec<StatusCut>) {
-        if !self.poisoned
-            && self.raw_len <= MAX_SEQUENCE_BYTES
-            && let Some(action) = classify(&self.body, bel)
-        {
+        let action = if self.poisoned || self.raw_len > MAX_SEQUENCE_BYTES {
+            // Only a command start survives: its parameters may be long.
+            classify(&self.body, bel).filter(|a| *a == CutAction::CommandStart)
+        } else {
+            classify(&self.body, bel)
+        };
+        if let Some(action) = action {
             cuts.push(StatusCut { end, action });
         }
         self.reset(ScanState::Ground);
@@ -302,8 +317,24 @@ fn classify(body: &[u8], bel: bool) -> Option<CutAction> {
             bel,
         });
     }
-    let rest = body.strip_prefix(b"133;A")?;
-    (rest.is_empty() || rest.starts_with(b";")).then_some(CutAction::PromptStart)
+    let rest = body.strip_prefix(b"133;")?;
+    let (mark, params) = rest.split_first()?;
+    if !(params.is_empty() || params.starts_with(b";")) {
+        return None;
+    }
+    match mark {
+        b'A' => Some(CutAction::PromptStart),
+        b'C' => Some(CutAction::CommandStart),
+        b'D' => {
+            let exit_code = params
+                .get(1..)
+                .and_then(|p| p.split(|&b| b == b';').next())
+                .and_then(|f| std::str::from_utf8(f).ok())
+                .and_then(|f| f.parse::<i32>().ok());
+            Some(CutAction::CommandEnd { exit_code })
+        }
+        _ => None,
+    }
 }
 
 /// The scanner and its vte reference, for the differential tests and the

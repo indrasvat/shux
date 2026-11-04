@@ -501,6 +501,9 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     PaneCommand::WaitExit { .. } => {
                         cli::wait_unreachable("wait-exit", e.into(), args.format)
                     }
+                    PaneCommand::WaitCommand { .. } => {
+                        cli::wait_unreachable("wait-command", e.into(), args.format)
+                    }
                     PaneCommand::Split { wait, .. } if wait.wait => {
                         cli::wait_unreachable("pane split", e.into(), args.format)
                     }
@@ -851,6 +854,14 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     };
                     cli::handle_pane_wait_status(&mut stream, &pane, &wait, args.format).await
                 }
+                PaneCommand::WaitCommand {
+                    pane,
+                    after,
+                    timeout,
+                } => {
+                    cli::handle_pane_wait_command(&mut stream, &pane, after, timeout, args.format)
+                        .await
+                }
                 PaneCommand::WaitExit { pane, timeout } => {
                     cli::handle_pane_wait_exit(&mut stream, &pane, timeout, args.format).await
                 }
@@ -1083,6 +1094,13 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
         Some(Command::Init { dir }) => {
             let root = dir.unwrap_or_else(|| std::path::PathBuf::from("."));
             cli::handle_init(&root, args.format)
+        }
+
+        Some(Command::ShellIntegration { shell }) => {
+            let script = cli::shell_integration_script(&shell)
+                .ok_or_else(|| anyhow::anyhow!("no shell integration for {shell}"))?;
+            crate::style::print_shell_integration(script);
+            Ok(())
         }
 
         Some(Command::__daemon) => unreachable!("handled above"),

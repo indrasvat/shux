@@ -35,6 +35,11 @@ pub(crate) fn register_program_status_methods(
         io_state.clone(),
         bus.clone(),
     );
+    let builder = crate::rpc::wait_command::register_wait_command_method(
+        builder,
+        graph.clone(),
+        io_state.clone(),
+    );
     let (g1, io1) = (graph.clone(), io_state);
     let (g2, io2) = (graph, io1.clone());
     builder
@@ -64,8 +69,13 @@ pub(crate) fn register_program_status_methods(
                         "generation": publication.generation,
                         "summary": publication.summary,
                         "records": records,
-                        // Read in the same hold: a later report is stamped above it.
+                        // Read in the same hold: a later report or command is
+                        // stamped above it.
                         "as_of": shux_vt::program_status_as_of(),
+                        "commands": {
+                            "seen": vt.commands_seen(),
+                            "running": vt.command_running(),
+                        },
                     }))
                 }
             },

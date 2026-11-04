@@ -95,6 +95,9 @@ pub struct PaneIoState {
     /// its previous task is still winding down belongs to the newer task; the
     /// older one must not touch its VT, handles or exit status.
     pub incarnations: HashMap<shux_core::model::PaneId, u64>,
+    /// Bumped whenever a command ends in any pane (OSC 133 `D`, or a prompt
+    /// or start that ends one): `pane.wait_command` wakes on it.
+    pub commands_ended: tokio::sync::watch::Sender<u64>,
     /// Panes whose last spawn failed and that have never run a program.
     pub failed_spawns: std::collections::HashSet<shux_core::model::PaneId>,
     /// Completion waiters for PTY tasks that were already explicitly torn
@@ -208,6 +211,7 @@ impl PaneIoState {
             pty_done: HashMap::new(),
             scratch_ends: HashMap::new(),
             incarnations: HashMap::new(),
+            commands_ended: tokio::sync::watch::Sender::new(0),
             failed_spawns: Default::default(),
             teardown_waiters: Vec::new(),
             vts: HashMap::new(),

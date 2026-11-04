@@ -18,6 +18,7 @@ pub mod rpc;
 pub mod session;
 pub mod state;
 pub mod system;
+pub mod wait_command;
 pub mod wait_exit;
 pub mod window;
 
@@ -38,5 +39,6 @@ pub use rpc::*;
 pub use session::*;
 pub use state::*;
 pub use system::*;
+pub use wait_command::*;
 pub use wait_exit::*;
 pub use window::*;

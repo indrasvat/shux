@@ -2016,6 +2016,79 @@ pub fn print_pane_wait_exit_plain(result: &serde_json::Value) {
     );
 }
 
+/// `shux shell-integration`: the script, verbatim, for `eval`.
+pub fn print_shell_integration(script: &str) {
+    print!("{script}");
+}
+
+/// `pane wait-command --format plain`: `OUTCOME\tPANE_ID\tEXIT_CODE\tSTARTED`;
+/// absent fields are empty.
+pub fn print_pane_wait_command_plain(result: &serde_json::Value) {
+    let s = |p: &str| result.pointer(p).and_then(|v| v.as_str()).unwrap_or("");
+    let n = |p: &str| {
+        result
+            .pointer(p)
+            .filter(|v| !v.is_null())
+            .map(|v| v.to_string())
+            .unwrap_or_default()
+    };
+    println!(
+        "{}\t{}\t{}\t{}",
+        s("/outcome"),
+        s("/pane_id"),
+        n("/exit_code"),
+        n("/started")
+    );
+}
+
+/// Print `pane wait-command`'s outcome.
+pub fn print_pane_wait_command(result: &serde_json::Value) {
+    let pane_id = short_id(result.get("pane_id").and_then(|v| v.as_str()).unwrap_or(""));
+    match result.get("outcome").and_then(|v| v.as_str()).unwrap_or("") {
+        "completed" => {
+            let code = match result.get("exit_code").and_then(|v| v.as_i64()) {
+                Some(0) => success("0").to_string(),
+                Some(c) => error(&c.to_string()).to_string(),
+                None => muted("with no exit code").to_string(),
+            };
+            println!(
+                "{} pane {}: the command ended {}",
+                success("✓"),
+                muted(pane_id),
+                code
+            );
+        }
+        "timeout" if result.get("no_integration").and_then(|v| v.as_bool()) == Some(true) => {
+            println!(
+                "{} pane {}: no command ended in time, and its shell has never reported one; \
+                 see `shux shell-integration`",
+                warning("✗"),
+                muted(pane_id)
+            );
+        }
+        "timeout" => println!(
+            "{} pane {}: no command ended in time",
+            warning("✗"),
+            muted(pane_id)
+        ),
+        "overrun" => println!(
+            "{} pane {}: more commands ended after --after than are kept; read a new as_of",
+            warning("✗"),
+            muted(pane_id)
+        ),
+        other => println!(
+            "{} pane {} {}",
+            warning("✗"),
+            muted(pane_id),
+            match result.get("reason").and_then(|v| v.as_str()) {
+                Some("respawned") => "was respawned before the command ended",
+                Some("exited") => "exited before the command ended",
+                _ => other,
+            }
+        ),
+    }
+}
+
 /// Print `pane wait-exit`'s outcome.
 pub fn print_pane_wait_exit(result: &serde_json::Value) {
     let pane_id = short_id(result.get("pane_id").and_then(|v| v.as_str()).unwrap_or(""));

@@ -11,7 +11,7 @@ pub(super) fn print_json(result: &serde_json::Value) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn print_json_error(message: &str) -> anyhow::Result<()> {
+pub(super) fn print_json_error(message: &str) -> anyhow::Result<()> {
     let envelope = serde_json::json!({
         "error": { "code": -32603, "message": message }
     });

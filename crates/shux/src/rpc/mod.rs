@@ -20,6 +20,7 @@ pub(crate) mod plugin;
 pub(crate) mod program_status;
 pub(crate) mod session;
 pub(crate) mod state;
+pub(crate) mod wait_command;
 pub(crate) mod wait_exit;
 pub(crate) mod window;
 
