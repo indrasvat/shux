@@ -1,3 +1,10 @@
+## [0.56.2](https://github.com/indrasvat/shux/compare/v0.56.1...v0.56.2) (2026-11-04)
+
+
+### Bug Fixes
+
+* a busy daemon is waited for, and a hung-up request still finishes ([#264](https://github.com/indrasvat/shux/issues/264)) ([12e8870](https://github.com/indrasvat/shux/commit/12e887001ee7c51a895aec11ed89a165b569280c)), closes [#257](https://github.com/indrasvat/shux/issues/257)
+
 ## [0.56.1](https://github.com/indrasvat/shux/compare/v0.56.0...v0.56.1) (2026-11-03)
 
 
