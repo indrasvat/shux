@@ -148,3 +148,97 @@ proptest! {
         prop_assert_eq!(exits(&ended_after(&vt, floor)), codes);
     }
 }
+
+/// Past the sequence limit only a short prefix is kept; whether it is kept
+/// must not depend on where the reads were cut.
+#[test]
+fn a_long_sequence_is_classified_the_same_whole_or_bytewise() {
+    let pad = vec![0u8; 5000]; // C0 NUL: on the wire, never in the body
+    let malformed = [b"\x1b]133;C" as &[u8], &pad, b"X\x07", &d(";7")].concat();
+    let late_mark = [b"\x1b]133;" as &[u8], &pad, b"C\x07", &d(";7")].concat();
+    for (name, stream, want) in [
+        ("133;C…X is not a start", malformed, vec![]),
+        ("133;…C is a start", late_mark, vec![Some(7)]),
+    ] {
+        for bytewise in [false, true] {
+            let mut vt = vt();
+            let floor = shux_vt::program_status_as_of();
+            if bytewise {
+                for b in &stream {
+                    vt.process_with_responses(std::slice::from_ref(b));
+                }
+            } else {
+                vt.process_with_responses(&stream);
+            }
+            assert_eq!(
+                exits(&ended_after(&vt, floor)),
+                want,
+                "{name}, bytewise={bytewise}"
+            );
+        }
+    }
+}
+
+/// An end with long parameters still carries its own exit code.
+#[test]
+fn a_long_end_keeps_its_own_exit_code() {
+    let long_d = format!("\x1b]133;D;7;err={}\x07", "y".repeat(5000));
+    for bytewise in [false, true] {
+        let mut vt = vt();
+        let floor = shux_vt::program_status_as_of();
+        let stream = [C, long_d.as_bytes()].concat();
+        if bytewise {
+            for b in &stream {
+                vt.process_with_responses(std::slice::from_ref(b));
+            }
+        } else {
+            vt.process_with_responses(&stream);
+        }
+        let ended = ended_after(&vt, floor);
+        assert_eq!(exits(&ended), [Some(7)], "bytewise={bytewise}");
+        assert_eq!(ended[0].ended_by, EndedBy::End, "bytewise={bytewise}");
+    }
+}
+
+/// Ignored C0 bytes before the mark: vte stores none of them, so the start
+/// counts, read whole or a byte at a time.
+#[test]
+fn a_start_after_ignored_control_bytes_counts_however_it_is_read() {
+    let stream = [
+        b"\x1b]" as &[u8],
+        &[0u8; 5000],
+        b"133;C;cmdline=ls\x07",
+        &d(";1"),
+    ]
+    .concat();
+    for bytewise in [false, true] {
+        let mut vt = vt();
+        let floor = shux_vt::program_status_as_of();
+        if bytewise {
+            for b in &stream {
+                vt.process_with_responses(std::slice::from_ref(b));
+            }
+        } else {
+            vt.process_with_responses(&stream);
+        }
+        assert_eq!(
+            exits(&ended_after(&vt, floor)),
+            [Some(1)],
+            "bytewise={bytewise}"
+        );
+    }
+}
+
+/// An exit code is a decimal number, optionally negative: nothing else.
+#[test]
+fn only_a_plain_decimal_is_an_exit_code() {
+    let mut vt = vt();
+    let floor = shux_vt::program_status_as_of();
+    for exit in [";+5", ";-5", ";05", "; 5", ";0x5", ";-"] {
+        vt.process_with_responses(&[C, &d(exit)].concat());
+    }
+    assert_eq!(
+        exits(&ended_after(&vt, floor)),
+        [None, Some(-5), Some(5), None, None, None]
+    );
+}

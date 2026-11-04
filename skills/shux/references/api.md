@@ -200,7 +200,7 @@ pane.wait_command { "pane_id": "uuid", "after": 41, "timeout_ms": 30000 }
   → { "outcome": "completed", "exit_code": 1, "started": 57, "ended": 58, "ended_by": "end" }
   | { "outcome": "timeout", "no_integration": false }
   | { "outcome": "overrun", "kept": 32 }
-  | { "outcome": "pane_gone", "reason": "exited" | "respawned" | "no_terminal" }
+  | { "outcome": "pane_gone", "reason": "exited" | "killed" | "respawned" }
 ```
 
 - **`after`** is `as_of` from `pane.status`, read before the command was
@@ -209,6 +209,10 @@ pane.wait_command { "pane_id": "uuid", "after": 41, "timeout_ms": 30000 }
 - **`exit_code`** is null when the end carried none, or when the end was
   inferred: `ended_by: "prompt"` (for example after `exec bash`) or
   `"next_command"`.
+- **A nested shell that also reports boundaries** (`bash`, `ssh`,
+  `docker exec -it` into an integrated shell) ends the outer command at its
+  first prompt, with `ended_by: "prompt"` and no exit code. Its own commands
+  are then reported as they run.
 - **`overrun`:** more than 32 commands ended after the floor. Read a new
   `as_of`.
 - **`no_integration`:** the pane's shell has never sent a command start, so
@@ -218,6 +222,10 @@ pane.wait_command { "pane_id": "uuid", "after": 41, "timeout_ms": 30000 }
 - **Program status:** boundaries are tracked whether or not program status is
   enabled, and RIS does not reset them.
 - `pane.status` reports `commands: { seen, running }`.
+- **The boundaries are in-band.** Output the command itself prints, such as a
+  file `cat`'d that contains `ESC ] 133;D;0 BEL`, is read as a boundary too, as
+  it is by every terminal's shell integration. Trust `exit_code` only as far as
+  you trust what the pane prints.
 
 CLI: `shux pane wait-command <PANE> [--after AS_OF] [--timeout 30s]`.
 - Exit 0: the command ended, whatever its own code (read `exit_code`).

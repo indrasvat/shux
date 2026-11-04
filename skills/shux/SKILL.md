@@ -160,7 +160,7 @@ printed and no marker: read the floor, send the command, wait.
 eval "$(shux shell-integration bash)"        # or: zsh. bash needs 4.4+
 
 AS_OF=$(shux --format json pane status "$P" | jq .result.as_of)
-shux pane send-keys -s dev --text 'make test' && shux pane send-keys -s dev --data DQ==
+shux pane send-keys -s dev --text 'make test' && shux pane send-keys -s dev --data Cg==   # C-j
 R=$(shux --format json pane wait-command "$P" --after "$AS_OF" --timeout 10m)
 echo "$R" | jq .result.exit_code                # that command's own exit code
 ```

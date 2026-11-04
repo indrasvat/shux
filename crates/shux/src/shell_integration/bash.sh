@@ -15,32 +15,49 @@ __shux_osc133_install() {
     return 0
   fi
   __shux_osc133=1
+  # Leaves `$?` as the command left it for the hooks after this one; with
+  # errexit on, a non-zero return would end the shell, so it returns 0.
+  __shux_osc133_keep() {
+    [[ $- == *e* ]] && return 0
+    return "$1"
+  }
   if [[ -n ${BLE_VERSION-} ]]; then
     # ble.sh draws its own marks after a command; report the end before them.
     __shux_osc133_start() { printf '\e]133;C\a'; }
     __shux_osc133_end() {
       local ec=$?
       printf '\e]133;D;%s\a' "$ec"
-      return "$ec"
+      __shux_osc133_keep "$ec"
     }
     __shux_osc133_prompt() {
       local ec=$?
       printf '\e]133;A\a'
-      return "$ec"
+      __shux_osc133_keep "$ec"
     }
     blehook PREEXEC+=__shux_osc133_start
     blehook POSTEXEC+=__shux_osc133_end
     blehook PRECMD+=__shux_osc133_prompt
     return 0
   fi
-  PS0+='\e]133;C\a'
+  # PS0 is expanded in this shell, not a subshell: the arithmetic marks that
+  # this shell started the command, and rides harmlessly as a C parameter.
+  # shellcheck disable=SC2016  # expanded at each prompt, not now
+  PS0+='\e]133;C;shux=$((__shux_osc133_ran = 1))\a'
   __shux_osc133_precmd() {
     local ec=$?
-    printf '\e]133;D;%s\a\e]133;A\a' "$ec"
-    return "$ec"
+    # Only a command this shell started ends here: a new shell's first
+    # prompt (`bash`, `sudo -i` typed into this one) must not end its parent's.
+    if [[ -n ${__shux_osc133_ran-} ]]; then
+      printf '\e]133;D;%s\a' "$ec"
+      __shux_osc133_ran=
+    fi
+    printf '\e]133;A\a'
+    __shux_osc133_keep "$ec"
   }
   # First, so it reads the command's status before any other hook runs.
-  if [[ $(declare -p PROMPT_COMMAND 2>/dev/null) == "declare -a"* ]]; then
+  # An array runs every element only from bash 5.1; before, only the first.
+  if ((BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] >= 501)) &&
+    [[ $(declare -p PROMPT_COMMAND 2>/dev/null) == "declare -a"* ]]; then
     PROMPT_COMMAND=(__shux_osc133_precmd "${PROMPT_COMMAND[@]}")
   else
     # shellcheck disable=SC2178,SC2128  # this branch runs only when it is not an array

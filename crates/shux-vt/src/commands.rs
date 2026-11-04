@@ -61,22 +61,17 @@ pub enum CommandLookup {
 
 #[derive(Debug, Default)]
 pub(crate) struct CommandBoundaries {
-    /// A `133;C` has been seen in this terminal.
-    seen: bool,
     /// The start stamp of the command running now.
     open: Option<u64>,
     ended: VecDeque<CommandRecord>,
     /// The start stamp of the newest record dropped from `ended`.
     dropped_through: u64,
-    /// Commands ended, ever.
-    ended_total: u64,
 }
 
 impl CommandBoundaries {
     pub(crate) fn on_start(&mut self) {
         self.close(None, EndedBy::NextCommand);
         self.open = Some(next_generation());
-        self.seen = true;
     }
 
     /// A `D` with no command running (Enter at an empty prompt) is ignored.
@@ -98,7 +93,6 @@ impl CommandBoundaries {
             exit_code,
             ended_by,
         });
-        self.ended_total += 1;
         while self.ended.len() > KEEP_ENDED {
             if let Some(old) = self.ended.pop_front() {
                 self.dropped_through = old.started;
@@ -106,17 +100,18 @@ impl CommandBoundaries {
         }
     }
 
+    /// A `133;C` has been seen in this terminal.
     pub(crate) fn seen(&self) -> bool {
-        self.seen
+        self.open.is_some() || !self.ended.is_empty()
     }
 
     pub(crate) fn running(&self) -> bool {
         self.open.is_some()
     }
 
-    /// Commands ended, ever: it moves exactly when one does.
-    pub(crate) fn ended_total(&self) -> u64 {
-        self.ended_total
+    /// The newest end stamp, or 0: it moves exactly when a command ends.
+    pub(crate) fn last_end(&self) -> u64 {
+        self.ended.back().map_or(0, |c| c.ended)
     }
 
     pub(crate) fn first_after(&self, floor: u64) -> CommandLookup {
@@ -186,15 +181,6 @@ mod tests {
             b.first_after(found(&b, first.started).started),
             CommandLookup::Pending
         );
-    }
-
-    #[test]
-    fn an_end_with_no_command_running_is_ignored() {
-        let mut b = CommandBoundaries::default();
-        let floor = crate::program_status::as_of();
-        b.on_end(Some(0));
-        assert!(!b.seen());
-        assert_eq!(b.first_after(floor), CommandLookup::Pending);
     }
 
     /// `exec bash`: a C, no D, then the new shell's prompt.

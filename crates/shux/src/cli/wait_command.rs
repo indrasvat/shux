@@ -1,7 +1,7 @@
 //! `shux pane wait-command` and `shux shell-integration`.
 
-use super::program_status::{print_json, print_json_error};
-use super::{args::*, rpc::*};
+use super::args::*;
+use super::program_status::{call_wait, print_json};
 
 /// Exit 0: the command ended, whatever its own code (read `exit_code`).
 /// 1: timeout. 2: bad arguments. 3: anything else.
@@ -16,30 +16,11 @@ pub async fn handle_pane_wait_command(
     if let Some(after) = after {
         params["after"] = after.into();
     }
-    let result = match rpc_call(stream, "pane.wait_command", params).await {
-        Ok(result) => result,
-        Err(RpcClientError::Rpc {
-            code,
-            message,
-            data,
-        }) => super::lens::lens_emit_error_and_exit(
-            format,
-            "wait-command",
-            code,
-            &message,
-            data,
-            super::lens::lens_checkpoint_exit_code(code),
-        ),
-        Err(other) => {
-            match format {
-                OutputFormat::Json => print_json_error(&other.to_string())?,
-                OutputFormat::Text | OutputFormat::Plain => crate::style::print_error(&format!(
-                    "wait-command lost the daemon connection ({other}); is the daemon still running?"
-                )),
-            }
-            std::process::exit(3);
-        }
-    };
+    let result =
+        match call_wait(stream, "pane.wait_command", "wait-command", params, format).await? {
+            Ok(result) => result,
+            Err(code) => std::process::exit(code),
+        };
     match format {
         OutputFormat::Json => print_json(&result)?,
         OutputFormat::Text => crate::style::print_pane_wait_command(&result),

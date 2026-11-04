@@ -119,7 +119,8 @@ shux --format json pane wait-status "$PANE" --id b7 --state done,error --timeout
 # `eval "$(shux shell-integration bash)"` to its rc), wait for a typed
 # command with nothing printed: read the floor, send it, wait.
 AS_OF=$(shux --format json pane status "$PANE" | jq .result.as_of)
-shux pane send-keys -s build --text 'make' && shux pane send-keys -s build --data DQ==
+# C-j submits even where ble.sh would hold Enter in -- MULTILINE --.
+shux pane send-keys -s build --text 'make' && shux pane send-keys -s build --data Cg==
 shux --format json pane wait-command "$PANE" --after "$AS_OF" --timeout 10m | jq .result.exit_code
 # The next command: pass the returned `.result.started` as `--after`.
 

@@ -1429,6 +1429,10 @@ pub enum PaneCommand {
     /// sending the command, and pass it as `--after`: the first command that
     /// started after it is the one waited for. To wait for the next one, pass
     /// the returned `started`.
+    ///
+    /// The boundaries travel in the pane's own output, so output that prints
+    /// an OSC 133 sequence is read as one: trust `exit_code` as far as you
+    /// trust what the pane prints.
     #[command(name = "wait-command")]
     WaitCommand {
         /// Pane id — full UUID or a unique prefix of 4 or more characters.

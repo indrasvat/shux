@@ -897,6 +897,58 @@ mod tests {
         finish(h).await;
     }
 
+    /// A command that ends as its pane exits is a completed command, not a
+    /// pane that went away.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_command_that_ends_as_its_pane_exits_is_completed() {
+        let h = RpcHarness::new();
+        let (_s, _w, pane) = h.seed_session("command-then-exit").await;
+        let floor = shux_vt::program_status_as_of();
+        spawn_sh(&h, pane, r"printf '\033]133;C\007\033]133;D;5\007'").await;
+        wait_exited(&h, pane).await;
+        let waited = dispatch_ok(
+            &h.router,
+            "pane.wait_command",
+            json!({"pane_id": pane.to_string(), "after": floor, "timeout_ms": 1_000}),
+        )
+        .await;
+        assert_eq!(waited["outcome"], "completed", "{waited}");
+        assert_eq!(waited["exit_code"], 5, "{waited}");
+        finish(h).await;
+    }
+
+    /// A wait whose pane is killed says so; respawned means a different
+    /// program now runs in the pane, not none.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_command_wait_whose_pane_is_killed_is_not_called_a_respawn() {
+        let h = RpcHarness::new();
+        let (session, _w, pane) = h.seed_session("command-killed").await;
+        spawn_sh(&h, pane, "sleep 30").await;
+        let floor = shux_vt::program_status_as_of();
+        let waiter = {
+            let router = h.router.clone();
+            tokio::spawn(async move {
+                dispatch_ok(
+                    &router,
+                    "pane.wait_command",
+                    json!({"pane_id": pane.to_string(), "after": floor, "timeout_ms": 20_000}),
+                )
+                .await
+            })
+        };
+        tokio::task::yield_now().await;
+        dispatch_ok(
+            &h.router,
+            "session.kill",
+            json!({"id": session.to_string()}),
+        )
+        .await;
+        let waited = waiter.await.expect("waiter");
+        assert_eq!(waited["outcome"], "pane_gone", "{waited}");
+        assert_ne!(waited["reason"], "respawned", "{waited}");
+        finish(h).await;
+    }
+
     /// A spawn whose future is dropped mid-flight (an RPC client hung up)
     /// must not leave the pane unspawnable.
     #[tokio::test(flavor = "multi_thread")]

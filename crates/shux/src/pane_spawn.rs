@@ -294,9 +294,9 @@ async fn run_pane_pty_task(
                                     // one batch leaves the flag equal → no switch,
                                     // matching §4.2's "nets to no bump".
                                     let alt_before = vt.is_alternate_screen();
-                                    let ended_before = vt.commands_ended();
+                                    let ended_before = vt.last_command_end();
                                     let responses = vt.process_with_responses(data);
-                                    if vt.commands_ended() != ended_before {
+                                    if vt.last_command_end() != ended_before {
                                         commands_ended.send_modify(|n| *n += 1);
                                     }
                                     if let Some(probe) = &probe {

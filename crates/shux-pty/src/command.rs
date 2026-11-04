@@ -5,7 +5,8 @@
 //!
 //! ```text
 //! __shux_ec=$?; command -p printf 'SHUX_BE''GIN%s\n' <id>; (exit "$__shux_ec"); CMD; __shux_ec=$?;
-//! command -p printf 'SHUX_MAR''KER%sEXIT%sSHUX_END\n' <id> "$__shux_ec"; unset __shux_ec
+//! command -p printf 'SHUX_MAR''KER%sEXIT%sSHUX_END\n' <id> "$__shux_ec";
+//! eval "unset __shux_ec; (exit $__shux_ec)"
 //! ```
 //!
 //! The marker text never appears contiguously in the typed line, so the
@@ -129,13 +130,13 @@ impl CommandEngine {
         };
         // `command -p` skips shell functions and searches the default PATH, not
         // the pane's: zsh's `command` never runs the builtin. The pane's `$?`
-        // is restored before the command, and the command's read straight
-        // after it.
+        // is restored before the command, and the command's own is left as
+        // `$?` after the line: `eval` expands it before the unset runs.
         let line = format!(
             "__shux_ec=$?; command -p printf 'SHUX_BE''GIN%s\\n' {marker}; \
              (exit \"$__shux_ec\"); {command}; __shux_ec=$?; \
              command -p printf 'SHUX_MAR''KER%sEXIT%sSHUX_END\\n' {marker} \"$__shux_ec\"; \
-             unset __shux_ec\n",
+             eval \"unset __shux_ec; (exit $__shux_ec)\"\n",
         );
         PreparedCommand {
             id,

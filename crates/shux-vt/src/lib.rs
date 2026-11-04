@@ -124,7 +124,6 @@ pub struct VirtualTerminal {
     /// Frames OSC 7501 / OSC 133 from raw bytes. Runs even while program
     /// status is disabled, so enabling mid-sequence cannot misparse.
     status_scanner: program_status::OscStatusScanner,
-    /// OSC 133 command boundaries; kept whether or not program status is on.
     commands: commands::CommandBoundaries,
     /// `None` while program status is disabled.
     program_status: Option<program_status::VtProgramStatus>,
@@ -613,9 +612,9 @@ impl VirtualTerminal {
         self.commands.first_after(floor)
     }
 
-    /// Commands ended in this terminal, ever: it moves exactly when one does.
-    pub fn commands_ended(&self) -> u64 {
-        self.commands.ended_total()
+    /// The newest command end's stamp, or 0: it moves exactly when one ends.
+    pub fn last_command_end(&self) -> u64 {
+        self.commands.last_end()
     }
 
     /// Turn OSC 7501 program status on or off. Off answers no probe and
@@ -942,7 +941,6 @@ impl VirtualTerminal {
         // query's stream position: before the DA1 that follows it.
         let mut status_cuts = self.status_scanner.scan(bytes);
         if self.program_status.is_none() {
-            // Off, 7501 does not exist; command boundaries still count.
             status_cuts.retain(|c| !matches!(c.action, program_status::CutAction::Report { .. }));
         }
         if apc_cuts.is_empty() && status_cuts.is_empty() {

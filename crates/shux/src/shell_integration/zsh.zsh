@@ -8,10 +8,21 @@ __shux_osc133_install() {
   [[ -o interactive ]] || return 0
   (( ${+__shux_osc133} )) && return 0
   typeset -g __shux_osc133=1
-  __shux_osc133_preexec() { print -n '\e]133;C\a' }
+  __shux_osc133_preexec() {
+    typeset -g __shux_osc133_ran=1
+    print -n '\e]133;C\a'
+  }
   __shux_osc133_precmd() {
     local ec=$?
-    print -n "\e]133;D;${ec}\a\e]133;A\a"
+    # Only a command this shell started ends here: a new shell's first
+    # prompt (`zsh`, `sudo -i` typed into this one) must not end its parent's.
+    if [[ -n ${__shux_osc133_ran-} ]]; then
+      print -n "\e]133;D;${ec}\a"
+      __shux_osc133_ran=
+    fi
+    print -n '\e]133;A\a'
+    # With ERR_EXIT on, a non-zero return would end the shell.
+    [[ -o errexit ]] && return 0
     return $ec
   }
   # First, so they run before any other hook touches the status.

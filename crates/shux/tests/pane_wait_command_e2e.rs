@@ -75,33 +75,16 @@ fn start(env: &Env, rc: &tempfile::TempDir, shell: &str, integrate: bool) -> Str
         "session create failed: {}",
         String::from_utf8_lossy(&created.stderr)
     );
-    if zsh {
-        env.ok(&[
-            "pane",
-            "wait-for",
-            "-s",
-            "ws",
-            "--text",
-            "%",
-            "--timeout-ms",
-            "30000",
-        ]);
-        type_line(env, &format!("source '{}'", rcfile.display()));
-    }
-    env.ok(&[
-        "pane",
-        "wait-for",
-        "-s",
-        "ws",
-        "--text",
-        PROMPT,
-        "--timeout-ms",
-        "30000",
-    ]);
     let panes: serde_json::Value =
         serde_json::from_str(&env.ok(&["--format", "json", "pane", "list", "-s", "ws"]))
             .expect("json");
-    panes[0]["id"].as_str().expect("pane id").to_string()
+    let pane = panes[0]["id"].as_str().expect("pane id").to_string();
+    if zsh {
+        env.wait_for("ws", &pane, "%");
+        type_line(env, &format!("source '{}'", rcfile.display()));
+    }
+    env.wait_for("ws", &pane, PROMPT);
+    pane
 }
 
 fn type_line(env: &Env, line: &str) {
@@ -243,7 +226,7 @@ fn the_script_installs_once_and_old_bash_is_told_why_not() {
         .expect("bash");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "__shux_osc133_precmd; echo mine|\\e]133;C\\a",
+        "__shux_osc133_precmd; echo mine|\\e]133;C;shux=$((__shux_osc133_ran = 1))\\a",
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -266,4 +249,124 @@ fn the_script_installs_once_and_old_bash_is_told_why_not() {
             String::from_utf8_lossy(&out.stderr)
         );
     }
+}
+
+/// A shell started inside the integrated one draws its first prompt while
+/// the outer command (`bash`, `sudo -i`, `ssh host`) still runs: that prompt
+/// must not report the outer command as ended with a made-up exit 0.
+fn a_nested_shell_does_not_report_a_fake_success(shell: &str) {
+    let env = Env::new(80, 24);
+    let rc = tempfile::tempdir().expect("rc dir");
+    let pane = start(&env, &rc, shell, true);
+    let floor = as_of(&env, &pane);
+    let rcfile = rc.path().join("rc");
+    if shell.ends_with("zsh") {
+        type_line(&env, &format!("{shell} -f -i"));
+        env.wait_for("ws", &pane, "%");
+        type_line(&env, &format!("source '{}'", rcfile.display()));
+    } else {
+        type_line(
+            &env,
+            &format!("{shell} --noprofile --rcfile '{}' -i", rcfile.display()),
+        );
+    }
+    let r = result(
+        &wait(&env, &pane, floor, "20s")
+            .output()
+            .expect("spawn shux"),
+    );
+    assert_ne!(
+        (r["exit_code"].as_i64(), r["ended_by"].as_str()),
+        (Some(0), Some("end")),
+        "{shell}: the inner shell's first prompt reported the outer command as a success: {r}"
+    );
+    type_line(&env, "exit");
+}
+
+#[test]
+fn a_nested_bash_does_not_report_a_fake_success() {
+    let bash = modern_bash().expect("no bash 4.4+ installed: the integration cannot be tested");
+    a_nested_shell_does_not_report_a_fake_success(&bash);
+}
+
+#[test]
+fn a_nested_zsh_does_not_report_a_fake_success() {
+    if !has("zsh") {
+        eprintln!("zsh not installed: skipped");
+        return;
+    }
+    a_nested_shell_does_not_report_a_fake_success("zsh");
+}
+
+/// With errexit on in the user's shell, a failed command must not take the
+/// shell with it through the hooks.
+#[test]
+fn the_hooks_do_not_end_a_shell_running_with_errexit() {
+    let bash = modern_bash().expect("no bash 4.4+ installed");
+    for shell in [bash.as_str(), "zsh"] {
+        if !has(shell) {
+            continue;
+        }
+        let env = Env::new(80, 24);
+        let rc = tempfile::tempdir().expect("rc dir");
+        let pane = start(&env, &rc, shell, true);
+        let errexit = if shell.ends_with("zsh") {
+            "setopt ERR_EXIT"
+        } else {
+            "set -e"
+        };
+        type_line(&env, errexit);
+        type_line(&env, "[[ -f /nonexistent ]] && echo never");
+        type_line(&env, "echo AL\"\"IVE");
+        let alive = env.run(&[
+            "pane",
+            "wait-for",
+            "-s",
+            "ws",
+            "-p",
+            &pane,
+            "--text",
+            "ALIVE",
+            "--timeout-ms",
+            "10000",
+        ]);
+        assert!(
+            alive.status.success(),
+            "{shell}: the hooks ended a shell running with errexit"
+        );
+    }
+}
+
+/// A `pane run` line is one command to the shell: its own exit code, not the
+/// status of the wrapper's last statement.
+#[test]
+fn a_pane_run_line_reports_the_commands_own_exit_code() {
+    let env = Env::new(80, 24);
+    let rc = tempfile::tempdir().expect("rc dir");
+    let bash = modern_bash().expect("no bash 4.4+ installed");
+    let pane = start(&env, &rc, &bash, true);
+    let floor = as_of(&env, &pane);
+    let ran: serde_json::Value = serde_json::from_str(&env.ok(&[
+        "--format",
+        "json",
+        "pane",
+        "run",
+        "-s",
+        "ws",
+        "--timeout",
+        "20",
+        "-c",
+        "(exit 4)",
+    ]))
+    .expect("json");
+    assert_eq!(ran["exit_code"], 4, "{ran}");
+    let r = result(
+        &wait(&env, &pane, floor, "20s")
+            .output()
+            .expect("spawn shux"),
+    );
+    assert_eq!(
+        r["exit_code"], 4,
+        "the shell reported the wrapper's status, not the command's: {r}"
+    );
 }

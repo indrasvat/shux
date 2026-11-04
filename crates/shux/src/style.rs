@@ -2060,8 +2060,8 @@ pub fn print_pane_wait_command(result: &serde_json::Value) {
         }
         "timeout" if result.get("no_integration").and_then(|v| v.as_bool()) == Some(true) => {
             println!(
-                "{} pane {}: no command ended in time, and its shell has never reported one; \
-                 see `shux shell-integration`",
+                "{} pane {}: no command ended in time, and its shell has not reported a command \
+                 start; if it should, see `shux shell-integration`",
                 warning("✗"),
                 muted(pane_id)
             );
@@ -2082,6 +2082,7 @@ pub fn print_pane_wait_command(result: &serde_json::Value) {
             muted(pane_id),
             match result.get("reason").and_then(|v| v.as_str()) {
                 Some("respawned") => "was respawned before the command ended",
+                Some("killed") => "was killed before the command ended",
                 Some("exited") => "exited before the command ended",
                 _ => other,
             }
