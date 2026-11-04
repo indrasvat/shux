@@ -399,13 +399,12 @@ fn register_pane_io_methods(
 
                     let (command_id, pty_command) = {
                         let mut state = io.lock().await;
-                        state.cmd_engine.start_command(
-                            pane_id.0,
-                            command,
-                            &args,
-                            timeout,
-                            completion_tx,
-                        )
+                        state
+                            .cmd_engine
+                            .start_command(pane_id.0, command, &args, timeout, completion_tx)
+                            .map_err(|busy| {
+                                shux_rpc::RpcError::internal(&format!("pane busy with {busy}"))
+                            })?
                     };
 
                     {

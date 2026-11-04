@@ -281,17 +281,19 @@ pub(crate) fn register_pane_io_methods(
 
                     let (command_id, pty_command) = {
                         let mut state = io.lock().await;
-                        state.cmd_engine.start_command(
-                            pane_id.0,
-                            command,
-                            &args,
-                            timeout,
-                            completion_tx,
-                        )
+                        state
+                            .cmd_engine
+                            .start_command(pane_id.0, command, &args, timeout, completion_tx)
+                            .map_err(pane_busy)?
                     };
 
                     drop(params);
-                    send_to_pane(&io, pane_id, pty_command.into_bytes()).await?;
+                    // A line that never reached the pane never ran: it must not
+                    // hold the pane busy until its timeout.
+                    if let Err(e) = send_to_pane(&io, pane_id, pty_command.into_bytes()).await {
+                        io.lock().await.cmd_engine.abandon(command_id);
+                        return Err(e);
+                    }
 
                     if is_async {
                         return Ok(serde_json::json!({
@@ -1800,17 +1802,26 @@ pub(crate) fn register_pane_io_methods(
         )
 }
 
+/// A pane already running a command takes no second one: a line typed while
+/// another runs is echoed into that command's output.
+fn pane_busy(running: uuid::Uuid) -> shux_rpc::RpcError {
+    shux_rpc::RpcError::with_message_and_data(
+        shux_rpc::ErrorCode::ResourceExhausted,
+        format!("the pane is still running command {running}"),
+        serde_json::json!({
+            "resource": "pane command",
+            "running_command_id": running.to_string(),
+            "hint": "wait for it (pane.command_status) or cancel it (pane.command_cancel), then retry",
+        }),
+    )
+}
+
 /// A command's result as `pane.run_command` and `pane.command_status` report
-/// it: the same frozen fields from both.
+/// it: every field, serialized from the one frozen result.
 fn command_result_json(result: &shux_pty::CommandResult) -> serde_json::Value {
-    serde_json::json!({
-        "command_id": result.command_id.to_string(),
-        "state": result.state,
-        "exit_code": result.exit_code,
-        "stdout": result.stdout,
-        "truncated": result.truncated,
-        "runtime_ms": result.runtime_ms,
-    })
+    serde_json::to_value(result).unwrap_or_else(
+        |e| serde_json::json!({ "command_id": result.command_id, "error": e.to_string() }),
+    )
 }
 
 /// Waits for the pane's PTY task to apply a queued resize.

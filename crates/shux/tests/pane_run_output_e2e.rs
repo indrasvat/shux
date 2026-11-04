@@ -127,3 +127,121 @@ fn pane_run_returns_only_what_the_command_wrote() {
     );
     assert_ne!(second["exit_code"], 0, "{second}");
 }
+
+/// A command started while another runs in the same pane is refused: its
+/// typed line would be echoed into the running command's output.
+#[test]
+fn a_second_command_waits_its_turn_instead_of_polluting_the_first() {
+    let env = Env::new();
+    let rc = env.root.path().join("rc");
+    assert!(
+        env.shux()
+            .args([
+                "session",
+                "create",
+                "pr",
+                "-d",
+                "--",
+                "bash",
+                "--noprofile",
+                "--rcfile"
+            ])
+            .arg(&rc)
+            .arg("-i")
+            .status()
+            .expect("spawn shux")
+            .success()
+    );
+    assert!(
+        env.shux()
+            .args([
+                "pane",
+                "wait-for",
+                "-s",
+                "pr",
+                "--text",
+                "pane-run-prompt",
+                "--timeout-ms",
+                "30000"
+            ])
+            .status()
+            .expect("wait-for")
+            .success()
+    );
+
+    let started = env
+        .shux()
+        .args([
+            "--format",
+            "json",
+            "pane",
+            "run",
+            "-s",
+            "pr",
+            "--async",
+            "-c",
+            "sleep 1; echo first",
+        ])
+        .output()
+        .expect("spawn shux");
+    let started: serde_json::Value = serde_json::from_slice(&started.stdout).expect("json");
+    let first_id = started["command_id"]
+        .as_str()
+        .expect("command id")
+        .to_string();
+
+    let second = env
+        .shux()
+        .args([
+            "--format",
+            "json",
+            "pane",
+            "run",
+            "-s",
+            "pr",
+            "--timeout",
+            "10",
+            "-c",
+            "echo second",
+        ])
+        .output()
+        .expect("spawn shux");
+
+    // The first command's own result, once it has finished.
+    let params = serde_json::json!({ "command_id": first_id }).to_string();
+    let deadline = std::time::Instant::now() + shux_testkit::BUDGET;
+    let first = loop {
+        let out = env
+            .shux()
+            .args([
+                "--format",
+                "json",
+                "rpc",
+                "call",
+                "pane.command_status",
+                "--params",
+                &params,
+            ])
+            .output()
+            .expect("spawn shux");
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+        let r = v.get("result").cloned().unwrap_or(v);
+        if r["state"] != "running" {
+            break r;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the first command never finished"
+        );
+        std::thread::yield_now();
+    };
+    assert_eq!(
+        first["stdout"], "first\n",
+        "the first command's output was polluted: {first}"
+    );
+    assert!(
+        !second.status.success(),
+        "a second command was accepted while the first ran: {}",
+        String::from_utf8_lossy(&second.stdout)
+    );
+}

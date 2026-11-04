@@ -937,13 +937,12 @@ for i in range(600): os.write(1, b'TICK%dX ' % i); time.sleep(0.05)""#,
             ready.exists()
         })
         .await;
-        let (command_id, _) = h.io.lock().await.cmd_engine.start_command(
-            pane.0,
-            "true",
-            &[],
-            Duration::from_secs(60),
-            None,
-        );
+        let (command_id, _) =
+            h.io.lock()
+                .await
+                .cmd_engine
+                .start_command(pane.0, "true", &[], Duration::from_secs(60), None)
+                .unwrap();
         let writer = h.io.lock().await.writers[&pane].clone();
         shux_testkit::wait_until_async("the pane's input to back up", || async {
             writer.try_send(vec![b'k'; 64 << 10]).is_err()

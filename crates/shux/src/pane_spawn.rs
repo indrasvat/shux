@@ -502,7 +502,13 @@ async fn run_pane_pty_task(
     // Before the reap: senders waiting for room learn now that none will come.
     drop((write_rx, pending));
     // No more output will come: a command still running here is answered now.
-    io_state.lock().await.cmd_engine.forget_pane(pane_id.0);
+    // A replaced task leaves its successor's commands alone.
+    {
+        let mut state = io_state.lock().await;
+        if state.is_current(pane_id, incarnation) {
+            state.cmd_engine.forget_pane(pane_id.0);
+        }
+    }
     // A program's last words, staged inside the final interval.
     if task_exit == PtyTaskExit::Natural {
         staged.publish(&graph, pane_id);

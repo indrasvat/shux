@@ -4,8 +4,8 @@
 //! The typed line frames the command between two markers the shell prints:
 //!
 //! ```text
-//! command printf 'SHUX_BE''GIN%s\n' <id>; CMD; __shux_ec=$?;
-//! command printf 'SHUX_MAR''KER%sEXIT%sSHUX_END\n' <id> "$__shux_ec"; unset __shux_ec
+//! printf 'SHUX_BE''GIN%s\n' <id>; CMD; __shux_ec=$?;
+//! printf 'SHUX_MAR''KER%sEXIT%sSHUX_END\n' <id> "$__shux_ec"; unset __shux_ec
 //! ```
 //!
 //! The marker text never appears contiguously in the typed line, so the
@@ -70,7 +70,6 @@ pub struct CommandResult {
     pub exit_code: Option<i32>,
     pub stdout: String,
     /// Output past [`CAPTURE_LIMIT`] bytes was dropped.
-    #[serde(default)]
     pub truncated: bool,
     pub runtime_ms: u64,
 }
@@ -78,9 +77,10 @@ pub struct CommandResult {
 /// The command execution engine manages running commands in panes.
 pub struct CommandEngine {
     commands: HashMap<Uuid, TrackedCommand>,
-    /// Each pane's running commands in the order they were sent; output is
-    /// framed for the front one only, as the shell runs them in turn.
-    queues: HashMap<Uuid, VecDeque<Uuid>>,
+    /// Each pane's one running command. A shell runs one line at a time, and a
+    /// line typed while another runs is echoed into its output, so a pane
+    /// takes a second command only after the first has finished.
+    active: HashMap<Uuid, Uuid>,
     /// Each pane's bytes not yet classified, so a marker split across reads
     /// is seen whole and never leaks into a capture.
     pending: HashMap<Uuid, Vec<u8>>,
@@ -97,14 +97,14 @@ impl CommandEngine {
     pub fn new() -> Self {
         Self {
             commands: HashMap::new(),
-            queues: HashMap::new(),
+            active: HashMap::new(),
             pending: HashMap::new(),
             finished: VecDeque::new(),
         }
     }
 
-    /// Start tracking a new command.
-    /// Returns the command ID and the full line to send to the PTY.
+    /// Start tracking a new command: its ID and the full line to send to the
+    /// PTY, or `Err` with the ID of the command still running in the pane.
     pub fn start_command(
         &mut self,
         pane_id: Uuid,
@@ -112,7 +112,10 @@ impl CommandEngine {
         args: &[String],
         timeout: Duration,
         completion_tx: Option<tokio::sync::oneshot::Sender<CommandResult>>,
-    ) -> (Uuid, String) {
+    ) -> Result<(Uuid, String), Uuid> {
+        if let Some(&running) = self.active.get(&pane_id) {
+            return Err(running);
+        }
         let command_id = Uuid::new_v4();
         let marker = format!("__SHUX_CMD_{}__", command_id.as_simple());
 
@@ -122,11 +125,11 @@ impl CommandEngine {
             format!("{} {}", command, shell_escape_args(args))
         };
 
-        // `command printf` skips a shell function named printf. `$?` is read
-        // straight after the command, before anything else can reset it.
+        // The shell's builtin printf, never a PATH lookup: zsh's `command`
+        // skips builtins. `$?` is read straight after the command.
         let pty_command = format!(
-            "command printf 'SHUX_BE''GIN%s\\n' {marker}; {full_cmd}; __shux_ec=$?; \
-             command printf 'SHUX_MAR''KER%sEXIT%sSHUX_END\\n' {marker} \"$__shux_ec\"; \
+            "printf 'SHUX_BE''GIN%s\\n' {marker}; {full_cmd}; __shux_ec=$?; \
+             printf 'SHUX_MAR''KER%sEXIT%sSHUX_END\\n' {marker} \"$__shux_ec\"; \
              unset __shux_ec\n",
         );
 
@@ -147,97 +150,74 @@ impl CommandEngine {
                 result: None,
             },
         );
-        self.queues
-            .entry(pane_id)
-            .or_default()
-            .push_back(command_id);
+        self.active.insert(pane_id, command_id);
 
-        (command_id, pty_command)
+        Ok((command_id, pty_command))
     }
 
-    /// Feed a pane's PTY output. Returns the commands it completed.
+    /// Feed a pane's PTY output. Returns the command it completed, if any.
     pub fn process_output(&mut self, pane_id: Uuid, output: &[u8]) -> Vec<CommandResult> {
         let mut completed = Vec::new();
-        let Some(queue) = self.queues.get(&pane_id) else {
+        let Some(&id) = self.active.get(&pane_id) else {
             return completed;
         };
-        if queue.is_empty() {
-            return completed;
-        }
         let mut buf = self.pending.remove(&pane_id).unwrap_or_default();
         buf.extend_from_slice(output);
-        while let Some(&id) = self.queues.get(&pane_id).and_then(|q| q.front()) {
-            let Some(cmd) = self.commands.get_mut(&id) else {
-                break;
+        let Some(cmd) = self.commands.get_mut(&id) else {
+            return completed;
+        };
+        if !cmd.begun {
+            let begin = format!("SHUX_BEGIN{}", cmd.marker).into_bytes();
+            let Some(at) = find(&buf, &begin) else {
+                // Nothing before BEGIN is the command's; keep only what could
+                // be the start of a split marker.
+                let keep = buf.len().min(begin.len() - 1);
+                buf.drain(..buf.len() - keep);
+                self.pending.insert(pane_id, buf);
+                return completed;
             };
-            if !cmd.begun {
-                let begin = format!("SHUX_BEGIN{}", cmd.marker).into_bytes();
-                match find(&buf, &begin) {
-                    Some(at) => {
-                        let after = at + begin.len();
-                        match buf[after..].iter().position(|&b| b == b'\n') {
-                            Some(nl) => {
-                                buf.drain(..after + nl + 1);
-                                cmd.begun = true;
-                            }
-                            None => {
-                                buf.drain(..at);
-                                break;
-                            }
-                        }
-                    }
-                    None => {
-                        // Nothing before BEGIN is the command's; keep only
-                        // what could be the start of a split marker.
-                        let keep = buf.len().min(begin.len() - 1);
-                        buf.drain(..buf.len() - keep);
-                        break;
-                    }
-                }
-                continue;
-            }
-            let end = format!("SHUX_MARKER{}EXIT", cmd.marker).into_bytes();
+            let Some(nl) = buf[at + begin.len()..].iter().position(|&b| b == b'\n') else {
+                buf.drain(..at);
+                self.pending.insert(pane_id, buf);
+                return completed;
+            };
+            buf.drain(..at + begin.len() + nl + 1);
+            cmd.begun = true;
+        }
+        let end = format!("SHUX_MARKER{}EXIT", cmd.marker).into_bytes();
+        loop {
             let Some(at) = find(&buf, &end) else {
-                let keep = buf.len().min(end.len() - 1);
-                let payload: Vec<u8> = buf.drain(..buf.len() - keep).collect();
-                cmd.keep(&payload);
+                let take = buf.len() - buf.len().min(end.len() - 1);
+                cmd.keep(&buf[..take]);
+                buf.drain(..take);
                 break;
             };
             match end_marker(&buf[at + end.len()..]) {
                 EndMarker::Incomplete => {
-                    let payload: Vec<u8> = buf.drain(..at).collect();
-                    cmd.keep(&payload);
+                    cmd.keep(&buf[..at]);
+                    buf.drain(..at);
                     break;
                 }
                 EndMarker::Not => {
                     // Marker-shaped bytes the command wrote itself.
-                    let payload: Vec<u8> = buf.drain(..at + end.len()).collect();
-                    cmd.keep(&payload);
+                    cmd.keep(&buf[..at + end.len()]);
+                    buf.drain(..at + end.len());
                 }
-                EndMarker::Exit(code, len) => {
-                    let payload: Vec<u8> = buf.drain(..at).collect();
-                    cmd.keep(&payload);
-                    buf.drain(..end.len() + len);
-                    if buf.first() == Some(&b'\r') {
-                        buf.remove(0);
-                    }
-                    if buf.first() == Some(&b'\n') {
-                        buf.remove(0);
-                    }
+                EndMarker::Exit(code) => {
+                    cmd.keep(&buf[..at]);
                     if let Some(result) = self.finish(id, CommandState::Completed, Some(code)) {
                         completed.push(result);
                     }
+                    return completed;
                 }
             }
         }
-        if self.queues.get(&pane_id).is_some_and(|q| !q.is_empty()) {
-            self.pending.insert(pane_id, buf);
-        }
+        self.pending.insert(pane_id, buf);
         completed
     }
 
-    /// Finish a running command: freeze its result, answer its waiter, and
-    /// let the oldest finished results go.
+    /// Finish a running command: freeze its result, answer its waiter, free
+    /// its pane, and let the oldest finished results go.
     fn finish(
         &mut self,
         id: Uuid,
@@ -247,6 +227,13 @@ impl CommandEngine {
         let cmd = self.commands.get_mut(&id)?;
         if cmd.state != CommandState::Running {
             return None;
+        }
+        let pane = cmd.pane_id;
+        let held = self.pending.remove(&pane).unwrap_or_default();
+        // Ended some other way than its END marker: the bytes held back in
+        // case they began a marker were the command's own output.
+        if state != CommandState::Completed && cmd.begun {
+            cmd.keep(&held);
         }
         cmd.state = state;
         let capture = std::mem::take(&mut cmd.capture);
@@ -263,13 +250,8 @@ impl CommandEngine {
         if let Some(tx) = cmd.completion_tx.take() {
             let _ = tx.send(result.clone());
         }
-        let pane = cmd.pane_id;
-        if let Some(q) = self.queues.get_mut(&pane) {
-            q.retain(|c| *c != id);
-            if q.is_empty() {
-                self.queues.remove(&pane);
-                self.pending.remove(&pane);
-            }
+        if self.active.get(&pane) == Some(&id) {
+            self.active.remove(&pane);
         }
         self.finished.push_back(id);
         while self.finished.len() > KEEP_FINISHED {
@@ -306,15 +288,20 @@ impl CommandEngine {
             .map(|_| pane)
     }
 
-    /// The pane is gone: finish every command still running in it, so no
-    /// caller waits out its timeout.
+    /// Forget a command whose line never reached the pane: it never ran.
+    pub fn abandon(&mut self, command_id: Uuid) {
+        if let Some(cmd) = self.commands.remove(&command_id)
+            && self.active.get(&cmd.pane_id) == Some(&command_id)
+        {
+            self.active.remove(&cmd.pane_id);
+            self.pending.remove(&cmd.pane_id);
+        }
+    }
+
+    /// The pane is gone: finish its running command, so no caller waits out
+    /// its timeout.
     pub fn forget_pane(&mut self, pane_id: Uuid) {
-        let ids: Vec<Uuid> = self
-            .queues
-            .get(&pane_id)
-            .map(|q| q.iter().copied().collect())
-            .unwrap_or_default();
-        for id in ids {
+        if let Some(&id) = self.active.get(&pane_id) {
             self.finish(id, CommandState::PaneGone, None);
         }
         self.pending.remove(&pane_id);
@@ -351,8 +338,8 @@ enum EndMarker {
     Incomplete,
     /// Not the END marker after all.
     Not,
-    /// The exit code, and how many bytes after the prefix the marker used.
-    Exit(i32, usize),
+    /// The command's exit code.
+    Exit(i32),
 }
 
 /// Classify what follows an END prefix: `<digits>SHUX_END`.
@@ -374,13 +361,11 @@ fn end_marker(rest: &[u8]) -> EndMarker {
     if digits == 0 || !tail.starts_with(SUFFIX) {
         return EndMarker::Not;
     }
-    match std::str::from_utf8(&rest[..digits])
-        .ok()
-        .and_then(|d| d.parse().ok())
-    {
-        Some(code) => EndMarker::Exit(code, digits + SUFFIX.len()),
-        None => EndMarker::Not,
-    }
+    // At most three ASCII digits: no overflow, no parse failure.
+    let code = rest[..digits]
+        .iter()
+        .fold(0, |n, b| n * 10 + i32::from(b - b'0'));
+    EndMarker::Exit(code)
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -477,7 +462,9 @@ mod tests {
     fn run_one(payload: &[u8], code: i32) -> CommandResult {
         let mut engine = CommandEngine::new();
         let pane = Uuid::new_v4();
-        let (id, line) = engine.start_command(pane, "cmd", &[], Duration::from_secs(10), None);
+        let (id, line) = engine
+            .start_command(pane, "cmd", &[], Duration::from_secs(10), None)
+            .unwrap();
         let bytes = framed(&engine, id, &line, payload, code);
         let done = engine.process_output(pane, &bytes);
         assert_eq!(done.len(), 1, "the command did not complete");
@@ -499,7 +486,9 @@ mod tests {
     fn test_marker_split_across_chunks() {
         let mut engine = CommandEngine::new();
         let pane = Uuid::new_v4();
-        let (id, line) = engine.start_command(pane, "echo", &[], Duration::from_secs(10), None);
+        let (id, line) = engine
+            .start_command(pane, "echo", &[], Duration::from_secs(10), None)
+            .unwrap();
         let bytes = framed(&engine, id, &line, b"hello\r\n", 0);
         let end = bytes.windows(8).position(|w| w == b"SHUX_END").unwrap();
         let (a, b) = bytes.split_at(end + 3);
@@ -530,11 +519,15 @@ mod tests {
     fn markers_split_at_any_byte_still_frame_the_output() {
         let mut probe = CommandEngine::new();
         let pane = Uuid::new_v4();
-        let (id, line) = probe.start_command(pane, "cmd", &[], Duration::from_secs(10), None);
+        let (id, line) = probe
+            .start_command(pane, "cmd", &[], Duration::from_secs(10), None)
+            .unwrap();
         let bytes = framed(&probe, id, &line, b"hello\r\n", 0);
         for cut in 1..bytes.len() {
             let mut engine = CommandEngine::new();
-            let (id2, _) = engine.start_command(pane, "cmd", &[], Duration::from_secs(10), None);
+            let (id2, _) = engine
+                .start_command(pane, "cmd", &[], Duration::from_secs(10), None)
+                .unwrap();
             let marker = engine.commands[&id2].marker.clone();
             let bytes = String::from_utf8(bytes.clone())
                 .unwrap()
@@ -551,7 +544,9 @@ mod tests {
     fn a_character_split_across_reads_survives() {
         let mut engine = CommandEngine::new();
         let pane = Uuid::new_v4();
-        let (id, line) = engine.start_command(pane, "cmd", &[], Duration::from_secs(10), None);
+        let (id, line) = engine
+            .start_command(pane, "cmd", &[], Duration::from_secs(10), None)
+            .unwrap();
         let bytes = framed(&engine, id, &line, "héllo ✓\r\n".as_bytes(), 0);
         let cut = bytes.windows(3).position(|w| w == "✓".as_bytes()).unwrap() + 1;
         let mut done = engine.process_output(pane, &bytes[..cut]);
@@ -563,7 +558,9 @@ mod tests {
     fn marker_shaped_output_is_kept_as_output() {
         let mut engine = CommandEngine::new();
         let pane = Uuid::new_v4();
-        let (id, line) = engine.start_command(pane, "cmd", &[], Duration::from_secs(10), None);
+        let (id, line) = engine
+            .start_command(pane, "cmd", &[], Duration::from_secs(10), None)
+            .unwrap();
         let marker = engine.commands[&id].marker.clone();
         let fake = format!("SHUX_MARKER{marker}EXITnotacode\r\n");
         let done = engine.process_output(pane, &framed(&engine, id, &line, fake.as_bytes(), 0));
@@ -591,20 +588,156 @@ mod tests {
     fn a_second_command_gets_only_its_own_output() {
         let mut engine = CommandEngine::new();
         let pane = Uuid::new_v4();
-        let (a, la) = engine.start_command(pane, "a", &[], Duration::from_secs(10), None);
+        let (a, la) = engine
+            .start_command(pane, "a", &[], Duration::from_secs(10), None)
+            .unwrap();
         let first = framed(&engine, a, &la, b"first\r\n", 0);
         engine.process_output(pane, &first);
-        let (b, lb) = engine.start_command(pane, "b", &[], Duration::from_secs(10), None);
+        let (b, lb) = engine
+            .start_command(pane, "b", &[], Duration::from_secs(10), None)
+            .unwrap();
         let done = engine.process_output(pane, &framed(&engine, b, &lb, b"second\r\n", 0));
         assert_eq!(done[0].stdout, "second\n");
         assert_eq!(engine.get_status(a).unwrap().stdout, "first\n");
+    }
+
+    /// The markers come from the shell's builtin printf, never a PATH lookup:
+    /// zsh's `command printf` skips builtins, so a pane whose PATH is broken
+    /// (a stray `/etc/zshenv` will do it) never completed a command.
+    #[test]
+    fn the_markers_need_no_printf_on_path() {
+        if std::process::Command::new("zsh")
+            .arg("-c")
+            .arg("true")
+            .status()
+            .is_err()
+        {
+            return; // no zsh here; bash's `command` already finds builtins
+        }
+        let mut engine = CommandEngine::new();
+        let pane = Uuid::new_v4();
+        let (_, line) = engine
+            .start_command(
+                pane,
+                "PATH=/nowhere; echo ok",
+                &[],
+                Duration::from_secs(5),
+                None,
+            )
+            .unwrap();
+        let out = std::process::Command::new("zsh")
+            .arg("-f")
+            .arg("-c")
+            .arg(&line)
+            .output()
+            .expect("zsh");
+        let done = engine.process_output(pane, &out.stdout);
+        assert_eq!(
+            done.first().map(|r| r.stdout.as_str()),
+            Some("ok\n"),
+            "zsh said: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A pane runs one command at a time: a line typed while another runs
+    /// would be echoed into the running command's output.
+    #[test]
+    fn a_busy_pane_refuses_a_second_command() {
+        let mut engine = CommandEngine::new();
+        let pane = Uuid::new_v4();
+        let (first, line) = engine
+            .start_command(pane, "a", &[], Duration::from_secs(10), None)
+            .unwrap();
+        assert_eq!(
+            engine
+                .start_command(pane, "b", &[], Duration::from_secs(10), None)
+                .err(),
+            Some(first)
+        );
+        engine.process_output(pane, &framed(&engine, first, &line, b"", 0));
+        assert!(
+            engine
+                .start_command(pane, "b", &[], Duration::from_secs(10), None)
+                .is_ok()
+        );
+    }
+
+    /// A command whose line the shell rejected never prints BEGIN. It holds
+    /// the pane until cancelled; the next command then runs cleanly.
+    #[test]
+    fn a_command_that_never_begins_holds_the_pane_until_cancelled() {
+        let mut engine = CommandEngine::new();
+        let pane = Uuid::new_v4();
+        let (stuck, line) = engine
+            .start_command(pane, "if", &[], Duration::from_secs(30), None)
+            .unwrap();
+        let mut bash = line.replace('\n', "\r\n").into_bytes();
+        bash.extend_from_slice(b"bash: syntax error near unexpected token `;'\r\n$ ");
+        assert!(engine.process_output(pane, &bash).is_empty());
+        assert_eq!(
+            engine
+                .start_command(pane, "echo hi", &[], Duration::from_secs(30), None)
+                .err(),
+            Some(stuck)
+        );
+        engine.cancel_command(stuck);
+        let (next, l2) = engine
+            .start_command(pane, "echo hi", &[], Duration::from_secs(30), None)
+            .unwrap();
+        let done = engine.process_output(pane, &framed(&engine, next, &l2, b"hi\r\n", 0));
+        assert_eq!(done[0].stdout, "hi\n");
+    }
+
+    /// A line that never reached the pane never ran: forgetting it frees the pane.
+    #[test]
+    fn an_abandoned_command_frees_its_pane() {
+        let mut engine = CommandEngine::new();
+        let pane = Uuid::new_v4();
+        let (id, _) = engine
+            .start_command(pane, "a", &[], Duration::from_secs(10), None)
+            .unwrap();
+        engine.abandon(id);
+        assert!(engine.get_status(id).is_none());
+        assert!(
+            engine
+                .start_command(pane, "b", &[], Duration::from_secs(10), None)
+                .is_ok()
+        );
+    }
+
+    /// A command that ends some other way than its END marker keeps what it
+    /// wrote, including bytes held back in case they began a marker.
+    #[test]
+    fn output_survives_a_command_that_ends_abnormally() {
+        let mut engine = CommandEngine::new();
+        let pane = Uuid::new_v4();
+        let (id, _) = engine
+            .start_command(
+                pane,
+                "printf hello; exit",
+                &[],
+                Duration::from_secs(10),
+                None,
+            )
+            .unwrap();
+        let marker = engine.commands[&id].marker.clone();
+        engine.process_output(pane, format!("SHUX_BEGIN{marker}\r\nhello").as_bytes());
+        engine.forget_pane(pane);
+        let r = engine.get_status(id).unwrap();
+        assert_eq!(
+            (r.state.as_str(), r.stdout.as_str()),
+            ("pane_gone", "hello")
+        );
     }
 
     #[test]
     fn status_returns_the_finished_result_unchanged() {
         let mut engine = CommandEngine::new();
         let pane = Uuid::new_v4();
-        let (id, line) = engine.start_command(pane, "cmd", &[], Duration::from_secs(10), None);
+        let (id, line) = engine
+            .start_command(pane, "cmd", &[], Duration::from_secs(10), None)
+            .unwrap();
         assert_eq!(engine.get_status(id).unwrap().state, "running");
         engine.process_output(pane, &framed(&engine, id, &line, b"out\r\n", 2));
         let once = engine.get_status(id).unwrap();
@@ -612,7 +745,9 @@ mod tests {
             (once.state.as_str(), once.exit_code, once.stdout.as_str()),
             ("completed", Some(2), "out\n")
         );
-        let (other, lo) = engine.start_command(pane, "x", &[], Duration::from_secs(10), None);
+        let (other, lo) = engine
+            .start_command(pane, "x", &[], Duration::from_secs(10), None)
+            .unwrap();
         engine.process_output(pane, &framed(&engine, other, &lo, b"noise\r\n", 0));
         let twice = engine.get_status(id).unwrap();
         assert_eq!(
@@ -625,10 +760,14 @@ mod tests {
     fn finished_results_are_kept_only_up_to_the_bound() {
         let mut engine = CommandEngine::new();
         let pane = Uuid::new_v4();
-        let (first, l) = engine.start_command(pane, "c", &[], Duration::from_secs(10), None);
+        let (first, l) = engine
+            .start_command(pane, "c", &[], Duration::from_secs(10), None)
+            .unwrap();
         engine.process_output(pane, &framed(&engine, first, &l, b"", 0));
         for _ in 0..KEEP_FINISHED {
-            let (id, l) = engine.start_command(pane, "c", &[], Duration::from_secs(10), None);
+            let (id, l) = engine
+                .start_command(pane, "c", &[], Duration::from_secs(10), None)
+                .unwrap();
             engine.process_output(pane, &framed(&engine, id, &l, b"", 0));
         }
         assert!(
@@ -643,15 +782,16 @@ mod tests {
         let mut engine = CommandEngine::new();
         let pane = Uuid::new_v4();
         let (tx, mut rx) = tokio::sync::oneshot::channel();
-        let (id, _) =
-            engine.start_command(pane, "sleep 60", &[], Duration::from_secs(300), Some(tx));
+        let (id, _) = engine
+            .start_command(pane, "sleep 60", &[], Duration::from_secs(300), Some(tx))
+            .unwrap();
         engine.forget_pane(pane);
         assert_eq!(
             rx.try_recv().expect("the waiter was answered").state,
             "pane_gone"
         );
         assert_eq!(engine.get_status(id).unwrap().state, "pane_gone");
-        assert!(engine.pending.is_empty() && engine.queues.is_empty());
+        assert!(engine.pending.is_empty() && engine.active.is_empty());
     }
 
     #[test]
@@ -659,13 +799,15 @@ mod tests {
         let mut engine = CommandEngine::new();
         let pane_id = Uuid::new_v4();
 
-        let (cmd_id, _) = engine.start_command(
-            pane_id,
-            "sleep",
-            &["60".to_string()],
-            Duration::from_secs(300),
-            None,
-        );
+        let (cmd_id, _) = engine
+            .start_command(
+                pane_id,
+                "sleep",
+                &["60".to_string()],
+                Duration::from_secs(300),
+                None,
+            )
+            .unwrap();
 
         let result = engine.cancel_command(cmd_id);
         assert_eq!(result, Some(pane_id));
@@ -685,19 +827,19 @@ mod tests {
         let mut engine = CommandEngine::new();
         let pane_id = Uuid::new_v4();
 
-        let (cmd_id, _) = engine.start_command(
-            pane_id,
-            "echo",
-            &["hi".to_string()],
-            Duration::from_secs(10),
-            None,
-        );
+        let (cmd_id, _) = engine
+            .start_command(
+                pane_id,
+                "echo",
+                &["hi".to_string()],
+                Duration::from_secs(10),
+                None,
+            )
+            .unwrap();
 
-        let line = String::new();
-        let bytes = framed(&engine, cmd_id, &line, b"hi\r\n", 0);
+        let bytes = framed(&engine, cmd_id, "", b"hi\r\n", 0);
         engine.process_output(pane_id, &bytes);
 
-        // Cancel should fail (already completed)
         assert!(engine.cancel_command(cmd_id).is_none());
     }
 
@@ -707,7 +849,9 @@ mod tests {
         let pane_a = Uuid::new_v4();
         let pane_b = Uuid::new_v4();
 
-        let (cmd_id, _) = engine.start_command(pane_a, "echo", &[], Duration::from_secs(10), None);
+        let (cmd_id, _) = engine
+            .start_command(pane_a, "echo", &[], Duration::from_secs(10), None)
+            .unwrap();
 
         let output = framed(&engine, cmd_id, "", b"", 0);
 
@@ -931,8 +1075,9 @@ mod tests {
     #[test]
     fn a_command_with_no_arguments_is_unchanged() {
         let mut engine = CommandEngine::new();
-        let (_, line) =
-            engine.start_command(Uuid::new_v4(), "echo hi", &[], Duration::from_secs(5), None);
+        let (_, line) = engine
+            .start_command(Uuid::new_v4(), "echo hi", &[], Duration::from_secs(5), None)
+            .unwrap();
         assert!(
             line.contains("; echo hi; __shux_ec=$?;"),
             "the command string is a shell line and must be passed through: {line:?}"
@@ -947,13 +1092,15 @@ mod tests {
         let pane = Uuid::new_v4();
         // No space anywhere in the argument: the pre-fix denylist saw nothing
         // to quote and `id` became a command of its own.
-        let (_, pty_line) = engine.start_command(
-            pane,
-            "echo",
-            &["a;id".to_string()],
-            Duration::from_secs(5),
-            None,
-        );
+        let (_, pty_line) = engine
+            .start_command(
+                pane,
+                "echo",
+                &["a;id".to_string()],
+                Duration::from_secs(5),
+                None,
+            )
+            .unwrap();
         let out = std::process::Command::new("/bin/sh")
             .arg("-c")
             .arg(&pty_line)
@@ -978,13 +1125,15 @@ mod tests {
         let mut engine = CommandEngine::new();
         let pane_id = Uuid::new_v4();
 
-        let (cmd_id, _) = engine.start_command(
-            pane_id,
-            "sleep",
-            &["10".to_string()],
-            Duration::from_secs(300),
-            None,
-        );
+        let (cmd_id, _) = engine
+            .start_command(
+                pane_id,
+                "sleep",
+                &["10".to_string()],
+                Duration::from_secs(300),
+                None,
+            )
+            .unwrap();
 
         let status = engine.get_status(cmd_id).unwrap();
         assert_eq!(status.state, "running");
