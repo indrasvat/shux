@@ -4,9 +4,9 @@
 //! The typed line frames the command between two markers the shell prints:
 //!
 //! ```text
-//! __shux_ec=$?; command -p printf 'SHUX_BE''GIN%s\n' <id>; (exit "$__shux_ec"); CMD; __shux_ec=$?;
+//! __shux_ec=$?; command -p printf 'SHUX_BE''GIN%s\n' <id>; (exit "$__shux_ec") && :; CMD; __shux_ec=$?;
 //! command -p printf 'SHUX_MAR''KER%sEXIT%sSHUX_END\n' <id> "$__shux_ec";
-//! eval "unset __shux_ec; (exit $__shux_ec)"
+//! eval "unset __shux_ec; (exit $__shux_ec)" && :
 //! ```
 //!
 //! The marker text never appears contiguously in the typed line, so the
@@ -131,12 +131,14 @@ impl CommandEngine {
         // `command -p` skips shell functions and searches the default PATH, not
         // the pane's: zsh's `command` never runs the builtin. The pane's `$?`
         // is restored before the command, and the command's own is left as
-        // `$?` after the line: `eval` expands it before the unset runs.
+        // `$?` after the line: `eval` expands it before the unset runs. Each
+        // `(exit N)` heads an `&&` list, so errexit, which spares all but a
+        // list's last command, never ends the shell on it.
         let line = format!(
             "__shux_ec=$?; command -p printf 'SHUX_BE''GIN%s\\n' {marker}; \
-             (exit \"$__shux_ec\"); {command}; __shux_ec=$?; \
+             (exit \"$__shux_ec\") && :; {command}; __shux_ec=$?; \
              command -p printf 'SHUX_MAR''KER%sEXIT%sSHUX_END\\n' {marker} \"$__shux_ec\"; \
-             eval \"unset __shux_ec; (exit $__shux_ec)\"\n",
+             eval \"unset __shux_ec; (exit $__shux_ec)\" && :\n",
         );
         PreparedCommand {
             id,
@@ -731,6 +733,45 @@ mod tests {
                 Some("was:1\n"),
                 "{shell}: the framing reset $? before the command ran"
             );
+        }
+        assert!(ran > 0, "no shell found to run the markers in");
+    }
+
+    /// A shell running with errexit survives the framing: a non-zero status
+    /// carried in or out is restored in an `&&` list, which errexit spares.
+    #[test]
+    fn the_framing_does_not_end_a_shell_running_with_errexit() {
+        let mut ran = 0;
+        for shell in ["bash", "zsh", "dash", "sh"] {
+            if std::process::Command::new(shell)
+                .arg("-c")
+                .arg("true")
+                .output()
+                .is_err()
+            {
+                continue;
+            }
+            ran += 1;
+            for (before, command) in [
+                ("false && :", "echo in"),
+                ("true", "[ -f /nonexistent ] && echo never"),
+            ] {
+                let mut engine = CommandEngine::new();
+                let pane = Uuid::new_v4();
+                let (_, line) = engine
+                    .start_command(pane, command, &[], Duration::from_secs(5), None)
+                    .unwrap();
+                let out = std::process::Command::new(shell)
+                    .arg("-c")
+                    .arg(format!("set -eu; {before}; {line}echo AL''IVE"))
+                    .output()
+                    .expect("shell");
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                assert!(
+                    stdout.contains("ALIVE"),
+                    "{shell}: `{before}` then `{command}` ended the shell: {stdout:?}"
+                );
+            }
         }
         assert!(ran > 0, "no shell found to run the markers in");
     }

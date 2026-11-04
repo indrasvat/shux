@@ -8,13 +8,15 @@
 #   eval "$(shux shell-integration bash)"
 __shux_osc133_install() {
   [[ $- == *i* ]] || return 0
-  [[ -n ${__shux_osc133-} ]] && return 0
+  # A shell reading its rc has started no command. Inherited (allexport
+  # exports it), the flag would make its first prompt end its parent's.
+  __shux_osc133_ran=
+  declare -F __shux_osc133_keep >/dev/null && return 0
   if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4))); then
     printf 'shux shell-integration: bash %s has no PS0; command boundaries need bash 4.4 or newer\n' \
       "$BASH_VERSION" >&2
     return 0
   fi
-  __shux_osc133=1
   # Leaves `$?` as the command left it for the hooks after this one; with
   # errexit on, a non-zero return would end the shell, so it returns 0.
   __shux_osc133_keep() {
@@ -42,18 +44,20 @@ __shux_osc133_install() {
   # PS0 is expanded in this shell, not a subshell: the arithmetic marks that
   # this shell started the command, and rides harmlessly as a C parameter.
   # shellcheck disable=SC2016  # expanded at each prompt, not now
-  PS0+='\e]133;C;shux=$((__shux_osc133_ran = 1))\a'
+  [[ $PS0 == *'133;C;shux='* ]] || PS0+='\e]133;C;shux=$((__shux_osc133_ran = 1))\a'
   __shux_osc133_precmd() {
     local ec=$?
     # Only a command this shell started ends here: a new shell's first
     # prompt (`bash`, `sudo -i` typed into this one) must not end its parent's.
-    if [[ -n ${__shux_osc133_ran-} ]]; then
+    # With promptvars off PS0 cannot mark that, so every prompt reports.
+    if [[ -n ${__shux_osc133_ran-} ]] || ! shopt -q promptvars; then
       printf '\e]133;D;%s\a' "$ec"
       __shux_osc133_ran=
     fi
     printf '\e]133;A\a'
     __shux_osc133_keep "$ec"
   }
+  [[ ${PROMPT_COMMAND[*]-} == *__shux_osc133_precmd* ]] && return 0
   # First, so it reads the command's status before any other hook runs.
   # An array runs every element only from bash 5.1; before, only the first.
   if ((BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] >= 501)) &&

@@ -6,8 +6,10 @@
 #   eval "$(shux shell-integration zsh)"
 __shux_osc133_install() {
   [[ -o interactive ]] || return 0
-  (( ${+__shux_osc133} )) && return 0
-  typeset -g __shux_osc133=1
+  # A shell reading its rc has started no command. Inherited (allexport
+  # exports it), the flag would make its first prompt end its parent's.
+  typeset -g __shux_osc133_ran=
+  (( ${+functions[__shux_osc133_precmd]} )) && return 0
   __shux_osc133_preexec() {
     typeset -g __shux_osc133_ran=1
     print -n '\e]133;C\a'

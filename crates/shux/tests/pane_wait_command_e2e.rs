@@ -370,3 +370,69 @@ fn a_pane_run_line_reports_the_commands_own_exit_code() {
         "the shell reported the wrapper's status, not the command's: {r}"
     );
 }
+
+/// With allexport on, everything the hooks set is exported. A shell started
+/// inside must neither inherit "this shell started a command" (its first
+/// prompt would fake the parent's success) nor stack a second set of hooks.
+#[test]
+fn a_child_of_an_allexport_shell_installs_cleanly() {
+    let bin = env!("CARGO_BIN_EXE_shux");
+    let bash = modern_bash().expect("no bash 4.4+ installed");
+    let child = r#"eval "$("$SHUX_BIN" shell-integration bash)"; printf "%s|%s|%s" "${__shux_osc133_ran-}" "$PS0" "${PROMPT_COMMAND[*]}""#;
+    let out = Command::new(&bash)
+        .env("SHUX_BIN", bin)
+        .env("CHILD_BASH", &bash)
+        .env("CHILD", child)
+        .args(["--noprofile", "--norc", "-i", "-c"])
+        .arg(r#"set -a; eval "$("$SHUX_BIN" shell-integration bash)"; __shux_osc133_ran=1; "$CHILD_BASH" --noprofile --norc -i -c "$CHILD""#)
+        .output()
+        .expect("bash");
+    let got = String::from_utf8_lossy(&out.stdout);
+    let fields: Vec<&str> = got.split('|').collect();
+    assert_eq!(
+        fields.len(),
+        3,
+        "{got:?} {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        fields[0], "",
+        "the child inherited its parent's started-command flag"
+    );
+    assert_eq!(
+        fields[1].matches("133;C").count(),
+        1,
+        "PS0 got a second start: {got:?}"
+    );
+    assert_eq!(
+        fields[2].matches("__shux_osc133_precmd").count(),
+        1,
+        "PROMPT_COMMAND got a second hook: {got:?}"
+    );
+}
+
+/// With `promptvars` off, PS0 is never expanded, so the hook cannot tell it
+/// started the command: it must still report the exit code.
+#[test]
+fn a_bash_with_promptvars_off_still_reports_exit_codes() {
+    let env = Env::new(80, 24);
+    let rc = tempfile::tempdir().expect("rc dir");
+    let bash = modern_bash().expect("no bash 4.4+ installed");
+    let pane = start(&env, &rc, &bash, true);
+    let floor = as_of(&env, &pane);
+    type_line(&env, "shopt -u promptvars");
+    let shopt = result(
+        &wait(&env, &pane, floor, "20s")
+            .output()
+            .expect("spawn shux"),
+    );
+    assert_eq!(shopt["outcome"], "completed", "{shopt}");
+    type_line(&env, "(exit 7)");
+    let after = shopt["started"].as_u64().expect("started");
+    let r = result(
+        &wait(&env, &pane, after, "20s")
+            .output()
+            .expect("spawn shux"),
+    );
+    assert_eq!(r["exit_code"], 7, "{r}");
+}
