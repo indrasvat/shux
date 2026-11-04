@@ -306,7 +306,10 @@ pub(crate) fn register_pane_io_methods(
                     );
                     let command_id = match start {
                         CommandStart::Started(id) => id,
-                        CommandStart::Busy(running) => return Err(pane_busy(running)),
+                        CommandStart::Busy(running) => {
+                            let state = io.lock().await.cmd_engine.get_status(running);
+                            return Err(pane_busy(running, state.map(|r| r.state)));
+                        }
                         CommandStart::PaneGone => {
                             return Err(shux_rpc::RpcError::not_found(
                                 "pane PTY",
@@ -396,11 +399,13 @@ pub(crate) fn register_pane_io_methods(
                     ) {
                         tracing::warn!(%pane_id, "pane is gone; Ctrl-C not delivered");
                     }
+                    // A timed-out command keeps its frozen `timed_out`.
+                    let cancelled = state.cmd_engine.get_status(command_id).map(|r| r.state);
                     drop(state);
 
                     Ok(serde_json::json!({
                         "command_id": cmd_id_str,
-                        "state": "cancelled",
+                        "state": cancelled,
                     }))
                 }
             },
@@ -1822,14 +1827,31 @@ pub(crate) fn register_pane_io_methods(
         )
 }
 
-fn pane_busy(running: uuid::Uuid) -> shux_rpc::RpcError {
+/// `state` is the holder's own: once it has timed out, waiting cannot free
+/// the pane, only its program ending or a cancel can.
+fn pane_busy(running: uuid::Uuid, state: Option<String>) -> shux_rpc::RpcError {
+    let state = state.unwrap_or_else(|| "running".to_string());
+    let (message, hint) = if state == "running" {
+        (
+            format!("the pane is still running command {running}"),
+            "wait for it (pane.command_status) or cancel it (pane.command_cancel), then retry",
+        )
+    } else {
+        (
+            format!(
+                "the pane is still held by command {running} ({state}): its program may still be running; cancel it (pane.command_cancel) to take the pane back"
+            ),
+            "cancel it (pane.command_cancel) to stop its program, then retry",
+        )
+    };
     shux_rpc::RpcError::with_message_and_data(
         shux_rpc::ErrorCode::ResourceExhausted,
-        format!("the pane is still running command {running}"),
+        message,
         serde_json::json!({
             "resource": "pane command",
             "running_command_id": running.to_string(),
-            "hint": "wait for it (pane.command_status) or cancel it (pane.command_cancel), then retry",
+            "running_command_state": state,
+            "hint": hint,
         }),
     )
 }

@@ -259,9 +259,10 @@ impl CommandEngine {
         completed
     }
 
-    /// Finish a running command: freeze its result and answer its waiter. A
-    /// timed-out command's program may still be reading the pane, so it keeps
-    /// the pane until its END marker, a cancel, or the pane going.
+    /// Finish a running command: freeze its result and answer its waiter. It
+    /// keeps its pane until [`Self::release`]: a timed-out command's program
+    /// may still be reading the pane, so only its END marker, a cancel, or the
+    /// pane going releases it.
     fn finish(
         &mut self,
         id: Uuid,
@@ -294,9 +295,6 @@ impl CommandEngine {
         if let Some(tx) = cmd.completion_tx.take() {
             let _ = tx.send(result.clone());
         }
-        if state != CommandState::TimedOut {
-            self.release(id);
-        }
         Some(result)
     }
 
@@ -325,7 +323,7 @@ impl CommandEngine {
             .commands
             .values()
             .filter(|t| {
-                t.state == CommandState::Running && now.duration_since(t.started_at) > t.timeout
+                t.state == CommandState::Running && now.duration_since(t.started_at) >= t.timeout
             })
             .map(|t| t.id)
             .collect();

@@ -64,26 +64,17 @@ impl Env {
         assert!(ready.success(), "the shell never drew its prompt");
     }
 
-    fn run_raw(&self, command: &str) -> std::process::Output {
+    fn run_raw(&self, flags: &[&str], command: &str) -> std::process::Output {
         self.shux()
-            .args([
-                "--format",
-                "json",
-                "pane",
-                "run",
-                "-s",
-                "pr",
-                "--timeout",
-                "30",
-                "-c",
-            ])
-            .arg(command)
+            .args(["--format", "json", "pane", "run", "-s", "pr"])
+            .args(flags)
+            .args(["-c", command])
             .output()
             .expect("spawn shux")
     }
 
     fn run_in_pane(&self, command: &str) -> serde_json::Value {
-        let out = self.run_raw(command);
+        let out = self.run_raw(&["--timeout", "30"], command);
         assert!(
             out.status.success(),
             "pane run failed: {}",
@@ -128,8 +119,7 @@ fn pane_run_returns_only_what_the_command_wrote() {
 }
 
 /// A command started while another runs in the same pane is refused, naming
-/// the one running: its typed line would be echoed into that command's output.
-/// Once the first finishes, the same command is accepted.
+/// the one running. Once the first finishes, the same command is accepted.
 #[test]
 fn a_second_command_is_refused_while_the_first_runs_then_accepted() {
     let env = Env::new();
@@ -144,21 +134,17 @@ fn a_second_command_is_refused_while_the_first_runs_then_accepted() {
     env.start_shell();
 
     // The first command blocks reading the gate until the test opens it.
-    let started = env
-        .shux()
-        .args([
-            "--format", "json", "pane", "run", "-s", "pr", "--async", "-c",
-        ])
-        .arg(format!("read -r _ < '{}'; echo first", gate.display()))
-        .output()
-        .expect("spawn shux");
+    let started = env.run_raw(
+        &["--async"],
+        &format!("read -r _ < '{}'; echo first", gate.display()),
+    );
     let started: serde_json::Value = serde_json::from_slice(&started.stdout).expect("json");
     let first_id = started["command_id"]
         .as_str()
         .expect("command id")
         .to_string();
 
-    let refused = env.run_raw("echo second");
+    let refused = env.run_raw(&["--timeout", "30"], "echo second");
     let said = format!(
         "{}{}",
         String::from_utf8_lossy(&refused.stdout),
@@ -213,43 +199,42 @@ fn a_timed_out_command_holds_the_pane_until_cancelled() {
     let env = Env::new();
     env.start_shell();
 
-    let timed_out = env
-        .shux()
-        .args([
-            "--format",
-            "json",
-            "pane",
-            "run",
-            "-s",
-            "pr",
-            "--timeout",
-            "1",
-        ])
-        .args(["-c", "read -r x; echo got:$x"])
-        .output()
-        .expect("spawn shux");
+    let timed_out = env.run_raw(&["--timeout", "1"], "read -r x; echo got:$x");
     let timed_out: serde_json::Value = serde_json::from_slice(&timed_out.stdout).expect("json");
     assert_eq!(timed_out["state"], "timed_out", "{timed_out}");
     let first_id = timed_out["command_id"].as_str().expect("command id");
 
-    let refused = env.run_raw("echo second");
+    let refused = env.run_raw(&["--timeout", "30"], "echo second");
     let said = String::from_utf8_lossy(&refused.stderr);
     assert!(
         !refused.status.success() && said.contains(first_id),
         "a second command was typed into the timed-out one: {}{said}",
         String::from_utf8_lossy(&refused.stdout)
     );
+    // Waiting cannot free the pane: the refusal must say so.
+    assert!(
+        said.contains("timed_out") && said.contains("cancel") && !said.contains("wait for it"),
+        "the refusal sends the caller to wait on a command that already timed out: {}{said}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
 
     let params = serde_json::json!({ "command_id": first_id }).to_string();
     let cancelled = env
         .shux()
-        .args(["rpc", "call", "pane.command_cancel", "--params", &params])
+        .args(["--format", "json", "rpc", "call", "pane.command_cancel"])
+        .args(["--params", &params])
         .output()
         .expect("spawn shux");
     assert!(
         cancelled.status.success(),
         "{}",
         String::from_utf8_lossy(&cancelled.stderr)
+    );
+    let cancelled: serde_json::Value = serde_json::from_slice(&cancelled.stdout).expect("json");
+    let cancelled = cancelled.get("result").unwrap_or(&cancelled);
+    assert_eq!(
+        cancelled["state"], "timed_out",
+        "cancel and status disagree on the command's state: {cancelled}"
     );
     let accepted = env.run_in_pane("echo second");
     assert_eq!(accepted["stdout"], "second\n", "{accepted}");
