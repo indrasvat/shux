@@ -187,6 +187,14 @@ threads-required = "num-test-threads"
 filter = 'binary_id(=shux::lens_settle) & test(=s2_settle_flake_gate_100x)'
 slow-timeout = { period = "60s", terminate-after = 8 }
 
+# 140 state.apply calls (70 per case) with multi-megabyte payloads, enough to
+# overflow the response limit if the per-session cap ever went. 25-26 s on a
+# loaded laptop both before and after 12e8870; timed out at 120 s once on a
+# hosted macOS runner. The count is the test.
+[[profile.default.overrides]]
+filter = 'binary_id(=shux::pane_command_e2e) & test(=a_session_full_of_large_argvs_or_cwds_stays_listable)'
+slow-timeout = { period = "60s", terminate-after = 8 }
+
 # ── CI profile ────────────────────────────────────────────────────────────
 # Same scheduling as local; only the reporting differs. Keeping the groups
 # shared is the point — a CI-only relaxation would put the divergence this

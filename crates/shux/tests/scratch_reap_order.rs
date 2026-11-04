@@ -120,13 +120,9 @@ fn reap_sends_sigterm_then_sigkill_and_removes_row_only_after_death() {
         wait_until(BUDGET, || row_outlives_group() == 0),
         "SIGKILL must follow the grace window (TERM-ignoring workload survived)"
     );
-    assert_eq!(
-        std::fs::read_to_string(&marker)
-            .expect("marker readable")
-            .trim(),
-        "TERMED",
-        "the marker carries the trap's payload (TERM, not KILL, fired it)"
-    );
+    // Only the TERM trap creates the marker, and KILL runs no trap, so its
+    // existence is the proof. Its text is not: KILL may land after the
+    // trap's `>` opened the file and before `echo` wrote to it.
 
     // (b) Row removed only after death — and the session is gone with it.
     assert!(
