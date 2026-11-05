@@ -1985,16 +1985,25 @@ pub fn print_pane_wait_status(result: &serde_json::Value, states: &[&String], id
             warning("✗"),
             muted(pane_id),
         ),
-        (other, _) => println!(
-            "{} pane {} {}",
-            warning("✗"),
-            muted(pane_id),
-            if other == "pane_gone" {
-                "exited before reaching the state"
-            } else {
-                other
-            },
-        ),
+        ("pane_gone", _) => {
+            let how = match (
+                result.get("exit_signal").and_then(|v| v.as_i64()),
+                result.get("exit_status").and_then(|v| v.as_i64()),
+            ) {
+                (Some(signal), _) => format!("was killed by signal {signal}"),
+                // -1 is the "no code" sentinel, not an exit code.
+                (None, Some(code)) if code >= 0 => format!("exited with code {code}"),
+                (None, Some(_)) => "exited".to_string(),
+                (None, None) => "was removed".to_string(),
+            };
+            println!(
+                "{} pane {} {how} before reaching {}",
+                warning("✗"),
+                muted(pane_id),
+                states.join("|"),
+            );
+        }
+        (other, _) => println!("{} pane {} {other}", warning("✗"), muted(pane_id)),
     }
 }
 

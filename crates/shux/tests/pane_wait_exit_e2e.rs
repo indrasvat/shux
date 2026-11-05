@@ -245,6 +245,58 @@ fn wait_exit_on_an_unknown_pane_exits_2() {
     }
 }
 
+/// An id that names no pane is not found, never a pane that exited: a typo'd
+/// or stale id must not read as "the program finished".
+#[test]
+fn the_other_waits_on_an_unknown_pane_exit_2_not_3() {
+    let env = Env::new();
+    for id in ["0000ffff", "00000000-0000-4000-8000-000000000000"] {
+        for wait in [
+            &[
+                "pane",
+                "wait-status",
+                id,
+                "--state",
+                "done",
+                "--timeout",
+                "0",
+            ][..],
+            &["pane", "wait-command", id, "--timeout", "0"][..],
+        ] {
+            let (exit, v) = env.json(wait);
+            assert_eq!(exit, 2, "{wait:?}: {v}");
+            assert_eq!(v["error"]["code"], -32004, "{wait:?}: {v}");
+        }
+    }
+}
+
+/// A pane whose program exited keeps `pane_gone` with its exit status, and
+/// the text line says what the status was.
+#[test]
+fn wait_status_on_an_exited_pane_reports_its_exit_status() {
+    let env = Env::new();
+    let pane = env.split(&format!("{PROBE}; exit 7"));
+    assert_eq!(env.wait_exit(&pane, &["--timeout", "30s"]).0, 0);
+    let wait = [
+        "pane",
+        "wait-status",
+        &pane,
+        "--state",
+        "done",
+        "--timeout",
+        "0",
+    ];
+    let (exit, v) = env.json(&wait);
+    assert_eq!(exit, 3, "{v}");
+    assert_eq!(v["result"]["outcome"], "pane_gone", "{v}");
+    assert_eq!(v["result"]["exit_status"], 7, "{v}");
+    let out = env.run(&wait);
+    assert_eq!(out.status.code(), Some(3), "{}", show(&out));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("exited with code 7"), "{}", show(&out));
+    env.assert_probe(&pane);
+}
+
 #[test]
 fn a_program_that_reports_done_but_keeps_running_has_not_exited() {
     let env = Env::new();

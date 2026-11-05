@@ -89,6 +89,11 @@ pub(crate) fn register_program_status_methods(
                     let params = params.unwrap_or_default();
                     let wait = WaitParams::parse(&params)?;
                     let pane_id = resolve_pane_id_from_params(&gh, &params)?;
+                    // A full id resolves unchecked: one that names no pane is
+                    // not found, not a pane that exited.
+                    if !gh.snapshot().panes.contains_key(&pane_id) {
+                        return Err(RpcError::not_found("pane", &pane_id.to_string()));
+                    }
                     wait_status(&gh, &io, &bus, pane_id, &wait).await
                 }
             },

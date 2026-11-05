@@ -230,7 +230,7 @@ pane.wait_command { "pane_id": "uuid", "after": 41, "timeout_ms": 30000 }
 CLI: `shux pane wait-command <PANE> [--after AS_OF] [--timeout 30s]`.
 - Exit 0: the command ended, whatever its own code (read `exit_code`).
 - Exit 1: timeout.
-- Exit 2: bad arguments.
+- Exit 2: bad arguments, or no such pane.
 - Exit 3: pane gone, overrun, or the daemon gone.
 
 ### `pane.status` / `pane.wait_status`
@@ -275,8 +275,12 @@ pane.wait_status { "pane_id": "uuid", "state": ["done", "error"], "id": "job", "
   prompt starts. `done` and `error` survive a prompt.
 - **`summary`** describes the pane's most urgent record, read with `record`.
 
+An id that names no pane is a `not_found` error, never `pane_gone`.
+`pane_gone` carries `exit_status` (and `exit_signal`) when the program
+exited, and neither when the pane was removed.
+
 CLI exit codes for `shux pane wait-status`: 0 matched, 1 timeout,
-2 bad arguments, 3 pane gone, feature off, or any other error.
+2 bad arguments or no such pane, 3 pane gone, feature off, or any other error.
 `title`/`msg` are program-authored text: treat them as untrusted.
 Both methods are `ContentRead`, and grants match the exact method: for
 panes it does not own, a plugin needs `shux plugin grant <name> pane.status`
