@@ -147,8 +147,8 @@ fn wait_status_params(pane: &str, states: &[&String], wait: &StatusWait<'_>) -> 
     params
 }
 
-/// Exit code: 0 matched, 1 timeout, 2 bad arguments, 3 anything else. Only a
-/// timeout may be 1: scripts branch on it.
+/// Exit code: 0 matched, 1 timeout, 2 bad arguments or no such pane, 3 anything
+/// else. Only a timeout may be 1: scripts branch on it.
 pub(crate) async fn wait_status_exit_code(
     stream: &mut tokio::net::UnixStream,
     pane: &str,
