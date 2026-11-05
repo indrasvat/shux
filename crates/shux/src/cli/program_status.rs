@@ -90,7 +90,8 @@ fn unique(states: &[String]) -> Vec<&String> {
 }
 
 /// A wait RPC's result, or `Err` with the exit code once its failure is
-/// reported: a refused request exits here, a lost daemon is 3.
+/// reported: a refused request exits here, a lost daemon is 3. No such pane
+/// is 2, as `wait-exit` says, so it cannot read as a pane that went away.
 pub(super) async fn call_wait(
     stream: &mut tokio::net::UnixStream,
     method: &str,
@@ -110,7 +111,10 @@ pub(super) async fn call_wait(
             code,
             &message,
             data,
-            super::lens::lens_checkpoint_exit_code(code),
+            match code {
+                -32004 => 2,
+                code => super::lens::lens_checkpoint_exit_code(code),
+            },
         ),
         Err(other) => {
             match format {

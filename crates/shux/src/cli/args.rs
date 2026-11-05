@@ -1379,7 +1379,7 @@ pub enum PaneCommand {
 
     /// Block until a pane's program status reaches one of the given states,
     /// or time out. Mirrors `pane.wait_status`. Exit 0 matched, 1 timeout,
-    /// 2 bad arguments, 3 the pane exited, program status is off, the
+    /// 2 bad arguments or no such pane, 3 the pane exited, program status is off, the
     /// daemon went away, or any other error.
     ///
     /// To wait for one command typed into a shell, have it report under its
@@ -1422,7 +1422,7 @@ pub enum PaneCommand {
     /// exit code. Needs the shell to report command boundaries (OSC 133):
     /// see `shux shell-integration`. Mirrors `pane.wait_command`. Exit 0 the
     /// command ended (whatever its own code: read `exit_code`), 1 timeout,
-    /// 2 bad arguments, 3 the pane went away or respawned, the floor is
+    /// 2 bad arguments or no such pane, 3 the pane went away or respawned, the floor is
     /// older than the commands kept, or the daemon went away.
     ///
     /// Read `.result.as_of` from `shux --format json pane status` before
