@@ -1,3 +1,10 @@
+## [0.57.1](https://github.com/indrasvat/shux/compare/v0.57.0...v0.57.1) (2026-11-05)
+
+
+### Bug Fixes
+
+* **pane:** wait-status on an id that names no pane is not found ([#270](https://github.com/indrasvat/shux/issues/270)) ([8fff6dc](https://github.com/indrasvat/shux/commit/8fff6dc134bcd69cb540b79ecc7c6d43598a47dd)), closes [#249](https://github.com/indrasvat/shux/issues/249)
+
 # [0.57.0](https://github.com/indrasvat/shux/compare/v0.56.4...v0.57.0) (2026-11-04)
 
 
