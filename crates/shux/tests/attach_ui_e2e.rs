@@ -9,6 +9,7 @@
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
+use proptest::prelude::*;
 use shux_testkit::wait_until;
 
 /// The probe, then a wide-character line, then park.
@@ -396,6 +397,7 @@ fn raw_key_script(name: &str) -> String {
          while IFS= read -r -N 1 byte; do \
            printf '%s' \"$byte\" >> '{{root}}/{name}.keys'; \
            if [ \"$byte\" = '!' ]; then n=$((n+1)); printf 'ACK-{name}-%s\\r\\n' \"$n\"; fi; \
+           if [ \"$byte\" = '%' ]; then printf 'FENCE-{name}\\r\\n'; fi; \
          done"
     )
 }
@@ -490,4 +492,69 @@ fn option_left_and_right_edit_words_in_a_real_attached_bash() {
     env.wait_for("<Zbbb>");
     env.send_keys("printf '<%s>\\n' aaa bbb\x1b[1;3D\x1b[1;3D\x1b[1;3CZ\n");
     env.wait_for("<aaaZ>");
+}
+
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 16, ..ProptestConfig::default() })]
+
+    #[test]
+    fn generated_focus_and_zoom_sequences_preserve_exact_pty_input(
+        operations in prop::collection::vec(0u8..9, 1..128),
+    ) {
+        let env = raw_key_env();
+        let second = raw_key_script("second")
+            .replace("{root}", &env.root.path().display().to_string());
+        env.ok(&["pane", "split", "-s", "target", "-d", "vertical", "--",
+            "/bin/bash", "--noprofile", "--norc", "-c", &second]);
+        env.wait_for("RAW-READY-second");
+        // A vertical split puts the original pane on the left and focuses
+        // the new right pane. Equal-height panes have no up/down neighbour.
+        let mut side = 1usize;
+        let mut zoomed = false;
+        let mut expected = [String::new(), String::new()];
+        let mut input = String::new();
+        for &operation in &operations {
+            match operation {
+                0..=3 => {
+                    let key = ALT_ARROWS[operation as usize];
+                    input.push_str(key);
+                    match (operation, side, zoomed) {
+                        (0, 1, false) => side = 0,
+                        (1, 0, false) => side = 1,
+                        _ => expected[side].push_str(key),
+                    }
+                }
+                4 => {
+                    input.push_str("\x1bz");
+                    zoomed = !zoomed;
+                }
+                5..=8 => {
+                    input.push('\x01');
+                    input.push(['h', 'j', 'k', 'l'][(operation - 5) as usize]);
+                    if !zoomed {
+                        match operation {
+                            5 => side = 0,
+                            8 => side = 1,
+                            _ => {}
+                        }
+                    }
+                }
+                _ => unreachable!("the generator bounds operations"),
+            }
+        }
+        if zoomed {
+            input.push_str("\x1bz");
+        }
+        // Fence each PTY independently: seeing the second pane's fence
+        // cannot establish that the first pane has drained its own input.
+        input.push_str("\x01h%\x01l%");
+        env.send_keys(&input);
+        env.wait_for("FENCE-first");
+        env.wait_for("FENCE-second");
+        expected[0].push('%');
+        expected[1].push('%');
+        prop_assert_eq!(&key_log(&env, "first"), &expected[0], "left pane, operations: {:?}", operations);
+        prop_assert_eq!(&key_log(&env, "second"), &expected[1], "right pane, operations: {:?}", operations);
+    }
 }
