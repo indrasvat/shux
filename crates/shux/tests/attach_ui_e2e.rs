@@ -39,6 +39,10 @@ impl Env {
     /// [`Self::attached`], with `env_vars` before the client's command line
     /// and `redirect` after it, `{root}` in it naming the test's root.
     fn attached_with(config_toml: &str, env_vars: &str, redirect: &str) -> Self {
+        Self::attached_command(config_toml, env_vars, redirect, &["/bin/sh", "-c", TARGET_SCRIPT])
+    }
+
+    fn attached_command(config_toml: &str, env_vars: &str, redirect: &str, argv: &[&str]) -> Self {
         let root = tempfile::tempdir().expect("temp root");
         for sub in ["runtime", "config/shux", "state", "work"] {
             std::fs::create_dir_all(root.path().join(sub)).expect("mkdir");
@@ -56,7 +60,11 @@ impl Env {
         env.ok(&[
             "pane", "set-size", "-s", "host", "--cols", "100", "--rows", "40",
         ]);
-        env.session_with_argv("target", &["/bin/sh", "-c", TARGET_SCRIPT]);
+        let argv: Vec<String> = argv.iter()
+            .map(|arg| arg.replace("{root}", &env.root.path().display().to_string()))
+            .collect();
+        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+        env.session_with_argv("target", &argv);
 
         let bin = env.bin.display().to_string();
         let root = env.root.path().display().to_string();
@@ -372,4 +380,114 @@ fn the_copy_mode_cursor_keeps_the_character_under_it() {
         row.contains("漢字WIDE"),
         "the cursor blanked the wide glyph under it: {row:?}"
     );
+}
+
+
+const ALT_ARROWS: [&str; 4] = ["\x1b[1;3D", "\x1b[1;3C", "\x1b[1;3A", "\x1b[1;3B"];
+const COLOUR_PROBE: &str = "printf '\\033[38;2;120;220;180mTRUECOLOR\\033[0m \\
+    \\033[38;5;208mINDEXED\\033[0m \\033[34mBASIC\\033[0m\\n';";
+
+/// The acknowledgement is emitted after the sentinel reaches the raw PTY;
+/// it fences earlier input without a sleep or an assertion about missing output.
+fn raw_key_script(name: &str) -> String {
+    format!(
+        "stty raw -echo; : > '{{root}}/{name}.keys'; {COLOUR_PROBE} \
+         printf 'RAW-READY-{name}\\r\\n'; n=0; \
+         while IFS= read -r -N 1 byte; do \
+           printf '%s' \"$byte\" >> '{{root}}/{name}.keys'; \
+           if [ \"$byte\" = '!' ]; then n=$((n+1)); printf 'ACK-{name}-%s\\r\\n' \"$n\"; fi; \
+         done"
+    )
+}
+
+fn raw_key_env() -> Env {
+    let env = Env::attached_command(
+        &keys_config("ctrl-a"), "", "",
+        &["/bin/bash", "--noprofile", "--norc", "-c", &raw_key_script("first")],
+    );
+    env.wait_for("RAW-READY-first");
+    env
+}
+
+fn key_log(env: &Env, name: &str) -> String {
+    std::fs::read_to_string(env.root.path().join(format!("{name}.keys")))
+        .expect("the raw PTY's input log")
+}
+
+#[test]
+fn alt_arrows_without_a_neighbour_reach_the_real_attach_pty() {
+    let env = raw_key_env();
+    let input = format!("{}!", ALT_ARROWS.concat());
+    env.send_keys(&input);
+    env.wait_for("ACK-first-1");
+    assert_eq!(key_log(&env, "first"), input);
+
+    // Prefix commands are commands even when their focus action has no target.
+    env.send_keys("\x01h\x01j\x01k\x01l!");
+    env.wait_for("ACK-first-2");
+    assert_eq!(key_log(&env, "first"), format!("{input}!"));
+}
+
+#[test]
+fn alt_arrows_in_a_zoomed_split_reach_only_the_visible_pane() {
+    let env = raw_key_env();
+    let second = raw_key_script("second").replace("{root}", &env.root.path().display().to_string());
+    env.ok(&["pane", "split", "-s", "target", "-d", "vertical", "--",
+        "/bin/bash", "--noprofile", "--norc", "-c", &second]);
+    env.wait_for("RAW-READY-second");
+    env.send_keys("\x1bz");
+    env.wait_for("zoom");
+    let input = format!("{}!", ALT_ARROWS.concat());
+    env.send_keys(&input);
+    env.wait_for("ACK-second-1");
+    assert_eq!(key_log(&env, "second"), input);
+    assert_eq!(key_log(&env, "first"), "");
+    let panes: serde_json::Value = serde_json::from_str(
+        &env.ok(&["--format", "json", "pane", "list", "-s", "target"]),
+    ).expect("pane list");
+    assert!(panes.as_array().expect("panes").iter().any(|p|
+        p["is_focused"] == true && p["is_zoomed"] == true));
+}
+
+#[test]
+fn alt_arrows_focus_real_split_neighbours_and_fall_through_at_edges() {
+    for (direction, inward, outward) in [("vertical", 0, 1), ("horizontal", 2, 3)] {
+        let env = raw_key_env();
+        let second = raw_key_script("second").replace("{root}", &env.root.path().display().to_string());
+        env.ok(&["pane", "split", "-s", "target", "-d", direction, "--",
+            "/bin/bash", "--noprofile", "--norc", "-c", &second]);
+        env.wait_for("RAW-READY-second");
+
+        // New split is focused: its outer edge forwards, then the inward key
+        // focuses the original pane. A sentinel proves the ordered result.
+        env.send_keys(&format!("{}!", ALT_ARROWS[outward]));
+        env.wait_for("ACK-second-1");
+        env.send_keys(&format!("{}!", ALT_ARROWS[inward]));
+        env.wait_for("ACK-first-1");
+        assert_eq!(key_log(&env, "first"), "!");
+        assert_eq!(key_log(&env, "second"), format!("{}!", ALT_ARROWS[outward]));
+
+        env.send_keys(&format!("{}!", ALT_ARROWS[inward]));
+        env.wait_for("ACK-first-2");
+        env.send_keys(&format!("{}!", ALT_ARROWS[outward]));
+        env.wait_for("ACK-second-2");
+        assert_eq!(key_log(&env, "first"), format!("!{}!", ALT_ARROWS[inward]));
+        assert_eq!(key_log(&env, "second"), format!("{}!!", ALT_ARROWS[outward]));
+    }
+}
+
+#[test]
+fn option_left_and_right_edit_words_in_a_real_attached_bash() {
+    let script = format!("{COLOUR_PROBE} exec /bin/bash --noprofile --norc -i");
+    let env = Env::attached_command(&keys_config("ctrl-a"), "", "",
+        &["/bin/sh", "-c", &script]);
+    // Pin readline bindings instead of depending on a host's inputrc.
+    env.send_keys("bind '\"\\e[1;3D\": backward-word'; bind '\"\\e[1;3C\": forward-word'; \
+        PS1='NAV> '; printf '%s\\n' 'READ''LINE-READY'\n");
+    env.wait_for("READLINE-READY");
+
+    env.send_keys("printf '<%s>\\n' aaa bbb\x1b[1;3DZ\n");
+    env.wait_for("<Zbbb>");
+    env.send_keys("printf '<%s>\\n' aaa bbb\x1b[1;3D\x1b[1;3D\x1b[1;3CZ\n");
+    env.wait_for("<aaaZ>");
 }
