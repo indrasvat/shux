@@ -122,6 +122,7 @@ Inside the TUI, the prefix key is `Ctrl+Space` by default:
 |---|---|
 | `Ctrl+Space \|`/`-` | split vertical / horizontal |
 | `Ctrl+Space h`/`j`/`k`/`l` | focus left / down / up / right |
+| `Alt+←`/`→`/`↑`/`↓` | focus a neighbour; send the key to the pane if none is visible |
 | `Ctrl+Space z` | toggle zoom |
 | `Ctrl+Space d` | detach |
 | click any pane | focus it |

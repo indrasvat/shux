@@ -223,6 +223,7 @@ impl AttachClient {
                                         args: shux_rpc::attach::ActionArgs {
                                             name: None,
                                             window_index,
+                                            ..Default::default()
                                         },
                                     }
                                 }

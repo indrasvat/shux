@@ -40,7 +40,12 @@ impl Env {
     /// [`Self::attached`], with `env_vars` before the client's command line
     /// and `redirect` after it, `{root}` in it naming the test's root.
     fn attached_with(config_toml: &str, env_vars: &str, redirect: &str) -> Self {
-        Self::attached_command(config_toml, env_vars, redirect, &["/bin/sh", "-c", TARGET_SCRIPT])
+        Self::attached_command(
+            config_toml,
+            env_vars,
+            redirect,
+            &["/bin/sh", "-c", TARGET_SCRIPT],
+        )
     }
 
     fn attached_command(config_toml: &str, env_vars: &str, redirect: &str, argv: &[&str]) -> Self {
@@ -61,7 +66,8 @@ impl Env {
         env.ok(&[
             "pane", "set-size", "-s", "host", "--cols", "100", "--rows", "40",
         ]);
-        let argv: Vec<String> = argv.iter()
+        let argv: Vec<String> = argv
+            .iter()
             .map(|arg| arg.replace("{root}", &env.root.path().display().to_string()))
             .collect();
         let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
@@ -383,7 +389,6 @@ fn the_copy_mode_cursor_keeps_the_character_under_it() {
     );
 }
 
-
 const ALT_ARROWS: [&str; 4] = ["\x1b[1;3D", "\x1b[1;3C", "\x1b[1;3A", "\x1b[1;3B"];
 const COLOUR_PROBE: &str = "printf '\\033[38;2;120;220;180mTRUECOLOR\\033[0m \\
     \\033[38;5;208mINDEXED\\033[0m \\033[34mBASIC\\033[0m\\n';";
@@ -403,9 +408,21 @@ fn raw_key_script(name: &str) -> String {
 }
 
 fn raw_key_env() -> Env {
+    raw_key_env_with_config(&keys_config("ctrl-a"))
+}
+
+fn raw_key_env_with_config(config: &str) -> Env {
     let env = Env::attached_command(
-        &keys_config("ctrl-a"), "", "",
-        &["/bin/bash", "--noprofile", "--norc", "-c", &raw_key_script("first")],
+        config,
+        "",
+        "",
+        &[
+            "/bin/bash",
+            "--noprofile",
+            "--norc",
+            "-c",
+            &raw_key_script("first"),
+        ],
     );
     env.wait_for("RAW-READY-first");
     env
@@ -431,11 +448,62 @@ fn alt_arrows_without_a_neighbour_reach_the_real_attach_pty() {
 }
 
 #[test]
+fn focus_fallback_preserves_aliases_custom_keys_and_other_action_overrides() {
+    let config = format!(
+        "{}[keybindings]\n\"ctrl-x\" = \"focus-left\"\n\"alt-left\" = \"redraw\"\n",
+        keys_config("ctrl-a")
+    );
+    let env = raw_key_env_with_config(&config);
+    env.send_keys("\x1bh\x18\x1b[1;3D!");
+    env.wait_for("ACK-first-1");
+    assert_eq!(key_log(&env, "first"), "\x1bh\x18!");
+
+    env.send_keys("\x01?");
+    env.wait_for("keybindings (prefix = ^A)");
+    env.write_config(&format!(
+        "{}[keybindings]\n\"alt-left\" = \"focus-left\"\n",
+        keys_config("ctrl-b")
+    ));
+    env.wait_for("keybindings (prefix = ^B)");
+    env.send_keys("\x02?\x1b[1;3D!");
+    env.wait_for("ACK-first-2");
+    assert_eq!(key_log(&env, "first"), "\x1bh\x18!\x1b[1;3D!");
+}
+
+#[test]
+fn focus_fallback_respects_help_and_copy_mode_input_capture() {
+    let env = raw_key_env();
+    env.send_keys("\x01?");
+    env.wait_for("keybindings (prefix = ^A)");
+    env.send_keys(&format!("{}\x01?!", ALT_ARROWS.concat()));
+    env.wait_for("ACK-first-1");
+    assert_eq!(key_log(&env, "first"), "!");
+
+    env.send_keys("\x01[");
+    env.wait_for("COPY");
+    env.send_keys(&format!("{}q!", ALT_ARROWS.concat()));
+    env.wait_for("ACK-first-2");
+    assert_eq!(key_log(&env, "first"), "!!");
+}
+
+#[test]
 fn alt_arrows_in_a_zoomed_split_reach_only_the_visible_pane() {
     let env = raw_key_env();
     let second = raw_key_script("second").replace("{root}", &env.root.path().display().to_string());
-    env.ok(&["pane", "split", "-s", "target", "-d", "vertical", "--",
-        "/bin/bash", "--noprofile", "--norc", "-c", &second]);
+    env.ok(&[
+        "pane",
+        "split",
+        "-s",
+        "target",
+        "-d",
+        "vertical",
+        "--",
+        "/bin/bash",
+        "--noprofile",
+        "--norc",
+        "-c",
+        &second,
+    ]);
     env.wait_for("RAW-READY-second");
     env.send_keys("\x1bz");
     env.wait_for("zoom");
@@ -444,20 +512,38 @@ fn alt_arrows_in_a_zoomed_split_reach_only_the_visible_pane() {
     env.wait_for("ACK-second-1");
     assert_eq!(key_log(&env, "second"), input);
     assert_eq!(key_log(&env, "first"), "");
-    let panes: serde_json::Value = serde_json::from_str(
-        &env.ok(&["--format", "json", "pane", "list", "-s", "target"]),
-    ).expect("pane list");
-    assert!(panes.as_array().expect("panes").iter().any(|p|
-        p["is_focused"] == true && p["is_zoomed"] == true));
+    let panes: serde_json::Value =
+        serde_json::from_str(&env.ok(&["--format", "json", "pane", "list", "-s", "target"]))
+            .expect("pane list");
+    assert!(
+        panes
+            .as_array()
+            .expect("panes")
+            .iter()
+            .any(|p| p["is_focused"] == true && p["is_zoomed"] == true)
+    );
 }
 
 #[test]
 fn alt_arrows_focus_real_split_neighbours_and_fall_through_at_edges() {
     for (direction, inward, outward) in [("vertical", 0, 1), ("horizontal", 2, 3)] {
         let env = raw_key_env();
-        let second = raw_key_script("second").replace("{root}", &env.root.path().display().to_string());
-        env.ok(&["pane", "split", "-s", "target", "-d", direction, "--",
-            "/bin/bash", "--noprofile", "--norc", "-c", &second]);
+        let second =
+            raw_key_script("second").replace("{root}", &env.root.path().display().to_string());
+        env.ok(&[
+            "pane",
+            "split",
+            "-s",
+            "target",
+            "-d",
+            direction,
+            "--",
+            "/bin/bash",
+            "--noprofile",
+            "--norc",
+            "-c",
+            &second,
+        ]);
         env.wait_for("RAW-READY-second");
 
         // New split is focused: its outer edge forwards, then the inward key
@@ -474,18 +560,22 @@ fn alt_arrows_focus_real_split_neighbours_and_fall_through_at_edges() {
         env.send_keys(&format!("{}!", ALT_ARROWS[outward]));
         env.wait_for("ACK-second-2");
         assert_eq!(key_log(&env, "first"), format!("!{}!", ALT_ARROWS[inward]));
-        assert_eq!(key_log(&env, "second"), format!("{}!!", ALT_ARROWS[outward]));
+        assert_eq!(
+            key_log(&env, "second"),
+            format!("{}!!", ALT_ARROWS[outward])
+        );
     }
 }
 
 #[test]
 fn option_left_and_right_edit_words_in_a_real_attached_bash() {
     let script = format!("{COLOUR_PROBE} exec /bin/bash --noprofile --norc -i");
-    let env = Env::attached_command(&keys_config("ctrl-a"), "", "",
-        &["/bin/sh", "-c", &script]);
+    let env = Env::attached_command(&keys_config("ctrl-a"), "", "", &["/bin/sh", "-c", &script]);
     // Pin readline bindings instead of depending on a host's inputrc.
-    env.send_keys("bind '\"\\e[1;3D\": backward-word'; bind '\"\\e[1;3C\": forward-word'; \
-        PS1='NAV> '; printf '%s\\n' 'READ''LINE-READY'\n");
+    env.send_keys(
+        "bind '\"\\e[1;3D\": backward-word'; bind '\"\\e[1;3C\": forward-word'; \
+        PS1='NAV> '; printf '%s\\n' 'READ''LINE-READY'\n",
+    );
     env.wait_for("READLINE-READY");
 
     env.send_keys("printf '<%s>\\n' aaa bbb\x1b[1;3DZ\n");
@@ -494,14 +584,16 @@ fn option_left_and_right_edit_words_in_a_real_attached_bash() {
     env.wait_for("<aaaZ>");
 }
 
-
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 16, ..ProptestConfig::default() })]
+    // Cases boot real PTYs; keep the triggering sequence instead of rebooting
+    // during shrinking. Larger fuzz runs repeat this test through nextest.
+    #![proptest_config(ProptestConfig { cases: 4, max_shrink_iters: 0, ..ProptestConfig::default() })]
 
     #[test]
     fn generated_focus_and_zoom_sequences_preserve_exact_pty_input(
         operations in prop::collection::vec(0u8..9, 1..128),
     ) {
+        eprintln!("focus-model case operations={}", operations.len());
         let env = raw_key_env();
         let second = raw_key_script("second")
             .replace("{root}", &env.root.path().display().to_string());

@@ -42,10 +42,17 @@ The prefix key is `Ctrl+Space` (configurable via `[keys].prefix` in
 | `Ctrl+Space d` | detach |
 | `Ctrl+Space Ctrl+Space` | send literal prefix to inner shell |
 | `Alt+Enter` | smart split (no prefix needed) |
+| `Alt+←`/`→`/`↑`/`↓` | focus a neighbour, or send the key to the pane if none is visible |
 | **mouse click** on a pane | focus that pane |
 | **mouse drag** on a border | resize the split |
 | **mouse drag** on pane text | select visible text and copy on release |
 | **right-click** selected text | open inline `Copy` / `Clear` menu |
+
+Without a neighbour in the requested direction, including while zoomed,
+unprefixed directional focus bindings pass their original key to the pane.
+This preserves Option/Alt word navigation in a single-pane shell. The same
+rule applies to `Alt+h`/`j`/`k`/`l` and custom unprefixed focus bindings.
+Prefix focus commands remain consumed even when focus cannot move.
 
 ### Copying text
 
