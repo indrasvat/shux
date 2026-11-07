@@ -1039,7 +1039,80 @@ async fn run_attach_loop(
                         continue;
                     }
                 };
+                // External CLI/API focus changes must apply before this key.
+                if !sync_focus(&graph, &mut session, &render_session).await {
+                    final_frame = Some(AttachServerFrame::SessionEnded {
+                        reason: "session_destroyed".into(),
+                    });
+                    break;
+                }
+                // A focus action without a target can reuse the normal input path.
+                let parsed = match parsed {
+                    AttachClientFrame::Action { kind, mut args } => {
+                        // The user pressed prefix + key — onboarding hint
+                        // can dismiss. Cheap idempotent write; first call
+                        // persists, subsequent ones short-circuit.
+                        onboarding.mark_prefix_discovered().await;
+                        if std::mem::take(&mut render_session.lock().await.show_welcome_toast) {
+                            onboarding.mark_welcome_toast_seen().await;
+                        }
+
+                        let action_result = handle_action(
+                            kind,
+                            args.clone(),
+                            &graph,
+                            &io_state,
+                            &render_session,
+                            &client_size,
+                            &config,
+                            &cancel,
+                        )
+                        .await;
+                        if let Err(e) = &action_result {
+                            warn!(?kind, error = %format!("{e:#}"), "attach: action failed");
+                        }
+                        render_session.lock().await.action_error = action_result
+                            .as_ref()
+                            .err()
+                            .map(|e| action_failure_notice(kind, e));
+
+                        // Transient command-feedback overlay in the status
+                        // bar's center zone. Resolves the "did my keystroke
+                        // do anything?" UX gap for actions whose effect
+                        // isn't immediately obvious (kill, zoom, copy).
+                        //
+                        // Gated on success: an action that rolled back must
+                        // not flash its own name as if it had happened. That
+                        // is the "did my keystroke do anything?" question
+                        // answered wrongly, which is worse than not answering.
+                        if action_result.is_ok()
+                            && let Some(label) = action_feedback_label(kind)
+                        {
+                            let mut s = render_session.lock().await;
+                            s.last_action = Some((label.into(), std::time::Instant::now()));
+                        }
+                        // Layout-changing actions invalidate per-pane PTY
+                        // sizes. Re-fan the winsizes so vim/htop/etc. inside
+                        // each pane learn their new dimensions.
+                        if action_changes_layout(kind) {
+                            let attached = render_session.lock().await.clone();
+                            let (cols, rows) = *client_size.lock().await;
+                            apply_resize_to_window(&graph, &io_state, &attached, &config, cols, rows).await;
+                        }
+                        let pulse = io_state.lock().await.render_pulse.clone();
+                        pulse.bump();
+                        if matches!(action_result, Ok(false))
+                            && let Some(data) = args.fallback_input.take()
+                        {
+                            AttachClientFrame::Input { data }
+                        } else {
+                            AttachClientFrame::Action { kind, args }
+                        }
+                    }
+                    frame => frame,
+                };
                 match parsed {
+                    AttachClientFrame::Action { .. } => {}, // Dispatched above.
                     frame @ (AttachClientFrame::Input { .. } | AttachClientFrame::Paste { .. }) => {
                         let (data, paste) = match frame {
                             AttachClientFrame::Paste { data, more } => (data, Some(more)),
@@ -1267,60 +1340,6 @@ async fn run_attach_loop(
                         }
                         let attached = render_session.lock().await.clone();
                         apply_resize_to_window(&graph, &io_state, &attached, &config, cols, rows).await;
-                        let pulse = io_state.lock().await.render_pulse.clone();
-                        pulse.bump();
-                    }
-                    AttachClientFrame::Action { kind, args } => {
-                        // The user pressed prefix + key — onboarding hint
-                        // can dismiss. Cheap idempotent write; first call
-                        // persists, subsequent ones short-circuit.
-                        onboarding.mark_prefix_discovered().await;
-                        if std::mem::take(&mut render_session.lock().await.show_welcome_toast) {
-                            onboarding.mark_welcome_toast_seen().await;
-                        }
-
-                        let action_result = handle_action(
-                            kind,
-                            args.clone(),
-                            &graph,
-                            &io_state,
-                            &render_session,
-                            &client_size,
-                            &config,
-                            &cancel,
-                        )
-                        .await;
-                        if let Err(e) = &action_result {
-                            warn!(?kind, error = %format!("{e:#}"), "attach: action failed");
-                        }
-                        render_session.lock().await.action_error = action_result
-                            .as_ref()
-                            .err()
-                            .map(|e| action_failure_notice(kind, e));
-
-                        // Transient command-feedback overlay in the status
-                        // bar's center zone. Resolves the "did my keystroke
-                        // do anything?" UX gap for actions whose effect
-                        // isn't immediately obvious (kill, zoom, copy).
-                        //
-                        // Gated on success: an action that rolled back must
-                        // not flash its own name as if it had happened. That
-                        // is the "did my keystroke do anything?" question
-                        // answered wrongly, which is worse than not answering.
-                        if action_result.is_ok()
-                            && let Some(label) = action_feedback_label(kind)
-                        {
-                            let mut s = render_session.lock().await;
-                            s.last_action = Some((label.into(), std::time::Instant::now()));
-                        }
-                        // Layout-changing actions invalidate per-pane PTY
-                        // sizes. Re-fan the winsizes so vim/htop/etc. inside
-                        // each pane learn their new dimensions.
-                        if action_changes_layout(kind) {
-                            let attached = render_session.lock().await.clone();
-                            let (cols, rows) = *client_size.lock().await;
-                            apply_resize_to_window(&graph, &io_state, &attached, &config, cols, rows).await;
-                        }
                         let pulse = io_state.lock().await.render_pulse.clone();
                         pulse.bump();
                     }
@@ -3683,7 +3702,9 @@ async fn current_viewport(client_size: &ClientSize, config: &ConfigHandle) -> Re
     shux_ui::pane_viewport(current_content_rect(client_size).await, border_style, false)
 }
 
-/// Dispatch an Action keybinding from the client.
+/// Dispatch an Action keybinding from the client. Returns false only when
+/// directional focus has no visible target, allowing the original root key
+/// to pass through normal input handling.
 #[allow(clippy::too_many_arguments)]
 async fn handle_action(
     kind: ActionKind,
@@ -3694,7 +3715,7 @@ async fn handle_action(
     client_size: &ClientSize,
     config: &ConfigHandle,
     cancel: &CancellationToken,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     use shux_core::layout::Direction;
 
     // ToggleHelp is handled before the snapshot — it's a UI-only flip
@@ -3707,7 +3728,7 @@ async fn handle_action(
             help_visible = s.help_visible,
             "attach: toggled help overlay"
         );
-        return Ok(());
+        return Ok(true);
     }
 
     // EnterCopyMode is also a UI-only flip — start a fresh copy-mode
@@ -3718,18 +3739,31 @@ async fn handle_action(
         let mut s = session.lock().await;
         s.copy_mode = Some(shux_ui::CopyModeState::new());
         tracing::info!("attach: entered copy mode on focused pane");
-        return Ok(());
+        return Ok(true);
     }
 
     // While the overlay is visible, swallow every other action — the
     // user is meant to read the cheat sheet, not navigate around behind
     // it. They dismiss with Esc / q (handled in the Input frame path).
     if session.lock().await.help_visible {
-        return Ok(());
+        return Ok(true);
     }
 
     let attached = session.lock().await.clone();
     let viewport = current_viewport(client_size, config).await;
+
+    let direction = match kind {
+        ActionKind::FocusUp => Some(NavDirection::Up),
+        ActionKind::FocusDown => Some(NavDirection::Down),
+        ActionKind::FocusLeft => Some(NavDirection::Left),
+        ActionKind::FocusRight => Some(NavDirection::Right),
+        _ => None,
+    };
+    if let Some(direction) = direction {
+        let moved = focus_dir(graph, &attached, direction, viewport, session).await?;
+        // Bound focus keys stay commands in copy mode.
+        return Ok(moved || session.lock().await.copy_mode.is_some());
+    }
 
     match kind {
         ActionKind::SplitSmart => split(graph, &attached, None, viewport, io_state, cancel).await,
@@ -3755,17 +3789,11 @@ async fn handle_action(
             )
             .await
         }
-        ActionKind::FocusUp => {
-            focus_dir(graph, &attached, NavDirection::Up, viewport, session).await
-        }
-        ActionKind::FocusDown => {
-            focus_dir(graph, &attached, NavDirection::Down, viewport, session).await
-        }
-        ActionKind::FocusLeft => {
-            focus_dir(graph, &attached, NavDirection::Left, viewport, session).await
-        }
-        ActionKind::FocusRight => {
-            focus_dir(graph, &attached, NavDirection::Right, viewport, session).await
+        ActionKind::FocusUp
+        | ActionKind::FocusDown
+        | ActionKind::FocusLeft
+        | ActionKind::FocusRight => {
+            unreachable!("directional focus handled above")
         }
         ActionKind::FocusNext => focus_relative(graph, &attached, 1, session).await,
         ActionKind::FocusPrev => focus_relative(graph, &attached, -1, session).await,
@@ -3802,6 +3830,7 @@ async fn handle_action(
         ActionKind::ToggleHelp => unreachable!("ToggleHelp short-circuited above"),
         ActionKind::EnterCopyMode => unreachable!("EnterCopyMode short-circuited above"),
     }
+    .map(|()| true)
 }
 
 async fn split(
@@ -3878,15 +3907,14 @@ async fn focus_dir(
     nav: NavDirection,
     viewport: Rect,
     session: &Arc<Mutex<AttachedSession>>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     // Refuse to change focus while zoomed — the user wouldn't see the
-    // change and would be typing into a hidden pane. Falls through as
-    // a no-op (the renderer keeps showing the zoomed pane).
+    // change and would be typing into a hidden pane.
     let snap = graph.snapshot();
     if let Some(win) = snap.windows.get(&attached.active_window_id)
         && win.layout.is_zoomed()
     {
-        return Ok(());
+        return Ok(false);
     }
     drop(snap);
     let new_id = graph
@@ -3897,7 +3925,7 @@ async fn focus_dir(
         let mut s = session.lock().await;
         s.active_pane_id = pid;
     }
-    Ok(())
+    Ok(new_id.is_some())
 }
 
 async fn focus_relative(

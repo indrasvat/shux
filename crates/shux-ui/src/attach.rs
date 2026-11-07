@@ -353,7 +353,7 @@ where
                                 continue;
                             }
                             if let Some(target) = bindings.resolve_prefix(key) {
-                                send_binding_target(&mut sink, target).await?;
+                                send_binding_target(&mut sink, target, None).await?;
                                 continue;
                             }
                             // Unbound prefix-key: fall through and forward
@@ -380,7 +380,7 @@ where
                         }
                         // Bare-key Tier-1 actions (Alt+key etc.).
                         if let Some(target) = bindings.resolve_root(key) {
-                            send_binding_target(&mut sink, target).await?;
+                            send_binding_target(&mut sink, target, Some(key)).await?;
                             continue;
                         }
                         // Otherwise forward as PTY input bytes.
@@ -508,23 +508,43 @@ where
     }
 }
 
-async fn send_binding_target<SinkT>(sink: &mut SinkT, target: &BindingTarget) -> Result<()>
+async fn send_binding_target<SinkT>(
+    sink: &mut SinkT,
+    target: &BindingTarget,
+    root_key: Option<KeyEvent>,
+) -> Result<()>
 where
     SinkT: futures::Sink<Bytes> + Unpin,
     SinkT::Error: std::fmt::Display,
 {
-    let frame = match target {
-        BindingTarget::Action(kind, args) => AttachClientFrame::Action {
-            kind: *kind,
-            args: args.clone(),
-        },
-        BindingTarget::Detach => AttachClientFrame::Detach,
-    };
-    let bytes = serde_json::to_vec(&frame)?;
+    let bytes = serde_json::to_vec(&binding_frame(target, root_key))?;
     sink.send(Bytes::from(bytes))
         .await
         .map_err(|e| anyhow::anyhow!("send binding frame: {e}"))?;
     Ok(())
+}
+
+fn binding_frame(target: &BindingTarget, root_key: Option<KeyEvent>) -> AttachClientFrame {
+    match target {
+        BindingTarget::Action(kind, args) => {
+            let mut args = args.clone();
+            args.fallback_input = root_key
+                .filter(|_| {
+                    matches!(
+                        kind,
+                        ActionKind::FocusUp
+                            | ActionKind::FocusDown
+                            | ActionKind::FocusLeft
+                            | ActionKind::FocusRight
+                    )
+                })
+                .map(encode_key_event)
+                .filter(|bytes| !bytes.is_empty())
+                .map(|bytes| BASE64.encode(bytes));
+            AttachClientFrame::Action { kind: *kind, args }
+        }
+        BindingTarget::Detach => AttachClientFrame::Detach,
+    }
 }
 
 fn ct_button(b: CtMouseButton) -> MouseButton {
@@ -791,6 +811,66 @@ mod tests {
         assert_eq!(ct_button(CtMouseButton::Middle), MouseButton::Middle);
     }
 
+    #[test]
+    fn root_focus_bindings_keep_the_actual_key_and_prefix_commands_do_not() {
+        for (kind, key, encoded) in [
+            (
+                ActionKind::FocusLeft,
+                KeyEvent::new(KeyCode::Left, KeyModifiers::ALT),
+                b"\x1b[1;3D".as_slice(),
+            ),
+            (
+                ActionKind::FocusRight,
+                KeyEvent::new(KeyCode::Right, KeyModifiers::ALT),
+                b"\x1b[1;3C".as_slice(),
+            ),
+            (
+                ActionKind::FocusUp,
+                KeyEvent::new(KeyCode::Up, KeyModifiers::ALT),
+                b"\x1b[1;3A".as_slice(),
+            ),
+            (
+                ActionKind::FocusDown,
+                KeyEvent::new(KeyCode::Down, KeyModifiers::ALT),
+                b"\x1b[1;3B".as_slice(),
+            ),
+            (
+                ActionKind::FocusLeft,
+                KeyEvent::new(KeyCode::Char('h'), KeyModifiers::ALT),
+                b"\x1bh".as_slice(),
+            ),
+            (
+                ActionKind::FocusRight,
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+                b"\x18".as_slice(),
+            ),
+        ] {
+            let target = BindingTarget::Action(kind, ActionArgs::default());
+            let AttachClientFrame::Action { args, .. } = binding_frame(&target, Some(key)) else {
+                panic!("focus binding must be an action");
+            };
+            assert_eq!(
+                BASE64
+                    .decode(args.fallback_input.expect("root fallback"))
+                    .expect("base64"),
+                encoded
+            );
+            let AttachClientFrame::Action { args, .. } = binding_frame(&target, None) else {
+                panic!("prefix binding must be an action");
+            };
+            assert_eq!(args.fallback_input, None);
+        }
+        let target = BindingTarget::Action(ActionKind::ToggleZoom, ActionArgs::default());
+        let key = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT);
+        let AttachClientFrame::Action { args, .. } = binding_frame(&target, Some(key)) else {
+            panic!("zoom binding must be an action");
+        };
+        assert_eq!(
+            args.fallback_input, None,
+            "other actions cannot forward input"
+        );
+    }
+
     #[tokio::test]
     async fn send_binding_target_serializes_action_and_detach_frames() {
         let (mut tx, mut rx) = futures::channel::mpsc::channel::<Bytes>(4);
@@ -803,10 +883,11 @@ mod tests {
                     ..Default::default()
                 },
             ),
+            None,
         )
         .await
         .expect("send action");
-        send_binding_target(&mut tx, &BindingTarget::Detach)
+        send_binding_target(&mut tx, &BindingTarget::Detach, None)
             .await
             .expect("send detach");
         drop(tx);

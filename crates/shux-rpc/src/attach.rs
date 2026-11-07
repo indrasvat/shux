@@ -231,6 +231,10 @@ pub struct ActionArgs {
     /// doesn't try to be clever about clamping.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_index: Option<u16>,
+    /// Original root-binding key bytes, base64 encoded. Directional focus
+    /// forwards them through normal input handling only when focus cannot move.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_input: Option<String>,
 }
 
 #[cfg(test)]
@@ -356,6 +360,20 @@ mod tests {
             AttachClientFrame::Action { kind, .. } => assert_eq!(kind, ActionKind::ToggleZoom),
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn directional_action_roundtrips_optional_fallback_input() {
+        let wire = r#"{"type":"action","kind":"focus_left","args":{"fallback_input":"G1sxOzNE"}}"#;
+        let frame: AttachClientFrame = serde_json::from_str(wire).expect("directional action");
+        let back = serde_json::to_value(frame).expect("serialize action");
+        assert_eq!(back["args"]["fallback_input"], "G1sxOzNE");
+
+        let old: AttachClientFrame =
+            serde_json::from_str(r#"{"type":"action","kind":"focus_left"}"#)
+                .expect("older clients need no fallback field");
+        let old = serde_json::to_value(old).expect("serialize older action");
+        assert!(old["args"].get("fallback_input").is_none());
     }
 
     #[test]
