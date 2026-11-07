@@ -1039,6 +1039,13 @@ async fn run_attach_loop(
                         continue;
                     }
                 };
+                // External CLI/API focus changes must apply before this key.
+                if !sync_focus(&graph, &mut session, &render_session).await {
+                    final_frame = Some(AttachServerFrame::SessionEnded {
+                        reason: "session_destroyed".into(),
+                    });
+                    break;
+                }
                 // A focus action without a target can reuse the normal input path.
                 let parsed = match parsed {
                     AttachClientFrame::Action { kind, mut args } => {

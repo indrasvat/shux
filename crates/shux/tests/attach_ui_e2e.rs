@@ -399,7 +399,7 @@ fn raw_key_script(name: &str) -> String {
     format!(
         "stty raw -echo; : > '{{root}}/{name}.keys'; {COLOUR_PROBE} \
          printf 'RAW-READY-{name}\\r\\n'; n=0; \
-         while IFS= read -r -N 1 byte; do \
+         while IFS= read -r -n 1 -d '' byte; do \
            printf '%s' \"$byte\" >> '{{root}}/{name}.keys'; \
            if [ \"$byte\" = '!' ]; then n=$((n+1)); printf 'ACK-{name}-%s\\r\\n' \"$n\"; fi; \
            if [ \"$byte\" = '%' ]; then printf 'FENCE-{name}\\r\\n'; fi; \
@@ -445,6 +445,55 @@ fn alt_arrows_without_a_neighbour_reach_the_real_attach_pty() {
     env.send_keys("\x01h\x01j\x01k\x01l!");
     env.wait_for("ACK-first-2");
     assert_eq!(key_log(&env, "first"), format!("{input}!"));
+}
+
+#[test]
+fn external_focus_routes_edge_keys_to_the_current_pane() {
+    let env = raw_key_env();
+    let second = raw_key_script("second").replace("{root}", &env.root.path().display().to_string());
+    env.ok(&[
+        "pane",
+        "split",
+        "-s",
+        "target",
+        "-d",
+        "vertical",
+        "--",
+        "/bin/bash",
+        "--noprofile",
+        "--norc",
+        "-c",
+        &second,
+    ]);
+    env.wait_for("RAW-READY-second");
+    let panes: serde_json::Value =
+        serde_json::from_str(&env.ok(&["--format", "json", "pane", "list", "-s", "target"]))
+            .expect("pane list");
+    let first_id = panes
+        .as_array()
+        .expect("panes")
+        .iter()
+        .find(|pane| pane["is_focused"] == false)
+        .and_then(|pane| pane["id"].as_str())
+        .expect("original pane");
+
+    // Establish the client's focus through its own command, then change it
+    // externally. Do not wait for a render between the CLI reply and the key.
+    for iteration in 1..=16 {
+        env.send_keys("\x01l!");
+        env.wait_for(&format!("ACK-second-{iteration}"));
+        env.ok(&["pane", "focus", "-s", "target", "-p", first_id]);
+        env.send_keys("\x1b[1;3D!");
+        env.wait_for(&format!("ACK-first-{iteration}"));
+    }
+    env.send_keys("\x01h%\x01l%");
+    env.wait_for("FENCE-first");
+    env.wait_for("FENCE-second");
+    assert_eq!(
+        key_log(&env, "first"),
+        format!("{}%", "\x1b[1;3D!".repeat(16))
+    );
+    assert_eq!(key_log(&env, "second"), format!("{}%", "!".repeat(16)));
 }
 
 #[test]
