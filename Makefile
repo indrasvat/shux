@@ -853,7 +853,7 @@ FUZZ_SECONDS ?= 60
 FUZZ_PROGRAM_STATUS := program_status_decode program_status_table scanner_vs_vte vt_program_status_stream
 
 .PHONY: fuzz
-fuzz: fuzz-program-status fuzz-pane-mouse fuzz-pane-record ## Run every libFuzzer target (FUZZ_SECONDS each, default 60)
+fuzz: fuzz-program-status fuzz-pane-mouse fuzz-pane-record fuzz-plugin-io ## Run every libFuzzer target (FUZZ_SECONDS each, default 60)
 
 .PHONY: fuzz-pane-record
 fuzz-pane-record: ## Recording lifecycle: overlapping starts, stops, faults, shutdown (FUZZ_SECONDS)
@@ -866,6 +866,12 @@ fuzz-pane-mouse: ## Mouse-to-grid-cell mapping against the live compositor (FUZZ
 .PHONY: fuzz-program-status
 fuzz-program-status: ## OSC 7501 libFuzzer targets in fuzz/ (FUZZ_SECONDS each)
 	@bash scripts/fuzz.sh $(FUZZ_SECONDS) $(FUZZ_PROGRAM_STATUS)
+
+FUZZ_PLUGIN_IO := plugin_io_backpressure plugin_io_interleave
+
+.PHONY: fuzz-plugin-io
+fuzz-plugin-io: ## Plugin reply backlog: flood, never-read, kill, interleaving (FUZZ_SECONDS)
+	@bash scripts/fuzz.sh $(FUZZ_SECONDS) $(FUZZ_PLUGIN_IO)
 
 .PHONY: setup
 setup: ## Run full dev environment setup

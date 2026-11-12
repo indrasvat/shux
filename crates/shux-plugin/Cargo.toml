@@ -30,3 +30,7 @@ tempfile = { workspace = true }
 shux-testkit = { path = "../shux-testkit" }
 # `test-util`: the handshake-budget tests drive tokio's paused clock.
 tokio = { workspace = true, features = ["test-util"] }
+
+[lints.rust]
+# cargo-fuzz builds with `--cfg fuzzing`; fuzz/ drives the I/O session through it.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }

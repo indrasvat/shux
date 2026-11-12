@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use shux_core::bus::EventBus;
 use shux_plugin::{HANDSHAKE_TIMEOUT, PluginManager, PluginSource};
-use shux_testkit::{BUDGET, gate, open_gate_async, wait_for_async, wait_until_async};
+use shux_testkit::{
+    BUDGET, gate, open_gate_async, poll_until_async, wait_for_async, wait_until_async,
+};
 
 /// How many processes on this machine have `needle` in their argv.
 ///
@@ -1642,4 +1644,132 @@ async fn a_plugin_inherits_no_descriptor_beyond_its_stdio() {
     mgr.kill("noop").await.expect("kill");
     assert!(running, "the plugin exited, so the pipe proves nothing");
     assert!(closed, "the plugin still holds a pipe its host had open");
+}
+
+/// 2000 `plugin.state.get` calls, each answered with a 1 KiB value, written
+/// before any reply is read. A 64 KiB pipe holds only a few dozen of those
+/// replies, so the host has to queue the rest. All 2000 come back, in order.
+#[tokio::test]
+async fn a_plugin_that_writes_2000_requests_before_reading_gets_every_reply_in_order() {
+    const N: u64 = 2000;
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("replies.log");
+    let pad = "a".repeat(1024);
+    let body = format!(
+        r#"#!/usr/bin/env bash
+set -u
+out="$1"
+IFS= read -r _ || exit 1
+printf '%s\n' '{{"jsonrpc":"2.0","id":"init","result":{{"name":"flood","version":"0.1.0","subscribes":[],"provides":[],"capabilities":[]}}}}'
+printf '%s\n' '{{"jsonrpc":"2.0","method":"plugin.state.set","params":{{"value":"{pad}"}},"id":0}}'
+IFS= read -r _ || exit 1
+i=1
+while [ "$i" -le {N} ]; do
+  printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"method\":\"plugin.state.get\",\"params\":{{}},\"id\":$i}}"
+  i=$((i + 1))
+done
+{{
+  i=1
+  while [ "$i" -le {N} ]; do
+    IFS= read -r line || exit 2
+    printf '%s\n' "$line"
+    i=$((i + 1))
+  done
+}} > "$out"
+printf 'done\n' >> "$out"
+"#
+    );
+    let script = write_script(tmp.path(), "flood.sh", &body);
+    let mut source = PluginSource::from_path(&script);
+    source.args = vec![out.display().to_string()];
+    let mgr = PluginManager::with_state_root(EventBus::new(), tmp.path().join("state"));
+    mgr.install(source).await.expect("install");
+
+    let finished = poll_until_async(BUDGET, || async {
+        std::fs::read_to_string(&out)
+            .ok()
+            .is_some_and(|s| s.ends_with("done\n") && s.lines().count() > N as usize)
+    })
+    .await;
+    let replies = std::fs::read_to_string(&out).unwrap_or_default();
+    let audit_path = mgr.audit_path("flood").await.ok();
+    let audit = audit_path
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default();
+    mgr.shutdown().await;
+
+    assert!(
+        finished,
+        "a plugin that wrote {N} requests before reading got no complete reply stream:\n{replies}"
+    );
+    let ids: Vec<u64> = replies
+        .lines()
+        .filter(|l| l != &"done")
+        .map(|l| {
+            serde_json::from_str::<serde_json::Value>(l)
+                .unwrap_or_else(|e| panic!("reply is not json ({e}): {l}"))["id"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("reply id is not a number: {l}"))
+        })
+        .collect();
+    assert_eq!(ids, (1..=N).collect::<Vec<_>>(), "replies out of order");
+    let audited = audit
+        .lines()
+        .filter(|l| l.contains("\"method\":\"plugin.state.get\""))
+        .count();
+    assert_eq!(
+        audited, N as usize,
+        "not every request was audited:\n{audit}"
+    );
+}
+
+/// A plugin that never reads is disconnected once the reply backlog is full,
+/// and `last_error` names that reason.
+#[tokio::test]
+async fn a_plugin_that_never_reads_is_disconnected_when_the_reply_backlog_fills() {
+    let tmp = tempfile::tempdir().unwrap();
+    let marker = unique_marker("noread");
+    let body = r#"#!/usr/bin/env bash
+set -u
+IFS= read -r _ || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":"init","result":{"name":"noread","version":"0.1.0","subscribes":[],"provides":[],"capabilities":[]}}'
+i=1
+while true; do
+  printf '%s\n' "{\"jsonrpc\":\"2.0\",\"method\":\"plugin.state.get\",\"params\":{},\"id\":$i}"
+  i=$((i + 1))
+done
+"#;
+    // The script path is the process-table needle (`ps` shows argv).
+    let script = write_script(tmp.path(), &format!("{marker}.sh"), body);
+    let mgr = PluginManager::with_state_root(EventBus::new(), tmp.path().join("state"));
+    mgr.install(PluginSource::from_path(&script))
+        .await
+        .expect("install");
+
+    let reported = poll_until_async(BUDGET, || async {
+        mgr.list().await.iter().any(|p| {
+            p.name == "noread"
+                && p.last_error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("reply backlog full"))
+        })
+    })
+    .await;
+    let reason = mgr
+        .list()
+        .await
+        .into_iter()
+        .find(|p| p.name == "noread")
+        .and_then(|p| p.last_error);
+    let gone = if reported {
+        wait_for_no_procs(&marker).await == 0
+    } else {
+        false
+    };
+    mgr.shutdown().await;
+    assert!(
+        reported && gone,
+        "never-reader was not disconnected (reason: {reason:?}, gone: {gone})"
+    );
 }

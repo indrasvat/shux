@@ -15,6 +15,7 @@ shux-vt = { path = "../crates/shux-vt" }
 shux-core = { path = "../crates/shux-core" }
 shux-ui = { path = "../crates/shux-ui" }
 shux = { path = "../crates/shux" }
+shux-plugin = { path = "../crates/shux-plugin" }
 # The recording interpreter runs on paused time; fuzz builds only.
 tokio = { version = "1", features = ["test-util"] }
 
@@ -69,6 +70,20 @@ bench = false
 [[bin]]
 name = "pane_record_lifecycle"
 path = "fuzz_targets/pane_record_lifecycle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "plugin_io_backpressure"
+path = "fuzz_targets/plugin_io_backpressure.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "plugin_io_interleave"
+path = "fuzz_targets/plugin_io_interleave.rs"
 test = false
 doc = false
 bench = false
