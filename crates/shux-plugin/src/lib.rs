@@ -19,6 +19,7 @@
 //!    plugin's declared `subscribes` filters.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -32,15 +33,18 @@ use shux_core::event::EventData;
 use shux_core::graph::GraphHandle;
 use shux_core::model::PluginId;
 use shux_rpc::router::Router;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 pub mod audit;
 pub mod grants;
 pub mod permissions;
+
+#[cfg(any(test, fuzzing))]
+pub mod io_fuzz;
 
 use crate::audit::AuditEntry;
 use crate::grants::Grants;
@@ -61,6 +65,18 @@ pub const PROTOCOL_VERSION: &str = "1";
 /// not the plugin.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+
+/// Outbound frames waiting on a plugin that has not read them yet.
+///
+/// The pipe to the plugin holds only a few dozen KiB. Replies that do not
+/// fit there wait in this queue, so the task reading the plugin's stdout
+/// never blocks on the write. A burst of 2000 replies fits while the writer
+/// is already parked on a full pipe. The frame that does not fit disconnects
+/// the plugin. `plugin.shutdown` does not wait behind this queue.
+pub const REPLY_BACKLOG: usize = 4096;
+
+/// Reported on `last_error` when [`REPLY_BACKLOG`] is exceeded.
+pub const DISCONNECT_REASON: &str = "reply backlog full; plugin disconnected";
 
 /// SIGKILL a plugin's entire process group.
 ///
@@ -1343,21 +1359,124 @@ async fn relay_stderr(name: String, stderr: ChildStderr) {
 /// How a [`write_frame`] ended.
 enum Written {
     Whole,
-    /// The kill signal arrived first, with `sent` bytes of the frame in the
-    /// pipe.
+    /// The kill signal arrived first, with `sent` bytes of the frame in the pipe.
     Killed {
         sent: usize,
     },
 }
 
-/// Write and flush one frame, unless the kill signal arrives first. A plugin
-/// that stopped reading fills the pipe, and a write that waited on it alone
-/// would never see the kill.
-async fn write_frame(
-    stdin: &mut ChildStdin,
+/// Why the stdin/stdout session stopped reading.
+enum ReadStop {
+    Halted(Halt),
+    Backlog,
+    Closed,
+    Eof,
+    StdoutErr(String),
+    InboxClosed,
+}
+
+/// Shared stop signal. The external kill is a [`oneshot`]; both tasks need to
+/// see it, and a full reply queue stops the writer without taking the kill path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Halt {
+    Run,
+    Kill,
+    Disconnect,
+}
+
+/// Result of [`run_stdio_session`].
+pub(crate) struct SessionEnd {
+    pub killed: bool,
+    pub grace_deadline: Option<tokio::time::Instant>,
+}
+
+async fn remember_error(slot: &Mutex<Option<String>>, msg: String) {
+    let mut guard = slot.lock().await;
+    if guard.is_none() {
+        *guard = Some(msg);
+    }
+}
+
+/// A reply waits its turn. An inbox frame (`plugin.shutdown`) is written on
+/// kill before any reply still queued behind it.
+enum Outbound {
+    Reply(String),
+    Inbox(String),
+}
+
+fn enqueue_stop(err: mpsc::error::TrySendError<Outbound>) -> ReadStop {
+    match err {
+        mpsc::error::TrySendError::Full(_) => ReadStop::Backlog,
+        mpsc::error::TrySendError::Closed(_) => ReadStop::Closed,
+    }
+}
+
+/// One stdout line from the plugin. Production dispatches it; the fuzzer
+/// answers it. Either way the reply is staged, not written, on this call.
+pub(crate) trait PluginLineHandler: Send {
+    fn handle_line(&mut self, line: String) -> impl Future<Output = ()> + Send;
+}
+
+struct DispatchLines {
+    name: String,
+    plugin_id: PluginId,
+    router: Arc<tokio::sync::OnceCell<Router>>,
+    event_bus: EventBus,
+    state_root: Arc<PathBuf>,
+    perm_root: Arc<PathBuf>,
+    graph: Arc<tokio::sync::OnceCell<GraphHandle>>,
+    denial_hook: Option<DenialHook>,
+    resp_tx: mpsc::Sender<String>,
+}
+
+impl PluginLineHandler for DispatchLines {
+    async fn handle_line(&mut self, line: String) {
+        // Permission check, audit and state methods do file I/O: off the
+        // async workers, one frame at a time.
+        let (plugin, id, router, bus) = (
+            self.name.clone(),
+            self.plugin_id,
+            self.router.clone(),
+            self.event_bus.clone(),
+        );
+        let (state_root, perm_root, graph) = (
+            self.state_root.clone(),
+            self.perm_root.clone(),
+            self.graph.clone(),
+        );
+        let (hook, tx) = (self.denial_hook.clone(), self.resp_tx.clone());
+        let dispatched = tokio::task::spawn_blocking(move || {
+            dispatch_plugin_frame(
+                &plugin,
+                &id,
+                line,
+                &router,
+                &bus,
+                &state_root,
+                &perm_root,
+                &graph,
+                hook,
+                tx,
+            )
+        })
+        .await;
+        if let Err(e) = dispatched {
+            warn!(plugin = %self.name, "frame dispatch failed: {e}");
+        }
+    }
+}
+
+/// Write and flush one frame, unless [`Halt`] leaves [`Halt::Run`] first.
+/// A plugin that stopped reading fills the pipe, and a write that waited on
+/// it alone would never observe kill or disconnect.
+async fn write_frame<W: AsyncWrite + Unpin>(
+    stdin: &mut W,
     frame: &[u8],
-    kill_rx: &mut oneshot::Receiver<()>,
+    halt: &mut watch::Receiver<Halt>,
 ) -> std::io::Result<Written> {
+    if *halt.borrow() != Halt::Run {
+        return Ok(Written::Killed { sent: 0 });
+    }
     let mut sent = 0;
     let write = async {
         while sent < frame.len() {
@@ -1370,7 +1489,7 @@ async fn write_frame(
     };
     let killed = tokio::select! {
         biased;
-        _ = kill_rx => true,
+        changed = halt.changed() => changed.is_ok() && *halt.borrow() != Halt::Run,
         written = write => { written?; false }
     };
     Ok(if killed {
@@ -1380,57 +1499,126 @@ async fn write_frame(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_plugin_io(
-    name: String,
-    plugin_id: PluginId,
-    mut child: Child,
-    mut stdin: ChildStdin,
-    mut reader: tokio::io::Lines<BufReader<ChildStdout>>,
-    mut inbox_rx: mpsc::Receiver<String>,
-    mut kill_rx: oneshot::Receiver<()>,
-    mut sub: Option<Subscription>,
-    router: Arc<tokio::sync::OnceCell<Router>>,
-    event_bus: EventBus,
-    state_root: Arc<std::path::PathBuf>,
-    perm_root: Arc<std::path::PathBuf>,
-    graph: Arc<tokio::sync::OnceCell<GraphHandle>>,
-    denial_hook: Arc<tokio::sync::OnceCell<DenialHook>>,
+/// The only task that writes the plugin's stdin. Frames leave in enqueue order.
+async fn write_plugin_frames<W: AsyncWrite + Unpin>(
+    mut stdin: W,
+    mut rx: mpsc::Receiver<Outbound>,
+    mut grace_rx: mpsc::Receiver<String>,
+    mut halt: watch::Receiver<Halt>,
     last_error: Arc<Mutex<Option<String>>>,
     grace: Duration,
-) {
-    // Plugin→daemon RPC dispatches run in spawned tasks so a slow
-    // handler can't stall this loop; responses come back via resp_tx
-    // and get serialized onto stdin like any other outbound frame.
-    let (resp_tx, mut resp_rx) = mpsc::channel::<String>(64);
-
-    // Remembered up front, because `child.id()` goes to `None` the moment the
-    // plugin is reaped — including by the graceful `child.wait()` below. A
-    // plugin that exits politely on `plugin.shutdown` can still have left
-    // something running behind it, and after the reap there is no longer any
-    // handle telling us which group to clean up. The `Child` stays alive for
-    // the whole function, which is what keeps this pid safe from reuse.
-    let plugin_pgid = child.id();
-
-    let mut killed = false;
-    // The frame a kill interrupted, and how much of it was written.
+) -> SessionEnd {
     let mut cut: Option<(String, usize)> = None;
     loop {
-        let (frame, what) = tokio::select! {
+        let frame = tokio::select! {
+            biased;
+            _ = halt.changed() => break,
+            frame = rx.recv() => match frame {
+                Some(frame) => frame,
+                None => break,
+            },
+        };
+        let line = match frame {
+            Outbound::Reply(line) | Outbound::Inbox(line) => line,
+        };
+        match write_frame(&mut stdin, line.as_bytes(), &mut halt).await {
+            Ok(Written::Whole) => {}
+            Ok(Written::Killed { sent }) => {
+                cut = Some((line, sent));
+                break;
+            }
+            Err(e) => {
+                remember_error(&last_error, format!("stdin write: {e}")).await;
+                break;
+            }
+        }
+    }
+
+    let mut grace_deadline = None;
+    let killed = *halt.borrow() == Halt::Kill;
+    if killed {
+        // Finish the cut frame, then inbox frames only. Queued replies are
+        // not written: they would fill the pipe and the grace would end
+        // before `plugin.shutdown`.
+        let deadline = tokio::time::Instant::now() + grace;
+        grace_deadline = Some(deadline);
+        let drain = async {
+            if let Some((frame, sent)) = &cut {
+                stdin.write_all(&frame.as_bytes()[*sent..]).await?;
+            }
+            while let Ok(msg) = rx.try_recv() {
+                if let Outbound::Inbox(line) = msg {
+                    stdin.write_all(line.as_bytes()).await?;
+                }
+            }
+            while let Some(line) = grace_rx.recv().await {
+                stdin.write_all(line.as_bytes()).await?;
+            }
+            stdin.flush().await
+        };
+        if let Ok(Err(e)) = tokio::time::timeout_at(deadline, drain).await {
+            remember_error(&last_error, format!("stdin write (drain): {e}")).await;
+        }
+    }
+    SessionEnd {
+        killed,
+        grace_deadline,
+    }
+}
+
+/// Reads the plugin and enqueues outbound frames. Never awaits a write.
+#[allow(clippy::too_many_arguments)]
+async fn read_plugin_frames<R, H>(
+    mut lines: tokio::io::Lines<R>,
+    mut inbox_rx: mpsc::Receiver<String>,
+    mut resp_rx: mpsc::Receiver<String>,
+    tx: mpsc::Sender<Outbound>,
+    grace_tx: mpsc::Sender<String>,
+    halt_tx: watch::Sender<Halt>,
+    mut kill_rx: oneshot::Receiver<()>,
+    mut handler: H,
+    mut sub: Option<Subscription>,
+    perm_root: Arc<PathBuf>,
+) -> ReadStop
+where
+    R: AsyncBufRead + Unpin,
+    H: PluginLineHandler,
+{
+    loop {
+        tokio::select! {
             biased;
 
+            // Polled here, not in a helper task: `plugin.shutdown` is already
+            // in `inbox_rx` when this fires, and a helper can lose that race
+            // to the sender being dropped.
             _ = &mut kill_rx => {
-                killed = true;
-                break;
+                if *halt_tx.borrow() == Halt::Run {
+                    let _ = halt_tx.send(Halt::Kill);
+                }
+                while let Ok(line) = inbox_rx.try_recv() {
+                    // Not the reply queue: that one may already be full.
+                    if grace_tx.try_send(line).is_err() {
+                        break;
+                    }
+                }
+                return ReadStop::Halted(Halt::Kill);
             }
 
             line = inbox_rx.recv() => match line {
-                Some(line) => (line, "stdin write"),
-                None => break,
+                Some(line) => {
+                    if let Err(e) = tx.try_send(Outbound::Inbox(line)) {
+                        return enqueue_stop(e);
+                    }
+                }
+                None => return ReadStop::InboxClosed,
             },
 
             line = resp_rx.recv() => match line {
-                Some(line) => (line, "stdin write (resp)"),
+                Some(line) => {
+                    if let Err(e) = tx.try_send(Outbound::Reply(line)) {
+                        return enqueue_stop(e);
+                    }
+                }
                 None => continue,
             },
 
@@ -1441,77 +1629,166 @@ async fn run_plugin_io(
                     "method": "event",
                     "params": ev,
                 });
-                (format!("{frame}\n"), "event write")
-            }
-
-            res = reader.next_line() => {
-                match res {
-                    Ok(Some(line)) if line.is_empty() => continue,
-                    Ok(Some(line)) => {
-                        // Its permission check, audit and state methods do
-                        // file I/O: off the async workers, one frame at a time.
-                        let (plugin, id, router, bus) =
-                            (name.clone(), plugin_id, router.clone(), event_bus.clone());
-                        let (state_root, perm_root, graph) =
-                            (state_root.clone(), perm_root.clone(), graph.clone());
-                        let (hook, tx) = (denial_hook.get().cloned(), resp_tx.clone());
-                        let dispatched = tokio::task::spawn_blocking(move || {
-                            dispatch_plugin_frame(
-                                &plugin, &id, line, &router, &bus, &state_root, &perm_root,
-                                &graph, hook, tx,
-                            )
-                        })
-                        .await;
-                        if let Err(e) = dispatched {
-                            warn!(plugin = %name, "frame dispatch failed: {e}");
-                        }
-                        continue;
-                    }
-                    Ok(None) => {
-                        debug!(plugin = %name, "plugin closed stdout; exiting io task");
-                        break;
-                    }
-                    Err(e) => {
-                        *last_error.lock().await = Some(format!("stdout read: {e}"));
-                        warn!(plugin = %name, "stdout error: {e}");
-                        break;
-                    }
+                if let Err(e) = tx.try_send(Outbound::Reply(format!("{frame}\n"))) {
+                    return enqueue_stop(e);
                 }
             }
-        };
-        match write_frame(&mut stdin, frame.as_bytes(), &mut kill_rx).await {
-            Ok(Written::Whole) => {}
-            Ok(Written::Killed { sent }) => {
-                (killed, cut) = (true, Some((frame, sent)));
-                break;
-            }
-            Err(e) => {
-                *last_error.lock().await = Some(format!("{what}: {e}"));
-                break;
-            }
+
+            res = lines.next_line() => match res {
+                Ok(Some(line)) if line.is_empty() => continue,
+                Ok(Some(line)) => handler.handle_line(line).await,
+                Ok(None) => return ReadStop::Eof,
+                Err(e) => return ReadStop::StdoutErr(e.to_string()),
+            },
         }
     }
+}
 
-    if killed {
-        // Drain any frames already queued on inbox — notably the
-        // `plugin.shutdown` notification that `PluginManager::kill` pushes
-        // immediately before signaling us — inside the grace, so a plugin
-        // that stopped reading cannot stall the kill on a full pipe.
-        let deadline = tokio::time::Instant::now() + grace;
-        let drain = async {
-            // Finish the interrupted frame first: it may be `plugin.shutdown`
-            // itself, and a half-written one would swallow the next line.
-            if let Some((frame, sent)) = &cut {
-                stdin.write_all(&frame.as_bytes()[*sent..]).await?;
-            }
-            while let Ok(line) = inbox_rx.try_recv() {
-                stdin.write_all(line.as_bytes()).await?;
-            }
-            stdin.flush().await
-        };
-        if let Ok(Err(e)) = tokio::time::timeout_at(deadline, drain).await {
-            *last_error.lock().await = Some(format!("stdin write (drain): {e}"));
+/// Reader and writer tasks sharing a bounded queue of at most [`REPLY_BACKLOG`]
+/// frames. The reader enqueues with [`mpsc::Sender::try_send`] and disconnects
+/// the plugin when the queue is full.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_stdio_session<R, W, H>(
+    name: &str,
+    lines: tokio::io::Lines<R>,
+    stdin: W,
+    inbox_rx: mpsc::Receiver<String>,
+    kill_rx: oneshot::Receiver<()>,
+    sub: Option<Subscription>,
+    perm_root: Arc<PathBuf>,
+    handler: H,
+    resp_rx: mpsc::Receiver<String>,
+    last_error: Arc<Mutex<Option<String>>>,
+    grace: Duration,
+) -> SessionEnd
+where
+    R: AsyncBufRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+    H: PluginLineHandler + 'static,
+{
+    let (halt_tx, halt_rx) = watch::channel(Halt::Run);
+    let (tx, rx) = mpsc::channel(REPLY_BACKLOG);
+    let (grace_tx, grace_rx) = mpsc::channel(4);
+    let reader = tokio::spawn(read_plugin_frames(
+        lines,
+        inbox_rx,
+        resp_rx,
+        tx,
+        grace_tx,
+        halt_tx.clone(),
+        kill_rx,
+        handler,
+        sub,
+        perm_root,
+    ));
+    let writer = tokio::spawn(write_plugin_frames(
+        stdin,
+        rx,
+        grace_rx,
+        halt_rx,
+        last_error.clone(),
+        grace,
+    ));
+
+    let stop = match reader.await {
+        Ok(stop) => stop,
+        Err(e) => {
+            warn!(plugin = %name, "reader task failed: {e}");
+            ReadStop::Closed
         }
+    };
+    let reader_killed = matches!(stop, ReadStop::Halted(Halt::Kill));
+    match stop {
+        ReadStop::Backlog => {
+            remember_error(&last_error, DISCONNECT_REASON.to_string()).await;
+            warn!(plugin = %name, "{DISCONNECT_REASON}");
+        }
+        ReadStop::StdoutErr(e) => {
+            warn!(plugin = %name, "stdout error: {e}");
+            remember_error(&last_error, format!("stdout read: {e}")).await;
+        }
+        ReadStop::Eof => {
+            debug!(plugin = %name, "plugin closed stdout; exiting io task");
+        }
+        ReadStop::Closed => {
+            remember_error(&last_error, "reply writer closed".into()).await;
+        }
+        ReadStop::Halted(_) | ReadStop::InboxClosed => {}
+    }
+    // Kill keeps the grace drain. Every other exit has to unblock a writer
+    // parked in a full pipe: the reader owns the kill signal, and once it
+    // has returned a later kill() cannot reach that writer.
+    if !reader_killed && *halt_tx.borrow() == Halt::Run {
+        let _ = halt_tx.send(Halt::Disconnect);
+    }
+
+    let writer_out = match writer.await {
+        Ok(out) => out,
+        Err(e) => {
+            warn!(plugin = %name, "writer task failed: {e}");
+            SessionEnd {
+                killed: false,
+                grace_deadline: None,
+            }
+        }
+    };
+
+    SessionEnd {
+        killed: reader_killed || writer_out.killed,
+        grace_deadline: writer_out
+            .grace_deadline
+            .or_else(|| reader_killed.then(|| tokio::time::Instant::now() + grace)),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_plugin_io(
+    name: String,
+    plugin_id: PluginId,
+    mut child: Child,
+    stdin: ChildStdin,
+    reader: tokio::io::Lines<BufReader<ChildStdout>>,
+    inbox_rx: mpsc::Receiver<String>,
+    kill_rx: oneshot::Receiver<()>,
+    sub: Option<Subscription>,
+    router: Arc<tokio::sync::OnceCell<Router>>,
+    event_bus: EventBus,
+    state_root: Arc<PathBuf>,
+    perm_root: Arc<PathBuf>,
+    graph: Arc<tokio::sync::OnceCell<GraphHandle>>,
+    denial_hook: Arc<tokio::sync::OnceCell<DenialHook>>,
+    last_error: Arc<Mutex<Option<String>>>,
+    grace: Duration,
+) {
+    // Remembered up front, because `child.id()` goes to `None` the moment the
+    // plugin is reaped — including by the graceful `child.wait()` below. A
+    // plugin that exits politely on `plugin.shutdown` can still have left
+    // something running behind it, and after the reap there is no longer any
+    // handle telling us which group to clean up. The `Child` stays alive for
+    // the whole function, which is what keeps this pid safe from reuse.
+    let plugin_pgid = child.id();
+
+    // Slow handlers must not stall the reader. Their responses come back on
+    // this queue and are forwarded, in order, onto the single writer.
+    let (resp_tx, resp_rx) = mpsc::channel::<String>(64);
+    let handler = DispatchLines {
+        name: name.clone(),
+        plugin_id,
+        router,
+        event_bus,
+        state_root,
+        perm_root: Arc::clone(&perm_root),
+        graph,
+        denial_hook: denial_hook.get().cloned(),
+        resp_tx,
+    };
+    let end = run_stdio_session(
+        &name, reader, stdin, inbox_rx, kill_rx, sub, perm_root, handler, resp_rx, last_error,
+        grace,
+    )
+    .await;
+
+    if end.killed {
         debug!(plugin = %name, "kill signal received; draining grace");
         // Grace WITHOUT reaping. `child.wait()` would be the obvious way
         // to wait out the grace, and it is the wrong one: `wait` calls
@@ -1525,12 +1802,15 @@ async fn run_plugin_io(
         // An UNREAPED child pins its pid, so probing the group with
         // signal 0 keeps the pgid ours for the whole window. Same probe
         // `shux::lens_scratch` uses for the same reason.
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let remaining = end
+            .grace_deadline
+            .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .unwrap_or(Duration::ZERO);
         wait_for_group_exit(plugin_pgid, remaining).await;
     }
 
-    // Every exit from the loop above lands here — the graceful shutdown, a
-    // closed stdout, an I/O error. Whatever brought us here, anything the
+    // Every exit lands here — the graceful shutdown, a closed stdout, an
+    // I/O error, a full reply queue. Whatever brought us here, anything the
     // plugin started is now unowned, so the group goes with it.
     //
     // No path above reaps the child, so its pid is still pinned and this pgid
