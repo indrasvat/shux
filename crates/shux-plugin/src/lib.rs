@@ -1404,6 +1404,30 @@ enum Outbound {
     Inbox(String),
 }
 
+fn stop_for_halt(
+    halt_tx: &watch::Sender<Halt>,
+    grace_tx: &mpsc::Sender<String>,
+    inbox_rx: &mut mpsc::Receiver<String>,
+    why: Halt,
+) -> ReadStop {
+    if *halt_tx.borrow() == Halt::Run && why != Halt::Run {
+        let _ = halt_tx.send(why);
+    }
+    if *halt_tx.borrow() == Halt::Kill || why == Halt::Kill {
+        while let Ok(line) = inbox_rx.try_recv() {
+            // Not the reply queue: that one may already be full.
+            if grace_tx.try_send(line).is_err() {
+                break;
+            }
+        }
+        return ReadStop::Halted(Halt::Kill);
+    }
+    if why == Halt::Run {
+        return ReadStop::Closed;
+    }
+    ReadStop::Halted(why)
+}
+
 fn enqueue_stop(err: mpsc::error::TrySendError<Outbound>) -> ReadStop {
     match err {
         mpsc::error::TrySendError::Full(_) => ReadStop::Backlog,
@@ -1575,6 +1599,7 @@ async fn read_plugin_frames<R, H>(
     tx: mpsc::Sender<Outbound>,
     grace_tx: mpsc::Sender<String>,
     halt_tx: watch::Sender<Halt>,
+    mut halt: watch::Receiver<Halt>,
     mut kill_rx: oneshot::Receiver<()>,
     mut handler: H,
     mut sub: Option<Subscription>,
@@ -1592,16 +1617,16 @@ where
             // in `inbox_rx` when this fires, and a helper can lose that race
             // to the sender being dropped.
             _ = &mut kill_rx => {
-                if *halt_tx.borrow() == Halt::Run {
-                    let _ = halt_tx.send(Halt::Kill);
+                return stop_for_halt(&halt_tx, &grace_tx, &mut inbox_rx, Halt::Kill);
+            }
+
+            // The writer sets this when a reply write fails. Stdout may still
+            // be open and idle, so the kill oneshot is not what wakes us.
+            changed = halt.changed() => {
+                if changed.is_err() {
+                    return ReadStop::Closed;
                 }
-                while let Ok(line) = inbox_rx.try_recv() {
-                    // Not the reply queue: that one may already be full.
-                    if grace_tx.try_send(line).is_err() {
-                        break;
-                    }
-                }
-                return ReadStop::Halted(Halt::Kill);
+                return stop_for_halt(&halt_tx, &grace_tx, &mut inbox_rx, *halt.borrow());
             }
 
             line = inbox_rx.recv() => match line {
@@ -1669,19 +1694,20 @@ where
     let (halt_tx, halt_rx) = watch::channel(Halt::Run);
     let (tx, rx) = mpsc::channel(REPLY_BACKLOG);
     let (grace_tx, grace_rx) = mpsc::channel(4);
-    let reader = tokio::spawn(read_plugin_frames(
+    let mut reader = tokio::spawn(read_plugin_frames(
         lines,
         inbox_rx,
         resp_rx,
         tx,
         grace_tx,
         halt_tx.clone(),
+        halt_rx.clone(),
         kill_rx,
         handler,
         sub,
         perm_root,
     ));
-    let writer = tokio::spawn(write_plugin_frames(
+    let mut writer = tokio::spawn(write_plugin_frames(
         stdin,
         rx,
         grace_rx,
@@ -1690,13 +1716,51 @@ where
         grace,
     ));
 
-    let stop = match reader.await {
-        Ok(stop) => stop,
-        Err(e) => {
-            warn!(plugin = %name, "reader task failed: {e}");
-            ReadStop::Closed
+    // Either task can finish first. A write error used to leave the reader
+    // parked on a quiet stdout, so the session never reached process cleanup.
+    let mut reader_stop = None;
+    let mut writer_end = None;
+    loop {
+        tokio::select! {
+            biased;
+            stop = &mut reader, if reader_stop.is_none() => {
+                let stop = match stop {
+                    Ok(stop) => stop,
+                    Err(e) => {
+                        warn!(plugin = %name, "reader task failed: {e}");
+                        ReadStop::Closed
+                    }
+                };
+                if !matches!(stop, ReadStop::Halted(Halt::Kill))
+                    && writer_end.is_none()
+                    && *halt_tx.borrow() == Halt::Run
+                {
+                    let _ = halt_tx.send(Halt::Disconnect);
+                }
+                reader_stop = Some(stop);
+            }
+            out = &mut writer, if writer_end.is_none() => {
+                if reader_stop.is_none() && *halt_tx.borrow() == Halt::Run {
+                    let _ = halt_tx.send(Halt::Disconnect);
+                }
+                writer_end = Some(match out {
+                    Ok(out) => out,
+                    Err(e) => {
+                        warn!(plugin = %name, "writer task failed: {e}");
+                        SessionEnd {
+                            killed: false,
+                            grace_deadline: None,
+                        }
+                    }
+                });
+            }
         }
-    };
+        if reader_stop.is_some() && writer_end.is_some() {
+            break;
+        }
+    }
+    let stop = reader_stop.expect("reader stop is set before the loop breaks");
+    let writer_out = writer_end.expect("writer end is set before the loop breaks");
     let reader_killed = matches!(stop, ReadStop::Halted(Halt::Kill));
     match stop {
         ReadStop::Backlog => {
@@ -1715,23 +1779,6 @@ where
         }
         ReadStop::Halted(_) | ReadStop::InboxClosed => {}
     }
-    // Kill keeps the grace drain. Every other exit has to unblock a writer
-    // parked in a full pipe: the reader owns the kill signal, and once it
-    // has returned a later kill() cannot reach that writer.
-    if !reader_killed && *halt_tx.borrow() == Halt::Run {
-        let _ = halt_tx.send(Halt::Disconnect);
-    }
-
-    let writer_out = match writer.await {
-        Ok(out) => out,
-        Err(e) => {
-            warn!(plugin = %name, "writer task failed: {e}");
-            SessionEnd {
-                killed: false,
-                grace_deadline: None,
-            }
-        }
-    };
 
     SessionEnd {
         killed: reader_killed || writer_out.killed,

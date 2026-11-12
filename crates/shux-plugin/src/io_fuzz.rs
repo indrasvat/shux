@@ -333,6 +333,51 @@ async fn interleave(data: &[u8]) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// Closing stdin while stdout stays open must finish the session. The
+    /// reply write fails, and a quiet plugin never enqueues another frame, so
+    /// the reader has to be told the writer is gone.
+    #[tokio::test]
+    async fn stdin_close_while_stdout_stays_open_finishes_the_session() {
+        let (daemon_read, mut plugin_write, mut plugin_read, daemon_write) = pipes(1, 64 * 1024);
+        let (inbox_tx, inbox_rx) = mpsc::channel(8);
+        let (kill_tx, kill_rx) = oneshot::channel();
+        let (resp_tx, resp_rx) = mpsc::channel(64);
+        let last_error = Arc::new(Mutex::new(None));
+        let session = tokio::spawn(run_stdio_session(
+            "fuzz",
+            BufReader::new(daemon_read).lines(),
+            daemon_write,
+            inbox_rx,
+            kill_rx,
+            None,
+            Arc::new(PathBuf::from("/")),
+            Echo { resp: resp_tx },
+            resp_rx,
+            Arc::clone(&last_error),
+            Duration::from_secs(2),
+        ));
+        plugin_write.write_all(b"Q1\n").await.expect("request");
+        let mut one = [0u8; 1];
+        plugin_read
+            .read_exact(&mut one)
+            .await
+            .expect("writer started");
+        drop(plugin_read);
+        let finished = tokio::time::timeout(Duration::from_secs(2), session).await;
+        drop(plugin_write);
+        drop(inbox_tx);
+        drop(kill_tx);
+        assert!(
+            finished.is_ok(),
+            "session wedged after stdin closed while stdout stayed open"
+        );
+        let err = last_error.lock().await.clone();
+        assert!(
+            err.as_deref().is_some_and(|e| e.contains("stdin write")),
+            "write failure was not reported: {err:?}"
+        );
+    }
+
     /// Closing stdout while the writer is parked on a full stdin pipe must
     /// finish the session. The reader is the only task that sees the EOF;
     /// the writer has to be stopped too, or shutdown waits forever.
