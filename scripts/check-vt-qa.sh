@@ -472,9 +472,11 @@ unchanged_since() {
     fi
 }
 
-# What `make vt-neutrality` measures with: the VT code, its corpus, and the tool.
-NEUTRALITY_INPUTS=("${VT_PATHS[@]}" .shux/fixtures/vt-corpus .shux/goldens/073-vt-corpus
-    scripts/vt-neutrality.sh .shux/scripts/lib Cargo.toml Cargo.lock rust-toolchain.toml .cargo)
+# What `make vt-neutrality` measures with: the whole binary it builds (all of
+# crates/, not only VT_PATHS), its corpus, the comparator and the tool.
+NEUTRALITY_INPUTS=(crates Cargo.toml Cargo.lock rust-toolchain.toml .cargo fuzz scripts/fuzz.sh
+    .shux/fixtures/vt-corpus .shux/goldens/073-vt-corpus .claude/automations/pixel_verify.py
+    scripts/vt-neutrality.sh .shux/scripts/lib)
 NEUTRALITY_LAYERS='["corpus-goldens","corpus-ab","live-ab","colour-probe","fuzz","leaks"]'
 
 # Council records must be issued for this diff, not carried over from an old scope.

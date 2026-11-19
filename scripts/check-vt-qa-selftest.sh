@@ -207,6 +207,19 @@ size_mismatch_metric() {
     git add "$q/neutrality/corpus-ab-x.json"
     jq_stage neutrality.json '.status = "moved" | .layers["corpus-ab"].status = "moved"'
 }
+# The binary neutrality measured is built from all of crates/, not only VT_PATHS.
+# shellcheck disable=SC2016  # jq programs: $h is a jq variable
+late_non_vt_edit() {
+    local a2
+    mkdir -p crates/shux/src
+    echo snapshot >crates/shux/src/snapshot.rs
+    git add crates/shux/src/snapshot.rs
+    git commit -qm "snapshot change after the neutrality run"
+    a2="$(git rev-parse HEAD)"
+    echo "Re-audited at $a2." >>"$q/SOLID-QA.md"
+    git add "$q/SOLID-QA.md"
+    jq_stage evidence-manifest.json --arg h "$a2" '.commit_under_audit = $h'
+}
 incomplete_neutrality() { jq_stage neutrality.json 'del(.layers.fuzz)'; }
 fuzz_error() {
     jq_stage neutrality.json '.status = "error" | .layers.fuzz.status = "error"'
@@ -272,6 +285,7 @@ gov 2 "trivial tier with a moved pixel" trivial failed_neutrality "trivial tier 
 gov 0 "full tier may carry an intended pixel change" full failed_neutrality
 gov 2 "trivial report saying pass over a moved layer" trivial inconsistent_pass "trivial tier requires"
 gov 0 "full tier may carry a size-mismatch metric" full size_mismatch_metric
+gov 2 "non-VT source changed after the neutrality run" full late_non_vt_edit "neutrality head"
 gov 2 "neutrality report missing a layer" full incomplete_neutrality "not a complete"
 gov 2 "full tier with a layer that did not run" full fuzz_error "did not run cleanly"
 gov 2 "a committed metric the report never wrote" full extra_metric "but the report wrote"
