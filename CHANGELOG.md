@@ -1,3 +1,10 @@
+## [0.57.2](https://github.com/indrasvat/shux/compare/v0.57.1...v0.57.2) (2026-11-19)
+
+
+### Bug Fixes
+
+* **pane:** pane run types only the command on a shell that reports its boundaries ([#279](https://github.com/indrasvat/shux/issues/279)) ([225a58d](https://github.com/indrasvat/shux/commit/225a58dfa328e0b0e87b10311aa9824572f64a38)), closes [#275](https://github.com/indrasvat/shux/issues/275) [#275](https://github.com/indrasvat/shux/issues/275) [#275](https://github.com/indrasvat/shux/issues/275) [#281](https://github.com/indrasvat/shux/issues/281) [#281](https://github.com/indrasvat/shux/issues/281) [#281](https://github.com/indrasvat/shux/issues/281) [#281](https://github.com/indrasvat/shux/issues/281) [#281](https://github.com/indrasvat/shux/issues/281)
+
 ## [0.57.1](https://github.com/indrasvat/shux/compare/v0.57.0...v0.57.1) (2026-11-05)
 
 
