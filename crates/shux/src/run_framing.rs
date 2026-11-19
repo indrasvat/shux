@@ -29,6 +29,9 @@ pub(crate) struct Front {
     /// The foreground process group is the pane's program or another shell
     /// (one started from it, at its own prompt).
     pub(crate) foreground_is_shell: bool,
+    /// The prompt's mark says no line editor reads it, so line mode is how
+    /// it is read, not a sign that something else runs.
+    pub(crate) no_line_editor: bool,
     /// `None` when the terminal could not be asked.
     pub(crate) program: Option<shux_pty::Foreground>,
     pub(crate) full_screen: bool,
@@ -104,7 +107,7 @@ pub(crate) fn choose(wanted: Wanted, front: &Front, multiline: bool) -> Choice {
         // The terminal is in line mode: readline, zle and ble.sh read a
         // prompt in raw mode, so a hook or an accepted line runs now, and a
         // line typed now would be its input, echoed by the terminal.
-        (_, AtPrompt) if front.program.is_some_and(|p| p.canonical) => {
+        (_, AtPrompt) if !front.no_line_editor && front.program.is_some_and(|p| p.canonical) => {
             Choice::Await(Refusal::PromptNotReady)
         }
         (_, AtPrompt) => Choice::Use(Boundaries::Osc133),
@@ -149,8 +152,12 @@ pub(crate) fn runs_a_shell(argv: &[String]) -> bool {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or_default();
+    // A login shell's `-bash`; a versioned `bash5.2` or `zsh-5.9`.
+    let name = name
+        .trim_start_matches('-')
+        .trim_end_matches(|c: char| c.is_ascii_digit() || c == '.' || c == '-');
     // `-c` runs a script, not a prompt.
-    SHELLS.contains(&name.trim_start_matches('-')) && !argv.iter().any(|a| a == "-c")
+    SHELLS.contains(&name) && !argv.iter().any(|a| a == "-c")
 }
 
 /// Whether the leader of process group `group` is a shell.
@@ -191,6 +198,7 @@ mod tests {
             input_pending: false,
             input_present: false,
             foreground_is_shell: true,
+            no_line_editor: false,
             program: Some(shux_pty::Foreground {
                 leader: true,
                 hidden_input: false,
@@ -280,6 +288,17 @@ mod tests {
             ),
             Choice::Await(Refusal::PromptNotReady)
         );
+        // A prompt whose mark names no line editor is read in line mode.
+        assert_eq!(
+            with(|f| {
+                f.program = fg(true, false).map(|p| shux_pty::Foreground {
+                    canonical: true,
+                    ..p
+                });
+                f.no_line_editor = true;
+            }),
+            Choice::Use(Osc133)
+        );
         // At the prompt mark a prompt hook's program may hold the terminal: wait.
         assert_eq!(
             with(|f| {
@@ -318,6 +337,7 @@ mod tests {
         assert!(runs_a_shell(&["/bin/bash".into(), "-l".into()]));
         assert!(runs_a_shell(&["-zsh".into()]));
         assert!(!runs_a_shell(&["python3".into()]));
+        assert!(runs_a_shell(&["bash5.2".into()]) && runs_a_shell(&["zsh-5.9".into()]));
         assert!(!runs_a_shell(&["bash".into(), "-c".into(), "make".into()]));
     }
 

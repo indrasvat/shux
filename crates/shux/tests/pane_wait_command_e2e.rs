@@ -1393,3 +1393,18 @@ fn a_nested_integrated_shell_takes_the_line() {
         "{r}"
     );
 }
+
+/// A bash without a line editor reads its prompt in line mode; its prompt
+/// mark says so, so the line is typed and runs.
+#[test]
+fn a_shell_without_a_line_editor_takes_the_line() {
+    let env = Env::new(80, 24);
+    let rc = tempfile::tempdir().expect("rc dir");
+    let pane = start_with(&env, &rc, &bash(), true, "set +o emacs +o vi\n");
+    let (r, code) = pane_run(&env, &pane, "echo plain", &["--timeout", "10"]);
+    assert_eq!(
+        (r["stdout"].as_str(), code),
+        (Some("plain\n"), Some(0)),
+        "{r}"
+    );
+}

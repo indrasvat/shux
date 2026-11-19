@@ -231,7 +231,7 @@ pane.wait_command { "pane_id": "uuid", "after": 41, "timeout_ms": 30000, "output
   older command's comes back `stdout: null, evicted: true`. zsh's
   partial-line mark (PROMPT_SP), which it prints before reporting the end, is
   not part of it, nor is ble.sh's `prompt_eol_mark`: the shipped integration
-  names its line editor on the prompt mark (`133;A;shux-editor=zsh|ble`), and
+  names its line editor on the prompt mark (`133;A;shux-editor=zsh|ble|readline|none`), and
   the mark is trimmed only for the editor named, pinned to the pane's width.
 - **`timeout_ms`**: 30 s by default, at most 3600000 (1 h). Past it the wait is
   refused with `-32602`, `data: { field, max, hint }`, exactly as
@@ -344,7 +344,9 @@ being drawn (prompt hooks); a line read with echo off is `hidden_input`; the
 alternate screen is `full_screen`. At the prompt mark the terminal must be in
 raw mode, as readline, zle and ble.sh leave it while they read: in line mode a
 hook, or a line the shell accepted, runs, and it waits, then refuses
-`prompt_not_ready`. Input the pane was sent counts too: a line
+`prompt_not_ready`. A prompt whose mark says no line editor reads it (the
+shipped bash integration under `--noediting`: `shux-editor=none`) is read in
+line mode, so that is not taken as a sign. Input the pane was sent counts too: a line
 submitted at the prompt (a CR or LF outside a bracketed paste) that has not
 started, or input still queued, is `input_pending`; keys sent to the prompt
 that submitted nothing are `input_present` (C-c gives a fresh prompt). A pane whose

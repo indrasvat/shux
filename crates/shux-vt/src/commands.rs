@@ -75,6 +75,11 @@ pub enum LineEditor {
     Zsh,
     /// ble.sh: `prompt_eol_mark`.
     Ble,
+    /// bash's readline: no mark.
+    Readline,
+    /// No line editor (`bash --noediting`): the prompt is read in the
+    /// terminal's line mode.
+    None,
 }
 
 impl LineEditor {
@@ -83,6 +88,8 @@ impl LineEditor {
         params.split(|&b| b == b';').find_map(|p| match p {
             b"shux-editor=zsh" => Some(LineEditor::Zsh),
             b"shux-editor=ble" => Some(LineEditor::Ble),
+            b"shux-editor=readline" => Some(LineEditor::Readline),
+            b"shux-editor=none" => Some(LineEditor::None),
             _ => None,
         })
     }
@@ -256,6 +263,10 @@ impl CommandBoundaries {
 
     pub(crate) fn state(&self) -> ShellState {
         self.state
+    }
+
+    pub(crate) fn editor(&self) -> Option<LineEditor> {
+        self.editor
     }
 
     /// The prompt is being redrawn with no command started since the last
@@ -459,7 +470,7 @@ pub fn eol_mark_len(out: &[u8], cols: usize, editor: Option<LineEditor>) -> usiz
     match editor {
         Some(LineEditor::Zsh) => zsh_prompt_sp(out, cols),
         Some(LineEditor::Ble) => ble_eol_mark(out, cols),
-        None => None,
+        Some(LineEditor::Readline | LineEditor::None) | None => None,
     }
     .unwrap_or(0)
 }

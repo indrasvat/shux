@@ -723,6 +723,11 @@ impl VirtualTerminal {
         self.commands.line_pending()
     }
 
+    /// The line editor the last prompt's mark named, if any.
+    pub fn prompt_editor(&self) -> Option<LineEditor> {
+        self.commands.editor()
+    }
+
     /// How many prompts (`133;A`) this terminal has seen.
     pub fn prompts_seen(&self) -> u64 {
         self.commands.prompts()
