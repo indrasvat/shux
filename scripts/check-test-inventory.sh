@@ -135,7 +135,7 @@ list_tests() {
   fi
   raw="$(bash "${REPO_ROOT}/scripts/run-bounded.sh" "${LIST_TIMEOUT}" cargo nextest list \
     --binaries-metadata "${meta}/binaries.json" --cargo-metadata "${meta}/cargo.json" \
-    --color never)" || rc=$?
+    --run-ignored all --color never)" || rc=$?
   find "${meta}" -delete
   if [[ "${rc}" -eq 124 ]]; then
     echo "error: a test binary is stuck answering --list (the build already ran)." >&2
