@@ -817,6 +817,19 @@ impl RunBoundaries {
     }
 }
 
+/// `pane run --timeout`: a bare number is seconds, as it always was; a
+/// duration must come to whole seconds.
+pub fn parse_run_timeout_secs(s: &str) -> Result<u64, String> {
+    if let Ok(secs) = s.trim().parse::<u64>() {
+        return Ok(secs);
+    }
+    let ms = parse_duration_ms(s)?;
+    if ms % 1000 != 0 {
+        return Err(format!("timeout {s:?} is not whole seconds"));
+    }
+    Ok(ms / 1000)
+}
+
 /// Parse a human duration into whole milliseconds (PRD §2.2: the CLI accepts
 /// human durations and normalizes to ms for the RPC). Accepts a bare integer
 /// (= milliseconds) or an integer with a `ms`/`s`/`m`/`h` suffix. A parse
@@ -1217,7 +1230,8 @@ pub enum PaneCommand {
     /// `prompt` or `next_command` means the shell drew a prompt or started
     /// another command without reporting this one's end, so the exit code is
     /// unknown), `not_run` (the shell drew its next prompt without starting
-    /// the line: a syntax error or a comment; `stdout` is what it replied),
+    /// the line; `stdout` is what it replied: plain bash and zsh on a syntax
+    /// error or a comment, where ble.sh instead runs it and reports 2),
     /// `timed_out` (`phase: awaiting_start` if the line never started;
     /// `hidden_input: true` if the terminal was reading with echo off, as a
     /// password prompt does), `cancelled`, `pane_gone`, `overrun`. After
@@ -1261,8 +1275,9 @@ pub enum PaneCommand {
         #[arg(short, long)]
         command: String,
 
-        /// Timeout in whole seconds, at most 3600 (default: 30)
-        #[arg(long, default_value = "30")]
+        /// Timeout: whole seconds (`60`), or a duration in whole seconds
+        /// (`60s`, `2m`, `1h`); at most 1h. Default 30s.
+        #[arg(long, default_value = "30", value_parser = parse_run_timeout_secs)]
         timeout: u64,
 
         /// Run asynchronously (return command ID immediately)
@@ -1276,6 +1291,26 @@ pub enum PaneCommand {
         /// printed markers and type it whatever holds the pane.
         #[arg(long, value_enum, default_value_t = RunBoundaries::Auto)]
         boundaries: RunBoundaries,
+    },
+
+    /// A `pane run --async` command's result, or while it runs its `phase`
+    /// (`awaiting_start`, `executing`, `awaiting_input`). Mirrors
+    /// `pane.command_status`. Exit 0 found, 2 no such command.
+    #[command(name = "command-status")]
+    CommandStatus {
+        /// The `command_id` `pane run` returned.
+        #[arg(value_name = "COMMAND_ID")]
+        command_id: String,
+    },
+
+    /// Interrupt the command holding its pane (it is sent C-c) and free the
+    /// pane; an ended command reports its state and is sent nothing. Mirrors
+    /// `pane.command_cancel`. Exit 0 done, 2 no such command.
+    #[command(name = "command-cancel")]
+    CommandCancel {
+        /// The `command_id` `pane run` returned.
+        #[arg(value_name = "COMMAND_ID")]
+        command_id: String,
     },
 
     /// Capture the current text content of a pane
@@ -1487,12 +1522,12 @@ pub enum PaneCommand {
     /// started after it is the one waited for. To wait for the next one, pass
     /// the returned `started`.
     ///
-    /// With `--output`, the result also carries `output`: what the command
+    /// With `--output`, the result also carries `stdout`: what the command
     /// wrote between its start and its end (stdout and stderr as the terminal
-    /// received them, ANSI-stripped, first 1 MiB, `output_truncated` past
-    /// it), however long it is or however its lines wrapped. The last few MiB
-    /// of output are kept, so a command whose output has been let go returns
-    /// `output: null, output_evicted: true`.
+    /// received them, ANSI-stripped, first 1 MiB, `truncated` past it),
+    /// however long it is or however its lines wrapped; `pane run` names it
+    /// the same. The last few MiB of output are kept, so a command whose
+    /// output has been let go returns `stdout: null, evicted: true`.
     ///
     /// The boundaries travel in the pane's own output, so output that prints
     /// an OSC 133 sequence is read as one: trust `exit_code` as far as you
@@ -1513,7 +1548,7 @@ pub enum PaneCommand {
         #[arg(long, default_value = "30s", value_parser = parse_duration_ms)]
         timeout: u64,
 
-        /// Also return what the command wrote, as `output`.
+        /// Also return what the command wrote, as `stdout`.
         #[arg(long)]
         output: bool,
     },
@@ -1942,6 +1977,16 @@ impl Cli {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_run_timeout_is_seconds_or_a_duration_in_whole_seconds() {
+        assert_eq!(super::parse_run_timeout_secs("60"), Ok(60));
+        assert_eq!(super::parse_run_timeout_secs("60s"), Ok(60));
+        assert_eq!(super::parse_run_timeout_secs("2m"), Ok(120));
+        assert_eq!(super::parse_run_timeout_secs("1h"), Ok(3600));
+        assert!(super::parse_run_timeout_secs("1500ms").is_err());
+        assert!(super::parse_run_timeout_secs("soon").is_err());
+    }
+
     use super::*;
 
     #[test]

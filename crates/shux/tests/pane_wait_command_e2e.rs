@@ -716,8 +716,8 @@ fn wait_command_output_is_exactly_what_the_command_wrote() {
     let r = result(&out);
     let want: String =
         (1..=200).map(|n| format!("{n}\n")).collect::<String>() + &format!("{:0300}\n", 7);
-    assert_eq!(r["output"].as_str(), Some(want.as_str()), "{r}");
-    assert_eq!(r["output_truncated"], false, "{r}");
+    assert_eq!(r["stdout"].as_str(), Some(want.as_str()), "{r}");
+    assert_eq!(r["truncated"], false, "{r}");
     // Without --output the shape is as before.
     let floor = as_of(&env, &pane);
     type_line(&env, "true");
@@ -726,7 +726,7 @@ fn wait_command_output_is_exactly_what_the_command_wrote() {
             .output()
             .expect("spawn shux"),
     );
-    assert!(r.get("output").is_none(), "{r}");
+    assert!(r.get("stdout").is_none(), "{r}");
     // `pane run`'s stdout agrees with `wait-command --output` for the same text.
     let (run, _) = pane_run(&env, &pane, "seq 1 200; printf '%0300d\\n' 7", &[]);
     assert_eq!(run["stdout"].as_str(), Some(want.as_str()));
@@ -754,7 +754,7 @@ fn pane_run_refuses_a_pane_not_at_its_prompt() {
             .expect("spawn shux"),
     );
     assert_eq!(
-        r["output"], "reading-275\ngot-pw\n",
+        r["stdout"], "reading-275\ngot-pw\n",
         "the refused line was typed into the prompt: {r}"
     );
 
@@ -851,7 +851,7 @@ fn a_timed_out_run_can_be_waited_on_to_its_end() {
             .output()
             .expect("spawn shux"),
     );
-    assert_eq!(r["output"], "early\nlate\n", "{r}");
+    assert_eq!(r["stdout"], "early\nlate\n", "{r}");
     let (r, _) = pane_run(&env, &pane, "echo free", &[]);
     assert_eq!(r["stdout"], "free\n", "{r}");
 }
@@ -884,7 +884,7 @@ fn a_line_submitted_and_not_yet_started_is_never_typed_behind() {
             .expect("spawn shux"),
     );
     assert_eq!(
-        r["output"], "pass: got-pw\n",
+        r["stdout"], "pass: got-pw\n",
         "the refused line reached the shell: {r}"
     );
 }
@@ -1148,7 +1148,7 @@ fn echo_off_is_not_taken_for_a_password_prompt() {
             .output()
             .expect("spawn shux"),
     );
-    assert_eq!(r["output"], "pass: got-pw\n", "{r}");
+    assert_eq!(r["stdout"], "pass: got-pw\n", "{r}");
 }
 
 /// A pane held by a timed-out command is refused naming it; cancelling an
@@ -1164,6 +1164,11 @@ fn a_held_pane_names_its_holder_and_an_ended_command_cancels_to_its_state() {
         r["error"]["data"]["running_command_id"], held["command_id"],
         "{r}"
     );
+    assert_eq!(r["error"]["data"]["reason"], "pane_held", "{r}");
+    // The CLI verbs: status of the holder, then cancel of an ended command.
+    let id = held["command_id"].as_str().expect("command id").to_string();
+    let status = result(&env.run(&["--format", "json", "pane", "command-status", &id]));
+    assert_eq!(status["state"], "timed_out", "{status}");
     let after = held["as_of"]
         .as_u64()
         .unwrap_or_else(|| panic!("no as_of: {held}"));
@@ -1175,18 +1180,18 @@ fn a_held_pane_names_its_holder_and_an_ended_command_cancels_to_its_state() {
     assert_eq!(ended["outcome"], "completed", "{ended}");
     let (done, _) = pane_run(&env, &pane, "true", &["--timeout", "20"]);
     assert_eq!(done["state"], "completed", "{done}");
-    let params = serde_json::json!({ "command_id": done["command_id"] }).to_string();
+    let done_id = done["command_id"].as_str().expect("command id").to_string();
+    let out = env.run(&["--format", "json", "pane", "command-cancel", &done_id]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(result(&out)["state"], "completed");
     let out = env.run(&[
         "--format",
         "json",
-        "rpc",
-        "call",
-        "pane.command_cancel",
-        "--params",
-        &params,
+        "pane",
+        "command-status",
+        "00000000-0000-4000-8000-000000000000",
     ]);
-    let r = result(&out);
-    assert_eq!(r["state"], "completed", "{r}");
+    assert_eq!(out.status.code(), Some(2), "no such command");
 }
 
 /// Bad targets and bad requests: exit 2 with a JSON error, as every wait.
@@ -1248,4 +1253,25 @@ fn a_pane_that_is_not_a_shell_is_refused() {
     let (r, code) = pane_run(&env, &pane, "print(1)", &[]);
     assert_eq!(code, Some(3), "{r}");
     assert_eq!(r["error"]["data"]["reason"], "not_a_shell", "{r}");
+}
+
+/// A shux call from inside a pane never types into that same pane: it would
+/// type into the caller and wait on itself.
+#[test]
+fn a_run_into_the_callers_own_pane_is_refused() {
+    let (env, _rc, pane) = integrated(&bash());
+    let mut cmd = env.shux();
+    cmd.env("SHUX_PANE_ID", &pane).args([
+        "--format", "json", "pane", "run", "-s", "ws", "-c", "echo x",
+    ]);
+    let out = cmd.output().expect("spawn shux");
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(result(&out)["error"]["data"]["reason"], "own_pane");
+    // Every pane's program knows its pane.
+    let (r, _) = pane_run(&env, &pane, "echo $SHUX_PANE_ID", &["--timeout", "20s"]);
+    assert_eq!(
+        r["stdout"].as_str(),
+        Some(format!("{pane}\n").as_str()),
+        "{r}"
+    );
 }

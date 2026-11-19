@@ -123,13 +123,13 @@ pub(crate) async fn wait_command(
                 });
                 match text {
                     Some(Some((text, truncated))) => {
-                        result["output"] = text.into();
-                        result["output_truncated"] = truncated.into();
+                        result["stdout"] = text.into();
+                        result["truncated"] = truncated.into();
                     }
                     // Kept output is bounded: older commands' is let go.
                     Some(None) => {
-                        result["output"] = Value::Null;
-                        result["output_evicted"] = true.into();
+                        result["stdout"] = Value::Null;
+                        result["evicted"] = true.into();
                     }
                     None => {}
                 }

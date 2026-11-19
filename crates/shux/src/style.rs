@@ -1736,6 +1736,35 @@ pub fn print_run_command(result: &serde_json::Value, is_async: bool) {
     }
 }
 
+/// `pane command-status` / `command-cancel`: a running command's phase, or
+/// its result.
+pub fn print_command_call(result: &serde_json::Value) {
+    let state = result
+        .get("state")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let id = result
+        .get("command_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    if state == "running" {
+        let phase = result
+            .get("phase")
+            .and_then(|v| v.as_str())
+            .unwrap_or("running");
+        println!(
+            "{} {} {}",
+            warning("⏳"),
+            muted(&short_id(id)),
+            phase.replace('_', " ")
+        );
+    } else if result.get("stdout").is_some() {
+        print_run_command(result, false);
+    } else {
+        println!("{} {} {}", muted("•"), muted(&short_id(id)), state);
+    }
+}
+
 /// A command's captured output, then a note if it was cut at the limit.
 fn print_command_output(result: &serde_json::Value, field: &str, truncated: &str) {
     let text = result.get(field).and_then(|v| v.as_str()).unwrap_or("");
@@ -2097,8 +2126,8 @@ pub fn print_pane_wait_command(result: &serde_json::Value) {
                 muted(pane_id),
                 code
             );
-            print_command_output(result, "output", "output_truncated");
-            if result.get("output_evicted").and_then(|v| v.as_bool()) == Some(true) {
+            print_command_output(result, "stdout", "truncated");
+            if result.get("evicted").and_then(|v| v.as_bool()) == Some(true) {
                 println!(
                     "{}",
                     warning("… its output is no longer kept: newer commands' took its place")

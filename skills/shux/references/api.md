@@ -198,7 +198,7 @@ A command typed into a pane's shell, ended, as the shell reports it over OSC
 ```json
 pane.wait_command { "pane_id": "uuid", "after": 41, "timeout_ms": 30000, "output": true }
   → { "outcome": "completed", "exit_code": 1, "started": 57, "ended": 58, "ended_by": "end",
-      "output": "...", "output_truncated": false }
+      "stdout": "...", "truncated": false }
   | { "outcome": "timeout", "no_integration": false }
   | { "outcome": "overrun", "kept": 32 }
   | { "outcome": "pane_gone", "reason": "exited" | "killed" | "respawned" | "not_started" }
@@ -224,10 +224,11 @@ pane.wait_command { "pane_id": "uuid", "after": 41, "timeout_ms": 30000, "output
   enabled, and RIS does not reset them.
 - **`output`** (only when asked for): what the command wrote between its
   start and its end, stdout and stderr as the terminal received them,
-  ANSI-stripped, `\r\n` as `\n`, first 1 MiB (`output_truncated`). It is the
+  ANSI-stripped, `\r\n` as `\n`, first 1 MiB (`truncated`), named as
+  `pane.run_command` names it: `stdout`. It is the
   stream, not the screen, so long output and wrapped lines come back whole.
   Output is kept passively for every command, within a few MiB per pane; an
-  older command's comes back `output: null, output_evicted: true`. zsh's
+  older command's comes back `stdout: null, evicted: true`. zsh's
   partial-line mark (PROMPT_SP), which it prints before reporting the end, is
   not part of it.
 - **`timeout_ms`**: 30 s by default, at most 3600000 (1 h). Past it the wait is
@@ -357,13 +358,14 @@ hidden_input, full_screen, hint }`; nothing was typed.
 | `state` | Meaning |
 |---|---|
 | `completed` | `exit_code` is the command's. `ended_by` (`osc133` only): `end` (its own `D`), or `prompt` / `next_command`, where the shell drew a prompt or started another command without reporting this one's end, and `exit_code` is null |
-| `not_run` | `osc133` only: the shell drew its next prompt without starting the line (a syntax error, a comment). `stdout` holds what the pane showed for the line, its echo included, up to that prompt |
+| `not_run` | `osc133` only: the shell drew its next prompt without starting the line. `stdout` is the shell's reply as the screen showed it. Plain bash and zsh do this for a syntax error or a comment; ble.sh runs such a line instead, so it is `completed` with bash's own status (2 for a syntax error) |
 | `timed_out` | the timeout passed first; `stdout` is what it wrote so far. Its program may still run, and the pane stays held until it ends or is cancelled |
 | `cancelled` | `pane.command_cancel` |
 | `pane_gone` | the pane's program ended or the pane was removed first |
 | `overrun` | `osc133` only: more commands ended after the line than the terminal keeps |
 
-- `as_of` (`osc133` only) is the floor the line was typed above: pass it to
+- `as_of` (`osc133` only) is the floor read just before the line was typed, so
+  the line's command is the first above it: pass it to
   `pane.wait_command` as `after`, with `output: true`, to keep waiting on a
   `timed_out` command until its own end.
 - A `timed_out` result carries `phase` (`awaiting_start`: the line never
@@ -371,8 +373,13 @@ hidden_input, full_screen, hint }`; nothing was typed.
   true`. While running, `pane.command_status`'s `phase` is `awaiting_start`,
   `executing` or `awaiting_input` (echo off now).
 - `stdout` is ANSI-stripped, `\r\n` as `\n`, up to 1 MiB (`truncated`).
-- One command per pane. A second is refused with `ResourceExhausted`, plus
-  `running_command_id` and `running_command_state`.
+- One command per pane. A second is refused with `ResourceExhausted`,
+  `reason: "pane_held"`, `running_command_id` and `running_command_state`.
+- `from_pane`: the caller's own pane (the CLI sends `$SHUX_PANE_ID`, which
+  every pane's program has); a target equal to it is refused, `reason:
+  "own_pane"`.
+- CLI: `shux pane command-status <ID>` and `shux pane command-cancel <ID>`
+  mirror `pane.command_status` and `pane.command_cancel`.
 - `timeout` is whole seconds, 30 by default, at most 3600; anything else is
   refused with `-32602`.
 - CLI exit: 0 ended (read `exit_code`), 1 timed out, 2 bad arguments or no

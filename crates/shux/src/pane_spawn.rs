@@ -1166,6 +1166,13 @@ async fn spawn_pane_pty_unshared(
     };
     config.size = size;
     config.env = env;
+    if !env_clear {
+        // Which pane a program runs in, so a shux call from it can tell its
+        // own pane from its target. Ahead of the caller's own entries.
+        config
+            .env
+            .insert(0, ("SHUX_PANE_ID".to_string(), pane_id.to_string()));
+    }
     config.env_clear = env_clear;
     let mut handle = shux_pty::handle::PtyHandle::spawn(&config)?;
     let input = handle.input_writer()?;

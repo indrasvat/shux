@@ -270,6 +270,20 @@ pub(crate) fn register_pane_io_methods(
 
                     let args: Vec<String> = pane_command::parse_run_args(&params)?;
                     let wanted = parse_boundaries(&params)?;
+                    // Typing into the pane the caller runs in would type into
+                    // the caller, and wait on itself.
+                    if params.get("from_pane").and_then(|v| v.as_str())
+                        == Some(pane_id.to_string().as_str())
+                    {
+                        return Err(shux_rpc::RpcError::with_data(
+                            shux_rpc::ErrorCode::InvalidParams,
+                            serde_json::json!({
+                                "detail": "the target is the pane this command runs in: pass -p with another pane",
+                                "reason": "own_pane",
+                                "pane_id": pane_id.to_string(),
+                            }),
+                        ));
+                    }
                     let multiline = check_typed_line(command, &args)?;
 
                     let timeout_secs = match params.get("timeout") {
@@ -1918,14 +1932,14 @@ fn pane_busy(running: uuid::Uuid, state: &str) -> shux_rpc::RpcError {
     let (message, hint) = if state == "running" {
         (
             format!("the pane is still running command {running}"),
-            "wait for it (pane.command_status) or cancel it (pane.command_cancel), then retry",
+            "wait for it to finish (pane command-status, or pane wait-command --after <its as_of>), then retry; pane command-cancel interrupts it",
         )
     } else {
         (
             format!(
-                "the pane is still held by command {running} ({state}): its program may still be running; cancel it (pane.command_cancel) to take the pane back"
+                "the pane is still held by command {running} ({state}): its program may still be running"
             ),
-            "cancel it (pane.command_cancel) to stop its program, then retry",
+            "wait for its own end (pane wait-command --after <its as_of> --output), then retry; pane command-cancel interrupts it",
         )
     };
     shux_rpc::RpcError::with_message_and_data(
@@ -1933,6 +1947,7 @@ fn pane_busy(running: uuid::Uuid, state: &str) -> shux_rpc::RpcError {
         message,
         serde_json::json!({
             "resource": "pane command",
+            "reason": "pane_held",
             "running_command_id": running.to_string(),
             "running_command_state": state,
             "hint": hint,

@@ -919,6 +919,9 @@ pub async fn handle_pane_run(
         "async": is_async,
         "boundaries": boundaries.as_str(),
     });
+    if let Ok(own) = std::env::var("SHUX_PANE_ID") {
+        params["from_pane"] = own.into();
+    }
 
     if let Some(pid) = pane_spec {
         params["pane_id"] = serde_json::Value::String(pid.to_string());
@@ -956,6 +959,30 @@ pub async fn handle_pane_run(
         Some("timed_out") => std::process::exit(1),
         _ => std::process::exit(3),
     }
+}
+
+/// `shux pane command-status` / `command-cancel`: one call naming a command.
+pub async fn handle_pane_command_call(
+    stream: &mut tokio::net::UnixStream,
+    method: &str,
+    verb: &str,
+    command_id: &str,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    let params = serde_json::json!({ "command_id": command_id });
+    let result =
+        match super::program_status::call_wait(stream, method, verb, params, format).await? {
+            Ok(result) => result,
+            Err(code) => std::process::exit(code),
+        };
+    match format {
+        OutputFormat::Json => println!(
+            "{}",
+            crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+        ),
+        OutputFormat::Text | OutputFormat::Plain => crate::style::print_command_call(&result),
+    }
+    Ok(())
 }
 
 /// Handle the `shux pane capture` command.
