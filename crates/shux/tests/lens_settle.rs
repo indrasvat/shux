@@ -89,9 +89,6 @@ fn s3_settle_timeout() {
     let h = Harness::new();
     let f = h.launch_fixture("f3_flip.sh", 80, 24, "AAAAAAAAAA");
 
-    // Each check runs under its OWN pump, bound to it (p0-council-r1
-    // BLOCKER 1: a shared pump dying early would let a later check observe
-    // a quiet pane and false-green).
     h.with_token_pump(&f.pane_id, 100, || {
         let env = h.rpc_raw(
             "pane.wait_settled",

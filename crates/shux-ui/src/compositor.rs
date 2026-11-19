@@ -1341,9 +1341,8 @@ mod tests {
 
     #[test]
     fn test_performance_80x24_under_budget() {
-        // The cost is bounded by work, not by time: a first frame draws each
-        // cell once, in a bounded number of bytes, and an unchanged second
-        // frame draws nothing. A wall-clock bound here measured runner load.
+        // Bounded by work, not time: a first frame draws each cell once, in
+        // a bounded number of bytes. Unchanged frames: `test_force_redraw`.
         let mut compositor = make_compositor(80, 24, CompositorConfig::default());
         let cell = |col: u16, row: u16| {
             let ch = (b'A' + ((col + row) % 26) as u8) as char;
@@ -1355,14 +1354,12 @@ mod tests {
             stats.dirty_cells, stats.total_cells,
             "a first frame draws every cell"
         );
+        // ~8.5 B/cell today (CUP + glyph): one more escape per cell exceeds it.
         let bytes = compositor.inner().get_ref().len();
         assert!(
-            bytes <= stats.total_cells * 32,
+            bytes <= stats.total_cells * 10,
             "a full 80x24 frame wrote {bytes} bytes for {} cells",
             stats.total_cells
         );
-
-        let again = compositor.render_frame(cell, 80, 24, Some((0, 0))).unwrap();
-        assert_eq!(again.dirty_cells, 0, "an unchanged frame redrew cells");
     }
 }

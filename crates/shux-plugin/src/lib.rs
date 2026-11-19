@@ -1101,6 +1101,9 @@ struct WatcherCounts {
     /// Held by a test, the next watcher thread blocks before it reports ready.
     #[cfg(test)]
     arming_latch: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    /// Saves that reached a debouncer.
+    #[cfg(test)]
+    received: std::sync::atomic::AtomicU64,
 }
 
 /// Counts its watcher stopped when the debouncer task ends, however it ends.
@@ -1286,6 +1289,8 @@ fn spawn_reload_watcher(
     tokio::spawn(async move {
         let _stopped = stopped;
         while rx.recv().await.is_some() {
+            #[cfg(test)]
+            mgr.watchers.received.fetch_add(1, Ordering::SeqCst);
             // Coalesce a burst of saves into one reload by draining
             // anything that arrives within the next 250ms.
             #[expect(
@@ -2075,20 +2080,32 @@ done
         assert!(polled.is_pending(), "the latch held the watcher back");
         assert_eq!(mgr.watcher_counts().0, 1, "the poll started one watcher");
         drop(arming);
-        std::fs::write(&script, body).unwrap();
+        // The thread stays parked, so no save is lost to the watcher stopping
+        // first: the debouncer has to decide one. FSEvents can miss a change
+        // made just after its stream starts, so the save repeats until one lands.
+        shux_testkit::wait_until_async("a save to reach the debouncer", || {
+            let received = mgr.watchers.received.load(Ordering::SeqCst);
+            if received == 0 {
+                std::fs::write(&script, body).unwrap();
+            }
+            async move { received >= 1 }
+        })
+        .await;
         drop(release);
-        // Once every watcher has stopped, nothing is left to act on the save.
-        shux_testkit::wait_until_async("the dropped watcher to stop", || {
-            let (started, stopped) = mgr.watcher_counts();
-            async move { started == stopped }
+        // Its debouncer stops only after acting on the save, or declining to.
+        shux_testkit::wait_until_async("the dropped watcher's debouncer to stop", || {
+            let (_, stopped) = mgr.watcher_counts();
+            async move { stopped >= 1 }
         })
         .await;
         let listed = mgr.list().await;
+        let counts = mgr.watcher_counts();
         mgr.shutdown().await;
         assert!(
             listed.is_empty(),
             "a save installed a plugin whose install was dropped"
         );
+        assert_eq!(counts, (1, 1), "a save started another watcher");
     }
 
     #[test]

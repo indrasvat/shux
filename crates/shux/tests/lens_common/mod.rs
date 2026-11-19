@@ -889,11 +889,14 @@ pub fn wait_until<F: FnMut() -> bool>(timeout: Duration, cond: F) -> bool {
 /// [`release_after_compare`] lets it go.
 pub fn make_fifo(dir: &Path) -> PathBuf {
     let fifo = dir.join("release");
-    let made = Command::new("mkfifo")
-        .arg(&fifo)
-        .status()
+    let made = spawn_output(Command::new("mkfifo").arg(&fifo))
         .unwrap_or_else(|e| panic!("mkfifo could not run: {e}"));
-    assert!(made.success(), "mkfifo {}", fifo.display());
+    assert!(
+        made.status.success(),
+        "mkfifo {}: {}",
+        fifo.display(),
+        String::from_utf8_lossy(&made.stderr)
+    );
     fifo
 }
 

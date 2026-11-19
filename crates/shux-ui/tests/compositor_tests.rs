@@ -302,9 +302,10 @@ fn test_complex_layout_renders_under_budget() {
         stats.dirty_cells, stats.total_cells,
         "a first frame draws every cell"
     );
+    // ~9.5 B/cell today (CUP + glyph + borders): one more escape per cell exceeds it.
     let bytes = compositor.inner().get_ref().len();
     assert!(
-        bytes <= stats.total_cells * 32,
+        bytes <= stats.total_cells * 11,
         "a 4-pane 80x24 frame wrote {bytes} bytes for {} cells",
         stats.total_cells
     );

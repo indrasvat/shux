@@ -238,43 +238,36 @@ pub(crate) async fn kill_scratch_and_wait(harness: &RpcHarness, session_id: &str
     .await;
 }
 
-/// Count live processes whose argv contains `needle` (unique per test
-/// run, so co-tenant argv text cannot collide). A zombie is dead, so it is
-/// not counted; a failed scan panics rather than reading as 0.
-pub(crate) fn count_procs_containing(needle: &str) -> usize {
+/// `ps -axo <fields>`; a failed scan panics rather than reading as empty.
+fn ps(fields: &str) -> String {
     let out = std::process::Command::new("ps")
-        .args(["-axo", "stat=,args="])
+        .args(["-axo", fields])
         .output()
         .expect("run ps");
     assert!(
         out.status.success(),
         "ps failed: a failed scan would count 0"
     );
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter(|l| !l.trim_start().starts_with('Z') && l.contains(needle))
-        .count()
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Count live processes whose argv contains `needle` (unique per test
+/// run, so co-tenant argv text cannot collide).
+pub(crate) fn count_procs_containing(needle: &str) -> usize {
+    ps("args=").lines().filter(|l| l.contains(needle)).count()
 }
 
 /// Live processes whose argv contains `needle` and whose parent's does not:
 /// one per command started, however many times that command has forked. A
 /// child between `fork` and `exec` still carries its parent's argv.
 pub(crate) fn count_command_roots(needle: &str) -> usize {
-    let out = std::process::Command::new("ps")
-        .args(["-axo", "pid=,ppid=,stat=,args="])
-        .output()
-        .expect("run ps");
-    assert!(
-        out.status.success(),
-        "ps failed: a failed scan would count 0"
-    );
-    let text = String::from_utf8_lossy(&out.stdout);
+    let text = ps("pid=,ppid=,args=");
     let matches: Vec<(&str, &str)> = text
         .lines()
+        .filter(|l| l.contains(needle))
         .filter_map(|l| {
             let mut f = l.split_whitespace();
-            let (pid, ppid, stat) = (f.next()?, f.next()?, f.next()?);
-            (!stat.starts_with('Z') && l.contains(needle)).then_some((pid, ppid))
+            Some((f.next()?, f.next()?))
         })
         .collect();
     matches
