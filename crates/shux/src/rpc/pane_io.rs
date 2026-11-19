@@ -292,12 +292,13 @@ pub(crate) fn register_pane_io_methods(
                             .as_u64()
                             .filter(|&s| s <= crate::rpc::program_status::WAIT_MAX_MS / 1000)
                             .ok_or_else(|| {
-                                shux_rpc::RpcError::with_data(
+                                shux_rpc::RpcError::with_message_and_data(
                                     shux_rpc::ErrorCode::InvalidParams,
+                                    "timeout must be at most 3600 (1h), in whole seconds",
                                     serde_json::json!({
-                                        "detail": "timeout must be a whole number of seconds, at most 3600 (1h)",
                                         "field": "timeout",
                                         "max": crate::rpc::program_status::WAIT_MAX_MS / 1000,
+                                        "hint": "to wait longer, wait for the command again when this run returns",
                                     }),
                                 )
                             })?,

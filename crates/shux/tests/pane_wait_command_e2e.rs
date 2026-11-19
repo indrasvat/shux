@@ -1235,6 +1235,13 @@ fn bad_targets_and_requests_exit_2_with_a_json_error() {
         );
         let r = result(&out);
         assert!(r["error"]["code"].is_i64(), "{args:?}: {r}");
+        if args.contains(&"3601") {
+            // The waits' own words for their cap.
+            assert_eq!(
+                r["error"]["message"], "timeout must be at most 3600 (1h), in whole seconds",
+                "{r}"
+            );
+        }
     }
 }
 
@@ -1253,6 +1260,39 @@ fn a_pane_that_is_not_a_shell_is_refused() {
     let (r, code) = pane_run(&env, &pane, "print(1)", &[]);
     assert_eq!(code, Some(3), "{r}");
     assert_eq!(r["error"]["data"]["reason"], "not_a_shell", "{r}");
+}
+
+/// A shell started through a wrapper (`env`, `bash -c 'exec bash'`) is still
+/// a shell: without the integration it gets markers, as before.
+#[test]
+fn a_wrapped_shell_without_integration_uses_markers() {
+    let bash = bash();
+    let rc = tempfile::tempdir().expect("rc dir");
+    let rcfile = rc.path().join("rc");
+    std::fs::write(&rcfile, format!("PS1='{PROMPT} $ '\n")).expect("rcfile");
+    let rc = rcfile.display().to_string();
+    let exec = format!("exec '{bash}' --noprofile --rcfile '{rc}' -i");
+    let wrapped: [Vec<&str>; 2] = [
+        vec!["env", "QA=1", &bash, "--noprofile", "--rcfile", &rc, "-i"],
+        vec![&bash, "-c", &exec],
+    ];
+    for argv in wrapped {
+        let env = Env::new(80, 24);
+        let mut create = vec!["session", "create", "ws", "-d", "--"];
+        create.extend(&argv);
+        assert!(env.run(&create).status.success(), "{argv:?}");
+        let panes: serde_json::Value =
+            serde_json::from_str(&env.ok(&["--format", "json", "pane", "list", "-s", "ws"]))
+                .expect("json");
+        let pane = panes[0]["id"].as_str().expect("pane id").to_string();
+        env.wait_for("ws", &pane, PROMPT);
+        let (r, code) = pane_run(&env, &pane, "echo hi", &[]);
+        assert_eq!(
+            (r["stdout"].as_str(), r["boundaries"].as_str(), code),
+            (Some("hi\n"), Some("markers"), Some(0)),
+            "{argv:?}: {r}"
+        );
+    }
 }
 
 /// A shux call from inside a pane never types into that same pane: it would

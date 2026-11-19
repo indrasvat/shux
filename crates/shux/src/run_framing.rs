@@ -35,7 +35,7 @@ pub(crate) struct Front {
     /// `None` when the terminal could not be asked.
     pub(crate) program: Option<shux_pty::Foreground>,
     pub(crate) full_screen: bool,
-    /// The pane's own program is a shell.
+    /// The pane's own program, or the foreground group's leader, is a shell.
     pub(crate) pane_is_shell: bool,
 }
 

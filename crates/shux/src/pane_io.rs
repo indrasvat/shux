@@ -428,7 +428,9 @@ impl PaneIoState {
                 .is_some_and(|p| p.leader || crate::run_framing::group_is_a_shell(p.group)),
             no_line_editor: vt.prompt_editor() == Some(shux_vt::LineEditor::None),
             full_screen: vt.is_alternate_screen(),
-            pane_is_shell,
+            // `env … bash`, `bash -c 'exec bash'`: the argv hides the shell.
+            pane_is_shell: pane_is_shell
+                || program.is_some_and(|p| crate::run_framing::group_is_a_shell(p.group)),
         })
     }
 
