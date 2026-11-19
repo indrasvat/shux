@@ -3912,4 +3912,79 @@ mod production_route_tests {
 
         harness.stop().await;
     }
+
+    /// LENS-R-042 at `max_runtime`: SIGTERM first, SIGKILL after the grace,
+    /// and the registry row removed only once the group is dead. The reaper
+    /// is held at its fired deadline until the workload is confirmed live,
+    /// so no step races the deadline.
+    #[tokio::test]
+    async fn reap_sends_sigterm_then_sigkill_and_removes_row_only_after_death() {
+        let harness = RpcHarness::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tag = format!("shuxlensreap{}", PaneId::new().to_string().replace('-', ""));
+        let (ready, marker) = (dir.path().join("ready"), dir.path().join("termed"));
+        // The trap is installed before `ready` exists. A plain TERM cannot
+        // end the loop, so only the follow-up KILL can.
+        let script = format!(
+            "TAG={tag}; trap 'echo TERMED > {m}' TERM; : > {r}; while :; do sleep 0.2; done",
+            m = marker.display(),
+            r = ready.display(),
+        );
+        let pause = test_hooks::Pause::arm(&test_hooks::PAUSE_BEFORE_REAP);
+        let run = dispatch_ok(
+            &harness.router,
+            "lens.run",
+            json!({"argv": ["sh", "-c", script], "max_runtime_ms": MIN_MAX_RUNTIME_MS}),
+        )
+        .await;
+        let sid: SessionId = run["session_id"].as_str().unwrap().parse().unwrap();
+
+        tokio::time::timeout(shux_testkit::BUDGET, pause.reached.notified())
+            .await
+            .expect("the max_runtime deadline fires");
+        shux_testkit::wait_until_async("the workload to arm its trap", || async { ready.exists() })
+            .await;
+        assert!(count_procs_containing(&tag) >= 1, "the workload runs");
+        assert!(
+            harness.scratch_registry.ids().contains(&sid),
+            "the row is present before the reap"
+        );
+        assert!(!marker.exists(), "nothing signalled it before the reap");
+
+        // Read the row, THEN count: a row read as gone with the group alive
+        // afterwards was removed while the group lived.
+        let row_outlives_group = || {
+            let row = harness.scratch_registry.ids().contains(&sid);
+            let alive = count_procs_containing(&tag);
+            assert!(
+                row || alive == 0,
+                "the row went while {alive} process(es) of the group ran"
+            );
+            row
+        };
+        *test_hooks::PAUSE_BEFORE_REAP.lock().unwrap() = None;
+        pause.release.notify_one();
+
+        shux_testkit::wait_until_async("the row to go", || async { !row_outlives_group() }).await;
+        assert_eq!(count_procs_containing(&tag), 0, "the group is dead");
+        // Only the TERM trap creates the marker, and a TERM cannot end the
+        // loop: its presence with the group dead proves TERM, then KILL.
+        assert!(marker.exists(), "SIGTERM reached the group before SIGKILL");
+        assert!(
+            graph_scratch_sessions(&harness).is_empty(),
+            "the scratch session is reaped"
+        );
+        let audit = std::fs::read_to_string(harness._scratch_dir.path().join("lens-audit.ndjson"))
+            .expect("audit log");
+        assert!(
+            audit
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .any(|e| e["method"] == "scratch.reap"
+                    && e["reason"] == "max_runtime"
+                    && e["session_id"] == sid.to_string().as_str()),
+            "reap audited as max_runtime: {audit}"
+        );
+        harness.stop().await;
+    }
 }

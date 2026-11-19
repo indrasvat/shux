@@ -1341,28 +1341,28 @@ mod tests {
 
     #[test]
     fn test_performance_80x24_under_budget() {
-        // A catastrophic-regression guard, not the PRD's 8ms frame budget: this
-        // runs on an unoptimised test build (opt-level 0 is ~4.2x slower here),
-        // so it measures codegen and runner load. Nothing asserts the 8ms budget
-        // now — that needs a release-profile bench, which does not exist yet.
+        // The cost is bounded by work, not by time: a first frame draws each
+        // cell once, in a bounded number of bytes, and an unchanged second
+        // frame draws nothing. A wall-clock bound here measured runner load.
         let mut compositor = make_compositor(80, 24, CompositorConfig::default());
+        let cell = |col: u16, row: u16| {
+            let ch = (b'A' + ((col + row) % 26) as u8) as char;
+            RenderCell::text(ch)
+        };
 
-        let stats = compositor
-            .render_frame(
-                |col, row| {
-                    let ch = (b'A' + ((col + row) % 26) as u8) as char;
-                    RenderCell::text(ch)
-                },
-                80,
-                24,
-                Some((0, 0)),
-            )
-            .unwrap();
-
-        assert!(
-            stats.total_time_us < 100_000,
-            "Full 80x24 render took {}us — an order of magnitude over any sane cost",
-            stats.total_time_us
+        let stats = compositor.render_frame(cell, 80, 24, Some((0, 0))).unwrap();
+        assert_eq!(
+            stats.dirty_cells, stats.total_cells,
+            "a first frame draws every cell"
         );
+        let bytes = compositor.inner().get_ref().len();
+        assert!(
+            bytes <= stats.total_cells * 32,
+            "a full 80x24 frame wrote {bytes} bytes for {} cells",
+            stats.total_cells
+        );
+
+        let again = compositor.render_frame(cell, 80, 24, Some((0, 0))).unwrap();
+        assert_eq!(again.dirty_cells, 0, "an unchanged frame redrew cells");
     }
 }

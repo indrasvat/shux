@@ -119,8 +119,8 @@ filter = '''
     (binary_id(=shux) & (
         test(=lens_scratch::production_route_tests::production_unconfirmed_kill_preserves_registry_row)
       + test(=lens_scratch::production_route_tests::production_lens_run_dropped_mid_core_leaves_no_orphan)
+      + test(=lens_scratch::production_route_tests::reap_sends_sigterm_then_sigkill_and_removes_row_only_after_death)
     ))
-  + binary_id(=shux::scratch_reap_order)
   + (binary_id(=shux-plugin::plugin_lifecycle) & (
         test(=a_killed_plugin_takes_its_whole_process_tree_with_it)
       + test(=install_times_out_on_silent_plugin)
@@ -143,14 +143,9 @@ test-group = 'process-table'
 # nothing measurable, whereas a genuinely daemon-backed suite missing its bound
 # fails on a loaded machine having done nothing wrong. `make check-test-groups`
 # holds the group under 30% of the workspace, which is where the real cost is.
-#
-# `shux::scratch_reap_order` is excluded explicitly: it belongs here by nature
-# but `process-table` above is strictly tighter (1 thread, not 12), and first
-# match wins. Without the exclusion this filterset would overlap that group —
-# harmless-looking, silent, and now a hard failure in `make check-test-groups`.
 [[profile.default.overrides]]
 filter = '''
-    (package(shux) & kind(test) & !binary_id(=shux::scratch_reap_order))
+    (package(shux) & kind(test))
   + (package(shux-pty) & kind(test))
   + (binary_id(=shux) & test(/^pane_spawn::tests::a_replaced_pty_task/))
   + (binary_id(=shux) & test(/^program_status::tests::a_pane_/))

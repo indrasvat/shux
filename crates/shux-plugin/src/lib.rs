@@ -1098,6 +1098,9 @@ impl PluginManager {
 struct WatcherCounts {
     started: std::sync::atomic::AtomicU64,
     stopped: std::sync::atomic::AtomicU64,
+    /// Held by a test, the next watcher thread blocks before it reports ready.
+    #[cfg(test)]
+    arming_latch: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
 }
 
 /// Counts its watcher stopped when the debouncer task ends, however it ends.
@@ -1173,6 +1176,13 @@ fn spawn_reload_watcher(
     let watcher_cancel = cancel.clone();
     let stopping = mgr.stopping.clone();
     mgr.watchers.started.fetch_add(1, Ordering::SeqCst);
+    #[cfg(test)]
+    let arming_latch = mgr
+        .watchers
+        .arming_latch
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
     let stopped = WatcherStopped(mgr.watchers.clone());
     let watch = move || {
         let name = watcher_name;
@@ -1233,6 +1243,11 @@ fn spawn_reload_watcher(
         if let Err(e) = watcher.watch(&parent, RecursiveMode::NonRecursive) {
             warn!(plugin = %name, error = %e, "watcher: failed to start");
             return;
+        }
+        #[cfg(test)]
+        if let Some(latch) = arming_latch {
+            // Released by a send or by the test dropping its end.
+            let _ = latch.recv();
         }
         let _ = ready_tx.send(());
         // Park until stopped — the watcher object itself holds the OS
@@ -2030,8 +2045,6 @@ mod tests {
     /// An install dropped while its watcher is arming, as when the RPC
     /// client disconnects, must not leave the watcher installing on a save.
     #[tokio::test]
-    // TODO(#281): flaky under load; fix the timing dependence, then remove the ignore.
-    #[ignore = "flaky under load: see #281"]
     async fn a_watcher_dropped_while_arming_does_not_install_on_a_save() {
         use std::future::Future;
         let dir = tempfile::tempdir().unwrap();
@@ -2047,6 +2060,10 @@ done
         std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .unwrap();
         let mgr = PluginManager::with_state_root(EventBus::new(), dir.path().join("state"));
+        // The watcher thread cannot report ready until `release` goes, so the
+        // install is certainly still arming when it is dropped.
+        let (release, latch) = std::sync::mpsc::channel::<()>();
+        *mgr.watchers.arming_latch.lock().unwrap() = Some(latch);
 
         let mut arming = Box::pin(arm_reload_watcher(
             mgr.clone(),
@@ -2055,12 +2072,11 @@ done
         ));
         let polled =
             std::future::poll_fn(|cx| std::task::Poll::Ready(arming.as_mut().poll(cx))).await;
-        assert!(
-            polled.is_pending(),
-            "the watcher was ready on its first poll"
-        );
+        assert!(polled.is_pending(), "the latch held the watcher back");
+        assert_eq!(mgr.watcher_counts().0, 1, "the poll started one watcher");
         drop(arming);
         std::fs::write(&script, body).unwrap();
+        drop(release);
         // Once every watcher has stopped, nothing is left to act on the save.
         shux_testkit::wait_until_async("the dropped watcher to stop", || {
             let (started, stopped) = mgr.watcher_counts();

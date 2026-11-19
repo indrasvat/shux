@@ -14,37 +14,10 @@
 mod lens_common;
 use lens_common::*;
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
-
 /// Window for the must-NOT-settle checks that a pump gap could satisfy: the
 /// quiet / hold window equals the timeout, so only a gap as long as the whole
 /// wait settles the pane, and a loaded machine never stretches one that far.
 const NEG_WAIT_MS: u64 = 5_000;
-
-/// Run `check` while a background thread pumps one stdin token every `interval_ms` into the pane
-/// (mirrors `lens_settle.rs::s3_check_under_pump`). The pump's lifetime is bound to the check and
-/// deadline-capped so a panic cannot leave it spinning.
-fn under_pump<T>(h: &Harness, pane_id: &str, interval_ms: u64, check: impl FnOnce() -> T) -> T {
-    let stop = AtomicBool::new(false);
-    std::thread::scope(|scope| {
-        let pump = scope.spawn(|| {
-            let deadline = Instant::now() + BUDGET;
-            while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
-                h.send_line_token(pane_id, "");
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = "§16.1: paces INPUT tokens, never synchronises on output"
-                )]
-                std::thread::sleep(Duration::from_millis(interval_ms));
-            }
-        });
-        let out = check();
-        stop.store(true, Ordering::Relaxed);
-        pump.join().expect("pump");
-        out
-    })
-}
 
 fn settled(env: &RpcEnvelope, ctx: &str) -> bool {
     env.expect_result(ctx)["settled"]
@@ -62,7 +35,7 @@ fn stable_frames_settles_identical_repainter() {
     let f = h.launch_fixture("f11_heartbeat.sh", 80, 24, "LENS-F11-HEARTBEAT");
 
     // stable_frames=3 settles: 3 contiguous identical revisions accumulate as tokens flow.
-    let ok = under_pump(&h, &f.pane_id, 60, || {
+    let ok = h.with_token_pump(&f.pane_id, 60, || {
         let env = h.rpc_raw(
             "pane.wait_settled",
             serde_json::json!({
@@ -75,7 +48,7 @@ fn stable_frames_settles_identical_repainter() {
 
     // Quiet-mode (no stability criterion) under the SAME pump must NOT settle — proves
     // stable_frames enables what quiet cannot.
-    let quiet_ok = under_pump(&h, &f.pane_id, 60, || {
+    let quiet_ok = h.with_token_pump(&f.pane_id, 60, || {
         let env = h.rpc_raw(
             "pane.wait_settled",
             serde_json::json!({ "pane_id": f.pane_id, "quiet_ms": NEG_WAIT_MS, "timeout_ms": NEG_WAIT_MS }),
@@ -97,7 +70,7 @@ fn stable_frames_never_settles_perpetual_animation() {
     let h = Harness::new();
     let f = h.launch_fixture("f3_flip.sh", 80, 24, "AAAAAAAAAA");
 
-    let ok = under_pump(&h, &f.pane_id, 60, || {
+    let ok = h.with_token_pump(&f.pane_id, 60, || {
         let env = h.rpc_raw(
             "pane.wait_settled",
             serde_json::json!({
@@ -124,7 +97,7 @@ fn hold_ms_settles_identical_but_not_changing() {
 
     // Identical repainter: the frame hash holds, so hold_ms=400 settles despite constant tokens.
     let f11 = h.launch_fixture("f11_heartbeat.sh", 80, 24, "LENS-F11-HEARTBEAT");
-    let held = under_pump(&h, &f11.pane_id, 50, || {
+    let held = h.with_token_pump(&f11.pane_id, 50, || {
         let env = h.rpc_raw(
             "pane.wait_settled",
             serde_json::json!({
@@ -142,7 +115,7 @@ fn hold_ms_settles_identical_but_not_changing() {
     // Changing pane: f8 rewrites row 10 with a new glyph each token → hold clock resets → the
     // hold window (tokens every 80ms) never elapses without a content change → no settle.
     let f8 = h.launch_fixture("f8_repaint.sh", 80, 24, "LENS-F8-REPAINT");
-    let changing = under_pump(&h, &f8.pane_id, 80, || {
+    let changing = h.with_token_pump(&f8.pane_id, 80, || {
         let env = h.rpc_raw(
             "pane.wait_settled",
             serde_json::json!({
@@ -165,14 +138,12 @@ fn hold_ms_settles_identical_but_not_changing() {
 /// constant → `--stable-frames` settles. Without the mask the churn prevents settling. This is
 /// the council's "masked dynamic region settles; unmasked dynamic region fails" test.
 #[test]
-// TODO(#281): flaky under load; fix the timing dependence, then remove the ignore.
-#[ignore = "flaky under load: see #281"]
 fn masked_churn_settles_unmasked_does_not() {
     let h = Harness::new();
     let f = h.launch_fixture("f8_repaint.sh", 80, 24, "LENS-F8-REPAINT");
 
     // Mask the churning row (0-based row 10, whole 80-col span) → stable → settles.
-    let masked = under_pump(&h, &f.pane_id, 60, || {
+    let masked = h.with_token_pump(&f.pane_id, 60, || {
         let env = h.rpc_raw(
             "pane.wait_settled",
             serde_json::json!({
@@ -188,7 +159,7 @@ fn masked_churn_settles_unmasked_does_not() {
     );
 
     // Unmasked: the row-10 churn keeps changing the frame → never K identical → no settle.
-    let unmasked = under_pump(&h, &f.pane_id, 60, || {
+    let unmasked = h.with_token_pump(&f.pane_id, 60, || {
         let env = h.rpc_raw(
             "pane.wait_settled",
             serde_json::json!({

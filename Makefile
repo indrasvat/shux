@@ -661,7 +661,7 @@ test-lens-diff-concurrency: nextest-ready ## Run the P4 diff concurrent-reader i
 
 .PHONY: test-lens-scratch-reap
 test-lens-scratch-reap: nextest-ready ## Run the P5 scratch reap signal-order test (LENS-R-042, codex B3)
-	$(call lens_run,Running lens P5 scratch reap-order test (§8),--test scratch_reap_order)
+	$(call lens_run,Running lens P5 scratch reap-order test (§8),-p shux --lib -E 'test(=lens_scratch::production_route_tests::reap_sends_sigterm_then_sigkill_and_removes_row_only_after_death)')
 
 .PHONY: test-lens-gate
 test-lens-gate: nextest-ready ## Run the lens-gate GREEN dogfood suite (task 078; capture on real shux TUIs + cross-path PNG) serially under the leak guard

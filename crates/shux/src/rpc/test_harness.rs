@@ -239,18 +239,48 @@ pub(crate) async fn kill_scratch_and_wait(harness: &RpcHarness, session_id: &str
 }
 
 /// Count live processes whose argv contains `needle` (unique per test
-/// run, so co-tenant argv text cannot collide).
+/// run, so co-tenant argv text cannot collide). A zombie is dead, so it is
+/// not counted; a failed scan panics rather than reading as 0.
 pub(crate) fn count_procs_containing(needle: &str) -> usize {
-    std::process::Command::new("ps")
-        .args(["-axo", "args="])
+    let out = std::process::Command::new("ps")
+        .args(["-axo", "stat=,args="])
         .output()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .filter(|l| l.contains(needle))
-                .count()
+        .expect("run ps");
+    assert!(
+        out.status.success(),
+        "ps failed: a failed scan would count 0"
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('Z') && l.contains(needle))
+        .count()
+}
+
+/// Live processes whose argv contains `needle` and whose parent's does not:
+/// one per command started, however many times that command has forked. A
+/// child between `fork` and `exec` still carries its parent's argv.
+pub(crate) fn count_command_roots(needle: &str) -> usize {
+    let out = std::process::Command::new("ps")
+        .args(["-axo", "pid=,ppid=,stat=,args="])
+        .output()
+        .expect("run ps");
+    assert!(
+        out.status.success(),
+        "ps failed: a failed scan would count 0"
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    let matches: Vec<(&str, &str)> = text
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split_whitespace();
+            let (pid, ppid, stat) = (f.next()?, f.next()?, f.next()?);
+            (!stat.starts_with('Z') && l.contains(needle)).then_some((pid, ppid))
         })
-        .unwrap_or(0)
+        .collect();
+    matches
+        .iter()
+        .filter(|(_, ppid)| !matches.iter().any(|(pid, _)| pid == ppid))
+        .count()
 }
 
 /// `__scratch-*` sessions currently in the GRAPH (what a leaked

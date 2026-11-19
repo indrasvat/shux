@@ -359,6 +359,40 @@ impl Harness {
         );
     }
 
+    /// Run `check` while a thread sends `pane_id` an empty line token every
+    /// `interval_ms` (§16.1: the interval paces INPUT, never synchronises on
+    /// output). The pump stops when `check` returns or panics, so no check
+    /// can observe a pane its pump stopped churning early.
+    pub fn with_token_pump<T>(
+        &self,
+        pane_id: &str,
+        interval_ms: u64,
+        check: impl FnOnce() -> T,
+    ) -> T {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct StopOnDrop<'a>(&'a AtomicBool);
+        impl Drop for StopOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    self.send_line_token(pane_id, "");
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "§16.1: paces INPUT tokens, never synchronises on output"
+                    )]
+                    std::thread::sleep(Duration::from_millis(interval_ms));
+                }
+            });
+            let _stop = StopOnDrop(&stop);
+            check()
+        })
+    }
+
     /// Send raw bytes (F4 raw-mode single-byte tokens; e.g. "a", "s", "\t").
     pub fn send_raw(&self, pane_id: &str, bytes: &str) {
         self.rpc_ok(

@@ -765,10 +765,11 @@ mod tests {
         a.unwrap();
         b.unwrap();
         // A spawn returns once its child has exec'd, so every child either
-        // spawn started is visible now.
+        // spawn started is visible now. `sh`'s own fork for `sleep` is not a
+        // second start.
         let needle = log.display().to_string();
         assert_eq!(
-            crate::rpc::test_harness::count_procs_containing(&needle),
+            crate::rpc::test_harness::count_command_roots(&needle),
             1,
             "the pane's command ran more than once"
         );
