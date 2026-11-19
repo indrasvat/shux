@@ -2,16 +2,18 @@
 # scripts/flake-gate.sh — run the tests a branch adds or changes, many times,
 # under CPU load, before they merge (docs/testing.md#the-flake-gate).
 #
-# A test that passes once on an idle machine says little about a loaded CI
-# runner, and process races (job control, `ps` seeing a fork, a pane exiting
-# between two reads) are beyond any lint. So every test the branch touches runs
-# FLAKE_COUNT times next to FLAKE_LOAD CPU hogs, through scripts/test-stress.sh,
-# which fails on any failed run.
-#
 # "Touched" is read from `git diff BASE...HEAD`:
 #   crates/<pkg>/tests/<name>.rs       that integration-test binary
 #   crates/<pkg>/tests/<dir>/…         every binary in <pkg> that declares `mod <dir>`
-#   crates/<pkg>/src/<path>.rs         the unit tests under that module path
+#                                      or a `#[path = "<dir>/…"]` module
+#   crates/<pkg>/src/<path>.rs         the unit tests under that module path, when a
+#                                      hunk reaches its `cfg(test)` code
+#   a test-only src file               (scripts/test-only-files.sh) its module's tests;
+#                                      the package's whole unit-test binary if it holds none
+#   any other file under tests/ or     the tests whose sources name it (a proptest
+#   .shux/fixtures/                    regressions file: the binary it is named after)
+# shux-testkit's dependents are not re-run when it changes: that is most of the
+# suite, which CI runs once anyway; its own tests are gated like any others.
 #
 #   BASE          ref to diff against   (default origin/main)
 #   FLAKE_COUNT   runs                  (default 20)
@@ -28,17 +30,33 @@ cd "$root"
 
 base="$(git merge-base HEAD "$base_ref")" ||
     { echo "flake-gate: no merge base with $base_ref (is it fetched?)" >&2; exit 1; }
-mapfile -t changed < <(git diff --name-only --diff-filter=AMR "$base"...HEAD -- 'crates/*.rs')
+mapfile -t changed < <(git diff --name-only --diff-filter=AMR "$base"...HEAD -- 'crates/*' '.shux/fixtures/*')
 
-# Whether the diff changes a src file's `#[cfg(test)] mod`. Clippy's
-# `items_after_test_module` keeps that module last, so any hunk ending at or
-# past its first line touches test code; a change above it is production code,
-# which the suite at large already runs.
+declare -A test_only=()
+while IFS=$'\t' read -r file _ modp; do
+    test_only[$file]="$modp"
+done < <(bash scripts/test-only-files.sh "$root")
+
+# A test attribute: the set test-outside-cfg-test recognises.
+test_attr='^[[:space:]]*#\[[[:space:]]*(::)?([A-Za-z_][A-Za-z0-9_]*::)*(test|rstest|proptest)([^A-Za-z0-9_]|$)|proptest!'
+
+# Whether the diff reaches a src file's test code: a hunk at or past the first
+# item under a `cfg` naming `test` (attributes and comments may sit between),
+# not counting `mod x;`, whose code is x's file.
+# Clippy's `items_after_test_module` keeps the test module last, so what comes
+# after that line is test code, give or take a cfg(test) helper above it.
 touches_tests() {
     local start
-    start="$(awk '/^[[:space:]]*#\[cfg\(test\)\]/ { at = FNR; next }
-        at && /^[[:space:]]*#\[/ { next }
-        at && /^[[:space:]]*(pub(\([^)]*\))? )?mod [A-Za-z_0-9]+ *\{/ { print at; exit }
+    start="$(awk '
+        function cfg_test(a,  s) {
+            s = a
+            while (gsub(/not[[:space:]]*\([^()]*\)/, "", s)) {}
+            return s ~ /^[[:space:]]*#!?\[[[:space:]]*cfg[[:space:]]*\(/ && s ~ /(^|[^A-Za-z0-9_])test([^A-Za-z0-9_]|$)/
+        }
+        cfg_test($0) { if (!at) at = FNR; next }
+        at && (/^[[:space:]]*(#\[|\/\/)/ || /^[[:space:]]*$/) { next }
+        at && /^[[:space:]]*(pub(\([^)]*\))?[[:space:]]+)?mod[[:space:]]+[A-Za-z0-9_]+[[:space:]]*;/ { at = 0; next }
+        at && /^[[:space:]]*(pub(\([^)]*\))?[[:space:]]+)?(mod|fn|impl|async fn|const|static|struct|enum|use)[[:space:](<]/ { print at; exit }
         { at = 0 }' "$1")"
     [[ -n "$start" ]] || return 1
     git diff -U0 "$base"...HEAD -- "$1" |
@@ -49,29 +67,51 @@ touches_tests() {
 }
 
 terms=()
-add() {
-    local t
-    for t in ${terms[@]+"${terms[@]}"}; do [[ "$t" == "$1" ]] && return; done
-    terms+=("$1")
-}
-for f in ${changed[@]+"${changed[@]}"}; do
-    [[ "$f" =~ ^crates/([^/]+)/(tests|src)/(.+)\.rs$ ]] || continue
-    pkg="${BASH_REMATCH[1]}" kind="${BASH_REMATCH[2]}" rest="${BASH_REMATCH[3]}"
-    [[ "$pkg" == shux-testkit ]] && continue
+# select_rs <file> [test]: the tests a change to this .rs file can break;
+# "test" when the change is known to reach test code (a fixture it names).
+select_rs() {
+    local f="$1" known="${2:-}"
+    [[ "$f" =~ ^crates/([^/]+)/(tests|src)/(.+)\.rs$ ]] || return 0
+    local pkg="${BASH_REMATCH[1]}" kind="${BASH_REMATCH[2]}" rest="${BASH_REMATCH[3]}"
     if [[ "$kind" == tests && "$rest" != */* ]]; then
-        add "binary_id(=$pkg::$rest)"
+        terms+=("binary_id(=$pkg::$rest)")
     elif [[ "$kind" == tests ]]; then
-        dir="${rest%%/*}"
+        local dir="${rest%%/*}" user
         while IFS= read -r user; do
-            add "binary_id(=$pkg::$(basename "$user" .rs))"
-        done < <(grep -lE "^[[:space:]]*(#\[path = \"$dir/mod\.rs\"\]|mod $dir;)" "crates/$pkg/tests/"*.rs || true)
+            terms+=("binary_id(=$pkg::$(basename "$user" .rs))")
+        done < <(grep -lE "^[[:space:]]*(#\[[[:space:]]*path[[:space:]]*=[[:space:]]*\"$dir/[^\"]*\"[[:space:]]*\]|(pub(\([^)]*\))?[[:space:]]+)?mod[[:space:]]+${dir}[[:space:]]*;)" \
+            "crates/$pkg/tests/"*.rs || true)
+    elif [[ -n "${test_only[$f]+set}" ]]; then
+        if [[ -f "$f" ]] && grep -qE "$test_attr" "$f"; then
+            terms+=("binary_id(=$pkg) & test(/^${test_only[$f]}::/)")
+        else
+            terms+=("binary_id(=$pkg)")
+        fi
     else
-        touches_tests "$f" || continue
-        path="${rest%/mod}"
+        [[ "$known" == test ]] || touches_tests "$f" || return 0
+        local path="${rest%/mod}"
         case "$path" in
-        lib | main) add "binary_id(=$pkg)" ;;
-        *) add "binary_id(=$pkg) & test(/^${path//\//::}::/)" ;;
+        lib | main) terms+=("binary_id(=$pkg)") ;;
+        *) terms+=("binary_id(=$pkg) & test(/^${path//\//::}::/)") ;;
         esac
+    fi
+}
+
+for f in ${changed[@]+"${changed[@]}"}; do
+    if [[ "$f" == *.rs ]]; then
+        select_rs "$f"
+    elif [[ "$f" =~ ^crates/([^/]+)/tests/([^/]+)\.proptest-regressions$ ]]; then
+        select_rs "crates/${BASH_REMATCH[1]}/tests/${BASH_REMATCH[2]}.rs"
+    elif [[ "$f" == crates/*/tests/* || "$f" == .shux/fixtures/* ]]; then
+        # A fixture: the test sources that name it, or else its directory.
+        users=""
+        for needle in "$(basename "$f")" "$(basename "$(dirname "$f")")"; do
+            users="$(grep -rslF --include='*.rs' -- "$needle" crates/*/tests crates/*/src || true)"
+            [[ -z "$users" ]] || break
+        done
+        while IFS= read -r user; do
+            [[ -z "$user" ]] || select_rs "$user" test
+        done <<<"$users"
     fi
 done
 
@@ -79,6 +119,7 @@ if ((${#terms[@]} == 0)); then
     echo "flake-gate: no test code changed since $(git rev-parse --short "$base"); nothing to gate"
     exit 0
 fi
+mapfile -t terms < <(printf '%s\n' "${terms[@]}" | sort -u)
 filter="$(printf '(%s) + ' "${terms[@]}")"
 filter="${filter% + }"
 

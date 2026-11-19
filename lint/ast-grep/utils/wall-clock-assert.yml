@@ -1,10 +1,10 @@
-# An assertion that compares a measured duration against a bound. Macro
-# arguments are an unparsed token tree to ast-grep, so this matches text.
+# An assertion that compares a measured duration, or a clock read, against a
+# bound. Macro arguments are an unparsed token tree, so this matches text.
 id: wall-clock-assert
 language: rust
 rule:
   all:
     - kind: macro_invocation
-      regex: '^(debug_)?assert(_eq|_ne)?!\s*\((?s:.)*?(\.elapsed\(\)|\b(elapsed|elapsed_ms|waited|waited_ms|took|total_time_us|total_time_ms)\s*(<|<=|>|>=)|contains\(&(elapsed|waited))'
+      regex: '^(debug_)?assert(_eq|_ne)?!\s*\((?s:.)*?(\.elapsed\(\)|::now\(\)\s*[-+<>]|\b(elapsed|elapsed_ms|waited|waited_ms|took|total_time_us|total_time_ms)\s*(<|<=|>|>=)|contains\(&(elapsed|waited))'
     - not:
         matches: paused-clock

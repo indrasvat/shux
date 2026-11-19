@@ -1,8 +1,14 @@
-# A fixture script that sleeps and then signals: a head start in disguise.
-# Hold-open loops (`while :; do sleep 3600; done`) and shell condition polls
-# (`while [ ! -e f ]; do sleep 0.05; done`) are not matched.
+# A fixture script that sleeps and then runs anything: a head start in
+# disguise. A sleep a loop's `done` follows (`while :; do sleep 3600; done`, a
+# shell condition poll), or that ends the script, is not matched.
 id: sleep-then-act
 language: rust
 rule:
-  kind: string_literal
-  regex: 'sleep +[0-9.]+ *(;|&&|\\n) *(echo|printf|exit|touch|kill|: |cat|true|\{)'
+  all:
+    - any:
+        - kind: string_literal
+        - kind: raw_string_literal
+    - any:
+        - regex: '\bsleep\s+([0-9.]+|\{[^}]*\}|\$\{?\w+\}?)\s*(;|&&|\n|\\n)(\s|\\n|;)*([^d:\s;\\"#]|d[^o]|do[^n]|don[^e]|done\w|:\s*[^\s"#])'
+        # The rest follows in a later literal: `concat!("sleep 1; ", "echo")`.
+        - regex: '\bsleep\s+([0-9.]+|\{[^}]*\}|\$\{?\w+\}?)\s*(;|&&)\s*"#*$'

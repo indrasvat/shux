@@ -1,0 +1,11 @@
+# A clock read: `<path>::now()`, whatever the type is imported as.
+id: clock-now
+language: rust
+rule:
+  kind: call_expression
+  has:
+    field: function
+    kind: scoped_identifier
+    has:
+      field: name
+      regex: '^now$'

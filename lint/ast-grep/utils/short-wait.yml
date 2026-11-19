@@ -1,0 +1,27 @@
+# A wait for a fixed, short span: a tokio `timeout`/`timeout_at`, awaited, or a
+# `recv_timeout`, whose duration is not `BUDGET` (bounds failure only) or
+# `Duration::ZERO` (one poll).
+id: short-wait
+language: rust
+utils:
+  exempt-first:
+    has:
+      field: arguments
+      has:
+        nthChild: 1
+        regex: '^((std::time::|core::time::)?Duration::ZERO|(shux_testkit::)?BUDGET)$'
+rule:
+  any:
+    - kind: await_expression
+      has:
+        kind: call_expression
+        all:
+          - has: { field: function, regex: '^((tokio::)?time::)?timeout(_at)?$' }
+          - not: { matches: exempt-first }
+    - kind: call_expression
+      all:
+        - has:
+            field: function
+            kind: field_expression
+            has: { field: field, regex: '^recv_timeout$' }
+        - not: { matches: exempt-first }

@@ -8,6 +8,7 @@ files:
   - "crates/shux/src/rpc/test_harness.rs"
   - "crates/shux/src/rpc/surface_tests.rs"
   - "crates/shux/src/cli/test_support.rs"
+  - "crates/shux/src/pane_record_fuzz.rs"
 rule:
   matches: wall-clock-read
 ---

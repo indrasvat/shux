@@ -1,16 +1,27 @@
-# A timed blocking wait. One bounded by the shared BUDGET (it bounds failure,
-# success is the receipt) is not matched.
+# A timed blocking wait. One whose duration argument is the shared BUDGET (it
+# bounds failure; success is the receipt) is not matched: the whole argument,
+# never a name that merely contains it.
 id: timed-wait
 language: rust
 rule:
-  all:
-    - any:
-        - pattern: $R.recv_timeout($$$)
-        - pattern: $R.recv_deadline($$$)
-        - pattern: std::thread::park_timeout($$$)
-        - pattern: thread::park_timeout($$$)
-        - pattern: park_timeout($$$)
-        - pattern: $C.wait_timeout($$$)
-        - pattern: $C.wait_timeout_while($$$)
-    - not:
-        regex: '(?i)budget|\bleft\b|remaining'
+  any:
+    - all:
+        - any:
+            - pattern: $R.recv_timeout($$$)
+            - pattern: $R.recv_deadline($$$)
+            - pattern: std::thread::park_timeout($$$)
+            - pattern: thread::park_timeout($$$)
+            - pattern: park_timeout($$$)
+            - pattern: $C.wait_timeout($$$)
+            - pattern: $C.wait_timeout_while($$$)
+        - not:
+            has:
+              field: arguments
+              has:
+                regex: '^(shux_testkit::)?BUDGET$'
+    - kind: macro_invocation
+      regex: '\.(recv_timeout|recv_deadline|wait_timeout(_while)?)\s*\(|park_timeout\s*\('
+      not:
+        any:
+          - regex: '(recv_timeout|recv_deadline|wait_timeout(_while)?|park_timeout)\s*\(([^(),]*,)?\s*(shux_testkit::)?BUDGET\s*[,)]'
+          - inside: { stopBy: end, kind: macro_invocation }

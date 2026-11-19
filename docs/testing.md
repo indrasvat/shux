@@ -65,24 +65,34 @@ deadline is ordered by the monotonic clock.
   the tree, in `make check` and in CI.
 
 - `scripts/check-test-timing.sh` runs the ast-grep rules in `lint/ast-grep/`
-  over test code: `crates/*/tests/`, the test-only files in `src/`, and every
-  `#[cfg(test)] mod`. They ban the sleeps in disguise that clippy cannot scope
+  over test code: `crates/*/tests/`, the test-only files in `src/` (those a
+  parent declares under a `cfg` naming `test`, found by
+  `scripts/test-only-files.sh`; the rules list them, and the scan fails if
+  the list drifts), and every item under `cfg(test)`, `cfg(all(test, …))` or
+  `cfg(any(test, …))`. They ban the sleeps in disguise that clippy cannot scope
   to tests, because production code uses the same calls legitimately:
 
   | Rule | Flags |
   |---|---|
-  | `test-wall-clock` | `Instant::now() + D` deadlines and `.elapsed()` measurements |
-  | `test-wall-clock-assert` | an assertion comparing a measured duration (`waited_ms`, `elapsed`, `total_time_us`) to a bound |
-  | `test-timed-wait` | `recv_timeout`, `park_timeout`, `wait_timeout` not bounded by `BUDGET` |
-  | `test-absence-by-timeout` | absence asserted by letting a short wait expire |
-  | `test-sleep-then-act` | a fixture script that sleeps, then signals |
-  | `test-outside-cfg-test` | a `#[test]` in `src/` outside a `#[cfg(test)] mod`, where the rules would not see it |
-  | `suppression-needs-reason` | an `ast-grep-ignore` with no reason above it |
+  | `test-wall-clock` | arithmetic, a comparison or a duration on a clock read (`Instant::now() + D`, `now - t0`, `now.checked_add`), directly or through the `let` holding it, and any `.elapsed()` |
+  | `test-wall-clock-assert` | an assertion comparing a measured duration (`waited_ms`, `elapsed`, `total_time_us`) or a clock read to a bound |
+  | `test-timed-wait` | `recv_timeout`, `park_timeout`, `wait_timeout` whose duration argument is not `BUDGET` |
+  | `test-absence-by-timeout` | a short wait's expiry read as the outcome (`is_err`, `unwrap_err`, `!is_ok`, `Err(_)`, an `Ok` arm that panics), directly or through its `let` |
+  | `test-sleep-then-act` | a fixture script that sleeps, then runs anything (a `done` after it, or nothing, is a hold) |
+  | `test-outside-cfg-test` | a test attribute or `proptest!` in `src/` outside `cfg(test)` code, where the rules would not see it |
+
+  A clock read handed on as data (`record(Instant::now())`, a `let` passed to
+  the code under test, `duration_since(UNIX_EPOCH)`) is not flagged; the rare
+  test that does arithmetic on one says why in a suppression.
 
   A test on a paused tokio clock or the `test_clock` seam is exempt by
-  structure. Where time really is the subject (a bound load can only loosen,
-  a slow cleanup under test), suppress the one line, with the reason directly
-  above:
+  structure: a real `#[tokio::test(start_paused = true)]`, or a
+  `tokio::time::pause();` / `let _c = test_clock::Frozen::new();` statement
+  before the code in its block. Where time really is the subject (a bound
+  load can only loosen, a slow cleanup under test), suppress the one line,
+  with a reason of three words or more directly above. The script checks
+  that in text, since ast-grep also honours forms that would hide it
+  (trailing, bare, block or file-level comments); only this one passes:
 
   ```rust
   // why: a lower bound the monotonic clock orders; load only adds to it
@@ -93,14 +103,15 @@ deadline is ordered by the monotonic clock.
   `.claude/settings.json` runs it after every edit; `make check-test-timing`
   runs its self-test and scans the tree, in `make check` and in CI. It fails,
   rather than passing, when ast-grep is missing or not the pinned version,
-  when it loads fewer rules than `lint/ast-grep/rules` defines, and when it
-  scans no file.
+  when it loads fewer rules than `lint/ast-grep/rules` defines, when it
+  scans no file, and when a Rust path it is given cannot be scanned. A file
+  is scanned from the checkout that holds it (the nearest `sgconfig.yml`).
 - `[workspace.lints]` in the root `Cargo.toml` is the one lint policy, and
   every crate opts in. A waiver is `#[expect(lint, reason = "...")]`, never
   `#[allow]`: an `expect` fails once the lint it waives stops firing.
 
-Macro arguments are an unparsed token tree to ast-grep, so inside `assert!`
-the rules match text. Process races (job control, `ps` seeing a zombie or a
+Macro arguments are an unparsed token tree to ast-grep, so inside a macro
+(`assert!`, `proptest!`, `tokio::select!`, `dbg!`) the rules match text. Process races (job control, `ps` seeing a zombie or a
 child between `fork` and `exec`, a pane exiting between two reads) cannot be
 linted at all: that is what the flake gate is for. The shell QA scripts under
 `.shux/scripts/` follow the same rules and are not scanned.
@@ -121,16 +132,21 @@ linted at all: that is what the flake gate is for. The shell QA scripts under
 `#[ignore]` is for a test that cannot run yet, never for one that fails
 sometimes. Its reason names an open issue, `#[ignore = "<why>: see #N"]`, or
 starts with `generator:` for a test run by hand to write fixtures.
-`make check-test-ignores` fails a bare `#[ignore]`, a reason with no issue,
-and one whose issue `gh` reports closed: an ignore does not outlive its fix.
+`make check-test-ignores` reads `#[ignore]` and `ignore` inside a
+`#[cfg_attr(…)]` wherever they sit, and fails a bare one, a reason with no
+issue, and one naming an issue `gh` reports closed or that is a pull request:
+an ignore does not outlive its fix.
 
 ## The flake gate
 
 On every pull request, CI's `Flake gate` job runs the tests the branch adds or
 changes 20 times, next to twice as many CPU hogs as cores, on ubuntu and
 macOS (`make flake-gate BASE=origin/main`). "Changed" is an integration-test
-file, a shared helper under `tests/<dir>/` (every binary that declares it),
-or a hunk inside a src file's `#[cfg(test)] mod`. Any failed run fails the
+file, a shared helper under `tests/<dir>/` (every binary that declares it, by
+`mod` or `#[path]`), a hunk reaching a src file's `cfg(test)` code, a
+test-only src file (its module's tests, or the whole unit-test binary for a
+helper with none), or a fixture a test names. shux-testkit's dependents are
+not re-run when it changes. Any failed run fails the
 job, and a run that outlasts the job's time limit fails it too. This replaces
 "stress it locally if you remember".
 

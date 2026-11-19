@@ -1,15 +1,66 @@
-# A measurement or a deadline taken from the clock. A clock value passed as
-# data (a timestamp argument, a `now` handed to the code under test) is not.
+# A deadline or a measurement taken from the clock: arithmetic, a comparison or
+# a duration on a clock read, directly or through the `let` that holds it, and
+# any `.elapsed()`. A clock value passed on as data (a timestamp argument, a
+# `now` handed to the code under test) is not one, and neither is
+# `duration_since(UNIX_EPOCH)`. Macro bodies are a token tree: matched by text.
 id: wall-clock-read
 language: rust
+utils:
+  on-clock:
+    any:
+      - kind: binary_expression
+        any:
+          - has: { field: left, matches: clock-now }
+          - has: { field: right, matches: clock-now }
+      - kind: call_expression
+        has:
+          field: function
+          kind: field_expression
+          all:
+            - has: { field: value, matches: clock-now }
+            - has: { field: field, regex: '^(checked_add|checked_sub|duration_since|saturating_duration_since|checked_duration_since|elapsed)$' }
+        not:
+          has: { field: arguments, regex: 'UNIX_EPOCH' }
+      - kind: call_expression
+        all:
+          - has:
+              field: function
+              kind: field_expression
+              has: { field: field, regex: '^(duration_since|saturating_duration_since|checked_duration_since)$' }
+          - has: { field: arguments, has: { matches: clock-now } }
+  held-clock:
+    all:
+      - kind: let_declaration
+      - has: { field: value, matches: clock-now }
+      - has: { field: pattern, kind: identifier, pattern: $N }
+      - precedes:
+          stopBy: end
+          has:
+            stopBy: end
+            any:
+              - kind: binary_expression
+                any:
+                  - has: { field: left, pattern: $N }
+                  - has: { field: right, pattern: $N }
+              - pattern: $N.checked_add($$$)
+              - pattern: $N.checked_sub($$$)
+              - pattern: $N.duration_since($$$)
+              - pattern: $N.saturating_duration_since($$$)
+              - pattern: $N.checked_duration_since($$$)
+              - pattern: $X.duration_since($N)
+              - pattern: $X.saturating_duration_since($N)
+              - pattern: $X.checked_duration_since($N)
 rule:
   all:
     - any:
-        - pattern: Instant::now() + $D
-        - pattern: std::time::Instant::now() + $D
-        - pattern: tokio::time::Instant::now() + $D
+        - matches: on-clock
+        - matches: held-clock
         - pattern: $X.elapsed()
-        - pattern: $X.saturating_duration_since(Instant::now())
-        - pattern: $X.duration_since(Instant::now())
+        - kind: macro_invocation
+          regex: '::now\(\)\s*([-+<>]|\.\s*(checked_|saturating_)?(add|sub|duration_since|elapsed)\b)|\.elapsed\(\)|duration_since\([^)]*::now\(\)'
+          not:
+            any:
+              - regex: '^(debug_)?assert(_eq|_ne)?!'
+              - inside: { stopBy: end, kind: macro_invocation }
     - not:
         matches: paused-clock

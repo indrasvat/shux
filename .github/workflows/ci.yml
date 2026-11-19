@@ -98,10 +98,6 @@ jobs:
       - name: No raw sleeps in tests
         run: make check-test-sleeps
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6.8.0
-      - name: Install ast-grep
-        run: |
-          bash scripts/ensure-ast-grep.sh
-          echo "$(uv tool dir --bin)" >> "$GITHUB_PATH"
       - name: No timing in disguise in tests
         run: make check-test-timing
       - name: Every ignored test names an open issue
@@ -340,13 +336,6 @@ jobs:
       - name: Integration regressions (12 deterministic scenarios)
         run: SHUX="$PWD/target/debug/shux" .shux/scripts/no_leak_guard.sh bash .shux/scripts/integration.sh
 
-  # No `needs:` on purpose. Coverage re-runs the whole suite itself under
-  # instrumentation and consumes nothing from `test-ubuntu` — no artifact, no
-  # target dir, its own rust-cache key. Gating it on that job bought one thing,
-  # not spending a runner when tests already failed, and charged the full
-  # coverage duration to the end of EVERY green run: 227s of pure serialization
-  # in run 31503355437, which started coverage 3s after Test finished. Standard
-  # runners are free on a public repo; wall clock is not (issue #157).
   flake-gate:
     name: Flake gate (${{ matrix.os }})
     # The tests a PR adds or changes, 20 runs each next to twice as many CPU
@@ -378,6 +367,13 @@ jobs:
       - name: New and changed tests under load
         run: make flake-gate BASE=origin/${{ github.base_ref }}
 
+  # No `needs:` on purpose. Coverage re-runs the whole suite itself under
+  # instrumentation and consumes nothing from `test-ubuntu` — no artifact, no
+  # target dir, its own rust-cache key. Gating it on that job bought one thing,
+  # not spending a runner when tests already failed, and charged the full
+  # coverage duration to the end of EVERY green run: 227s of pure serialization
+  # in run 31503355437, which started coverage 3s after Test finished. Standard
+  # runners are free on a public repo; wall clock is not (issue #157).
   coverage:
     name: Coverage (llvm-cov)
     if: github.event_name != 'schedule'

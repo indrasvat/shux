@@ -2,7 +2,8 @@
 # scripts/check-test-ignores-selftest.sh — prove check-test-ignores.sh can FAIL.
 #
 # Runs the shipped guard, copied into a throwaway tree, with a stub `gh` that
-# answers OPEN for #1, CLOSED for #2 and fails for anything else.
+# answers an open issue for #1, a closed one for #2, an open pull request for
+# #4, and fails for anything else.
 
 set -euo pipefail
 
@@ -15,9 +16,11 @@ mkdir -p "$work/tree/scripts" "$work/tree/crates/k/tests" "$work/bin"
 cp "$src" "$work/tree/scripts/"
 cat >"$work/bin/gh" <<'EOF'
 #!/usr/bin/env bash
-case "$3" in
-1) echo OPEN ;;
-2) echo CLOSED ;;
+[[ "$1" == api ]] || { echo "gh: unexpected call: $*" >&2; exit 1; }
+case "${2##*/}" in
+1) echo "open false" ;;
+2) echo "closed false" ;;
+4) echo "open true" ;;
 *) echo "gh: not found" >&2; exit 1 ;;
 esac
 EOF
@@ -60,6 +63,35 @@ t '#[test]' '#[ignore = "generator: writes fixtures; run by hand"]' 'fn t() {}'
 expect 0 "a generator passes" guard
 t '/// never #[ignore] a flaky test' '#[test]' 'fn ok() {}'
 expect 0 "a doc comment mentioning #[ignore] is not one" guard
+t '#[test]' '#[cfg_attr(unix, ignore = "waits on a VT fix: see #1")]' 'fn t() {}'
+expect 0 "a cfg_attr ignore naming an open issue passes" guard
+t '#[test]' '#[ignore = r"see #1"]' 'fn t() {}'
+expect 0 "a raw-string reason is read" guard
+t '/* #[ignore] */' '#[test]' 'fn ok() {}' '// #[ignore]' 'const S: &str = "a // b";'
+expect 0 "an ignore inside a comment is not one" guard
+
+# Every one of these must fail.
+bad=(
+    $'#[test] #[ignore]\nfn t() {}'
+    $'#[test]\n#[cfg_attr(target_os = "linux", ignore)]\nfn t() {}'
+    $'#[test]\n#[cfg_attr(all(unix, not(windows)), ignore = "flaky")]\nfn t() {}'
+    $'#[test]\n#[cfg_attr(unix, ignore = "see #2")]\nfn t() {}'
+    $'#[test]\n#[ignore = "see #2"] #[allow(x)]\nfn t() {}'
+    $'#[test]\n#[ignore = "flaky"] // see #1\nfn t() {}'
+    $'#[test]\n#[ignore = "see #2, then see #1"]\nfn t() {}'
+    $'#[test]\n#[ignore = "see #1"]\nfn t() {}\n#[test]\n#[ignore = "see #2"]\nfn u() {}'
+    $'#[test]\n#[ignore =\n    "flaky"]\nfn t() {}'
+    $'#[test]\n#[ignore="see #2"]\nfn t() {}'
+    $'#[test]\n#[ignore = r"see #2"]\nfn t() {}'
+    $'#[test]\n#[ignore = "a \\"q\\" see #2"]\nfn t() {}'
+    $'macro_rules! m { () => { #[test] #[ignore] fn t() {} } }'
+    $'#[test]\n#[ignore = "see #01"]\nfn t() {}'
+    $'#[test]\n#[ignore = "see #4"]\nfn t() {}'
+)
+for code in "${bad[@]}"; do
+    t "$code"
+    expect 1 "fails: ${code//$'\n'/ ⏎ }" guard
+done
 
 if ((fail)); then
     printf '\033[1;31m✗ check-test-ignores self-test failed\033[0m\n'
