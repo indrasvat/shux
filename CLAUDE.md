@@ -25,6 +25,8 @@ make lint               # clippy -D warnings + fmt-check
 make check              # lint + test (pre-commit)
 make deny               # license + advisory audit
 make check-vt-qa        # VT-touching diffs carry tracked QA evidence
+make vt-neutrality BASE=<sha> SCOPE=<scope>  # the scripted half of the VT gate: 0/0 or it fails
+make check-vt-qa-pregate  # evidence + governance checks, before a gate agent starts
 make check-test-groups  # nextest groups still bound what they claim
 make shellcheck         # every tracked shell script (the guards live in shell)
 make test-gui-terminal  # what a REAL GUI terminal (kitty/Xvfb) draws from shux's output
@@ -198,6 +200,32 @@ pixel-verify where a baseline exists (`.claude/automations/pixel_verify.py` via
 `uv run --script`); prove zero leaked daemons. **Missing evidence is failure, not residual
 risk.**
 
+**A gate agent breaks the new surface. Scripts prove everything else.** The defects
+only the gates caught came from probing the new surface: cross-path disagreements,
+lifecycle edges, hostile input. The rest of a run was re-proving neutrality by hand,
+plus bookkeeping. So:
+
+- **Scripted first.** For a VT-path diff, run `make vt-neutrality BASE=$(git merge-base
+  origin/main HEAD) SCOPE=<scope>` and then `make check-vt-qa-pregate` before any agent
+  starts. The first does the corpus replay against goldens, a base-vs-HEAD A/B of every
+  committed rich-TUI recording through `pane.snapshot`/`window.snapshot`/capture, the
+  colour probe, a short fuzz and a leak check, at 0/0. Its base build is cached per
+  merge-base and toolchain, outside `target/`. The second checks council records,
+  committed metrics and that the reports match the code. Red here is fixed by the
+  author, never by a gate agent.
+- **Time-boxed.** The agent gets about 20 minutes. It does not re-run `make check`,
+  tests, the corpus or a council-compliance review. It cites `neutrality.json`. An
+  attack the PR requires but the box did not reach is `BLOCKED`.
+- **Delta re-audits.** After a FAIL, the agent audits `commit_under_audit..HEAD` and
+  the previous findings, not the whole change again.
+- **One agent when both gates apply.** It carries both charters in one run and one
+  time box, and writes one report.
+- **Trivial tier.** A VT-path diff with no behaviour change (lint fix, rename, comment,
+  mechanical refactor) needs no gate agent: `make vt-neutrality SCOPE=<scope>`, a
+  two-line `SOLID-QA.md`, and `"tier": "trivial"` in the manifest. The guard then
+  requires 0/0 on every layer. The feature protocol's councils still apply. The tier
+  only replaces the agent.
+
 VT gate PASS report commits to `.shux/qa/<scope>/SOLID-QA.md`, first line exactly
 `VERDICT: PASS`. `<scope>` is free-form — name it after the change. `make check-vt-qa`
 demands it from any diff touching a path in `VT_PATHS` in `scripts/check-vt-qa.sh` —
@@ -207,7 +235,9 @@ demands it from any diff touching a path in `VT_PATHS` in `scripts/check-vt-qa.s
 The one exemption is the `tests/` and `benches/` trees under those crates: they
 ship no cells and no pixels, so the only audit they could carry would be about
 code the diff never touched. A diff touching `src/` **and** `tests/` still owes
-evidence. `scripts/check-vt-qa-selftest.sh` runs the real guard against a
+evidence. The guard also fails a verdict whose `commit_under_audit`, or a neutrality
+report whose `head`, predates a change to a VT file in the diff: a PASS must have seen
+the code that ships. `scripts/check-vt-qa-selftest.sh` runs the real guard against a
 reintroduced defect and against empty input, and `make check-vt-qa` runs it first.
 
 **Evidence storage.** `.shux/out/<scope>/` is gitignored scratch. Review via PR comments,
@@ -300,6 +330,7 @@ Paste into every feature PR:
 - [ ] config states: default · init · feature-maxed · malformed · hot-reload
 - [ ] cross-path consistency test
 - [ ] `make check` (lint + tests)
+- [ ] VT-path diff: `make vt-neutrality` + `make check-vt-qa-pregate` green before the gate; tier (`full`/`trivial`) stated; gate time-boxed, one agent when both gates apply
 - [ ] real-target dogfood — consumer-facing output judged; findings reproduced
 - [ ] visual proof for every (render path × config state) cell, attached as a PR comment (or Claude Artifact link); non-visual change → exemption stated
 - [ ] `gh-ghent` skill loaded at PR creation, re-entered after every push, output read; every thread answered **and** resolved
@@ -327,8 +358,10 @@ passes and 5 VT-gate re-audits; the last round's suggestion broke an existing te
 
 - **The QA gate starts once, after review freezes**, never alongside it: its scope is
   the diff up to `HEAD`, so every commit during an audit restarts it. A FAIL's fixes,
-  or a fix after PASS, re-run only the layers they touch, at most twice; PASS is still
-  required to merge, and the PR says which layers were re-run.
+  or a fix after PASS, get a delta re-audit (`commit_under_audit..HEAD`) plus a fresh
+  `make vt-neutrality`, at most twice; PASS is still required to merge, and the PR says
+  what was re-run. A trivial-tier diff (*Gates*) has no gate agent, so it spends no
+  gate round at all.
 - **Past the cap, fix only P0/P1**, judged by severity wherever it lands: a crash, a
   hang, data loss, a wrong result, a security hole. Each still ships with a test seen
   failing first, and opens no new review round. Everything else goes in the PR's
