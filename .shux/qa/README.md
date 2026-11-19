@@ -33,10 +33,23 @@ VERDICT: PASS
 `evidence-manifest.json` must include these top-level keys:
 
 - `solid_qa_report`
-- `dootsabha_design`
-- `dootsabha_implementation`
+- `commit_under_audit`: the SHA whose VT code the verdict saw. No VT file in the
+  diff may change after it.
+- `neutrality`: `neutrality.json`, written with its `neutrality/*.json` metrics by
+  `make vt-neutrality BASE=<merge-base> SCOPE=<scope>` on a clean tree, at a head
+  whose VT files match HEAD's.
 - `screenshots`
 - `pixel_metrics`
+- `dootsabha_design` and `dootsabha_implementation`: council records changed in
+  this diff, non-empty, and valid JSON when they are `.json`. Not required when
+  `tier` is `trivial`.
+
+`tier` is optional: `full` by default, or `trivial` for a VT-path diff with no
+behaviour change. A trivial scope needs no gate agent and no council records, but
+every neutrality layer must be 0/0.
+
+`make check-vt-qa-pregate` runs all of this except the `SOLID-QA.md` checks and
+`commit_under_audit`, so bookkeeping is settled before a gate agent starts.
 
 Every artifact reference must be a **path string** relative to the audit's
 `.shux/qa/<scope>/` directory, and must resolve to a tracked regular file —

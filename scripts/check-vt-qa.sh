@@ -5,6 +5,7 @@
 # Usage:
 #   ./scripts/check-vt-qa.sh
 #   VT_QA_BASE=origin/main ./scripts/check-vt-qa.sh
+#   VT_QA_STAGE=pregate ./scripts/check-vt-qa.sh   (make check-vt-qa-pregate)
 #
 # Exit codes:
 #   0 = nothing owed, or evidence present and conforming
@@ -31,6 +32,15 @@
 # is the thing being removed.
 
 set -euo pipefail
+
+# VT_QA_STAGE=pregate (`make check-vt-qa-pregate`) runs every evidence and
+# governance check that does not need the gate's own report, so a bookkeeping
+# FAIL lands before a gate agent starts instead of after it finishes.
+STAGE="${VT_QA_STAGE:-final}"
+if [[ "$STAGE" != final && "$STAGE" != pregate ]]; then
+    echo "✗ VT_QA_STAGE must be 'final' or 'pregate', not '$STAGE'" >&2
+    exit 1
+fi
 
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 cd "$REPO_ROOT"
@@ -207,7 +217,7 @@ scopes=()
 add_scope_if_complete() {
     local scope="$1"
     [[ " ${scopes[*]-} " != *" $scope "* ]] || return 0
-    changed_contains ".shux/qa/$scope/SOLID-QA.md" || return 0
+    [[ "$STAGE" == pregate ]] || changed_contains ".shux/qa/$scope/SOLID-QA.md" || return 0
     changed_contains ".shux/qa/$scope/evidence-manifest.json" || return 0
     scopes+=("$scope")
 }
@@ -226,11 +236,13 @@ if [[ ${#scopes[@]} -eq 0 ]]; then
         echo "  This diff touches VT rendering paths:"
         printf '    - %s\n' "${touched_vt[@]}"
         echo ""
-        echo "  but adds or updates no .shux/qa/<scope>/ evidence. Run the"
-        echo "  shux-vt-solid-qa gate and commit BOTH of its files:"
+        echo "  but adds or updates no .shux/qa/<scope>/ evidence. Run"
+        echo "  make vt-neutrality BASE=<merge-base> SCOPE=<scope>, then the"
+        echo "  shux-vt-solid-qa gate (or the trivial tier), and commit:"
         echo ""
         echo "    .shux/qa/<scope>/SOLID-QA.md            first line exactly 'VERDICT: PASS'"
         echo "    .shux/qa/<scope>/evidence-manifest.json see .shux/qa/README.md"
+        echo "    .shux/qa/<scope>/neutrality.json        + neutrality/*.json"
         echo ""
         echo "  Both must be in this diff: a scope is not selected by touching some"
         echo "  other file underneath it, or an old audit would satisfy a new change."
@@ -310,7 +322,9 @@ check_scope() {
         return
     fi
 
-    if [[ ! -f "$qa_file" ]]; then
+    if [[ "$STAGE" == pregate ]]; then
+        :  # the gate has not written its report yet
+    elif [[ ! -f "$qa_file" ]]; then
         add_error "$scope: missing $qa_file"
     elif ! is_tracked "$qa_file"; then
         add_error "$scope: $qa_file is not tracked"
@@ -341,9 +355,20 @@ check_scope() {
         return
     fi
 
+    # `full` (the default): councils and a gate audit. `trivial`: a diff with no
+    # behaviour change, carried by a 0/0 neutrality report alone.
+    local tier
+    tier="$(jq -r '.tier // "full"' "$manifest")"
+    if [[ "$tier" != full && "$tier" != trivial ]]; then
+        add_error "$scope: manifest tier must be \"full\" or \"trivial\", not '$tier'"
+        return
+    fi
+
     # `task` is deliberately NOT required, and no field is compared against the
     # folder name. That assertion was the task coupling.
-    for key in solid_qa_report dootsabha_design dootsabha_implementation screenshots pixel_metrics; do
+    local -a required=(solid_qa_report screenshots pixel_metrics)
+    [[ "$tier" == full ]] && required+=(dootsabha_design dootsabha_implementation)
+    for key in "${required[@]}"; do
         jq -e "has(\"$key\")" "$manifest" >/dev/null 2>&1 ||
             add_error "$scope: manifest is missing required top-level key '$key'"
     done
@@ -360,14 +385,17 @@ check_scope() {
         add_error "$scope: manifest pixel_metrics must be a non-empty array of path strings"
         return
     fi
-    for key in solid_qa_report dootsabha_design dootsabha_implementation; do
-        if ! jq -e "has(\"$key\") and (.[\"$key\"] | type == \"string\")" "$manifest" >/dev/null 2>&1; then
-            add_error "$scope: manifest '$key' must be a path string relative to $qa_dir"
-            continue
+    if [[ "$STAGE" == final ]]; then
+        if ! jq -e '.solid_qa_report | type == "string"' "$manifest" >/dev/null 2>&1; then
+            add_error "$scope: manifest 'solid_qa_report' must be a path string relative to $qa_dir"
+        else
+            resolve_artifact "$scope" "$qa_dir" "$(jq -r .solid_qa_report "$manifest")" "solid_qa_report" || true
         fi
-        manifest_path="$(jq -r ".$key" "$manifest")"
-        resolve_artifact "$scope" "$qa_dir" "$manifest_path" "$key" || true
-    done
+    fi
+    if [[ "$tier" == full ]]; then
+        check_council_record "$scope" "$qa_dir" "$manifest" dootsabha_design
+        check_council_record "$scope" "$qa_dir" "$manifest" dootsabha_implementation
+    fi
 
     while IFS= read -r manifest_path; do
         resolve_artifact "$scope" "$qa_dir" "$manifest_path" "screenshot" || true
@@ -405,6 +433,91 @@ check_scope() {
         ! jq -e '.screenshots | any(.[]; test("(^|[-_])actual\\.png$"))' "$manifest" >/dev/null 2>&1; then
         add_error "$scope: a pixel metric compares against a committed baseline, so the manifest must reference at least one *-actual.png screenshot"
     fi
+
+    check_neutrality "$scope" "$qa_dir" "$manifest" "$tier"
+
+    if [[ "$STAGE" == final ]]; then
+        local audited
+        audited="$(jq -r '.commit_under_audit // empty | strings' "$manifest")"
+        if [[ -z "$audited" ]]; then
+            add_error "$scope: manifest needs 'commit_under_audit': the SHA whose VT code the verdict saw"
+        else
+            vt_unchanged_since "$scope" "$audited" "commit_under_audit"
+        fi
+    fi
+}
+
+# The VT files this diff touches are byte-identical at <sha> and in the index, so a
+# verdict or measurement made at <sha> saw the VT code that ships.
+vt_unchanged_since() {
+    local scope="$1" sha="$2" label="$3" file
+    local -a stale=()
+    if ! git rev-parse --verify --quiet "${sha}^{commit}" >/dev/null; then
+        add_error "$scope: $label '$sha' is not a commit in this repository"
+        return
+    fi
+    for file in "${touched_vt[@]}"; do
+        git diff --cached --quiet "$sha" -- "$file" || stale+=("$file")
+    done
+    if [[ ${#stale[@]} -gt 0 ]]; then
+        add_error "$scope: $label ${sha:0:10} predates changes to ${stale[*]}; re-run on the current code"
+    fi
+}
+
+# Council records must be issued for this diff, not carried over from an old scope.
+check_council_record() {
+    local scope="$1" qa_dir="$2" manifest="$3" key="$4" rel
+    if ! jq -e "(.[\"$key\"] | type == \"string\")" "$manifest" >/dev/null 2>&1; then
+        add_error "$scope: manifest '$key' must be a path string relative to $qa_dir"
+        return
+    fi
+    resolve_artifact "$scope" "$qa_dir" "$(jq -r ".$key" "$manifest")" "$key" || return 0
+    rel="$RESOLVED"
+    if ! changed_contains "$rel"; then
+        add_error "$scope: council record $rel is not part of this diff; record the council run for this change"
+    elif [[ ! -s "$rel" ]]; then
+        add_error "$scope: council record $rel is empty"
+    elif [[ "$rel" == *.json ]] && ! jq -e . "$rel" >/dev/null 2>&1; then
+        add_error "$scope: council record $rel is not valid JSON"
+    fi
+}
+
+# The `make vt-neutrality` report: run on clean code, on this branch's base, with
+# every metric it wrote committed. A trivial-tier change must be 0/0 everywhere.
+check_neutrality() {
+    local scope="$1" qa_dir="$2" manifest="$3" tier="$4" report nbase nhead metrics_dir count untracked
+    if ! jq -e '.neutrality | type == "string"' "$manifest" >/dev/null 2>&1; then
+        add_error "$scope: manifest needs 'neutrality': the report from make vt-neutrality BASE=<merge-base> SCOPE=$scope"
+        return
+    fi
+    resolve_artifact "$scope" "$qa_dir" "$(jq -r .neutrality "$manifest")" "neutrality" || return 0
+    report="$RESOLVED"
+    if ! jq -e '.tool == "scripts/vt-neutrality.sh" and (.base | type == "string") and (.head | type == "string") and (.layers | type == "object" and length > 0)' "$report" >/dev/null 2>&1; then
+        add_error "$scope: $report is not a scripts/vt-neutrality.sh report"
+        return
+    fi
+    if ! jq -e '.dirty == false' "$report" >/dev/null 2>&1; then
+        add_error "$scope: $report was measured on a dirty tree; commit, then re-run make vt-neutrality"
+    fi
+    nbase="$(jq -r .base "$report")"
+    nhead="$(jq -r .head "$report")"
+    if ! git merge-base --is-ancestor "$nbase" HEAD 2>/dev/null; then
+        add_error "$scope: neutrality base ${nbase:0:10} is not an ancestor of HEAD"
+    elif ! git diff --quiet "$nbase" "$base" -- ${touched_vt[@]+"${touched_vt[@]}"}; then
+        add_error "$scope: neutrality base ${nbase:0:10} is not this branch's base for the VT files it touches; re-run with BASE=$(git rev-parse --short "$base")"
+    fi
+    vt_unchanged_since "$scope" "$nhead" "neutrality head"
+    metrics_dir="$qa_dir/$(jq -r '.metrics_dir // "neutrality"' "$report")"
+    count="$(git ls-files -- "$metrics_dir/*.json" | wc -l | tr -d ' ')"
+    untracked="$(cd "$metrics_dir" 2>/dev/null && git ls-files --others --exclude-standard -- '*.json' | head -1)"
+    if [[ "$count" -eq 0 ]]; then
+        add_error "$scope: no neutrality metrics are committed under $metrics_dir"
+    elif [[ -n "$untracked" ]]; then
+        add_error "$scope: neutrality metric $metrics_dir/$untracked is not committed"
+    fi
+    if [[ "$tier" == trivial ]] && ! jq -e '.status == "pass" and all(.layers[]; .status == "pass")' "$report" >/dev/null 2>&1; then
+        add_error "$scope: trivial tier requires make vt-neutrality to be 0/0 on every layer; $report is not"
+    fi
 }
 
 for scope in "${scopes[@]}"; do
@@ -422,4 +535,4 @@ if [[ ${#errors[@]} -gt 0 ]]; then
     exit 2
 fi
 
-echo "✓ VT QA: ${#touched_vt[@]} VT path(s) touched; evidence conforming in ${scopes[*]}"
+echo "✓ VT QA ($STAGE): ${#touched_vt[@]} VT path(s) touched; evidence conforming in ${scopes[*]}"
