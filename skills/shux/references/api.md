@@ -383,7 +383,10 @@ hidden_input, full_screen, hint }`; nothing was typed.
   `reason: "pane_held"`, `running_command_id` and `running_command_state`.
 - `from_pane`: the caller's own pane (the CLI sends `$SHUX_PANE_ID`, which
   every pane's program has); a target equal to it is refused, `reason:
-  "own_pane"`.
+  "own_pane"`, here and in `pane.send_keys`.
+- A `timed_out` result carries `hint`: the exact command to run next
+  (`shux pane wait-command <PANE> --after <as_of> --output` for OSC 133,
+  `shux pane command-cancel <ID>` for markers).
 - CLI: `shux pane command-status <ID>` and `shux pane command-cancel <ID>`
   mirror `pane.command_status` and `pane.command_cancel`.
 - `timeout` is whole seconds, 30 by default, at most 3600; anything else is

@@ -867,6 +867,9 @@ pub async fn handle_pane_send_keys(
         anyhow::bail!("either --text or --data must be provided");
     }
 
+    if let Ok(own) = std::env::var("SHUX_PANE_ID") {
+        params["from_pane"] = own.into();
+    }
     let result = rpc_call(stream, "pane.send_keys", params).await?;
 
     match format {

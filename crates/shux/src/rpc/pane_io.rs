@@ -222,6 +222,7 @@ pub(crate) fn register_pane_io_methods(
                 async move {
                     let params = params.unwrap_or_default();
                     let pane_id = resolve_pane_id_from_params(&gh, &params)?;
+                    refuse_own_pane(&params, pane_id)?;
 
                     let bytes = if let Some(text) = params.get("text").and_then(|v| v.as_str()) {
                         text.as_bytes().to_vec()
@@ -272,18 +273,7 @@ pub(crate) fn register_pane_io_methods(
                     let wanted = parse_boundaries(&params)?;
                     // Typing into the pane the caller runs in would type into
                     // the caller, and wait on itself.
-                    if params.get("from_pane").and_then(|v| v.as_str())
-                        == Some(pane_id.to_string().as_str())
-                    {
-                        return Err(shux_rpc::RpcError::with_data(
-                            shux_rpc::ErrorCode::InvalidParams,
-                            serde_json::json!({
-                                "detail": "the target is the pane this command runs in: pass -p with another pane",
-                                "reason": "own_pane",
-                                "pane_id": pane_id.to_string(),
-                            }),
-                        ));
-                    }
+                    refuse_own_pane(&params, pane_id)?;
                     let multiline = check_typed_line(command, &args)?;
 
                     let timeout_secs = match params.get("timeout") {
@@ -1976,6 +1966,25 @@ fn pane_input_full(timeout: Duration) -> shux_rpc::RpcError {
         format!("the pane took no input for {}s", timeout.as_secs()),
         serde_json::json!({ "resource": "pane input", "timeout_secs": timeout.as_secs() }),
     )
+}
+
+/// `from_pane` is the caller's own pane (`$SHUX_PANE_ID`): typing into it
+/// would type into the caller.
+fn refuse_own_pane(
+    params: &serde_json::Value,
+    pane_id: shux_core::model::PaneId,
+) -> Result<(), shux_rpc::RpcError> {
+    if params.get("from_pane").and_then(|v| v.as_str()) != Some(pane_id.to_string().as_str()) {
+        return Ok(());
+    }
+    Err(shux_rpc::RpcError::with_data(
+        shux_rpc::ErrorCode::InvalidParams,
+        serde_json::json!({
+            "detail": "the target is the pane this command runs in: pass -p with another pane",
+            "reason": "own_pane",
+            "pane_id": pane_id.to_string(),
+        }),
+    ))
 }
 
 fn parse_boundaries(

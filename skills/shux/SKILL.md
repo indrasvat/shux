@@ -173,7 +173,7 @@ running) are waited out first, up to `--timeout`:
 | `not_a_shell` | a pane whose program is not a shell, and reports no prompt | `--boundaries markers` to type into it anyway |
 | `no_prompt` | nothing reported a prompt within `--timeout` | source the integration, or `--boundaries markers` |
 | `pane_held` | an earlier `pane run` still holding the pane (it timed out, or runs) | wait for its end (`wait-command --after` its `as_of`), then retry |
-| `own_pane` | the pane this `shux` itself runs in (exit 2) | pass `-p` with the pane you mean |
+| `own_pane` | the pane this `shux` itself runs in (exit 2); `send-keys` refuses it too | pass `-p` with the pane you mean |
 
 **`state` says how the command ended:**
 
@@ -181,17 +181,23 @@ running) are waited out first, up to `--timeout`:
 |---|---|---|
 | `completed` | it ended: read `exit_code`. `ended_by: "prompt"` / `"next_command"` means the shell never reported the end (a nested shell, `exec bash`), so `exit_code` is null | 0 |
 | `not_run` | the shell drew its next prompt without starting the line; `stdout` is what it replied. Plain bash and zsh do this for a syntax error or a comment; ble.sh runs such a line, so there it is `completed` with `exit_code` 2 | 3 |
-| `timed_out` | still running at `--timeout`; `stdout` is what it wrote so far, and the pane stays held. `phase: "awaiting_start"` means the line never started (the shell may want more input); `hidden_input: true` means the terminal was reading with echo off, as a password prompt does | 1 |
+| `timed_out` | still running at `--timeout`; `stdout` is what it wrote so far, and the pane stays held; `hint` is the exact command that gets its end. `phase: "awaiting_start"` means the line never started (the shell may want more input); `hidden_input: true` means the terminal was reading with echo off, as a password prompt does | 1 |
 | `cancelled` / `pane_gone` / `overrun` | cancelled; the pane went away; more lines came ahead of it than are kept | 3 |
 
 - **Keep waiting, don't re-run.** After `timed_out` with `boundaries: osc133`,
-  wait for the same command's end with its output. `as_of` is the floor read
-  just before the line was typed:
+  wait for the same command's end with its output. `as_of` is a sequence
+  stamp (not a time) read just before the line was typed:
   `shux --format json pane wait-command "$P" --after "$(jq .as_of <<<"$R")" --timeout 1h --output`
-  (its result is under `.result`, with the same `stdout` and `truncated`).
+  The `pane run` result is frozen at its timeout (`pane command-status` keeps
+  returning it); only `wait-command` reports the command's own end. Its
+  answer is under `.result` and says `outcome` where `pane run` says `state`:
+  `jq '.result | {outcome, exit_code, stdout}'`.
 - **A password prompt** never answers itself: the run times out with
-  `hidden_input: true`. Send the answer, then Enter: `send-keys --text
-  'hunter2'` and `send-keys --data Cg==`; then wait as above.
+  `hidden_input: true` (a sync result's `phase` stays `executing`; branch on
+  `hidden_input`). Send the answer to that pane, `-s` and `-p` both:
+  `send-keys -s S -p "$P" --text 'hunter2'`, then Enter. A program's own
+  prompt takes Enter (`--data DQ==`) or C-j (`--data Cg==`) alike; only
+  ble.sh's line editor needs C-j. Then wait as above.
   With `--async`, `pane.command_status` shows `phase: "awaiting_input"` the
   moment the terminal starts reading with echo off.
 - **One command per pane.** While one holds the pane, another `pane run` is

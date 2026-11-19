@@ -1448,3 +1448,59 @@ fn a_shell_without_a_line_editor_takes_the_line() {
         "{r}"
     );
 }
+
+/// `send-keys` from inside a pane never types into that same pane: keys, a
+/// password among them, meant for another pane must not land in the caller.
+#[test]
+fn send_keys_into_the_callers_own_pane_is_refused() {
+    let (env, _rc, pane) = integrated(&bash());
+    let mut cmd = env.shux();
+    cmd.env("SHUX_PANE_ID", &pane).args([
+        "--format",
+        "json",
+        "pane",
+        "send-keys",
+        "-s",
+        "ws",
+        "--text",
+        "own-pane-275",
+    ]);
+    let out = cmd.output().expect("spawn shux");
+    assert!(
+        !out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        said.contains("own_pane") || said.contains("the pane this command runs in"),
+        "{said}"
+    );
+    assert!(
+        !env.capture("ws", &pane).contains("own-pane-275"),
+        "the keys reached the caller's pane"
+    );
+}
+
+/// A timed-out result says, in the result itself, how to get the command's
+/// end: the exact wait for an OSC 133 command.
+#[test]
+fn a_timed_out_result_says_how_to_wait_for_its_end() {
+    let (env, _rc, pane) = integrated(&bash());
+    let (r, _) = pane_run(&env, &pane, "sleep 3", &["--timeout", "1"]);
+    assert_eq!(r["state"], "timed_out", "{r}");
+    let as_of = r["as_of"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("no as_of: {r}"));
+    let hint = r["hint"].as_str().unwrap_or_else(|| panic!("no hint: {r}"));
+    assert!(
+        hint.contains(&format!(
+            "pane wait-command {pane} --after {as_of} --output"
+        )),
+        "{hint}"
+    );
+}

@@ -169,6 +169,9 @@ pub struct CommandResult {
     /// password prompt.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hidden_input: bool,
+    /// For `timed_out`: how to get the pane back, as a command to run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
     /// For [`Boundaries::Osc133`]: the floor its line was typed above. Pass it
     /// to `pane.wait_command` as `after` to wait on for the command's own end
     /// once this result froze.
@@ -414,6 +417,13 @@ impl CommandEngine {
             ended_by: cmd.ended_by.map(str::to_string),
             hidden_input: cmd.hidden_input,
             phase: (state == CommandState::TimedOut).then(|| phase(cmd.begun).to_string()),
+            hint: (state == CommandState::TimedOut).then(|| match cmd.anchor {
+                Some(a) => format!(
+                    "the command keeps the pane until it ends: shux pane wait-command {pane} --after {} --output",
+                    a.floor
+                ),
+                None => format!("its program may still run: shux pane command-cancel {id} stops it"),
+            }),
             as_of: cmd.anchor.map(|a| a.floor),
         };
         cmd.result = Some(result.clone());
@@ -499,6 +509,7 @@ impl CommandEngine {
             boundaries: tracked.boundaries,
             ended_by: None,
             hidden_input: false,
+            hint: None,
             phase: Some(phase(tracked.begun).to_string()),
             as_of: tracked.anchor.map(|a| a.floor),
         }))
