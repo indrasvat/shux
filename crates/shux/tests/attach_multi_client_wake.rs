@@ -157,10 +157,9 @@ impl Client {
     /// Replays render frames into the client's screen until it shows `word`,
     /// the daemon hangs up, or [`BUDGET`] runs out.
     async fn draws(&mut self, word: &str) -> bool {
-        let deadline = tokio::time::Instant::now() + BUDGET;
+        let deadline = shux_testkit::Deadline::start();
         while find_cell(&self.vt, word).is_none() {
-            let Ok(Some(Ok(frame))) = tokio::time::timeout_at(deadline, self.framed.next()).await
-            else {
+            let Some(Some(Ok(frame))) = deadline.run(self.framed.next()).await else {
                 return false;
             };
             if let Ok(AttachServerFrame::Render { data, .. }) = serde_json::from_slice(&frame)

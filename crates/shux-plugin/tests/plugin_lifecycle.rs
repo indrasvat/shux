@@ -697,20 +697,15 @@ done
     let (ran_tx, ran_rx) = std::sync::mpsc::channel::<()>();
     // An OS thread, so neither the verdict nor the release needs the worker.
     let judge = std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + BUDGET;
         // A non-blocking writer opens only once the reader is blocked in
         // open(); holding it open without writing keeps the read blocked.
-        let writer = loop {
-            match std::fs::OpenOptions::new()
+        let writer = shux_testkit::wait_for("the plugin to read its state", || {
+            std::fs::OpenOptions::new()
                 .write(true)
                 .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits())
                 .open(&state)
-            {
-                Ok(w) => break w,
-                Err(_) if std::time::Instant::now() < deadline => std::thread::yield_now(),
-                Err(e) => panic!("the plugin never read its state: {e}"),
-            }
-        };
+                .ok()
+        });
         let _ = blocked_tx.send(());
         let free = ran_rx.recv_timeout(BUDGET).is_ok();
         drop(writer);

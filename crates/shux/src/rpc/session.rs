@@ -518,29 +518,33 @@ mod tests {
     ) {
         let held = h.io.lock().await;
         let mut call = Box::pin(h.router.dispatch(method, Some(params)));
-        let deadline = std::time::Instant::now() + shux_testkit::BUDGET;
-        while h.graph.snapshot().panes.contains_key(&pane) {
-            assert!(
-                tokio::time::timeout(std::time::Duration::ZERO, &mut call)
-                    .await
-                    .is_err(),
-                "{method} finished while its IO teardown was blocked"
-            );
-            assert!(
-                std::time::Instant::now() < deadline,
-                "{method} never changed the graph"
-            );
-            tokio::task::yield_now().await;
-        }
+        let deadline = shux_testkit::Deadline::start();
+        deadline
+            .run(async {
+                while h.graph.snapshot().panes.contains_key(&pane) {
+                    assert!(
+                        tokio::time::timeout(std::time::Duration::ZERO, &mut call)
+                            .await
+                            .is_err(),
+                        "{method} finished while its IO teardown was blocked"
+                    );
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap_or_else(|| panic!("{method} never changed the graph"));
         drop(call);
         drop(held);
-        while h.io.lock().await.vts.contains_key(&pane) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "{method} whose caller hung up left its pane's IO, and program, behind"
-            );
-            tokio::task::yield_now().await;
-        }
+        deadline
+            .run(async {
+                while h.io.lock().await.vts.contains_key(&pane) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap_or_else(|| {
+                panic!("{method} whose caller hung up left its pane's IO, and program, behind")
+            });
     }
 
     /// Dispatches `method` while the pane IO lock is held, so the handler
@@ -556,43 +560,47 @@ mod tests {
             h.graph.snapshot().panes.keys().copied().collect();
         let held = h.io.lock().await;
         let mut call = Box::pin(h.router.dispatch(method, Some(params)));
-        let deadline = std::time::Instant::now() + shux_testkit::BUDGET;
-        let added = loop {
-            let added: Vec<_> = h
-                .graph
-                .snapshot()
-                .panes
-                .keys()
-                .copied()
-                .filter(|p| !before.contains(p))
-                .collect();
-            if !added.is_empty() {
-                break added;
-            }
-            assert!(
-                tokio::time::timeout(std::time::Duration::ZERO, &mut call)
-                    .await
-                    .is_err(),
-                "{method} finished while its PTY start was blocked"
-            );
-            assert!(
-                std::time::Instant::now() < deadline,
-                "{method} never changed the graph"
-            );
-            tokio::task::yield_now().await;
-        };
+        let deadline = shux_testkit::Deadline::start();
+        let added = deadline
+            .run(async {
+                loop {
+                    let added: Vec<_> = h
+                        .graph
+                        .snapshot()
+                        .panes
+                        .keys()
+                        .copied()
+                        .filter(|p| !before.contains(p))
+                        .collect();
+                    if !added.is_empty() {
+                        break added;
+                    }
+                    assert!(
+                        tokio::time::timeout(std::time::Duration::ZERO, &mut call)
+                            .await
+                            .is_err(),
+                        "{method} finished while its PTY start was blocked"
+                    );
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap_or_else(|| panic!("{method} never changed the graph"));
         drop(call);
         drop(held);
         for pane in added {
-            while h.graph.snapshot().panes.contains_key(&pane)
-                && !h.io.lock().await.vts.contains_key(&pane)
-            {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "{method} whose caller hung up left a pane in the graph with no PTY"
-                );
-                tokio::task::yield_now().await;
-            }
+            deadline
+                .run(async {
+                    while h.graph.snapshot().panes.contains_key(&pane)
+                        && !h.io.lock().await.vts.contains_key(&pane)
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap_or_else(|| {
+                    panic!("{method} whose caller hung up left a pane in the graph with no PTY")
+                });
         }
     }
 

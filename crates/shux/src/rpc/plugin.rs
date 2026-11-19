@@ -248,28 +248,30 @@ done
 
         let mut call =
             Box::pin(router.dispatch("plugin.reload", Some(serde_json::json!({"name": "noop"}))));
-        let deadline = std::time::Instant::now() + shux_testkit::BUDGET;
-        while listed(manager.clone()).await {
-            assert!(
-                tokio::time::timeout(std::time::Duration::ZERO, &mut call)
-                    .await
-                    .is_err(),
-                "the reload finished before it stopped the plugin"
-            );
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the reload never stopped the plugin"
-            );
-            tokio::task::yield_now().await;
-        }
+        let deadline = shux_testkit::Deadline::start();
+        deadline
+            .run(async {
+                while listed(manager.clone()).await {
+                    assert!(
+                        tokio::time::timeout(std::time::Duration::ZERO, &mut call)
+                            .await
+                            .is_err(),
+                        "the reload finished before it stopped the plugin"
+                    );
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the reload never stopped the plugin");
         drop(call);
-        while !listed(manager.clone()).await {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "a reload whose caller hung up left the plugin stopped"
-            );
-            tokio::task::yield_now().await;
-        }
+        deadline
+            .run(async {
+                while !listed(manager.clone()).await {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("a reload whose caller hung up left the plugin stopped");
         manager.kill("noop").await.expect("kill");
     }
 

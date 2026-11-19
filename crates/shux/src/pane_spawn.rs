@@ -2273,10 +2273,10 @@ mod tests {
         .await
         .unwrap();
         let mut seen = Vec::new();
-        let deadline = tokio::time::Instant::now() + shux_testkit::BUDGET;
+        let deadline = shux_testkit::Deadline::start();
         while !String::from_utf8_lossy(&seen).contains("LAST") {
-            match tokio::time::timeout_at(deadline, sub.recv()).await {
-                Ok(Some(shux_core::bus::PaneOutputSubscriptionEvent::Chunk(c)))
+            match deadline.run(sub.recv()).await {
+                Some(Some(shux_core::bus::PaneOutputSubscriptionEvent::Chunk(c)))
                     if c.pane_id == pane =>
                 {
                     seen.extend(
@@ -2285,8 +2285,8 @@ mod tests {
                             .unwrap(),
                     );
                 }
-                Ok(Some(_)) => {}
-                Ok(None) | Err(_) => break,
+                Some(Some(_)) => {}
+                Some(None) | None => break,
             }
         }
         h.stop().await;

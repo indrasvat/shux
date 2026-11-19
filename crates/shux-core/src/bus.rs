@@ -424,6 +424,21 @@ impl Subscription {
         }
     }
 
+    /// The next already-published event matching the filters, without waiting.
+    /// `None` when none is queued or the bus is shut down.
+    pub fn try_recv(&mut self) -> Option<SubscriptionEvent> {
+        loop {
+            match self.receiver.try_recv() {
+                Ok(event) if self.matches(&event) => return Some(SubscriptionEvent::Event(event)),
+                Ok(_) => continue,
+                Err(broadcast::error::TryRecvError::Lagged(count)) => {
+                    return Some(SubscriptionEvent::Lagged(count));
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+
     /// Check if an event matches this subscription's filters.
     fn matches(&self, event: &Event) -> bool {
         if self.filters.is_empty() {

@@ -160,8 +160,7 @@ fn a_second_command_is_refused_while_the_first_runs_then_accepted() {
 
     std::fs::write(&gate, "go\n").expect("open the gate");
     let params = serde_json::json!({ "command_id": first_id }).to_string();
-    let deadline = std::time::Instant::now() + shux_testkit::BUDGET;
-    let first = loop {
+    let first = shux_testkit::wait_for("the first command to finish", || {
         let out = env
             .shux()
             .args([
@@ -177,15 +176,8 @@ fn a_second_command_is_refused_while_the_first_runs_then_accepted() {
             .expect("spawn shux");
         let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
         let r = v.get("result").cloned().unwrap_or(v);
-        if r["state"] != "running" {
-            break r;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the first command never finished"
-        );
-        std::thread::yield_now();
-    };
+        (r["state"] != "running").then_some(r)
+    });
     assert_eq!(
         first["stdout"], "first\n",
         "the first command's output was polluted: {first}"

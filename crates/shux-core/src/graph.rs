@@ -4852,16 +4852,8 @@ mod tests {
             .split_pane(pane_in_w2, Direction::Vertical, 0.5)
             .unwrap();
 
-        // Drain subscription for setup events; we only care about teardown
-        // and rename below.
-        for _ in 0..16 {
-            if tokio::time::timeout(std::time::Duration::from_millis(20), sub.recv())
-                .await
-                .is_err()
-            {
-                break;
-            }
-        }
+        // Graph events publish before the mutation returns: drain setup.
+        while sub.try_recv().is_some() {}
 
         // 1. rename_window must fire WindowRenamed.
         graph.rename_window(w2, "scratch".into(), None).unwrap();
@@ -4876,13 +4868,8 @@ mod tests {
 
         // Drain the rest.
         let mut after = Vec::new();
-        for _ in 0..32 {
-            match tokio::time::timeout(std::time::Duration::from_millis(50), sub.recv()).await {
-                Ok(Some(crate::bus::SubscriptionEvent::Event(e))) => {
-                    after.push(e.meta.event_type.clone());
-                }
-                _ => break,
-            }
+        while let Some(crate::bus::SubscriptionEvent::Event(e)) = sub.try_recv() {
+            after.push(e.meta.event_type.clone());
         }
 
         // WindowRenamed for the rename_window call.
@@ -5705,14 +5692,7 @@ mod tests {
 
         // Drain the SessionCreated / WindowCreated / PaneCreated events
         // so we only see what set_pane_title fires.
-        for _ in 0..5 {
-            if tokio::time::timeout(Duration::from_millis(20), sub.recv())
-                .await
-                .is_err()
-            {
-                break;
-            }
-        }
+        while sub.try_recv().is_some() {}
 
         graph
             .set_pane_title(pid, Some("agent-1".into()), None)
@@ -5796,7 +5776,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_set_pane_osc_title_skips_event_when_no_visible_change() {
-        use std::time::Duration;
         let bus = crate::bus::EventBus::new();
         let mut sub = bus.subscribe();
         let (graph, state) = SessionGraph::new_with_event_bus(Some(bus));
@@ -5807,21 +5786,14 @@ mod tests {
         graph
             .set_pane_title(pid, Some("locked".into()), None)
             .unwrap();
-        // Drain everything fired so far.
-        for _ in 0..10 {
-            if tokio::time::timeout(Duration::from_millis(10), sub.recv())
-                .await
-                .is_err()
-            {
-                break;
-            }
-        }
+        while sub.try_recv().is_some() {}
+        // Graph events publish before the mutation returns, so anything
+        // set_pane_osc_title fired is already queued.
         graph.set_pane_osc_title(pid, "irrelevant".into()).unwrap();
-        // No new event within a short window.
-        let nothing = tokio::time::timeout(Duration::from_millis(50), sub.recv()).await;
+        let fired = sub.try_recv();
         assert!(
-            nothing.is_err(),
-            "no PaneTitleChanged event should fire when title is pinned",
+            fired.is_none(),
+            "no PaneTitleChanged event should fire when title is pinned; got {fired:?}",
         );
     }
 
@@ -5982,14 +5954,7 @@ mod tests {
 
         // Drain pre-existing events from the create_session call so the assert
         // below cleanly checks "no apply events".
-        for _ in 0..5 {
-            if tokio::time::timeout(std::time::Duration::from_millis(20), sub.recv())
-                .await
-                .is_err()
-            {
-                break;
-            }
-        }
+        while sub.try_recv().is_some() {}
 
         let snap_before = state.load_full();
         let sessions_before = snap_before.sessions.len();
@@ -6026,14 +5991,11 @@ mod tests {
         );
         assert!(snap_after.find_session_by_name("workspace-a").is_none());
 
-        // No events fired on failure (post-drain).
-        let no_events_during_apply =
-            tokio::time::timeout(std::time::Duration::from_millis(100), sub.recv())
-                .await
-                .is_err();
+        // apply_batch publishes before it returns: anything fired is queued.
+        let fired = sub.try_recv();
         assert!(
-            no_events_during_apply,
-            "no apply events should fire when batch fails"
+            fired.is_none(),
+            "no apply events should fire when batch fails; got {fired:?}"
         );
     }
 

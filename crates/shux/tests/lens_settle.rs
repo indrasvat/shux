@@ -100,8 +100,9 @@ fn s3_settle_timeout() {
             serde_json::Value::Bool(false),
             "S3: must NOT settle while flipping"
         );
-        // The monotonic clock orders this bound; load only adds to it.
         let waited = settled["waited_ms"].as_u64().expect("waited_ms");
+        // why: a lower bound the monotonic clock orders; load only adds to it
+        // ast-grep-ignore: test-wall-clock-assert
         assert!(
             waited >= S3_WAIT_MS,
             "S3: timed out after {waited}ms, before the {S3_WAIT_MS}ms timeout"
@@ -205,6 +206,8 @@ fn s4_already_still_returns_immediately() {
     let s2 = env2.expect_result("S4 wait_settled #2");
     assert_eq!(s2["settled"], serde_json::Value::Bool(true));
     let waited = s2["waited_ms"].as_u64().expect("waited_ms");
+    // why: an honest answer waits ~0ms, so only a 2s stall inside one RPC can fail this
+    // ast-grep-ignore: test-wall-clock-assert
     assert!(
         waited < quiet_ms,
         "S4: already-still must not wait out a fresh {quiet_ms}ms quiet window, waited {waited}"

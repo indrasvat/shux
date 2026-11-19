@@ -4578,14 +4578,14 @@ mod tests {
         ));
 
         let mut screen = shux_vt::VirtualTerminal::new(40, 100);
-        let deadline = tokio::time::Instant::now() + shux_testkit::BUDGET;
+        let deadline = shux_testkit::Deadline::start();
         while !screen.capture_text(None).contains("keybindings") {
-            match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(AttachServerFrame::Render { data, .. })) => {
+            match deadline.run(rx.recv()).await {
+                Some(Some(AttachServerFrame::Render { data, .. })) => {
                     screen.process(&BASE64.decode(data).expect("render base64"));
                 }
-                Ok(Some(_)) => {}
-                Ok(None) | Err(_) => panic!("the help sheet was never drawn"),
+                Some(Some(_)) => {}
+                Some(None) | None => panic!("the help sheet was never drawn"),
             }
         }
 
@@ -4616,16 +4616,16 @@ mod tests {
 
         let mut idle_frames = 0;
         let drew = loop {
-            match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(AttachServerFrame::Render { data, .. })) => {
+            match deadline.run(rx.recv()).await {
+                Some(Some(AttachServerFrame::Render { data, .. })) => {
                     screen.process(&BASE64.decode(data).expect("render base64"));
                     if screen.capture_text(None).contains("MARK") {
                         break true;
                     }
                     idle_frames += 1;
                 }
-                Ok(Some(_)) => {}
-                Ok(None) | Err(_) => break false,
+                Some(Some(_)) => {}
+                Some(None) | None => break false,
             }
         };
         assert!(drew, "the change after the idle frame was never drawn");
@@ -4693,17 +4693,17 @@ mod tests {
         drop(held);
 
         let mut screen = shux_vt::VirtualTerminal::new(24, 100);
-        let deadline = tokio::time::Instant::now() + shux_testkit::BUDGET;
+        let deadline = shux_testkit::Deadline::start();
         let drew = loop {
             if screen.capture_text(None).contains("MARK") {
                 break true;
             }
-            match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(AttachServerFrame::Render { data, .. })) => {
+            match deadline.run(rx.recv()).await {
+                Some(Some(AttachServerFrame::Render { data, .. })) => {
                     screen.process(&BASE64.decode(data).expect("render base64"));
                 }
-                Ok(Some(_)) => {}
-                Ok(None) | Err(_) => break false,
+                Some(Some(_)) => {}
+                Some(None) | None => break false,
             }
         };
         assert!(drew, "a bump that landed mid-frame was never drawn");
@@ -8558,10 +8558,8 @@ mod tests {
             &mut self,
             mut pred: impl FnMut(&AttachServerFrame, &str) -> bool,
         ) -> bool {
-            let deadline = tokio::time::Instant::now() + shux_testkit::BUDGET;
-            while let Ok(Some(Ok(buf))) =
-                tokio::time::timeout_at(deadline, self.framed.next()).await
-            {
+            let deadline = shux_testkit::Deadline::start();
+            while let Some(Some(Ok(buf))) = deadline.run(self.framed.next()).await {
                 let frame: AttachServerFrame = serde_json::from_slice(&buf).expect("server frame");
                 if let AttachServerFrame::Render { data, frame } = &frame {
                     let bytes = BASE64.decode(data.as_bytes()).expect("render base64");
@@ -8589,10 +8587,8 @@ mod tests {
         /// numbered one shows `needle`: a client that has not caught up yet,
         /// whose screen and mouse-event stamp stay where they were.
         async fn receive_unapplied(&mut self, needle: &str) {
-            let deadline = tokio::time::Instant::now() + shux_testkit::BUDGET;
-            while let Ok(Some(Ok(buf))) =
-                tokio::time::timeout_at(deadline, self.framed.next()).await
-            {
+            let deadline = shux_testkit::Deadline::start();
+            while let Some(Some(Ok(buf))) = deadline.run(self.framed.next()).await {
                 let frame: AttachServerFrame = serde_json::from_slice(&buf).expect("server frame");
                 let AttachServerFrame::Render { data, frame } = frame else {
                     continue;

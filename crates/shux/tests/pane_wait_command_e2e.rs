@@ -828,11 +828,12 @@ fn zsh_a_parse_error_is_not_run() {
 /// and `wait-command --after <as_of>` still gets it.
 #[test]
 fn a_timed_out_run_can_be_waited_on_to_its_end() {
-    let (env, _rc, pane) = integrated(&bash());
+    let (env, rc, pane) = integrated(&bash());
+    let gate = shux_testkit::gate(rc.path(), "late");
     let (r, code) = pane_run(
         &env,
         &pane,
-        "echo early; sleep 3; echo late",
+        &format!("echo early; read -r _ < {}; echo late", gate.display()),
         &["--timeout", "1"],
     );
     assert_eq!(
@@ -847,6 +848,7 @@ fn a_timed_out_run_can_be_waited_on_to_its_end() {
     let after = r["as_of"]
         .as_u64()
         .unwrap_or_else(|| panic!("no as_of: {r}"));
+    shux_testkit::open_gate(&gate);
     let r = result(
         &wait(&env, &pane, after, "20s")
             .arg("--output")

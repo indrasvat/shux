@@ -885,20 +885,23 @@ mod tests {
         .await;
         // Asked again at once until it matches: the first match lands as soon as
         // the terminal has the record, before the graph's paced publication.
-        let deadline = std::time::Instant::now() + shux_testkit::BUDGET;
-        let waited = loop {
-            let w = dispatch_ok(
-                &h.router,
-                "pane.wait_status",
-                json!({"pane_id": pane.to_string(), "state": "error", "id": "a", "timeout_ms": 0}),
-            )
-            .await;
-            if w["outcome"] == "matched" {
-                break w;
-            }
-            assert!(std::time::Instant::now() < deadline, "never matched: {w}");
-            tokio::task::yield_now().await;
-        };
+        let waited = shux_testkit::Deadline::start()
+            .run(async {
+                loop {
+                    let w = dispatch_ok(
+                        &h.router,
+                        "pane.wait_status",
+                        json!({"pane_id": pane.to_string(), "state": "error", "id": "a", "timeout_ms": 0}),
+                    )
+                    .await;
+                    if w["outcome"] == "matched" {
+                        break w;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("never matched");
         assert_eq!(waited["summary"]["state"], "error", "{waited}");
         finish(h).await;
     }

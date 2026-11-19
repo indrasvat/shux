@@ -111,6 +111,8 @@ fn g1_glance_atomicity_under_concurrent_flips() {
         // The pump returns true iff it stopped because the done-flag was set;
         // stopping at the deadline means late glances raced a quiet pane.
         let pump = scope.spawn(|| {
+            // why: bounds a pump whose sibling panicked; success is the done-flag, never the clock
+            // ast-grep-ignore: test-wall-clock
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
             loop {
                 if done.load(Ordering::Relaxed) {

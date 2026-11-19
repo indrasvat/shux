@@ -517,9 +517,10 @@ async fn headless_attach(
         "attach denied"
     );
     let mut seen = Vec::new();
-    let deadline = tokio::time::Instant::now() + BUDGET;
+    let deadline = shux_testkit::Deadline::start();
     while !drew_every_probe(&seen) {
-        let frame = tokio::time::timeout_at(deadline, framed.next())
+        let frame = deadline
+            .run(framed.next())
             .await
             .expect("pane never drawn")
             .expect("daemon hung up before drawing the pane")
@@ -537,11 +538,9 @@ async fn assert_hung_up_after(
     framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
     is_last: fn(&AttachServerFrame) -> bool,
 ) {
-    let deadline = tokio::time::Instant::now() + BUDGET;
+    let deadline = shux_testkit::Deadline::start();
     loop {
-        let frame = tokio::time::timeout_at(deadline, framed.next())
-            .await
-            .expect("no final frame");
+        let frame = deadline.run(framed.next()).await.expect("no final frame");
         let parsed: AttachServerFrame =
             serde_json::from_slice(&frame.expect("closed before the final frame").unwrap())
                 .expect("parse frame");
@@ -673,9 +672,10 @@ async fn a_resize_during_the_handshake_reaches_the_daemon() {
         .await
         .expect("send ready");
 
-    let deadline = tokio::time::Instant::now() + BUDGET;
+    let deadline = shux_testkit::Deadline::start();
     loop {
-        let frame = tokio::time::timeout_at(deadline, framed.next())
+        let frame = deadline
+            .run(framed.next())
             .await
             .expect("the client never reported the size it was resized to")
             .expect("the client hung up")
@@ -699,7 +699,8 @@ async fn a_resize_during_the_handshake_reaches_the_daemon() {
         assert_eq!(rc, 0, "TIOCSWINSZ: {}", std::io::Error::last_os_error());
     }
     loop {
-        let frame = tokio::time::timeout_at(deadline, framed.next())
+        let frame = deadline
+            .run(framed.next())
             .await
             .expect("the client never reported its final size")
             .expect("the client hung up")

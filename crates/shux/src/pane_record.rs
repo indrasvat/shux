@@ -1624,7 +1624,8 @@ mod tests {
         admitted
             .send_bytes(b"boom".to_vec(), Instant::now(), &CancellationToken::new())
             .await;
-        // Bounded: on a correct registry nothing is final while the lock is held.
+        // why: caps how long a wrong finalisation is hunted; load shortens the hunt, never fails it
+        // ast-grep-ignore: test-wall-clock-unit
         let deadline = Instant::now() + Duration::from_secs(2);
         while !outcome.borrow().finalized && Instant::now() < deadline {
             std::thread::yield_now();
