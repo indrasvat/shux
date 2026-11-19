@@ -775,9 +775,11 @@ fn pane_run_refuses_a_program_in_front_of_a_shell_without_integration() {
     let pane = start(&env, &rc, &bash(), false);
     type_line(&env, "printf 'sleep''ing-275\\n'; sleep 30");
     env.wait_for("ws", &pane, "sleeping-275");
-    let (r, code) = pane_run(&env, &pane, "echo leaked-275", &[]);
+    // Without marks a program in front is waited out, up to the timeout.
+    let (r, code) = pane_run(&env, &pane, "echo leaked-275", &["--timeout", "2"]);
     assert_eq!(code, Some(3), "{r}");
     assert_eq!(r["error"]["data"]["reason"], "other_program", "{r}");
+    assert!(!env.capture("ws", &pane).contains("leaked-275"));
     // `markers` types into whatever holds the pane, as asked.
     let (r, _) = pane_run(
         &env,

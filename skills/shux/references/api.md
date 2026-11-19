@@ -339,8 +339,9 @@ the line prints a `SHUX_BEGIN…`/`SHUX_MARKER…` pair around the command, and
 Before any framing but `markers`, the pane's terminal is asked who reads its
 input (the foreground process group, and termios): another program in front
 is refused as `other_program` unless it is a shell (one started from the
-pane's, at its own prompt), and waited out while the marks say the prompt is
-being drawn (prompt hooks); a line read with echo off is `hidden_input`; the
+pane's, at its own prompt). It is waited out, up to `timeout`, while the marks say the prompt is
+being drawn (prompt hooks) or the shell reports no marks (the last run's own
+`(exit N)` may still hold the terminal); a line read with echo off is `hidden_input`; the
 alternate screen is `full_screen`. At the prompt mark the terminal must be in
 raw mode, as readline, zle and ble.sh leave it while they read: in line mode a
 hook, or a line the shell accepted, runs, and it waits, then refuses

@@ -95,8 +95,9 @@ pub(crate) fn choose(wanted: Wanted, front: &Front, multiline: bool) -> Choice {
         );
     }
     if let Some(refusal) = refusal(front) {
-        // A prompt hook runs its programs after the prompt mark: wait them out.
-        let hook = front.shell == AtPrompt && refusal == Refusal::OtherProgram;
+        // A prompt hook runs its programs after the prompt mark, and a silent
+        // shell may still be running the last run's `(exit N)`: wait them out.
+        let hook = matches!(front.shell, AtPrompt | Unknown) && refusal == Refusal::OtherProgram;
         return if hook {
             Choice::Await(refusal)
         } else {
@@ -332,6 +333,15 @@ mod tests {
         assert_eq!(
             choose(Wanted::Auto, &python, false),
             Choice::Refuse(Refusal::NotAShell)
+        );
+        // The last run's own `(exit N)` may still hold a silent shell's
+        // terminal: wait it out, as at a prompt.
+        let mut busy = front(Unknown);
+        busy.program = fg(false, false);
+        busy.foreground_is_shell = false;
+        assert_eq!(
+            choose(Wanted::Auto, &busy, false),
+            Choice::Await(Refusal::OtherProgram)
         );
         assert!(runs_a_shell(&[]));
         assert!(runs_a_shell(&["/bin/bash".into(), "-l".into()]));
