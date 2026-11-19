@@ -21,7 +21,7 @@ use crate::daemon::{self, DaemonError};
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The git SHA of this binary, baked in at compile time.
-const CLIENT_GIT_SHA: &str = env!("SHUX_GIT_SHA");
+const CLIENT_GIT_SHA: &str = shux_rpc::GIT_SHA;
 
 /// How long the client waits for the daemon it started to accept connections.
 struct ConnectBudget {

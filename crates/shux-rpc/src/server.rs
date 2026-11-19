@@ -765,7 +765,7 @@ pub fn register_builtin_methods(
             |_params: Option<serde_json::Value>| async {
                 Ok(serde_json::json!({
                     "version": env!("CARGO_PKG_VERSION"),
-                    "git_sha": env!("SHUX_GIT_SHA"),
+                    "git_sha": crate::GIT_SHA,
                     "name": "shux",
                 }))
             },

@@ -63,7 +63,7 @@ pub async fn handle_version(
 ) -> anyhow::Result<()> {
     use crate::client::DaemonAnswer;
 
-    let cli = (env!("CARGO_PKG_VERSION"), env!("SHUX_GIT_SHA"));
+    let cli = (env!("CARGO_PKG_VERSION"), shux_rpc::GIT_SHA);
     // `daemon`: `None` when no daemon serves the socket, `Err` when one is
     // there but did not say which build. `mismatch`: whether it is not this
     // build, as far as it said.
