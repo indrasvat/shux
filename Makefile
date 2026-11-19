@@ -760,7 +760,7 @@ fmt: ## Format all code
 	@echo "$(COLOR_GREEN)✓ Formatting complete$(COLOR_RESET)"
 
 .PHONY: check-after-hygiene
-check-after-hygiene: lint shellcheck check-test-sleeps check-darwin test check-test-groups check-test-opt-out check-test-inventory check-ci-parity test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-lens-frozen check-no-bin-mods check-action-pins check-vt-corpus-scratch
+check-after-hygiene: lint shellcheck check-test-sleeps check-darwin test check-build-rerun check-test-groups check-test-opt-out check-test-inventory check-ci-parity test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-lens-frozen check-no-bin-mods check-action-pins check-vt-corpus-scratch
 
 .PHONY: check
 check: hooks-check check-target-hygiene ## Run lint + test + process/QA guards (what pre-commit runs)
@@ -816,6 +816,18 @@ check-vt-qa: ## Require SOLID QA evidence from any diff that touches VT renderin
 	@bash scripts/check-vt-qa-selftest.sh
 	@bash scripts/check-vt-qa.sh
 	@bash scripts/check-vt-fixtures.sh
+
+.PHONY: check-vt-qa-pregate
+check-vt-qa-pregate: ## Run the VT QA evidence + governance checks that need no gate report (before a gate agent starts)
+	@VT_QA_STAGE=pregate bash scripts/check-vt-qa.sh
+
+.PHONY: check-build-rerun
+check-build-rerun: ## A build with nothing changed compiles nothing (build-script rerun paths are stable, worktrees included)
+	@bash scripts/check-build-rerun.sh
+
+.PHONY: vt-neutrality
+vt-neutrality: ## Prove a diff moves no VT cell/pixel: BASE=<merge-base sha> [SCOPE=<qa scope>] (corpus, live rich-TUI A/B, colour probe, fuzz, leaks)
+	@BASE="$(BASE)" SCOPE="$(SCOPE)" .shux/scripts/no_leak_guard.sh bash scripts/vt-neutrality.sh
 
 .PHONY: check-test-sleeps
 check-test-sleeps: ## No raw sleeps in crates/*/tests, no waivers of the sleep ban (the hook's check; clippy covers the rest)
