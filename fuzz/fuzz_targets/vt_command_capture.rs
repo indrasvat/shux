@@ -1,10 +1,17 @@
-//! A command's boundaries, its exit code and the output kept for it do not
-//! depend on how the pane's output was cut into reads.
+//! A command's boundaries, its exit code, the output kept for it and what
+//! the screen showed for each line the shell read do not depend on how the
+//! pane's output was cut into reads.
 #![no_main]
 use libfuzzer_sys::fuzz_target;
 use shux_vt::{CommandLookup, VirtualTerminal};
 
-type Observed = (&'static str, u64, Vec<(Option<i32>, &'static str, Option<(Vec<u8>, bool)>)>, Option<Vec<u8>>);
+type Observed = (
+    &'static str,
+    u64,
+    Vec<(Option<i32>, &'static str, Option<(Vec<u8>, bool)>)>,
+    Option<Vec<u8>>,
+    Option<Vec<String>>,
+);
 
 fn drive(chunks: &[&[u8]]) -> Observed {
     let mut vt = VirtualTerminal::new(8, 30);
@@ -23,7 +30,14 @@ fn drive(chunks: &[&[u8]]) -> Observed {
         ended.push((c.exit_code, c.ended_by.as_str(), out));
     }
     let running = vt.running_command_output(floor).map(|o| o.bytes.to_vec());
-    (vt.shell_state().as_str(), vt.prompts_seen(), ended, running)
+    // What the screen shows for malformed UTF-8 depends on where vte's reads
+    // were cut; a typed command is always well-formed.
+    let submitted = std::str::from_utf8(chunks.concat().as_slice())
+        .is_ok()
+        .then(|| vt.submitted_after(floor))
+        .flatten()
+        .map(|lines| lines.iter().map(|s| format!("{s:?}")).collect());
+    (vt.shell_state().as_str(), vt.prompts_seen(), ended, running, submitted)
 }
 
 fuzz_target!(|input: (u16, u16, &[u8])| {

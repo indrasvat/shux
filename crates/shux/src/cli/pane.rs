@@ -905,7 +905,11 @@ pub async fn handle_pane_run(
     boundaries: super::args::RunBoundaries,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
-    let (session_id, window_id) = resolve_pane_window_id(stream, session_name, window_spec).await?;
+    let (session_id, window_id) = super::program_status::or_exit(
+        resolve_pane_window_id(stream, session_name, window_spec).await,
+        "pane run",
+        format,
+    )?;
 
     let mut params = serde_json::json!({
         "session_id": session_id,

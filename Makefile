@@ -863,6 +863,10 @@ fuzz-pane-record: ## Recording lifecycle: overlapping starts, stops, faults, shu
 fuzz-pane-mouse: ## Mouse-to-grid-cell mapping against the live compositor (FUZZ_SECONDS)
 	@bash scripts/fuzz.sh $(FUZZ_SECONDS) pane_grid_cell
 
+.PHONY: fuzz-command-capture
+fuzz-command-capture: ## OSC 133 command capture: boundaries, output, screen record vs chunking (FUZZ_SECONDS)
+	@bash scripts/fuzz.sh $(FUZZ_SECONDS) vt_command_capture
+
 .PHONY: fuzz-program-status
 fuzz-program-status: ## OSC 7501 libFuzzer targets in fuzz/ (FUZZ_SECONDS each)
 	@bash scripts/fuzz.sh $(FUZZ_SECONDS) $(FUZZ_PROGRAM_STATUS)

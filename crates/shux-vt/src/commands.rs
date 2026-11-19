@@ -125,6 +125,34 @@ impl Captured {
     }
 }
 
+/// The `n`th command to start above a floor, counting from 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NthCommand {
+    Ended(CommandRecord),
+    /// It has started and not ended.
+    Running,
+    /// Not started yet.
+    Pending,
+    /// The commands after the floor include one no longer kept.
+    Overrun,
+}
+
+/// A line the shell read at its prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Submitted<'a> {
+    /// It started the `n`th command (from 0) above the floor; `line` is what
+    /// the screen showed from the prompt to the start.
+    Command { n: usize, line: &'a [String] },
+    /// The shell drew its next prompt without starting a command: `rows` is
+    /// what the screen showed from the prompt to the next one, the shell's
+    /// reply included.
+    Rejected { rows: &'a [String] },
+}
+
+/// Wire bytes kept from the end of the open command's output, for finding
+/// the line editor's end-of-line mark however much output was dropped.
+const TAIL_KEEP: usize = 16 << 10;
+
 #[derive(Debug, Default)]
 pub(crate) struct CommandBoundaries {
     /// The start stamp of the command running now.
@@ -132,15 +160,31 @@ pub(crate) struct CommandBoundaries {
     open_output: Captured,
     /// Bytes the open command has seen, kept or not.
     open_wire: usize,
+    /// The last of them, up to [`TAIL_KEEP`] (and up to twice that between
+    /// trims).
+    open_tail: Vec<u8>,
     ended: VecDeque<CommandRecord>,
     /// Ended commands' output by start stamp, oldest first.
     outputs: VecDeque<(u64, Captured)>,
     kept_bytes: usize,
     /// The start stamp of the newest record dropped from `ended`.
     dropped_through: u64,
+    /// The stamp of the newest input dropped from `rejected`.
+    rejected_through: u64,
     state: ShellState,
     /// A line typed into the shell and not yet started.
     line: Line,
+    /// Keys sent to the prompt since it was drawn that submitted nothing:
+    /// the line editor may hold text, or be in another mode.
+    edited: bool,
+    /// Such keys sent before the prompt was drawn.
+    edited_before_prompt: bool,
+    /// What the screen showed for each command's line, by start stamp,
+    /// kept as long as its record.
+    lines: VecDeque<(u64, Vec<String>)>,
+    /// Inputs the shell drew a new prompt after without starting a command,
+    /// by the stamp of that prompt.
+    rejected: VecDeque<(u64, Vec<String>)>,
     /// Prompts (`A`) seen.
     prompts: u64,
     /// Boundaries that changed the state; moves on every C, D and A that counts.
@@ -148,32 +192,39 @@ pub(crate) struct CommandBoundaries {
 }
 
 impl CommandBoundaries {
-    /// `seq_len` on each mark: the wire length of the sequence itself, which
-    /// a command it ends did not write.
-    pub(crate) fn on_start(&mut self, seq_len: usize) {
-        self.close(None, EndedBy::NextCommand, seq_len);
-        self.open = Some(next_generation());
+    /// `seq_len`: the wire length of the mark itself, which a command it ends
+    /// did not write. `cols`: the terminal's width, which pins the line
+    /// editor's end-of-line mark.
+    /// `line`: what the screen showed from the prompt to this start.
+    pub(crate) fn on_start(&mut self, seq_len: usize, cols: usize, line: Vec<String>) {
+        self.close(None, EndedBy::NextCommand, seq_len, cols);
+        let started = next_generation();
+        self.open = Some(started);
+        self.lines.push_back((started, line));
         self.state = ShellState::Running;
         self.line = Line::None;
+        self.edited = false;
+        self.edited_before_prompt = false;
         self.marks += 1;
     }
 
     /// A `D` with no command running (Enter at an empty prompt) is ignored.
-    pub(crate) fn on_end(&mut self, exit_code: Option<i32>, seq_len: usize) {
+    pub(crate) fn on_end(&mut self, exit_code: Option<i32>, seq_len: usize, cols: usize) {
         if self.open.is_some() {
-            self.close(exit_code, EndedBy::End, seq_len);
+            self.close(exit_code, EndedBy::End, seq_len, cols);
             self.state = ShellState::Between;
             self.marks += 1;
         }
     }
 
-    pub(crate) fn on_prompt(&mut self, seq_len: usize) {
-        self.close(None, EndedBy::Prompt, seq_len);
+    pub(crate) fn on_prompt(&mut self, seq_len: usize, cols: usize) {
+        self.close(None, EndedBy::Prompt, seq_len, cols);
         self.state = ShellState::AtPrompt;
         self.line = match self.line {
             Line::BeforePrompt => Line::AtPrompt,
             _ => Line::None,
         };
+        self.edited = std::mem::take(&mut self.edited_before_prompt);
         self.prompts += 1;
         self.marks += 1;
     }
@@ -182,12 +233,58 @@ impl CommandBoundaries {
         self.state
     }
 
-    /// A line was submitted (a CR or LF outside a bracketed paste). While a
-    /// command runs it is that program's input, so nothing is noted.
-    pub(crate) fn on_line_submitted(&mut self) {
+    /// The prompt is being redrawn with no command started since the last
+    /// one: what the screen showed in between was rejected or abandoned.
+    pub(crate) fn on_input_rejected(&mut self, rows: Vec<String>) {
+        if rows.is_empty() {
+            return;
+        }
+        self.rejected.push_back((next_generation(), rows));
+        while self.rejected.len() > KEEP_ENDED {
+            if let Some((stamp, _)) = self.rejected.pop_front() {
+                self.rejected_through = stamp;
+            }
+        }
+    }
+
+    pub(crate) fn submitted_after(&self, floor: u64) -> Option<Vec<Submitted<'_>>> {
+        if floor < self.dropped_through || floor < self.rejected_through {
+            return None;
+        }
+        let commands = self
+            .lines
+            .iter()
+            .filter(|(started, _)| *started > floor)
+            .enumerate()
+            .map(|(n, (started, line))| (*started, Submitted::Command { n, line }));
+        let rejected = self
+            .rejected
+            .iter()
+            .filter(|(stamp, _)| *stamp > floor)
+            .map(|(stamp, rows)| (*stamp, Submitted::Rejected { rows }));
+        let mut all: Vec<_> = commands.chain(rejected).collect();
+        all.sort_by_key(|(stamp, _)| *stamp);
+        Some(all.into_iter().map(|(_, s)| s).collect())
+    }
+
+    /// Input sent to the pane: whether it submitted a line (a CR or LF
+    /// outside a bracketed paste), and whether keys that submitted nothing
+    /// came after the last submission. While a command runs, input is that
+    /// program's, so nothing is noted.
+    pub(crate) fn on_input(&mut self, submits: bool, edits: bool) {
         match self.state {
-            ShellState::AtPrompt => self.line = Line::AtPrompt,
-            ShellState::Between => self.line = Line::BeforePrompt,
+            ShellState::AtPrompt => {
+                if submits {
+                    self.line = Line::AtPrompt;
+                }
+                self.edited = edits || (self.edited && !submits);
+            }
+            ShellState::Between => {
+                if submits {
+                    self.line = Line::BeforePrompt;
+                }
+                self.edited_before_prompt = edits || (self.edited_before_prompt && !submits);
+            }
             ShellState::Unknown | ShellState::Running => {}
         }
     }
@@ -195,6 +292,11 @@ impl CommandBoundaries {
     /// The shell is at its prompt with a submitted line it has not started.
     pub(crate) fn line_pending(&self) -> bool {
         self.line == Line::AtPrompt && self.state == ShellState::AtPrompt
+    }
+
+    /// Keys were sent to the prompt since it was drawn and submitted nothing.
+    pub(crate) fn input_present(&self) -> bool {
+        self.edited && self.state == ShellState::AtPrompt
     }
 
     pub(crate) fn prompts(&self) -> u64 {
@@ -215,14 +317,23 @@ impl CommandBoundaries {
         let room = OUTPUT_LIMIT.saturating_sub(out.bytes.len());
         out.bytes.extend_from_slice(&bytes[..bytes.len().min(room)]);
         out.truncated = self.open_wire > OUTPUT_LIMIT;
+        self.open_tail.extend_from_slice(bytes);
+        if self.open_tail.len() > 2 * TAIL_KEEP {
+            self.open_tail.drain(..self.open_tail.len() - TAIL_KEEP);
+        }
     }
 
-    fn close(&mut self, exit_code: Option<i32>, ended_by: EndedBy, seq_len: usize) {
+    fn close(&mut self, exit_code: Option<i32>, ended_by: EndedBy, seq_len: usize, cols: usize) {
         let Some(started) = self.open.take() else {
             return;
         };
-        // The ending sequence arrived as the command's last bytes.
-        let payload = std::mem::take(&mut self.open_wire).saturating_sub(seq_len);
+        // The ending sequence arrived as the command's last bytes, and the
+        // line editor's end-of-line mark just before it.
+        let tail = std::mem::take(&mut self.open_tail);
+        let tail = &tail[..tail.len().saturating_sub(seq_len)];
+        let payload = std::mem::take(&mut self.open_wire)
+            .saturating_sub(seq_len)
+            .saturating_sub(eol_mark_len(tail, cols));
         self.open_output.bytes.truncate(payload);
         self.open_output.truncated = payload > OUTPUT_LIMIT;
         self.ended.push_back(CommandRecord {
@@ -238,6 +349,13 @@ impl CommandBoundaries {
             if let Some(old) = self.ended.pop_front() {
                 self.dropped_through = old.started;
             }
+        }
+        while self
+            .lines
+            .front()
+            .is_some_and(|(s, _)| *s <= self.dropped_through)
+        {
+            self.lines.pop_front();
         }
         while self.kept_bytes > OUTPUT_BUDGET
             || self
@@ -276,20 +394,125 @@ impl CommandBoundaries {
         self.open.is_some()
     }
 
-    /// The newest end stamp, or 0: it moves exactly when a command ends.
-    pub(crate) fn last_end(&self) -> u64 {
-        self.ended.back().map_or(0, |c| c.ended)
+    pub(crate) fn first_after(&self, floor: u64) -> CommandLookup {
+        match self.nth_after(floor, 0) {
+            NthCommand::Ended(c) => CommandLookup::Found(c),
+            NthCommand::Overrun => CommandLookup::Overrun,
+            NthCommand::Running | NthCommand::Pending => CommandLookup::Pending,
+        }
     }
 
-    pub(crate) fn first_after(&self, floor: u64) -> CommandLookup {
+    pub(crate) fn nth_after(&self, floor: u64, n: usize) -> NthCommand {
         if floor < self.dropped_through {
-            return CommandLookup::Overrun;
+            return NthCommand::Overrun;
         }
-        self.ended
-            .iter()
-            .find(|c| c.started > floor)
-            .map_or(CommandLookup::Pending, |c| CommandLookup::Found(*c))
+        let after = self.ended.iter().filter(|c| c.started > floor);
+        if let Some(c) = after.clone().nth(n) {
+            return NthCommand::Ended(*c);
+        }
+        let open_is_nth = self.open.is_some_and(|s| s > floor) && after.count() == n;
+        if open_is_nth {
+            NthCommand::Running
+        } else {
+            NthCommand::Pending
+        }
     }
+}
+
+/// How many bytes at the end of `out` are the end-of-line mark a line editor
+/// draws after a command and before it reports the end: shell output, not the
+/// command's. 0 when there is none. Both shapes are pinned to the terminal's
+/// width, `cols`, so output that merely ends alike is not taken for one.
+///
+/// - zsh (PROMPT_SP, `preprompt()`): the mark (`PROMPT_EOL_MARK`, `%` by
+///   default), `cols - w - !xn` spaces, CR, `w` spaces, CR, where `w` is the
+///   mark's width.
+/// - ble.sh (`prompt_eol_mark`, `.adjust-eol`): an optional `SGR0 [SI] DECSC
+///   mark SGR0 [SI] DECRC`, then `CUF (cols - 2 | cols - 3)`, two spaces, CR,
+///   and EL.
+pub fn eol_mark_len(out: &[u8], cols: usize) -> usize {
+    zsh_prompt_sp(out, cols)
+        .or_else(|| ble_eol_mark(out, cols))
+        .unwrap_or(0)
+}
+
+fn trailing(buf: &[u8], byte: u8) -> usize {
+    buf.iter().rev().take_while(|&&b| b == byte).count()
+}
+
+fn zsh_prompt_sp(out: &[u8], cols: usize) -> Option<usize> {
+    let body = out.strip_suffix(b"\r")?;
+    let w = trailing(body, b' ');
+    let body = body[..body.len() - w].strip_suffix(b"\r")?;
+    let n = trailing(body, b' ');
+    if n + w != cols && n + w + 1 != cols {
+        return None;
+    }
+    let body = &body[..body.len() - n];
+    Some(out.len() - mark_start(body, w)?)
+}
+
+/// Where a mark `width` columns wide, with escape sequences around it,
+/// starts at the end of `body`.
+fn mark_start(body: &[u8], width: usize) -> Option<usize> {
+    let mut end = body.len();
+    let mut seen = 0;
+    loop {
+        if let Some(csi) = trailing_csi(&body[..end]) {
+            end -= csi;
+            continue;
+        }
+        if seen == width {
+            return Some(end);
+        }
+        let start = (0..end).rev().find(|&i| body[i] & 0xc0 != 0x80)?;
+        let ch = std::str::from_utf8(&body[start..end])
+            .ok()?
+            .chars()
+            .next()?;
+        if ch.is_control() {
+            return None;
+        }
+        seen += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if seen > width {
+            return None;
+        }
+        end = start;
+    }
+}
+
+/// The length of a CSI sequence (`ESC [ params final`) ending `buf`.
+fn trailing_csi(buf: &[u8]) -> Option<usize> {
+    let (&last, rest) = buf.split_last()?;
+    if !(0x40..=0x7e).contains(&last) {
+        return None;
+    }
+    let esc = rest.iter().rposition(|&b| b == 0x1b)?;
+    let params = &rest[esc + 1..];
+    let (&open, params) = params.split_first()?;
+    (open == b'[' && params.iter().all(|b| (0x20..=0x3f).contains(b))).then(|| buf.len() - esc)
+}
+
+fn ble_eol_mark(out: &[u8], cols: usize) -> Option<usize> {
+    let body = out.strip_suffix(b"\x1b[K").unwrap_or(out);
+    let body = body.strip_suffix(b"  \r")?;
+    let csi = trailing_csi(body)?;
+    let cuf = &body[body.len() - csi..];
+    let n: usize = std::str::from_utf8(cuf.get(2..cuf.len() - 1)?)
+        .ok()?
+        .parse()
+        .ok()?;
+    if !cuf.ends_with(b"C") || (n + 2 != cols && n + 3 != cols) {
+        return None;
+    }
+    let mut body = &body[..body.len() - csi];
+    if let Some(mark) = body.strip_suffix(b"\x1b8") {
+        let saved = mark.windows(2).rposition(|w| w == b"\x1b7")?;
+        body = &mark[..saved];
+        body = body.strip_suffix(b"\x0f").unwrap_or(body);
+        body = body.strip_suffix(b"\x1b[m").unwrap_or(body);
+    }
+    Some(out.len() - body.len())
 }
 
 #[cfg(test)]
@@ -308,10 +531,10 @@ mod tests {
         let mut b = CommandBoundaries::default();
         assert!(!b.seen());
         let floor = crate::program_status::as_of();
-        b.on_start(0);
+        b.on_start(0, 80, Vec::new());
         assert!(b.seen() && b.running());
         assert_eq!(b.first_after(floor), CommandLookup::Pending);
-        b.on_end(Some(7), 0);
+        b.on_end(Some(7), 0, 80);
         let c = found(&b, floor);
         assert_eq!((c.exit_code, c.ended_by), (Some(7), EndedBy::End));
         assert!(c.started > floor && c.ended > c.started);
@@ -323,12 +546,12 @@ mod tests {
     #[test]
     fn a_command_already_running_at_the_floor_is_not_the_next_one() {
         let mut b = CommandBoundaries::default();
-        b.on_start(0);
+        b.on_start(0, 80, Vec::new());
         let floor = crate::program_status::as_of();
-        b.on_end(Some(0), 0);
+        b.on_end(Some(0), 0, 80);
         assert_eq!(b.first_after(floor), CommandLookup::Pending);
-        b.on_start(0);
-        b.on_end(Some(3), 0);
+        b.on_start(0, 80, Vec::new());
+        b.on_end(Some(3), 0, 80);
         assert_eq!(found(&b, floor).exit_code, Some(3));
     }
 
@@ -338,8 +561,8 @@ mod tests {
         let mut b = CommandBoundaries::default();
         let floor = crate::program_status::as_of();
         for code in [1, 2] {
-            b.on_start(0);
-            b.on_end(Some(code), 0);
+            b.on_start(0, 80, Vec::new());
+            b.on_end(Some(code), 0, 80);
         }
         let first = found(&b, floor);
         assert_eq!(first.exit_code, Some(1));
@@ -355,16 +578,16 @@ mod tests {
     fn a_prompt_or_a_new_start_ends_a_command_that_never_reported() {
         let mut b = CommandBoundaries::default();
         let floor = crate::program_status::as_of();
-        b.on_start(0);
-        b.on_prompt(0);
+        b.on_start(0, 80, Vec::new());
+        b.on_prompt(0, 80);
         let c = found(&b, floor);
         assert_eq!((c.exit_code, c.ended_by), (None, EndedBy::Prompt));
-        b.on_start(0);
-        b.on_start(0);
+        b.on_start(0, 80, Vec::new());
+        b.on_start(0, 80, Vec::new());
         let c = found(&b, c.started);
         assert_eq!((c.exit_code, c.ended_by), (None, EndedBy::NextCommand));
-        b.on_prompt(0);
-        b.on_prompt(0);
+        b.on_prompt(0, 80);
+        b.on_prompt(0, 80);
         assert!(!b.running());
     }
 
@@ -373,8 +596,8 @@ mod tests {
         let mut b = CommandBoundaries::default();
         let floor = crate::program_status::as_of();
         for _ in 0..KEEP_ENDED + 1 {
-            b.on_start(0);
-            b.on_end(Some(0), 0);
+            b.on_start(0, 80, Vec::new());
+            b.on_end(Some(0), 0, 80);
         }
         assert_eq!(b.first_after(floor), CommandLookup::Overrun);
         let newest = b.ended.back().unwrap().started;

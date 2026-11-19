@@ -93,7 +93,7 @@ pub(crate) async fn wait_command(
                     let text = match lookup {
                         CommandLookup::Found(c) if output => Some(
                             vt.command_output(c.started)
-                                .map(|o| (shux_pty::boundary_output_text(o.bytes), o.truncated)),
+                                .map(|o| (shux_pty::output_text(o.bytes), o.truncated)),
                         ),
                         _ => None,
                     };

@@ -109,6 +109,8 @@ pub enum Lane {
 #[derive(Clone)]
 pub struct PaneWriter {
     tx: mpsc::UnboundedSender<Queued>,
+    /// Chunks sent and not yet received.
+    queued: Arc<std::sync::atomic::AtomicUsize>,
     slots: Arc<Semaphore>,
     budget: Budget,
     control: Budget,
@@ -123,12 +125,14 @@ struct Queued {
 /// The PTY task's side of a pane's input channel.
 pub struct PaneInputRx {
     rx: mpsc::UnboundedReceiver<Queued>,
+    queued: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Room for one chunk: a slot in the channel and its bytes' budget, either
 /// absent for urgent input.
 pub struct InputPermit {
     tx: mpsc::UnboundedSender<Queued>,
+    queued: Arc<std::sync::atomic::AtomicUsize>,
     slot: Option<OwnedSemaphorePermit>,
     budget: Option<OwnedSemaphorePermit>,
 }
@@ -143,19 +147,26 @@ pub fn channel() -> (PaneWriter, PaneInputRx) {
 pub fn channel_with(slots: usize, budget: usize) -> (PaneWriter, PaneInputRx) {
     let (tx, rx) = mpsc::unbounded_channel();
     let (budget, control) = (Budget::new(budget), Budget::new(CONTROL_BUDGET));
+    let queued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let writer = PaneWriter {
         tx,
+        queued: queued.clone(),
         slots: Arc::new(Semaphore::new(slots)),
         budget,
         control,
     };
-    (writer, PaneInputRx { rx })
+    (writer, PaneInputRx { rx, queued })
 }
 
 impl PaneWriter {
     /// The pane's PTY task has stopped taking input.
     pub fn is_closed(&self) -> bool {
         self.tx.is_closed()
+    }
+
+    /// Chunks sent that the PTY task has not taken yet.
+    pub fn queued(&self) -> usize {
+        self.queued.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Room for a chunk of `len` bytes, waiting for it. Fails once the pane
@@ -217,6 +228,7 @@ impl PaneWriter {
     ) -> InputPermit {
         InputPermit {
             tx: self.tx.clone(),
+            queued: self.queued.clone(),
             slot,
             budget,
         }
@@ -253,12 +265,21 @@ impl InputPermit {
             bytes,
             budget: self.budget,
         };
-        self.tx
+        // Counted before it can be received, so the count never goes below 0.
+        self.queued
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let sent = self
+            .tx
             .send(Queued {
                 input,
                 _slot: self.slot,
             })
-            .is_ok()
+            .is_ok();
+        if !sent {
+            self.queued
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        sent
     }
 
     /// Whether this is room in `writer`'s channel.
@@ -270,24 +291,48 @@ impl InputPermit {
 impl PaneInputRx {
     /// The next chunk, holding its budget until it is written.
     pub async fn recv_input(&mut self) -> Option<PaneInput> {
-        self.rx.recv().await.map(|queued| queued.input)
+        let queued = self.rx.recv().await?;
+        self.queued
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        Some(queued.input)
     }
 
     /// The next chunk's bytes, giving its budget back.
     #[cfg(test)]
     pub async fn recv(&mut self) -> Option<Vec<u8>> {
-        self.rx.recv().await.map(|queued| queued.input.bytes)
+        self.recv_input().await.map(|input| input.bytes)
     }
 
     #[cfg(test)]
     pub fn try_recv(&mut self) -> Result<Vec<u8>, TryRecvError> {
-        self.rx.try_recv().map(|queued| queued.input.bytes)
+        let queued = self.rx.try_recv()?;
+        self.queued
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(queued.input.bytes)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Input queued ahead of a line is visible to whoever is about to type
+    /// one, until the PTY task takes it.
+    #[tokio::test]
+    async fn queued_chunks_are_counted_until_received() {
+        let (tx, mut rx) = channel_with(8, 1000);
+        assert_eq!(tx.queued(), 0);
+        tx.try_send(b"a".to_vec()).unwrap();
+        tx.try_send(b"b".to_vec()).unwrap();
+        assert_eq!(tx.queued(), 2);
+        let permit = tx.try_reserve(1).unwrap();
+        assert_eq!(tx.queued(), 2, "room reserved is not input queued");
+        drop(permit);
+        rx.recv().await.unwrap();
+        assert_eq!(tx.queued(), 1);
+        rx.try_recv().unwrap();
+        assert_eq!(tx.queued(), 0);
+    }
 
     #[tokio::test]
     async fn a_chunk_holds_its_budget_until_written() {

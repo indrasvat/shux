@@ -233,7 +233,7 @@ pane.wait_command { "pane_id": "uuid", "after": 41, "timeout_ms": 30000, "output
 - **`timeout_ms`**: 30 s by default, at most 3600000 (1 h). Past it the wait is
   refused with `-32602`, `data: { field, max, hint }`, exactly as
   `pane.wait_status` and `pane.wait_for` refuse it.
-- `pane.status` reports `commands: { seen, running, shell, line_pending }`;
+- `pane.status` reports `commands: { seen, running, shell, line_pending, input_present }`;
   `shell` is `unknown` (no boundary yet), `at_prompt`, `running` or `between`
   (a command ended, its next prompt not yet drawn); `line_pending` is true while
   a line submitted at the prompt has not started.
@@ -317,9 +317,12 @@ pane.command_cancel { "command_id": "uuid" } → { "command_id": "uuid", "state"
 ```
 
 **How the command is framed (`boundaries`).** `osc133`: the shell reports its
-own boundaries (`shux shell-integration`); the line typed is C-u then the
-command, so the pane shows only the command and its output, and `stdout` is
-the stream between the shell's `133;C` and the end of that command. `markers`:
+own boundaries (`shux shell-integration`); the line typed is the command, so
+the pane shows only the command and its output, and `stdout` is the stream
+between the shell's `133;C` and the end of that command. Which command is the
+line's is read from the screen: the first line the shell read, in order,
+whose text as drawn holds the command, so a line typed ahead of it, or
+accepted and not yet started, is never taken for it. `markers`:
 the line prints a `SHUX_BEGIN…`/`SHUX_MARKER…` pair around the command, and
 `stdout` is what lies between. The request's `boundaries`:
 
@@ -332,12 +335,17 @@ the line prints a `SHUX_BEGIN…`/`SHUX_MARKER…` pair around the command, and
 
 Before any framing but `markers`, the pane's terminal is asked who reads its
 input (the foreground process group, and termios): another program in front
-is refused as `other_program`, a line read with echo off as `hidden_input`,
-the alternate screen as `full_screen`. A line already submitted at the prompt
-(a CR or LF sent outside a bracketed paste, by `send-keys` or a person typing)
-that has not started is `input_pending`: a line typed behind it would become
-its input, and its result ours. A multi-line command uses markers under
-`auto` and is refused under `osc133`. A control character in `command` or
+is refused as `other_program` (waited out while the marks say the prompt is
+being drawn: prompt hooks), a line read with echo off as `hidden_input`, the
+alternate screen as `full_screen`. Input the pane was sent counts too: a line
+submitted at the prompt (a CR or LF outside a bracketed paste) that has not
+started, or input still queued, is `input_pending`; keys sent to the prompt
+that submitted nothing are `input_present` (C-c gives a fresh prompt). With
+the cursor at the start of a row at the prompt mark (a line accepted, or the
+prompt not drawn yet), it waits, then refuses `input_pending`. A pane whose
+program is not a shell (`python3`, `bash -c …`) and reports no prompt is
+`not_a_shell` under `auto`. A multi-line command is refused
+(`-32602`) unless the shell reports nothing (then markers) or `markers` is asked for. A control character in `command` or
 `args` is refused under every framing (`-32602`, `data: { field, offset, char }`).
 
 Refusals are `ResourceExhausted` (`-32012`) with
@@ -351,18 +359,22 @@ hidden_input, full_screen, hint }`; nothing was typed.
 | `completed` | `exit_code` is the command's. `ended_by` (`osc133` only): `end` (its own `D`), or `prompt` / `next_command`, where the shell drew a prompt or started another command without reporting this one's end, and `exit_code` is null |
 | `not_run` | `osc133` only: the shell drew its next prompt without starting the line (a syntax error, a comment). `stdout` holds what the pane showed for the line, its echo included, up to that prompt |
 | `timed_out` | the timeout passed first; `stdout` is what it wrote so far. Its program may still run, and the pane stays held until it ends or is cancelled |
-| `awaiting_input` | its command started and then read hidden input (a password prompt); answered at once rather than at the timeout. The pane stays held |
 | `cancelled` | `pane.command_cancel` |
 | `pane_gone` | the pane's program ended or the pane was removed first |
 | `overrun` | `osc133` only: more commands ended after the line than the terminal keeps |
 
 - `as_of` (`osc133` only) is the floor the line was typed above: pass it to
   `pane.wait_command` as `after`, with `output: true`, to keep waiting on a
-  `timed_out` or `awaiting_input` command until its own end.
+  `timed_out` command until its own end.
+- A `timed_out` result carries `phase` (`awaiting_start`: the line never
+  started) and, when the terminal was reading with echo off, `hidden_input:
+  true`. While running, `pane.command_status`'s `phase` is `awaiting_start`,
+  `executing` or `awaiting_input` (echo off now).
 - `stdout` is ANSI-stripped, `\r\n` as `\n`, up to 1 MiB (`truncated`).
 - One command per pane. A second is refused with `ResourceExhausted`, plus
   `running_command_id` and `running_command_state`.
-- `timeout` is whole seconds, 30 by default; anything else is refused.
+- `timeout` is whole seconds, 30 by default, at most 3600; anything else is
+  refused with `-32602`.
 - CLI exit: 0 ended (read `exit_code`), 1 timed out, 2 bad arguments or no
   such pane, 3 anything else; `--async` exits 0 once the line is typed. Under
   `--format json`, an error is `{"error": {code, message, data}}` on stdout.

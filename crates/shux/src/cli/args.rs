@@ -1206,26 +1206,28 @@ pub enum PaneCommand {
     /// shows only the command and its output. A shell that does not gets it
     /// framed by markers it prints. `boundaries` in the result says which.
     ///
-    /// Nothing is typed into a pane whose input would not reach its shell's
-    /// prompt: a command still running, a line already submitted that has
-    /// not started, another program in the foreground, hidden input (a
-    /// password prompt), a full-screen program. The refusal's `data.reason`
-    /// names which; `--boundaries markers` types anyway.
+    /// A line goes only to a shell's empty prompt. Anything else is refused,
+    /// and `error.data.reason` names it: `command_running`, `input_pending`
+    /// (a line already sent has not started), `input_present` (keys sent to
+    /// the prompt submitted nothing), `other_program`, `hidden_input` (a
+    /// password prompt), `full_screen`, `not_a_shell`, `no_prompt`.
+    /// `--boundaries markers` types anyway.
     ///
     /// `state` in the result: `completed` (read `exit_code`; `ended_by`
     /// `prompt` or `next_command` means the shell drew a prompt or started
     /// another command without reporting this one's end, so the exit code is
     /// unknown), `not_run` (the shell drew its next prompt without starting
-    /// the line: a syntax error or a comment; `stdout` holds what it printed),
-    /// `timed_out`, `awaiting_input` (the command is reading hidden input,
-    /// such as a password), `cancelled`, `pane_gone`, `overrun`. After
-    /// `timed_out` or `awaiting_input` the pane stays held until the command
-    /// ends or is cancelled; with `boundaries: osc133`, `pane wait-command
-    /// --after <as_of> --output` waits on for its end.
+    /// the line: a syntax error or a comment; `stdout` is what it replied),
+    /// `timed_out` (`phase: awaiting_start` if the line never started;
+    /// `hidden_input: true` if the terminal was reading with echo off, as a
+    /// password prompt does), `cancelled`, `pane_gone`, `overrun`. After
+    /// `timed_out` the pane stays held until the command ends or is
+    /// cancelled; with `boundaries: osc133`, `pane wait-command --after
+    /// <as_of> --output` waits on for its end.
     ///
     /// Exit 0 the command ended (whatever its own code: read `exit_code`),
-    /// 1 timeout, 2 bad arguments or no such pane, 3 anything else: refused,
-    /// not run, awaiting input, cancelled, the pane went away, or the daemon
+    /// 1 timeout, 2 bad arguments or no such pane or session, 3 anything
+    /// else: refused, not run, cancelled, the pane went away, or the daemon
     /// did. With `--async`, 0 once it is typed.
     Run {
         /// Session name or id (full UUID, or the short form `session list` prints)
@@ -1259,7 +1261,7 @@ pub enum PaneCommand {
         #[arg(short, long)]
         command: String,
 
-        /// Timeout in seconds (default: 30)
+        /// Timeout in whole seconds, at most 3600 (default: 30)
         #[arg(long, default_value = "30")]
         timeout: u64,
 

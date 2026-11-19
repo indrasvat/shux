@@ -79,6 +79,7 @@ pub(crate) fn register_program_status_methods(
                             "running": vt.command_running(),
                             "shell": vt.shell_state().as_str(),
                             "line_pending": vt.line_pending(),
+                            "input_present": vt.input_present(),
                         },
                     }))
                 }

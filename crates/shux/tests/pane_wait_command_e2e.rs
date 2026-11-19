@@ -600,7 +600,7 @@ fn the_script_installs_under_nounset() {
     );
 }
 
-// ── issue #275: `pane run` on the shell's own boundaries ────────────────────
+// ── `pane run` on the shell's own boundaries ─────────────────────────────────
 
 /// Truecolor, indexed and basic: a run whose output loses colour on screen,
 /// or keeps escapes in `stdout`, cannot pass.
@@ -632,9 +632,9 @@ fn bash() -> String {
     modern_bash().expect("no bash 4.4+ installed: the integration cannot be tested")
 }
 
-/// The Done-when of #275: with the integration sourced, only the command and
-/// its output reach the screen, and the JSON still carries both. It is the
-/// pane's FIRST command: a fresh shell has drawn a prompt and nothing else.
+/// With the integration sourced, only the command and its output reach the
+/// screen, and the JSON still carries both. It is the pane's FIRST command:
+/// a fresh shell has drawn a prompt and nothing else.
 fn run_types_only_the_command(shell: &str) {
     let (env, _rc, pane) = integrated(shell);
     let (r, code) = pane_run(&env, &pane, "echo hi", &[]);
@@ -653,10 +653,7 @@ fn run_types_only_the_command(shell: &str) {
         !screen.contains("SHUX_") && !screen.contains("__shux"),
         "{shell}: a marker reached the screen:\n{screen}"
     );
-    assert!(
-        screen.contains("echo hi\n") || screen.contains("echo hi"),
-        "{shell}:\n{screen}"
-    );
+    assert!(screen.contains("echo hi"), "{shell}:\n{screen}");
     env.assert_colour_probe(&pane);
     let (r, code) = pane_run(&env, &pane, "false", &[]);
     assert_eq!(
@@ -825,43 +822,6 @@ fn zsh_a_parse_error_is_not_run() {
     a_rejected_line_is_not_run("zsh", "fi", "parse error");
 }
 
-/// A command that stops for a password answers at once, and the pane's
-/// boundaries still give its end once the input arrives.
-#[test]
-fn a_command_waiting_on_hidden_input_answers_at_once() {
-    let (env, _rc, pane) = integrated(&bash());
-    let (r, code) = pane_run(
-        &env,
-        &pane,
-        "printf 'pass: '; read -rs x; echo; echo got-$x",
-        &["--timeout", "60"],
-    );
-    assert_eq!(r["state"], "awaiting_input", "{r}");
-    assert_eq!(code, Some(3));
-    assert!(
-        r["stdout"].as_str().is_some_and(|s| s.contains("pass: ")),
-        "{r}"
-    );
-    let after = r["as_of"]
-        .as_u64()
-        .unwrap_or_else(|| panic!("no as_of: {r}"));
-    type_line(&env, "pw");
-    let r = result(
-        &wait(&env, &pane, after, "20s")
-            .arg("--output")
-            .output()
-            .expect("spawn shux"),
-    );
-    assert_eq!(
-        (r["exit_code"].as_i64(), r["output"].as_str()),
-        (Some(0), Some("pass: \ngot-pw\n")),
-        "{r}"
-    );
-    // Its end freed the pane.
-    let (r, _) = pane_run(&env, &pane, "echo free", &[]);
-    assert_eq!(r["stdout"], "free\n", "{r}");
-}
-
 /// A timeout freezes the result; the command's own end still frees the pane,
 /// and `wait-command --after <as_of>` still gets it.
 #[test]
@@ -927,16 +887,6 @@ fn a_line_submitted_and_not_yet_started_is_never_typed_behind() {
         r["output"], "pass: got-pw\n",
         "the refused line reached the shell: {r}"
     );
-}
-
-/// Something typed and never submitted does not become part of the command.
-#[test]
-fn a_half_typed_line_does_not_join_the_command() {
-    let (env, _rc, pane) = integrated(&bash());
-    env.ok(&["pane", "send-keys", "-s", "ws", "--text", "zzz-half"]);
-    env.wait_for("ws", &pane, "zzz-half");
-    let (r, code) = pane_run(&env, &pane, "echo hi", &[]);
-    assert_eq!((r["stdout"].as_str(), code), (Some("hi\n"), Some(0)), "{r}");
 }
 
 /// A control character in the line would be typed as a key: refused, in
@@ -1016,4 +966,286 @@ fn every_wait_refuses_past_an_hour_the_same_way() {
     type_line(&env, "echo accepted-$((270 + 5))");
     let out = child.wait_with_output().expect("wait-for");
     assert!(out.status.success());
+}
+
+/// A FIFO the shell waits on in PS0, after accepting a line and before it
+/// reports the start: the window ble.sh leaves open, held until released.
+fn gated_bash(env: &Env, rc: &tempfile::TempDir) -> (String, std::path::PathBuf) {
+    let gate = rc.path().join("gate");
+    nix::unistd::mkfifo(&gate, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
+    let ps0 = format!("PS0='$(read -r _ < {})'\n", gate.display());
+    (start_with(env, rc, &bash(), true, &ps0), gate)
+}
+
+/// A line typed ahead while a command ran is the shell's next command. Held
+/// after the shell accepted it and before it starts, ours is not typed (it
+/// would be echoed into that line and taken for it); once it has run, ours is.
+#[test]
+fn a_command_typed_ahead_is_never_taken_for_ours() {
+    let env = Env::new(80, 24);
+    let rc = tempfile::tempdir().expect("rc dir");
+    let (pane, gate) = gated_bash(&env, &rc);
+    // sleep holds the terminal, so the line typed ahead waits for the shell.
+    let floor = as_of(&env, &pane);
+    type_line(&env, "sleep 1");
+    std::fs::write(&gate, "go\n").expect("release sleep");
+    type_line(&env, "echo AHEAD-$((2 + 2))");
+    let r = result(
+        &wait(&env, &pane, floor, "20s")
+            .output()
+            .expect("spawn shux"),
+    );
+    assert_eq!(r["outcome"], "completed", "{r}");
+    // The shell reads the line typed ahead at its prompt, accepts it, and
+    // waits at the gate: the cursor is at the start of the next row.
+    let accepted = env.run(&[
+        "pane",
+        "wait-for",
+        "-s",
+        "ws",
+        "-p",
+        &pane,
+        "--regex",
+        &format!(r"{PROMPT} \$ echo AHEAD-\$\(\(2 \+ 2\)\)\n"),
+        "--timeout-ms",
+        "60000",
+    ]);
+    assert!(accepted.status.success(), "{}", env.capture("ws", &pane));
+    let (r, code) = pane_run(&env, &pane, "echo OURS-$((3 + 3))", &["--timeout", "2"]);
+    assert_eq!(
+        code,
+        Some(3),
+        "typed behind a line that had not started: {r}"
+    );
+    assert_eq!(r["error"]["data"]["reason"], "input_pending", "{r}");
+    assert!(
+        !env.capture("ws", &pane).contains("OURS-"),
+        "the refused line reached the pane"
+    );
+    std::fs::write(&gate, "go\n").expect("release the line typed ahead");
+    env.wait_for("ws", &pane, "AHEAD-4");
+    let mut run = env.shux();
+    run.args([
+        "--format",
+        "json",
+        "pane",
+        "run",
+        "-s",
+        "ws",
+        "-p",
+        &pane,
+        "-c",
+        "echo OURS-$((3 + 3))",
+        "--timeout",
+        "20",
+    ]);
+    let child = run.stdout(Stdio::piped()).spawn().expect("spawn shux");
+    std::fs::write(&gate, "go\n").expect("release ours");
+    let r = result(&child.wait_with_output().expect("pane run"));
+    assert_eq!(r["stdout"], "OURS-6\n", "{r}");
+}
+
+/// Keys sent to the prompt that submitted nothing: the line editor holds
+/// text (and the cursor may be anywhere in it), so nothing is typed until
+/// it is cleared.
+#[test]
+fn a_prompt_with_unsubmitted_keys_is_refused_until_cleared() {
+    let (env, _rc, pane) = integrated(&bash());
+    env.ok(&["pane", "send-keys", "-s", "ws", "--text", "true; XYZ"]);
+    env.ok(&["pane", "send-keys", "-s", "ws", "--data", "G1tEG1tE"]); // Left, Left
+    env.wait_for("ws", &pane, "XYZ");
+    let (r, code) = pane_run(&env, &pane, "echo CLEAN", &[]);
+    assert_eq!(code, Some(3), "{r}");
+    assert_eq!(r["error"]["data"]["reason"], "input_present", "{r}");
+    env.ok(&["pane", "send-keys", "-s", "ws", "--data", "Aw=="]); // C-c: a fresh prompt
+    // The prompt's text follows its mark: once it shows, the mark is read.
+    let fresh = env.run(&[
+        "pane",
+        "wait-for",
+        "-s",
+        "ws",
+        "-p",
+        &pane,
+        "--regex",
+        &format!(r"\^C\s*\n{PROMPT}"),
+        "--timeout-ms",
+        "60000",
+    ]);
+    assert!(fresh.status.success(), "{}", env.capture("ws", &pane));
+    let (r, code) = pane_run(&env, &pane, "echo CLEAN", &[]);
+    assert_eq!(
+        (r["stdout"].as_str(), code),
+        (Some("CLEAN\n"), Some(0)),
+        "{r}"
+    );
+}
+
+/// zsh's mark is not output, whatever PROMPT_EOL_MARK is; output that only
+/// ends like one is.
+#[test]
+fn zsh_end_of_line_marks_never_reach_stdout() {
+    if !has("zsh") {
+        eprintln!("zsh not installed: skipped");
+        return;
+    }
+    for mark in ["", "'<EOL>'"] {
+        let env = Env::new(80, 24);
+        let rc = tempfile::tempdir().expect("rc dir");
+        let pane = start_with(&env, &rc, "zsh", true, &format!("PROMPT_EOL_MARK={mark}\n"));
+        for (cmd, want) in [
+            ("printf '50%%'", "50%"),
+            ("printf abc", "abc"),
+            ("echo ok", "ok\n"),
+        ] {
+            let (r, _) = pane_run(&env, &pane, cmd, &[]);
+            assert_eq!(r["stdout"], want, "PROMPT_EOL_MARK={mark}: {r}");
+        }
+    }
+}
+
+#[test]
+fn output_that_ends_like_a_mark_is_kept_whole() {
+    let (env, _rc, pane) = integrated(&bash());
+    let (r, _) = pane_run(&env, &pane, r"printf 'Loading 100%%\r \r'", &[]);
+    assert_eq!(r["stdout"], "Loading 100%\r \r", "{r}");
+}
+
+/// A program that turns echo off without reading is running, not waiting
+/// on a password; a timeout says whether the terminal hid input.
+#[test]
+fn echo_off_is_not_taken_for_a_password_prompt() {
+    let (env, _rc, pane) = integrated(&bash());
+    let (r, code) = pane_run(
+        &env,
+        &pane,
+        "stty -echo; sleep 2; stty echo; echo done",
+        &["--timeout", "20"],
+    );
+    assert_eq!(
+        (r["state"].as_str(), r["stdout"].as_str(), code),
+        (Some("completed"), Some("done\n"), Some(0)),
+        "{r}"
+    );
+    let (r, code) = pane_run(
+        &env,
+        &pane,
+        "printf 'pass: '; read -rs x; echo got-$x",
+        &["--timeout", "2"],
+    );
+    assert_eq!(
+        (r["state"].as_str(), r["hidden_input"].as_bool(), code),
+        (Some("timed_out"), Some(true), Some(1)),
+        "{r}"
+    );
+    assert_eq!(r["stdout"], "pass: ", "{r}");
+    let after = r["as_of"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("no as_of: {r}"));
+    type_line(&env, "pw");
+    let r = result(
+        &wait(&env, &pane, after, "20s")
+            .arg("--output")
+            .output()
+            .expect("spawn shux"),
+    );
+    assert_eq!(r["output"], "pass: got-pw\n", "{r}");
+}
+
+/// A pane held by a timed-out command is refused naming it; cancelling an
+/// ended command reports its end and sends nothing.
+#[test]
+fn a_held_pane_names_its_holder_and_an_ended_command_cancels_to_its_state() {
+    let (env, _rc, pane) = integrated(&bash());
+    let (held, _) = pane_run(&env, &pane, "sleep 3", &["--timeout", "1"]);
+    assert_eq!(held["state"], "timed_out", "{held}");
+    let (r, code) = pane_run(&env, &pane, "echo second", &[]);
+    assert_eq!(code, Some(3), "{r}");
+    assert_eq!(
+        r["error"]["data"]["running_command_id"], held["command_id"],
+        "{r}"
+    );
+    let after = held["as_of"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("no as_of: {held}"));
+    let ended = result(
+        &wait(&env, &pane, after, "20s")
+            .output()
+            .expect("spawn shux"),
+    );
+    assert_eq!(ended["outcome"], "completed", "{ended}");
+    let (done, _) = pane_run(&env, &pane, "true", &["--timeout", "20"]);
+    assert_eq!(done["state"], "completed", "{done}");
+    let params = serde_json::json!({ "command_id": done["command_id"] }).to_string();
+    let out = env.run(&[
+        "--format",
+        "json",
+        "rpc",
+        "call",
+        "pane.command_cancel",
+        "--params",
+        &params,
+    ]);
+    let r = result(&out);
+    assert_eq!(r["state"], "completed", "{r}");
+}
+
+/// Bad targets and bad requests: exit 2 with a JSON error, as every wait.
+#[test]
+fn bad_targets_and_requests_exit_2_with_a_json_error() {
+    let (env, _rc, pane) = integrated(&bash());
+    for args in [
+        vec!["pane", "run", "-s", "nosuch-275", "-c", "echo x"],
+        vec!["pane", "wait-for", "-s", "nosuch-275", "-t", "x"],
+        vec![
+            "pane",
+            "run",
+            "-s",
+            "ws",
+            "-p",
+            &pane,
+            "-c",
+            "echo x",
+            "--timeout",
+            "3601",
+        ],
+        vec![
+            "pane",
+            "run",
+            "-s",
+            "ws",
+            "-p",
+            &pane,
+            "-c",
+            "echo a\necho b",
+        ],
+    ] {
+        let mut full = vec!["--format", "json"];
+        full.extend(args.iter().copied());
+        let out = env.run(&full);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let r = result(&out);
+        assert!(r["error"]["code"].is_i64(), "{args:?}: {r}");
+    }
+}
+
+/// A pane whose program is not a shell, and reports no prompt, is not typed
+/// into unless markers are asked for.
+#[test]
+fn a_pane_that_is_not_a_shell_is_refused() {
+    let env = Env::new(80, 24);
+    let created = env.run(&["session", "create", "ws", "-d", "--", "python3", "-q"]);
+    assert!(created.status.success());
+    let panes: serde_json::Value =
+        serde_json::from_str(&env.ok(&["--format", "json", "pane", "list", "-s", "ws"]))
+            .expect("json");
+    let pane = panes[0]["id"].as_str().expect("pane id").to_string();
+    env.wait_for("ws", &pane, ">>>");
+    let (r, code) = pane_run(&env, &pane, "print(1)", &[]);
+    assert_eq!(code, Some(3), "{r}");
+    assert_eq!(r["error"]["data"]["reason"], "not_a_shell", "{r}");
 }

@@ -12,7 +12,7 @@ pub mod spawn;
 pub use capture::strip_ansi;
 pub use command::{
     Boundaries, CAPTURE_LIMIT, CommandEngine, CommandResult, Osc133Anchor, Osc133End,
-    PreparedCommand, boundary_output_text, output_text, shell_escape_args, shell_quote_arg,
+    PreparedCommand, output_text, shell_escape_args, shell_quote_arg,
 };
 pub use handle::{
     DECLARED_CELL_PIXELS, Foreground, GroupEnd, OUTER_TERMINAL_IDENTITY_PREFIXES,

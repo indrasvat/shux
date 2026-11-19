@@ -352,10 +352,18 @@ pub async fn handle_wait_for(
     if let Some(p) = pane {
         params.insert("pane_id".into(), serde_json::Value::String(p.to_string()));
     } else if let Some(s) = session {
-        let sid = resolve_session_id(stream, s).await?;
+        let sid = super::program_status::or_exit(
+            resolve_session_id(stream, s).await,
+            "wait-for",
+            format,
+        )?;
         params.insert("session_id".into(), serde_json::Value::String(sid.clone()));
         if let Some(w) = window {
-            let (wid, _t) = resolve_window_id(stream, &sid, w).await?;
+            let (wid, _t) = super::program_status::or_exit(
+                resolve_window_id(stream, &sid, w).await,
+                "wait-for",
+                format,
+            )?;
             params.insert("window_id".into(), serde_json::Value::String(wid));
         }
     } else {

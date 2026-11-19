@@ -16,8 +16,8 @@
 //!
 //! A shell that reports its own boundaries (OSC 133) needs no markers: the
 //! line typed is the command itself ([`Boundaries::Osc133`]). The engine then
-//! learns nothing from the bytes; the daemon reads the pane's terminal and
-//! reports each step through the `osc133_*` methods.
+//! reads nothing from the bytes: which command is the line's, its output and
+//! its end come from the pane's terminal, through the `osc133_*` methods.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -60,8 +60,9 @@ pub enum Osc133End {
         truncated: bool,
     },
     /// The shell drew its next prompt without starting a command: a syntax
-    /// error, a comment, an incomplete line abandoned.
-    NotRun,
+    /// error, a comment, an incomplete line abandoned. `stdout` is the shell's
+    /// reply, as the screen showed it.
+    NotRun { stdout: String },
     /// More commands ended after the line than the terminal keeps.
     Overrun,
 }
@@ -107,6 +108,10 @@ pub struct TrackedCommand {
     boundaries: Boundaries,
     anchor: Option<Osc133Anchor>,
     ended_by: Option<&'static str>,
+    hidden_input: bool,
+    /// For [`Boundaries::Osc133`]: commands that started ahead of the line.
+    skip: usize,
+    not_run_reply: Option<String>,
     /// Its command has started: BEGIN printed, or the shell's C seen.
     begun: bool,
     capture: Vec<u8>,
@@ -126,8 +131,6 @@ pub enum CommandState {
     NotRun,
     /// More commands ended after the line than the terminal keeps.
     Overrun,
-    /// Its command started and is reading hidden input (a password prompt).
-    AwaitingInput,
 }
 
 impl CommandState {
@@ -140,7 +143,6 @@ impl CommandState {
             CommandState::PaneGone => "pane_gone",
             CommandState::NotRun => "not_run",
             CommandState::Overrun => "overrun",
-            CommandState::AwaitingInput => "awaiting_input",
         }
     }
 }
@@ -161,12 +163,17 @@ pub struct CommandResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended_by: Option<String>,
     /// While running: `awaiting_start` until its command starts, then
-    /// `executing`.
+    /// `executing`; the daemon reports `awaiting_input` while the terminal
+    /// reads with echo off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<String>,
+    /// `timed_out` while the terminal read with echo off: most often a
+    /// password prompt.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hidden_input: bool,
     /// For [`Boundaries::Osc133`]: the floor its line was typed above. Pass it
     /// to `pane.wait_command` as `after` to wait on for the command's own end
-    /// after this result froze (`timed_out`, `awaiting_input`).
+    /// once this result froze.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub as_of: Option<u64>,
 }
@@ -200,7 +207,18 @@ impl CommandEngine {
         }
     }
 
-    /// Frame `command` for the pane: its ID and the line to type.
+    /// Frame `command` as `boundaries` says.
+    pub fn prepare_as(boundaries: Boundaries, command: &str, args: &[String]) -> PreparedCommand {
+        let mut prepared = Self::prepare(command, args);
+        if boundaries == Boundaries::Osc133 {
+            prepared.line = format!("{}\n", prepared.command);
+            prepared.marker.clear();
+            prepared.boundaries = Boundaries::Osc133;
+        }
+        prepared
+    }
+
+    /// Frame `command` with markers: its ID and the line to type.
     pub fn prepare(command: &str, args: &[String]) -> PreparedCommand {
         let id = Uuid::new_v4();
         let marker = format!("__SHUX_CMD_{}__", id.as_simple());
@@ -227,24 +245,6 @@ impl CommandEngine {
             marker,
             line,
             boundaries: Boundaries::Markers,
-            anchor: None,
-        }
-    }
-
-    /// Frame `command` for a shell that reports OSC 133: the line is the
-    /// command itself, after C-u, which clears anything typed at the prompt.
-    pub fn prepare_osc133(command: &str, args: &[String]) -> PreparedCommand {
-        let command = if args.is_empty() {
-            command.to_string()
-        } else {
-            format!("{} {}", command, shell_escape_args(args))
-        };
-        PreparedCommand {
-            id: Uuid::new_v4(),
-            line: format!("\x15{command}\n"),
-            command,
-            marker: String::new(),
-            boundaries: Boundaries::Osc133,
             anchor: None,
         }
     }
@@ -283,6 +283,9 @@ impl CommandEngine {
                 boundaries,
                 anchor,
                 ended_by: None,
+                hidden_input: false,
+                skip: 0,
+                not_run_reply: None,
                 begun: false,
                 capture: Vec::new(),
                 truncated: false,
@@ -322,11 +325,6 @@ impl CommandEngine {
             return completed;
         };
         if cmd.boundaries == Boundaries::Osc133 {
-            // Before its start: what the pane shows for the line, kept in case
-            // the shell never runs it. After: the terminal keeps the output.
-            if !cmd.begun {
-                cmd.keep(&buf);
-            }
             return completed;
         }
         if !cmd.begun {
@@ -403,11 +401,10 @@ impl CommandEngine {
         }
         cmd.state = state;
         let capture = std::mem::take(&mut cmd.capture);
-        let stdout = if cmd.boundaries == Boundaries::Osc133 && cmd.begun {
-            boundary_output_text(&capture)
-        } else {
-            output_text(&capture)
-        };
+        let stdout = cmd
+            .not_run_reply
+            .take()
+            .unwrap_or_else(|| output_text(&capture));
         let result = CommandResult {
             command_id: id,
             state: state.as_str().to_string(),
@@ -417,7 +414,8 @@ impl CommandEngine {
             runtime_ms: cmd.started_at.elapsed().as_millis() as u64,
             boundaries: cmd.boundaries,
             ended_by: cmd.ended_by.map(str::to_string),
-            phase: None,
+            hidden_input: cmd.hidden_input,
+            phase: (state == CommandState::TimedOut).then(|| phase(cmd.begun).to_string()),
             as_of: cmd.anchor.map(|a| a.floor),
         };
         cmd.result = Some(result.clone());
@@ -445,18 +443,22 @@ impl CommandEngine {
         }
     }
 
-    /// Check for timed-out commands. Returns their results and pane IDs.
-    pub fn check_timeouts(&mut self) -> Vec<(Uuid, CommandResult)> {
+    /// Running commands past their timeout.
+    pub fn due(&self) -> Vec<Uuid> {
         let now = Instant::now();
-        let ids: Vec<Uuid> = self
-            .commands
+        self.commands
             .values()
             .filter(|t| {
                 t.state == CommandState::Running && now.duration_since(t.started_at) >= t.timeout
             })
             .map(|t| t.id)
-            .collect();
-        ids.into_iter()
+            .collect()
+    }
+
+    /// Check for timed-out commands. Returns their results and pane IDs.
+    pub fn check_timeouts(&mut self) -> Vec<(Uuid, CommandResult)> {
+        self.due()
+            .into_iter()
             .filter_map(|id| {
                 let pane = self.commands.get(&id)?.pane_id;
                 Some((pane, self.finish(id, CommandState::TimedOut, None)?))
@@ -489,42 +491,31 @@ impl CommandEngine {
     /// Get the status of a command: its frozen result once it has finished.
     pub fn get_status(&self, command_id: Uuid) -> Option<CommandResult> {
         let tracked = self.commands.get(&command_id)?;
-        Some(tracked.result.clone().unwrap_or_else(|| {
-            CommandResult {
-                command_id,
-                state: CommandState::Running.as_str().to_string(),
-                exit_code: None,
-                stdout: String::new(),
-                truncated: false,
-                runtime_ms: tracked.started_at.elapsed().as_millis() as u64,
-                boundaries: tracked.boundaries,
-                ended_by: None,
-                phase: Some(
-                    if tracked.begun {
-                        "executing"
-                    } else {
-                        "awaiting_start"
-                    }
-                    .to_string(),
-                ),
-                as_of: tracked.anchor.map(|a| a.floor),
-            }
+        Some(tracked.result.clone().unwrap_or_else(|| CommandResult {
+            command_id,
+            state: CommandState::Running.as_str().to_string(),
+            exit_code: None,
+            stdout: String::new(),
+            truncated: false,
+            runtime_ms: tracked.started_at.elapsed().as_millis() as u64,
+            boundaries: tracked.boundaries,
+            ended_by: None,
+            hidden_input: false,
+            phase: Some(phase(tracked.begun).to_string()),
+            as_of: tracked.anchor.map(|a| a.floor),
         }))
     }
 
-    /// Running commands whose command has started, with their panes.
-    pub fn started(&self) -> Vec<(Uuid, Uuid)> {
-        self.commands
-            .values()
-            .filter(|t| t.state == CommandState::Running && t.begun)
-            .map(|t| (t.id, t.pane_id))
-            .collect()
+    /// Note that `id` timed out while its terminal read with echo off.
+    pub fn note_hidden_input(&mut self, id: Uuid) {
+        if let Some(cmd) = self.commands.get_mut(&id) {
+            cmd.hidden_input = true;
+        }
     }
 
-    /// Its command is reading hidden input: answer its waiter now. Like a
-    /// timeout, it keeps the pane until it ends or is cancelled.
-    pub fn awaiting_input(&mut self, id: Uuid) -> Option<CommandResult> {
-        self.finish(id, CommandState::AwaitingInput, None)
+    /// The command holding `pane_id`, if one does.
+    pub fn holder(&self, pane_id: Uuid) -> Option<Uuid> {
+        self.active.get(&pane_id).copied()
     }
 
     /// The pane `command_id` was typed into.
@@ -533,19 +524,23 @@ impl CommandEngine {
     }
 
     /// The [`Boundaries::Osc133`] command holding `pane_id`, its anchor, and
-    /// whether its command has started.
-    pub fn osc133_holder(&self, pane_id: Uuid) -> Option<(Uuid, Osc133Anchor, bool)> {
+    /// once its command has started, how many started ahead of it.
+    pub fn osc133_holder(&self, pane_id: Uuid) -> Option<(Uuid, Osc133Anchor, Option<usize>)> {
         let id = *self.active.get(&pane_id)?;
         let cmd = self.commands.get(&id)?;
-        Some((id, cmd.anchor?, cmd.begun))
+        Some((id, cmd.anchor?, cmd.begun.then_some(cmd.skip)))
     }
 
-    /// Its command started: what the pane showed before it was the line's.
-    pub fn osc133_started(&mut self, id: Uuid) {
+    /// The command `id` typed, as typed.
+    pub fn command_text(&self, id: Uuid) -> Option<&str> {
+        self.commands.get(&id).map(|cmd| cmd.command.as_str())
+    }
+
+    /// Its command started, after `skip` others.
+    pub fn osc133_started(&mut self, id: Uuid, skip: usize) {
         if let Some(cmd) = self.commands.get_mut(&id) {
             cmd.begun = true;
-            cmd.capture.clear();
-            cmd.truncated = false;
+            cmd.skip = skip;
         }
     }
 
@@ -561,20 +556,6 @@ impl CommandEngine {
                 .extend_from_slice(&raw[..raw.len().min(CAPTURE_LIMIT)]);
             cmd.truncated = truncated || raw.len() > CAPTURE_LIMIT;
         }
-    }
-
-    /// Running [`Boundaries::Osc133`] commands whose timeout is due.
-    pub fn osc133_due(&self) -> Vec<Uuid> {
-        let now = Instant::now();
-        self.commands
-            .values()
-            .filter(|t| {
-                t.boundaries == Boundaries::Osc133
-                    && t.state == CommandState::Running
-                    && now.duration_since(t.started_at) >= t.timeout
-            })
-            .map(|t| t.id)
-            .collect()
     }
 
     /// The line ended: answer its waiter, unless a timeout already did, and
@@ -598,12 +579,9 @@ impl CommandEngine {
                 }
                 self.finish(id, CommandState::Completed, exit_code)
             }
-            Osc133End::NotRun => {
+            Osc133End::NotRun { stdout } => {
                 if running {
-                    // Up to the prompt that ended it, not the prompt itself.
-                    let at = find(&cmd.capture, b"\x1b]133;A").unwrap_or(cmd.capture.len());
-                    cmd.capture.truncate(at);
-                    cmd.begun = true;
+                    cmd.not_run_reply = Some(stdout);
                 }
                 self.finish(id, CommandState::NotRun, None)
             }
@@ -669,49 +647,8 @@ pub fn output_text(raw: &[u8]) -> String {
     crate::strip_ansi(&String::from_utf8_lossy(raw)).replace("\r\n", "\n")
 }
 
-/// [`output_text`] for output cut at the shell's own boundaries, without the
-/// end-of-line mark the line editor draws after a command and before it
-/// reports the end: shell output, not the command's.
-///
-/// - ble.sh (`prompt_eol_mark`): `SGR0 [SI] DECSC <mark> SGR0 [SI] DECRC
-///   [CUF n] "  " CR [EL]`.
-/// - zsh (PROMPT_SP): `<mark>`, spaces to the edge, `CR " " CR`. The default
-///   mark is `%`, or `#` for root.
-pub fn boundary_output_text(raw: &[u8]) -> String {
-    let mut text = output_text(trim_ble_eol_mark(raw));
-    if let Some(body) = text.strip_suffix("\r \r") {
-        let body = body.trim_end_matches(' ');
-        let body = body.strip_suffix(['%', '#']).unwrap_or(body);
-        text.truncate(body.len());
-    }
-    text
-}
-
-fn trim_ble_eol_mark(raw: &[u8]) -> &[u8] {
-    let body = raw.strip_suffix(b"\x1b[K").unwrap_or(raw);
-    let Some(body) = body.strip_suffix(b"  \r") else {
-        return raw;
-    };
-    let body = match body.iter().rposition(|&b| b == 0x1b) {
-        // CUF n: ESC [ digits C
-        Some(at)
-            if body[at..].starts_with(b"\x1b[")
-                && body.ends_with(b"C")
-                && body[at + 2..body.len() - 1].iter().all(u8::is_ascii_digit) =>
-        {
-            &body[..at]
-        }
-        _ => body,
-    };
-    let Some(body) = body.strip_suffix(b"\x1b8") else {
-        return raw;
-    };
-    let Some(save) = body.windows(2).rposition(|w| w == b"\x1b7") else {
-        return raw;
-    };
-    let before = &body[..save];
-    let before = before.strip_suffix(b"\x0f").unwrap_or(before);
-    before.strip_suffix(b"\x1b[m").unwrap_or(before)
+fn phase(begun: bool) -> &'static str {
+    if begun { "executing" } else { "awaiting_start" }
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -824,7 +761,7 @@ mod tests {
         cmd: &str,
         timeout: Duration,
     ) -> (Uuid, String) {
-        let mut prepared = CommandEngine::prepare_osc133(cmd, &[]);
+        let mut prepared = CommandEngine::prepare_as(Boundaries::Osc133, cmd, &[]);
         prepared.anchor(Osc133Anchor {
             floor: 7,
             prompts: 1,
@@ -841,61 +778,51 @@ mod tests {
         }
     }
 
-    /// zsh writes its partial-line mark (PROMPT_SP) after a command and
-    /// before the `precmd` that reports its end: shell output, not the
-    /// command's, whether or not the command ended its last line.
-    #[test]
-    fn zshs_partial_line_mark_is_not_command_output() {
-        let mark = |cols: usize| {
-            format!(
-                "\x1b[1m\x1b[7m%\x1b[27m\x1b[1m\x1b[0m{}\r \r",
-                " ".repeat(cols - 1)
-            )
-        };
-        assert_eq!(
-            boundary_output_text(format!("a\r\n{}", mark(80)).as_bytes()),
-            "a\n"
-        );
-        assert_eq!(
-            boundary_output_text(format!("foo{}", mark(40)).as_bytes()),
-            "foo"
-        );
-        assert_eq!(boundary_output_text(mark(80).as_bytes()), "");
-        // Root's mark is `#`; spaces the command itself wrote stay.
-        assert_eq!(
-            boundary_output_text(format!("x  \r\n#{}\r \r", " ".repeat(79)).as_bytes()),
-            "x  \n"
-        );
-        assert_eq!(boundary_output_text(b"keep  \r\n"), "keep  \n");
-    }
-
-    /// ble.sh draws its `[ble: EOF]` mark under save/restore and erases it,
-    /// after the command and before POSTEXEC: recorded from ble.sh 0.4.
-    #[test]
-    fn ble_shs_end_of_line_mark_is_not_command_output() {
-        let mark =
-            b"\x1b[m\x0f\x1b7\x1b[0;94m[ble: EOF]\x1b[m\x0f\x1b[m\x0f\x1b8\x1b[78C  \r\x1b[K";
-        let with = |out: &[u8]| [out, mark].concat();
-        assert_eq!(boundary_output_text(&with(b"a\r\nb\r\n")), "a\nb\n");
-        assert_eq!(boundary_output_text(mark), "");
-        assert_eq!(
-            boundary_output_text(&with(
-                b"bash: syntax error near unexpected token `newline'\r\n"
-            )),
-            "bash: syntax error near unexpected token `newline'\n"
-        );
-        // Only that shape, at the very end, is trimmed.
-        assert_eq!(boundary_output_text(b"x  \r"), "x  \r");
-        assert!(boundary_output_text(&[mark as &[u8], b"after\r\n"].concat()).ends_with("after\n"));
-    }
-
-    /// The line is the command itself, cleared of anything typed before it.
+    /// The line is the command itself: nothing typed before it, no marker.
     #[test]
     fn an_osc133_line_is_the_command_and_nothing_else() {
-        let p = CommandEngine::prepare_osc133("ls", &["a b".to_string()]);
-        assert_eq!(p.line(), "\x15ls 'a b'\n");
+        let p = CommandEngine::prepare_as(Boundaries::Osc133, "ls", &["a b".to_string()]);
+        assert_eq!(p.line(), "ls 'a b'\n");
         assert_eq!(p.boundaries(), Boundaries::Osc133);
-        assert!(!p.line().contains("SHUX"));
+        let m = CommandEngine::prepare_as(Boundaries::Markers, "ls", &[]);
+        assert!(m.line().contains("SHUX_BE''GIN"));
+    }
+
+    /// A line the shell never ran answers with the shell's reply.
+    #[test]
+    fn a_line_the_shell_never_ran_is_not_run() {
+        let mut engine = CommandEngine::new();
+        let pane = Uuid::new_v4();
+        let (id, _) = osc133(&mut engine, pane, "echo (", Duration::from_secs(10));
+        let reply = "bash: syntax error near unexpected token `newline'\n".to_string();
+        let r = engine
+            .osc133_end(
+                id,
+                Osc133End::NotRun {
+                    stdout: reply.clone(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            (r.state.as_str(), r.stdout, r.exit_code),
+            ("not_run", reply, None)
+        );
+        assert!(engine.osc133_holder(pane).is_none());
+    }
+
+    /// A timeout before the line started says so.
+    #[test]
+    fn a_line_that_never_started_times_out_awaiting_its_start() {
+        let mut engine = CommandEngine::new();
+        let pane = Uuid::new_v4();
+        let (id, _) = osc133(&mut engine, pane, "echo (", Duration::ZERO);
+        let frozen = engine.check_timeouts();
+        assert_eq!(
+            (frozen[0].1.state.as_str(), frozen[0].1.phase.as_deref()),
+            ("timed_out", Some("awaiting_start"))
+        );
+        assert!(engine.process_output(pane, b"> ").is_empty());
+        assert!(engine.cancel_command(id).is_some());
     }
 
     /// Its result comes from the terminal's record, not from the bytes the
@@ -910,7 +837,8 @@ mod tests {
             Some("awaiting_start")
         );
         assert!(engine.process_output(pane, b"echo hi\r\n").is_empty());
-        engine.osc133_started(id);
+        assert_eq!(engine.command_text(id), Some("echo hi"));
+        engine.osc133_started(id, 0);
         assert_eq!(
             engine.get_status(id).unwrap().phase.as_deref(),
             Some("executing")
@@ -932,26 +860,9 @@ mod tests {
             "status lost ended_by"
         );
         assert!(
-            osc133(&mut engine, pane, "true", Duration::from_secs(1)).0 != id,
+            engine.osc133_holder(pane).is_none(),
             "the pane was not freed"
         );
-    }
-
-    /// A line the shell never ran answers with what the shell said, up to
-    /// the prompt that ended it.
-    #[test]
-    fn a_line_the_shell_never_ran_is_not_run() {
-        let mut engine = CommandEngine::new();
-        let pane = Uuid::new_v4();
-        let (id, _) = osc133(&mut engine, pane, "echo (", Duration::from_secs(10));
-        engine.process_output(
-            pane,
-            b"echo (\r\nbash: syntax error near `newline'\r\n\x1b]133;A\x07$ ",
-        );
-        let r = engine.osc133_end(id, Osc133End::NotRun).unwrap();
-        assert_eq!(r.state, "not_run");
-        assert_eq!(r.stdout, "echo (\nbash: syntax error near `newline'\n");
-        assert_eq!(r.exit_code, None);
     }
 
     /// A timeout freezes the result with the output so far; the command's own
@@ -961,12 +872,14 @@ mod tests {
         let mut engine = CommandEngine::new();
         let pane = Uuid::new_v4();
         let (id, _) = osc133(&mut engine, pane, "sleep 9", Duration::ZERO);
-        engine.osc133_started(id);
-        assert_eq!(engine.osc133_due(), vec![id]);
+        engine.osc133_started(id, 0);
+        assert_eq!(engine.due(), vec![id]);
         engine.osc133_output_so_far(id, b"early\r\n", false);
+        engine.note_hidden_input(id);
         let frozen = engine.check_timeouts();
         assert_eq!(frozen[0].1.stdout, "early\n");
-        let second = CommandEngine::prepare_osc133("x", &[]);
+        assert!(frozen[0].1.hidden_input);
+        let second = CommandEngine::prepare_as(Boundaries::Osc133, "x", &[]);
         assert_eq!(
             engine
                 .register(pane, second, Duration::ZERO, None)
@@ -988,25 +901,6 @@ mod tests {
             engine.osc133_holder(pane).is_none(),
             "its end did not free the pane"
         );
-    }
-
-    /// Hidden input answers at once, and holds the pane like a timeout.
-    #[test]
-    fn a_command_on_hidden_input_answers_and_holds_its_pane() {
-        let mut engine = CommandEngine::new();
-        let pane = Uuid::new_v4();
-        let (id, _) = osc133(&mut engine, pane, "sudo true", Duration::from_secs(60));
-        assert!(
-            engine.started().is_empty(),
-            "a command not yet started was offered as started"
-        );
-        engine.osc133_started(id);
-        assert_eq!(engine.started(), vec![(id, pane)]);
-        assert_eq!(engine.awaiting_input(id).unwrap().state, "awaiting_input");
-        assert!(engine.osc133_holder(pane).is_some());
-        assert!(engine.started().is_empty());
-        engine.osc133_end(id, ended(b"", Some(0)));
-        assert!(engine.osc133_holder(pane).is_none());
     }
 
     #[test]

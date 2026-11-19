@@ -30,8 +30,9 @@ pub use cell::{
 };
 pub use charset::{CharsetSlot, TerminalCharset, TerminalCharsets};
 pub use commands::{
-    CommandLookup, CommandOutput, CommandRecord, EndedBy, KEEP_ENDED as COMMANDS_KEPT,
+    CommandLookup, CommandOutput, CommandRecord, EndedBy, KEEP_ENDED as COMMANDS_KEPT, NthCommand,
     OUTPUT_BUDGET as COMMAND_OUTPUT_BUDGET, OUTPUT_LIMIT as COMMAND_OUTPUT_LIMIT, ShellState,
+    Submitted, eol_mark_len,
 };
 pub use cursor::{Cursor, CursorShape, SavedCursor};
 pub use diff::{
@@ -128,6 +129,8 @@ pub struct VirtualTerminal {
     /// status is disabled, so enabling mid-sequence cannot misparse.
     status_scanner: program_status::OscStatusScanner,
     commands: commands::CommandBoundaries,
+    /// The absolute row the last prompt started on.
+    prompt_row: Option<u64>,
     /// `None` while program status is disabled.
     program_status: Option<program_status::VtProgramStatus>,
     /// Generation of the last disable, or of construction.
@@ -318,6 +321,7 @@ impl VirtualTerminal {
             apc_cut_slicing: true,
             status_scanner: program_status::OscStatusScanner::default(),
             commands: commands::CommandBoundaries::default(),
+            prompt_row: None,
             program_status: None,
             status_disabled_generation: program_status::disabled_generation(),
             graphics: graphics::GraphicsSink::default(),
@@ -580,10 +584,21 @@ impl VirtualTerminal {
     ) {
         use program_status::CutAction;
         match action {
-            CutAction::CommandStart => self.commands.on_start(len),
-            CutAction::CommandEnd { exit_code } => self.commands.on_end(exit_code, len),
+            CutAction::CommandStart => {
+                let line = self.input_rows();
+                self.commands.on_start(len, self.grid.cols(), line);
+                self.prompt_row = None;
+            }
+            CutAction::CommandEnd { exit_code } => {
+                self.commands.on_end(exit_code, len, self.grid.cols());
+            }
             CutAction::PromptStart => {
-                self.commands.on_prompt(len);
+                if self.commands.state() == ShellState::AtPrompt {
+                    let rows = self.input_rows();
+                    self.commands.on_input_rejected(rows);
+                }
+                self.commands.on_prompt(len, self.grid.cols());
+                self.prompt_row = (!self.modes.alternate_screen).then(|| self.cursor_row_abs());
                 if let Some(ps) = self.program_status.as_mut() {
                     ps.on_prompt_start();
                 }
@@ -602,6 +617,58 @@ impl VirtualTerminal {
         }
     }
 
+    fn cursor_row_abs(&self) -> u64 {
+        self.grid.evicted() + (self.grid.scrollback_len() + self.cursor.row) as u64
+    }
+
+    /// What the screen shows from the last prompt's row to the cursor's (its
+    /// own row too unless the cursor is at its start): the prompt and the
+    /// line typed at it, as the line editor finally drew them. One entry per
+    /// line, soft-wrapped rows joined.
+    fn input_rows(&self) -> Vec<String> {
+        const MOST: u64 = 200;
+        let (Some(from), false) = (self.prompt_row, self.modes.alternate_screen) else {
+            return Vec::new();
+        };
+        let cursor = self.cursor_row_abs();
+        let end = if self.cursor.col == 0 {
+            cursor
+        } else {
+            cursor + 1
+        };
+        let from = from.max(end.saturating_sub(MOST)).max(self.grid.evicted());
+        let mut lines = vec![String::new()];
+        for abs in from..end {
+            let Some(row) = usize::try_from(abs - self.grid.evicted())
+                .ok()
+                .and_then(|i| self.grid.row(i))
+            else {
+                break;
+            };
+            let text: String = row
+                .cells
+                .iter()
+                .filter(|c| c.width > 0)
+                .map(|c| c.ch)
+                .collect();
+            if let Some(line) = lines.last_mut() {
+                line.push_str(text.trim_end_matches(' '));
+            }
+            if !row.wrapped {
+                lines.push(String::new());
+            }
+        }
+        lines.retain(|l| !l.is_empty());
+        lines
+    }
+
+    /// Lines submitted to the shell above `floor`, in the order it read
+    /// them: the commands they started (with what the screen showed for
+    /// each), and the inputs it rejected. `None` when one is no longer kept.
+    pub fn submitted_after(&self, floor: u64) -> Option<Vec<Submitted<'_>>> {
+        self.commands.submitted_after(floor)
+    }
+
     /// Whether this terminal has seen a prompt or a command start (`133;A`,
     /// `133;C`): its shell sends command boundaries. Never reset by RIS.
     pub fn commands_seen(&self) -> bool {
@@ -611,6 +678,11 @@ impl VirtualTerminal {
     /// A command has started and not yet ended.
     pub fn command_running(&self) -> bool {
         self.commands.running()
+    }
+
+    /// The `n`th command (from 0) to start above `floor`.
+    pub fn nth_command_after(&self, floor: u64, n: usize) -> NthCommand {
+        self.commands.nth_after(floor, n)
     }
 
     /// The earliest ended command that started above `floor`.
@@ -634,10 +706,17 @@ impl VirtualTerminal {
         self.commands.state()
     }
 
-    /// Note a line submitted to the pane's program: a CR or LF it was sent
-    /// outside a bracketed paste.
-    pub fn note_line_submitted(&mut self) {
-        self.commands.on_line_submitted();
+    /// Note input sent to the pane's program: whether it submitted a line (a
+    /// CR or LF outside a bracketed paste), and whether keys that submitted
+    /// nothing followed the last submission.
+    pub fn note_input(&mut self, submits: bool, edits: bool) {
+        self.commands.on_input(submits, edits);
+    }
+
+    /// Keys were sent to the shell's prompt since it was drawn and submitted
+    /// nothing: its line editor may hold text, or be in another mode.
+    pub fn input_present(&self) -> bool {
+        self.commands.input_present()
     }
 
     /// The shell is at its prompt with a line submitted to it that has not
@@ -654,11 +733,6 @@ impl VirtualTerminal {
     /// Moves on every boundary that changed [`Self::shell_state`].
     pub fn boundary_marks(&self) -> u64 {
         self.commands.marks()
-    }
-
-    /// The newest command end's stamp, or 0: it moves exactly when one ends.
-    pub fn last_command_end(&self) -> u64 {
-        self.commands.last_end()
     }
 
     /// Turn OSC 7501 program status on or off. Off answers no probe and

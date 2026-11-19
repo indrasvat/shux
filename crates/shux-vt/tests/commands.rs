@@ -306,19 +306,6 @@ fn output_past_the_screen_and_wider_than_it_is_kept_whole() {
 }
 
 #[test]
-fn each_command_keeps_its_own_output() {
-    let mut vt = vt();
-    let floor = shux_vt::program_status_as_of();
-    vt.process_with_responses(&[C, b"one\r\n", &d(";0"), A, C, b"two\r\n", &d(";1"), A].concat());
-    let ended = ended_after(&vt, floor);
-    let texts: Vec<String> = ended
-        .iter()
-        .map(|c| String::from_utf8(output_of(&vt, c).0).unwrap())
-        .collect();
-    assert_eq!(texts, ["one\r\n", "two\r\n"]);
-}
-
-#[test]
 fn a_command_past_the_capture_limit_is_truncated_and_says_so() {
     let mut vt = vt();
     let floor = shux_vt::program_status_as_of();
@@ -411,6 +398,8 @@ enum Ev {
     Out(Vec<u8>),
     /// A line submitted to the pane (input, not output).
     Submit,
+    /// Keys sent to the pane that submit nothing.
+    Keys,
 }
 
 /// The reference: what each event does, written out plainly.
@@ -420,6 +409,9 @@ struct Model {
     prompts: u64,
     /// "at_prompt" or "before_prompt": a submitted line not yet started.
     line: Option<&'static str>,
+    /// Keys at the prompt, or before it was drawn, that submitted nothing.
+    edited: bool,
+    edited_before_prompt: bool,
     open: Option<Vec<u8>>,
     ended: Vec<(Option<i32>, &'static str, Vec<u8>)>,
 }
@@ -440,16 +432,30 @@ impl Model {
                 self.state = Some("at_prompt");
                 self.prompts += 1;
                 self.line = (self.line == Some("before_prompt")).then_some("at_prompt");
+                self.edited = std::mem::take(&mut self.edited_before_prompt);
             }
             Ev::Start => {
                 self.close(None, "next_command");
                 self.open = Some(Vec::new());
                 self.state = Some("running");
                 self.line = None;
+                self.edited = false;
+                self.edited_before_prompt = false;
             }
             Ev::Submit => match self.state {
-                Some("at_prompt") => self.line = Some("at_prompt"),
-                Some("between") => self.line = Some("before_prompt"),
+                Some("at_prompt") => {
+                    self.line = Some("at_prompt");
+                    self.edited = false;
+                }
+                Some("between") => {
+                    self.line = Some("before_prompt");
+                    self.edited_before_prompt = false;
+                }
+                _ => {}
+            },
+            Ev::Keys => match self.state {
+                Some("at_prompt") => self.edited = true,
+                Some("between") => self.edited_before_prompt = true,
                 _ => {}
             },
             Ev::End(code) => {
@@ -469,7 +475,7 @@ fn render(ev: &Ev) -> Vec<u8> {
         Ev::Start => C.to_vec(),
         Ev::End(code) => d(&code.map_or(String::new(), |c| format!(";{c}"))),
         Ev::Out(b) => b.clone(),
-        Ev::Submit => Vec::new(),
+        Ev::Submit | Ev::Keys => Vec::new(),
     }
 }
 
@@ -478,6 +484,7 @@ fn ev_strategy() -> impl Strategy<Value = Ev> {
         Just(Ev::Prompt),
         Just(Ev::Start),
         Just(Ev::Submit),
+        Just(Ev::Keys),
         prop::option::of(-2i32..300).prop_map(Ev::End),
         // Output never holds ESC: an escape could open a string that swallows
         // the next boundary, which the chunking proptest covers separately.
@@ -516,9 +523,9 @@ proptest! {
         for ev in &events {
             let bytes = render(ev);
             model.apply(ev, &bytes);
-            if let Ev::Submit = ev {
+            if let Ev::Submit | Ev::Keys = ev {
                 flush(&mut vt, &mut out, &mut cut);
-                vt.note_line_submitted();
+                vt.note_input(matches!(ev, Ev::Submit), matches!(ev, Ev::Keys));
             } else {
                 out.extend_from_slice(&bytes);
             }
@@ -526,10 +533,10 @@ proptest! {
         flush(&mut vt, &mut out, &mut cut);
         prop_assert_eq!(vt.shell_state().as_str(), model.state.unwrap_or("unknown"));
         prop_assert_eq!(vt.prompts_seen(), model.prompts);
-        prop_assert_eq!(
-            vt.line_pending(),
-            model.line == Some("at_prompt") && model.state == Some("at_prompt")
-        );
+        let at_prompt = model.state == Some("at_prompt");
+        prop_assert_eq!(vt.line_pending(), model.line == Some("at_prompt") && at_prompt);
+        prop_assert_eq!(vt.input_present(), model.edited && at_prompt);
+        prop_assert_eq!(vt.commands_seen(), model.state.is_some());
         let ended = ended_after(&vt, floor);
         let got: Vec<_> = ended
             .iter()
@@ -566,4 +573,189 @@ fn the_ending_sequence_is_never_output_or_counted() {
             assert!(!truncated, "ending={ending:?} split={split:?}");
         }
     }
+}
+
+// ── The line editor's end-of-line mark, drawn before the end is reported ──
+
+/// A command at `cols` wide that wrote `out`, then the mark, then its end.
+fn ended_output(cols: usize, out: &[u8], mark: &[u8]) -> (Vec<u8>, bool) {
+    let mut vt = VirtualTerminal::new(24, cols);
+    let floor = shux_vt::program_status_as_of();
+    vt.process_with_responses(&[C, out, mark, &d(";0")].concat());
+    let ended = ended_after(&vt, floor);
+    output_of(&vt, &ended[0])
+}
+
+/// zsh's PROMPT_SP: `mark`, `cols - w - !xn` spaces, CR, `w` spaces, CR.
+fn zsh_mark(cols: usize, mark: &str, w: usize) -> Vec<u8> {
+    format!("{mark}{}\r{}\r", " ".repeat(cols - w), " ".repeat(w)).into_bytes()
+}
+
+/// ble.sh's prompt_eol_mark, recorded from ble.sh 0.4 at 80 columns.
+const BLE_MARK_80: &[u8] =
+    b"\x1b[m\x0f\x1b7\x1b[0;94m[ble: EOF]\x1b[m\x0f\x1b[m\x0f\x1b8\x1b[78C  \r\x1b[K";
+
+#[test]
+fn zshs_mark_is_not_output_whatever_the_mark() {
+    let default = "\x1b[1m\x1b[7m%\x1b[27m\x1b[1m\x1b[0m";
+    for (cols, mark, w) in [
+        (80, default, 1),
+        (40, default, 1),
+        (80, "", 0),
+        (80, "<EOL>", 5),
+        (80, "\x1b[31m⏎\x1b[0m", 1),
+    ] {
+        for out in [b"a\r\n" as &[u8], b"abc", b"50%", b""] {
+            let (bytes, truncated) = ended_output(cols, out, &zsh_mark(cols, mark, w));
+            assert_eq!(bytes, out, "cols={cols} mark={mark:?}");
+            assert!(!truncated);
+        }
+    }
+}
+
+#[test]
+fn bles_mark_is_not_output_empty_or_not() {
+    let empty = b"\x1b[78C  \r\x1b[K";
+    for mark in [BLE_MARK_80, empty] {
+        for out in [b"a\r\nb\r\n" as &[u8], b"abc", b""] {
+            assert_eq!(ended_output(80, out, mark).0, out, "{mark:?}");
+        }
+    }
+}
+
+/// Output that merely ends like a mark, at a width it does not fit, is the
+/// command's own, in full.
+#[test]
+fn output_shaped_like_a_mark_is_kept() {
+    for out in [
+        b"Loading 100%\r \r" as &[u8],
+        b"issue #\r \r",
+        b"\x1b7hi\x1b8  \r",
+        b"x  \r",
+        b"\x1b[10C  \r\x1b[K",
+        b"a%   \r \r",
+    ] {
+        assert_eq!(ended_output(80, out, b"").0, out, "{out:?}");
+    }
+}
+
+/// A mark after exactly the limit of output: not counted, not truncated.
+#[test]
+fn a_mark_after_exactly_the_limit_is_not_counted() {
+    let body = vec![b'x'; shux_vt::COMMAND_OUTPUT_LIMIT];
+    for mark in [zsh_mark(80, "%", 1), BLE_MARK_80.to_vec()] {
+        let (bytes, truncated) = ended_output(80, &body, &mark);
+        assert_eq!(bytes.len(), body.len());
+        assert!(!truncated, "{mark:?}");
+    }
+}
+
+#[test]
+fn the_mark_is_found_however_the_reads_were_cut() {
+    let mut stream = [C, b"out\r\n"].concat();
+    stream.extend_from_slice(&zsh_mark(80, "%", 1));
+    stream.extend_from_slice(&d(";0"));
+    let mut vt = VirtualTerminal::new(24, 80);
+    let floor = shux_vt::program_status_as_of();
+    feed(&mut vt, &stream, true);
+    assert_eq!(output_of(&vt, &ended_after(&vt, floor)[0]).0, b"out\r\n");
+}
+
+/// Input sent to the prompt: keys that submit nothing leave it edited until
+/// a new prompt; a submitted line is pending until it starts.
+#[test]
+fn input_at_the_prompt_is_tracked_until_a_start_or_a_new_prompt() {
+    let mut vt = vt();
+    vt.process_with_responses(A);
+    assert!(!vt.input_present() && !vt.line_pending());
+    vt.note_input(false, true);
+    assert!(vt.input_present(), "half-typed text");
+    vt.note_input(true, false);
+    assert!(!vt.input_present() && vt.line_pending(), "submitted");
+    vt.process_with_responses(C);
+    assert!(!vt.line_pending());
+    vt.note_input(true, true);
+    assert!(
+        !vt.input_present(),
+        "input while a command runs is the program's"
+    );
+    vt.process_with_responses(&[&d(";0")[..], A].concat());
+    assert!(!vt.input_present() && !vt.line_pending());
+}
+
+// ── What the screen showed for each line the shell read ──────────────────
+
+fn submitted(vt: &VirtualTerminal, floor: u64) -> Vec<String> {
+    vt.submitted_after(floor)
+        .expect("kept")
+        .iter()
+        .map(|s| match s {
+            shux_vt::Submitted::Command { n, line } => format!("command {n}: {}", line.join("|")),
+            shux_vt::Submitted::Rejected { rows } => format!("rejected: {}", rows.join("|")),
+        })
+        .collect()
+}
+
+/// A line as the line editor finally drew it. Recorded from zsh at 80
+/// columns: at the wrap zle writes a character, a space and CR, then the
+/// character again, so the byte stream holds it twice and the screen once.
+#[test]
+fn a_command_line_is_recorded_as_the_screen_shows_it() {
+    let mut vt = VirtualTerminal::new(24, 80);
+    let floor = shux_vt::program_status_as_of();
+    let echo: &[u8] = b"wait-command-prompt % p\x08printf '\\033[38;2;120;220;180mT\\033[38;5;208mI\\033[34mB\\03 \r3\r3[0m\\n'\r\n";
+    vt.process_with_responses(&[A, echo, C].concat());
+    let shown = submitted(&vt, floor).concat();
+    let squeezed: String = shown.chars().filter(|c| !c.is_whitespace()).collect();
+    let typed = r"printf '\033[38;2;120;220;180mT\033[38;5;208mI\033[34mB\033[0m\n'";
+    let want: String = typed.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(squeezed.contains(&want), "{shown}");
+}
+
+/// An input the shell drew a new prompt after, with no start: rejected,
+/// with what the shell replied.
+#[test]
+fn a_rejected_input_is_recorded_with_the_reply() {
+    let mut vt = vt();
+    let floor = shux_vt::program_status_as_of();
+    vt.process_with_responses(
+        &[A, b"$ echo (\r\nbash: syntax error\r\n", A, b"$ ok\r\n", C].concat(),
+    );
+    assert_eq!(
+        submitted(&vt, floor),
+        ["rejected: $ echo (|bash: syntax error", "command 0: $ ok"]
+    );
+}
+
+/// A line read ahead of another keeps its place: they come back in the
+/// order the shell read them.
+#[test]
+fn lines_come_back_in_the_order_the_shell_read_them() {
+    let mut vt = vt();
+    let floor = shux_vt::program_status_as_of();
+    let stream = [
+        A,
+        b"$ sleep 1\r\n",
+        C,
+        b"echo AHEAD\r\n",
+        &d(";0"),
+        A,
+        b"$ echo AHEAD\r\n",
+        C,
+        b"AHEAD\r\n",
+        &d(";0"),
+        A,
+        b"$ echo OURS\r\n",
+        C,
+    ]
+    .concat();
+    vt.process_with_responses(&stream);
+    assert_eq!(
+        submitted(&vt, floor),
+        [
+            "command 0: $ sleep 1",
+            "command 1: $ echo AHEAD",
+            "command 2: $ echo OURS"
+        ]
+    );
 }

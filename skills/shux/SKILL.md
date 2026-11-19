@@ -151,17 +151,20 @@ watcher sees them. `--boundaries osc133` insists on the shell's own marks
 (waiting up to `--timeout` for its prompt); `--boundaries markers` forces the
 old framing.
 
-**Nothing is typed into a pane that is not at its shell's prompt.** The call
-is refused (`error.data.reason`), never guessed at:
+**A line goes only to a shell's empty prompt.** Anything else is refused
+with `error.data.reason`, and nothing is typed. Transient states (a prompt not
+drawn yet, prompt hooks still running) are waited out first, up to `--timeout`:
 
 | `reason` | The pane's input would go to | Do |
 |---|---|---|
 | `command_running` | a command the shell reports running | `pane wait-command`, then retry |
-| `input_pending` | a line already submitted at the prompt that has not started (you sent `send-keys … C-j` just before) | `pane wait-command` for it, then retry |
+| `input_pending` | a line already sent that has not started (`send-keys … C-j` just before, or input still queued) | `pane wait-command` for it, then retry |
+| `input_present` | keys sent to the prompt that submitted nothing: the editor holds text, or is in another mode | `send-keys --data Aw==` (C-c) for a fresh prompt, then retry |
 | `other_program` | another program in the foreground (a REPL, `ssh`, `less`) | wait for it, or `--boundaries markers` to type into it |
 | `hidden_input` | a password prompt (`sudo`, `read -s`) | answer it with `send-keys`, or cancel it |
 | `full_screen` | a full-screen program (an editor) | quit it first |
-| `no_prompt` | nothing yet: no prompt within `--timeout` (only with `--boundaries osc133`) | source the integration |
+| `not_a_shell` | a pane whose program is not a shell, and reports no prompt | `--boundaries markers` to type into it anyway |
+| `no_prompt` | nothing reported a prompt within `--timeout` | source the integration, or `--boundaries markers` |
 
 **`state` says how the command ended:**
 
@@ -169,24 +172,30 @@ is refused (`error.data.reason`), never guessed at:
 |---|---|---|
 | `completed` | it ended: read `exit_code`. `ended_by: "prompt"` / `"next_command"` means the shell never reported the end (a nested shell, `exec bash`), so `exit_code` is null | 0 |
 | `not_run` | the shell drew its next prompt without starting the line: a syntax error or a comment. `stdout` holds what the shell said | 3 |
-| `timed_out` | still running at `--timeout`; `stdout` is what it wrote so far. The pane stays held | 1 |
-| `awaiting_input` | it stopped for hidden input (a password). The pane stays held | 3 |
-| `cancelled` / `pane_gone` / `overrun` | cancelled; the pane went away; more commands ended than are kept | 3 |
+| `timed_out` | still running at `--timeout`; `stdout` is what it wrote so far, and the pane stays held. `phase: "awaiting_start"` means the line never started (the shell may want more input); `hidden_input: true` means the terminal was reading with echo off, as a password prompt does | 1 |
+| `cancelled` / `pane_gone` / `overrun` | cancelled; the pane went away; more lines came ahead of it than are kept | 3 |
 
-- **Keep waiting, don't re-run.** After `timed_out` or `awaiting_input` with
-  `boundaries: osc133`, wait for the same command's end with its output:
+- **Keep waiting, don't re-run.** After `timed_out` with `boundaries: osc133`,
+  wait for the same command's end with its output:
   `shux --format json pane wait-command "$P" --after "$(jq .as_of <<<"$R")" --timeout 1h --output`.
+- **A password prompt** never answers itself: the run times out with
+  `hidden_input: true`. Send the answer with `send-keys`, then wait as above.
+  With `--async`, `pane.command_status` shows `phase: "awaiting_input"` the
+  moment the terminal starts reading with echo off.
 - **One command per pane.** While one holds the pane, another `pane run` is
-  refused, naming its `command_id`. `--async` returns at once; poll with
-  `shux rpc call pane.command_status` (its `phase` is `awaiting_start`, then
-  `executing`), or cancel with `pane.command_cancel`.
+  refused, naming its `running_command_id`. `--async` returns at once; poll
+  with `shux rpc call pane.command_status` (`phase`: `awaiting_start`,
+  `executing`, `awaiting_input`), or cancel with `pane.command_cancel`.
 - **One line.** A control character (Tab, ESC, C-c…) in the command is
-  refused: typed, it would act as a key. A multi-line command falls back to
-  markers.
+  refused: typed, it would act as a key. A shell that reports its boundaries
+  runs one command per line, so join lines with `;` or `&&`.
+- **Which command is yours** is decided from the screen: the first line the
+  shell read whose text holds yours. A line typed ahead of it is never taken
+  for it.
 - **CLI exit codes** are shux's, never the command's: 0 ended, 1 timed out,
-  2 bad arguments or no such pane, 3 everything else (refused, not run,
-  awaiting input…). Errors come as `{"error": {code, message, data}}` on
-  stdout under `--format json`.
+  2 bad arguments or no such pane/session, 3 everything else (refused, not
+  run…). Errors come as `{"error": {code, message, data}}` on stdout under
+  `--format json`. `--timeout` is whole seconds, at most 3600.
 
 ## Wait for a typed command to end, with its exit code
 
@@ -216,12 +225,14 @@ echo "$R" | jq -r .result.output                # exactly what it wrote, however
 - **Under ble.sh,** submit with C-j (`--data Cg==`), not Enter: ble.sh can
   take scripted keystrokes for a paste and wait in `-- MULTILINE --`.
 - `pane status` reports the shell's state as `.result.commands.shell`:
-  `unknown`, `at_prompt`, `running` or `between`, and `.line_pending` is true
-  while a line submitted at the prompt has not started.
+  `unknown`, `at_prompt`, `running` or `between`; `.line_pending` and
+  `.input_present` say whether a line or keys were sent to the prompt.
 
-**Every wait takes at most an hour** (`--timeout 1h`, or `--timeout-ms
-3600000` for `wait-for`), and a longer one is refused, never shortened. For
-longer runs, wait again from the returned `started`.
+**`pane run`, `wait-command`, `wait-status` and `wait-for` take at most an
+hour** (`--timeout 1h`; `--timeout-ms 3600000` for `wait-for`, `--timeout
+3600` for `pane run`), and a longer one is refused with the same error, never
+shortened. For longer runs, wait again from the returned `started`.
+`wait-exit` takes any timeout, or none.
 
 **Which route when:**
 

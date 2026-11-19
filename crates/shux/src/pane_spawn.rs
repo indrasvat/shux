@@ -61,27 +61,65 @@ struct PtyTaskControl {
     probe: Option<shux_pty::PtyOutputProbe>,
 }
 
-/// Whether `bytes` submit a line: a CR or LF outside a bracketed paste.
-/// `in_paste` carries the paste state across chunks.
-fn submits_line(bytes: &[u8], in_paste: &mut bool) -> bool {
+/// What a chunk of input does to a shell's prompt: whether it submits a
+/// line (a CR or LF outside a bracketed paste), and whether keys that submit
+/// nothing follow the last submission. Focus and mouse reports, which a
+/// terminal sends on its own, are neither. `scan` carries a paste, and a
+/// marker cut across chunks, from one chunk to the next.
+fn classify_input(bytes: &[u8], scan: &mut InputScan) -> (bool, bool) {
     const START: &[u8] = b"\x1b[200~";
     const END: &[u8] = b"\x1b[201~";
-    let mut submits = false;
+    let joined = [std::mem::take(&mut scan.held).as_slice(), bytes].concat();
+    let (mut submits, mut edits) = (false, false);
     let mut i = 0;
-    while i < bytes.len() {
-        let rest = &bytes[i..];
-        if rest.starts_with(START) {
-            *in_paste = true;
-            i += START.len();
-        } else if rest.starts_with(END) {
-            *in_paste = false;
-            i += END.len();
-        } else {
-            submits |= !*in_paste && matches!(bytes[i], b'\r' | b'\n');
-            i += 1;
+    while i < joined.len() {
+        let rest = &joined[i..];
+        if rest.len() < START.len() && (START.starts_with(rest) || END.starts_with(rest)) {
+            scan.held = rest.to_vec();
+            break;
         }
+        if rest.starts_with(START) || rest.starts_with(END) {
+            scan.in_paste = rest.starts_with(START);
+            i += START.len();
+            continue;
+        }
+        if !scan.in_paste
+            && let Some(n) = report_len(rest)
+        {
+            i += n;
+            continue;
+        }
+        if !scan.in_paste && matches!(joined[i], b'\r' | b'\n') {
+            submits = true;
+            edits = false;
+        } else {
+            edits = true;
+        }
+        i += 1;
     }
-    submits
+    (submits, edits)
+}
+
+/// A focus or mouse report at the start of `rest`: its length.
+fn report_len(rest: &[u8]) -> Option<usize> {
+    if rest.starts_with(b"\x1b[I") || rest.starts_with(b"\x1b[O") {
+        return Some(3);
+    }
+    if let Some(body) = rest.strip_prefix(b"\x1b[<") {
+        let end = body.iter().position(|&b| b == b'M' || b == b'm')?;
+        return body[..end]
+            .iter()
+            .all(|&b| b.is_ascii_digit() || b == b';')
+            .then_some(3 + end + 1);
+    }
+    (rest.starts_with(b"\x1b[M") && rest.len() >= 6).then_some(6)
+}
+
+#[derive(Default)]
+struct InputScan {
+    in_paste: bool,
+    /// A possible paste marker cut at the end of the last chunk.
+    held: Vec<u8>,
 }
 
 /// Everything bound for the program's input, in order: terminal replies
@@ -265,7 +303,7 @@ async fn run_pane_pty_task(
     let mut staged = StagedOutput::new();
     let mut task_exit = PtyTaskExit::Natural;
     let mut pending = PtyInputQueue::default();
-    let mut submit_in_paste = false;
+    let mut input_scan = InputScan::default();
 
     loop {
         let output_due = staged.due_at();
@@ -510,12 +548,13 @@ async fn run_pane_pty_task(
                     task_exit = PtyTaskExit::RequestedTeardown;
                     break;
                 };
-                if submits_line(&data.bytes, &mut submit_in_paste) {
+                let (submits, edits) = classify_input(&data.bytes, &mut input_scan);
+                if submits || edits {
                     let mut state = io_state.lock().await;
                     if state.is_current(pane_id, incarnation)
                         && let Some(vt) = state.vts.get_mut(&pane_id)
                     {
-                        vt.note_line_submitted();
+                        vt.note_input(submits, edits);
                     }
                 }
                 pending.push_input(data);
@@ -1859,20 +1898,41 @@ mod tests {
         h.stop().await;
     }
 
-    /// What a program taking at most `limit` bytes per write receives.
     #[test]
-    fn a_line_is_submitted_by_cr_or_lf_outside_a_paste() {
-        let mut paste = false;
-        assert!(!super::submits_line(b"echo hi", &mut paste));
-        assert!(super::submits_line(b"echo hi\r", &mut paste));
-        assert!(super::submits_line(b"\n", &mut paste));
-        assert!(!super::submits_line(b"\x1b[200~a\nb\r", &mut paste));
-        assert!(paste, "the paste is still open after its chunk");
-        assert!(!super::submits_line(b"c\n", &mut paste));
-        assert!(super::submits_line(b"\x1b[201~\r", &mut paste));
-        assert!(!paste);
+    fn input_is_classified_by_what_it_does_to_a_prompt() {
+        let classify = |chunks: &[&[u8]]| {
+            let mut scan = super::InputScan::default();
+            chunks
+                .iter()
+                .map(|c| super::classify_input(c, &mut scan))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(classify(&[b"echo hi"]), [(false, true)]);
+        assert_eq!(classify(&[b"echo hi\r"]), [(true, false)]);
+        assert_eq!(
+            classify(&[b"a\rb"]),
+            [(true, true)],
+            "keys after the submission"
+        );
+        assert_eq!(classify(&[b"\x1b[D\x1b[D"]), [(false, true)], "arrows edit");
+        assert_eq!(
+            classify(&[b"\x1b[I\x1b[<0;3;4M\x1b[O"]),
+            [(false, false)],
+            "reports do not"
+        );
+        assert_eq!(
+            classify(&[b"\x1b[200~a\nb\r", b"c\n", b"\x1b[201~\r"]),
+            [(false, true), (false, true), (true, false)],
+            "a newline inside a paste submits nothing"
+        );
+        assert_eq!(
+            classify(&[b"\x1b[200~x\x1b[20", b"1~\r"]),
+            [(false, true), (true, false)],
+            "a paste end cut across chunks still ends it"
+        );
     }
 
+    /// What a program taking at most `limit` bytes per write receives.
     fn write(q: &mut PtyInputQueue, limit: usize) -> Vec<u8> {
         let mut sent = Vec::new();
         while !q.is_empty() && sent.len() < limit {

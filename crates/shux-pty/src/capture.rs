@@ -52,9 +52,9 @@ pub fn strip_ansi(input: &str) -> String {
                         }
                     }
                 }
-                Some('P') => {
-                    // DCS sequence: ESC P ... ST (ESC \)
-                    chars.next(); // consume 'P'
+                Some('P' | 'X' | '^' | '_') => {
+                    // DCS, SOS, PM or APC string: ESC P|X|^|_ ... ST (ESC \)
+                    chars.next(); // consume the introducer
                     while let Some(c) = chars.next() {
                         if c == '\x1b' {
                             if chars.peek() == Some(&'\\') {
@@ -101,6 +101,16 @@ pub fn strip_ansi(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// APC (kitty graphics), PM and SOS strings are terminal control, not
+    /// text: a graphics transfer must not land in a command's output.
+    #[test]
+    fn application_strings_are_not_text() {
+        assert_eq!(
+            strip_ansi("\x1b_Gf=100;QUFB\x1b\\K\x1b^pm\x1b\\L\x1bXsos\x1b\\M\n"),
+            "KLM\n"
+        );
+    }
+
     use super::*;
 
     #[test]

@@ -100,9 +100,10 @@ shux --format json pane run -s build -c 'cargo test' | jq '{state, exit_code, st
 # With `eval "$(shux shell-integration bash)"` in the pane shell's rc, the
 # pane shows only the command and its output (`boundaries: "osc133"`);
 # without it, markers frame the line (`"markers"`).
-# Nothing is typed into a pane that is not at its shell's prompt (a command
-# running, a password prompt, another program in front, a full-screen one):
-# the error's `data.reason` says which.
+# A line goes only to a shell's empty prompt: a command running, a line
+# already sent, keys at the prompt, a password prompt, another program in
+# front or a full-screen one is refused, and the error's `data.reason` says
+# which. A line typed ahead is never taken for yours.
 # The CLI's own exit status is not the command's: read `exit_code`. It is
 # 0 ended, 1 timed out, 2 bad arguments or no such pane, 3 anything else.
 # A pane runs one command at a time: while one runs, another `pane run` is
@@ -131,7 +132,8 @@ shux pane send-keys -s build --text 'make' && shux pane send-keys -s build --dat
 shux --format json pane wait-command "$PANE" --after "$AS_OF" --timeout 10m --output \
   | jq '.result | {exit_code, output}'
 # The next command: pass the returned `.result.started` as `--after`.
-# Every wait takes at most `--timeout 1h`; a longer one is refused.
+# pane run, wait-command, wait-status and wait-for take at most an hour; a
+# longer timeout is refused, never shortened.
 
 # Capture the last N lines of pane output:
 shux pane capture -s build --lines 50 --format json
