@@ -64,7 +64,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
       - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32  # v2.88.0
         with:
-          tool: nextest
+          tool: nextest@0.9.133  # the pin in scripts/ensure-nextest.sh
 
       - name: Count workspace tests (stamped into version.json so the
           landing page can show a live "N tests passing" chip)

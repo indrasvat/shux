@@ -1,0 +1,23 @@
+# The expiry of a short wait is the asserted outcome. Statements are matched
+# structurally; inside assert! (a token tree) by text.
+id: absence-by-timeout
+language: rust
+rule:
+  all:
+    - any:
+        - pattern: timeout($D, $F).await.is_err()
+        - pattern: tokio::time::timeout($D, $F).await.is_err()
+        - pattern: time::timeout($D, $F).await.is_err()
+        - pattern: $R.recv_timeout($D).is_err()
+        - pattern: let Err(_) = timeout($D, $F).await
+        - pattern: let Err(_) = tokio::time::timeout($D, $F).await
+        - kind: macro_invocation
+          regex: '^(debug_)?assert!\s*\((?s:.)*?(timeout(_at)?\((?s:.)*?\.await\s*\.is_err\(\)|!\s*(shux_testkit::)?poll_until(_async)?\(|recv_timeout\((?s:.)*?\.is_err\(\)|\bpoll(_async)?\((?s:.)*?\.is_none\(\))'
+        - pattern: "!poll_until($$$)"
+        - pattern: "!shux_testkit::poll_until($$$)"
+        - pattern: poll($$$).is_none()
+    - not:
+        matches: paused-clock
+    # A zero timeout is one poll (is it still pending?), and BUDGET bounds failure.
+    - not:
+        regex: 'Duration::ZERO|BUDGET'

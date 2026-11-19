@@ -1,0 +1,18 @@
+# The test-only rules see a unit test only inside a `#[cfg(test)] mod`. clippy's
+# `tests_outside_test_module` cannot do this: `[lints]` would apply it to every
+# integration-test crate too, where each item is test code by design.
+id: test-outside-cfg-test
+language: rust
+severity: error
+message: "a test outside a `#[cfg(test)] mod` is invisible to the test-only rules; move it into one, or list a test-only file in every rule's `files`"
+files:
+  - "crates/*/src/**/*.rs"
+ignores:
+  - "crates/shux/src/rpc/test_harness.rs"
+  - "crates/shux/src/rpc/surface_tests.rs"
+  - "crates/shux/src/cli/test_support.rs"
+rule:
+  kind: attribute_item
+  regex: '^#\[(tokio::)?test\b'
+  not:
+    matches: in-cfg-test

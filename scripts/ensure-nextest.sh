@@ -12,8 +12,19 @@
 # already on PATH this exits immediately.
 set -euo pipefail
 
+# One version for every machine and CI (`.github/workflows/ci.yml` installs the
+# same): a runner that differs locally and in CI reports differently, and
+# `--stress-count`'s exit code is a version-dependent fact (scripts/test-stress.sh).
+NEXTEST_VERSION=0.9.133
+
 if command -v cargo-nextest >/dev/null 2>&1; then
-  exit 0
+  have="$(cargo-nextest nextest --version 2>/dev/null | awk 'NR == 1 {print $2}')"
+  if [ "${have}" = "${NEXTEST_VERSION}" ]; then
+    exit 0
+  fi
+  echo "error: cargo-nextest ${have:-of unknown version} is on PATH; this repo pins ${NEXTEST_VERSION}." >&2
+  echo "       cargo install cargo-nextest --locked --version ${NEXTEST_VERSION}" >&2
+  exit 1
 fi
 
 cargo_bin="${CARGO_HOME:-${HOME}/.cargo}/bin"
@@ -54,7 +65,7 @@ if [ -n "${platform}" ] && command -v curl >/dev/null 2>&1; then
   # it. Inside a bare `echo "$(...)"` a broken binary's failure is swallowed by
   # the enclosing echo, `set -e` never fires, and the script exits 0 having
   # installed something that cannot run.
-  if curl -fsSL --retry 3 "https://get.nexte.st/latest/${platform}" -o "${tmp}/nextest.tar.gz" \
+  if curl -fsSL --retry 3 "https://get.nexte.st/${NEXTEST_VERSION}/${platform}" -o "${tmp}/nextest.tar.gz" \
      && tar zxf "${tmp}/nextest.tar.gz" -C "${cargo_bin}" \
      && version="$("${cargo_bin}/cargo-nextest" nextest --version 2>/dev/null)" \
      && [ -n "${version}" ]; then
@@ -67,9 +78,9 @@ fi
 
 if command -v cargo-binstall >/dev/null 2>&1; then
   echo "▶ Installing cargo-nextest via cargo-binstall..."
-  cargo binstall --no-confirm cargo-nextest
+  cargo binstall --no-confirm "cargo-nextest@${NEXTEST_VERSION}"
   exit 0
 fi
 
 echo "▶ Installing cargo-nextest from source (slow — no pre-built path available)..."
-cargo install cargo-nextest --locked
+cargo install cargo-nextest --locked --version "${NEXTEST_VERSION}"

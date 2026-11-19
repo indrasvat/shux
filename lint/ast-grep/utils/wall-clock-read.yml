@@ -1,0 +1,15 @@
+# A measurement or a deadline taken from the clock. A clock value passed as
+# data (a timestamp argument, a `now` handed to the code under test) is not.
+id: wall-clock-read
+language: rust
+rule:
+  all:
+    - any:
+        - pattern: Instant::now() + $D
+        - pattern: std::time::Instant::now() + $D
+        - pattern: tokio::time::Instant::now() + $D
+        - pattern: $X.elapsed()
+        - pattern: $X.saturating_duration_since(Instant::now())
+        - pattern: $X.duration_since(Instant::now())
+    - not:
+        matches: paused-clock

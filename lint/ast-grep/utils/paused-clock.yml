@@ -1,0 +1,20 @@
+# A test on a driven clock (paused tokio time, or shux-vt's test_clock seam):
+# elapsed time there is deterministic.
+id: paused-clock
+language: rust
+rule:
+  inside:
+    stopBy: end
+    kind: function_item
+    any:
+      - follows:
+          stopBy:
+            not:
+              kind: attribute_item
+          regex: start_paused\s*=\s*true
+      - has:
+          stopBy: end
+          any:
+            - pattern: tokio::time::pause()
+            - pattern: time::pause()
+            - pattern: test_clock::Frozen::new()

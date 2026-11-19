@@ -760,7 +760,7 @@ fmt: ## Format all code
 	@echo "$(COLOR_GREEN)✓ Formatting complete$(COLOR_RESET)"
 
 .PHONY: check-after-hygiene
-check-after-hygiene: lint shellcheck check-test-sleeps check-darwin test check-build-rerun check-test-groups check-test-opt-out check-test-inventory check-ci-parity test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-lens-frozen check-no-bin-mods check-action-pins check-vt-corpus-scratch
+check-after-hygiene: lint shellcheck check-test-sleeps check-test-timing check-test-ignores check-darwin test check-build-rerun check-test-groups check-test-opt-out check-test-inventory check-ci-parity test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-lens-frozen check-no-bin-mods check-action-pins check-vt-corpus-scratch
 
 .PHONY: check
 check: hooks-check check-target-hygiene ## Run lint + test + process/QA guards (what pre-commit runs)
@@ -772,7 +772,7 @@ check: hooks-check check-target-hygiene ## Run lint + test + process/QA guards (
 	@echo ""
 
 .PHONY: ci
-ci: lint shellcheck check-test-sleeps check-darwin test check-test-groups check-test-inventory check-ci-parity test-doc test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-no-bin-mods check-action-pins check-vt-corpus-scratch ## Run the CI pipeline locally (lint + full test + doc tests + process/QA guards)
+ci: lint shellcheck check-test-sleeps check-test-timing check-test-ignores check-darwin test check-test-groups check-test-inventory check-ci-parity test-doc test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-no-bin-mods check-action-pins check-vt-corpus-scratch ## Run the CI pipeline locally (lint + full test + doc tests + process/QA guards)
 	@echo ""
 	@echo "$(COLOR_GREEN)$(COLOR_BOLD)✓ CI pipeline passed!$(COLOR_RESET)"
 	@echo ""
@@ -833,6 +833,21 @@ vt-neutrality: ## Prove a diff moves no VT cell/pixel: BASE=<merge-base sha> [SC
 check-test-sleeps: ## No raw sleeps in crates/*/tests, no waivers of the sleep ban (the hook's check; clippy covers the rest)
 	@bash scripts/check-test-sleeps-selftest.sh
 	@bash scripts/check-test-sleeps.sh
+
+.PHONY: check-test-timing
+check-test-timing: ## No timing in disguise in test code: the ast-grep rules in lint/ast-grep (the hook's check too)
+	@bash scripts/ensure-ast-grep.sh
+	@bash scripts/check-test-timing-selftest.sh
+	@bash scripts/check-test-timing.sh
+
+.PHONY: check-test-ignores
+check-test-ignores: ## Every #[ignore] names an open issue ("see #N") or is a "generator:"; issue state read with gh
+	@bash scripts/check-test-ignores-selftest.sh
+	@bash scripts/check-test-ignores.sh
+
+.PHONY: flake-gate
+flake-gate: nextest-ready ## Run the tests a branch adds or changes FLAKE_COUNT times under CPU load (BASE=<ref>, FLAKE_COUNT, FLAKE_LOAD)
+	@NEXTEST_JOBS=$(NEXTEST_JOBS) .shux/scripts/no_leak_guard.sh bash scripts/flake-gate.sh
 
 .PHONY: shellcheck
 shellcheck: ## shellcheck every tracked shell script (the layer the guards live in)

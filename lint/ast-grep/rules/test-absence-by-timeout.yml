@@ -1,0 +1,26 @@
+id: test-absence-by-timeout
+language: rust
+severity: error
+message: "absence asserted by letting a short wait expire; fence it behind a later ordered event, then assert"
+note: "docs/testing.md#which-wait-to-use"
+files:
+  - "crates/*/tests/**/*.rs"
+  - "crates/shux/src/rpc/test_harness.rs"
+  - "crates/shux/src/rpc/surface_tests.rs"
+  - "crates/shux/src/cli/test_support.rs"
+rule:
+  matches: absence-by-timeout
+---
+id: test-absence-by-timeout-unit
+language: rust
+severity: error
+message: "absence asserted by letting a short wait expire; fence it behind a later ordered event, then assert"
+note: "docs/testing.md#which-wait-to-use"
+files:
+  - "crates/*/src/**/*.rs"
+ignores:
+  - "crates/shux-testkit/**"
+rule:
+  all:
+    - matches: absence-by-timeout
+    - matches: in-cfg-test

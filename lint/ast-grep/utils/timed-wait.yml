@@ -1,0 +1,16 @@
+# A timed blocking wait. One bounded by the shared BUDGET (it bounds failure,
+# success is the receipt) is not matched.
+id: timed-wait
+language: rust
+rule:
+  all:
+    - any:
+        - pattern: $R.recv_timeout($$$)
+        - pattern: $R.recv_deadline($$$)
+        - pattern: std::thread::park_timeout($$$)
+        - pattern: thread::park_timeout($$$)
+        - pattern: park_timeout($$$)
+        - pattern: $C.wait_timeout($$$)
+        - pattern: $C.wait_timeout_while($$$)
+    - not:
+        regex: '(?i)budget|\bleft\b|remaining'

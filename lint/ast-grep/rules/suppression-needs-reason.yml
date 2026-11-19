@@ -1,0 +1,13 @@
+id: suppression-needs-reason
+language: rust
+severity: error
+message: "an ast-grep-ignore needs a `// why: ...` comment on the line above it"
+files:
+  - "crates/**/*.rs"
+rule:
+  kind: line_comment
+  regex: '^//\s*ast-grep-ignore'
+  not:
+    follows:
+      kind: line_comment
+      regex: '^//\s*why:\s*\S'

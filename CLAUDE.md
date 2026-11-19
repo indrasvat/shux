@@ -32,6 +32,9 @@ make shellcheck         # every tracked shell script (the guards live in shell)
 make test-gui-terminal  # what a REAL GUI terminal (kitty/Xvfb) draws from shux's output
 make reap               # stop daemons this checkout leaked when a run was interrupted
 make test-stress        # repeat tests under CPU load (STRESS_COUNT/FILTER/LOAD) to expose timing
+make check-test-timing  # ast-grep bans on timing in disguise in test code (lint/ast-grep/)
+make check-test-ignores # every #[ignore] names an open issue ("see #N") or is a "generator:"
+make flake-gate         # the tests a branch adds or changes, 20x under CPU load (CI runs it on PRs)
 make fuzz               # libFuzzer targets in fuzz/ (FUZZ_SECONDS each); crashes land in fuzz/artifacts/
 make install / hooks    # install binary / lefthook hooks
 ```
@@ -116,8 +119,12 @@ Colour-probed `printf`/`cat` is the letter, not the spirit.
 ## Verification discipline
 
 - **No timing-based tests: wait for a condition, never for time.** Deadlines bound
-  failure, never success. Use `shux-testkit`; clippy bans raw sleeps. Patterns, the
-  exemption form and how to prove a de-flake: `docs/testing.md`.
+  failure, never success. Use `shux-testkit`; clippy bans raw sleeps, and
+  `make check-test-timing` bans the shapes that hide one (wall-clock bounds, absence
+  by timeout, timed waits, sleep-then-act fixtures). A flaky test is fixed by its
+  shape, never retried, never given a longer timeout, never `#[ignore]`d without an
+  open issue. New and changed tests run 20x under load in CI's flake gate. Patterns,
+  the escape form and how to prove a de-flake: `docs/testing.md`.
 - **Prove a check can FAIL before trusting it to pass.** Run every gate/guard/comparator
   against a reintroduced defect AND empty input.
 - **Anything that parses cargo output pins `--color never` at the call site.** CI

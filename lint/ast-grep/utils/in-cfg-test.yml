@@ -1,0 +1,12 @@
+# Inside a `#[cfg(test)] mod` (other attributes may sit between).
+id: in-cfg-test
+language: rust
+rule:
+  inside:
+    stopBy: end
+    kind: mod_item
+    follows:
+      stopBy:
+        not:
+          kind: attribute_item
+      pattern: "#[cfg(test)]"

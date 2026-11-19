@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Make sure the pinned ast-grep is on PATH for `make check-test-timing`.
+#
+# The rules in lint/ast-grep/ are pinned to one ast-grep version because a
+# different parser can match different nodes, and a rule that silently stops
+# matching guards nothing. Prefers an existing install of the pinned version,
+# then a pre-built wheel through uv or pip, then npm. Fails loudly rather than
+# letting the guard run on whatever it finds.
+set -euo pipefail
+
+version=0.51.3
+
+have() { command -v ast-grep >/dev/null && [[ "$(ast-grep --version | awk '{print $2}')" == "$version" ]]; }
+have && exit 0
+
+echo "▶ installing ast-grep $version" >&2
+if command -v uv >/dev/null; then
+    uv tool install --force "ast-grep-cli==$version" >&2
+elif command -v pip3 >/dev/null; then
+    pip3 install --user "ast-grep-cli==$version" >&2
+elif command -v npm >/dev/null; then
+    npm install --global "@ast-grep/cli@$version" >&2
+else
+    echo "ensure-ast-grep: no uv, pip3 or npm to install ast-grep $version with" >&2
+    exit 1
+fi
+hash -r
+have || {
+    echo "ensure-ast-grep: installed ast-grep $version, but \`ast-grep --version\` on PATH says: $(ast-grep --version 2>&1 || echo 'not found')" >&2
+    exit 1
+}
