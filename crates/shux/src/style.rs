@@ -1699,29 +1699,60 @@ pub fn print_run_command(result: &serde_json::Value, is_async: bool) {
             .get("runtime_ms")
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
-        let stdout = result.get("stdout").and_then(|v| v.as_str()).unwrap_or("");
-
+        let ended_by = result.get("ended_by").and_then(|v| v.as_str());
         let status = match (state, exit_code) {
             ("completed", Some(0)) => format!("{}", success("✓ completed")),
             ("completed", Some(code)) => format!("{}", error(&format!("✗ exit {code}"))),
+            ("completed", None) => format!(
+                "{}",
+                warning(&format!(
+                    "✓ completed, exit code unknown: the shell {} without reporting it",
+                    if ended_by == Some("next_command") {
+                        "started another command"
+                    } else {
+                        "drew a prompt"
+                    }
+                ))
+            ),
+            ("not_run", _) => format!(
+                "{}",
+                error("✗ not run: the shell drew its next prompt without starting the line")
+            ),
             ("timed_out", _) => format!("{}", warning("⏱ timed out")),
+            ("awaiting_input", _) => format!(
+                "{}",
+                warning("⏸ waiting on hidden input (a password prompt?): send it, or cancel")
+            ),
             ("cancelled", _) => format!("{}", warning("⊘ cancelled")),
             ("pane_gone", _) => format!("{}", warning("⊘ the pane ended first")),
+            ("overrun", _) => format!(
+                "{}",
+                warning("✗ more commands ended than are kept; its result is lost")
+            ),
             _ => format!("{}", muted(state)),
         };
         println!("{status} {}", muted(&format!("({runtime_ms}ms)")));
-        if !stdout.is_empty() {
-            print!("{stdout}");
+        print_command_output(result, "stdout", "truncated");
+    }
+}
+
+/// A command's captured output, then a note if it was cut at the limit.
+fn print_command_output(result: &serde_json::Value, field: &str, truncated: &str) {
+    let text = result.get(field).and_then(|v| v.as_str()).unwrap_or("");
+    if !text.is_empty() {
+        print!("{text}");
+        if !text.ends_with('\n') {
+            println!();
         }
-        if result.get("truncated").and_then(|v| v.as_bool()) == Some(true) {
-            println!(
-                "{}",
-                warning(&format!(
-                    "… output past {} MiB was dropped",
-                    shux_pty::CAPTURE_LIMIT >> 20
-                ))
-            );
-        }
+    }
+    if result.get(truncated).and_then(|v| v.as_bool()) == Some(true) {
+        println!(
+            "{}",
+            warning(&format!(
+                "… output past {} MiB was dropped",
+                shux_pty::CAPTURE_LIMIT >> 20
+            ))
+        );
     }
 }
 
@@ -2066,6 +2097,13 @@ pub fn print_pane_wait_command(result: &serde_json::Value) {
                 muted(pane_id),
                 code
             );
+            print_command_output(result, "output", "output_truncated");
+            if result.get("output_evicted").and_then(|v| v.as_bool()) == Some(true) {
+                println!(
+                    "{}",
+                    warning("… its output is no longer kept: newer commands' took its place")
+                );
+            }
         }
         "timeout" if result.get("no_integration").and_then(|v| v.as_bool()) == Some(true) => {
             println!(

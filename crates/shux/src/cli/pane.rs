@@ -902,6 +902,7 @@ pub async fn handle_pane_run(
     command: &str,
     timeout: u64,
     is_async: bool,
+    boundaries: super::args::RunBoundaries,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
     let (session_id, window_id) = resolve_pane_window_id(stream, session_name, window_spec).await?;
@@ -912,13 +913,25 @@ pub async fn handle_pane_run(
         "command": command,
         "timeout": timeout,
         "async": is_async,
+        "boundaries": boundaries.as_str(),
     });
 
     if let Some(pid) = pane_spec {
         params["pane_id"] = serde_json::Value::String(pid.to_string());
     }
 
-    let result = rpc_call(stream, "pane.run_command", params).await?;
+    let result = match super::program_status::call_wait(
+        stream,
+        "pane.run_command",
+        "pane run",
+        params,
+        format,
+    )
+    .await?
+    {
+        Ok(result) => result,
+        Err(code) => std::process::exit(code),
+    };
 
     match format {
         OutputFormat::Json => {
@@ -931,8 +944,14 @@ pub async fn handle_pane_run(
             crate::style::print_run_command(&result, is_async);
         }
     }
-
-    Ok(())
+    if is_async {
+        return Ok(());
+    }
+    match result.get("state").and_then(|v| v.as_str()) {
+        Some("completed") => Ok(()),
+        Some("timed_out") => std::process::exit(1),
+        _ => std::process::exit(3),
+    }
 }
 
 /// Handle the `shux pane capture` command.
@@ -1143,6 +1162,7 @@ mod tests {
             "make test",
             60,
             true,
+            super::super::args::RunBoundaries::Auto,
             OutputFormat::Json,
         )
         .await

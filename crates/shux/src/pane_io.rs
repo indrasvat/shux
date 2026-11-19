@@ -65,6 +65,8 @@ pub(crate) enum CommandStart {
     /// `timed_out`).
     Busy(uuid::Uuid, String),
     PaneGone,
+    /// An OSC 133 line is typed only at a drawn prompt; the shell is here.
+    NotAtPrompt(shux_vt::ShellState),
 }
 
 /// Shared state for pane I/O operations (PTY writes, VT state, command tracking).
@@ -95,9 +97,10 @@ pub struct PaneIoState {
     /// its previous task is still winding down belongs to the newer task; the
     /// older one must not touch its VT, handles or exit status.
     pub incarnations: HashMap<shux_core::model::PaneId, u64>,
-    /// Bumped whenever a command ends in any pane (OSC 133 `D`, or a prompt
-    /// or start that ends one): `pane.wait_command` wakes on it.
-    pub commands_ended: tokio::sync::watch::Sender<u64>,
+    /// Bumped whenever a pane's shell reports a boundary that moves its state
+    /// (OSC 133 `A`, `C`, `D`): `pane.wait_command` and `pane.run_command`
+    /// wake on it.
+    pub boundaries_moved: tokio::sync::watch::Sender<u64>,
     /// Panes whose last spawn failed and that have never run a program.
     pub failed_spawns: std::collections::HashSet<shux_core::model::PaneId>,
     /// Completion waiters for PTY tasks that were already explicitly torn
@@ -211,7 +214,7 @@ impl PaneIoState {
             pty_done: HashMap::new(),
             scratch_ends: HashMap::new(),
             incarnations: HashMap::new(),
-            commands_ended: tokio::sync::watch::Sender::new(0),
+            boundaries_moved: tokio::sync::watch::Sender::new(0),
             failed_spawns: Default::default(),
             teardown_waiters: Vec::new(),
             vts: HashMap::new(),
@@ -311,7 +314,8 @@ impl PaneIoState {
     }
 
     /// Track `prepared` as `pane_id`'s running command and queue its line
-    /// through `permit`, both under this one lock. Its timeout counts from
+    /// through `permit`, both under this one lock. `completion_tx` is taken
+    /// only when the command is tracked. Its timeout counts from
     /// `requested_at`, so time spent waiting for the permit is not given twice.
     pub(crate) fn start_command(
         &mut self,
@@ -319,15 +323,30 @@ impl PaneIoState {
         permit: InputPermit,
         prepared: shux_pty::PreparedCommand,
         (requested_at, timeout): (std::time::Instant, std::time::Duration),
-        completion_tx: Option<tokio::sync::oneshot::Sender<shux_pty::CommandResult>>,
+        completion_tx: &mut Option<tokio::sync::oneshot::Sender<shux_pty::CommandResult>>,
     ) -> CommandStart {
         if !self.is_current_writer(pane_id, &permit) {
             return CommandStart::PaneGone;
         }
+        let mut prepared = prepared;
+        if prepared.boundaries() == shux_pty::Boundaries::Osc133 {
+            let Some(vt) = self.vts.get(&pane_id) else {
+                return CommandStart::PaneGone;
+            };
+            if vt.shell_state() != shux_vt::ShellState::AtPrompt {
+                return CommandStart::NotAtPrompt(vt.shell_state());
+            }
+            // Read in the hold that queues the line: the PTY task cannot
+            // process a boundary between the two.
+            prepared.anchor(shux_pty::Osc133Anchor {
+                floor: shux_vt::program_status_as_of(),
+                prompts: vt.prompts_seen(),
+            });
+        }
         let left = timeout.saturating_sub(requested_at.elapsed());
         match self
             .cmd_engine
-            .register(pane_id.0, prepared, left, completion_tx)
+            .register(pane_id.0, prepared, left, completion_tx.take())
         {
             Err(running) => {
                 let state = self.cmd_engine.get_status(running).map(|r| r.state);
@@ -338,11 +357,106 @@ impl PaneIoState {
                     CommandStart::Started(id)
                 } else {
                     // The PTY task stopped reading before its `forget_pane`.
-                    self.cmd_engine.forget_pane(pane_id.0);
+                    self.forget_command(pane_id);
                     CommandStart::PaneGone
                 }
             }
         }
+    }
+
+    /// Answer an OSC 133 command from what the pane's terminal now reports.
+    /// Called after each batch of the pane's output.
+    pub(crate) fn settle_osc133(&mut self, pane_id: shux_core::model::PaneId) {
+        let Some((id, anchor, begun)) = self.cmd_engine.osc133_holder(pane_id.0) else {
+            return;
+        };
+        let Some(vt) = self.vts.get(&pane_id) else {
+            return;
+        };
+        let end = match vt.command_after(anchor.floor) {
+            shux_vt::CommandLookup::Found(c) => {
+                let out = vt.command_output(c.started);
+                shux_pty::Osc133End::Ended {
+                    exit_code: c.exit_code,
+                    ended_by: c.ended_by.as_str(),
+                    output: out.map(|o| o.bytes.to_vec()).unwrap_or_default(),
+                    // Let go of already: never in practice, as this runs per batch.
+                    truncated: out.is_none_or(|o| o.truncated),
+                }
+            }
+            shux_vt::CommandLookup::Overrun => shux_pty::Osc133End::Overrun,
+            shux_vt::CommandLookup::Pending => {
+                if vt.running_command_output(anchor.floor).is_some() {
+                    if !begun {
+                        self.cmd_engine.osc133_started(id);
+                    }
+                    return;
+                }
+                if vt.prompts_seen() == anchor.prompts {
+                    return;
+                }
+                shux_pty::Osc133End::NotRun
+            }
+        };
+        self.cmd_engine.osc133_end(id, end);
+    }
+
+    /// Copy what a started OSC 133 command has written so far from the
+    /// terminal into the engine, before its result is frozen.
+    fn osc133_output_so_far(&mut self, pane_id: shux_core::model::PaneId, id: uuid::Uuid) {
+        let Some((holder, anchor, true)) = self.cmd_engine.osc133_holder(pane_id.0) else {
+            return;
+        };
+        if holder != id {
+            return;
+        }
+        if let Some(out) = self
+            .vts
+            .get(&pane_id)
+            .and_then(|vt| vt.running_command_output(anchor.floor))
+        {
+            let (raw, truncated) = (out.bytes.to_vec(), out.truncated);
+            self.cmd_engine.osc133_output_so_far(id, &raw, truncated);
+        }
+    }
+
+    /// Time out commands past their timeout, and answer those whose program
+    /// waits on hidden input; an OSC 133 one with the output so far.
+    pub(crate) fn check_command_timeouts(&mut self) -> Vec<(uuid::Uuid, shux_pty::CommandResult)> {
+        for id in self.cmd_engine.osc133_due() {
+            if let Some(pane) = self.cmd_engine.get_pane(id) {
+                self.osc133_output_so_far(shux_core::model::PaneId::from_uuid(pane), id);
+            }
+        }
+        for (id, pane) in self.cmd_engine.started() {
+            let pane = shux_core::model::PaneId::from_uuid(pane);
+            let hidden = self
+                .sync_gates
+                .get(&pane)
+                .and_then(|p| p.foreground())
+                .is_some_and(|f| f.hidden_input);
+            if hidden {
+                self.osc133_output_so_far(pane, id);
+                self.cmd_engine.awaiting_input(id);
+            }
+        }
+        self.cmd_engine.check_timeouts()
+    }
+
+    /// Cancel `command_id`, freezing what it has written so far.
+    pub(crate) fn cancel_command(&mut self, command_id: uuid::Uuid) -> Option<uuid::Uuid> {
+        if let Some(pane) = self.cmd_engine.get_pane(command_id) {
+            self.osc133_output_so_far(shux_core::model::PaneId::from_uuid(pane), command_id);
+        }
+        self.cmd_engine.cancel_command(command_id)
+    }
+
+    /// The pane is going: answer its command with what it wrote so far.
+    pub(crate) fn forget_command(&mut self, pane_id: shux_core::model::PaneId) {
+        if let Some((id, _, _)) = self.cmd_engine.osc133_holder(pane_id.0) {
+            self.osc133_output_so_far(pane_id, id);
+        }
+        self.cmd_engine.forget_pane(pane_id.0);
     }
 
     /// [`Self::send_outside_paste`] without waiting for room, taking it from
@@ -384,7 +498,7 @@ impl PaneIoState {
             self.writers.remove(pane_id);
             // A command still running in the pane is answered now, not at
             // its timeout.
-            self.cmd_engine.forget_pane(pane_id.0);
+            self.forget_command(*pane_id);
             self.sync_gates.remove(pane_id);
             self.resizers.remove(pane_id);
             if let Some(rx) = self.pty_done.remove(pane_id) {
@@ -613,7 +727,7 @@ mod tests {
             permit,
             prepared,
             (std::time::Instant::now(), timeout),
-            None,
+            &mut None,
         );
         assert_eq!(start, CommandStart::PaneGone);
         let next = shux_pty::CommandEngine::prepare("true", &[]);
@@ -641,7 +755,7 @@ mod tests {
             .checked_sub(std::time::Duration::from_secs(2))
             .unwrap();
         let timeout = std::time::Duration::from_secs(1);
-        let start = state.start_command(pane_id, permit, prepared, (asked, timeout), None);
+        let start = state.start_command(pane_id, permit, prepared, (asked, timeout), &mut None);
         assert!(matches!(start, CommandStart::Started(_)), "{start:?}");
         assert_eq!(
             state.cmd_engine.check_timeouts().len(),
@@ -662,7 +776,7 @@ mod tests {
         let start = |state: &mut PaneIoState, timeout| {
             let prepared = shux_pty::CommandEngine::prepare("read -r x", &[]);
             let permit = writer.try_reserve(prepared.line().len()).unwrap();
-            state.start_command(pane_id, permit, prepared, (now, timeout), None)
+            state.start_command(pane_id, permit, prepared, (now, timeout), &mut None)
         };
         let CommandStart::Started(first) = start(&mut state, std::time::Duration::ZERO) else {
             panic!("the first command did not start");

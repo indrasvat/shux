@@ -27,6 +27,24 @@ fn modern_bash() -> Option<String> {
     .map(str::to_string)
 }
 
+/// An interactive shell the test runs itself, in a session of its own. One
+/// that shares the caller's terminal opens it, and a run of the tests from a
+/// terminal then leaves it stopped by SIGTTOU until the test times out.
+fn detached(program: &str) -> Command {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = Command::new(program);
+    // SAFETY: `setsid` is async-signal-safe and touches no memory of the
+    // parent: what `pre_exec` requires between fork and exec.
+    unsafe {
+        cmd.pre_exec(|| {
+            nix::unistd::setsid()
+                .map(drop)
+                .map_err(std::io::Error::from)
+        });
+    }
+    cmd
+}
+
 fn has(shell: &str) -> bool {
     Command::new(shell)
         .args(["-c", "true"])
@@ -37,6 +55,17 @@ fn has(shell: &str) -> bool {
 /// A session `ws` running `shell` with an rc that sets a known prompt and,
 /// when `integrate`, sources the shell integration. Returns the pane id.
 fn start(env: &Env, rc: &tempfile::TempDir, shell: &str, integrate: bool) -> String {
+    start_with(env, rc, shell, integrate, "")
+}
+
+/// [`start`], with `before_hook` in the rc ahead of the integration.
+fn start_with(
+    env: &Env,
+    rc: &tempfile::TempDir,
+    shell: &str,
+    integrate: bool,
+    before_hook: &str,
+) -> String {
     let bin = env!("CARGO_BIN_EXE_shux");
     let zsh = shell.ends_with("zsh");
     let hook = if integrate {
@@ -56,7 +85,11 @@ fn start(env: &Env, rc: &tempfile::TempDir, shell: &str, integrate: bool) -> Str
     // zsh reads /etc/zshenv however it is started, and a broken one sets
     // PATH: the rc restores this process's own.
     let path = std::env::var("PATH").expect("PATH");
-    std::fs::write(&rcfile, format!("export PATH='{path}'\n{prompt}{hook}")).expect("rcfile");
+    std::fs::write(
+        &rcfile,
+        format!("export PATH='{path}'\n{prompt}{before_hook}{hook}"),
+    )
+    .expect("rcfile");
     let mut create = env.shux();
     create.args(["session", "create", "ws", "-d", "--"]);
     if zsh {
@@ -216,7 +249,7 @@ fn the_script_installs_once_and_old_bash_is_told_why_not() {
     let bin = env!("CARGO_BIN_EXE_shux");
     let bash = modern_bash().expect("no bash 4.4+ installed");
     // Sourced twice, PROMPT_COMMAND gains the hook once, ahead of the rest.
-    let out = Command::new(&bash)
+    let out = detached(&bash)
         .args(["--noprofile", "--norc", "-i", "-c"])
         .arg(format!(
             "PROMPT_COMMAND='echo mine'; eval \"$('{bin}' shell-integration bash)\"; \
@@ -410,7 +443,7 @@ fn a_child_of_an_allexport_shell_installs_cleanly() {
     let bin = env!("CARGO_BIN_EXE_shux");
     let bash = modern_bash().expect("no bash 4.4+ installed");
     let child = r#"eval "$("$SHUX_BIN" shell-integration bash)"; printf "%s|%s|%s" "${__shux_osc133_ran-}" "$PS0" "${PROMPT_COMMAND[*]}""#;
-    let out = Command::new(&bash)
+    let out = detached(&bash)
         .env("SHUX_BIN", bin)
         .env("CHILD_BASH", &bash)
         .env("CHILD", child)
@@ -447,7 +480,7 @@ fn a_child_of_an_allexport_shell_installs_cleanly() {
 #[test]
 fn an_allexport_child_with_its_own_prompt_command_is_hooked() {
     let bash = modern_bash().expect("no bash 4.4+ installed");
-    let out = Command::new(&bash)
+    let out = detached(&bash)
         .env("SHUX_BIN", env!("CARGO_BIN_EXE_shux"))
         .env("CHILD_BASH", &bash)
         .args(["--noprofile", "--norc", "-i", "-c"])
@@ -468,7 +501,7 @@ fn an_allexport_child_with_its_own_prompt_command_is_hooked() {
 #[test]
 fn an_allexport_child_that_does_not_source_the_integration_reports_nothing() {
     let bash = modern_bash().expect("no bash 4.4+ installed");
-    let out = Command::new(&bash)
+    let out = detached(&bash)
         .env("SHUX_BIN", env!("CARGO_BIN_EXE_shux"))
         .env("CHILD_BASH", &bash)
         .args(["--noprofile", "--norc", "-i", "-c"])
@@ -494,7 +527,7 @@ fn an_allexport_child_that_does_not_source_the_integration_reports_nothing() {
 #[test]
 fn an_allexport_exec_of_bash_reports_no_made_up_end() {
     let bash = modern_bash().expect("no bash 4.4+ installed");
-    let out = Command::new(&bash)
+    let out = detached(&bash)
         .env("SHUX_BIN", env!("CARGO_BIN_EXE_shux"))
         .env("CHILD_BASH", &bash)
         .args(["--noprofile", "--norc", "-i", "-c"])
@@ -540,7 +573,7 @@ fn a_bash_with_promptvars_off_still_reports_exit_codes() {
 #[test]
 fn the_script_installs_under_nounset() {
     let bash = modern_bash().expect("no bash 4.4+ installed");
-    let out = Command::new(&bash)
+    let out = detached(&bash)
         .env("SHUX_BIN", env!("CARGO_BIN_EXE_shux"))
         .args(["--noprofile", "--norc", "-i", "-c"])
         .arg(r#"set -u; unset PS0 PROMPT_COMMAND; eval "$("$SHUX_BIN" shell-integration bash)"; printf '%s' "${PROMPT_COMMAND-}""#)
@@ -554,7 +587,7 @@ fn the_script_installs_under_nounset() {
     if !has("zsh") {
         return;
     }
-    let out = Command::new("zsh")
+    let out = detached("zsh")
         .env("SHUX_BIN", env!("CARGO_BIN_EXE_shux"))
         .args(["-f", "-i", "-c"])
         .arg(r#"setopt nounset; unset preexec_functions precmd_functions; eval "$("$SHUX_BIN" shell-integration zsh)"; print -r -- "${precmd_functions[*]}""#)
@@ -565,4 +598,422 @@ fn the_script_installs_under_nounset() {
         "zsh: the hook was not installed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+// ── issue #275: `pane run` on the shell's own boundaries ────────────────────
+
+/// Truecolor, indexed and basic: a run whose output loses colour on screen,
+/// or keeps escapes in `stdout`, cannot pass.
+const COLOUR_PROBE: &str = r"printf '\033[38;2;120;220;180mT\033[38;5;208mI\033[34mB\033[0m\n'";
+
+fn pane_run(
+    env: &Env,
+    pane: &str,
+    command: &str,
+    extra: &[&str],
+) -> (serde_json::Value, Option<i32>) {
+    let mut cmd = env.shux();
+    cmd.args([
+        "--format", "json", "pane", "run", "-s", "ws", "-p", pane, "-c", command,
+    ])
+    .args(extra);
+    let out = cmd.output().expect("spawn shux");
+    (result(&out), out.status.code())
+}
+
+fn integrated(shell: &str) -> (Env, tempfile::TempDir, String) {
+    let env = Env::new(80, 24);
+    let rc = tempfile::tempdir().expect("rc dir");
+    let pane = start(&env, &rc, shell, true);
+    (env, rc, pane)
+}
+
+fn bash() -> String {
+    modern_bash().expect("no bash 4.4+ installed: the integration cannot be tested")
+}
+
+/// The Done-when of #275: with the integration sourced, only the command and
+/// its output reach the screen, and the JSON still carries both. It is the
+/// pane's FIRST command: a fresh shell has drawn a prompt and nothing else.
+fn run_types_only_the_command(shell: &str) {
+    let (env, _rc, pane) = integrated(shell);
+    let (r, code) = pane_run(&env, &pane, "echo hi", &[]);
+    assert_eq!(
+        (r["stdout"].as_str(), r["exit_code"].as_i64()),
+        (Some("hi\n"), Some(0)),
+        "{shell}: {r}"
+    );
+    assert_eq!(r["boundaries"], "osc133", "{shell}: {r}");
+    assert_eq!(r["ended_by"], "end", "{shell}: {r}");
+    assert_eq!(code, Some(0));
+    let (r, _) = pane_run(&env, &pane, COLOUR_PROBE, &[]);
+    assert_eq!(r["stdout"], "TIB\n", "{shell}: escapes are not output: {r}");
+    let screen = env.capture("ws", &pane);
+    assert!(
+        !screen.contains("SHUX_") && !screen.contains("__shux"),
+        "{shell}: a marker reached the screen:\n{screen}"
+    );
+    assert!(
+        screen.contains("echo hi\n") || screen.contains("echo hi"),
+        "{shell}:\n{screen}"
+    );
+    env.assert_colour_probe(&pane);
+    let (r, code) = pane_run(&env, &pane, "false", &[]);
+    assert_eq!(
+        (r["state"].as_str(), r["exit_code"].as_i64(), code),
+        (Some("completed"), Some(1), Some(0)),
+        "{shell}: {r}"
+    );
+}
+
+#[test]
+fn bash_pane_run_types_only_the_command() {
+    run_types_only_the_command(&bash());
+}
+
+#[test]
+fn zsh_pane_run_types_only_the_command() {
+    if !has("zsh") {
+        eprintln!("zsh not installed: skipped");
+        return;
+    }
+    run_types_only_the_command("zsh");
+}
+
+/// Without the integration, nothing changes but the report of how.
+#[test]
+fn pane_run_without_integration_uses_markers_and_says_so() {
+    let env = Env::new(80, 24);
+    let rc = tempfile::tempdir().expect("rc dir");
+    let pane = start(&env, &rc, &bash(), false);
+    let (r, code) = pane_run(&env, &pane, "echo hi", &[]);
+    assert_eq!(
+        (r["stdout"].as_str(), r["exit_code"].as_i64(), code),
+        (Some("hi\n"), Some(0), Some(0)),
+        "{r}"
+    );
+    assert_eq!(r["boundaries"], "markers", "{r}");
+    // Asked for the shell's marks, a shell that sends none is refused, after
+    // waiting for a prompt that never says so, with nothing typed.
+    let (r, code) = pane_run(
+        &env,
+        &pane,
+        "echo never-typed-275",
+        &["--boundaries", "osc133", "--timeout", "1"],
+    );
+    assert_eq!(code, Some(3), "{r}");
+    assert_eq!(r["error"]["data"]["reason"], "no_prompt", "{r}");
+    assert!(!env.capture("ws", &pane).contains("never-typed-275"));
+}
+
+/// Output longer than the screen and wider than it, exactly as written.
+#[test]
+fn wait_command_output_is_exactly_what_the_command_wrote() {
+    let (env, _rc, pane) = integrated(&bash());
+    let floor = as_of(&env, &pane);
+    type_line(&env, "seq 1 200; printf '%0300d\\n' 7");
+    let out = wait(&env, &pane, floor, "20s")
+        .arg("--output")
+        .output()
+        .expect("spawn shux");
+    let r = result(&out);
+    let want: String =
+        (1..=200).map(|n| format!("{n}\n")).collect::<String>() + &format!("{:0300}\n", 7);
+    assert_eq!(r["output"].as_str(), Some(want.as_str()), "{r}");
+    assert_eq!(r["output_truncated"], false, "{r}");
+    // Without --output the shape is as before.
+    let floor = as_of(&env, &pane);
+    type_line(&env, "true");
+    let r = result(
+        &wait(&env, &pane, floor, "20s")
+            .output()
+            .expect("spawn shux"),
+    );
+    assert!(r.get("output").is_none(), "{r}");
+    // `pane run`'s stdout agrees with `wait-command --output` for the same text.
+    let (run, _) = pane_run(&env, &pane, "seq 1 200; printf '%0300d\\n' 7", &[]);
+    assert_eq!(run["stdout"].as_str(), Some(want.as_str()));
+}
+
+/// A pane whose input would not reach its shell's prompt is never typed
+/// into, and the refusal names why.
+#[test]
+fn pane_run_refuses_a_pane_not_at_its_prompt() {
+    let (env, _rc, pane) = integrated(&bash());
+    let floor = as_of(&env, &pane);
+    type_line(
+        &env,
+        "printf 'read''ing-275\\n'; read -rs secret; echo got-$secret",
+    );
+    env.wait_for("ws", &pane, "reading-275");
+    let (r, code) = pane_run(&env, &pane, "echo leaked-275", &[]);
+    assert_eq!(code, Some(3), "{r}");
+    assert_eq!(r["error"]["data"]["reason"], "hidden_input", "{r}");
+    type_line(&env, "pw");
+    let r = result(
+        &wait(&env, &pane, floor, "20s")
+            .arg("--output")
+            .output()
+            .expect("spawn shux"),
+    );
+    assert_eq!(
+        r["output"], "reading-275\ngot-pw\n",
+        "the refused line was typed into the prompt: {r}"
+    );
+
+    type_line(&env, "printf 'sleep''ing-275\\n'; sleep 30");
+    env.wait_for("ws", &pane, "sleeping-275");
+    let (r, code) = pane_run(&env, &pane, "echo leaked-275", &[]);
+    assert_eq!(code, Some(3), "{r}");
+    assert_eq!(r["error"]["data"]["reason"], "other_program", "{r}");
+    assert!(!env.capture("ws", &pane).contains("leaked-275"));
+}
+
+/// No integration, so no marks: the foreground process group still tells a
+/// running program from the shell.
+#[test]
+fn pane_run_refuses_a_program_in_front_of_a_shell_without_integration() {
+    let env = Env::new(80, 24);
+    let rc = tempfile::tempdir().expect("rc dir");
+    let pane = start(&env, &rc, &bash(), false);
+    type_line(&env, "printf 'sleep''ing-275\\n'; sleep 30");
+    env.wait_for("ws", &pane, "sleeping-275");
+    let (r, code) = pane_run(&env, &pane, "echo leaked-275", &[]);
+    assert_eq!(code, Some(3), "{r}");
+    assert_eq!(r["error"]["data"]["reason"], "other_program", "{r}");
+    // `markers` types into whatever holds the pane, as asked.
+    let (r, _) = pane_run(
+        &env,
+        &pane,
+        "echo typed-anyway",
+        &["--boundaries", "markers", "--async"],
+    );
+    assert!(r["command_id"].is_string(), "{r}");
+}
+
+/// The shell drew its next prompt without starting the line: answered at
+/// once, with what the shell said, not at the timeout.
+fn a_rejected_line_is_not_run(shell: &str, line: &str, said: &str) {
+    let (env, _rc, pane) = integrated(shell);
+    let (r, code) = pane_run(&env, &pane, line, &["--timeout", "20"]);
+    assert_eq!(r["state"], "not_run", "{shell}: {r}");
+    assert!(
+        r["stdout"].as_str().is_some_and(|s| s.contains(said)),
+        "{shell}: {r}"
+    );
+    assert!(
+        r["runtime_ms"].as_u64().is_some_and(|ms| ms < 15_000),
+        "{shell}: {r}"
+    );
+    assert_eq!(code, Some(3));
+    // The pane is free again.
+    let (r, _) = pane_run(&env, &pane, "echo next", &[]);
+    assert_eq!(r["stdout"], "next\n", "{shell}: {r}");
+}
+
+#[test]
+fn bash_a_syntax_error_is_not_run() {
+    a_rejected_line_is_not_run(&bash(), "echo (", "syntax error");
+}
+
+#[test]
+fn zsh_a_parse_error_is_not_run() {
+    if !has("zsh") {
+        eprintln!("zsh not installed: skipped");
+        return;
+    }
+    a_rejected_line_is_not_run("zsh", "fi", "parse error");
+}
+
+/// A command that stops for a password answers at once, and the pane's
+/// boundaries still give its end once the input arrives.
+#[test]
+fn a_command_waiting_on_hidden_input_answers_at_once() {
+    let (env, _rc, pane) = integrated(&bash());
+    let (r, code) = pane_run(
+        &env,
+        &pane,
+        "printf 'pass: '; read -rs x; echo; echo got-$x",
+        &["--timeout", "60"],
+    );
+    assert_eq!(r["state"], "awaiting_input", "{r}");
+    assert_eq!(code, Some(3));
+    assert!(
+        r["stdout"].as_str().is_some_and(|s| s.contains("pass: ")),
+        "{r}"
+    );
+    let after = r["as_of"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("no as_of: {r}"));
+    type_line(&env, "pw");
+    let r = result(
+        &wait(&env, &pane, after, "20s")
+            .arg("--output")
+            .output()
+            .expect("spawn shux"),
+    );
+    assert_eq!(
+        (r["exit_code"].as_i64(), r["output"].as_str()),
+        (Some(0), Some("pass: \ngot-pw\n")),
+        "{r}"
+    );
+    // Its end freed the pane.
+    let (r, _) = pane_run(&env, &pane, "echo free", &[]);
+    assert_eq!(r["stdout"], "free\n", "{r}");
+}
+
+/// A timeout freezes the result; the command's own end still frees the pane,
+/// and `wait-command --after <as_of>` still gets it.
+#[test]
+fn a_timed_out_run_can_be_waited_on_to_its_end() {
+    let (env, _rc, pane) = integrated(&bash());
+    let (r, code) = pane_run(
+        &env,
+        &pane,
+        "echo early; sleep 3; echo late",
+        &["--timeout", "1"],
+    );
+    assert_eq!(
+        (r["state"].as_str(), code),
+        (Some("timed_out"), Some(1)),
+        "{r}"
+    );
+    assert_eq!(
+        r["stdout"], "early\n",
+        "what it wrote before the timeout: {r}"
+    );
+    let after = r["as_of"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("no as_of: {r}"));
+    let r = result(
+        &wait(&env, &pane, after, "20s")
+            .arg("--output")
+            .output()
+            .expect("spawn shux"),
+    );
+    assert_eq!(r["output"], "early\nlate\n", "{r}");
+    let (r, _) = pane_run(&env, &pane, "echo free", &[]);
+    assert_eq!(r["stdout"], "free\n", "{r}");
+}
+
+/// A line submitted and not yet started is ahead of ours: typing now would
+/// make ours its input, and its result ours. Reproduced under ble.sh, where
+/// the shell accepts a line some time before it reports the start.
+#[test]
+fn a_line_submitted_and_not_yet_started_is_never_typed_behind() {
+    let env = Env::new(80, 24);
+    let rc = tempfile::tempdir().expect("rc dir");
+    // The shell accepts each line, then waits on this FIFO before it reports
+    // the start: the window ble.sh leaves open, held open until released.
+    let gate = rc.path().join("gate");
+    nix::unistd::mkfifo(&gate, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
+    let ps0 = format!("PS0='$(read -r _ < {})'\n", gate.display());
+    let pane = start_with(&env, &rc, &bash(), true, &ps0);
+    let floor = as_of(&env, &pane);
+    type_line(&env, "printf 'pass: '; read -rs x; echo got-$x");
+    env.wait_for("ws", &pane, "got-$x");
+    let (r, code) = pane_run(&env, &pane, "echo leaked-275", &["--timeout", "5"]);
+    assert_eq!(code, Some(3), "{r}");
+    assert_eq!(r["error"]["data"]["reason"], "input_pending", "{r}");
+    std::fs::write(&gate, "go\n").expect("release the line");
+    type_line(&env, "pw");
+    let r = result(
+        &wait(&env, &pane, floor, "20s")
+            .arg("--output")
+            .output()
+            .expect("spawn shux"),
+    );
+    assert_eq!(
+        r["output"], "pass: got-pw\n",
+        "the refused line reached the shell: {r}"
+    );
+}
+
+/// Something typed and never submitted does not become part of the command.
+#[test]
+fn a_half_typed_line_does_not_join_the_command() {
+    let (env, _rc, pane) = integrated(&bash());
+    env.ok(&["pane", "send-keys", "-s", "ws", "--text", "zzz-half"]);
+    env.wait_for("ws", &pane, "zzz-half");
+    let (r, code) = pane_run(&env, &pane, "echo hi", &[]);
+    assert_eq!((r["stdout"].as_str(), code), (Some("hi\n"), Some(0)), "{r}");
+}
+
+/// A control character in the line would be typed as a key: refused, in
+/// every framing, before anything is typed.
+#[test]
+fn a_control_character_is_refused_before_anything_is_typed() {
+    let (env, _rc, pane) = integrated(&bash());
+    for boundaries in ["auto", "markers"] {
+        let (r, code) = pane_run(&env, &pane, "echo a\tb", &["--boundaries", boundaries]);
+        assert_eq!(code, Some(2), "{boundaries}: {r}");
+        assert_eq!(r["error"]["data"]["char"], "U+0009", "{boundaries}: {r}");
+    }
+}
+
+/// One rule for every pane wait: up to an hour, and past it the same refusal.
+#[test]
+fn every_wait_refuses_past_an_hour_the_same_way() {
+    let (env, _rc, pane) = integrated(&bash());
+    let over = "3600001";
+    let outs = [
+        env.run(&[
+            "--format",
+            "json",
+            "pane",
+            "wait-for",
+            "-s",
+            "ws",
+            "-p",
+            &pane,
+            "-t",
+            "x",
+            "--timeout-ms",
+            over,
+        ]),
+        env.run(&[
+            "--format",
+            "json",
+            "pane",
+            "wait-command",
+            &pane,
+            "--timeout",
+            "3600001ms",
+        ]),
+        env.run(&[
+            "--format",
+            "json",
+            "pane",
+            "wait-status",
+            &pane,
+            "--state",
+            "done",
+            "--timeout",
+            "3600001ms",
+        ]),
+    ];
+    let errors: Vec<serde_json::Value> = outs.iter().map(|o| result(o)["error"].clone()).collect();
+    for (o, e) in outs.iter().zip(&errors) {
+        assert_eq!(o.status.code(), Some(2), "{e}");
+        assert_eq!(e["code"], -32602, "{e}");
+        assert_eq!(e["message"], errors[0]["message"], "{errors:?}");
+    }
+    // An hour is accepted: the wait starts, and its needle ends it.
+    let mut wait_for = env.shux();
+    wait_for.args([
+        "pane",
+        "wait-for",
+        "-s",
+        "ws",
+        "-p",
+        &pane,
+        "-t",
+        "accepted-275",
+        "--timeout-ms",
+        "3600000",
+    ]);
+    let child = wait_for.stdout(Stdio::null()).spawn().expect("spawn shux");
+    type_line(&env, "echo accepted-$((270 + 5))");
+    let out = child.wait_with_output().expect("wait-for");
+    assert!(out.status.success());
 }

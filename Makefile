@@ -850,7 +850,7 @@ check-skill-docs: ## Verify agent-facing skill gotchas match shipped CLI shapes
 	@bash scripts/check-skill-docs.sh
 
 FUZZ_SECONDS ?= 60
-FUZZ_PROGRAM_STATUS := program_status_decode program_status_table scanner_vs_vte vt_program_status_stream
+FUZZ_PROGRAM_STATUS := program_status_decode program_status_table scanner_vs_vte vt_program_status_stream vt_command_capture
 
 .PHONY: fuzz
 fuzz: fuzz-program-status fuzz-pane-mouse fuzz-pane-record ## Run every libFuzzer target (FUZZ_SECONDS each, default 60)

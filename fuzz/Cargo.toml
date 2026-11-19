@@ -53,6 +53,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "vt_command_capture"
+path = "fuzz_targets/vt_command_capture.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "vt_program_status_stream"
 path = "fuzz_targets/vt_program_status_stream.rs"
 test = false

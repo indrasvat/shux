@@ -94,10 +94,17 @@ shux session create build --ensure
 shux session create agent --title agent -- codex --yolo
 
 # Run a command in the pane's shell; get its exit code and its output:
-shux --format json pane run -s build -c 'cargo test' | jq '{exit_code, stdout}'
+shux --format json pane run -s build -c 'cargo test' | jq '{state, exit_code, stdout, boundaries}'
 # stdout is what the command wrote (stdout and stderr, as the terminal got
 # them, ANSI-stripped, first 1 MiB; `truncated` says if more was dropped).
-# The CLI's own exit status is not the command's: read `exit_code`.
+# With `eval "$(shux shell-integration bash)"` in the pane shell's rc, the
+# pane shows only the command and its output (`boundaries: "osc133"`);
+# without it, markers frame the line (`"markers"`).
+# Nothing is typed into a pane that is not at its shell's prompt (a command
+# running, a password prompt, another program in front, a full-screen one):
+# the error's `data.reason` says which.
+# The CLI's own exit status is not the command's: read `exit_code`. It is
+# 0 ended, 1 timed out, 2 bad arguments or no such pane, 3 anything else.
 # A pane runs one command at a time: while one runs, another `pane run` is
 # refused with the running command's id (wait for it, or cancel it, then retry).
 # A command that timed out still holds the pane until its program ends: cancel
@@ -121,8 +128,10 @@ shux --format json pane wait-status "$PANE" --id b7 --state done,error --timeout
 AS_OF=$(shux --format json pane status "$PANE" | jq .result.as_of)
 # C-j submits even where ble.sh would hold Enter in -- MULTILINE --.
 shux pane send-keys -s build --text 'make' && shux pane send-keys -s build --data Cg==
-shux --format json pane wait-command "$PANE" --after "$AS_OF" --timeout 10m | jq .result.exit_code
+shux --format json pane wait-command "$PANE" --after "$AS_OF" --timeout 10m --output \
+  | jq '.result | {exit_code, output}'
 # The next command: pass the returned `.result.started` as `--after`.
+# Every wait takes at most `--timeout 1h`; a longer one is refused.
 
 # Capture the last N lines of pane output:
 shux pane capture -s build --lines 50 --format json

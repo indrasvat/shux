@@ -205,7 +205,12 @@ fn a_timed_out_command_holds_the_pane_until_cancelled() {
     let first_id = timed_out["command_id"].as_str().expect("command id");
 
     let refused = env.run_raw(&["--timeout", "30"], "echo second");
-    let said = String::from_utf8_lossy(&refused.stderr);
+    // `--format json` puts the error envelope on stdout, as every wait verb does.
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
     assert!(
         !refused.status.success() && said.contains(first_id),
         "a second command was typed into the timed-out one: {}{said}",

@@ -61,6 +61,29 @@ struct PtyTaskControl {
     probe: Option<shux_pty::PtyOutputProbe>,
 }
 
+/// Whether `bytes` submit a line: a CR or LF outside a bracketed paste.
+/// `in_paste` carries the paste state across chunks.
+fn submits_line(bytes: &[u8], in_paste: &mut bool) -> bool {
+    const START: &[u8] = b"\x1b[200~";
+    const END: &[u8] = b"\x1b[201~";
+    let mut submits = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let rest = &bytes[i..];
+        if rest.starts_with(START) {
+            *in_paste = true;
+            i += START.len();
+        } else if rest.starts_with(END) {
+            *in_paste = false;
+            i += END.len();
+        } else {
+            submits |= !*in_paste && matches!(bytes[i], b'\r' | b'\n');
+            i += 1;
+        }
+    }
+    submits
+}
+
 /// Everything bound for the program's input, in order: terminal replies
 /// (DA1, DSR, OSC 7501 probes) and user input. Replies go between input
 /// chunks, never inside one or inside a bracketed paste. A reply that does
@@ -242,6 +265,7 @@ async fn run_pane_pty_task(
     let mut staged = StagedOutput::new();
     let mut task_exit = PtyTaskExit::Natural;
     let mut pending = PtyInputQueue::default();
+    let mut submit_in_paste = false;
 
     loop {
         let output_due = staged.due_at();
@@ -282,7 +306,7 @@ async fn run_pane_pty_task(
                                 task_exit = PtyTaskExit::RequestedTeardown;
                                 break;
                             }
-                            let commands_ended = state.commands_ended.clone();
+                            let boundaries_moved = state.boundaries_moved.clone();
                             let (vt_title, terminal_responses, rev_state, alt_switched, status) =
                                 if let Some(vt) = state.vts.get_mut(&pane_id) {
                                     // LENS-R-032/DEC-4: detect an alt-screen
@@ -294,10 +318,10 @@ async fn run_pane_pty_task(
                                     // one batch leaves the flag equal → no switch,
                                     // matching §4.2's "nets to no bump".
                                     let alt_before = vt.is_alternate_screen();
-                                    let ended_before = vt.last_command_end();
+                                    let marks_before = vt.boundary_marks();
                                     let responses = vt.process_with_responses(data);
-                                    if vt.last_command_end() != ended_before {
-                                        commands_ended.send_modify(|n| *n += 1);
+                                    if vt.boundary_marks() != marks_before {
+                                        boundaries_moved.send_modify(|n| *n += 1);
                                     }
                                     if let Some(probe) = &probe {
                                         probe.mark_handled();
@@ -333,6 +357,7 @@ async fn run_pane_pty_task(
                                 }
                             }
                             let _completed = state.cmd_engine.process_output(pane_id.0, data);
+                            state.settle_osc133(pane_id);
                             let bracketed = state
                                 .vts
                                 .get(&pane_id)
@@ -485,6 +510,14 @@ async fn run_pane_pty_task(
                     task_exit = PtyTaskExit::RequestedTeardown;
                     break;
                 };
+                if submits_line(&data.bytes, &mut submit_in_paste) {
+                    let mut state = io_state.lock().await;
+                    if state.is_current(pane_id, incarnation)
+                        && let Some(vt) = state.vts.get_mut(&pane_id)
+                    {
+                        vt.note_line_submitted();
+                    }
+                }
                 pending.push_input(data);
             }
             // Waits for room, never blocks the loop: a program that stops
@@ -511,7 +544,7 @@ async fn run_pane_pty_task(
     {
         let mut state = io_state.lock().await;
         if state.is_current(pane_id, incarnation) {
-            state.cmd_engine.forget_pane(pane_id.0);
+            state.forget_command(pane_id);
         }
     }
     // A program's last words, staged inside the final interval.
@@ -1827,6 +1860,19 @@ mod tests {
     }
 
     /// What a program taking at most `limit` bytes per write receives.
+    #[test]
+    fn a_line_is_submitted_by_cr_or_lf_outside_a_paste() {
+        let mut paste = false;
+        assert!(!super::submits_line(b"echo hi", &mut paste));
+        assert!(super::submits_line(b"echo hi\r", &mut paste));
+        assert!(super::submits_line(b"\n", &mut paste));
+        assert!(!super::submits_line(b"\x1b[200~a\nb\r", &mut paste));
+        assert!(paste, "the paste is still open after its chunk");
+        assert!(!super::submits_line(b"c\n", &mut paste));
+        assert!(super::submits_line(b"\x1b[201~\r", &mut paste));
+        assert!(!paste);
+    }
+
     fn write(q: &mut PtyInputQueue, limit: usize) -> Vec<u8> {
         let mut sent = Vec::new();
         while !q.is_empty() && sent.len() < limit {

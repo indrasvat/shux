@@ -29,7 +29,10 @@ pub use cell::{
     Cell, CellFlags, CellStyle, Color, ExtendedAttrs, Rgb, TerminalDefaultColors, UnderlineStyle,
 };
 pub use charset::{CharsetSlot, TerminalCharset, TerminalCharsets};
-pub use commands::{CommandLookup, CommandRecord, EndedBy, KEEP_ENDED as COMMANDS_KEPT};
+pub use commands::{
+    CommandLookup, CommandOutput, CommandRecord, EndedBy, KEEP_ENDED as COMMANDS_KEPT,
+    OUTPUT_BUDGET as COMMAND_OUTPUT_BUDGET, OUTPUT_LIMIT as COMMAND_OUTPUT_LIMIT, ShellState,
+};
 pub use cursor::{Cursor, CursorShape, SavedCursor};
 pub use diff::{
     CellGridView, CellRef, CursorState, FrameDiff, FrameView, GridFrame, LensRowSpan, diff_frames,
@@ -532,6 +535,7 @@ impl VirtualTerminal {
         if bytes.is_empty() {
             return;
         }
+        self.commands.capture(bytes);
         let mut handler = VtHandler {
             grid: sync::Presented::new(&mut self.grid, &mut self.frozen_grid, &self.sync_armed),
             cursor: sync::Presented::new(
@@ -567,17 +571,19 @@ impl VirtualTerminal {
         self.parser.advance(&mut handler, bytes);
     }
 
+    /// `len`: the sequence's wire length, which a command it ends did not write.
     fn dispatch_program_status(
         &mut self,
         action: program_status::CutAction,
+        len: usize,
         responses: &mut Vec<Vec<u8>>,
     ) {
         use program_status::CutAction;
         match action {
-            CutAction::CommandStart => self.commands.on_start(),
-            CutAction::CommandEnd { exit_code } => self.commands.on_end(exit_code),
+            CutAction::CommandStart => self.commands.on_start(len),
+            CutAction::CommandEnd { exit_code } => self.commands.on_end(exit_code, len),
             CutAction::PromptStart => {
-                self.commands.on_prompt();
+                self.commands.on_prompt(len);
                 if let Some(ps) = self.program_status.as_mut() {
                     ps.on_prompt_start();
                 }
@@ -596,8 +602,8 @@ impl VirtualTerminal {
         }
     }
 
-    /// Whether this terminal has seen a command start (`133;C`): its shell
-    /// sends command boundaries. Never reset by RIS.
+    /// Whether this terminal has seen a prompt or a command start (`133;A`,
+    /// `133;C`): its shell sends command boundaries. Never reset by RIS.
     pub fn commands_seen(&self) -> bool {
         self.commands.seen()
     }
@@ -610,6 +616,44 @@ impl VirtualTerminal {
     /// The earliest ended command that started above `floor`.
     pub fn command_after(&self, floor: u64) -> CommandLookup {
         self.commands.first_after(floor)
+    }
+
+    /// What the ended command that started at `started` wrote, while kept.
+    pub fn command_output(&self, started: u64) -> Option<CommandOutput<'_>> {
+        self.commands.output(started)
+    }
+
+    /// What the running command has written so far, if it started above
+    /// `floor`.
+    pub fn running_command_output(&self, floor: u64) -> Option<CommandOutput<'_>> {
+        self.commands.running_output(floor)
+    }
+
+    /// Where the shell stands, by the last boundary it reported.
+    pub fn shell_state(&self) -> ShellState {
+        self.commands.state()
+    }
+
+    /// Note a line submitted to the pane's program: a CR or LF it was sent
+    /// outside a bracketed paste.
+    pub fn note_line_submitted(&mut self) {
+        self.commands.on_line_submitted();
+    }
+
+    /// The shell is at its prompt with a line submitted to it that has not
+    /// started a command yet: a line typed now would run after it.
+    pub fn line_pending(&self) -> bool {
+        self.commands.line_pending()
+    }
+
+    /// How many prompts (`133;A`) this terminal has seen.
+    pub fn prompts_seen(&self) -> u64 {
+        self.commands.prompts()
+    }
+
+    /// Moves on every boundary that changed [`Self::shell_state`].
+    pub fn boundary_marks(&self) -> u64 {
+        self.commands.marks()
     }
 
     /// The newest command end's stamp, or 0: it moves exactly when one ends.
@@ -963,7 +1007,7 @@ impl VirtualTerminal {
                 } else {
                     let Some(cut) = status.next() else { break };
                     self.advance_slice(&bytes[at..cut.end], &mut responses);
-                    self.dispatch_program_status(cut.action, &mut responses);
+                    self.dispatch_program_status(cut.action, cut.len, &mut responses);
                     at = cut.end;
                 }
             }

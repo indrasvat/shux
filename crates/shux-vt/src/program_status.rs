@@ -143,6 +143,8 @@ impl VtProgramStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StatusCut {
     pub(crate) end: usize,
+    /// Its wire length from `ESC ]`, across reads.
+    pub(crate) len: usize,
     pub(crate) action: CutAction,
 }
 
@@ -309,7 +311,11 @@ impl OscStatusScanner {
             classify(&self.body, bel)
         };
         if let Some(action) = action {
-            cuts.push(StatusCut { end, action });
+            cuts.push(StatusCut {
+                end,
+                len: self.raw_len,
+                action,
+            });
         }
         self.reset(ScanState::Ground);
     }

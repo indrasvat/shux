@@ -196,8 +196,9 @@ A command typed into a pane's shell, ended, as the shell reports it over OSC
 `eval "$(shux shell-integration bash|zsh)"` in its rc file.
 
 ```json
-pane.wait_command { "pane_id": "uuid", "after": 41, "timeout_ms": 30000 }
-  → { "outcome": "completed", "exit_code": 1, "started": 57, "ended": 58, "ended_by": "end" }
+pane.wait_command { "pane_id": "uuid", "after": 41, "timeout_ms": 30000, "output": true }
+  → { "outcome": "completed", "exit_code": 1, "started": 57, "ended": 58, "ended_by": "end",
+      "output": "...", "output_truncated": false }
   | { "outcome": "timeout", "no_integration": false }
   | { "outcome": "overrun", "kept": 32 }
   | { "outcome": "pane_gone", "reason": "exited" | "killed" | "respawned" | "not_started" }
@@ -221,13 +222,27 @@ pane.wait_command { "pane_id": "uuid", "after": 41, "timeout_ms": 30000 }
   respawned.
 - **Program status:** boundaries are tracked whether or not program status is
   enabled, and RIS does not reset them.
-- `pane.status` reports `commands: { seen, running }`.
+- **`output`** (only when asked for): what the command wrote between its
+  start and its end, stdout and stderr as the terminal received them,
+  ANSI-stripped, `\r\n` as `\n`, first 1 MiB (`output_truncated`). It is the
+  stream, not the screen, so long output and wrapped lines come back whole.
+  Output is kept passively for every command, within a few MiB per pane; an
+  older command's comes back `output: null, output_evicted: true`. zsh's
+  partial-line mark (PROMPT_SP), which it prints before reporting the end, is
+  not part of it.
+- **`timeout_ms`**: 30 s by default, at most 3600000 (1 h). Past it the wait is
+  refused with `-32602`, `data: { field, max, hint }`, exactly as
+  `pane.wait_status` and `pane.wait_for` refuse it.
+- `pane.status` reports `commands: { seen, running, shell, line_pending }`;
+  `shell` is `unknown` (no boundary yet), `at_prompt`, `running` or `between`
+  (a command ended, its next prompt not yet drawn); `line_pending` is true while
+  a line submitted at the prompt has not started.
 - **The boundaries are in-band.** Output the command itself prints, such as a
   file `cat`'d that contains `ESC ] 133;D;0 BEL`, is read as a boundary too, as
   it is by every terminal's shell integration. Trust `exit_code` only as far as
   you trust what the pane prints.
 
-CLI: `shux pane wait-command <PANE> [--after AS_OF] [--timeout 30s]`.
+CLI: `shux pane wait-command <PANE> [--after AS_OF] [--timeout 30s] [--output]`.
 - Exit 0: the command ended, whatever its own code (read `exit_code`).
 - Exit 1: timeout.
 - Exit 2: bad arguments, or no such pane.
@@ -289,22 +304,68 @@ to read status and `shux plugin grant <name> pane.wait_status` to wait on it.
 ### `pane.run_command` / `pane.command_status` / `pane.command_cancel`
 
 Run one command in a pane's live shell and return what it wrote. The CLI is
-`shux pane run -s S -c CMD [--async] [--timeout SECS]`.
+`shux pane run -s S -c CMD [--async] [--timeout SECS] [--boundaries auto|osc133|markers]`.
 
 ```json
-pane.run_command    { "pane_id": "uuid", "command": "ls", "args": ["-la"], "timeout": 30, "async": false }
-  → { "command_id": "uuid", "state": "completed" | "timed_out" | "cancelled" | "pane_gone",
-      "exit_code": 0, "stdout": "...", "truncated": false, "runtime_ms": 12 }
-pane.command_status { "command_id": "uuid" } → the same result, once finished
+pane.run_command    { "pane_id": "uuid", "command": "ls", "args": ["-la"], "timeout": 30,
+                      "async": false, "boundaries": "auto" }
+  → { "command_id": "uuid", "state": "completed", "exit_code": 0, "stdout": "...",
+      "truncated": false, "runtime_ms": 12, "boundaries": "osc133", "ended_by": "end", "as_of": 41 }
+pane.command_status { "command_id": "uuid" } → the same result once finished; while running,
+                      `state: "running"` and `phase: "awaiting_start" | "executing"`
 pane.command_cancel { "command_id": "uuid" } → { "command_id": "uuid", "state": "..." }  (sends Ctrl-C)
 ```
 
-- `stdout` is the bytes between two markers that the shell prints around the
-  command, ANSI stripped, up to 1 MiB (`truncated` says if more was dropped).
+**How the command is framed (`boundaries`).** `osc133`: the shell reports its
+own boundaries (`shux shell-integration`); the line typed is C-u then the
+command, so the pane shows only the command and its output, and `stdout` is
+the stream between the shell's `133;C` and the end of that command. `markers`:
+the line prints a `SHUX_BEGIN…`/`SHUX_MARKER…` pair around the command, and
+`stdout` is what lies between. The request's `boundaries`:
+
+| Shell state (`pane.status` → `commands.shell`) | `auto` (default) | `osc133` | `markers` |
+|---|---|---|---|
+| `unknown`: no boundary ever seen | markers | wait for a prompt, else `no_prompt` | markers |
+| `at_prompt` | osc133 | osc133 | markers |
+| `between`: a command ended, prompt not drawn | wait for the prompt, then osc133 | same | markers |
+| `running` | refused: `command_running` | refused | markers |
+
+Before any framing but `markers`, the pane's terminal is asked who reads its
+input (the foreground process group, and termios): another program in front
+is refused as `other_program`, a line read with echo off as `hidden_input`,
+the alternate screen as `full_screen`. A line already submitted at the prompt
+(a CR or LF sent outside a bracketed paste, by `send-keys` or a person typing)
+that has not started is `input_pending`: a line typed behind it would become
+its input, and its result ours. A multi-line command uses markers under
+`auto` and is refused under `osc133`. A control character in `command` or
+`args` is refused under every framing (`-32602`, `data: { field, offset, char }`).
+
+Refusals are `ResourceExhausted` (`-32012`) with
+`data: { resource, reason, shell_state, foreground, foreground_pgid,
+hidden_input, full_screen, hint }`; nothing was typed.
+
+**How it ended (`state`).**
+
+| `state` | Meaning |
+|---|---|
+| `completed` | `exit_code` is the command's. `ended_by` (`osc133` only): `end` (its own `D`), or `prompt` / `next_command`, where the shell drew a prompt or started another command without reporting this one's end, and `exit_code` is null |
+| `not_run` | `osc133` only: the shell drew its next prompt without starting the line (a syntax error, a comment). `stdout` holds what the pane showed for the line, its echo included, up to that prompt |
+| `timed_out` | the timeout passed first; `stdout` is what it wrote so far. Its program may still run, and the pane stays held until it ends or is cancelled |
+| `awaiting_input` | its command started and then read hidden input (a password prompt); answered at once rather than at the timeout. The pane stays held |
+| `cancelled` | `pane.command_cancel` |
+| `pane_gone` | the pane's program ended or the pane was removed first |
+| `overrun` | `osc133` only: more commands ended after the line than the terminal keeps |
+
+- `as_of` (`osc133` only) is the floor the line was typed above: pass it to
+  `pane.wait_command` as `after`, with `output: true`, to keep waiting on a
+  `timed_out` or `awaiting_input` command until its own end.
+- `stdout` is ANSI-stripped, `\r\n` as `\n`, up to 1 MiB (`truncated`).
 - One command per pane. A second is refused with `ResourceExhausted`, plus
   `running_command_id` and `running_command_state`.
-- A `timed_out` command keeps its pane until its program ends or it is
-  cancelled.
+- `timeout` is whole seconds, 30 by default; anything else is refused.
+- CLI exit: 0 ended (read `exit_code`), 1 timed out, 2 bad arguments or no
+  such pane, 3 anything else; `--async` exits 0 once the line is typed. Under
+  `--format json`, an error is `{"error": {code, message, data}}` on stdout.
 
 ### `pane.wait_exit`
 

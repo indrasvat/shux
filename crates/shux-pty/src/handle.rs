@@ -508,12 +508,38 @@ pub struct PtyOutputProbe(std::sync::Arc<ProbeState>);
 struct ProbeState {
     /// A close-on-exec copy of the master, to poll without the handle.
     master: OwnedFd,
+    /// The pane's program: a session leader, so also its process group.
+    leader: u32,
     /// Output read but not yet marked handled. Set under this lock with the
     /// read itself, so no answer falls between the two.
     unhandled: std::sync::Mutex<bool>,
 }
 
+/// Who reads the pane's terminal now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Foreground {
+    /// The pane's own program (its shell) is the foreground process group.
+    pub leader: bool,
+    /// Input is read a line at a time with echo off: a password prompt.
+    pub hidden_input: bool,
+    /// The foreground process group.
+    pub group: i32,
+}
+
 impl PtyOutputProbe {
+    /// Who reads the terminal now, or `None` once it cannot be asked.
+    pub fn foreground(&self) -> Option<Foreground> {
+        use nix::sys::termios::{LocalFlags, tcgetattr};
+        let fd = self.0.master.as_fd();
+        let group = nix::unistd::tcgetpgrp(fd).ok()?;
+        let modes = tcgetattr(fd).ok()?.local_flags;
+        Some(Foreground {
+            group: group.as_raw(),
+            leader: u32::try_from(group.as_raw()).ok() == Some(self.0.leader),
+            hidden_input: modes.contains(LocalFlags::ICANON) && !modes.contains(LocalFlags::ECHO),
+        })
+    }
+
     /// Whether output the child wrote has not been handed on yet: still queued
     /// on the master, or read and not marked handled.
     pub fn output_pending(&self) -> bool {
@@ -1233,6 +1259,7 @@ impl PtyHandle {
             .map_err(PtyError::Read)?;
         let probe = PtyOutputProbe(std::sync::Arc::new(ProbeState {
             master,
+            leader: self.pid,
             unhandled: std::sync::Mutex::new(false),
         }));
         self.probe = Some(probe.clone());

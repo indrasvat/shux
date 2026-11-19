@@ -269,8 +269,17 @@ pub(crate) fn register_pane_io_methods(
                             })?;
 
                     let args: Vec<String> = pane_command::parse_run_args(&params)?;
+                    let wanted = parse_boundaries(&params)?;
+                    let multiline = check_typed_line(command, &args)?;
 
-                    let timeout_secs = params.get("timeout").and_then(|v| v.as_u64()).unwrap_or(30);
+                    let timeout_secs = match params.get("timeout") {
+                        None | Some(serde_json::Value::Null) => 30,
+                        Some(v) => v.as_u64().ok_or_else(|| {
+                            shux_rpc::RpcError::invalid_params(
+                                "timeout must be a non-negative whole number of seconds",
+                            )
+                        })?,
+                    };
                     let timeout = Duration::from_secs(timeout_secs);
 
                     let is_async = params
@@ -278,33 +287,79 @@ pub(crate) fn register_pane_io_methods(
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
 
-                    let (completion_tx, completion_rx) = if !is_async {
+                    let (mut completion_tx, completion_rx) = if !is_async {
                         let (tx, rx) = tokio::sync::oneshot::channel();
                         (Some(tx), Some(rx))
                     } else {
                         (None, None)
                     };
 
-                    // Room in the pane's input is reserved first, so tracking
-                    // the command and queueing its line happen under one lock:
-                    // nothing tracked was never sent, nothing sent is untracked.
                     let requested_at = std::time::Instant::now();
-                    let prepared = shux_pty::CommandEngine::prepare(command, &args);
+                    let deadline = tokio::time::Instant::now() + timeout;
+                    let command = command.to_string();
                     drop(params);
-                    let writer = io.lock().await.writers.get(&pane_id).cloned().ok_or_else(
-                        || shux_rpc::RpcError::not_found("pane PTY", &pane_id.to_string()),
-                    )?;
-                    let permit = tokio::time::timeout(timeout, writer.reserve(prepared.line().len()))
+                    let mut wake = io.lock().await.boundaries_moved.subscribe();
+                    let start = loop {
+                        let decided = {
+                            let state = io.lock().await;
+                            wake.borrow_and_update();
+                            let vt = state.vts.get(&pane_id).ok_or_else(|| {
+                                shux_rpc::RpcError::not_found("pane PTY", &pane_id.to_string())
+                            })?;
+                            let front = Front {
+                                shell: vt.shell_state(),
+                                line_pending: vt.line_pending(),
+                                program: state.sync_gates.get(&pane_id).and_then(|p| p.foreground()),
+                                full_screen: vt.is_alternate_screen(),
+                            };
+                            choose_boundaries(wanted, front, multiline)?
+                        };
+                        let boundaries = match decided {
+                            Choice::Use(b) => b,
+                            Choice::AwaitPrompt(shell) => {
+                                if tokio::time::Instant::now() >= deadline {
+                                    return Err(no_prompt(shell, timeout));
+                                }
+                                let wake_at = (tokio::time::Instant::now()
+                                    + crate::rpc::program_status::WAIT_REPOLL)
+                                    .min(deadline);
+                                let _ = tokio::time::timeout_at(wake_at, wake.changed()).await;
+                                continue;
+                            }
+                        };
+                        // Room in the pane's input is reserved first, so tracking
+                        // the command and queueing its line happen under one lock:
+                        // nothing tracked was never sent, nothing sent is untracked.
+                        let prepared = match boundaries {
+                            shux_pty::Boundaries::Osc133 => {
+                                shux_pty::CommandEngine::prepare_osc133(&command, &args)
+                            }
+                            shux_pty::Boundaries::Markers => {
+                                shux_pty::CommandEngine::prepare(&command, &args)
+                            }
+                        };
+                        let writer = io.lock().await.writers.get(&pane_id).cloned().ok_or_else(
+                            || shux_rpc::RpcError::not_found("pane PTY", &pane_id.to_string()),
+                        )?;
+                        let permit = tokio::time::timeout_at(
+                            deadline,
+                            writer.reserve(prepared.line().len()),
+                        )
                         .await
                         .map_err(|_| pane_input_full(timeout))?
                         .map_err(|_| shux_rpc::RpcError::internal("PTY write channel closed"))?;
-                    let start = io.lock().await.start_command(
-                        pane_id,
-                        permit,
-                        prepared,
-                        (requested_at, timeout),
-                        completion_tx,
-                    );
+                        match io.lock().await.start_command(
+                            pane_id,
+                            permit,
+                            prepared,
+                            (requested_at, timeout),
+                            &mut completion_tx,
+                        ) {
+                            // The shell moved since the choice: choose again.
+                            CommandStart::NotAtPrompt(_) => {}
+                            other => break other,
+                        }
+                    };
                     let command_id = match start {
                         CommandStart::Started(id) => id,
                         CommandStart::Busy(running, state) => {
@@ -315,6 +370,9 @@ pub(crate) fn register_pane_io_methods(
                                 "pane PTY",
                                 &pane_id.to_string(),
                             ));
+                        }
+                        CommandStart::NotAtPrompt(..) => {
+                            unreachable!("handled in the loop above")
                         }
                     };
 
@@ -385,7 +443,6 @@ pub(crate) fn register_pane_io_methods(
 
                     let mut state = io.lock().await;
                     let pane_uuid = state
-                        .cmd_engine
                         .cancel_command(command_id)
                         .ok_or_else(|| shux_rpc::RpcError::not_found("command", cmd_id_str))?;
 
@@ -478,16 +535,20 @@ pub(crate) fn register_pane_io_methods(
                         .unwrap_or(false);
                     let lines =
                         params.get("lines").and_then(|v| v.as_u64()).unwrap_or(200) as usize;
-                    let timeout_ms = params
-                        .get("timeout_ms")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(10_000)
-                        .min(60_000);
-                    let poll_ms = params
-                        .get("poll_ms")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(100)
-                        .clamp(20, 1_000);
+                    let timeout_ms =
+                        crate::rpc::program_status::parse_wait_timeout_or(&params, 10_000)?
+                            .as_millis() as u64;
+                    let poll_ms = match params.get("poll_ms") {
+                        None | Some(serde_json::Value::Null) => 100,
+                        Some(v) => v
+                            .as_u64()
+                            .filter(|ms| (20..=1_000).contains(ms))
+                            .ok_or_else(|| {
+                                shux_rpc::RpcError::invalid_params(
+                                    "poll_ms must be a whole number from 20 to 1000",
+                                )
+                            })?,
+                    };
 
                     if needle_text.is_none() && needle_regex_raw.is_none() {
                         return Err(shux_rpc::RpcError::invalid_params(
@@ -1863,6 +1924,170 @@ fn pane_input_full(timeout: Duration) -> shux_rpc::RpcError {
     )
 }
 
+/// `boundaries`: how `pane.run_command` finds its command's start and end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wanted {
+    /// The shell's OSC 133 marks when it reports them, else markers.
+    Auto,
+    Osc133,
+    Markers,
+}
+
+fn parse_boundaries(params: &serde_json::Value) -> Result<Wanted, shux_rpc::RpcError> {
+    match params.get("boundaries") {
+        None | Some(serde_json::Value::Null) => Ok(Wanted::Auto),
+        Some(v) => match v.as_str() {
+            Some("auto") => Ok(Wanted::Auto),
+            Some("osc133") => Ok(Wanted::Osc133),
+            Some("markers") => Ok(Wanted::Markers),
+            _ => Err(shux_rpc::RpcError::invalid_params(
+                "boundaries must be \"auto\", \"osc133\" or \"markers\"",
+            )),
+        },
+    }
+}
+
+/// The typed line is keystrokes: a control byte in it would act as a key
+/// (Tab completes, ESC and C-c edit or interrupt), so none is accepted. A
+/// newline is accepted in the command only, and makes it several lines.
+fn check_typed_line(command: &str, args: &[String]) -> Result<bool, shux_rpc::RpcError> {
+    let fields = std::iter::once(("command".to_string(), command)).chain(
+        args.iter()
+            .enumerate()
+            .map(|(i, a)| (format!("args[{i}]"), a.as_str())),
+    );
+    let mut multiline = false;
+    for (field, text) in fields {
+        for (offset, ch) in text.char_indices() {
+            if ch == '\n' && field == "command" {
+                multiline = true;
+                continue;
+            }
+            if ch.is_control() {
+                return Err(shux_rpc::RpcError::with_message_and_data(
+                    shux_rpc::ErrorCode::InvalidParams,
+                    format!(
+                        "{field} holds control character U+{:04X} at byte {offset}: it would be typed as a key",
+                        ch as u32
+                    ),
+                    serde_json::json!({ "field": field, "offset": offset, "char": format!("U+{:04X}", ch as u32) }),
+                ));
+            }
+        }
+    }
+    Ok(multiline)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Choice {
+    Use(shux_pty::Boundaries),
+    /// Type nothing yet: the shell's prompt is still to come.
+    AwaitPrompt(shux_vt::ShellState),
+}
+
+/// What the pane shows its input to now.
+#[derive(Debug, Clone, Copy)]
+struct Front {
+    shell: shux_vt::ShellState,
+    /// A line already submitted at the prompt has not started.
+    line_pending: bool,
+    /// `None` when the terminal could not be asked.
+    program: Option<shux_pty::Foreground>,
+    full_screen: bool,
+}
+
+/// The framing for the pane's state now. A pane that is not at its shell's
+/// prompt is never typed into except with `markers`: whatever holds it, a
+/// password prompt as easily as a REPL or an editor, would read the line.
+fn choose_boundaries(
+    wanted: Wanted,
+    front: Front,
+    multiline: bool,
+) -> Result<Choice, shux_rpc::RpcError> {
+    use shux_pty::Boundaries::{Markers, Osc133};
+    use shux_vt::ShellState::{AtPrompt, Between, Running, Unknown};
+    if wanted == Wanted::Markers {
+        return Ok(Choice::Use(Markers));
+    }
+    let other_program = front.program.is_some_and(|p| !p.leader);
+    let hidden_input = front.program.is_some_and(|p| p.hidden_input);
+    if front.shell == Running
+        || front.line_pending
+        || other_program
+        || hidden_input
+        || front.full_screen
+    {
+        return Err(pane_not_at_shell(front));
+    }
+    let shell = front.shell;
+    match (wanted, shell) {
+        (Wanted::Markers, _) => Ok(Choice::Use(Markers)),
+        (Wanted::Osc133, _) if multiline => Err(shux_rpc::RpcError::invalid_params(
+            "boundaries \"osc133\" runs one line: the command holds a newline",
+        )),
+        (_, Running) => Err(pane_not_at_shell(front)),
+        (Wanted::Auto, Unknown) => Ok(Choice::Use(Markers)),
+        (Wanted::Auto, _) if multiline => Ok(Choice::Use(Markers)),
+        (_, AtPrompt) => Ok(Choice::Use(Osc133)),
+        (Wanted::Osc133, Unknown) | (_, Between) => Ok(Choice::AwaitPrompt(shell)),
+    }
+}
+
+/// Refusal for a pane whose input would not reach its shell's prompt.
+fn pane_not_at_shell(front: Front) -> shux_rpc::RpcError {
+    let (reason, reading) = match front.program {
+        Some(p) if p.hidden_input => ("hidden_input", "hidden input, as a password prompt does"),
+        Some(p) if !p.leader => ("other_program", "another program in the foreground"),
+        _ if front.full_screen => ("full_screen", "a full-screen program"),
+        _ if front.shell == shux_vt::ShellState::Running => {
+            ("command_running", "a command the shell reports running")
+        }
+        _ => (
+            "input_pending",
+            "the line already submitted at its prompt, which has not started yet",
+        ),
+    };
+    shux_rpc::RpcError::with_message_and_data(
+        shux_rpc::ErrorCode::ResourceExhausted,
+        format!(
+            "the pane is not at its shell's prompt: its input goes to {reading}, so nothing was typed"
+        ),
+        serde_json::json!({
+            "resource": "pane shell",
+            "reason": reason,
+            "shell_state": front.shell.as_str(),
+            "foreground": front.program.map(|p| if p.leader { "pane_program" } else { "other_program" }),
+            "foreground_pgid": front.program.map(|p| p.group),
+            "hidden_input": front.program.map(|p| p.hidden_input),
+            "full_screen": front.full_screen,
+            "hint": "wait for it to end (pane wait-command / pane wait-exit), cancel it (send-keys C-c), or pass boundaries \"markers\" to type into whatever holds the pane",
+        }),
+    )
+}
+
+fn no_prompt(shell: shux_vt::ShellState, timeout: Duration) -> shux_rpc::RpcError {
+    let hint = match shell {
+        shux_vt::ShellState::Unknown => {
+            "the shell has reported no OSC 133 prompt: source `shux shell-integration bash|zsh` in its rc file, or pass boundaries \"markers\""
+        }
+        _ => "the shell ended a command but drew no prompt after it; check the pane (pane capture)",
+    };
+    shux_rpc::RpcError::with_message_and_data(
+        shux_rpc::ErrorCode::ResourceExhausted,
+        format!(
+            "the pane's shell drew no prompt within {}s, so nothing was typed",
+            timeout.as_secs()
+        ),
+        serde_json::json!({
+            "resource": "shell prompt",
+            "reason": "no_prompt",
+            "shell_state": shell.as_str(),
+            "timeout_secs": timeout.as_secs(),
+            "hint": hint,
+        }),
+    )
+}
+
 /// A command's result as `pane.run_command` and `pane.command_status` report
 /// it: every field, serialized from the one frozen result.
 fn command_result_json(
@@ -1882,6 +2107,165 @@ async fn resize_acked(ack: tokio::sync::oneshot::Receiver<()>) -> Result<(), shu
             ))
         })?
         .map_err(|_| shux_rpc::RpcError::internal("pane resize ack channel dropped"))
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+    use shux_pty::Boundaries::{Markers, Osc133};
+    use shux_vt::ShellState::{self, AtPrompt, Between, Running, Unknown};
+
+    fn shell(shell: ShellState) -> Front {
+        Front {
+            shell,
+            line_pending: false,
+            program: Some(shux_pty::Foreground {
+                leader: true,
+                hidden_input: false,
+                group: 1,
+            }),
+            full_screen: false,
+        }
+    }
+
+    fn reason(r: Result<Choice, shux_rpc::RpcError>) -> String {
+        match r {
+            Err(e) => e
+                .data
+                .and_then(|d| {
+                    d["reason"]
+                        .as_str()
+                        .or(d["detail"].as_str())
+                        .map(str::to_string)
+                })
+                .unwrap_or(e.message),
+            Ok(c) => format!("{c:?}"),
+        }
+    }
+
+    /// The whole decision table: what each requested framing does in each
+    /// state the shell can report.
+    #[test]
+    fn each_framing_in_each_shell_state() {
+        let use_ = |b| format!("{:?}", Choice::Use(b));
+        let wait = |s| format!("{:?}", Choice::AwaitPrompt(s));
+        let rows = [
+            (Wanted::Auto, Unknown, use_(Markers)),
+            (Wanted::Auto, AtPrompt, use_(Osc133)),
+            (Wanted::Auto, Between, wait(Between)),
+            (Wanted::Auto, Running, "command_running".to_string()),
+            (Wanted::Osc133, Unknown, wait(Unknown)),
+            (Wanted::Osc133, AtPrompt, use_(Osc133)),
+            (Wanted::Osc133, Between, wait(Between)),
+            (Wanted::Osc133, Running, "command_running".to_string()),
+            (Wanted::Markers, Unknown, use_(Markers)),
+            (Wanted::Markers, AtPrompt, use_(Markers)),
+            (Wanted::Markers, Between, use_(Markers)),
+            (Wanted::Markers, Running, use_(Markers)),
+        ];
+        for (wanted, state, want) in rows {
+            assert_eq!(
+                reason(choose_boundaries(wanted, shell(state), false)),
+                want,
+                "{wanted:?} {state:?}"
+            );
+        }
+    }
+
+    /// Whatever the shell's marks say, input that would not reach its prompt
+    /// is refused, by name; `markers` types anyway.
+    #[test]
+    fn a_pane_not_at_its_prompt_is_refused_by_name() {
+        let with = |leader, hidden_input, full_screen| Front {
+            shell: AtPrompt,
+            line_pending: false,
+            program: Some(shux_pty::Foreground {
+                leader,
+                hidden_input,
+                group: 9,
+            }),
+            full_screen,
+        };
+        for wanted in [Wanted::Auto, Wanted::Osc133] {
+            assert_eq!(
+                reason(choose_boundaries(wanted, with(false, false, false), false)),
+                "other_program"
+            );
+            assert_eq!(
+                reason(choose_boundaries(wanted, with(true, true, false), false)),
+                "hidden_input"
+            );
+            assert_eq!(
+                reason(choose_boundaries(wanted, with(true, false, true), false)),
+                "full_screen"
+            );
+            assert_eq!(
+                reason(choose_boundaries(
+                    Wanted::Markers,
+                    with(false, true, true),
+                    false
+                )),
+                format!("{:?}", Choice::Use(Markers))
+            );
+        }
+        // A terminal that cannot be asked does not block the marks' answer.
+        let unasked = Front {
+            shell: AtPrompt,
+            line_pending: false,
+            program: None,
+            full_screen: false,
+        };
+        let pending = Front {
+            line_pending: true,
+            ..unasked
+        };
+        assert_eq!(
+            reason(choose_boundaries(Wanted::Auto, pending, false)),
+            "input_pending",
+            "a line submitted and not started is ahead of ours"
+        );
+        assert_eq!(
+            reason(choose_boundaries(Wanted::Auto, unasked, false)),
+            format!("{:?}", Choice::Use(Osc133))
+        );
+    }
+
+    /// Several lines are several commands to the shell: markers in `auto`,
+    /// refused when OSC 133 was asked for.
+    #[test]
+    fn a_multi_line_command_is_never_run_on_the_shells_marks() {
+        assert_eq!(
+            reason(choose_boundaries(Wanted::Auto, shell(AtPrompt), true)),
+            format!("{:?}", Choice::Use(Markers))
+        );
+        assert!(
+            reason(choose_boundaries(Wanted::Osc133, shell(AtPrompt), true)).contains("newline")
+        );
+    }
+
+    #[test]
+    fn control_characters_are_refused_where_they_are() {
+        assert_eq!(check_typed_line("echo hi", &[]).ok(), Some(false));
+        assert_eq!(check_typed_line("echo a\nb", &[]).ok(), Some(true));
+        for (cmd, args, field) in [
+            ("echo a\tb", vec![], "command"),
+            (
+                "echo",
+                vec!["ok".to_string(), "a\u{1b}[A".to_string()],
+                "args[1]",
+            ),
+            ("echo", vec!["a\nb".to_string()], "args[0]"),
+            ("echo \u{7f}", vec![], "command"),
+            ("echo \u{9b}", vec![], "command"),
+        ] {
+            let err = check_typed_line(cmd, &args).expect_err(cmd);
+            assert_eq!(
+                err.data.as_ref().map(|d| d["field"].clone()),
+                Some(field.into()),
+                "{cmd:?}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

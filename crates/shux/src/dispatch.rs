@@ -721,6 +721,7 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     command,
                     timeout,
                     is_async,
+                    boundaries,
                 } => {
                     cli::handle_pane_run(
                         &mut stream,
@@ -730,6 +731,7 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
                         &command,
                         timeout,
                         is_async,
+                        boundaries,
                         args.format,
                     )
                     .await
@@ -858,9 +860,17 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     pane,
                     after,
                     timeout,
+                    output,
                 } => {
-                    cli::handle_pane_wait_command(&mut stream, &pane, after, timeout, args.format)
-                        .await
+                    cli::handle_pane_wait_command(
+                        &mut stream,
+                        &pane,
+                        after,
+                        timeout,
+                        output,
+                        args.format,
+                    )
+                    .await
                 }
                 PaneCommand::WaitExit { pane, timeout } => {
                     cli::handle_pane_wait_exit(&mut stream, &pane, timeout, args.format).await

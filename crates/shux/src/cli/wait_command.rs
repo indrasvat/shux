@@ -10,9 +10,13 @@ pub async fn handle_pane_wait_command(
     pane: &str,
     after: Option<u64>,
     timeout_ms: u64,
+    output: bool,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
     let mut params = serde_json::json!({ "pane_id": pane, "timeout_ms": timeout_ms });
+    if output {
+        params["output"] = true.into();
+    }
     if let Some(after) = after {
         params["after"] = after.into();
     }
