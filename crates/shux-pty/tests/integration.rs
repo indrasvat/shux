@@ -827,6 +827,8 @@ async fn ending_a_group_that_outlives_the_first_signal_sends_it_then_sigkill() {
         ended.status.and_then(|s| s.signal()),
         Some(nix::libc::SIGKILL)
     );
+    // why: a lower bound the monotonic clock orders; load only adds to it
+    // ast-grep-ignore: test-wall-clock-assert
     assert!(
         began.elapsed() >= grace,
         "SIGKILL went before the grace ran out"
