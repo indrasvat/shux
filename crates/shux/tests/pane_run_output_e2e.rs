@@ -16,11 +16,12 @@ impl Env {
         let root = tempfile::tempdir().expect("temp root");
         std::fs::create_dir_all(root.path().join("runtime")).expect("mkdir");
         // A two-line prompt in colour, the shape that used to leak into stdout.
-        // Job control off: under load bash's own `setpgid` race prints
-        // "child setpgid (N to N)" into the command's output.
+        // Job control off, or under load bash's own `setpgid` can fail and
+        // print "child setpgid (N to N)" into the command's output. Set at the
+        // prompt: bash turns job control back on after its startup files.
         std::fs::write(
             root.path().join("rc"),
-            "set +m\nPS1=$'\\e[35mpane-run-prompt\\e[0m\\n\\e[32m$\\e[0m '\n",
+            "PROMPT_COMMAND='set +m'\nPS1=$'\\e[35mpane-run-prompt\\e[0m\\n\\e[32m$\\e[0m '\n",
         )
         .expect("rcfile");
         Self {
