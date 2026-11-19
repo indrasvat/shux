@@ -795,6 +795,81 @@ async fn ending_a_group_claims_only_the_signals_its_leader_lived_to_get() {
     );
 }
 
+fn is_stopped(pid: i32) -> bool {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .expect("ps");
+    String::from_utf8_lossy(&out.stdout)
+        .trim_start()
+        .starts_with('T')
+}
+
+/// A group still alive once `first` has had its grace is sent it, then
+/// SIGKILL, in that order. The leader ignores SIGTERM before the test goes
+/// on, so only SIGKILL can end it however it is scheduled.
+#[tokio::test]
+async fn ending_a_group_that_outlives_the_first_signal_sends_it_then_sigkill() {
+    use std::os::unix::process::ExitStatusExt;
+    let dir = tempfile::tempdir().unwrap();
+    let ready = dir.path().join("ready");
+    let script = format!("trap '' TERM; : > {}; exec sleep 300", ready.display());
+    let config = PtyConfig::with_command(vec!["sh".into(), "-c".into(), script], test_cwd());
+    let mut handle = PtyHandle::spawn(&config).unwrap();
+    shux_testkit::wait_until("the leader to ignore SIGTERM", || ready.exists());
+    let grace = Duration::from_millis(200);
+    let began = tokio::time::Instant::now();
+    let ended = handle
+        .end_group(nix::sys::signal::Signal::SIGTERM, grace)
+        .await;
+    assert_eq!(ended.sent, [nix::libc::SIGTERM, nix::libc::SIGKILL]);
+    assert_eq!(
+        ended.status.and_then(|s| s.signal()),
+        Some(nix::libc::SIGKILL)
+    );
+    assert!(
+        began.elapsed() >= grace,
+        "SIGKILL went before the grace ran out"
+    );
+}
+
+/// A stopped leader has not exited: ending its group sends `first` and
+/// claims the signal that ends it.
+#[tokio::test]
+async fn ending_a_stopped_leader_claims_the_signal_that_ends_it() {
+    use std::os::unix::process::ExitStatusExt;
+    let config = PtyConfig::with_command(vec!["sleep".into(), "300".into()], test_cwd());
+    let mut handle = PtyHandle::spawn(&config).unwrap();
+    let pid = handle.pid() as i32;
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid),
+        nix::sys::signal::Signal::SIGSTOP,
+    )
+    .unwrap();
+    shux_testkit::wait_until("the leader to stop", || is_stopped(pid));
+    let ended = handle
+        .end_group(
+            nix::sys::signal::Signal::SIGTERM,
+            Duration::from_millis(200),
+        )
+        .await;
+    assert_eq!(
+        ended.sent.first(),
+        Some(&nix::libc::SIGTERM),
+        "{:?}",
+        ended.sent
+    );
+    let signal = ended
+        .status
+        .and_then(|s| s.signal())
+        .expect("a signal death");
+    assert!(
+        ended.sent.contains(&signal),
+        "died of {signal}, not claimed in {:?}",
+        ended.sent
+    );
+}
+
 /// The exit status read without reaping is exactly the one the reap returns.
 #[tokio::test]
 async fn an_exit_read_without_reaping_matches_the_reap() {

@@ -1313,7 +1313,12 @@ impl PtyHandle {
             self.reaped = true;
             return None;
         }
-        if siginfo_pid(&info) == 0 {
+        // macOS reports a stopped child to `WEXITED` too; it has not exited.
+        let exited = matches!(
+            info.si_code,
+            nix::libc::CLD_EXITED | nix::libc::CLD_KILLED | nix::libc::CLD_DUMPED
+        );
+        if siginfo_pid(&info) == 0 || !exited {
             return Some(None);
         }
         Some(Some(siginfo_exit_status(&info)))
