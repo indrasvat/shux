@@ -210,7 +210,7 @@ test: nextest-ready ## Run the whole workspace suite (same command CI runs)
 
 .PHONY: test-stress
 test-stress: nextest-ready ## Repeat tests to expose timing dependence (STRESS_COUNT, STRESS_FILTER, STRESS_LOAD)
-	@NEXTEST_JOBS=$(NEXTEST_JOBS) bash scripts/test-stress.sh
+	@NEXTEST_JOBS=$(NEXTEST_JOBS) .shux/scripts/no_leak_guard.sh bash scripts/test-stress.sh
 
 .PHONY: test-verbose
 test-verbose: nextest-ready ## Run tests with output visible
