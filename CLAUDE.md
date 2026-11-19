@@ -200,31 +200,18 @@ pixel-verify where a baseline exists (`.claude/automations/pixel_verify.py` via
 `uv run --script`); prove zero leaked daemons. **Missing evidence is failure, not residual
 risk.**
 
-**A gate agent breaks the new surface. Scripts prove everything else.** The defects
-only the gates caught came from probing the new surface: cross-path disagreements,
-lifecycle edges, hostile input. The rest of a run was re-proving neutrality by hand,
-plus bookkeeping. So:
+**A gate agent breaks the new surface; scripts prove everything else.** The
+charters in `.claude/agents/` hold the detail. The rules:
 
-- **Scripted first.** For a VT-path diff, run `make vt-neutrality BASE=$(git merge-base
-  origin/main HEAD) SCOPE=<scope>` and then `make check-vt-qa-pregate` before any agent
-  starts. The first does the corpus replay against goldens, a base-vs-HEAD A/B of every
-  committed rich-TUI recording through `pane.snapshot`/`window.snapshot`/capture, the
-  colour probe, a short fuzz and a leak check, at 0/0. Its base build is cached per
-  merge-base and toolchain, outside `target/`. The second checks council records,
-  committed metrics and that the reports match the code. Red here is fixed by the
-  author, never by a gate agent.
-- **Time-boxed.** The agent gets about 20 minutes. It does not re-run `make check`,
-  tests, the corpus or a council-compliance review. It cites `neutrality.json`. An
-  attack the PR requires but the box did not reach is `BLOCKED`.
-- **Delta re-audits.** After a FAIL, the agent audits `commit_under_audit..HEAD` and
-  the previous findings, not the whole change again.
-- **One agent when both gates apply.** It carries both charters in one run and one
-  time box, and writes one report.
-- **Trivial tier.** A VT-path diff with no behaviour change (lint fix, rename, comment,
-  mechanical refactor) needs no gate agent: `make vt-neutrality SCOPE=<scope>`, a
-  two-line `SOLID-QA.md`, and `"tier": "trivial"` in the manifest. The guard then
-  requires 0/0 on every layer. The feature protocol's councils still apply. The tier
-  only replaces the agent.
+- **Scripted first.** A VT-path diff runs `make vt-neutrality BASE=$(git merge-base
+  origin/main HEAD) SCOPE=<scope>`, then `make check-vt-qa-pregate`, before any agent
+  starts. The author fixes a red here, never a gate agent.
+- **Time-boxed** at about 20 minutes. The agent does not re-run `make check`, tests, the
+  corpus or a council-compliance review. It cites `neutrality.json`.
+- **Delta re-audits** after a FAIL: `commit_under_audit..HEAD` plus the old findings.
+- **One agent when both gates apply**, with both charters, one run, one report.
+- **Trivial tier**: a VT-path diff with no behaviour change needs no gate agent, only
+  `make vt-neutrality` at 0/0 and `"tier": "trivial"`. Its councils still run.
 
 VT gate PASS report commits to `.shux/qa/<scope>/SOLID-QA.md`, first line exactly
 `VERDICT: PASS`. `<scope>` is free-form — name it after the change. `make check-vt-qa`
@@ -330,7 +317,7 @@ Paste into every feature PR:
 - [ ] config states: default · init · feature-maxed · malformed · hot-reload
 - [ ] cross-path consistency test
 - [ ] `make check` (lint + tests)
-- [ ] VT-path diff: `make vt-neutrality` + `make check-vt-qa-pregate` green before the gate; tier (`full`/`trivial`) stated; gate time-boxed, one agent when both gates apply
+- [ ] VT-path diff: `make vt-neutrality` + `make check-vt-qa-pregate` before the gate; tier stated
 - [ ] real-target dogfood — consumer-facing output judged; findings reproduced
 - [ ] visual proof for every (render path × config state) cell, attached as a PR comment (or Claude Artifact link); non-visual change → exemption stated
 - [ ] `gh-ghent` skill loaded at PR creation, re-entered after every push, output read; every thread answered **and** resolved

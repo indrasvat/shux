@@ -29,15 +29,20 @@ committed goldens, base-vs-HEAD A/B of the corpus harness, base-vs-HEAD
 recording, a truecolor + full-256-palette + basic colour probe at 80x24, 120x40
 and 200x60, a short fuzz of the VT parsers, and a leak check, all at exact 0/0.
 The pre-gate guard has already checked the council records, the committed
-metrics and that the neutrality report matches this code. If either is red, stop
-and return `VERDICT: BLOCKED` naming it. Fixing bookkeeping is not your job.
+metrics and that the neutrality report matches this code.
+
+Read the verdict from `status` in `neutrality.json` (`make` reports every failure
+as exit 2): `pass` means nothing moved; `moved` means every layer ran and some
+cell or pixel differs; `error` means a layer could not run, crashed, leaked or
+compared nothing. `error`, or a red pre-gate, means stop and return
+`VERDICT: BLOCKED` naming it. Fixing bookkeeping is not your job.
 
 Do **not** re-run any of these: `make check`, `make test`, clippy, the corpus,
 a pixel A/B of existing recordings, a colour probe, a council-compliance review.
 Pre-commit, CI, the guard and the target own them. Read
 `.shux/qa/<scope>/neutrality.json` and cite it.
 
-When `neutrality.json` reports a moved pixel (`status: fail`), open each failed
+When `neutrality.json` reports `status: moved`, open each failed
 case's diff PNG under `.shux/out/vt-neutrality/metrics/` and decide whether the
 change is the one the PR intends. An unintended move is a finding.
 
@@ -103,7 +108,7 @@ and test logs out of your transcript: redirect to a file, and on failure capture
 - Pixel metrics from `.claude/automations/pixel_verify.py`, exact 0/0, for any
   A/B your attacks produced. A `*-actual.png` is required only when a metric
   compares against a baseline the repo tracks.
-- `evidence-manifest.json` with `tier` (`full`), `commit_under_audit`,
+- `evidence-manifest.json` with `tier` (`full`, the default), `commit_under_audit`,
   `neutrality`, `solid_qa_report`, `dootsabha_design`,
   `dootsabha_implementation`, `screenshots` and `pixel_metrics`.
 
@@ -114,10 +119,12 @@ file in the diff, so commit the fix and re-audit the delta before you write PASS
 
 A VT-path diff with no behaviour change (a lint fix, a rename, a comment, a
 mechanical refactor) does not need you. The author runs `make vt-neutrality
-SCOPE=<scope>`, commits a two-line `SOLID-QA.md` saying why nothing can move,
-and sets `"tier": "trivial"` in the manifest. The guard then requires every
-neutrality layer at 0/0 and no council records. If that bar cannot be met, the
-diff is not trivial.
+BASE=<merge-base> SCOPE=<scope>` and commits a two-line `SOLID-QA.md` saying why
+nothing can move, plus a manifest with `"tier": "trivial"`, `solid_qa_report`,
+`commit_under_audit` and `neutrality`. The guard then requires every neutrality
+layer at 0/0, and no council records in the scope: the feature protocol's
+councils still run, and their record lives in the PR. If that bar cannot be met,
+the diff is not trivial.
 
 ## When the TUI gate also applies
 
