@@ -4,6 +4,9 @@
 //! and optional TCP loopback. Uses length-prefixed framing (4-byte BE +
 //! JSON payload). Includes a method router and error system.
 
+/// The short git SHA this build came from (`unknown` outside a checkout).
+pub const GIT_SHA: &str = env!("SHUX_GIT_SHA");
+
 pub mod attach;
 pub mod caller;
 pub mod codec;

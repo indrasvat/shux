@@ -1202,7 +1202,7 @@ pub enum PaneCommand {
         /// `allow_hyphen_values` so agents can send literal flag-shaped
         /// strings (e.g. `--help`, `--version`) without resorting to
         /// `--text=--help` or base64 via `--data`.
-        #[arg(short, long, allow_hyphen_values = true)]
+        #[arg(short, long, allow_hyphen_values = true, conflicts_with = "data")]
         text: Option<String>,
 
         /// Base64-encoded bytes to send (mutually exclusive with --text)
@@ -2033,6 +2033,28 @@ mod tests {
     // the May 2026 CLI consistency overhaul. Codex council
     // verdict: RPC dots become CLI spaces, no top-level shortcut
     // verbs. Every session op now lives under `shux session`.
+
+    #[test]
+    fn send_keys_refuses_text_and_data_together() {
+        // Both used to parse, and --data was silently dropped.
+        let err = Cli::try_parse_from([
+            "shux",
+            "pane",
+            "send-keys",
+            "-s",
+            "s",
+            "--text",
+            "abc",
+            "--data",
+            "WFla",
+        ])
+        .expect_err("--text with --data must not parse");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "{err}"
+        );
+    }
 
     #[test]
     fn test_cli_parse_session_list() {

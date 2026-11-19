@@ -563,7 +563,7 @@ async fn version_names_the_cli_and_a_daemon_of_another_version() {
         env!("CARGO_PKG_VERSION"),
         "{parsed}"
     );
-    assert_eq!(parsed["cli"]["git_sha"], env!("SHUX_GIT_SHA"), "{parsed}");
+    assert_eq!(parsed["cli"]["git_sha"], shux_rpc::GIT_SHA, "{parsed}");
     assert_eq!(parsed["version"], env!("CARGO_PKG_VERSION"), "{parsed}");
     assert_eq!(parsed["daemon"]["version"], "0.0.1", "{parsed}");
     assert_eq!(parsed["daemon"]["git_sha"], "b623470", "{parsed}");
@@ -589,7 +589,7 @@ async fn version_names_the_cli_and_a_daemon_of_another_version() {
         format!(
             "cli\t{}\t{}\ndaemon\trunning\t0.0.1\tb623470\tmismatch\n",
             env!("CARGO_PKG_VERSION"),
-            env!("SHUX_GIT_SHA")
+            shux_rpc::GIT_SHA
         ),
         "plain names the same builds and mismatch as JSON and text"
     );
@@ -613,7 +613,7 @@ async fn version_flags_a_daemon_built_from_another_commit() {
 async fn version_reports_a_matching_daemon_as_matching() {
     let dir = tempfile::tempdir().unwrap();
     let (socket, cancel) =
-        start_versioned_server(dir.path(), env!("CARGO_PKG_VERSION"), env!("SHUX_GIT_SHA")).await;
+        start_versioned_server(dir.path(), env!("CARGO_PKG_VERSION"), shux_rpc::GIT_SHA).await;
     let (stdout, _) = shux_version(&socket, "json").await;
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(
