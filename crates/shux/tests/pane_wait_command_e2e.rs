@@ -841,9 +841,11 @@ fn a_timed_out_run_can_be_waited_on_to_its_end() {
         (Some("timed_out"), Some(1)),
         "{r}"
     );
-    assert_eq!(
-        r["stdout"], "early\n",
-        "what it wrote before the timeout: {r}"
+    // The timeout races the command's first write; load only shortens this.
+    let frozen = r["stdout"].as_str().unwrap_or_default();
+    assert!(
+        "early\n".starts_with(frozen),
+        "what it wrote before the timeout, and nothing else: {r}"
     );
     let after = r["as_of"]
         .as_u64()
