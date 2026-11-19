@@ -577,11 +577,13 @@ fn the_ending_sequence_is_never_output_or_counted() {
 
 // ── The line editor's end-of-line mark, drawn before the end is reported ──
 
-/// A command at `cols` wide that wrote `out`, then the mark, then its end.
-fn ended_output(cols: usize, out: &[u8], mark: &[u8]) -> (Vec<u8>, bool) {
+/// A command at `cols` wide, after a prompt `editor` drew, that wrote `out`,
+/// then the mark, then its end.
+fn ended_output(cols: usize, out: &[u8], mark: &[u8], editor: &str) -> (Vec<u8>, bool) {
     let mut vt = VirtualTerminal::new(24, cols);
     let floor = shux_vt::program_status_as_of();
-    vt.process_with_responses(&[C, out, mark, &d(";0")].concat());
+    let prompt = format!("\x1b]133;A{editor}\x07");
+    vt.process_with_responses(&[prompt.as_bytes(), C, out, mark, &d(";0")].concat());
     let ended = ended_after(&vt, floor);
     output_of(&vt, &ended[0])
 }
@@ -606,7 +608,8 @@ fn zshs_mark_is_not_output_whatever_the_mark() {
         (80, "\x1b[31m⏎\x1b[0m", 1),
     ] {
         for out in [b"a\r\n" as &[u8], b"abc", b"50%", b""] {
-            let (bytes, truncated) = ended_output(cols, out, &zsh_mark(cols, mark, w));
+            let (bytes, truncated) =
+                ended_output(cols, out, &zsh_mark(cols, mark, w), ";shux-editor=zsh");
             assert_eq!(bytes, out, "cols={cols} mark={mark:?}");
             assert!(!truncated);
         }
@@ -618,7 +621,11 @@ fn bles_mark_is_not_output_empty_or_not() {
     let empty = b"\x1b[78C  \r\x1b[K";
     for mark in [BLE_MARK_80, empty] {
         for out in [b"a\r\nb\r\n" as &[u8], b"abc", b""] {
-            assert_eq!(ended_output(80, out, mark).0, out, "{mark:?}");
+            assert_eq!(
+                ended_output(80, out, mark, ";shux-editor=ble").0,
+                out,
+                "{mark:?}"
+            );
         }
     }
 }
@@ -635,7 +642,11 @@ fn output_shaped_like_a_mark_is_kept() {
         b"\x1b[10C  \r\x1b[K",
         b"a%   \r \r",
     ] {
-        assert_eq!(ended_output(80, out, b"").0, out, "{out:?}");
+        assert_eq!(
+            ended_output(80, out, b"", ";shux-editor=zsh").0,
+            out,
+            "{out:?}"
+        );
     }
 }
 
@@ -643,8 +654,11 @@ fn output_shaped_like_a_mark_is_kept() {
 #[test]
 fn a_mark_after_exactly_the_limit_is_not_counted() {
     let body = vec![b'x'; shux_vt::COMMAND_OUTPUT_LIMIT];
-    for mark in [zsh_mark(80, "%", 1), BLE_MARK_80.to_vec()] {
-        let (bytes, truncated) = ended_output(80, &body, &mark);
+    for (mark, editor) in [
+        (zsh_mark(80, "%", 1), ";shux-editor=zsh"),
+        (BLE_MARK_80.to_vec(), ";shux-editor=ble"),
+    ] {
+        let (bytes, truncated) = ended_output(80, &body, &mark, editor);
         assert_eq!(bytes.len(), body.len());
         assert!(!truncated, "{mark:?}");
     }
@@ -652,7 +666,7 @@ fn a_mark_after_exactly_the_limit_is_not_counted() {
 
 #[test]
 fn the_mark_is_found_however_the_reads_were_cut() {
-    let mut stream = [C, b"out\r\n"].concat();
+    let mut stream = [b"\x1b]133;A;shux-editor=zsh\x07" as &[u8], C, b"out\r\n"].concat();
     stream.extend_from_slice(&zsh_mark(80, "%", 1));
     stream.extend_from_slice(&d(";0"));
     let mut vt = VirtualTerminal::new(24, 80);
@@ -757,5 +771,20 @@ fn lines_come_back_in_the_order_the_shell_read_them() {
             "command 1: $ echo AHEAD",
             "command 2: $ echo OURS"
         ]
+    );
+}
+
+/// A shell whose integration names no line editor (plain bash) gets nothing
+/// trimmed, whatever its output looks like.
+#[test]
+fn nothing_is_trimmed_without_a_named_editor() {
+    let zsh_like = zsh_mark(80, "%", 1);
+    assert_eq!(
+        ended_output(80, b"REAL", &zsh_like, "").0,
+        [b"REAL" as &[u8], &zsh_like].concat()
+    );
+    assert_eq!(
+        ended_output(80, b"x", BLE_MARK_80, ";k=1").0,
+        [b"x" as &[u8], BLE_MARK_80].concat()
     );
 }

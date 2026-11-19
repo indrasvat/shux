@@ -382,12 +382,11 @@ impl PaneIoState {
         }
         let mut prepared = prepared;
         if prepared.boundaries() == shux_pty::Boundaries::Osc133 {
-            let Some(vt) = self.vts.get(&pane_id) else {
+            if !self.vts.contains_key(&pane_id) {
                 return CommandStart::PaneGone;
-            };
+            }
             prepared.anchor(shux_pty::Osc133Anchor {
                 floor: shux_vt::program_status_as_of(),
-                prompts: vt.prompts_seen(),
             });
         }
         let left = timeout.saturating_sub(requested_at.elapsed());
@@ -419,12 +418,14 @@ impl PaneIoState {
     ) -> Option<crate::run_framing::Front> {
         let vt = self.vts.get(&pane_id)?;
         let queued = self.writers.get(&pane_id).is_some_and(|w| w.queued() > 0);
+        let program = self.sync_gates.get(&pane_id).and_then(|p| p.foreground());
         Some(crate::run_framing::Front {
             shell: vt.shell_state(),
             input_pending: vt.line_pending() || queued,
             input_present: vt.input_present(),
-            at_line_start: vt.cursor().col == 0,
-            program: self.sync_gates.get(&pane_id).and_then(|p| p.foreground()),
+            program,
+            foreground_is_shell: program
+                .is_some_and(|p| p.leader || crate::run_framing::group_is_a_shell(p.group)),
             full_screen: vt.is_alternate_screen(),
             pane_is_shell,
         })
@@ -523,7 +524,21 @@ impl PaneIoState {
             }
             self.osc133_output_so_far(id);
         }
-        self.cmd_engine.check_timeouts()
+        let timed_out = self.cmd_engine.check_timeouts();
+        // A line that timed out before it started holds its pane until the
+        // shell is ready at an empty prompt again: then it will never start.
+        let held: Vec<_> = self.cmd_engine.unstarted_holders();
+        for (id, pane) in held {
+            let pane_id = shux_core::model::PaneId::from_uuid(pane);
+            let ready = self.front(pane_id, true).is_some_and(|f| {
+                crate::run_framing::choose(crate::run_framing::Wanted::Osc133, &f, false)
+                    == crate::run_framing::Choice::Use(shux_pty::Boundaries::Osc133)
+            });
+            if ready {
+                self.cmd_engine.release_unstarted(id);
+            }
+        }
+        timed_out
     }
 
     /// `command_id`'s result, or while it runs its phase: `awaiting_input`

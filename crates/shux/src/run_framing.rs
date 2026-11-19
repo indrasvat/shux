@@ -26,10 +26,9 @@ pub(crate) struct Front {
     pub(crate) input_pending: bool,
     /// Keys were sent to the prompt that submitted nothing.
     pub(crate) input_present: bool,
-    /// The cursor is at the start of a row. A drawn prompt never leaves it
-    /// there; a line editor that has accepted a line, or prompt hooks still
-    /// running after the prompt mark, do.
-    pub(crate) at_line_start: bool,
+    /// The foreground process group is the pane's program or another shell
+    /// (one started from it, at its own prompt).
+    pub(crate) foreground_is_shell: bool,
     /// `None` when the terminal could not be asked.
     pub(crate) program: Option<shux_pty::Foreground>,
     pub(crate) full_screen: bool,
@@ -46,6 +45,9 @@ pub(crate) enum Refusal {
     CommandRunning,
     InputPending,
     InputPresent,
+    /// The marks say the shell is at its prompt, but no line editor is
+    /// reading: a prompt hook, or a line it accepted, is still running.
+    PromptNotReady,
     NotAShell,
     /// Nothing reported a prompt: `osc133` was asked for, or a command ended
     /// and its prompt never came.
@@ -61,6 +63,7 @@ impl Refusal {
             Refusal::CommandRunning => "command_running",
             Refusal::InputPending => "input_pending",
             Refusal::InputPresent => "input_present",
+            Refusal::PromptNotReady => "prompt_not_ready",
             Refusal::NotAShell => "not_a_shell",
             Refusal::NoPrompt => "no_prompt",
         }
@@ -98,7 +101,12 @@ pub(crate) fn choose(wanted: Wanted, front: &Front, multiline: bool) -> Choice {
         };
     }
     match (wanted, front.shell) {
-        (_, AtPrompt) if front.at_line_start => Choice::Await(Refusal::InputPending),
+        // The terminal is in line mode: readline, zle and ble.sh read a
+        // prompt in raw mode, so a hook or an accepted line runs now, and a
+        // line typed now would be its input, echoed by the terminal.
+        (_, AtPrompt) if front.program.is_some_and(|p| p.canonical) => {
+            Choice::Await(Refusal::PromptNotReady)
+        }
         (_, AtPrompt) => Choice::Use(Boundaries::Osc133),
         (Wanted::Auto, Unknown) if front.pane_is_shell => Choice::Use(Boundaries::Markers),
         (Wanted::Auto, Unknown) => Choice::Refuse(Refusal::NotAShell),
@@ -113,7 +121,7 @@ fn refusal(front: &Front) -> Option<Refusal> {
     let program = front.program;
     if program.is_some_and(|p| p.hidden_input) {
         Some(Refusal::HiddenInput)
-    } else if program.is_some_and(|p| !p.leader) {
+    } else if program.is_some() && !front.foreground_is_shell {
         Some(Refusal::OtherProgram)
     } else if front.full_screen {
         Some(Refusal::FullScreen)
@@ -145,6 +153,32 @@ pub(crate) fn runs_a_shell(argv: &[String]) -> bool {
     SHELLS.contains(&name.trim_start_matches('-')) && !argv.iter().any(|a| a == "-c")
 }
 
+/// Whether the leader of process group `group` is a shell.
+pub(crate) fn group_is_a_shell(group: i32) -> bool {
+    process_name(group).is_some_and(|name| runs_a_shell(&[name]))
+}
+
+#[cfg(target_os = "macos")]
+fn process_name(pid: i32) -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: `proc_name` writes at most `buf.len()` bytes into `buf`, which
+    // outlives the call, and returns how many it wrote.
+    let n = unsafe { libc::proc_name(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    let n = usize::try_from(n).ok().filter(|&n| n > 0)?;
+    String::from_utf8(buf[..n].to_vec()).ok()
+}
+
+#[cfg(target_os = "linux")]
+fn process_name(pid: i32) -> Option<String> {
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    Some(comm.trim_end().to_string())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn process_name(_pid: i32) -> Option<String> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,10 +190,11 @@ mod tests {
             shell,
             input_pending: false,
             input_present: false,
-            at_line_start: false,
+            foreground_is_shell: true,
             program: Some(shux_pty::Foreground {
                 leader: true,
                 hidden_input: false,
+                canonical: false,
                 group: 1,
             }),
             full_screen: false,
@@ -171,6 +206,7 @@ mod tests {
         Some(shux_pty::Foreground {
             leader,
             hidden_input,
+            canonical: hidden_input,
             group: 9,
         })
     }
@@ -233,18 +269,30 @@ mod tests {
             with(|f| f.input_present = true),
             Choice::Refuse(Refusal::InputPresent)
         );
-        // A line accepted and not started, or a prompt not drawn yet: wait.
+        // In line mode no line editor reads the prompt: a hook, or a line
+        // it accepted, runs. Wait.
         assert_eq!(
-            with(|f| f.at_line_start = true),
-            Choice::Await(Refusal::InputPending)
+            with(
+                |f| f.program = fg(true, false).map(|p| shux_pty::Foreground {
+                    canonical: true,
+                    ..p
+                })
+            ),
+            Choice::Await(Refusal::PromptNotReady)
         );
-        // At the prompt mark a prompt hook may still be running: wait.
+        // At the prompt mark a prompt hook's program may hold the terminal: wait.
         assert_eq!(
-            with(|f| f.program = fg(false, false)),
+            with(|f| {
+                f.program = fg(false, false);
+                f.foreground_is_shell = false;
+            }),
             Choice::Await(Refusal::OtherProgram)
         );
+        // A shell started from the pane's, at its own prompt, is a prompt.
+        assert_eq!(with(|f| f.program = fg(false, false)), Choice::Use(Osc133));
         let mut running = front(Running);
         running.program = fg(false, false);
+        running.foreground_is_shell = false;
         assert_eq!(
             choose(Wanted::Auto, &running, false),
             Choice::Refuse(Refusal::OtherProgram)

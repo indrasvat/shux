@@ -22,7 +22,7 @@ __shux_osc133_install() {
       print -n "\e]133;D;${ec}\a"
       __shux_osc133_ran=
     fi
-    print -n '\e]133;A\a'
+    print -n '\e]133;A;shux-editor=zsh\a'
     # zsh gives every hook, and the prompt, the command's own status, so a
     # non-zero return would only run ZERR again or trip ERR_EXIT.
     return 0

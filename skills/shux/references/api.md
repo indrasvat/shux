@@ -230,7 +230,9 @@ pane.wait_command { "pane_id": "uuid", "after": 41, "timeout_ms": 30000, "output
   Output is kept passively for every command, within a few MiB per pane; an
   older command's comes back `stdout: null, evicted: true`. zsh's
   partial-line mark (PROMPT_SP), which it prints before reporting the end, is
-  not part of it.
+  not part of it, nor is ble.sh's `prompt_eol_mark`: the shipped integration
+  names its line editor on the prompt mark (`133;A;shux-editor=zsh|ble`), and
+  the mark is trimmed only for the editor named, pinned to the pane's width.
 - **`timeout_ms`**: 30 s by default, at most 3600000 (1 h). Past it the wait is
   refused with `-32602`, `data: { field, max, hint }`, exactly as
   `pane.wait_status` and `pane.wait_for` refuse it.
@@ -336,14 +338,16 @@ the line prints a `SHUX_BEGIN…`/`SHUX_MARKER…` pair around the command, and
 
 Before any framing but `markers`, the pane's terminal is asked who reads its
 input (the foreground process group, and termios): another program in front
-is refused as `other_program` (waited out while the marks say the prompt is
-being drawn: prompt hooks), a line read with echo off as `hidden_input`, the
-alternate screen as `full_screen`. Input the pane was sent counts too: a line
+is refused as `other_program` unless it is a shell (one started from the
+pane's, at its own prompt), and waited out while the marks say the prompt is
+being drawn (prompt hooks); a line read with echo off is `hidden_input`; the
+alternate screen is `full_screen`. At the prompt mark the terminal must be in
+raw mode, as readline, zle and ble.sh leave it while they read: in line mode a
+hook, or a line the shell accepted, runs, and it waits, then refuses
+`prompt_not_ready`. Input the pane was sent counts too: a line
 submitted at the prompt (a CR or LF outside a bracketed paste) that has not
 started, or input still queued, is `input_pending`; keys sent to the prompt
-that submitted nothing are `input_present` (C-c gives a fresh prompt). With
-the cursor at the start of a row at the prompt mark (a line accepted, or the
-prompt not drawn yet), it waits, then refuses `input_pending`. A pane whose
+that submitted nothing are `input_present` (C-c gives a fresh prompt). A pane whose
 program is not a shell (`python3`, `bash -c …`) and reports no prompt is
 `not_a_shell` under `auto`. A multi-line command is refused
 (`-32602`) unless the shell reports nothing (then markers) or `markers` is asked for. A control character in `command` or

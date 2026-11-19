@@ -35,7 +35,7 @@ __shux_osc133_install() {
     }
     __shux_osc133_prompt() {
       local ec=$?
-      printf '\e]133;A\a'
+      printf '\e]133;A;shux-editor=ble\a'
       __shux_osc133_keep "$ec"
     }
     blehook PREEXEC!=__shux_osc133_start

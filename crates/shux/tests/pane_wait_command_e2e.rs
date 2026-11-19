@@ -1017,7 +1017,7 @@ fn a_command_typed_ahead_is_never_taken_for_ours() {
         Some(3),
         "typed behind a line that had not started: {r}"
     );
-    assert_eq!(r["error"]["data"]["reason"], "input_pending", "{r}");
+    assert_eq!(r["error"]["data"]["reason"], "prompt_not_ready", "{r}");
     assert!(
         !env.capture("ws", &pane).contains("OURS-"),
         "the refused line reached the pane"
@@ -1272,6 +1272,124 @@ fn a_run_into_the_callers_own_pane_is_refused() {
     assert_eq!(
         r["stdout"].as_str(),
         Some(format!("{pane}\n").as_str()),
+        "{r}"
+    );
+}
+
+/// A hook that reads input after the shell accepted a line: the terminal is
+/// in line mode, so nothing is typed (it would be the hook's input, echoed
+/// into that line); the line's own command runs as its own.
+#[test]
+fn a_hook_reading_input_after_an_accepted_line_is_never_typed_into() {
+    let (env, _rc, pane) = integrated(&bash());
+    type_line(
+        &env,
+        "sleep 2; PS0='$(printf \"HO\"\"LD>\" >&2; read -r gate)'\"$PS0\"",
+    );
+    type_line(&env, "printf OTHER");
+    let held = env.run(&[
+        "pane",
+        "wait-for",
+        "-s",
+        "ws",
+        "-p",
+        &pane,
+        "--text",
+        "HOLD>",
+        "--timeout-ms",
+        "60000",
+    ]);
+    assert!(held.status.success(), "{}", env.capture("ws", &pane));
+    let (r, code) = pane_run(&env, &pane, "echo OURS", &["--timeout", "2"]);
+    assert_eq!(
+        code,
+        Some(3),
+        "another command's result came back as ours: {r}"
+    );
+    assert_eq!(r["error"]["data"]["reason"], "prompt_not_ready", "{r}");
+    assert!(
+        !env.capture("ws", &pane).contains("OURS"),
+        "the refused line reached the hook"
+    );
+}
+
+/// A command holding a combining character is found, and its pane freed.
+#[test]
+fn a_command_with_a_combining_character_is_found() {
+    let (env, _rc, pane) = integrated(&bash());
+    let (r, code) = pane_run(&env, &pane, "printf 'cafe\u{301}\\n'", &["--timeout", "10"]);
+    assert_eq!(
+        (r["state"].as_str(), r["stdout"].as_str(), code),
+        (Some("completed"), Some("cafe\u{301}\n"), Some(0)),
+        "{r}"
+    );
+    let (r, _) = pane_run(&env, &pane, "echo after", &[]);
+    assert_eq!(r["stdout"], "after\n", "{r}");
+}
+
+/// Plain bash draws no end-of-line mark: output shaped like zsh's, at the
+/// pane's width, is the command's own.
+#[test]
+fn plain_bash_output_shaped_like_zshs_mark_is_kept() {
+    let (env, _rc, pane) = integrated(&bash());
+    let (r, _) = pane_run(&env, &pane, r"printf '%s%*s\r \r' REAL 79 ''", &[]);
+    let want = format!("REAL{}\r \r", " ".repeat(79));
+    assert_eq!(r["stdout"].as_str(), Some(want.as_str()), "{r}");
+}
+
+/// An empty prompt, and one ending in a newline, are prompts.
+#[test]
+fn a_prompt_that_ends_at_the_start_of_a_row_is_a_prompt() {
+    let (env, _rc, pane) = integrated(&bash());
+    for ps1 in ["PS1=''", "PS1='top\\n'"] {
+        let floor = as_of(&env, &pane);
+        type_line(&env, ps1);
+        let r = result(
+            &wait(&env, &pane, floor, "20s")
+                .output()
+                .expect("spawn shux"),
+        );
+        assert_eq!(r["outcome"], "completed", "{ps1}: {r}");
+        let (r, code) = pane_run(&env, &pane, "echo next", &["--timeout", "10"]);
+        assert_eq!(
+            (r["stdout"].as_str(), code),
+            (Some("next\n"), Some(0)),
+            "{ps1}: {r}"
+        );
+    }
+}
+
+/// A shell started from the pane's own, integrated and at its prompt, is a
+/// prompt: the line runs there.
+#[test]
+fn a_nested_integrated_shell_takes_the_line() {
+    let env = Env::new(80, 24);
+    let rc = tempfile::tempdir().expect("rc dir");
+    let pane = start(&env, &rc, &bash(), true);
+    let rcfile = rc.path().join("rc");
+    let floor = as_of(&env, &pane);
+    type_line(
+        &env,
+        &format!("{} --noprofile --rcfile '{}' -i", bash(), rcfile.display()),
+    );
+    // The child's first prompt ends the outer command.
+    let r = result(
+        &wait(&env, &pane, floor, "20s")
+            .output()
+            .expect("spawn shux"),
+    );
+    assert_eq!(r["ended_by"], "prompt", "{r}");
+    let (r, code) = pane_run(
+        &env,
+        &pane,
+        "echo child-$BASH_SUBSHELL$SHLVL",
+        &["--timeout", "10"],
+    );
+    assert_eq!(code, Some(0), "{r}");
+    assert!(
+        r["stdout"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("child-")),
         "{r}"
     );
 }

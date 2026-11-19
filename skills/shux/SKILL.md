@@ -155,16 +155,19 @@ watcher sees them. `--boundaries osc133` insists on the shell's own marks
 (waiting up to `--timeout` for its prompt); `--boundaries markers` forces the
 old framing.
 
-**A line goes only to a shell's empty prompt.** Anything else is refused
-with `error.data.reason`, and nothing is typed. Transient states (a prompt not
-drawn yet, prompt hooks still running) are waited out first, up to `--timeout`:
+**A line goes only to a shell's empty prompt**: the shell's marks say it is
+at its prompt, its line editor reads the terminal in raw mode, and nothing
+else was sent to it. Anything else is refused with `error.data.reason`, and
+nothing is typed. Transient states (a prompt not drawn yet, prompt hooks
+running) are waited out first, up to `--timeout`:
 
 | `reason` | The pane's input would go to | Do |
 |---|---|---|
 | `command_running` | a command the shell reports running | `pane wait-command`, then retry |
 | `input_pending` | a line already sent that has not started (`send-keys … C-j` just before, or input still queued) | `pane wait-command` for it, then retry |
 | `input_present` | keys sent to the prompt that submitted nothing: the editor holds text, or is in another mode | `send-keys --data Aw==` (C-c) for a fresh prompt, then retry |
-| `other_program` | another program in the foreground (a REPL, `ssh`, `less`) | wait for it, or `--boundaries markers` to type into it |
+| `other_program` | another program in the foreground (a REPL, `ssh`, `less`); a shell started from the pane's, at its own integrated prompt, is not one | wait for it, or `--boundaries markers` to type into it |
+| `prompt_not_ready` | the prompt mark is drawn but no line editor reads (the terminal is in line mode): a prompt hook, or a line the shell accepted, runs | wait, then retry |
 | `hidden_input` | a password prompt (`sudo`, `read -s`) | answer it with `send-keys`, or cancel it |
 | `full_screen` | a full-screen program (an editor) | quit it first |
 | `not_a_shell` | a pane whose program is not a shell, and reports no prompt | `--boundaries markers` to type into it anyway |

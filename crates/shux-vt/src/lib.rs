@@ -30,9 +30,9 @@ pub use cell::{
 };
 pub use charset::{CharsetSlot, TerminalCharset, TerminalCharsets};
 pub use commands::{
-    CommandLookup, CommandOutput, CommandRecord, EndedBy, KEEP_ENDED as COMMANDS_KEPT, NthCommand,
-    OUTPUT_BUDGET as COMMAND_OUTPUT_BUDGET, OUTPUT_LIMIT as COMMAND_OUTPUT_LIMIT, ShellState,
-    Submitted, eol_mark_len,
+    CommandLookup, CommandOutput, CommandRecord, EndedBy, KEEP_ENDED as COMMANDS_KEPT, LineEditor,
+    NthCommand, OUTPUT_BUDGET as COMMAND_OUTPUT_BUDGET, OUTPUT_LIMIT as COMMAND_OUTPUT_LIMIT,
+    ShellState, Submitted, eol_mark_len,
 };
 pub use cursor::{Cursor, CursorShape, SavedCursor};
 pub use diff::{
@@ -592,12 +592,12 @@ impl VirtualTerminal {
             CutAction::CommandEnd { exit_code } => {
                 self.commands.on_end(exit_code, len, self.grid.cols());
             }
-            CutAction::PromptStart => {
+            CutAction::PromptStart { editor } => {
                 if self.commands.state() == ShellState::AtPrompt {
                     let rows = self.input_rows();
                     self.commands.on_input_rejected(rows);
                 }
-                self.commands.on_prompt(len, self.grid.cols());
+                self.commands.on_prompt(len, self.grid.cols(), editor);
                 self.prompt_row = (!self.modes.alternate_screen).then(|| self.cursor_row_abs());
                 if let Some(ps) = self.program_status.as_mut() {
                     ps.on_prompt_start();
@@ -645,12 +645,10 @@ impl VirtualTerminal {
             else {
                 break;
             };
-            let text: String = row
-                .cells
-                .iter()
-                .filter(|c| c.width > 0)
-                .map(|c| c.ch)
-                .collect();
+            let mut text = String::new();
+            for cell in row.cells.iter().filter(|c| c.width > 0) {
+                cell.push_display_text(&mut text);
+            }
             if let Some(line) = lines.last_mut() {
                 line.push_str(text.trim_end_matches(' '));
             }

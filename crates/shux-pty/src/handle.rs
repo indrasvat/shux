@@ -522,6 +522,9 @@ pub struct Foreground {
     pub leader: bool,
     /// Input is read a line at a time with echo off: a password prompt.
     pub hidden_input: bool,
+    /// Input is read a line at a time (the terminal's own line editing): no
+    /// line editor such as readline or zle is reading it now.
+    pub canonical: bool,
     /// The foreground process group.
     pub group: i32,
 }
@@ -537,6 +540,7 @@ impl PtyOutputProbe {
             group: group.as_raw(),
             leader: u32::try_from(group.as_raw()).ok() == Some(self.0.leader),
             hidden_input: modes.contains(LocalFlags::ICANON) && !modes.contains(LocalFlags::ECHO),
+            canonical: modes.contains(LocalFlags::ICANON),
         })
     }
 

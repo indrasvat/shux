@@ -40,13 +40,11 @@ pub enum Boundaries {
     Markers,
 }
 
-/// The pane's state when an OSC 133 command's line was queued: its command is
-/// the first to start above `floor`, and a prompt past `prompts` with no
-/// start means the shell did not run the line.
+/// The pane's state when an OSC 133 command's line was queued: its command
+/// is one the shell read above `floor`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Osc133Anchor {
     pub floor: u64,
-    pub prompts: u64,
 }
 
 /// How an OSC 133 command's line ended, as the pane's terminal reports it.
@@ -513,6 +511,30 @@ impl CommandEngine {
         }
     }
 
+    /// OSC 133 commands still holding their pane after their result froze,
+    /// whose line never started, with their panes.
+    pub fn unstarted_holders(&self) -> Vec<(Uuid, Uuid)> {
+        self.active
+            .iter()
+            .filter_map(|(&pane, id)| self.commands.get(id).map(|c| (pane, c)))
+            .filter(|(_, c)| c.anchor.is_some() && !c.begun && c.result.is_some())
+            .map(|(pane, c)| (c.id, pane))
+            .collect()
+    }
+
+    /// A timed-out line that never started frees its pane: the shell is at
+    /// an empty prompt again, so it will not start now.
+    pub fn release_unstarted(&mut self, id: Uuid) -> bool {
+        let unstarted = self
+            .commands
+            .get(&id)
+            .is_some_and(|c| !c.begun && c.result.is_some());
+        if unstarted {
+            self.release(id);
+        }
+        unstarted
+    }
+
     /// The command holding `pane_id`, if one does.
     pub fn holder(&self, pane_id: Uuid) -> Option<Uuid> {
         self.active.get(&pane_id).copied()
@@ -762,10 +784,7 @@ mod tests {
         timeout: Duration,
     ) -> (Uuid, String) {
         let mut prepared = CommandEngine::prepare_as(Boundaries::Osc133, cmd, &[]);
-        prepared.anchor(Osc133Anchor {
-            floor: 7,
-            prompts: 1,
-        });
+        prepared.anchor(Osc133Anchor { floor: 7 });
         engine.register(pane, prepared, timeout, None).unwrap()
     }
 
@@ -862,6 +881,30 @@ mod tests {
         assert!(
             engine.osc133_holder(pane).is_none(),
             "the pane was not freed"
+        );
+    }
+
+    /// A line that timed out before it started is let go only once asked:
+    /// the daemon does that when the shell is ready at an empty prompt again.
+    #[test]
+    fn a_line_that_never_started_is_released_on_request() {
+        let mut engine = CommandEngine::new();
+        let pane = Uuid::new_v4();
+        let (id, _) = osc133(&mut engine, pane, "echo x", Duration::ZERO);
+        assert!(
+            !engine.release_unstarted(id),
+            "released before its result froze"
+        );
+        engine.check_timeouts();
+        assert_eq!(engine.unstarted_holders(), vec![(id, pane)]);
+        assert!(engine.release_unstarted(id));
+        assert!(engine.holder(pane).is_none());
+        let (started, _) = osc133(&mut engine, pane, "echo y", Duration::ZERO);
+        engine.osc133_started(started, 0);
+        engine.check_timeouts();
+        assert!(
+            !engine.release_unstarted(started),
+            "a started command holds its pane until its end"
         );
     }
 

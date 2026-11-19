@@ -66,6 +66,28 @@ pub enum CommandLookup {
     Overrun,
 }
 
+/// The line editor drawing a shell's prompt, as the integration names it
+/// on the prompt mark (`133;A;shux-editor=zsh`): what decides which
+/// end-of-line mark, if any, it draws after a command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineEditor {
+    /// zsh's ZLE: PROMPT_SP.
+    Zsh,
+    /// ble.sh: `prompt_eol_mark`.
+    Ble,
+}
+
+impl LineEditor {
+    /// The editor a mark's parameters (`;key=value...`) name, if any.
+    pub(crate) fn named(params: &[u8]) -> Option<Self> {
+        params.split(|&b| b == b';').find_map(|p| match p {
+            b"shux-editor=zsh" => Some(LineEditor::Zsh),
+            b"shux-editor=ble" => Some(LineEditor::Ble),
+            _ => None,
+        })
+    }
+}
+
 /// Where the shell stands, by the last boundary it reported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ShellState {
@@ -185,6 +207,8 @@ pub(crate) struct CommandBoundaries {
     /// Inputs the shell drew a new prompt after without starting a command,
     /// by the stamp of that prompt.
     rejected: VecDeque<(u64, Vec<String>)>,
+    /// The editor the last prompt named.
+    editor: Option<LineEditor>,
     /// Prompts (`A`) seen.
     prompts: u64,
     /// Boundaries that changed the state; moves on every C, D and A that counts.
@@ -217,8 +241,9 @@ impl CommandBoundaries {
         }
     }
 
-    pub(crate) fn on_prompt(&mut self, seq_len: usize, cols: usize) {
+    pub(crate) fn on_prompt(&mut self, seq_len: usize, cols: usize, editor: Option<LineEditor>) {
         self.close(None, EndedBy::Prompt, seq_len, cols);
+        self.editor = editor;
         self.state = ShellState::AtPrompt;
         self.line = match self.line {
             Line::BeforePrompt => Line::AtPrompt,
@@ -333,7 +358,7 @@ impl CommandBoundaries {
         let tail = &tail[..tail.len().saturating_sub(seq_len)];
         let payload = std::mem::take(&mut self.open_wire)
             .saturating_sub(seq_len)
-            .saturating_sub(eol_mark_len(tail, cols));
+            .saturating_sub(eol_mark_len(tail, cols, self.editor));
         self.open_output.bytes.truncate(payload);
         self.open_output.truncated = payload > OUTPUT_LIMIT;
         self.ended.push_back(CommandRecord {
@@ -419,10 +444,10 @@ impl CommandBoundaries {
     }
 }
 
-/// How many bytes at the end of `out` are the end-of-line mark a line editor
-/// draws after a command and before it reports the end: shell output, not the
-/// command's. 0 when there is none. Both shapes are pinned to the terminal's
-/// width, `cols`, so output that merely ends alike is not taken for one.
+/// How many bytes at the end of `out` are the end-of-line mark `editor`
+/// draws after a command and before its shell reports the end: shell
+/// output, not the command's. 0 when there is none, or no editor was named.
+/// Both shapes are pinned to the terminal's width, `cols`.
 ///
 /// - zsh (PROMPT_SP, `preprompt()`): the mark (`PROMPT_EOL_MARK`, `%` by
 ///   default), `cols - w - !xn` spaces, CR, `w` spaces, CR, where `w` is the
@@ -430,10 +455,13 @@ impl CommandBoundaries {
 /// - ble.sh (`prompt_eol_mark`, `.adjust-eol`): an optional `SGR0 [SI] DECSC
 ///   mark SGR0 [SI] DECRC`, then `CUF (cols - 2 | cols - 3)`, two spaces, CR,
 ///   and EL.
-pub fn eol_mark_len(out: &[u8], cols: usize) -> usize {
-    zsh_prompt_sp(out, cols)
-        .or_else(|| ble_eol_mark(out, cols))
-        .unwrap_or(0)
+pub fn eol_mark_len(out: &[u8], cols: usize, editor: Option<LineEditor>) -> usize {
+    match editor {
+        Some(LineEditor::Zsh) => zsh_prompt_sp(out, cols),
+        Some(LineEditor::Ble) => ble_eol_mark(out, cols),
+        None => None,
+    }
+    .unwrap_or(0)
 }
 
 fn trailing(buf: &[u8], byte: u8) -> usize {
@@ -579,15 +607,15 @@ mod tests {
         let mut b = CommandBoundaries::default();
         let floor = crate::program_status::as_of();
         b.on_start(0, 80, Vec::new());
-        b.on_prompt(0, 80);
+        b.on_prompt(0, 80, None);
         let c = found(&b, floor);
         assert_eq!((c.exit_code, c.ended_by), (None, EndedBy::Prompt));
         b.on_start(0, 80, Vec::new());
         b.on_start(0, 80, Vec::new());
         let c = found(&b, c.started);
         assert_eq!((c.exit_code, c.ended_by), (None, EndedBy::NextCommand));
-        b.on_prompt(0, 80);
-        b.on_prompt(0, 80);
+        b.on_prompt(0, 80, None);
+        b.on_prompt(0, 80, None);
         assert!(!b.running());
     }
 

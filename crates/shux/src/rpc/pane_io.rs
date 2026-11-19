@@ -336,8 +336,8 @@ pub(crate) fn register_pane_io_methods(
                             let state = io.lock().await;
                             wake.borrow_and_update();
                             if let Some(running) = state.cmd_engine.holder(pane_id.0) {
-                                let held = state.cmd_engine.get_status(running).map(|r| r.state);
-                                return Err(pane_busy(running, &held.unwrap_or_else(|| "running".into())));
+                                let held = state.cmd_engine.get_status(running);
+                                return Err(pane_busy(running, held.as_ref()));
                             }
                             let front = state.front(pane_id, pane_is_shell).ok_or_else(|| {
                                 shux_rpc::RpcError::not_found("pane PTY", &pane_id.to_string())
@@ -395,8 +395,9 @@ pub(crate) fn register_pane_io_methods(
                     };
                     let command_id = match start {
                         CommandStart::Started(id) => id,
-                        CommandStart::Busy(running, state) => {
-                            return Err(pane_busy(running, &state));
+                        CommandStart::Busy(running, _) => {
+                            let held = io.lock().await.cmd_engine.get_status(running);
+                            return Err(pane_busy(running, held.as_ref()));
                         }
                         CommandStart::PaneGone => {
                             return Err(shux_rpc::RpcError::not_found(
@@ -1928,19 +1929,31 @@ pub(crate) fn register_pane_io_methods(
 
 /// `state` is the holder's own: once it has timed out, waiting cannot free
 /// the pane, only its program ending or a cancel can.
-fn pane_busy(running: uuid::Uuid, state: &str) -> shux_rpc::RpcError {
-    let (message, hint) = if state == "running" {
-        (
+/// The pane is held by `running`, whose result or progress is `holder`. The
+/// remedy depends on whether its end can be waited for: an OSC 133 command's
+/// can, by `as_of`; a marker command that timed out has nothing to wait on.
+fn pane_busy(running: uuid::Uuid, holder: Option<&shux_pty::CommandResult>) -> shux_rpc::RpcError {
+    let state = holder.map_or("running", |h| h.state.as_str());
+    let as_of = holder.and_then(|h| h.as_of);
+    let (message, hint) = match (state, as_of) {
+        ("running", _) => (
             format!("the pane is still running command {running}"),
-            "wait for it to finish (pane command-status, or pane wait-command --after <its as_of>), then retry; pane command-cancel interrupts it",
-        )
-    } else {
-        (
+            format!("wait for it to finish (pane command-status {running}), then retry"),
+        ),
+        (_, Some(as_of)) => (
+            format!(
+                "the pane is still held by command {running} ({state}): its program is still running"
+            ),
+            format!(
+                "wait for its end (pane wait-command <PANE> --after {as_of} --output), then retry; pane command-cancel {running} interrupts it"
+            ),
+        ),
+        _ => (
             format!(
                 "the pane is still held by command {running} ({state}): its program may still be running"
             ),
-            "wait for its own end (pane wait-command --after <its as_of> --output), then retry; pane command-cancel interrupts it",
-        )
+            format!("cancel it (pane command-cancel {running}) to stop its program, then retry"),
+        ),
     };
     shux_rpc::RpcError::with_message_and_data(
         shux_rpc::ErrorCode::ResourceExhausted,
@@ -1950,6 +1963,7 @@ fn pane_busy(running: uuid::Uuid, state: &str) -> shux_rpc::RpcError {
             "reason": "pane_held",
             "running_command_id": running.to_string(),
             "running_command_state": state,
+            "as_of": as_of,
             "hint": hint,
         }),
     )
@@ -2051,6 +2065,10 @@ fn pane_refusal(
             "keys were sent to the prompt that submitted nothing, so its line editor may hold text"
                 .into(),
             "clear the prompt (send-keys C-c draws a fresh one), then retry",
+        ),
+        Refusal::PromptNotReady => (
+            "the shell is at its prompt mark but no line editor is reading yet (a prompt hook, or a line it accepted, is still running)".into(),
+            "wait for it, then retry; a line it accepted runs as its own command (pane wait-command)",
         ),
         Refusal::NotAShell => (
             "the pane's program is not a shell, and it reports no prompt".into(),
