@@ -263,7 +263,7 @@ still=$("$SHUX" rpc call session.list \
 ok "stale expected_version → -32002; entity untouched"
 
 # ──────────────────────────────────────────────────────────────
-echo "==> [10/12] wait-for timeout — never-matching pattern exits 2"
+echo "==> [10/12] wait-for timeout — never-matching pattern exits 1"
 # ──────────────────────────────────────────────────────────────
 sid_wt=$(mk_session "${PFX}-wt" "sleep 9000")
 pane_wt=$("$SHUX" rpc call session.list \
@@ -273,8 +273,8 @@ set +e
 "$SHUX" pane wait-for -p "$pane_wt" -t NEVER-PRESENT-XYZ --timeout-ms 300 >/dev/null 2>&1
 rc=$?
 set -e
-[ "$rc" = "2" ] || fail "wait-for timeout should exit 2, got $rc"
-ok "wait-for timeout returns exit 2"
+[ "$rc" = "1" ] || fail "wait-for timeout should exit 1, got $rc"
+ok "wait-for timeout returns exit 1"
 
 # ──────────────────────────────────────────────────────────────
 echo "==> [11/12] wait-for --absent + --regex modes"
