@@ -1627,6 +1627,8 @@ mod tests {
         // why: caps how long a wrong finalisation is hunted; load shortens the hunt, never fails it
         // ast-grep-ignore: test-wall-clock-unit
         let deadline = Instant::now() + Duration::from_secs(2);
+        // why: the same hunt cap as the deadline above; load shortens the hunt, never fails it
+        // ast-grep-ignore: test-wall-clock-unit
         while !outcome.borrow().finalized && Instant::now() < deadline {
             std::thread::yield_now();
         }

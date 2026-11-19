@@ -4557,6 +4557,8 @@ mod tests {
         let mut attached = fixture.attached.clone();
         attached.help_visible = true;
         // Past the seconds tier, so the uptime segment holds still.
+        // why: a start instant handed in as data; time passing only moves it further past the tier
+        // ast-grep-ignore: test-wall-clock-unit
         let daemon_start = std::time::Instant::now()
             .checked_sub(Duration::from_secs(61))
             .expect("monotonic clock past 61 s");

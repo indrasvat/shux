@@ -1124,6 +1124,8 @@ fn echo_off_is_not_taken_for_a_password_prompt() {
     let (r, code) = pane_run(
         &env,
         &pane,
+        // why: the sleep holds echo off while nothing reads; load only lengthens that window
+        // ast-grep-ignore: test-sleep-then-act
         "stty -echo; sleep 2; stty echo; echo done",
         &["--timeout", "20"],
     );
@@ -1330,6 +1332,8 @@ fn a_hook_reading_input_after_an_accepted_line_is_never_typed_into() {
     let (env, _rc, pane) = integrated(&bash());
     type_line(
         &env,
+        // why: the next line is accepted only after this one ends, so PS0 is set first however long the sleep runs
+        // ast-grep-ignore: test-sleep-then-act
         "sleep 2; PS0='$(printf \"HO\"\"LD>\" >&2; read -r gate)'\"$PS0\"",
     );
     type_line(&env, "printf OTHER");

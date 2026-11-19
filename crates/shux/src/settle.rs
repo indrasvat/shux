@@ -536,6 +536,8 @@ mod tests {
     fn stability_wake_avoids_busy_spin_when_hold_is_satisfied() {
         // impl-review Surface 1: with the hold window already met (remaining 0) but the count
         // criterion still pending, the wake must be the TIMEOUT — a `now`-sized sleep would spin.
+        // why: instants handed to a pure function as data; nothing waits on them
+        // ast-grep-ignore: test-wall-clock-unit
         let now = tokio::time::Instant::now();
         let timeout = now + Duration::from_secs(10);
         assert_eq!(

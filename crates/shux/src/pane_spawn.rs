@@ -2516,9 +2516,8 @@ mod tests {
         let mut events = bus.subscribe_filtered(vec!["pane.zoomed".into()]);
         undo_split(&gh, new, prior).await;
         assert_eq!(zoom_focus(&gh, window), (None, a));
-        let stray =
-            tokio::time::timeout(std::time::Duration::from_millis(200), events.recv()).await;
-        assert!(stray.is_err(), "undo fired a zoom event: {stray:?}");
+        let stray = events.try_recv();
+        assert!(stray.is_none(), "undo fired a zoom event: {stray:?}");
         cancel.cancel();
     }
 

@@ -490,6 +490,8 @@ mod tests {
     #[test]
     fn sessions_list_in_creation_order_whatever_the_wall_clock_says() {
         use shux_core::model::{Session, WindowId};
+        // why: creation times handed in as data; the listing reads no clock
+        // ast-grep-ignore: test-wall-clock-unit
         let t = std::time::SystemTime::now();
         for (name, step) in [("stepped back", 1), ("same instant", 0)] {
             let mut snap = shux_core::graph::SessionGraphSnapshot::default();

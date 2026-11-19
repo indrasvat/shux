@@ -104,6 +104,8 @@ fn read_until(rx: &mpsc::Receiver<Vec<u8>>, needle: &str, what: &str, by: Instan
         // why: the long poll's own end is the subject; an item it held cannot arrive before it
         // ast-grep-ignore: test-wall-clock
         let left = by.saturating_duration_since(Instant::now());
+        // why: the long poll's own end is the subject; an item it held cannot arrive before it
+        // ast-grep-ignore: test-timed-wait
         match rx.recv_timeout(left) {
             Ok(chunk) if !left.is_zero() => seen.push_str(&String::from_utf8_lossy(&chunk)),
             _ => {

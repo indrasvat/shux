@@ -47,6 +47,8 @@ async fn run_pane_pty_task(
 ) {
     let mut buf = vec![0u8; 8192];
     loop {
+        // why: a bounded grace for the child to exit before it is killed; either way the pane ends
+        // ast-grep-ignore: test-absence-by-timeout
         tokio::select! {
             result = handle.read(&mut buf) => {
                 match result {

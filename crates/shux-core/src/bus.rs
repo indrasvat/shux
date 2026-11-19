@@ -1041,11 +1041,12 @@ mod tests {
             },
             SubscriptionEvent::Lagged(_) => panic!("unexpected lag"),
         }
-        // No further control-plane event.
-        let nothing = tokio::time::timeout(Duration::from_millis(20), control_sub.recv()).await;
+        // Both were published before this read: a data-plane event that
+        // reached this subscriber would be queued behind SessionCreated.
+        let leaked = control_sub.try_recv();
         assert!(
-            nothing.is_err(),
-            "data-plane publish must NOT show up on control subscribers",
+            leaked.is_none(),
+            "data-plane publish must NOT show up on control subscribers: {leaked:?}",
         );
 
         // Data subscriber sees the chunk.

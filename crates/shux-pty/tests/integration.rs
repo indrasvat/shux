@@ -969,6 +969,8 @@ async fn a_process_forked_while_a_pane_opens_inherits_no_terminal_descriptors() 
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     let mut leaked = Vec::new();
     for _ in 0..2000 {
+        // why: the hunt cap set above; load shortens the hunt, never fails it
+        // ast-grep-ignore: test-wall-clock
         if !leaked.is_empty() || std::time::Instant::now() >= deadline {
             break;
         }

@@ -118,6 +118,8 @@ fn g1_glance_atomicity_under_concurrent_flips() {
                 if done.load(Ordering::Relaxed) {
                     break true; // stopped by flag — glances all finished first
                 }
+                // why: the panic bound set above; success is the done-flag, never the clock
+                // ast-grep-ignore: test-wall-clock
                 if std::time::Instant::now() >= deadline {
                     break false; // panic bound hit while glances still running
                 }
