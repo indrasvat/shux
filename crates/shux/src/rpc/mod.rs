@@ -33,10 +33,7 @@ pub(crate) mod test_harness;
 /// first, then session → window → pane → pane I/O → lens.run → program status →
 /// events → state → plugin. Later registrations of the same method name would win, so this is
 /// part of the surface, not a formatting choice.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each argument is an independent input; a struct would only move the list"
-)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 pub(crate) fn build_router(
     graph: shux_core::graph::GraphHandle,
     io_state: Arc<Mutex<PaneIoState>>,

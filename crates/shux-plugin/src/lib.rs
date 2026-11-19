@@ -1400,10 +1400,7 @@ async fn write_frame(
     })
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each argument is an independent input; a struct would only move the list"
-)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 async fn run_plugin_io(
     name: String,
     plugin_id: PluginId,
@@ -1733,10 +1730,7 @@ fn delete_plugin_state(root: &std::path::Path, plugin_id: &str) -> Result<bool, 
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each argument is an independent input; a struct would only move the list"
-)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 fn dispatch_plugin_frame(
     plugin: &str,
     plugin_id: &PluginId,

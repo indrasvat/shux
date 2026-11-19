@@ -24,11 +24,6 @@ use crate::style;
 // schema stays lenient. Both shapes share the toml file format; the
 // strict variant adds `deny_unknown_fields` everywhere AND keeps the
 // same `#[serde(default)]` so missing sections still parse.
-
-// All fields below are populated by the toml deserializer; nothing
-// reads them directly because we discard the typed Config after
-// validation. Suppress the dead-field warnings rather than #[allow]ing
-// each one.
 #[expect(
     dead_code,
     reason = "the strict schema is only deserialized into, never read"

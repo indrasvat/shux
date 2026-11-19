@@ -341,10 +341,7 @@ async fn reserve_input(
 
 /// Run the attach UDS listener. Each accepted connection spawns an
 /// independent attach session task. Runs until `cancel` fires.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each argument is an independent input; a struct would only move the list"
-)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 pub async fn run_attach_server(
     socket_path: std::path::PathBuf,
     graph: GraphHandle,
@@ -429,10 +426,7 @@ trait AttachStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin 
 impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static> AttachStream for S {}
 
 /// Handle one attach connection: handshake, then run the streaming loop.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each argument is an independent input; a struct would only move the list"
-)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 async fn handle_attach_connection(
     stream: impl AttachStream,
     graph: GraphHandle,
@@ -878,10 +872,7 @@ async fn send_ready_error(
 
 /// Main attach loop after handshake. Owns the render compositor and
 /// dispatches all client frames.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each argument is an independent input; a struct would only move the list"
-)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 async fn run_attach_loop(
     framed: Framed<impl AttachStream, tokio_util::codec::LengthDelimitedCodec>,
     graph: GraphHandle,
@@ -1537,10 +1528,7 @@ async fn run_attach_loop(
 /// it grabs a fresh `SessionGraphSnapshot`, walks all panes in the
 /// active window, runs the multi-pane compositor over a `Vec<u8>`
 /// buffer, then ships the bytes as a `Render` frame.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each argument is an independent input; a struct would only move the list"
-)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 async fn run_render_loop(
     graph: GraphHandle,
     io_state: Arc<Mutex<PaneIoState>>,
@@ -2266,10 +2254,7 @@ fn border_at(
     None
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each argument is an independent input; a struct would only move the list"
-)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 async fn handle_mouse_selection(
     kind: MouseKind,
     button: ProtoMouseButton,
@@ -2477,10 +2462,7 @@ async fn handle_mouse_selection(
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each argument is an independent input; a struct would only move the list"
-)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 async fn handle_copy_mode_mouse(
     kind: MouseKind,
     button: ProtoMouseButton,
@@ -2643,10 +2625,7 @@ async fn handle_copy_mode_mouse(
     Ok(true)
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each argument is an independent input; a struct would only move the list"
-)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 async fn handle_mouse(
     kind: MouseKind,
     button: ProtoMouseButton,
@@ -2789,10 +2768,7 @@ enum AppMouseRoute {
 /// 5. a pane whose app never asked for the mouse is shux's
 /// 6. an app that cannot decode what shux would send keeps nothing — shux does
 /// 7. everything else belongs to the app
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each argument is an independent input; a struct would only move the list"
-)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 fn route_app_mouse(
     gesture: SelectionDrag,
     border_drag_active: bool,
@@ -2934,10 +2910,7 @@ fn holds(rect: Rect, col: u16, row: u16) -> bool {
 /// whose app asked for the mouse, the mouse is the app's. `handle_wheel` stays
 /// the sole authority on scroll ticks — this returns [`AppMouse::NotHandled`]
 /// for them so the scrollback, alt-scroll and forward tiers keep working.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each argument is an independent input; a struct would only move the list"
-)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 async fn handle_app_mouse(
     kind: MouseKind,
     button: ProtoMouseButton,
@@ -3380,10 +3353,7 @@ async fn forward_bytes_to_pane(
 /// Handle a scroll-wheel event while copy mode is NOT active. Returns `Ok(true)`
 /// if the event was a wheel event (and thus consumed), `Ok(false)` otherwise so
 /// the caller falls through to the layout/focus mouse handler.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each argument is an independent input; a struct would only move the list"
-)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 async fn handle_wheel(
     kind: MouseKind,
     col: u16,
@@ -3714,10 +3684,7 @@ async fn current_viewport(client_size: &ClientSize, config: &ConfigHandle) -> Re
 }
 
 /// Dispatch an Action keybinding from the client.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each argument is an independent input; a struct would only move the list"
-)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 async fn handle_action(
     kind: ActionKind,
     args: shux_rpc::attach::ActionArgs,
@@ -6635,10 +6602,7 @@ mod tests {
                 .await
         }
 
-        #[expect(
-            clippy::too_many_arguments,
-            reason = "each argument is an independent input; a struct would only move the list"
-        )]
+        #[expect(clippy::too_many_arguments, reason = "independent inputs")]
         async fn send_mod(
             &mut self,
             kind: MouseKind,

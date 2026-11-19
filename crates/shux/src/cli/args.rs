@@ -1713,8 +1713,6 @@ above are pane primitives under `shux pane \u{2026}`, not `shux lens \u{2026}`."
 
 #[derive(Subcommand, Debug)]
 #[command(after_help = LENS_LOOP_RECIPE)]
-// A CLI arg enum parsed once per invocation, not stored hot — the `Gate` variant's rich
-// 082 flag set makes it larger than `Run`, but boxing clap-derived fields buys nothing.
 #[expect(
     clippy::large_enum_variant,
     reason = "clap-derived and parsed once; boxing fields buys nothing"

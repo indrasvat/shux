@@ -474,11 +474,7 @@ fn derive_terminal(signals: &[RunnerSignal]) -> Option<TerminalOutcome> {
 /// Drive a parsed scenario against a hidden scratch TUI, emit the raw-signal trace, and
 /// return the STRUCTURED outcome (design D1). Owns 081 MECHANICS only — no verdict, no
 /// stdout, no exit code. 082's `verdict` layer rolls the outcome into `report.json`.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each argument is an independent input; a struct would only move the list"
-)]
-// would only rename the same list (established precedent: attach.rs, shux-rpc server.rs).
+#[expect(clippy::too_many_arguments, reason = "one knob per gate CLI flag")]
 pub async fn drive_scenario(
     socket_path: &Path,
     scenario: &Scenario,
@@ -756,10 +752,7 @@ pub async fn drive_scenario(
 
 /// Drive one step. Blocking waits race the exit monitor so a crash short-circuits
 /// before any visual compare (design D7).
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each argument is an independent input; a struct would only move the list"
-)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 async fn drive_step(
     stream: &mut UnixStream,
     monitor: &ExitMonitor,
@@ -1285,10 +1278,7 @@ enum CaptureResult {
 
 /// One masked glance + golden compare for `expect_golden` (task 083 — the retry loop calls this
 /// once per attempt; the caller settles + checks child-exit first). Never retries anything itself.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each argument is an independent input; a struct would only move the list"
-)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 async fn capture_and_compare(
     stream: &mut UnixStream,
     pane_id: &str,

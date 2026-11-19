@@ -215,10 +215,7 @@ pub(crate) fn stability_wake(
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each argument is an independent input; a struct would only move the list"
-)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 pub(crate) async fn wait_settled_frame_stability(
     io: &Arc<Mutex<PaneIoState>>,
     pane_id: shux_core::model::PaneId,

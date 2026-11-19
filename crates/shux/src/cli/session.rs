@@ -330,10 +330,7 @@ pub async fn handle_session_save(
     Ok(())
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each argument is an independent input; a struct would only move the list"
-)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 pub async fn handle_wait_for(
     stream: &mut tokio::net::UnixStream,
     session: Option<&str>,

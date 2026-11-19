@@ -1786,10 +1786,7 @@ fn print_command_output(result: &serde_json::Value, field: &str, truncated: &str
 
 /// Print a `pane glance` summary (lens PRD §5/§10). PNG bytes are never
 /// printed here — only the file-write confirmation when `--png` was given.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each argument is an independent input; a struct would only move the list"
-)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 pub fn print_pane_glance(
     pane_id: &str,
     revision: u64,
@@ -2264,10 +2261,7 @@ pub fn print_lens_run(session_id: &str, pane_id: &str, revision: u64, exit_code:
 /// Print a `pane diff` summary (lens PRD §7/§10): the revision span and the
 /// structured delta. Diff is data, not a verdict, so this always reads as a
 /// neutral ✓ (the CLI exits 0 regardless of delta size).
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each argument is an independent input; a struct would only move the list"
-)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 pub fn print_pane_diff(
     pane_id: &str,
     from_revision: u64,

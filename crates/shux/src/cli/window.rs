@@ -71,10 +71,7 @@ pub async fn handle_window_list(
 }
 
 /// Handle the `shux window new` command.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each argument is an independent input; a struct would only move the list"
-)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 pub async fn handle_window_new(
     stream: &mut tokio::net::UnixStream,
     session_name: &str,

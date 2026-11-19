@@ -104,10 +104,6 @@ struct EventBusInner {
     /// gap-detect each independently. Held across the send so chunks reach
     /// subscribers in seq order.
     data_seq: Mutex<u64>,
-
-    /// Configuration (kept for introspection).
-    #[expect(dead_code, reason = "kept for introspection")]
-    config: EventBusConfig,
 }
 
 /// Ring buffer for event history.
@@ -138,12 +134,6 @@ impl EventHistory {
     /// Get the oldest sequence number in the history.
     fn oldest_seq(&self) -> Option<u64> {
         self.buffer.front().map(|e| e.meta.seq)
-    }
-
-    /// Get the newest sequence number in the history.
-    #[expect(dead_code, reason = "history introspection, read by tests")]
-    fn newest_seq(&self) -> Option<u64> {
-        self.buffer.back().map(|e| e.meta.seq)
     }
 
     /// Get events from a given sequence number onwards.
@@ -205,7 +195,6 @@ impl EventBus {
                 history: RwLock::new(EventHistory::new(config.history_capacity)),
                 data_plane,
                 data_seq: Mutex::new(1),
-                config,
             }),
         }
     }
@@ -425,7 +414,8 @@ impl Subscription {
     }
 
     /// The next already-published event matching the filters, without waiting.
-    /// `None` when none is queued or the bus is shut down.
+    /// `None` when none is queued or the bus is shut down. A graph mutation
+    /// publishes its events before it returns, so once it has, they are here.
     pub fn try_recv(&mut self) -> Option<SubscriptionEvent> {
         loop {
             match self.receiver.try_recv() {

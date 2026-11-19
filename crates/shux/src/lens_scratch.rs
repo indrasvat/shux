@@ -381,9 +381,8 @@ fn is_rotated_audit_path(path: &Path) -> bool {
 /// a direct rotated-file argument would resolve the wrong sibling set and
 /// self-justify its continuation header).
 ///
-/// Consumed by the unit + black-box test suites today (hence the
-/// dead-code allowance on the non-test build); the natural future surface
-/// is a `shux lens audit verify` CLI verb — P6 CLI-polish material.
+/// Consumed by the unit + black-box test suites today; the natural future
+/// surface is a `shux lens audit verify` CLI verb — P6 CLI-polish material.
 pub fn verify_chain(path: &Path) -> Result<usize, String> {
     if is_rotated_audit_path(path) {
         return Err(format!(
@@ -1632,10 +1631,7 @@ async fn group_ended(ended: Option<tokio::sync::watch::Receiver<Option<bool>>>) 
 /// arm first so a simultaneous wake can never start a timer reap that an
 /// explicit kill already owns (P5 round-1 claude N6); the `claim()` below
 /// closes the remaining race window (both paths reap exactly once).
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each argument is an independent input; a struct would only move the list"
-)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 async fn scratch_reaper(
     session_id: SessionId,
     pane_id: PaneId,

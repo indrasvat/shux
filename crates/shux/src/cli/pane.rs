@@ -126,10 +126,7 @@ pub async fn handle_pane_list(
 }
 
 /// Handle the `shux pane split` command.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each argument is an independent input; a struct would only move the list"
-)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 pub async fn handle_pane_split(
     stream: &mut tokio::net::UnixStream,
     session_name: &str,
@@ -272,10 +269,7 @@ pub async fn handle_pane_focus_dir(
 }
 
 /// Handle the `shux pane resize` command.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each argument is an independent input; a struct would only move the list"
-)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 pub async fn handle_pane_resize(
     stream: &mut tokio::net::UnixStream,
     session_name: &str,
@@ -422,10 +416,7 @@ pub async fn handle_pane_swap(
 /// titles flow into the displayed title (orthogonal to the manual
 /// override, so you can pin auto OFF without clearing your manual
 /// title).
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each argument is an independent input; a struct would only move the list"
-)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 pub async fn handle_pane_title(
     stream: &mut tokio::net::UnixStream,
     session_name: &str,
@@ -591,10 +582,7 @@ pub async fn handle_pane_watch(
 /// this command gets SIGINT, SIGTERM or SIGHUP (which stop it and report).
 /// If this command dies any other way, the daemon ends the recording with its
 /// connection; if the daemon goes away, this command fails at once.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each argument is an independent input; a struct would only move the list"
-)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 pub async fn handle_pane_record(
     stream: &mut tokio::net::UnixStream,
     socket_path: &std::path::Path,
@@ -908,10 +896,7 @@ pub async fn handle_pane_send_keys(
 }
 
 /// Handle the `shux pane run` command.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each argument is an independent input; a struct would only move the list"
-)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 pub async fn handle_pane_run(
     stream: &mut tokio::net::UnixStream,
     session_name: &str,

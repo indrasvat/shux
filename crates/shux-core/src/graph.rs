@@ -4852,7 +4852,7 @@ mod tests {
             .split_pane(pane_in_w2, Direction::Vertical, 0.5)
             .unwrap();
 
-        // Graph events publish before the mutation returns: drain setup.
+        // Drain setup.
         while sub.try_recv().is_some() {}
 
         // 1. rename_window must fire WindowRenamed.
@@ -5787,8 +5787,6 @@ mod tests {
             .set_pane_title(pid, Some("locked".into()), None)
             .unwrap();
         while sub.try_recv().is_some() {}
-        // Graph events publish before the mutation returns, so anything
-        // set_pane_osc_title fired is already queued.
         graph.set_pane_osc_title(pid, "irrelevant".into()).unwrap();
         let fired = sub.try_recv();
         assert!(
@@ -5991,7 +5989,6 @@ mod tests {
         );
         assert!(snap_after.find_session_by_name("workspace-a").is_none());
 
-        // apply_batch publishes before it returns: anything fired is queued.
         let fired = sub.try_recv();
         assert!(
             fired.is_none(),
