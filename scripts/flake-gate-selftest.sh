@@ -102,6 +102,21 @@ case_ "a proptest regressions file" "echo 'cc 01' >>crates/p/tests/a.proptest-re
 case_ "a .shux fixture a test names" "echo y >>.shux/fixtures/frames/frame.bin" 'binary_id(=p::b)'
 case_ "shux-testkit's own tests" "edit crates/shux-testkit/src/lib.rs" 'binary_id(=shux-testkit)'
 
+# Discovery that fails must fail the gate, never read as "nothing to gate".
+git checkout -q -f main
+git checkout -q -B feat
+echo "// y" >>crates/p/tests/old.rs
+git commit -qam change
+cp scripts/test-only-files.sh "$work/test-only-files.sh"
+printf '#!/usr/bin/env bash\nexit 3\n' >scripts/test-only-files.sh
+if out="$(PATH="$work/bin:$PATH" BASE=main bash scripts/flake-gate.sh 2>&1)"; then
+    echo "  ✗ a failing test-only-files.sh fails the gate: it exited 0: $out"
+    fail=1
+else
+    echo "  ✓ a failing test-only-files.sh fails the gate"
+fi
+cp "$work/test-only-files.sh" scripts/test-only-files.sh
+
 if ((fail)); then
     printf '\033[1;31m✗ flake-gate self-test failed\033[0m\n'
     exit 1

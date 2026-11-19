@@ -36,11 +36,15 @@ fail() {
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 
-command -v ast-grep >/dev/null ||
-    fail "ast-grep is not installed: run scripts/ensure-ast-grep.sh"
-have="$(ast-grep --version | awk '{print $2}')"
-[[ "$have" == "$AST_GREP_VERSION" ]] ||
-    fail "ast-grep $have found, $AST_GREP_VERSION expected: run scripts/ensure-ast-grep.sh"
+# Checked when a scan starts, so an edit with nothing to scan needs no ast-grep.
+need_ast_grep() {
+    command -v ast-grep >/dev/null ||
+        fail "ast-grep is not installed: run scripts/ensure-ast-grep.sh"
+    local have
+    have="$(ast-grep --version | awk '{print $2}')"
+    [[ "$have" == "$AST_GREP_VERSION" ]] ||
+        fail "ast-grep $have found, $AST_GREP_VERSION expected: run scripts/ensure-ast-grep.sh"
+}
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
@@ -79,6 +83,7 @@ report() { # report <text>: findings go to stdout, or stderr in hook mode
 # Scan one checkout: $1 its root, the rest paths relative to it (none: the tree).
 scan() {
     local root="$1"
+    need_ast_grep
     shift
     cd "$root"
     local defined

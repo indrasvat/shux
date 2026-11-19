@@ -271,6 +271,10 @@ mkdir -p "$work/bin"
 printf '#!/bin/sh\necho "ast-grep 0.1.0"\n' >"$work/bin/ast-grep"
 chmod +x "$work/bin/ast-grep"
 expect 1 "the wrong ast-grep version fails" env PATH="$work/bin:$PATH" bash "$work/tree/scripts/check-test-timing.sh"
+expect 0 "hook mode skips a non-Rust edit without needing ast-grep" \
+    bash -c "$(declare -f hook_payload); hook_payload '$work/tree/sgconfig.yml' | PATH='$work/bin:$PATH' bash '$work/tree/scripts/check-test-timing.sh' --hook"
+expect 2 "hook mode fails a Rust edit when ast-grep is wrong" \
+    bash -c "$(declare -f hook_payload); hook_payload '$work/tree/crates/k/tests/t.rs' | PATH='$work/bin:$PATH' bash '$work/tree/scripts/check-test-timing.sh' --hook"
 
 if ((fail)); then
     printf '\033[1;31m✗ check-test-timing self-test failed\033[0m\n'

@@ -30,12 +30,15 @@ cd "$root"
 
 base="$(git merge-base HEAD "$base_ref")" ||
     { echo "flake-gate: no merge base with $base_ref (is it fetched?)" >&2; exit 1; }
-mapfile -t changed < <(git diff --name-only --diff-filter=AMR "$base"...HEAD -- 'crates/*' '.shux/fixtures/*')
+# Captured, not read through `< <(…)`: a producer that fails must fail the gate.
+diff_out="$(git diff --name-only --diff-filter=AMR "$base"...HEAD -- 'crates/*' '.shux/fixtures/*')"
+mapfile -t changed <<<"$diff_out"
+test_only_out="$(bash scripts/test-only-files.sh "$root")"
 
 declare -A test_only=()
 while IFS=$'\t' read -r file _ modp; do
-    test_only[$file]="$modp"
-done < <(bash scripts/test-only-files.sh "$root")
+    [[ -n "$file" ]] && test_only[$file]="$modp"
+done <<<"$test_only_out"
 
 # A test attribute: the set test-outside-cfg-test recognises.
 test_attr='^[[:space:]]*#\[[[:space:]]*(::)?([A-Za-z_][A-Za-z0-9_]*::)*(test|rstest|proptest)([^A-Za-z0-9_]|$)|proptest!'
