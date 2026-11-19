@@ -45,6 +45,7 @@ pub mod pane_spawn;
 pub mod patience;
 pub mod program_status;
 pub mod rpc;
+pub(crate) mod run_framing;
 pub mod session_meta;
 pub mod session_persist;
 pub mod settle;

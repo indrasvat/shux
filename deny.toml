@@ -12,6 +12,11 @@
 [advisories]
 unmaintained = "workspace"
 yanked = "deny"
+ignore = [
+    # Unmaintained, not a vulnerability, and no safe upgrade exists; replacing
+    # chrono (jiff or time) is its own change.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; migration tracked separately" },
+]
 
 [licenses]
 allow = [

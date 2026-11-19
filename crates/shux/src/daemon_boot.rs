@@ -684,7 +684,7 @@ pub(crate) async fn run_rpc_server(
             tokio::select! {
                 _ = interval.tick() => {
                     let mut state = timeout_io.lock().await;
-                    let _timed_out = state.cmd_engine.check_timeouts();
+                    let _timed_out = state.check_command_timeouts();
                     // The only time-based release of a synchronized-output
                     // window (`CSI ?2026h`), for a pane that has not finished its
                     // frame by the deadline: never one whose output is queued or

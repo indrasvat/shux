@@ -11,12 +11,13 @@ pub mod spawn;
 
 pub use capture::strip_ansi;
 pub use command::{
-    CAPTURE_LIMIT, CommandEngine, CommandResult, PreparedCommand, shell_escape_args,
-    shell_quote_arg,
+    Boundaries, CAPTURE_LIMIT, CommandEngine, CommandResult, Osc133Anchor, Osc133End,
+    PreparedCommand, output_text, shell_escape_args, shell_quote_arg,
 };
 pub use handle::{
-    DECLARED_CELL_PIXELS, GroupEnd, OUTER_TERMINAL_IDENTITY_PREFIXES, OUTER_TERMINAL_IDENTITY_VARS,
-    PtyConfig, PtyError, PtyHandle, PtyInputWriter, PtyOutputProbe, PtySize,
+    DECLARED_CELL_PIXELS, Foreground, GroupEnd, OUTER_TERMINAL_IDENTITY_PREFIXES,
+    OUTER_TERMINAL_IDENTITY_VARS, PtyConfig, PtyError, PtyHandle, PtyInputWriter, PtyOutputProbe,
+    PtySize,
 };
 pub use manager::{PaneId, PtyEvent, PtyManager};
 pub use spawn::inherit_only_stdio;

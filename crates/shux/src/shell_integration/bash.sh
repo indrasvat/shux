@@ -35,7 +35,7 @@ __shux_osc133_install() {
     }
     __shux_osc133_prompt() {
       local ec=$?
-      printf '\e]133;A\a'
+      printf '\e]133;A;shux-editor=ble\a'
       __shux_osc133_keep "$ec"
     }
     blehook PREEXEC!=__shux_osc133_start
@@ -56,7 +56,11 @@ __shux_osc133_install() {
       printf '\e]133;D;%s\a' "$ec"
       __shux_osc133_ran=()
     fi
-    printf '\e]133;A\a'
+    # Which line editor reads the prompt: readline, or none (--noediting),
+    # which leaves the terminal in line mode even at an idle prompt.
+    local editor=none
+    [[ -o emacs || -o vi ]] && editor=readline
+    printf '\e]133;A;shux-editor=%s\a' "$editor"
     return "$ec"
   }
   [[ ${PROMPT_COMMAND[*]-} == *__shux_osc133_precmd* ]] && return 0

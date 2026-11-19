@@ -504,6 +504,18 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     PaneCommand::WaitCommand { .. } => {
                         cli::wait_unreachable("wait-command", e.into(), args.format)
                     }
+                    PaneCommand::Run { .. } => {
+                        cli::wait_unreachable("pane run", e.into(), args.format)
+                    }
+                    PaneCommand::WaitFor { .. } => {
+                        cli::wait_unreachable("wait-for", e.into(), args.format)
+                    }
+                    PaneCommand::CommandStatus { .. } => {
+                        cli::wait_unreachable("command-status", e.into(), args.format)
+                    }
+                    PaneCommand::CommandCancel { .. } => {
+                        cli::wait_unreachable("command-cancel", e.into(), args.format)
+                    }
                     PaneCommand::Split { wait, .. } if wait.wait => {
                         cli::wait_unreachable("pane split", e.into(), args.format)
                     }
@@ -721,6 +733,7 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     command,
                     timeout,
                     is_async,
+                    boundaries,
                 } => {
                     cli::handle_pane_run(
                         &mut stream,
@@ -730,6 +743,7 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
                         &command,
                         timeout,
                         is_async,
+                        boundaries,
                         args.format,
                     )
                     .await
@@ -854,13 +868,41 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     };
                     cli::handle_pane_wait_status(&mut stream, &pane, &wait, args.format).await
                 }
+                PaneCommand::CommandStatus { command_id } => {
+                    cli::handle_pane_command_call(
+                        &mut stream,
+                        "pane.command_status",
+                        "command-status",
+                        &command_id,
+                        args.format,
+                    )
+                    .await
+                }
+                PaneCommand::CommandCancel { command_id } => {
+                    cli::handle_pane_command_call(
+                        &mut stream,
+                        "pane.command_cancel",
+                        "command-cancel",
+                        &command_id,
+                        args.format,
+                    )
+                    .await
+                }
                 PaneCommand::WaitCommand {
                     pane,
                     after,
                     timeout,
+                    output,
                 } => {
-                    cli::handle_pane_wait_command(&mut stream, &pane, after, timeout, args.format)
-                        .await
+                    cli::handle_pane_wait_command(
+                        &mut stream,
+                        &pane,
+                        after,
+                        timeout,
+                        output,
+                        args.format,
+                    )
+                    .await
                 }
                 PaneCommand::WaitExit { pane, timeout } => {
                     cli::handle_pane_wait_exit(&mut stream, &pane, timeout, args.format).await

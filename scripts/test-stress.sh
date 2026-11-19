@@ -2,7 +2,7 @@
 # scripts/test-stress.sh — repeat tests, optionally under CPU load, to expose
 # timing dependence (docs/testing.md).
 #
-#   STRESS_COUNT   runs of each selected test            (default 10)
+#   STRESS_COUNT   runs of the selected tests            (default 10)
 #   STRESS_FILTER  nextest filterset                      (default all())
 #   STRESS_LOAD    CPU hogs to run alongside, via stress-ng (default 0)
 #   NEXTEST_JOBS   nextest -j                             (Makefile default)
@@ -29,6 +29,26 @@ hogs_alive() { ((load == 0)) || kill -0 "$hog" 2>/dev/null; }
 
 echo "▶ $count run(s) of '$filter' with $load CPU hog(s), -j $jobs"
 hogs_alive || { echo "test-stress: stress-ng exited before the run started" >&2; exit 1; }
-"$root/.shux/scripts/no_leak_guard.sh" cargo nextest run -j "$jobs" --status-level fail \
-    --workspace -E "$filter" --stress-count "$count"
-hogs_alive || { echo "test-stress: stress-ng exited during the run, so it was not loaded throughout" >&2; exit 1; }
+# One nextest run per iteration: `--stress-count` under this repo's
+# `fail-fast = false` exits 0 when only some iterations fail.
+failed=0
+for ((i = 1; i <= count; i++)); do
+    status=0
+    (cd "$root" && cargo nextest run -j "$jobs" --status-level fail --workspace -E "$filter") ||
+        status=$?
+    # 100 is a test failure; anything else (a build error, no test matched) ends the run.
+    case "$status" in
+    0) ;;
+    100) failed=$((failed + 1)) ;;
+    *)
+        echo "test-stress: run $i exited $status, not a test failure: stopping" >&2
+        exit "$status"
+        ;;
+    esac
+    hogs_alive || { echo "test-stress: stress-ng exited during the run, so it was not loaded throughout" >&2; exit 1; }
+done
+if ((failed > 0)); then
+    printf '\033[1;31m✗ %d of %d run(s) failed\033[0m\n' "$failed" "$count"
+    exit 100
+fi
+printf '\033[1;32m✓ %d of %d run(s) passed\033[0m\n' "$count" "$count"

@@ -867,6 +867,9 @@ pub async fn handle_pane_send_keys(
         anyhow::bail!("either --text or --data must be provided");
     }
 
+    if let Ok(own) = std::env::var("SHUX_PANE_ID") {
+        params["from_pane"] = own.into();
+    }
     let result = rpc_call(stream, "pane.send_keys", params).await?;
 
     match format {
@@ -902,9 +905,14 @@ pub async fn handle_pane_run(
     command: &str,
     timeout: u64,
     is_async: bool,
+    boundaries: super::args::RunBoundaries,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
-    let (session_id, window_id) = resolve_pane_window_id(stream, session_name, window_spec).await?;
+    let (session_id, window_id) = super::program_status::or_exit(
+        resolve_pane_window_id(stream, session_name, window_spec).await,
+        "pane run",
+        format,
+    )?;
 
     let mut params = serde_json::json!({
         "session_id": session_id,
@@ -912,13 +920,28 @@ pub async fn handle_pane_run(
         "command": command,
         "timeout": timeout,
         "async": is_async,
+        "boundaries": boundaries.as_str(),
     });
+    if let Ok(own) = std::env::var("SHUX_PANE_ID") {
+        params["from_pane"] = own.into();
+    }
 
     if let Some(pid) = pane_spec {
         params["pane_id"] = serde_json::Value::String(pid.to_string());
     }
 
-    let result = rpc_call(stream, "pane.run_command", params).await?;
+    let result = match super::program_status::call_wait(
+        stream,
+        "pane.run_command",
+        "pane run",
+        params,
+        format,
+    )
+    .await?
+    {
+        Ok(result) => result,
+        Err(code) => std::process::exit(code),
+    };
 
     match format {
         OutputFormat::Json => {
@@ -931,7 +954,37 @@ pub async fn handle_pane_run(
             crate::style::print_run_command(&result, is_async);
         }
     }
+    if is_async {
+        return Ok(());
+    }
+    match result.get("state").and_then(|v| v.as_str()) {
+        Some("completed") => Ok(()),
+        Some("timed_out") => std::process::exit(1),
+        _ => std::process::exit(3),
+    }
+}
 
+/// `shux pane command-status` / `command-cancel`: one call naming a command.
+pub async fn handle_pane_command_call(
+    stream: &mut tokio::net::UnixStream,
+    method: &str,
+    verb: &str,
+    command_id: &str,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    let params = serde_json::json!({ "command_id": command_id });
+    let result =
+        match super::program_status::call_wait(stream, method, verb, params, format).await? {
+            Ok(result) => result,
+            Err(code) => std::process::exit(code),
+        };
+    match format {
+        OutputFormat::Json => println!(
+            "{}",
+            crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+        ),
+        OutputFormat::Text | OutputFormat::Plain => crate::style::print_command_call(&result),
+    }
     Ok(())
 }
 
@@ -1143,6 +1196,7 @@ mod tests {
             "make test",
             60,
             true,
+            super::super::args::RunBoundaries::Auto,
             OutputFormat::Json,
         )
         .await

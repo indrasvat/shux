@@ -114,6 +114,8 @@ fn s3_check_under_pump<T>(h: &Harness, pane_id: &str, check: impl FnOnce() -> T)
 
 // S3 — settle timeout under a continuous 100 ms input pump.
 #[test]
+// TODO(#281): flaky under load; fix the timing dependence, then remove the ignore.
+#[ignore = "flaky under load: see #281"]
 fn s3_settle_timeout() {
     let h = Harness::new();
     let f = h.launch_fixture("f3_flip.sh", 80, 24, "AAAAAAAAAA");

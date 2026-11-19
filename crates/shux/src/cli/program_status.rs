@@ -128,6 +128,34 @@ pub(super) async fn call_wait(
     }
 }
 
+/// A wait verb's target lookup failed: report it as the wait itself would,
+/// as JSON under `--format json`, and exit 2 for no such target, 3 otherwise.
+pub(super) fn or_exit<T>(
+    resolved: Result<T, RpcClientError>,
+    verb: &str,
+    format: OutputFormat,
+) -> anyhow::Result<T> {
+    match resolved {
+        Ok(t) => Ok(t),
+        Err(RpcClientError::Rpc {
+            code,
+            message,
+            data,
+        }) => super::lens::lens_emit_error_and_exit(
+            format,
+            verb,
+            code,
+            &message,
+            data,
+            match code {
+                -32004 => 2,
+                code => super::lens::lens_checkpoint_exit_code(code),
+            },
+        ),
+        Err(other) => Err(other.into()),
+    }
+}
+
 /// `pane.wait_status`'s params: `match`, `id` and `after` only when given.
 fn wait_status_params(pane: &str, states: &[&String], wait: &StatusWait<'_>) -> serde_json::Value {
     let mut params = serde_json::json!({

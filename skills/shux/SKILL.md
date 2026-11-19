@@ -131,57 +131,140 @@ shux pane wait-exit "$P" --timeout 10m                            # or wait on a
 ## Run a command in a live shell and get its output
 
 When the command must run in a shell that already exists (its cwd, its env,
-a venv it activated), use `pane run`. It returns exactly what the command
-wrote, and its exit code, with no prompt, no echoed line and no marker of
-yours to grep for:
-
-```bash
-R=$(shux --format json pane run -s dev --timeout 60 -c 'cargo test -q')
-echo "$R" | jq -r .stdout          # the command's own output (stdout and stderr, merged)
-echo "$R" | jq -e '.exit_code == 0'
-```
-
-- **One command per pane.** While one runs, another `pane run` is refused,
-  naming the running `command_id`. Wait for it (`--async`, then
-  `shux rpc call pane.command_status`), or cancel it with `pane.command_cancel`.
-- **A timeout returns `timed_out`, but the program may still be running.** The
-  pane stays held, and the next command is refused rather than typed into
-  it, until the program ends or you cancel it.
-- Keep `-c` to one line: no trailing `&`, `#` comment or heredoc.
-
-## Wait for a typed command to end, with its exit code
-
-A shell that reports its command boundaries (OSC 133) tells shux where each
-command starts and how it ends. Then waiting for a typed command needs nothing
-printed and no marker: read the floor, send the command, wait.
+a venv it activated), use `pane run`. One call types the command, waits for
+it, and returns exactly what it wrote and its exit code: no prompt, no echoed
+line, no marker of yours to grep for.
 
 ```bash
 # Once, in ~/.bashrc (after ble.sh and starship) or ~/.zshrc:
 eval "$(shux shell-integration bash)"        # or: zsh. bash needs 4.4+
 
+R=$(shux --format json pane run -s dev -p "$P" --timeout 60s -c 'cargo test -q')
+echo "$R" | jq -r .stdout          # the command's own output (stdout and stderr, merged)
+echo "$R" | jq -e '.state == "completed" and .exit_code == 0'
+```
+
+Always name the pane (`-p`): without it the session's active pane is used,
+which in a split window may be the pane your own agent runs in (that one is
+refused, `own_pane`, but the other panes are not yours to guess at).
+
+With the integration sourced, the pane shows only `cargo test -q` and its
+output, and the result says `"boundaries": "osc133"`. Without it, shux frames
+the line with markers the shell prints (`"boundaries": "markers"`) and the
+watcher sees them. `--boundaries osc133` insists on the shell's own marks
+(waiting up to `--timeout` for its prompt); `--boundaries markers` forces the
+old framing.
+
+**A line goes only to a shell's empty prompt**: the shell's marks say it is
+at its prompt, its line editor reads the terminal in raw mode, and nothing
+else was sent to it. Anything else is refused with `error.data.reason`, and
+nothing is typed. Transient states (a prompt not drawn yet, prompt hooks
+running) are waited out first, up to `--timeout`:
+
+| `reason` | The pane's input would go to | Do |
+|---|---|---|
+| `command_running` | a command the shell reports running | `pane wait-command`, then retry |
+| `input_pending` | a line already sent that has not started (`send-keys … C-j` just before, or input still queued) | `pane wait-command` for it, then retry |
+| `input_present` | keys sent to the prompt that submitted nothing: the editor holds text, or is in another mode | `send-keys --data Aw==` (C-c) for a fresh prompt, then retry |
+| `other_program` | another program in the foreground (a REPL, `ssh`, `less`); a shell started from the pane's, at its own integrated prompt, is not one | wait for it, or `--boundaries markers` to type into it |
+| `prompt_not_ready` | the prompt mark is drawn but no line editor reads (the terminal is in line mode): a prompt hook, or a line the shell accepted, runs | wait, then retry |
+| `hidden_input` | a password prompt (`sudo`, `read -s`) | answer it with `send-keys`, or cancel it |
+| `full_screen` | a full-screen program (an editor) | quit it first |
+| `not_a_shell` | a pane whose program is not a shell, and reports no prompt | `--boundaries markers` to type into it anyway |
+| `no_prompt` | nothing reported a prompt within `--timeout` | source the integration, or `--boundaries markers` |
+| `pane_held` | an earlier `pane run` still holding the pane (it timed out, or runs) | wait for its end (`wait-command --after` its `as_of`), then retry |
+| `own_pane` | the pane this `shux` itself runs in (exit 2); `send-keys` refuses it too | pass `-p` with the pane you mean |
+
+**`state` says how the command ended:**
+
+| `state` | Meaning | CLI exit |
+|---|---|---|
+| `completed` | it ended: read `exit_code`. `ended_by: "prompt"` / `"next_command"` means the shell never reported the end (a nested shell, `exec bash`), so `exit_code` is null | 0 |
+| `not_run` | the shell drew its next prompt without starting the line; `stdout` is what it replied. Plain bash and zsh do this for a syntax error or a comment; ble.sh runs such a line, so there it is `completed` with `exit_code` 2 | 3 |
+| `timed_out` | still running at `--timeout`; `stdout` is what it wrote so far, and the pane stays held; `hint` is the exact command that gets its end. `phase: "awaiting_start"` means the line never started (the shell may want more input); `hidden_input: true` means the terminal was reading with echo off, as a password prompt does | 1 |
+| `cancelled` / `pane_gone` / `overrun` | cancelled; the pane went away; more lines came ahead of it than are kept | 3 |
+
+- **Keep waiting, don't re-run.** After `timed_out` with `boundaries: osc133`,
+  wait for the same command's end with its output. `as_of` is a sequence
+  stamp (not a time) read just before the line was typed:
+  `shux --format json pane wait-command "$P" --after "$(jq .as_of <<<"$R")" --timeout 1h --output`
+  The `pane run` result is frozen at its timeout (`pane command-status` keeps
+  returning it); only `wait-command` reports the command's own end. Its
+  answer is under `.result` and says `outcome` where `pane run` says `state`:
+  `jq '.result | {outcome, exit_code, stdout}'`.
+- **A password prompt** never answers itself: the run times out with
+  `hidden_input: true` (a sync result's `phase` stays `executing`; branch on
+  `hidden_input`). Send the answer to that pane, `-s` and `-p` both:
+  `send-keys -s S -p "$P" --text 'hunter2'`, then Enter. A program's own
+  prompt takes Enter (`--data DQ==`) or C-j (`--data Cg==`) alike; only
+  ble.sh's line editor needs C-j. Then wait as above.
+  With `--async`, `pane.command_status` shows `phase: "awaiting_input"` the
+  moment the terminal starts reading with echo off.
+- **One command per pane.** While one holds the pane, another `pane run` is
+  refused (`reason: "pane_held"`), naming its `running_command_id`: wait for
+  it, then retry. `--async` returns at once; poll with `shux pane
+  command-status <ID>` (`phase`: `awaiting_start`, `executing`,
+  `awaiting_input`). `shux pane command-cancel <ID>` sends it C-c, which a
+  person watching the pane may not want.
+- **One line.** A control character (Tab, ESC, C-c…) in the command is
+  refused: typed, it would act as a key. A shell that reports its boundaries
+  runs one command per line, so join lines with `;` or `&&`.
+- **Which command is yours** is decided from the screen: the first line the
+  shell read whose text holds yours. A line typed ahead of it is never taken
+  for it.
+- **CLI exit codes** are shux's, never the command's: 0 ended, 1 timed out,
+  2 bad arguments or no such pane/session, 3 everything else (refused, not
+  run…). Errors come as `{"error": {code, message, data}}` on stdout under
+  `--format json`. `--timeout` takes `60` (seconds) or `60s`, `2m`, `1h`;
+  at most 1h.
+
+## Wait for a typed command to end, with its exit code
+
+A shell that reports its command boundaries (OSC 133) tells shux where each
+command starts and how it ends. Then waiting for a command you (or a person)
+typed needs nothing printed and no marker: read the floor, send the command,
+wait. `--output` also returns what it wrote.
+
+```bash
 AS_OF=$(shux --format json pane status "$P" | jq .result.as_of)
 shux pane send-keys -s dev --text 'make test' && shux pane send-keys -s dev --data Cg==   # C-j
-R=$(shux --format json pane wait-command "$P" --after "$AS_OF" --timeout 10m)
+R=$(shux --format json pane wait-command "$P" --after "$AS_OF" --timeout 10m --output)
 echo "$R" | jq .result.exit_code                # that command's own exit code
+echo "$R" | jq -r .result.stdout                # exactly what it wrote, however long
 ```
 
 - **The first command that started after the floor** is the one returned.
   One already running when you read the floor is never taken for it.
 - **To wait for the next command,** pass the returned `.result.started` as
   `--after`. Commands typed back to back are each returned, in order.
+- **`stdout`** (with `--output`) is the stream between the command's start
+  and its end, not the screen: output longer than the screen and lines wider
+  than it come back whole, named as `pane run` names it. The last few MiB of
+  commands' output are kept; an older command's comes back `stdout: null,
+  evicted: true`.
 - **A timeout with `no_integration: true`** means the shell has never
-  reported a command: source the integration, or use a route below.
+  reported a prompt or a command: source the integration, or use a route below.
 - **Under ble.sh,** submit with C-j (`--data Cg==`), not Enter: ble.sh can
   take scripted keystrokes for a paste and wait in `-- MULTILINE --`.
+- `pane status` reports the shell's state as `.result.commands.shell`:
+  `unknown`, `at_prompt`, `running` or `between`; `.line_pending` and
+  `.input_present` say whether a line or keys were sent to the prompt.
+
+**`pane run`, `wait-command`, `wait-status` and `wait-for` take at most an
+hour** (`--timeout 1h`; `--timeout-ms 3600000` for `wait-for`, `--timeout
+3600` for `pane run`), and a longer one is refused with the same error, never
+shortened. For longer runs, wait again from the returned `started`.
+`wait-exit` takes any timeout, or none.
 
 **Which route when:**
 
 | You want | Use |
 |---|---|
-| A command's output, from a shell that exists | `pane run` |
-| A typed command's end and exit code, no marker | `pane wait-command` (needs the integration) |
+| A command's output and exit code, from a shell that exists | `pane run` |
+| The end, exit code and output of a command already typed | `pane wait-command --output` (needs the integration) |
 | A program to say when it is done or blocked | `pane wait-status --id` (OSC 7501) |
 | A program you start to finish | `session create --wait` / `pane wait-exit` |
+| Text on a TUI's screen | `pane wait-for` — it matches your own typed text too, echoed: wait on what a command *prints*, spelled so the command line cannot contain it |
 
 ## Wait for one command's own report
 
@@ -389,12 +472,12 @@ Need plain text of the screen?     → pane.capture    (shux pane capture)
 Need to block until text appears?  → pane.wait_for   (shux pane wait-for --text|--regex)
 Need to know when an agent in a
 pane is blocked on you or done?    → pane.wait_status (shux pane wait-status <PANE> --state blocked,done)
-Need one command's output from a
-shell that already exists?         → pane.run_command (shux pane run -s S -c '<cmd>')
+Need one command's output and exit
+code from a shell that exists?     → pane.run_command (shux pane run -s S -c '<cmd>')
 Need to wait for one command typed
 into a shell, by its own report?   → pane.wait_status (shux pane wait-status <PANE> --id <ID> --state done,error)
-Need a typed command's end and
-exit code, with no marker at all?  → pane.wait_command (shux pane wait-command <PANE> --after <AS_OF>)
+Need a typed command's end, exit
+code and output, with no marker?   → pane.wait_command (shux pane wait-command <PANE> --after <AS_OF> --output)
 Need a program's exit code (a
 test run, a build)?                → pane.wait_exit  (shux pane split --wait -- <argv>, or pane wait-exit <PANE>)
 Need live sampled PTY output?      → pane.output.watch (sealed data-plane, sampled)
@@ -493,6 +576,8 @@ Full protocol — handshake, event payload shape, RPC-out direction,
 - `pane wait-for -s SESSION` targets the session's **active pane** (often the last-spawned). In multi-pane templates pass `--pane <UUID>` (from `pane list` or `state.apply`'s `spawn_results`) — otherwise the wait will silently watch the wrong pane and time out.
   The needle is explicit: `shux pane wait-for -s SESSION -p PANE --text 'ready'`, not a
   positional argument. Use `--regex` for regex needles.
+- `pane wait-for` exits 0 matched, 1 timeout, 2 bad arguments or no such pane, like the
+  other waits, and takes `--timeout-ms` up to 3600000; a larger value is refused.
 - `pane.send_keys --text` is JSON-quoted text. For raw control bytes (Esc/Enter/Tab/Ctrl+letter), use `--data` with base64.
 - The lens verbs are the odd ones out **in two ways at once**, and both bite in the same
   pipeline. `lens run` plus the four lens `pane` verbs
@@ -500,6 +585,10 @@ Full protocol — handshake, event payload shape, RPC-out direction,
   1. take the pane as a **bare positional UUID** — `shux pane glance <PANE>`, not `-p <PANE>`; and
   2. wrap their `--format json` output in a `result` envelope — `jq -r .result.revision`.
 
+  The waits (`pane status`, `wait-command`, `wait-status`, `wait-exit`) share both traits:
+  a positional PANE and a `.result` envelope; `pane run` and `pane wait-for` take `-s` / `-p`
+  and answer bare. Under `--format json` every failure, a daemon that cannot be reached
+  included, is an `{"error": {code, message, data}}` object on stdout.
   Every OTHER verb uses `-s/--session` (+ optional `-w/--window`, `-p/--pane`) and returns
   its payload **bare** — but "bare" still means each verb's own RPC shape, not one uniform
   list shape.

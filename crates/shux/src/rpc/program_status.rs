@@ -17,7 +17,9 @@ use crate::pane_io::PaneIoState;
 use crate::rpc::params::resolve_pane_id_from_params;
 
 const WAIT_DEFAULT_MS: u64 = 30_000;
-const WAIT_MAX_MS: u64 = 600_000;
+/// The longest any pane wait (`wait_for`, `wait_command`, `wait_status`)
+/// accepts; past it each refuses the same way, never shortening the wait.
+pub(crate) const WAIT_MAX_MS: u64 = 3_600_000;
 /// Re-read even without an event: installing a VT that matches the graph's
 /// defaults (a disabled pane) changes nothing the graph would announce, and
 /// neither does an identical report, which an id wait with a floor needs.
@@ -75,6 +77,9 @@ pub(crate) fn register_program_status_methods(
                         "commands": {
                             "seen": vt.commands_seen(),
                             "running": vt.command_running(),
+                            "shell": vt.shell_state().as_str(),
+                            "line_pending": vt.line_pending(),
+                            "input_present": vt.input_present(),
                         },
                     }))
                 }
@@ -221,18 +226,29 @@ pub(crate) fn parse_after(params: &Value) -> Result<Option<u64>, RpcError> {
     Ok(Some(after))
 }
 
-/// `timeout_ms`: 30 s by default, at most 600 s.
+/// `timeout_ms`: 30 s by default, at most [`WAIT_MAX_MS`].
 pub(crate) fn parse_wait_timeout(params: &Value) -> Result<Duration, RpcError> {
+    parse_wait_timeout_or(params, WAIT_DEFAULT_MS)
+}
+
+/// [`parse_wait_timeout`] with the method's own default.
+pub(crate) fn parse_wait_timeout_or(params: &Value, default_ms: u64) -> Result<Duration, RpcError> {
     let timeout_ms = match params.get("timeout_ms") {
-        None | Some(Value::Null) => WAIT_DEFAULT_MS,
+        None | Some(Value::Null) => default_ms,
         Some(v) => v
             .as_u64()
             .ok_or_else(|| RpcError::invalid_params("timeout_ms must be a non-negative integer"))?,
     };
     if timeout_ms > WAIT_MAX_MS {
-        return Err(RpcError::invalid_params(&format!(
-            "timeout_ms must be at most {WAIT_MAX_MS}"
-        )));
+        return Err(RpcError::with_message_and_data(
+            shux_rpc::ErrorCode::InvalidParams,
+            format!("timeout_ms must be at most {WAIT_MAX_MS} (1h)"),
+            json!({
+                "field": "timeout_ms",
+                "max": WAIT_MAX_MS,
+                "hint": "to wait longer, wait again when this one returns",
+            }),
+        ));
     }
     Ok(Duration::from_millis(timeout_ms))
 }

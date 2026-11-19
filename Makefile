@@ -210,7 +210,7 @@ test: nextest-ready ## Run the whole workspace suite (same command CI runs)
 
 .PHONY: test-stress
 test-stress: nextest-ready ## Repeat tests to expose timing dependence (STRESS_COUNT, STRESS_FILTER, STRESS_LOAD)
-	@NEXTEST_JOBS=$(NEXTEST_JOBS) bash scripts/test-stress.sh
+	@NEXTEST_JOBS=$(NEXTEST_JOBS) .shux/scripts/no_leak_guard.sh bash scripts/test-stress.sh
 
 .PHONY: test-verbose
 test-verbose: nextest-ready ## Run tests with output visible
@@ -850,7 +850,7 @@ check-skill-docs: ## Verify agent-facing skill gotchas match shipped CLI shapes
 	@bash scripts/check-skill-docs.sh
 
 FUZZ_SECONDS ?= 60
-FUZZ_PROGRAM_STATUS := program_status_decode program_status_table scanner_vs_vte vt_program_status_stream
+FUZZ_PROGRAM_STATUS := program_status_decode program_status_table scanner_vs_vte vt_program_status_stream vt_command_capture
 
 .PHONY: fuzz
 fuzz: fuzz-program-status fuzz-pane-mouse fuzz-pane-record ## Run every libFuzzer target (FUZZ_SECONDS each, default 60)
@@ -862,6 +862,10 @@ fuzz-pane-record: ## Recording lifecycle: overlapping starts, stops, faults, shu
 .PHONY: fuzz-pane-mouse
 fuzz-pane-mouse: ## Mouse-to-grid-cell mapping against the live compositor (FUZZ_SECONDS)
 	@bash scripts/fuzz.sh $(FUZZ_SECONDS) pane_grid_cell
+
+.PHONY: fuzz-command-capture
+fuzz-command-capture: ## OSC 133 command capture: boundaries, output, screen record vs chunking (FUZZ_SECONDS)
+	@bash scripts/fuzz.sh $(FUZZ_SECONDS) vt_command_capture
 
 .PHONY: fuzz-program-status
 fuzz-program-status: ## OSC 7501 libFuzzer targets in fuzz/ (FUZZ_SECONDS each)

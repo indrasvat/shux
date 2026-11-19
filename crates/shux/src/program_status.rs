@@ -939,7 +939,7 @@ mod tests {
         let io = h.io.clone();
         shux_testkit::wait_until_async("the waiter to subscribe", || {
             let io = io.clone();
-            async move { io.lock().await.commands_ended.receiver_count() >= 1 }
+            async move { io.lock().await.boundaries_moved.receiver_count() >= 1 }
         })
         .await;
         dispatch_ok(
@@ -977,7 +977,7 @@ mod tests {
         shux_testkit::wait_until_async("the waiter to subscribe", || {
             let io = io.clone();
             let done = waiter.is_finished();
-            async move { done || io.lock().await.commands_ended.receiver_count() >= 1 }
+            async move { done || io.lock().await.boundaries_moved.receiver_count() >= 1 }
         })
         .await;
         spawn_sh(
@@ -1011,6 +1011,7 @@ mod tests {
             pane,
             None,
             std::time::Duration::from_secs(5),
+            false,
         )
         .await
         .expect("wait");

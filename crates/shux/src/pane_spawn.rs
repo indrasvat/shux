@@ -61,6 +61,67 @@ struct PtyTaskControl {
     probe: Option<shux_pty::PtyOutputProbe>,
 }
 
+/// What a chunk of input does to a shell's prompt: whether it submits a
+/// line (a CR or LF outside a bracketed paste), and whether keys that submit
+/// nothing follow the last submission. Focus and mouse reports, which a
+/// terminal sends on its own, are neither. `scan` carries a paste, and a
+/// marker cut across chunks, from one chunk to the next.
+fn classify_input(bytes: &[u8], scan: &mut InputScan) -> (bool, bool) {
+    const START: &[u8] = b"\x1b[200~";
+    const END: &[u8] = b"\x1b[201~";
+    let joined = [std::mem::take(&mut scan.held).as_slice(), bytes].concat();
+    let (mut submits, mut edits) = (false, false);
+    let mut i = 0;
+    while i < joined.len() {
+        let rest = &joined[i..];
+        if rest.len() < START.len() && (START.starts_with(rest) || END.starts_with(rest)) {
+            scan.held = rest.to_vec();
+            break;
+        }
+        if rest.starts_with(START) || rest.starts_with(END) {
+            scan.in_paste = rest.starts_with(START);
+            i += START.len();
+            continue;
+        }
+        if !scan.in_paste
+            && let Some(n) = report_len(rest)
+        {
+            i += n;
+            continue;
+        }
+        if !scan.in_paste && matches!(joined[i], b'\r' | b'\n') {
+            submits = true;
+            edits = false;
+        } else {
+            edits = true;
+        }
+        i += 1;
+    }
+    (submits, edits)
+}
+
+/// A focus or mouse report at the start of `rest`: its length.
+fn report_len(rest: &[u8]) -> Option<usize> {
+    if rest.starts_with(b"\x1b[I") || rest.starts_with(b"\x1b[O") {
+        return Some(3);
+    }
+    if let Some(body) = rest.strip_prefix(b"\x1b[<") {
+        let end = body.iter().position(|&b| b == b'M' || b == b'm')?;
+        return body[..end]
+            .iter()
+            .all(|&b| b.is_ascii_digit() || b == b';')
+            .then_some(3 + end + 1);
+    }
+    (rest.starts_with(b"\x1b[M") && rest.len() >= 6).then_some(6)
+}
+
+#[derive(Default)]
+struct InputScan {
+    in_paste: bool,
+    /// A possible paste marker cut at the end of the last chunk.
+    held: Vec<u8>,
+}
+
 /// Everything bound for the program's input, in order: terminal replies
 /// (DA1, DSR, OSC 7501 probes) and user input. Replies go between input
 /// chunks, never inside one or inside a bracketed paste. A reply that does
@@ -242,6 +303,7 @@ async fn run_pane_pty_task(
     let mut staged = StagedOutput::new();
     let mut task_exit = PtyTaskExit::Natural;
     let mut pending = PtyInputQueue::default();
+    let mut input_scan = InputScan::default();
 
     loop {
         let output_due = staged.due_at();
@@ -282,7 +344,7 @@ async fn run_pane_pty_task(
                                 task_exit = PtyTaskExit::RequestedTeardown;
                                 break;
                             }
-                            let commands_ended = state.commands_ended.clone();
+                            let boundaries_moved = state.boundaries_moved.clone();
                             let (vt_title, terminal_responses, rev_state, alt_switched, status) =
                                 if let Some(vt) = state.vts.get_mut(&pane_id) {
                                     // LENS-R-032/DEC-4: detect an alt-screen
@@ -294,10 +356,10 @@ async fn run_pane_pty_task(
                                     // one batch leaves the flag equal → no switch,
                                     // matching §4.2's "nets to no bump".
                                     let alt_before = vt.is_alternate_screen();
-                                    let ended_before = vt.last_command_end();
+                                    let marks_before = vt.boundary_marks();
                                     let responses = vt.process_with_responses(data);
-                                    if vt.last_command_end() != ended_before {
-                                        commands_ended.send_modify(|n| *n += 1);
+                                    if vt.boundary_marks() != marks_before {
+                                        boundaries_moved.send_modify(|n| *n += 1);
                                     }
                                     if let Some(probe) = &probe {
                                         probe.mark_handled();
@@ -333,6 +395,7 @@ async fn run_pane_pty_task(
                                 }
                             }
                             let _completed = state.cmd_engine.process_output(pane_id.0, data);
+                            state.settle_osc133(pane_id);
                             let bracketed = state
                                 .vts
                                 .get(&pane_id)
@@ -485,6 +548,15 @@ async fn run_pane_pty_task(
                     task_exit = PtyTaskExit::RequestedTeardown;
                     break;
                 };
+                let (submits, edits) = classify_input(&data.bytes, &mut input_scan);
+                if submits || edits {
+                    let mut state = io_state.lock().await;
+                    if state.is_current(pane_id, incarnation)
+                        && let Some(vt) = state.vts.get_mut(&pane_id)
+                    {
+                        vt.note_input(submits, edits);
+                    }
+                }
                 pending.push_input(data);
             }
             // Waits for room, never blocks the loop: a program that stops
@@ -511,7 +583,7 @@ async fn run_pane_pty_task(
     {
         let mut state = io_state.lock().await;
         if state.is_current(pane_id, incarnation) {
-            state.cmd_engine.forget_pane(pane_id.0);
+            state.forget_command(pane_id);
         }
     }
     // A program's last words, staged inside the final interval.
@@ -1094,6 +1166,13 @@ async fn spawn_pane_pty_unshared(
     };
     config.size = size;
     config.env = env;
+    if !env_clear {
+        // Which pane a program runs in, so a shux call from it can tell its
+        // own pane from its target. Ahead of the caller's own entries.
+        config
+            .env
+            .insert(0, ("SHUX_PANE_ID".to_string(), pane_id.to_string()));
+    }
     config.env_clear = env_clear;
     let mut handle = shux_pty::handle::PtyHandle::spawn(&config)?;
     let input = handle.input_writer()?;
@@ -1824,6 +1903,40 @@ mod tests {
             "a recording on a killed pane ended other than complete"
         );
         h.stop().await;
+    }
+
+    #[test]
+    fn input_is_classified_by_what_it_does_to_a_prompt() {
+        let classify = |chunks: &[&[u8]]| {
+            let mut scan = super::InputScan::default();
+            chunks
+                .iter()
+                .map(|c| super::classify_input(c, &mut scan))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(classify(&[b"echo hi"]), [(false, true)]);
+        assert_eq!(classify(&[b"echo hi\r"]), [(true, false)]);
+        assert_eq!(
+            classify(&[b"a\rb"]),
+            [(true, true)],
+            "keys after the submission"
+        );
+        assert_eq!(classify(&[b"\x1b[D\x1b[D"]), [(false, true)], "arrows edit");
+        assert_eq!(
+            classify(&[b"\x1b[I\x1b[<0;3;4M\x1b[O"]),
+            [(false, false)],
+            "reports do not"
+        );
+        assert_eq!(
+            classify(&[b"\x1b[200~a\nb\r", b"c\n", b"\x1b[201~\r"]),
+            [(false, true), (false, true), (true, false)],
+            "a newline inside a paste submits nothing"
+        );
+        assert_eq!(
+            classify(&[b"\x1b[200~x\x1b[20", b"1~\r"]),
+            [(false, true), (true, false)],
+            "a paste end cut across chunks still ends it"
+        );
     }
 
     /// What a program taking at most `limit` bytes per write receives.

@@ -143,6 +143,8 @@ impl VtProgramStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StatusCut {
     pub(crate) end: usize,
+    /// Its wire length from `ESC ]`, across reads.
+    pub(crate) len: usize,
     pub(crate) action: CutAction,
 }
 
@@ -150,8 +152,11 @@ pub(crate) struct StatusCut {
 pub(crate) enum CutAction {
     /// Payload after `7501;`, and the terminator to mirror in a reply.
     Report { payload: Vec<u8>, bel: bool },
-    /// OSC 133 `A`: a new shell prompt.
-    PromptStart,
+    /// OSC 133 `A`: a new shell prompt, and the line editor that draws it
+    /// when the shell's integration names it (`shux-editor=`).
+    PromptStart {
+        editor: Option<crate::commands::LineEditor>,
+    },
     /// OSC 133 `C`: a typed command started.
     CommandStart,
     /// OSC 133 `D[;exit]`: it ended; `None` when no exit code came with it.
@@ -309,7 +314,11 @@ impl OscStatusScanner {
             classify(&self.body, bel)
         };
         if let Some(action) = action {
-            cuts.push(StatusCut { end, action });
+            cuts.push(StatusCut {
+                end,
+                len: self.raw_len,
+                action,
+            });
         }
         self.reset(ScanState::Ground);
     }
@@ -331,7 +340,9 @@ fn classify(body: &[u8], bel: bool) -> Option<CutAction> {
         return None;
     }
     match mark {
-        b'A' => Some(CutAction::PromptStart),
+        b'A' => Some(CutAction::PromptStart {
+            editor: crate::commands::LineEditor::named(params),
+        }),
         b'C' => Some(CutAction::CommandStart),
         b'D' => Some(CutAction::CommandEnd {
             exit_code: exit_field(body, false),
@@ -583,7 +594,10 @@ mod tests {
     fn only_133_a_and_7501_are_cut() {
         assert_eq!(
             cuts(&[b"\x1b]133;A\x07\x1b]133;A;aid=1\x1b\\\x1b]133;B\x07\x1b]133;AB\x07"]),
-            [CutAction::PromptStart, CutAction::PromptStart]
+            [
+                CutAction::PromptStart { editor: None },
+                CutAction::PromptStart { editor: None }
+            ]
         );
         assert_eq!(
             cuts(&[b"\x1b]0;7501;x\x07\x1b]75010;state=idle\x07\x1b]7501\x07"]),

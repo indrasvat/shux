@@ -29,13 +29,19 @@ pub(crate) fn register_wait_command_method(
                 let params = params.unwrap_or_default();
                 let after = crate::rpc::program_status::parse_after(&params)?;
                 let timeout = crate::rpc::program_status::parse_wait_timeout(&params)?;
+                let output = match params.get("output") {
+                    None | Some(Value::Null) => false,
+                    Some(v) => v
+                        .as_bool()
+                        .ok_or_else(|| RpcError::invalid_params("output must be true or false"))?,
+                };
                 let pane_id = resolve_pane_id_from_params(&gh, &params)?;
                 // A full id resolves unchecked: one that names no pane is not
                 // found, as `pane.wait_exit` says, not a pane that went away.
                 if !gh.snapshot().panes.contains_key(&pane_id) {
                     return Err(RpcError::not_found("pane", &pane_id.to_string()));
                 }
-                wait_command(&gh, &io, pane_id, after, timeout).await
+                wait_command(&gh, &io, pane_id, after, timeout, output).await
             }
         },
     )
@@ -47,6 +53,7 @@ pub(crate) async fn wait_command(
     pane_id: PaneId,
     after: Option<u64>,
     timeout: Duration,
+    output: bool,
 ) -> Result<Value, RpcError> {
     let gone = |why: &str| {
         Ok(json!({"outcome": "pane_gone", "pane_id": pane_id.to_string(), "reason": why}))
@@ -61,7 +68,7 @@ pub(crate) async fn wait_command(
         (
             after.unwrap_or_else(shux_vt::program_status_as_of),
             state.incarnations.get(&pane_id).copied(),
-            state.commands_ended.subscribe(),
+            state.boundaries_moved.subscribe(),
         )
     };
     loop {
@@ -81,7 +88,16 @@ pub(crate) async fn wait_command(
                     if *incarnation.get_or_insert(now) != now {
                         return gone("respawned");
                     }
-                    Some((vt.command_after(floor), vt.commands_seen()))
+                    let lookup = vt.command_after(floor);
+                    // Read in the same hold as the record it belongs to.
+                    let text = match lookup {
+                        CommandLookup::Found(c) if output => Some(
+                            vt.command_output(c.started)
+                                .map(|o| (shux_pty::output_text(o.bytes), o.truncated)),
+                        ),
+                        _ => None,
+                    };
+                    Some((lookup, vt.commands_seen(), text))
                 }
                 _ if ended.is_some() || incarnation.is_some() => {
                     return gone(ended.unwrap_or("killed"));
@@ -94,17 +110,30 @@ pub(crate) async fn wait_command(
                 _ => None,
             }
         };
-        let (lookup, seen) = looked.unwrap_or((CommandLookup::Pending, false));
+        let (lookup, seen, text) = looked.unwrap_or((CommandLookup::Pending, false, None));
         match lookup {
             CommandLookup::Found(c) => {
-                return Ok(json!({
+                let mut result = json!({
                     "outcome": "completed",
                     "pane_id": pane_id.to_string(),
                     "exit_code": c.exit_code,
                     "started": c.started,
                     "ended": c.ended,
                     "ended_by": c.ended_by.as_str(),
-                }));
+                });
+                match text {
+                    Some(Some((text, truncated))) => {
+                        result["stdout"] = text.into();
+                        result["truncated"] = truncated.into();
+                    }
+                    // Kept output is bounded: older commands' is let go.
+                    Some(None) => {
+                        result["stdout"] = Value::Null;
+                        result["evicted"] = true.into();
+                    }
+                    None => {}
+                }
+                return Ok(result);
             }
             CommandLookup::Overrun => {
                 return Ok(json!({

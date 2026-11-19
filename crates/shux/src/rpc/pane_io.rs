@@ -222,6 +222,7 @@ pub(crate) fn register_pane_io_methods(
                 async move {
                     let params = params.unwrap_or_default();
                     let pane_id = resolve_pane_id_from_params(&gh, &params)?;
+                    refuse_own_pane(&params, pane_id)?;
 
                     let bytes = if let Some(text) = params.get("text").and_then(|v| v.as_str()) {
                         text.as_bytes().to_vec()
@@ -269,8 +270,29 @@ pub(crate) fn register_pane_io_methods(
                             })?;
 
                     let args: Vec<String> = pane_command::parse_run_args(&params)?;
+                    let wanted = parse_boundaries(&params)?;
+                    // Typing into the pane the caller runs in would type into
+                    // the caller, and wait on itself.
+                    refuse_own_pane(&params, pane_id)?;
+                    let multiline = check_typed_line(command, &args)?;
 
-                    let timeout_secs = params.get("timeout").and_then(|v| v.as_u64()).unwrap_or(30);
+                    let timeout_secs = match params.get("timeout") {
+                        None | Some(serde_json::Value::Null) => 30,
+                        Some(v) => v
+                            .as_u64()
+                            .filter(|&s| s <= crate::rpc::program_status::WAIT_MAX_MS / 1000)
+                            .ok_or_else(|| {
+                                shux_rpc::RpcError::with_message_and_data(
+                                    shux_rpc::ErrorCode::InvalidParams,
+                                    "timeout must be at most 3600 (1h), in whole seconds",
+                                    serde_json::json!({
+                                        "field": "timeout",
+                                        "max": crate::rpc::program_status::WAIT_MAX_MS / 1000,
+                                        "hint": "to wait longer, wait for the command again when this run returns",
+                                    }),
+                                )
+                            })?,
+                    };
                     let timeout = Duration::from_secs(timeout_secs);
 
                     let is_async = params
@@ -278,37 +300,95 @@ pub(crate) fn register_pane_io_methods(
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
 
-                    let (completion_tx, completion_rx) = if !is_async {
+                    let (mut completion_tx, completion_rx) = if !is_async {
                         let (tx, rx) = tokio::sync::oneshot::channel();
                         (Some(tx), Some(rx))
                     } else {
                         (None, None)
                     };
 
-                    // Room in the pane's input is reserved first, so tracking
-                    // the command and queueing its line happen under one lock:
-                    // nothing tracked was never sent, nothing sent is untracked.
                     let requested_at = std::time::Instant::now();
-                    let prepared = shux_pty::CommandEngine::prepare(command, &args);
+                    let deadline = tokio::time::Instant::now() + timeout;
+                    let command = command.to_string();
                     drop(params);
-                    let writer = io.lock().await.writers.get(&pane_id).cloned().ok_or_else(
-                        || shux_rpc::RpcError::not_found("pane PTY", &pane_id.to_string()),
-                    )?;
-                    let permit = tokio::time::timeout(timeout, writer.reserve(prepared.line().len()))
+                    let pane_is_shell = gh
+                        .snapshot()
+                        .panes
+                        .get(&pane_id)
+                        .is_none_or(|p| crate::run_framing::runs_a_shell(&p.command));
+                    let guard = crate::pane_io::Guard {
+                        wanted,
+                        multiline,
+                        pane_is_shell,
+                    };
+                    let mut wake = io.lock().await.boundaries_moved.subscribe();
+                    let start = loop {
+                        let choice = {
+                            let state = io.lock().await;
+                            wake.borrow_and_update();
+                            if let Some(running) = state.cmd_engine.holder(pane_id.0) {
+                                let held = state.cmd_engine.get_status(running);
+                                return Err(pane_busy(running, held.as_ref()));
+                            }
+                            let front = state.front(pane_id, pane_is_shell).ok_or_else(|| {
+                                shux_rpc::RpcError::not_found("pane PTY", &pane_id.to_string())
+                            })?;
+                            match crate::run_framing::choose(wanted, &front, multiline) {
+                                crate::run_framing::Choice::Use(b) => Ok(b),
+                                crate::run_framing::Choice::Await(at_deadline) => Err((at_deadline, front)),
+                                crate::run_framing::Choice::Refuse(r) => {
+                                    return Err(pane_refusal(r, &front, timeout));
+                                }
+                                crate::run_framing::Choice::Invalid(why) => {
+                                    return Err(shux_rpc::RpcError::invalid_params(why));
+                                }
+                            }
+                        };
+                        let boundaries = match choice {
+                            Ok(b) => b,
+                            Err((at_deadline, front)) => {
+                                if tokio::time::Instant::now() >= deadline {
+                                    return Err(pane_refusal(at_deadline, &front, timeout));
+                                }
+                                let wake_at = (tokio::time::Instant::now()
+                                    + crate::rpc::program_status::WAIT_REPOLL)
+                                    .min(deadline);
+                                let _ = tokio::time::timeout_at(wake_at, wake.changed()).await;
+                                continue;
+                            }
+                        };
+                        // Room in the pane's input is reserved first, so tracking
+                        // the command and queueing its line happen under one lock:
+                        // nothing tracked was never sent, nothing sent is untracked.
+                        let prepared = shux_pty::CommandEngine::prepare_as(boundaries, &command, &args);
+                        let writer = io.lock().await.writers.get(&pane_id).cloned().ok_or_else(
+                            || shux_rpc::RpcError::not_found("pane PTY", &pane_id.to_string()),
+                        )?;
+                        let permit = tokio::time::timeout_at(
+                            deadline,
+                            writer.reserve(prepared.line().len()),
+                        )
                         .await
                         .map_err(|_| pane_input_full(timeout))?
                         .map_err(|_| shux_rpc::RpcError::internal("PTY write channel closed"))?;
-                    let start = io.lock().await.start_command(
-                        pane_id,
-                        permit,
-                        prepared,
-                        (requested_at, timeout),
-                        completion_tx,
-                    );
+                        let checked = (wanted != crate::run_framing::Wanted::Markers).then_some(guard);
+                        match io.lock().await.start_command(
+                            pane_id,
+                            permit,
+                            prepared,
+                            (requested_at, timeout),
+                            &mut completion_tx,
+                            checked,
+                        ) {
+                            CommandStart::Changed => {}
+                            other => break other,
+                        }
+                    };
                     let command_id = match start {
                         CommandStart::Started(id) => id,
-                        CommandStart::Busy(running, state) => {
-                            return Err(pane_busy(running, &state));
+                        CommandStart::Busy(running, _) => {
+                            let held = io.lock().await.cmd_engine.get_status(running);
+                            return Err(pane_busy(running, held.as_ref()));
                         }
                         CommandStart::PaneGone => {
                             return Err(shux_rpc::RpcError::not_found(
@@ -316,6 +396,7 @@ pub(crate) fn register_pane_io_methods(
                                 &pane_id.to_string(),
                             ));
                         }
+                        CommandStart::Changed => unreachable!("chosen again in the loop above"),
                     };
 
                     if is_async {
@@ -357,8 +438,7 @@ pub(crate) fn register_pane_io_methods(
 
                     let state = io.lock().await;
                     let result = state
-                        .cmd_engine
-                        .get_status(command_id)
+                        .command_status(command_id)
                         .ok_or_else(|| shux_rpc::RpcError::not_found("command", cmd_id_str))?;
 
                     command_result_json(&result)
@@ -384,10 +464,17 @@ pub(crate) fn register_pane_io_methods(
                     })?;
 
                     let mut state = io.lock().await;
-                    let pane_uuid = state
-                        .cmd_engine
-                        .cancel_command(command_id)
-                        .ok_or_else(|| shux_rpc::RpcError::not_found("command", cmd_id_str))?;
+                    let Some(pane_uuid) = state.cancel_command(command_id) else {
+                        // Ended already: nothing to cancel, and no Ctrl-C.
+                        let ended = state
+                            .cmd_engine
+                            .get_status(command_id)
+                            .ok_or_else(|| shux_rpc::RpcError::not_found("command", cmd_id_str))?;
+                        return Ok(serde_json::json!({
+                            "command_id": cmd_id_str,
+                            "state": ended.state,
+                        }));
+                    };
 
                     // Ctrl-C, without waiting: a pane whose input is backed
                     // up must not hold this lock, and urgent input skips it.
@@ -478,16 +565,20 @@ pub(crate) fn register_pane_io_methods(
                         .unwrap_or(false);
                     let lines =
                         params.get("lines").and_then(|v| v.as_u64()).unwrap_or(200) as usize;
-                    let timeout_ms = params
-                        .get("timeout_ms")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(10_000)
-                        .min(60_000);
-                    let poll_ms = params
-                        .get("poll_ms")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(100)
-                        .clamp(20, 1_000);
+                    let timeout_ms =
+                        crate::rpc::program_status::parse_wait_timeout_or(&params, 10_000)?
+                            .as_millis() as u64;
+                    let poll_ms = match params.get("poll_ms") {
+                        None | Some(serde_json::Value::Null) => 100,
+                        Some(v) => v
+                            .as_u64()
+                            .filter(|ms| (20..=1_000).contains(ms))
+                            .ok_or_else(|| {
+                                shux_rpc::RpcError::invalid_params(
+                                    "poll_ms must be a whole number from 20 to 1000",
+                                )
+                            })?,
+                    };
 
                     if needle_text.is_none() && needle_regex_raw.is_none() {
                         return Err(shux_rpc::RpcError::invalid_params(
@@ -1829,27 +1920,41 @@ pub(crate) fn register_pane_io_methods(
 
 /// `state` is the holder's own: once it has timed out, waiting cannot free
 /// the pane, only its program ending or a cancel can.
-fn pane_busy(running: uuid::Uuid, state: &str) -> shux_rpc::RpcError {
-    let (message, hint) = if state == "running" {
-        (
+/// The pane is held by `running`, whose result or progress is `holder`. The
+/// remedy depends on whether its end can be waited for: an OSC 133 command's
+/// can, by `as_of`; a marker command that timed out has nothing to wait on.
+fn pane_busy(running: uuid::Uuid, holder: Option<&shux_pty::CommandResult>) -> shux_rpc::RpcError {
+    let state = holder.map_or("running", |h| h.state.as_str());
+    let as_of = holder.and_then(|h| h.as_of);
+    let (message, hint) = match (state, as_of) {
+        ("running", _) => (
             format!("the pane is still running command {running}"),
-            "wait for it (pane.command_status) or cancel it (pane.command_cancel), then retry",
-        )
-    } else {
-        (
+            format!("wait for it to finish (pane command-status {running}), then retry"),
+        ),
+        (_, Some(as_of)) => (
             format!(
-                "the pane is still held by command {running} ({state}): its program may still be running; cancel it (pane.command_cancel) to take the pane back"
+                "the pane is still held by command {running} ({state}): its program is still running"
             ),
-            "cancel it (pane.command_cancel) to stop its program, then retry",
-        )
+            format!(
+                "wait for its end (pane wait-command <PANE> --after {as_of} --output), then retry; pane command-cancel {running} interrupts it"
+            ),
+        ),
+        _ => (
+            format!(
+                "the pane is still held by command {running} ({state}): its program may still be running"
+            ),
+            format!("cancel it (pane command-cancel {running}) to stop its program, then retry"),
+        ),
     };
     shux_rpc::RpcError::with_message_and_data(
         shux_rpc::ErrorCode::ResourceExhausted,
         message,
         serde_json::json!({
             "resource": "pane command",
+            "reason": "pane_held",
             "running_command_id": running.to_string(),
             "running_command_state": state,
+            "as_of": as_of,
             "hint": hint,
         }),
     )
@@ -1860,6 +1965,147 @@ fn pane_input_full(timeout: Duration) -> shux_rpc::RpcError {
         shux_rpc::ErrorCode::ResourceExhausted,
         format!("the pane took no input for {}s", timeout.as_secs()),
         serde_json::json!({ "resource": "pane input", "timeout_secs": timeout.as_secs() }),
+    )
+}
+
+/// `from_pane` is the caller's own pane (`$SHUX_PANE_ID`): typing into it
+/// would type into the caller.
+fn refuse_own_pane(
+    params: &serde_json::Value,
+    pane_id: shux_core::model::PaneId,
+) -> Result<(), shux_rpc::RpcError> {
+    if params.get("from_pane").and_then(|v| v.as_str()) != Some(pane_id.to_string().as_str()) {
+        return Ok(());
+    }
+    Err(shux_rpc::RpcError::with_data(
+        shux_rpc::ErrorCode::InvalidParams,
+        serde_json::json!({
+            "detail": "the target is the pane this command runs in: pass -p with another pane",
+            "reason": "own_pane",
+            "pane_id": pane_id.to_string(),
+        }),
+    ))
+}
+
+fn parse_boundaries(
+    params: &serde_json::Value,
+) -> Result<crate::run_framing::Wanted, shux_rpc::RpcError> {
+    use crate::run_framing::Wanted;
+    match params.get("boundaries") {
+        None | Some(serde_json::Value::Null) => Ok(Wanted::Auto),
+        Some(v) => match v.as_str() {
+            Some("auto") => Ok(Wanted::Auto),
+            Some("osc133") => Ok(Wanted::Osc133),
+            Some("markers") => Ok(Wanted::Markers),
+            _ => Err(shux_rpc::RpcError::invalid_params(
+                "boundaries must be \"auto\", \"osc133\" or \"markers\"",
+            )),
+        },
+    }
+}
+
+/// The typed line is keystrokes: a control byte in it would act as a key
+/// (Tab completes, ESC and C-c edit or interrupt), so none is accepted. A
+/// newline is accepted in the command only, and makes it several lines.
+fn check_typed_line(command: &str, args: &[String]) -> Result<bool, shux_rpc::RpcError> {
+    if command.trim().is_empty() {
+        return Err(shux_rpc::RpcError::invalid_params("command is empty"));
+    }
+    let fields = std::iter::once(("command".to_string(), command)).chain(
+        args.iter()
+            .enumerate()
+            .map(|(i, a)| (format!("args[{i}]"), a.as_str())),
+    );
+    let mut multiline = false;
+    for (field, text) in fields {
+        for (offset, ch) in text.char_indices() {
+            if ch == '\n' && field == "command" {
+                multiline = true;
+                continue;
+            }
+            if ch.is_control() {
+                let char = format!("U+{:04X}", ch as u32);
+                return Err(shux_rpc::RpcError::with_data(
+                    shux_rpc::ErrorCode::InvalidParams,
+                    serde_json::json!({
+                        "detail": format!("{field} holds control character {char} at byte {offset}: typed, it would act as a key"),
+                        "field": field,
+                        "offset": offset,
+                        "char": char,
+                    }),
+                ));
+            }
+        }
+    }
+    Ok(multiline)
+}
+
+/// Nothing was typed: what reads the pane's input instead, and what to do.
+fn pane_refusal(
+    refusal: crate::run_framing::Refusal,
+    front: &crate::run_framing::Front,
+    timeout: Duration,
+) -> shux_rpc::RpcError {
+    use crate::run_framing::Refusal;
+    let integrated = front.shell != shux_vt::ShellState::Unknown;
+    let wait_hint = if integrated {
+        "wait for it to end (pane wait-command), cancel it (send-keys C-c), or pass boundaries \"markers\" to type into whatever holds the pane"
+    } else {
+        "wait for it to end (pane wait-for, pane wait-exit), cancel it (send-keys C-c), or pass boundaries \"markers\" to type into whatever holds the pane"
+    };
+    let (what, hint) = match refusal {
+        Refusal::HiddenInput => (
+            "the pane reads hidden input, as a password prompt does".to_string(),
+            "answer it with send-keys, or cancel it (send-keys C-c)",
+        ),
+        Refusal::OtherProgram => (
+            "another program is in the pane's foreground".into(),
+            wait_hint,
+        ),
+        Refusal::FullScreen => ("a full-screen program holds the pane".into(), wait_hint),
+        Refusal::CommandRunning => (
+            "the shell reports a command running".into(),
+            "wait for it to end (pane wait-command); if the shell was replaced (exec) or a nested shell without the integration runs, pass boundaries \"markers\"",
+        ),
+        Refusal::InputPending => (
+            "a line already sent to the pane has not started yet".into(),
+            "wait for it to start and end (pane wait-command), then retry",
+        ),
+        Refusal::InputPresent => (
+            "keys were sent to the prompt that submitted nothing, so its line editor may hold text"
+                .into(),
+            "clear the prompt (send-keys C-c draws a fresh one), then retry",
+        ),
+        Refusal::PromptNotReady => (
+            "the shell is at its prompt mark but no line editor is reading yet (a prompt hook, or a line it accepted, is still running)".into(),
+            "wait for it, then retry; a line it accepted runs as its own command (pane wait-command)",
+        ),
+        Refusal::NotAShell => (
+            "the pane's program is not a shell, and it reports no prompt".into(),
+            "pass boundaries \"markers\" to type into it anyway",
+        ),
+        Refusal::NoPrompt if integrated => (
+            format!("the shell drew no prompt within {}s", timeout.as_secs()),
+            "check the pane (pane capture)",
+        ),
+        Refusal::NoPrompt => (
+            format!("the shell reported no prompt within {}s", timeout.as_secs()),
+            "source `shux shell-integration bash|zsh` in its rc file, or pass boundaries \"markers\"",
+        ),
+    };
+    shux_rpc::RpcError::with_message_and_data(
+        shux_rpc::ErrorCode::ResourceExhausted,
+        format!("{what}, so nothing was typed ({})", refusal.reason()),
+        serde_json::json!({
+            "resource": "pane shell",
+            "reason": refusal.reason(),
+            "shell_state": front.shell.as_str(),
+            "foreground": front.program.map(|p| if p.leader { "pane_program" } else { "other_program" }),
+            "foreground_pgid": front.program.map(|p| p.group),
+            "hidden_input": front.program.map(|p| p.hidden_input),
+            "full_screen": front.full_screen,
+            "hint": hint,
+        }),
     )
 }
 

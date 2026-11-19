@@ -798,6 +798,38 @@ pub enum WindowCommand {
     },
 }
 
+/// `pane run --boundaries`: how the command's start and end are found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RunBoundaries {
+    Auto,
+    Osc133,
+    Markers,
+}
+
+impl RunBoundaries {
+    /// The RPC's `boundaries` value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RunBoundaries::Auto => "auto",
+            RunBoundaries::Osc133 => "osc133",
+            RunBoundaries::Markers => "markers",
+        }
+    }
+}
+
+/// `pane run --timeout`: a bare number is seconds, as it always was; a
+/// duration must come to whole seconds.
+pub fn parse_run_timeout_secs(s: &str) -> Result<u64, String> {
+    if let Ok(secs) = s.trim().parse::<u64>() {
+        return Ok(secs);
+    }
+    let ms = parse_duration_ms(s)?;
+    if ms % 1000 != 0 {
+        return Err(format!("timeout {s:?} is not whole seconds"));
+    }
+    Ok(ms / 1000)
+}
+
 /// Parse a human duration into whole milliseconds (PRD §2.2: the CLI accepts
 /// human durations and normalizes to ms for the RPC). Accepts a bare integer
 /// (= milliseconds) or an integer with a `ms`/`s`/`m`/`h` suffix. A parse
@@ -1181,6 +1213,36 @@ pub enum PaneCommand {
     /// Run a command in a pane's shell; print its exit code and exactly what it
     /// wrote (stdout and stderr as the terminal received them, ANSI-stripped,
     /// first 1 MiB)
+    ///
+    /// A shell that reports its boundaries (OSC 133: see `shux
+    /// shell-integration`) gets the command typed as written, so the pane
+    /// shows only the command and its output. A shell that does not gets it
+    /// framed by markers it prints. `boundaries` in the result says which.
+    ///
+    /// A line goes only to a shell's empty prompt. Anything else is refused,
+    /// and `error.data.reason` names it: `command_running`, `input_pending`
+    /// (a line already sent has not started), `input_present` (keys sent to
+    /// the prompt submitted nothing), `other_program`, `hidden_input` (a
+    /// password prompt), `full_screen`, `not_a_shell`, `no_prompt`.
+    /// `--boundaries markers` types anyway.
+    ///
+    /// `state` in the result: `completed` (read `exit_code`; `ended_by`
+    /// `prompt` or `next_command` means the shell drew a prompt or started
+    /// another command without reporting this one's end, so the exit code is
+    /// unknown), `not_run` (the shell drew its next prompt without starting
+    /// the line; `stdout` is what it replied: plain bash and zsh on a syntax
+    /// error or a comment, where ble.sh instead runs it and reports 2),
+    /// `timed_out` (`phase: awaiting_start` if the line never started;
+    /// `hidden_input: true` if the terminal was reading with echo off, as a
+    /// password prompt does), `cancelled`, `pane_gone`, `overrun`. After
+    /// `timed_out` the pane stays held until the command ends or is
+    /// cancelled; with `boundaries: osc133`, `pane wait-command --after
+    /// <as_of> --output` waits on for its end.
+    ///
+    /// Exit 0 the command ended (whatever its own code: read `exit_code`),
+    /// 1 timeout, 2 bad arguments or no such pane or session, 3 anything
+    /// else: refused, not run, cancelled, the pane went away, or the daemon
+    /// did. With `--async`, 0 once it is typed.
     Run {
         /// Session name or id (full UUID, or the short form `session list` prints)
         #[arg(short, long)]
@@ -1213,13 +1275,42 @@ pub enum PaneCommand {
         #[arg(short, long)]
         command: String,
 
-        /// Timeout in seconds (default: 30)
-        #[arg(long, default_value = "30")]
+        /// Timeout: whole seconds (`60`), or a duration in whole seconds
+        /// (`60s`, `2m`, `1h`); at most 1h. Default 30s.
+        #[arg(long, default_value = "30", value_parser = parse_run_timeout_secs)]
         timeout: u64,
 
         /// Run asynchronously (return command ID immediately)
         #[arg(long = "async")]
         is_async: bool,
+
+        /// How the command's start and end are found. `auto`: the shell's own
+        /// OSC 133 marks when it has reported any, else markers. `osc133`:
+        /// only the shell's marks; waits up to `--timeout` for a prompt, and
+        /// refuses a shell that reports none. `markers`: frame the line with
+        /// printed markers and type it whatever holds the pane.
+        #[arg(long, value_enum, default_value_t = RunBoundaries::Auto)]
+        boundaries: RunBoundaries,
+    },
+
+    /// A `pane run --async` command's result, or while it runs its `phase`
+    /// (`awaiting_start`, `executing`, `awaiting_input`). Mirrors
+    /// `pane.command_status`. Exit 0 found, 2 no such command.
+    #[command(name = "command-status")]
+    CommandStatus {
+        /// The `command_id` `pane run` returned.
+        #[arg(value_name = "COMMAND_ID")]
+        command_id: String,
+    },
+
+    /// Interrupt the command holding its pane (it is sent C-c) and free the
+    /// pane; an ended command reports its state and is sent nothing. Mirrors
+    /// `pane.command_cancel`. Exit 0 done, 2 no such command.
+    #[command(name = "command-cancel")]
+    CommandCancel {
+        /// The `command_id` `pane run` returned.
+        #[arg(value_name = "COMMAND_ID")]
+        command_id: String,
     },
 
     /// Capture the current text content of a pane
@@ -1413,7 +1504,8 @@ pub enum PaneCommand {
         #[arg(long, value_name = "AS_OF", requires = "id")]
         after: Option<u64>,
 
-        /// Deadline. Human duration (`30s`, `500ms`); at most 600s.
+        /// Deadline. Human duration (`30s`, `10m`); at most 1h, and a
+        /// longer one is refused.
         #[arg(long, default_value = "30s", value_parser = parse_duration_ms)]
         timeout: u64,
     },
@@ -1430,6 +1522,13 @@ pub enum PaneCommand {
     /// started after it is the one waited for. To wait for the next one, pass
     /// the returned `started`.
     ///
+    /// With `--output`, the result also carries `stdout`: what the command
+    /// wrote between its start and its end (stdout and stderr as the terminal
+    /// received them, ANSI-stripped, first 1 MiB, `truncated` past it),
+    /// however long it is or however its lines wrapped; `pane run` names it
+    /// the same. The last few MiB of output are kept, so a command whose
+    /// output has been let go returns `stdout: null, evicted: true`.
+    ///
     /// The boundaries travel in the pane's own output, so output that prints
     /// an OSC 133 sequence is read as one: trust `exit_code` as far as you
     /// trust what the pane prints.
@@ -1444,9 +1543,14 @@ pub enum PaneCommand {
         #[arg(long, value_name = "AS_OF")]
         after: Option<u64>,
 
-        /// Deadline. Human duration (`30s`, `500ms`); at most 600s.
+        /// Deadline. Human duration (`30s`, `10m`); at most 1h, and a
+        /// longer one is refused.
         #[arg(long, default_value = "30s", value_parser = parse_duration_ms)]
         timeout: u64,
+
+        /// Also return what the command wrote, as `stdout`.
+        #[arg(long)]
+        output: bool,
     },
 
     /// Block until a pane's program exits, and report how: its exit code, or
@@ -1541,6 +1645,14 @@ pub enum PaneCommand {
     /// in a multi-pane window. For multi-pane templates, pass an
     /// explicit `--pane <UUID>` (from `pane list` or `state.apply`'s
     /// spawn_results) so the wait targets the right pane.
+    ///
+    /// The needle is matched against the screen, so text you typed matches
+    /// too, echoed back: wait on what a command prints, spelled so its own
+    /// command line cannot contain it (`echo ok-$((6*7))`, wait for `ok-42`).
+    /// For a typed command's end and exit code, `pane wait-command` needs no
+    /// needle at all.
+    ///
+    /// Exit 0 matched, 1 timeout, 2 bad arguments or no such pane.
     #[command(name = "wait-for")]
     WaitFor {
         /// Session id-or-name. Combined with --window / --pane to
@@ -1571,10 +1683,12 @@ pub enum PaneCommand {
         /// How many recent lines to capture each poll. Default 200.
         #[arg(long, default_value_t = 200)]
         lines: u64,
-        /// Total timeout in milliseconds. Default 10000, max 60000.
+        /// Total timeout in milliseconds. Default 10000, at most 3600000 (1h);
+        /// a larger value is refused.
         #[arg(long, default_value_t = 10_000)]
         timeout_ms: u64,
-        /// Poll interval in milliseconds. Default 100, range 20..=1000.
+        /// Poll interval in milliseconds. Default 100, from 20 to 1000; a
+        /// value outside is refused.
         #[arg(long, default_value_t = 100)]
         poll_ms: u64,
     },
@@ -1863,6 +1977,16 @@ impl Cli {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_run_timeout_is_seconds_or_a_duration_in_whole_seconds() {
+        assert_eq!(super::parse_run_timeout_secs("60"), Ok(60));
+        assert_eq!(super::parse_run_timeout_secs("60s"), Ok(60));
+        assert_eq!(super::parse_run_timeout_secs("2m"), Ok(120));
+        assert_eq!(super::parse_run_timeout_secs("1h"), Ok(3600));
+        assert!(super::parse_run_timeout_secs("1500ms").is_err());
+        assert!(super::parse_run_timeout_secs("soon").is_err());
+    }
+
     use super::*;
 
     #[test]
