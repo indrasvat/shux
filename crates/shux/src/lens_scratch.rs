@@ -3918,7 +3918,7 @@ mod production_route_tests {
     /// is held at its fired deadline until the workload is confirmed live,
     /// so no step races the deadline.
     #[tokio::test]
-    async fn reap_sends_sigterm_then_sigkill_and_removes_row_only_after_death() {
+    async fn production_max_runtime_reap_holds_its_row_until_the_group_is_dead() {
         let harness = RpcHarness::new();
         let dir = tempfile::tempdir().expect("tempdir");
         let tag = format!("shuxlensreap{}", PaneId::new().to_string().replace('-', ""));
