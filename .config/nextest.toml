@@ -32,7 +32,8 @@ slow-timeout = { period = "30s", terminate-after = 4 }
 
 # A test that leaves a child holding its stdout or stderr has leaked a process.
 # The default reports it and passes; here it fails as LEAK-FAIL, which is the
-# process-hygiene rule (CLAUDE.md) enforced by the runner itself.
+# process-hygiene rule (CLAUDE.md) enforced by the runner itself, on Linux
+# (macOS only reports it: see the override at the end).
 leak-timeout = { period = "500ms", result = "fail" }
 
 [test-groups]
@@ -200,6 +201,13 @@ slow-timeout = { period = "60s", terminate-after = 8 }
 [[profile.default.overrides]]
 filter = 'binary_id(=shux::pane_command_e2e) & test(=a_session_full_of_large_argvs_or_cwds_stays_listable)'
 slow-timeout = { period = "60s", terminate-after = 8 }
+
+# macOS has no pipe2: a test's pipes go close-on-exec a step after they open,
+# so a sibling spawned between leaks them, and tests that spawn nothing read
+# as leaky (2 of 6 full runs). Linux's pipe2 is atomic, so it fails there.
+[[profile.default.overrides]]
+platform = 'cfg(target_os = "macos")'
+leak-timeout = { period = "500ms", result = "pass" }
 
 # ── CI profile ────────────────────────────────────────────────────────────
 # Same scheduling as local; only the reporting differs. Keeping the groups
