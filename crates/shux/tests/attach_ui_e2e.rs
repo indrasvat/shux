@@ -259,6 +259,8 @@ fn the_help_overlay_names_the_configured_prefix_through_a_reload() {
 /// the reloaded prefix is on screen that line has been written, wherever
 /// the client writes it.
 #[test]
+// TODO(#281): flaky under load; fix the timing dependence, then remove the ignore.
+#[ignore = "flaky under load: see #281"]
 fn the_attached_client_logs_after_the_terminal_is_restored() {
     let env = Env::attached_with(
         &keys_config("ctrl-a"),

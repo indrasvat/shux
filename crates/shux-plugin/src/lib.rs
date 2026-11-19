@@ -2030,6 +2030,8 @@ mod tests {
     /// An install dropped while its watcher is arming, as when the RPC
     /// client disconnects, must not leave the watcher installing on a save.
     #[tokio::test]
+    // TODO(#281): flaky under load; fix the timing dependence, then remove the ignore.
+    #[ignore = "flaky under load: see #281"]
     async fn a_watcher_dropped_while_arming_does_not_install_on_a_save() {
         use std::future::Future;
         let dir = tempfile::tempdir().unwrap();

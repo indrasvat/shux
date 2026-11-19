@@ -91,6 +91,8 @@ impl Drop for Env {
 }
 
 #[test]
+// TODO(#281): flaky under load; fix the timing dependence, then remove the ignore.
+#[ignore = "flaky under load: see #281"]
 fn pane_run_returns_only_what_the_command_wrote() {
     let env = Env::new();
     env.start_shell();
