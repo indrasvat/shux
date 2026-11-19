@@ -29,7 +29,10 @@ use crate::style;
 // reads them directly because we discard the typed Config after
 // validation. Suppress the dead-field warnings rather than #[allow]ing
 // each one.
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "the strict schema is only deserialized into, never read"
+)]
 mod strict {
     use serde::Deserialize;
     use std::collections::HashMap;

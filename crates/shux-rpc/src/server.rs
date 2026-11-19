@@ -406,7 +406,6 @@ impl PeerDeathMonitor {
 ///   any still-queued frames are discarded (the accepted fire-and-forget
 ///   delta: a DEAD client's unprocessed requests are dropped; a half-closed
 ///   client's requests are all answered).
-#[allow(clippy::too_many_arguments)]
 async fn serve_connection<R, W>(
     read_half: R,
     write_half: W,
@@ -1035,7 +1034,6 @@ mod tests {
     /// Router with a `test.hang` method that signals entry, then pends
     /// forever holding a HangGuard. Returns (router, entered, dropped,
     /// dropped_notify).
-    #[allow(clippy::type_complexity)]
     fn hang_router() -> (
         Router,
         Arc<tokio::sync::Notify>,

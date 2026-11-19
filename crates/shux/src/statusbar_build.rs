@@ -35,7 +35,6 @@ pub struct StatusBarCtx<'a> {
     /// `last_action`; we keep the field so future per-pane signals
     /// (zoom indicator from the pane vs. window, dirty indicator) have
     /// a place to land without another signature churn.
-    #[allow(dead_code)] // reserved for future per-pane signals (see field doc)
     pub active_pane_id: PaneId,
     pub session_meta: &'a SessionMeta,
     pub onboarding: &'a OnboardingState,

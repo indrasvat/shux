@@ -540,7 +540,13 @@ fn ct_button(b: CtMouseButton) -> MouseButton {
 /// Only fires for unmodified keys. Prefix + Ctrl+C must NOT trigger
 /// `c → NewWindow` — the user is trying to send a literal SIGINT to
 /// whatever was running before they hit prefix.
-#[allow(dead_code)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the prefix table, read only by tests now that the live keymap replaced it"
+    )
+)]
 fn key_to_prefix_action(key: KeyEvent) -> Option<ActionKind> {
     if key.modifiers != KeyModifiers::NONE && key.modifiers != KeyModifiers::SHIFT {
         return None;
@@ -584,7 +590,13 @@ fn key_to_prefix_action(key: KeyEvent) -> Option<ActionKind> {
 /// - Alt+1..9: switch directly to the Nth window (1-indexed)
 ///
 /// Closes the gap that demoted task 018 to Partial.
-#[allow(dead_code)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the bare-key table, read only by tests now that the live keymap replaced it"
+    )
+)]
 fn key_to_bare_action(key: KeyEvent) -> Option<(ActionKind, ActionArgs)> {
     if !key.modifiers.contains(KeyModifiers::ALT) {
         return None;

@@ -152,7 +152,7 @@ pub fn run_daemon(socket_override: Option<PathBuf>) -> anyhow::Result<()> {
 /// A process's argv. Exactly one variant is built per platform, so the other is
 /// genuinely dead there -- hence the type-level allow under `-Dwarnings`.
 #[derive(Debug)]
-#[allow(dead_code)]
+#[expect(dead_code, reason = "each variant is built on one platform only")]
 enum ProcessArgv {
     /// From `/proc`: boundaries are real, and the cwd a relative `--socket`
     /// resolves against is known. Linux only.

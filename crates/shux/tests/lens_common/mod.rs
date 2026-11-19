@@ -14,7 +14,10 @@
 //! and wait for a fixture sentinel. Fixtures are referenced by explicit
 //! repo-relative path (`sh .shux/fixtures/lens/fN.sh`).
 
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "shared by many test binaries, each using a subset"
+)]
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};

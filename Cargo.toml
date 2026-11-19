@@ -24,6 +24,21 @@ license = "MIT"
 repository = "https://github.com/indrasvat/shux"
 authors = ["indrasvat"]
 
+# One lint policy for every crate (each opts in with `[lints] workspace = true`).
+# Every waiver is an `#[expect(lint, reason = "...")]`: an `expect` fails once
+# the lint it waives stops firing, so a waiver cannot outlive its reason.
+[workspace.lints.rust]
+# cargo-fuzz builds with `--cfg fuzzing` for the targets in fuzz/.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
+
+[workspace.lints.clippy]
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+items_after_test_module = "deny"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+
 [workspace.dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }

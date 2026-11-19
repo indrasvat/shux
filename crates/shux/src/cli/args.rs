@@ -175,7 +175,10 @@ pub enum Command {
 
     /// Internal: start the daemon (used by auto-start, not for users)
     #[command(name = "__daemon", hide = true)]
-    #[allow(non_camel_case_types)]
+    #[expect(
+        non_camel_case_types,
+        reason = "the hidden subcommand's name is its argv spelling"
+    )]
     __daemon,
 }
 
@@ -1712,7 +1715,10 @@ above are pane primitives under `shux pane \u{2026}`, not `shux lens \u{2026}`."
 #[command(after_help = LENS_LOOP_RECIPE)]
 // A CLI arg enum parsed once per invocation, not stored hot — the `Gate` variant's rich
 // 082 flag set makes it larger than `Run`, but boxing clap-derived fields buys nothing.
-#[allow(clippy::large_enum_variant)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "clap-derived and parsed once; boxing fields buys nothing"
+)]
 pub enum LensCommand {
     /// Spawn `argv` directly (no shell, ever) in a hidden, quota-bounded
     /// scratch session. Mirrors `lens.run` RPC (lens PRD §8,

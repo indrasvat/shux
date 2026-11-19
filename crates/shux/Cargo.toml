@@ -59,6 +59,5 @@ base64 = "0.22"
 tokio = { workspace = true, features = ["test-util"] }
 proptest = "1"
 
-[lints.rust]
-# cargo-fuzz builds with `--cfg fuzzing`; fuzz/ drives the recording registry through it.
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
+[lints]
+workspace = true

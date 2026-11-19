@@ -655,25 +655,21 @@ fn a_control_byte_in_args_is_refused_and_leaves_the_pane_usable() {
 /// `shux-tui-qa` gate for task 095 found exactly such a disagreement that the
 /// entire unit suite was blind to.
 ///
-/// Ignored until #144 lands. shux-vt gives an emoji-presentation sequence
-/// (`⚠️` = U+26A0 U+FE0F) ONE cell while `UnicodeWidthStr` — and xterm, iTerm2
-/// and wezterm — give it two, so a title carrying one shifts its row a column
-/// left and the right border lands short. The fix belongs in shux-vt's cell
-/// allocation, not in this listing's padding: matching `style.rs` to shux-vt
-/// would square the frame inside a shux pane and break it in every other
-/// terminal. Un-ignore when #144 is fixed.
+/// Titled with wide CJK, whose width shux-vt, `UnicodeWidthStr` and real
+/// terminals agree on. An emoji-presentation sequence (`⚠️`) is no test of
+/// this: terminals disagree on its width (alacritty and shux-vt give 1 cell,
+/// xterm and iTerm2 give 2), so no frame is square in all of them (#144).
 #[test]
-#[ignore = "blocked on #144: shux-vt allocates 1 cell for VS16 emoji, real terminals allocate 2"]
 fn the_box_frame_is_square_on_the_rendered_grid() {
     let mut env = Env::new();
     let s = "t135f";
     // `shell_session` returns the live shell's PANE id — it lists itself below.
     let target = env.shell_session(s);
 
-    // Title it with an emoji-presentation sequence. The header and border rows
-    // are the control: they are pure ASCII, so a row that disagrees with them
+    // Title it with wide characters. The header and border rows are the
+    // control: they are pure ASCII, so a row that disagrees with them
     // disagrees because of its title.
-    env.ok(&["pane", "title", "-s", s, "-p", &target, "-t", "⚠️ build"]);
+    env.ok(&["pane", "title", "-s", s, "-p", &target, "-t", "漢字 build"]);
 
     env.ok(&[
         "pane", "set-size", "-s", s, "-p", &target, "--cols", "100", "--rows", "20",

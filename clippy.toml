@@ -16,7 +16,8 @@ disallowed-methods = [
     { path = "tokio::time::sleep_until", reason = "wait for a condition with shux_testkit, not for time (docs/testing.md)" },
     { path = "std::thread::sleep_ms", reason = "wait for a condition with shux_testkit, not for time (docs/testing.md)" },
     { path = "nix::unistd::sleep", reason = "wait for a condition with shux_testkit, not for time (docs/testing.md)" },
-    { path = "nix::time::clock_nanosleep", reason = "wait for a condition with shux_testkit, not for time (docs/testing.md)" },
+    # Reachable only where nix is built with its `time` feature.
+    { path = "nix::time::clock_nanosleep", reason = "wait for a condition with shux_testkit, not for time (docs/testing.md)", allow-invalid = true },
     { path = "libc::sleep", reason = "wait for a condition with shux_testkit, not for time (docs/testing.md)" },
     { path = "libc::usleep", reason = "wait for a condition with shux_testkit, not for time (docs/testing.md)" },
     { path = "libc::nanosleep", reason = "wait for a condition with shux_testkit, not for time (docs/testing.md)" },

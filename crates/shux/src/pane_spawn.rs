@@ -822,7 +822,10 @@ pub(crate) fn resolve_pane_spawn(
 /// `shux_pty::PtyError` (rather than an `RpcError`) so callers can map it
 /// to their own error code — `lens.run` needs `SPAWN_FAILED (-32014)`,
 /// every other caller keeps mapping to `internal()`.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is an independent input; a struct would only move the list"
+)]
 pub(crate) async fn spawn_pane_pty(
     pane_id: shux_core::model::PaneId,
     cwd: PathBuf,
@@ -1034,7 +1037,10 @@ pub(crate) async fn undo_window_create(graph: &shux_core::graph::GraphHandle, cr
 /// Like [`spawn_pane_pty`] but arms `cast_recorder` (a pre-opened recorder) BEFORE the read loop
 /// starts, so the recording captures the child's very first bytes — alt-screen setup, initial
 /// geometry, early output — with no post-spawn race (task 083 cast; council: arm at spawn).
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is an independent input; a struct would only move the list"
+)]
 pub(crate) async fn spawn_pane_pty_with_recorder(
     pane_id: shux_core::model::PaneId,
     cwd: PathBuf,
@@ -1145,7 +1151,10 @@ impl Drop for SpawnTicket {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is an independent input; a struct would only move the list"
+)]
 async fn spawn_pane_pty_unshared(
     pane_id: shux_core::model::PaneId,
     cwd: PathBuf,

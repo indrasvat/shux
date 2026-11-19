@@ -106,7 +106,7 @@ struct EventBusInner {
     data_seq: Mutex<u64>,
 
     /// Configuration (kept for introspection).
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "kept for introspection")]
     config: EventBusConfig,
 }
 
@@ -141,7 +141,7 @@ impl EventHistory {
     }
 
     /// Get the newest sequence number in the history.
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "history introspection, read by tests")]
     fn newest_seq(&self) -> Option<u64> {
         self.buffer.back().map(|e| e.meta.seq)
     }

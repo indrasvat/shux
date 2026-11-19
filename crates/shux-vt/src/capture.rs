@@ -662,7 +662,10 @@ impl FrameEnvelope {
     /// `scrollback_len() == 0` path applies. Masks are applied here — before any
     /// serialize/hash/compare (council D4) — so a secret never enters the emitted
     /// `cells`.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each argument is an independent input; a struct would only move the list"
+    )]
     pub fn from_snapshot(
         grid: &Grid,
         cursor_row: u16,
