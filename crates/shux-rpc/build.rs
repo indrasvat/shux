@@ -17,8 +17,9 @@ fn main() {
 
     println!("cargo:rustc-env=SHUX_GIT_SHA={sha}");
 
-    // Re-run when HEAD moves: HEAD itself, the one ref it names, and
-    // packed-refs. Asked of git, not spelled `../../.git/HEAD`: in a worktree
+    // Re-run when HEAD moves: HEAD itself, the one ref it names, packed-refs,
+    // and this worktree's HEAD reflog, which a commit appends to even when the
+    // branch ref only becomes a loose file in that commit. Asked of git, not spelled `../../.git/HEAD`: in a worktree
     // `.git` is a file, and a path that never exists reruns this script (and
     // rebuilds every dependent crate) on every build. Not all of `refs/`,
     // which every worktree's commits touch.
@@ -28,7 +29,7 @@ fn main() {
     if let Some(branch) = branch.as_deref().map(str::trim) {
         args.extend(["--git-path", branch]);
     }
-    args.extend(["--git-path", "packed-refs"]);
+    args.extend(["--git-path", "packed-refs", "--git-path", "logs/HEAD"]);
     for path in git(&args).iter().flat_map(|p| p.lines()) {
         if std::path::Path::new(path).exists() {
             println!("cargo:rerun-if-changed={path}");

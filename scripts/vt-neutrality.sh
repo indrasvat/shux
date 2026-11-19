@@ -51,7 +51,7 @@ done
 # A dirty tree is built and measured, but the report says so and the VT QA guard refuses it.
 dirty=false
 # Every input of the measurement, not only the code under test.
-inputs=(crates Cargo.toml Cargo.lock rust-toolchain.toml fuzz .shux/goldens .shux/fixtures
+inputs=(crates Cargo.toml Cargo.lock rust-toolchain.toml .cargo fuzz .shux/goldens .shux/fixtures
     .shux/scripts/lib .claude/automations/pixel_verify.py scripts/vt-neutrality.sh scripts/fuzz.sh)
 # fuzz/Cargo.lock lags each release's version bump, and the fuzz layer rewrites it.
 [[ -z "$(git status --porcelain -- "${inputs[@]}" ':(exclude)fuzz/Cargo.lock')" ]] || dirty=true
@@ -89,10 +89,14 @@ trap cleanup EXIT
 # Artifacts are read from target/release, so nothing may move them elsewhere.
 unset CARGO_BUILD_TARGET
 step "build HEAD (${head:0:10}) release shux + corpus harness"
-CARGO_TARGET_DIR="$repo_root/target" cargo build --release --locked -p shux --bin shux
-CARGO_TARGET_DIR="$repo_root/target" cargo build --release --locked -p shux-raster --example vt_corpus_harness
-head_bin="$repo_root/target/release/shux"
-head_harness="$repo_root/target/release/examples/vt_corpus_harness"
+# The executable path cargo reports, wherever a config puts its artifacts.
+built() {
+    cargo build --release --locked --message-format=json-render-diagnostics "$@" |
+        jq -r 'select(.reason == "compiler-artifact" and .executable != null) | .executable' | tail -1
+}
+head_bin="$(CARGO_TARGET_DIR="$repo_root/target" built -p shux --bin shux)"
+head_harness="$(CARGO_TARGET_DIR="$repo_root/target" built -p shux-raster --example vt_corpus_harness)"
+[[ -x "$head_bin" && -x "$head_harness" ]] || { echo "✗ cargo reported no HEAD executables" >&2; exit 1; }
 
 mkdir -p "$cache_root"
 probe="$(mktemp -d "${TMPDIR:-/tmp}/shux-neutral-tc.XXXXXX")"
@@ -118,15 +122,13 @@ else
     git worktree remove --force "$cache_root/src" >/dev/null 2>&1 || true  # leftover from a killed run, if any
     rm -rf "$cache_root/src"
     git worktree add --detach --force "$cache_root/src" "$base" >/dev/null
-    (
-        cd "$cache_root/src"
-        CARGO_TARGET_DIR="$cache_root/target" cargo build --release --locked -p shux --bin shux
-        CARGO_TARGET_DIR="$cache_root/target" cargo build --release --locked -p shux-raster --example vt_corpus_harness
-    )
+    built_base_bin="$(cd "$cache_root/src" && CARGO_TARGET_DIR="$cache_root/target" built -p shux --bin shux)"
+    built_base_harness="$(cd "$cache_root/src" &&
+        CARGO_TARGET_DIR="$cache_root/target" built -p shux-raster --example vt_corpus_harness)"
     rm -rf "$bin_dir.tmp"
     mkdir -p "$bin_dir.tmp"
-    cp "$cache_root/target/release/shux" "$bin_dir.tmp/shux"
-    cp "$cache_root/target/release/examples/vt_corpus_harness" "$bin_dir.tmp/vt_corpus_harness"
+    cp "$built_base_bin" "$bin_dir.tmp/shux"
+    cp "$built_base_harness" "$bin_dir.tmp/vt_corpus_harness"
     printf '%s\n%s\n' "$base" "$toolchain" >"$bin_dir.tmp/stamp"
     rm -rf "$bin_dir"
     mv "$bin_dir.tmp" "$bin_dir"
@@ -145,6 +147,8 @@ compare() {
         --diff "$out_rel/metrics/${layer}-${case}-diff.png" \
         --max-pixel-diff-ratio 0 --max-mean-channel-delta 0 >"$metric"; then
         status=pass
+    elif jq -e '.reason == "actual_missing" or .reason == "expected_missing"' "$metric" >/dev/null 2>&1; then
+        status=error  # nothing was rendered to compare
     else
         status=fail
     fi

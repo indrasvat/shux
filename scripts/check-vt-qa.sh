@@ -474,7 +474,7 @@ unchanged_since() {
 
 # What `make vt-neutrality` measures with: the VT code, its corpus, and the tool.
 NEUTRALITY_INPUTS=("${VT_PATHS[@]}" .shux/fixtures/vt-corpus .shux/goldens/073-vt-corpus
-    scripts/vt-neutrality.sh .shux/scripts/lib)
+    scripts/vt-neutrality.sh .shux/scripts/lib Cargo.toml Cargo.lock rust-toolchain.toml .cargo)
 NEUTRALITY_LAYERS='["corpus-goldens","corpus-ab","live-ab","colour-probe","fuzz","leaks"]'
 
 # Council records must be issued for this diff, not carried over from an old scope.
@@ -509,7 +509,8 @@ check_neutrality() {
             and (.base | type == "string") and (.head | type == "string")
             and (.metrics | type == "number")
             and (.layers | type == "object")
-            and all($want[] as $l | .layers[$l]; . != null and .cases > 0)' "$report" >/dev/null 2>&1; then
+            and all($want[] as $l | .layers[$l]; . != null and (.cases | type == "number") and .cases > 0)
+            and all(.layers[]; .status == "pass" or .status == "moved" or .status == "error")' "$report" >/dev/null 2>&1; then
         add_error "$scope: $report is not a complete scripts/vt-neutrality.sh report (every layer, each with cases)"
         return
     fi
@@ -522,7 +523,7 @@ check_neutrality() {
             and .layers.fuzz.status == "pass" and .layers.leaks.status == "pass"' "$report" >/dev/null 2>&1; then
         add_error "$scope: $report has a layer that did not run cleanly (status error, or fuzz/leaks failed)"
     fi
-    if [[ "$tier" == trivial ]] && ! jq -e '.status == "pass"' "$report" >/dev/null 2>&1; then
+    if [[ "$tier" == trivial ]] && ! jq -e '.status == "pass" and all(.layers[]; .status == "pass")' "$report" >/dev/null 2>&1; then
         add_error "$scope: trivial tier requires make vt-neutrality to be 0/0 on every layer; $report is not"
     fi
     nbase="$(jq -r .base "$report")"
@@ -542,7 +543,9 @@ check_neutrality() {
         add_error "$scope: $count neutrality metrics are committed under $metrics_dir, but the report wrote $(jq -r .metrics "$report")"
     fi
     while IFS= read -r metric; do
-        jq -e 'has("status") and has("actual") and has("expected") and has("pixel_diff_ratio") and has("mean_rgba_channel_delta")' "$metric" >/dev/null 2>&1 ||
+        # A failed comparison (a size mismatch, say) carries no pixel statistics.
+        jq -e 'has("status") and has("actual") and has("expected")
+            and (.status != "pass" or (has("pixel_diff_ratio") and has("mean_rgba_channel_delta")))' "$metric" >/dev/null 2>&1 ||
             add_error "$scope: $metric does not look like .claude/automations/pixel_verify.py output"
     done < <(git ls-files -- "$metrics_dir/*.json")
 }

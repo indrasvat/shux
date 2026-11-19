@@ -104,7 +104,7 @@ and test logs out of your transcript: redirect to a file, and on failure capture
 `.shux/qa/<scope>/`:
 
 - `SOLID-QA.md`, first line `VERDICT: PASS`.
-- `neutrality.json` and `neutrality/*.json`, written by `make vt-neutrality SCOPE=<scope>`.
+- `neutrality.json` and `neutrality/*.json`, written by `make vt-neutrality BASE=<merge-base> SCOPE=<scope>`.
 - Pixel metrics from `.claude/automations/pixel_verify.py`, exact 0/0, for any
   A/B your attacks produced. A `*-actual.png` is required only when a metric
   compares against a baseline the repo tracks.

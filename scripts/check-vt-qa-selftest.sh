@@ -201,6 +201,12 @@ uncommitted_metric() { echo '{}' >"$q/neutrality/extra.json"; }
 failed_neutrality() {
     jq_stage neutrality.json '.status = "moved" | .layers["corpus-ab"].status = "moved"'
 }
+inconsistent_pass() { jq_stage neutrality.json '.layers["corpus-ab"].status = "moved"'; }
+size_mismatch_metric() {
+    echo '{"status":"fail","reason":"size_mismatch","actual":"a.png","expected":"b.png"}' >"$q/neutrality/corpus-ab-x.json"
+    git add "$q/neutrality/corpus-ab-x.json"
+    jq_stage neutrality.json '.status = "moved" | .layers["corpus-ab"].status = "moved"'
+}
 incomplete_neutrality() { jq_stage neutrality.json 'del(.layers.fuzz)'; }
 fuzz_error() {
     jq_stage neutrality.json '.status = "error" | .layers.fuzz.status = "error"'
@@ -264,6 +270,8 @@ gov 2 "neutrality older than the VT code" full stale_neutrality "neutrality head
 gov 2 "neutrality metric not committed" full uncommitted_metric "extra.json is not committed"
 gov 2 "trivial tier with a moved pixel" trivial failed_neutrality "trivial tier requires"
 gov 0 "full tier may carry an intended pixel change" full failed_neutrality
+gov 2 "trivial report saying pass over a moved layer" trivial inconsistent_pass "trivial tier requires"
+gov 0 "full tier may carry a size-mismatch metric" full size_mismatch_metric
 gov 2 "neutrality report missing a layer" full incomplete_neutrality "not a complete"
 gov 2 "full tier with a layer that did not run" full fuzz_error "did not run cleanly"
 gov 2 "a committed metric the report never wrote" full extra_metric "but the report wrote"
