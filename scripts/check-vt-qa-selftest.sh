@@ -148,12 +148,14 @@ gov() {
     echo "$metric_json" >"$repo/$q/pixel-a.json"
     echo "$metric_json" >"$repo/$q/neutrality/corpus-ab-x.json"
     jq -n --arg b "$GOV_BASE" --arg h "$audited" '{tool: "scripts/vt-neutrality.sh", base: $b, head: $h,
-        dirty: false, status: "pass", metrics_dir: "neutrality",
-        layers: {"corpus-ab": {status: "pass", cases: 1, failed: []}}}' >"$repo/$q/neutrality.json"
+        dirty: false, status: "pass", metrics_dir: "neutrality", metrics: 1,
+        layers: (["corpus-goldens", "corpus-ab", "live-ab", "colour-probe", "fuzz", "leaks"]
+            | map({key: ., value: {status: "pass", cases: 1, failed: []}}) | from_entries)}' >"$repo/$q/neutrality.json"
+    # A trivial manifest carries only what its tier requires.
     jq -n --arg t "$tier" --arg h "$audited" '{tier: $t, solid_qa_report: "SOLID-QA.md",
-        screenshots: [], pixel_metrics: ["pixel-a.json"], neutrality: "neutrality.json",
-        commit_under_audit: $h}
-        + (if $t == "full" then {dootsabha_design: "council-design.json",
+        neutrality: "neutrality.json", commit_under_audit: $h}
+        + (if $t == "full" then {screenshots: [], pixel_metrics: ["pixel-a.json"],
+            dootsabha_design: "council-design.json",
             dootsabha_implementation: "council-impl.json"} else {} end)' >"$repo/$q/evidence-manifest.json"
     git -C "$repo" add .shux
     git -C "$repo" commit -qm evidence
@@ -197,7 +199,27 @@ fake_neutrality() { echo '{}' >"$q/neutrality.json"; git add "$q/neutrality.json
 wrong_base() { jq_stage neutrality.json --arg h "$(git rev-parse HEAD~1)" '.base = $h'; }
 uncommitted_metric() { echo '{}' >"$q/neutrality/extra.json"; }
 failed_neutrality() {
-    jq_stage neutrality.json '.status = "fail" | .layers["corpus-ab"].status = "fail"'
+    jq_stage neutrality.json '.status = "moved" | .layers["corpus-ab"].status = "moved"'
+}
+incomplete_neutrality() { jq_stage neutrality.json 'del(.layers.fuzz)'; }
+fuzz_error() {
+    jq_stage neutrality.json '.status = "error" | .layers.fuzz.status = "error"'
+}
+extra_metric() { echo "$metric_json" >"$q/neutrality/stray.json"; git add "$q/neutrality/stray.json"; }
+bogus_metric() { echo '{"status":"pass"}' >"$q/neutrality/corpus-ab-x.json"; git add "$q/neutrality/corpus-ab-x.json"; }
+# main moves VT code this diff never touched, and the PR is merged on top: the
+# verdict still covers its own files, the measurement no longer covers the engine.
+main_moved_vt() {
+    local tip
+    tip="$(git rev-parse HEAD)"
+    git checkout -q --detach "$GOV_BASE"
+    mkdir -p crates/shux-raster/src
+    echo raster >crates/shux-raster/src/lib.rs
+    git add crates/shux-raster/src/lib.rs
+    git commit -qm "main: raster change"
+    GOV_BASE="$(git rev-parse HEAD)"
+    git checkout -q --detach "$tip"
+    git merge -q --no-edit "$GOV_BASE"
 }
 no_report() { git rm -q "$q/SOLID-QA.md"; }
 # A council record committed in the base an audit is diffed against is an old
@@ -236,12 +258,17 @@ gov 2 "VT code changed after the audited SHA (stale PASS)" full late_vt_edit "co
 gov 2 "no commit_under_audit" full no_audit_sha "needs 'commit_under_audit'"
 gov 2 "no neutrality report" full no_neutrality "needs 'neutrality'"
 gov 2 "neutrality measured on a dirty tree" full dirty_neutrality "dirty tree"
-gov 2 "neutrality report not written by the tool" full fake_neutrality "is not a scripts/vt-neutrality.sh report"
+gov 2 "neutrality report not written by the tool" full fake_neutrality "is not a complete scripts/vt-neutrality.sh report"
 gov 2 "neutrality on the wrong base" full wrong_base "is not this branch's base"
 gov 2 "neutrality older than the VT code" full stale_neutrality "neutrality head"
 gov 2 "neutrality metric not committed" full uncommitted_metric "extra.json is not committed"
 gov 2 "trivial tier with a moved pixel" trivial failed_neutrality "trivial tier requires"
 gov 0 "full tier may carry an intended pixel change" full failed_neutrality
+gov 2 "neutrality report missing a layer" full incomplete_neutrality "not a complete"
+gov 2 "full tier with a layer that did not run" full fuzz_error "did not run cleanly"
+gov 2 "a committed metric the report never wrote" full extra_metric "but the report wrote"
+gov 2 "a neutrality metric not from the comparator" full bogus_metric "does not look like"
+gov 2 "main moved VT code under the measurement" full main_moved_vt "neutrality head"
 gov 2 "final stage needs the gate's report" full no_report "SOLID-QA.md"
 GOV_STAGE=pregate gov 0 "pregate runs before the gate's report exists" full no_report
 GOV_STAGE=pregate gov 2 "pregate still catches a missing council record" full drop_council "council-design.json"

@@ -366,8 +366,9 @@ check_scope() {
 
     # `task` is deliberately NOT required, and no field is compared against the
     # folder name. That assertion was the task coupling.
-    local -a required=(solid_qa_report screenshots pixel_metrics)
-    [[ "$tier" == full ]] && required+=(dootsabha_design dootsabha_implementation)
+    # A trivial scope's pixel evidence is its committed neutrality metrics.
+    local -a required=(solid_qa_report)
+    [[ "$tier" == full ]] && required+=(screenshots pixel_metrics dootsabha_design dootsabha_implementation)
     for key in "${required[@]}"; do
         jq -e "has(\"$key\")" "$manifest" >/dev/null 2>&1 ||
             add_error "$scope: manifest is missing required top-level key '$key'"
@@ -377,12 +378,17 @@ check_scope() {
     # and prose here, and `jq -r` renders those as pretty-printed JSON which was
     # then used as a filesystem path — one such manifest produced 134 KB of error
     # output with whole JSON objects quoted as "paths". Fail once, legibly.
-    if ! jq -e '.screenshots | type == "array" and all(.[]; type == "string")' "$manifest" >/dev/null 2>&1; then
+    if ! jq -e '(.screenshots // []) | type == "array" and all(.[]; type == "string")' "$manifest" >/dev/null 2>&1; then
         add_error "$scope: manifest screenshots must be an array of path strings"
         return
     fi
-    if ! jq -e '.pixel_metrics | type == "array" and length > 0 and all(.[]; type == "string")' "$manifest" >/dev/null 2>&1; then
+    if [[ "$tier" == full ]] &&
+        ! jq -e '.pixel_metrics | type == "array" and length > 0 and all(.[]; type == "string")' "$manifest" >/dev/null 2>&1; then
         add_error "$scope: manifest pixel_metrics must be a non-empty array of path strings"
+        return
+    fi
+    if ! jq -e '(.pixel_metrics // []) | type == "array" and all(.[]; type == "string")' "$manifest" >/dev/null 2>&1; then
+        add_error "$scope: manifest pixel_metrics must be an array of path strings"
         return
     fi
     if [[ "$STAGE" == final ]]; then
@@ -442,27 +448,34 @@ check_scope() {
         if [[ -z "$audited" ]]; then
             add_error "$scope: manifest needs 'commit_under_audit': the SHA whose VT code the verdict saw"
         else
-            vt_unchanged_since "$scope" "$audited" "commit_under_audit"
+            unchanged_since "$scope" "$audited" "commit_under_audit" "${touched_vt[@]}"
         fi
     fi
 }
 
-# The VT files this diff touches are byte-identical at <sha> and in the index, so a
-# verdict or measurement made at <sha> saw the VT code that ships.
-vt_unchanged_since() {
+# The given paths are byte-identical at <sha> and in the index, so a verdict or a
+# measurement made at <sha> saw what ships. A verdict is held to the VT files this
+# diff touches; a measurement to everything it measured.
+unchanged_since() {
     local scope="$1" sha="$2" label="$3" file
+    shift 3
     local -a stale=()
     if ! git rev-parse --verify --quiet "${sha}^{commit}" >/dev/null; then
         add_error "$scope: $label '$sha' is not a commit in this repository"
         return
     fi
-    for file in "${touched_vt[@]}"; do
+    for file in "$@"; do
         git diff --cached --quiet "$sha" -- "$file" || stale+=("$file")
     done
     if [[ ${#stale[@]} -gt 0 ]]; then
         add_error "$scope: $label ${sha:0:10} predates changes to ${stale[*]}; re-run on the current code"
     fi
 }
+
+# What `make vt-neutrality` measures with: the VT code, its corpus, and the tool.
+NEUTRALITY_INPUTS=("${VT_PATHS[@]}" .shux/fixtures/vt-corpus .shux/goldens/073-vt-corpus
+    scripts/vt-neutrality.sh .shux/scripts/lib)
+NEUTRALITY_LAYERS='["corpus-goldens","corpus-ab","live-ab","colour-probe","fuzz","leaks"]'
 
 # Council records must be issued for this diff, not carried over from an old scope.
 check_council_record() {
@@ -492,32 +505,46 @@ check_neutrality() {
     fi
     resolve_artifact "$scope" "$qa_dir" "$(jq -r .neutrality "$manifest")" "neutrality" || return 0
     report="$RESOLVED"
-    if ! jq -e '.tool == "scripts/vt-neutrality.sh" and (.base | type == "string") and (.head | type == "string") and (.layers | type == "object" and length > 0)' "$report" >/dev/null 2>&1; then
-        add_error "$scope: $report is not a scripts/vt-neutrality.sh report"
+    if ! jq -e --argjson want "$NEUTRALITY_LAYERS" '.tool == "scripts/vt-neutrality.sh"
+            and (.base | type == "string") and (.head | type == "string")
+            and (.metrics | type == "number")
+            and (.layers | type == "object")
+            and all($want[] as $l | .layers[$l]; . != null and .cases > 0)' "$report" >/dev/null 2>&1; then
+        add_error "$scope: $report is not a complete scripts/vt-neutrality.sh report (every layer, each with cases)"
         return
     fi
     if ! jq -e '.dirty == false' "$report" >/dev/null 2>&1; then
         add_error "$scope: $report was measured on a dirty tree; commit, then re-run make vt-neutrality"
     fi
+    # `moved` is a completed comparison the gate judges; `error` proves nothing.
+    if ! jq -e '(.status == "pass" or .status == "moved")
+            and all(.layers[]; .status != "error")
+            and .layers.fuzz.status == "pass" and .layers.leaks.status == "pass"' "$report" >/dev/null 2>&1; then
+        add_error "$scope: $report has a layer that did not run cleanly (status error, or fuzz/leaks failed)"
+    fi
+    if [[ "$tier" == trivial ]] && ! jq -e '.status == "pass"' "$report" >/dev/null 2>&1; then
+        add_error "$scope: trivial tier requires make vt-neutrality to be 0/0 on every layer; $report is not"
+    fi
     nbase="$(jq -r .base "$report")"
     nhead="$(jq -r .head "$report")"
     if ! git merge-base --is-ancestor "$nbase" HEAD 2>/dev/null; then
         add_error "$scope: neutrality base ${nbase:0:10} is not an ancestor of HEAD"
-    elif ! git diff --quiet "$nbase" "$base" -- ${touched_vt[@]+"${touched_vt[@]}"}; then
-        add_error "$scope: neutrality base ${nbase:0:10} is not this branch's base for the VT files it touches; re-run with BASE=$(git rev-parse --short "$base")"
+    elif ! git diff --quiet "$nbase" "$base" -- "${NEUTRALITY_INPUTS[@]}"; then
+        add_error "$scope: neutrality base ${nbase:0:10} is not this branch's base for what it measures; re-run with BASE=$(git rev-parse --short "$base")"
     fi
-    vt_unchanged_since "$scope" "$nhead" "neutrality head"
+    unchanged_since "$scope" "$nhead" "neutrality head" "${NEUTRALITY_INPUTS[@]}"
     metrics_dir="$qa_dir/$(jq -r '.metrics_dir // "neutrality"' "$report")"
     count="$(git ls-files -- "$metrics_dir/*.json" | wc -l | tr -d ' ')"
     untracked="$(cd "$metrics_dir" 2>/dev/null && git ls-files --others --exclude-standard -- '*.json' | head -1)"
-    if [[ "$count" -eq 0 ]]; then
-        add_error "$scope: no neutrality metrics are committed under $metrics_dir"
-    elif [[ -n "$untracked" ]]; then
+    if [[ -n "$untracked" ]]; then
         add_error "$scope: neutrality metric $metrics_dir/$untracked is not committed"
+    elif [[ "$count" -eq 0 || "$count" != "$(jq -r .metrics "$report")" ]]; then
+        add_error "$scope: $count neutrality metrics are committed under $metrics_dir, but the report wrote $(jq -r .metrics "$report")"
     fi
-    if [[ "$tier" == trivial ]] && ! jq -e '.status == "pass" and all(.layers[]; .status == "pass")' "$report" >/dev/null 2>&1; then
-        add_error "$scope: trivial tier requires make vt-neutrality to be 0/0 on every layer; $report is not"
-    fi
+    while IFS= read -r metric; do
+        jq -e 'has("status") and has("actual") and has("expected") and has("pixel_diff_ratio") and has("mean_rgba_channel_delta")' "$metric" >/dev/null 2>&1 ||
+            add_error "$scope: $metric does not look like .claude/automations/pixel_verify.py output"
+    done < <(git ls-files -- "$metrics_dir/*.json")
 }
 
 for scope in "${scopes[@]}"; do

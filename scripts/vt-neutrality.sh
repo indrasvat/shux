@@ -17,7 +17,9 @@
 # base's rust-toolchain.toml resolves to. Override the location with
 # SHUX_NEUTRALITY_CACHE.
 #
-# Exit: 0 neutral · 1 something moved or a layer failed · 2 bad input.
+# Exit: 0 neutral · 3 a cell or pixel moved (every layer ran) · 1 a layer could
+# not run, crashed, leaked or proved nothing · 2 bad input. Through make every
+# failure is 2, so callers read `status` (pass | moved | error) in the report.
 # The report lands in .shux/out/vt-neutrality/neutrality.json, and with SCOPE also
 # in .shux/qa/<scope>/neutrality.json, which scripts/check-vt-qa.sh reads.
 
@@ -48,7 +50,11 @@ done
 
 # A dirty tree is built and measured, but the report says so and the VT QA guard refuses it.
 dirty=false
-[[ -z "$(git status --porcelain --untracked-files=no -- crates Cargo.toml Cargo.lock)" ]] || dirty=true
+# Every input of the measurement, not only the code under test.
+inputs=(crates Cargo.toml Cargo.lock rust-toolchain.toml fuzz .shux/goldens .shux/fixtures
+    .shux/scripts/lib .claude/automations/pixel_verify.py scripts/vt-neutrality.sh scripts/fuzz.sh)
+# fuzz/Cargo.lock lags each release's version bump, and the fuzz layer rewrites it.
+[[ -z "$(git status --porcelain -- "${inputs[@]}" ':(exclude)fuzz/Cargo.lock')" ]] || dirty=true
 
 out_rel=".shux/out/vt-neutrality"
 out="$repo_root/$out_rel"
@@ -80,16 +86,20 @@ cleanup() {
 trap cleanup EXIT
 
 # ── Builds ──────────────────────────────────────────────────────────────────
+# Artifacts are read from target/release, so nothing may move them elsewhere.
+unset CARGO_BUILD_TARGET
 step "build HEAD (${head:0:10}) release shux + corpus harness"
-cargo build --release --locked -p shux --bin shux
-cargo build --release --locked -p shux-raster --example vt_corpus_harness
+CARGO_TARGET_DIR="$repo_root/target" cargo build --release --locked -p shux --bin shux
+CARGO_TARGET_DIR="$repo_root/target" cargo build --release --locked -p shux-raster --example vt_corpus_harness
 head_bin="$repo_root/target/release/shux"
 head_harness="$repo_root/target/release/examples/vt_corpus_harness"
 
 mkdir -p "$cache_root"
 probe="$(mktemp -d "${TMPDIR:-/tmp}/shux-neutral-tc.XXXXXX")"
 git show "$base:rust-toolchain.toml" >"$probe/rust-toolchain.toml"
-toolchain="$(cd "$probe" && rustc -vV && cargo -V)"
+toolchain="$(cd "$probe" && rustc -vV && cargo -V)
+$(env | grep -E '^(RUSTFLAGS|CARGO_ENCODED_RUSTFLAGS|CARGO_BUILD_|CARGO_PROFILE_|RUSTC_WRAPPER)' | sort || true)
+$(cat "${CARGO_HOME:-$HOME/.cargo}/config.toml" 2>/dev/null || true)"
 rm -rf "$probe"
 toolchain_key="$(printf '%s' "$toolchain" | shasum -a 256 | cut -c1-16)"
 bin_dir="$cache_root/bin/${base}-${toolchain_key}"
@@ -143,19 +153,27 @@ compare() {
         "$layer" "$case" "$(jq -c '{changed_pixels}' "$metric" 2>/dev/null || true)"
 }
 
+# compare_report <layer> <corpus-report.json>: every case's text, replies and
+# pixels; prints one line per case.
+compare_report() {
+    local layer="$1" report="$2" name status actual expected
+    while IFS=$'\t' read -r name status actual expected; do
+        [[ "$status" == fail ]] && record "$layer" "$name" fail "text or responses differ"
+        compare "$layer" "$name" "$actual" "$expected"
+    done < <(jq -r '.cases[] | ["\(.layer)-\(.name)", .status, .actual_png, .expected_png] | @tsv' "$report")
+}
+
 # ── corpus-goldens ──────────────────────────────────────────────────────────
 step "corpus-goldens: HEAD harness vs committed goldens"
 goldens_ok=true
 "$head_harness" --mode verify --fixtures .shux/fixtures/vt-corpus \
     --goldens .shux/goldens/073-vt-corpus --out "$out/corpus-goldens" || goldens_ok=false
 if [[ -f "$out/corpus-goldens/corpus-report.json" ]]; then
-    while IFS=$'\t' read -r name status actual expected; do
-        [[ "$status" == fail ]] && record corpus-goldens "$name" fail "text or responses differ"
-        compare corpus-goldens "$name" "$actual" "$expected"
-    done < <(jq -r '.cases[] | ["\(.layer)-\(.name)", .status, .actual_png, .expected_png] | @tsv' \
-        "$out/corpus-goldens/corpus-report.json")
+    compare_report corpus-goldens "$out/corpus-goldens/corpus-report.json"
+    [[ "$goldens_ok" == true ]] || record corpus-goldens harness fail "harness verify exited non-zero"
 fi
-[[ "$goldens_ok" == true ]] || record corpus-goldens harness fail "harness verify exited non-zero"
+[[ "$(awk -F'\t' '$1 == "corpus-goldens"' "$results" | wc -l)" -gt 0 ]] ||
+    record corpus-goldens harness error "the harness compared no case"
 
 # ── corpus-ab ───────────────────────────────────────────────────────────────
 step "corpus-ab: base vs HEAD harness on base's fixtures"
@@ -167,21 +185,17 @@ fixtures="$out/fixtures/.shux/fixtures/vt-corpus"
 ab_ok=true
 "$head_harness" --mode verify --fixtures "$fixtures" \
     --goldens "$out/corpus-ab/base" --out "$out/corpus-ab/head" || ab_ok=false
-ab_cases=0
-while IFS=$'\t' read -r name status actual expected; do
-    ab_cases=$((ab_cases + 1))
-    [[ "$status" == fail ]] && record corpus-ab "$name" fail "text or responses differ from base"
-    compare corpus-ab "$name" "$actual" "$expected"
-done < <(jq -r '.cases[] | ["\(.layer)-\(.name)", .status, .actual_png, .expected_png] | @tsv' \
-    "$out/corpus-ab/head/corpus-report.json")
+[[ ! -f "$out/corpus-ab/head/corpus-report.json" ]] ||
+    compare_report corpus-ab "$out/corpus-ab/head/corpus-report.json"
+ab_cases="$(awk -F'\t' '$1 == "corpus-ab"' "$results" | wc -l | tr -d ' ')"
 [[ "$ab_ok" == true ]] || record corpus-ab harness fail "HEAD harness differs from base on text or responses"
-[[ "$ab_cases" -gt 0 ]] || record corpus-ab harness fail "base fixtures produced no cases"
+[[ "$ab_cases" -gt 0 ]] || record corpus-ab harness error "base fixtures produced no cases"
 
 # ── live-ab + colour-probe ──────────────────────────────────────────────────
 # One pane per case. It waits on a line from us until set-size has landed, so no
-# byte is ever laid out at the default size, and brackets the replay in OSC 133
-# C/D: invisible, so the end is detected without drawing a marker into a frame
-# whose autowrap or scroll region the recording may have left changed.
+# byte is ever laid out at the default size. Its end is a file it touches, not a
+# drawn marker (a recording may leave autowrap or a scroll region changed) and
+# not a shux feature, so any base binary can be measured.
 probe_payload() {
     cat <<'EOF2'
 printf '\033[38;2;120;220;180mTRUECOLOR\033[0m \033[38;5;208mINDEXED\033[0m \033[34mBASIC\033[0m\n'
@@ -201,15 +215,14 @@ live_side() {
     local side="$1" bin="$2" case="$3" cols="$4" rows="$5" body="$6"
     local rt="$7" dir="$out/live/$side"
     local -a sx=(env -u SHUX_SOCKET XDG_RUNTIME_DIR="$rt" XDG_CONFIG_HOME="$rt/config" "$bin")
-    local script="$rt/$case.sh" pane floor
+    local script="$rt/$case.sh" done_file="$rt/$case.done" pane i
     mkdir -p "$dir"
     {
         # Echo stays off: the VT's replies to queries in a recording go back
         # down the PTY, and echoing them would draw them at a racy moment.
         printf 'stty -echo; read -r _\n'
-        printf '%s\n' "printf '\\033]133;C\\007'"
         printf '%s\n' "$body"
-        printf '%s\n' "printf '\\033]133;D;0\\007'"
+        printf ': >%q\n' "$done_file"
         printf 'exec sleep 600\n'
     } >"$script"
     # Same session name on both sides: it is drawn in the window chrome.
@@ -218,10 +231,12 @@ live_side() {
         sh "$script" >/dev/null
     pane="$("${sx[@]}" --format json pane list -s nt | jq -r '.[0].id')"
     "${sx[@]}" pane set-size -s nt -p "$pane" --cols "$cols" --rows "$rows" >/dev/null
-    floor="$("${sx[@]}" --format json pane status "$pane" | jq -r .result.as_of)"
     "${sx[@]}" pane send-keys -s nt -p "$pane" --data Cg== >/dev/null
-    "${sx[@]}" --format json pane wait-command "$pane" --after "$floor" --timeout 30s |
-        jq -e '.result.outcome == "completed"' >/dev/null
+    for ((i = 0; i < 300; i++)); do
+        [[ -e "$done_file" ]] && break
+        sleep 0.1
+    done
+    [[ -e "$done_file" ]] || { echo "✗ live $side $case: the replay never finished" >&2; exit 1; }
     "${sx[@]}" pane wait-settled "$pane" --quiet 250ms --timeout 10s >/dev/null
     "${sx[@]}" pane capture -s nt -p "$pane" --lines "$rows" >"$dir/$case.txt"
     "${sx[@]}" pane snapshot -s nt -p "$pane" -o "$dir/$case-pane.png" >/dev/null
@@ -263,7 +278,7 @@ for side in base head; do
     if shux_harness_assert_no_daemon "$rt"; then
         record leaks "$side" pass
     else
-        record leaks "$side" fail "daemon still running after daemon stop"
+        record leaks "$side" error "daemon still running after daemon stop"
     fi
 done
 
@@ -275,12 +290,12 @@ for entry in "${live_cases[@]}"; do
         for side in base head; do
             for needle in TRUECOLOR INDEXED BASIC; do
                 grep -q -- "$needle" "$out/live/$side/$name.txt" ||
-                    record colour-probe "$name-$side" fail "capture lacks $needle"
+                    record colour-probe "$name-$side" error "capture lacks $needle"
             done
             uv run --quiet --script .shux/scripts/lib/png_not_blank.py \
                 "$out/live/$side/$name-pane.png" "$out/live/$side/$name-window.png" \
                 --min-colors 8 --min-ink-ratio 0.004 >/dev/null ||
-                record colour-probe "$name-$side" fail "snapshot is blank or monochrome"
+                record colour-probe "$name-$side" error "snapshot is blank or monochrome"
         done
     fi
     if cmp -s "$out/live/base/$name.txt" "$out/live/head/$name.txt"; then
@@ -294,19 +309,26 @@ done
 
 # ── fuzz ────────────────────────────────────────────────────────────────────
 step "fuzz: ${fuzz_targets[*]} for ${fuzz_seconds}s each"
-if bash scripts/fuzz.sh "$fuzz_seconds" "${fuzz_targets[@]}"; then
+# One fuzz build dir for every worktree: its instrumented build is the slowest
+# step here, and sharing it keeps it incremental across branches.
+if CARGO_TARGET_DIR="$cache_root/fuzz-target" bash scripts/fuzz.sh "$fuzz_seconds" "${fuzz_targets[@]}"; then
     record fuzz "${fuzz_targets[*]}" pass "${fuzz_seconds}s each"
 else
-    record fuzz "${fuzz_targets[*]}" fail "crash or build failure; see fuzz/artifacts/"
+    record fuzz "${fuzz_targets[*]}" error "crash or build failure; see fuzz/artifacts/"
 fi
 
 # ── Report ──────────────────────────────────────────────────────────────────
+# pass: every layer 0/0 · moved: every layer ran, some cell or pixel differs ·
+# error: a layer could not run, crashed, leaked or compared nothing.
 status=pass
-awk -F'\t' '$3 != "pass" { bad = 1 } END { exit bad }' "$results" || status=fail
+awk -F'\t' '$3 == "fail" { bad = 1 } END { exit bad }' "$results" || status=moved
+awk -F'\t' '$3 == "error" { bad = 1 } END { exit bad }' "$results" || status=error
+metric_count="$(find "$out/metrics" -name '*.json' | wc -l | tr -d ' ')"
 jq -Rn \
     --arg base "$base" --arg head "$head" --argjson dirty "$dirty" \
     --arg toolchain_key "$toolchain_key" --argjson cache_hit "$cache_hit" \
-    --arg status "$status" --argjson fuzz_seconds "$fuzz_seconds" '
+    --arg status "$status" --argjson fuzz_seconds "$fuzz_seconds" \
+    --argjson metrics "$metric_count" '
     [inputs | split("\t") | {layer: .[0], case: .[1], status: .[2], detail: .[3]}] as $rows
     | {
         schema_version: 1,
@@ -315,10 +337,12 @@ jq -Rn \
         toolchain_key: $toolchain_key, base_cache_hit: $cache_hit,
         fuzz_seconds_per_target: $fuzz_seconds,
         status: $status,
+        metrics: $metrics,
         layers: ($rows | group_by(.layer) | map({key: .[0].layer, value: {
-            status: (if all(.[]; .status == "pass") then "pass" else "fail" end),
+            status: (if any(.[]; .status == "error") then "error"
+                     elif any(.[]; .status == "fail") then "moved" else "pass" end),
             cases: length,
-            failed: [.[] | select(.status != "pass") | {case, detail}]
+            failed: [.[] | select(.status != "pass") | {case, status, detail}]
         }}) | from_entries)
     }' <"$results" >"$out/neutrality.json"
 
@@ -334,10 +358,15 @@ fi
 echo "  total ${SECONDS}s"
 jq -C '{status, base: .base[0:10], head: .head[0:10], dirty, base_cache_hit,
         layers: (.layers | map_values({status, cases, failed: (.failed | length)}))}' "$out/neutrality.json"
-if [[ "$status" == pass ]]; then
-    printf '\033[1;32m✓ vt-neutrality: 0/0 on every layer (base %s → head %s)\033[0m\n' "${base:0:10}" "${head:0:10}"
-else
-    jq -r '.layers | to_entries[] | .key as $l | .value.failed[] | "  ✗ \($l) \(.case): \(.detail)"' "$out/neutrality.json" >&2
-    printf '\033[1;31m✗ vt-neutrality: something moved; inspect %s\033[0m\n' "$out_rel" >&2
-    exit 1
-fi
+case "$status" in
+    pass)
+        printf '\033[1;32m✓ vt-neutrality: 0/0 on every layer (base %s → head %s)\033[0m\n' "${base:0:10}" "${head:0:10}" ;;
+    moved)
+        jq -r '.layers | to_entries[] | .key as $l | .value.failed[] | "  ✗ \($l) \(.case): \(.detail)"' "$out/neutrality.json" >&2
+        printf '\033[1;33m✗ vt-neutrality: every layer ran and something moved; diffs in %s/metrics\033[0m\n' "$out_rel" >&2
+        exit 3 ;;
+    *)
+        jq -r '.layers | to_entries[] | .key as $l | .value.failed[] | "  ✗ \($l) \(.case) [\(.status)]: \(.detail)"' "$out/neutrality.json" >&2
+        printf '\033[1;31m✗ vt-neutrality: a layer did not run cleanly; nothing here is proof\033[0m\n' >&2
+        exit 1 ;;
+esac
