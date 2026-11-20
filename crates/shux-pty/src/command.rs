@@ -4,9 +4,9 @@
 //! The typed line frames the command between two markers the shell prints:
 //!
 //! ```text
-//! __shux_ec=$?; command -p printf 'SHUX_BE''GIN%s\n' <id>; (exit "$__shux_ec") && :; CMD; __shux_ec=$?;
+//! __shux_ec=$?; command -p printf 'SHUX_BE''GIN%s\n' <id>; { (exit "$__shux_ec"); } 2>/dev/null && :; CMD; __shux_ec=$?;
 //! command -p printf 'SHUX_MAR''KER%sEXIT%sSHUX_END\n' <id> "$__shux_ec";
-//! eval "unset __shux_ec; (exit $__shux_ec)" && :
+//! eval "unset __shux_ec; { (exit $__shux_ec); } 2>/dev/null" && :
 //! ```
 //!
 //! The marker text never appears contiguously in the typed line, so the
@@ -233,12 +233,14 @@ impl CommandEngine {
         // is restored before the command, and the command's own is left as
         // `$?` after the line: `eval` expands it before the unset runs. Each
         // `(exit N)` heads an `&&` list, so errexit, which spares all but a
-        // list's last command, never ends the shell on it.
+        // list's last command, never ends the shell on it. Each subshell's
+        // stderr goes to /dev/null before it forks: under load, macOS bash can
+        // warn there (`child setpgid`), and that is not the command's output.
         let line = format!(
             "__shux_ec=$?; command -p printf 'SHUX_BE''GIN%s\\n' {marker}; \
-             (exit \"$__shux_ec\") && :; {command}; __shux_ec=$?; \
+             {{ (exit \"$__shux_ec\"); }} 2>/dev/null && :; {command}; __shux_ec=$?; \
              command -p printf 'SHUX_MAR''KER%sEXIT%sSHUX_END\\n' {marker} \"$__shux_ec\"; \
-             eval \"unset __shux_ec; (exit $__shux_ec)\" && :\n",
+             eval \"unset __shux_ec; {{ (exit $__shux_ec); }} 2>/dev/null\" && :\n",
         );
         PreparedCommand {
             id,
