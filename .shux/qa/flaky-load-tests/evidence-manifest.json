@@ -1,0 +1,6 @@
+{
+  "tier": "trivial",
+  "solid_qa_report": "SOLID-QA.md",
+  "commit_under_audit": "a874c828654e1d5e7444f657e84d14239635774c",
+  "neutrality": "neutrality.json"
+}

@@ -44,8 +44,9 @@ nth_glyph() {
 count=0
 while read -r _; do
 	g=$(nth_glyph "$((count % 36))")
-	# Erase row 10 then repaint it (truecolor). Pure content change.
-	printf '\033[11;1H\033[2K\033[38;2;80;220;120mFRAME:%s\033[0m' "$g"
-	printf '\033[24;80H'
+	# Erase row 10 then repaint it (truecolor). Pure content change. One write
+	# in DEC 2026 synchronized output: the repaint and the parked cursor are
+	# one revision, never a frame with the cursor mid-row.
+	printf '\033[?2026h\033[11;1H\033[2K\033[38;2;80;220;120mFRAME:%s\033[0m\033[24;80H\033[?2026l' "$g"
 	count=$((count + 1))
 done

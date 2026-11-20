@@ -764,14 +764,20 @@ mod tests {
         );
         a.unwrap();
         b.unwrap();
-        // A spawn returns once its child has exec'd, so every child either
-        // spawn started is visible now.
+        // A spawn returns once its child has exec'd, but macOS `/bin/sh`
+        // re-execs the real shell, and `ps` shows a process mid-exec as
+        // `(sh)`, argv unread: wait until the command is seen at all.
+        // `sh`'s own fork for `sleep` is not a second start.
         let needle = log.display().to_string();
-        assert_eq!(
-            crate::rpc::test_harness::count_procs_containing(&needle),
-            1,
-            "the pane's command ran more than once"
-        );
+        let roots = shux_testkit::wait_for_async("the pane's command in the process table", || {
+            let needle = needle.clone();
+            async move {
+                let n = crate::rpc::test_harness::count_command_roots(&needle);
+                (n > 0).then_some(n)
+            }
+        })
+        .await;
+        assert_eq!(roots, 1, "the pane's command ran more than once");
         assert_eq!(starts(&log).await, 1, "the pane's command did not run once");
         finish(h).await;
     }

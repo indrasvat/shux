@@ -1341,28 +1341,25 @@ mod tests {
 
     #[test]
     fn test_performance_80x24_under_budget() {
-        // A catastrophic-regression guard, not the PRD's 8ms frame budget: this
-        // runs on an unoptimised test build (opt-level 0 is ~4.2x slower here),
-        // so it measures codegen and runner load. Nothing asserts the 8ms budget
-        // now — that needs a release-profile bench, which does not exist yet.
+        // Bounded by work, not time: a first frame draws each cell once, in
+        // a bounded number of bytes. Unchanged frames: `test_force_redraw`.
         let mut compositor = make_compositor(80, 24, CompositorConfig::default());
+        let cell = |col: u16, row: u16| {
+            let ch = (b'A' + ((col + row) % 26) as u8) as char;
+            RenderCell::text(ch)
+        };
 
-        let stats = compositor
-            .render_frame(
-                |col, row| {
-                    let ch = (b'A' + ((col + row) % 26) as u8) as char;
-                    RenderCell::text(ch)
-                },
-                80,
-                24,
-                Some((0, 0)),
-            )
-            .unwrap();
-
+        let stats = compositor.render_frame(cell, 80, 24, Some((0, 0))).unwrap();
+        assert_eq!(
+            stats.dirty_cells, stats.total_cells,
+            "a first frame draws every cell"
+        );
+        // ~8.5 B/cell today (CUP + glyph): one more escape per cell exceeds it.
+        let bytes = compositor.inner().get_ref().len();
         assert!(
-            stats.total_time_us < 100_000,
-            "Full 80x24 render took {}us — an order of magnitude over any sane cost",
-            stats.total_time_us
+            bytes <= stats.total_cells * 10,
+            "a full 80x24 frame wrote {bytes} bytes for {} cells",
+            stats.total_cells
         );
     }
 }

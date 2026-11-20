@@ -165,7 +165,8 @@ gov() {
     "$mutate"
     cd "$work"
     log="$repo.log"
-    (cd "$repo" && VT_QA_BASE="$GOV_BASE" VT_QA_STAGE="$GOV_STAGE" bash "$GUARD" >"$log" 2>&1) || got=$?
+    # GOV_GIT_DIR: run as a git hook does, with GIT_DIR exported.
+    (cd "$repo" && env ${GOV_GIT_DIR:+GIT_DIR="$repo/.git"} VT_QA_BASE="$GOV_BASE" VT_QA_STAGE="$GOV_STAGE" bash "$GUARD" >"$log" 2>&1) || got=$?
     if [[ "$got" == "$want" && -n "$needle" ]] && ! grep -qF -- "$needle" "$log"; then
         printf '  \033[31m✗\033[0m %s: exit %s, but not for its reason (%s):\n' "$label" "$got" "$needle"
         sed 's/^/      /' "$log"
@@ -176,7 +177,7 @@ gov() {
         printf '  \033[31m✗\033[0m %s: expected exit %s, got %s\n' "$label" "$want" "$got"
         failures=$((failures + 1))
     fi
-    unset GOV_STAGE
+    unset GOV_STAGE GOV_GIT_DIR
 }
 
 # Rewrite a JSON file under the scope with a jq filter and stage it.
@@ -281,6 +282,8 @@ gov 2 "neutrality report not written by the tool" full fake_neutrality "is not a
 gov 2 "neutrality on the wrong base" full wrong_base "is not this branch's base"
 gov 2 "neutrality older than the VT code" full stale_neutrality "neutrality head"
 gov 2 "neutrality metric not committed" full uncommitted_metric "extra.json is not committed"
+GOV_GIT_DIR=1 gov 0 "a conforming scope passes in a push hook (GIT_DIR set)" trivial untouched
+GOV_GIT_DIR=1 gov 2 "an uncommitted metric still fails in a push hook" full uncommitted_metric "extra.json is not committed"
 gov 2 "trivial tier with a moved pixel" trivial failed_neutrality "trivial tier requires"
 gov 0 "full tier may carry an intended pixel change" full failed_neutrality
 gov 2 "trivial report saying pass over a moved layer" trivial inconsistent_pass "trivial tier requires"

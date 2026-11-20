@@ -238,19 +238,42 @@ pub(crate) async fn kill_scratch_and_wait(harness: &RpcHarness, session_id: &str
     .await;
 }
 
+/// `ps -axo <fields>`; a failed scan panics rather than reading as empty.
+fn ps(fields: &str) -> String {
+    let out = std::process::Command::new("ps")
+        .args(["-axo", fields])
+        .output()
+        .expect("run ps");
+    assert!(
+        out.status.success(),
+        "ps failed: a failed scan would count 0"
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
 /// Count live processes whose argv contains `needle` (unique per test
 /// run, so co-tenant argv text cannot collide).
 pub(crate) fn count_procs_containing(needle: &str) -> usize {
-    std::process::Command::new("ps")
-        .args(["-axo", "args="])
-        .output()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .filter(|l| l.contains(needle))
-                .count()
+    ps("args=").lines().filter(|l| l.contains(needle)).count()
+}
+
+/// Live processes whose argv contains `needle` and whose parent's does not:
+/// one per command started, however many times that command has forked. A
+/// child between `fork` and `exec` still carries its parent's argv.
+pub(crate) fn count_command_roots(needle: &str) -> usize {
+    let text = ps("pid=,ppid=,args=");
+    let matches: Vec<(&str, &str)> = text
+        .lines()
+        .filter(|l| l.contains(needle))
+        .filter_map(|l| {
+            let mut f = l.split_whitespace();
+            Some((f.next()?, f.next()?))
         })
-        .unwrap_or(0)
+        .collect();
+    matches
+        .iter()
+        .filter(|(_, ppid)| !matches.iter().any(|(pid, _)| pid == ppid))
+        .count()
 }
 
 /// `__scratch-*` sessions currently in the GRAPH (what a leaked

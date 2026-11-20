@@ -497,10 +497,12 @@ fn a_failed_attach_split_or_new_window_leaves_no_phantom() {
 
     let bin = env.bin.display().to_string();
     let root = env.root.path().display().to_string();
+    // Job control off: under load the host shell's setpgid for the client
+    // can fail, leaving it outside the terminal's foreground group.
     env.send_keys(
         "host",
         &format!(
-            "XDG_RUNTIME_DIR={root}/runtime XDG_CONFIG_HOME={root}/config \
+            "set +m; XDG_RUNTIME_DIR={root}/runtime XDG_CONFIG_HOME={root}/config \
              {bin} session attach target\n"
         ),
     );
@@ -569,7 +571,7 @@ fn a_failed_attach_split_or_new_window_tells_the_user_why() {
     env.send_keys(
         "host",
         &format!(
-            "XDG_RUNTIME_DIR={root}/runtime XDG_CONFIG_HOME={root}/config \
+            "set +m; XDG_RUNTIME_DIR={root}/runtime XDG_CONFIG_HOME={root}/config \
              {bin} session attach target\n"
         ),
     );
@@ -633,7 +635,7 @@ fn a_failed_attach_new_window_keeps_the_window_it_was_opened_from() {
     env.send_keys(
         "host",
         &format!(
-            "XDG_RUNTIME_DIR={root}/runtime XDG_CONFIG_HOME={root}/config \
+            "set +m; XDG_RUNTIME_DIR={root}/runtime XDG_CONFIG_HOME={root}/config \
              {bin} session attach target\n"
         ),
     );
@@ -701,7 +703,7 @@ fn a_failed_attach_split_leaves_the_window_zoomed_on_the_same_pane() {
     env.send_keys(
         "host",
         &format!(
-            "XDG_RUNTIME_DIR={root}/runtime XDG_CONFIG_HOME={root}/config \
+            "set +m; XDG_RUNTIME_DIR={root}/runtime XDG_CONFIG_HOME={root}/config \
              {bin} session attach target\n"
         ),
     );

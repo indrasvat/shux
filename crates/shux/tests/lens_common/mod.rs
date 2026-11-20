@@ -17,10 +17,31 @@
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 
 pub use shux_testkit::{BUDGET, BUDGET_MS};
+
+/// `Command::output`, with the spawn serialised across this process's threads.
+///
+/// On macOS std creates a child's stdio pipes with `pipe()` and then sets
+/// close-on-exec, so a child spawned by another thread in between inherits a
+/// pipe end, and this caller's read of the child's output waits until THAT
+/// child exits. Every harness spawn goes through here, so a token pump never
+/// stalls behind a check's long-running `wait_settled`.
+pub fn spawn_output(cmd: &mut Command) -> std::io::Result<Output> {
+    static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let child = {
+        let _spawning = SPAWN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?
+    };
+    child.wait_with_output()
+}
 
 /// One JSON-RPC error `{code,message,data}` as surfaced by `shux rpc call`.
 #[derive(Debug, Clone)]
@@ -198,9 +219,7 @@ impl Harness {
     /// Run `shux <args...>` and return the raw process output (for CLI exit-code
     /// and file-output assertions).
     pub fn cli(&self, args: &[&str]) -> Output {
-        self.shux()
-            .args(args)
-            .output()
+        spawn_output(self.shux().args(args))
             .unwrap_or_else(|e| panic!("failed to run shux {args:?}: {e}"))
     }
 
@@ -208,13 +227,10 @@ impl Harness {
     /// parsed envelope so tests can assert on `-32601` etc.
     pub fn rpc_raw(&self, method: &str, params: serde_json::Value) -> RpcEnvelope {
         let params = params.to_string();
-        let out = self
-            .shux()
-            .args([
-                "--format", "json", "rpc", "call", method, "--params", &params,
-            ])
-            .output()
-            .unwrap_or_else(|e| panic!("failed to spawn shux rpc {method}: {e}"));
+        let out = spawn_output(self.shux().args([
+            "--format", "json", "rpc", "call", method, "--params", &params,
+        ]))
+        .unwrap_or_else(|e| panic!("failed to spawn shux rpc {method}: {e}"));
         let stdout = String::from_utf8_lossy(&out.stdout).to_string();
         let exit_code = out.status.code().unwrap_or(-1);
         let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
@@ -357,6 +373,40 @@ impl Harness {
             "pane.send_keys",
             serde_json::json!({ "pane_id": pane_id, "text": format!("{tok}\n") }),
         );
+    }
+
+    /// Run `check` while a thread sends `pane_id` an empty line token every
+    /// `interval_ms` (§16.1: the interval paces INPUT, never synchronises on
+    /// output). The pump stops when `check` returns or panics, so no check
+    /// can observe a pane its pump stopped churning early.
+    pub fn with_token_pump<T>(
+        &self,
+        pane_id: &str,
+        interval_ms: u64,
+        check: impl FnOnce() -> T,
+    ) -> T {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct StopOnDrop<'a>(&'a AtomicBool);
+        impl Drop for StopOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    self.send_line_token(pane_id, "");
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "§16.1: paces INPUT tokens, never synchronises on output"
+                    )]
+                    std::thread::sleep(Duration::from_millis(interval_ms));
+                }
+            });
+            let _stop = StopOnDrop(&stop);
+            check()
+        })
     }
 
     /// Send raw bytes (F4 raw-mode single-byte tokens; e.g. "a", "s", "\t").
@@ -525,9 +575,7 @@ impl Harness {
         let prefix = format!("sh {}", self.fixture_abs(name));
         // A failed `ps` must not read as "no processes": every reap check
         // waits for zero.
-        let out = Command::new("ps")
-            .args(["-axo", "args="])
-            .output()
+        let out = spawn_output(Command::new("ps").args(["-axo", "args="]))
             .unwrap_or_else(|e| panic!("ps -axo args= could not run: {e}"));
         assert!(out.status.success(), "ps -axo args= failed: {out:?}");
         String::from_utf8_lossy(&out.stdout)
@@ -731,9 +779,7 @@ pub fn assert_png_golden_masked(
         cmd.arg("--mask")
             .arg(format!("{},{},{},{}", c0 * cw, r0 * ch, c1 * cw, r1 * ch));
     }
-    let out = cmd
-        .output()
-        .unwrap_or_else(|e| panic!("run pixel_verify.py: {e}"));
+    let out = spawn_output(&mut cmd).unwrap_or_else(|e| panic!("run pixel_verify.py: {e}"));
     let stdout = String::from_utf8_lossy(&out.stdout);
     let verdict: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
         panic!(
@@ -769,12 +815,13 @@ pub fn assert_text_golden(harness: &Harness, actual_text: &str, golden_rel: &str
 /// early — a pass, NOT `#[ignore]`). Skips are allowed only in CI, never for
 /// the P6 DoD evidence.
 pub fn skip_unless_bin(bin: &str, test: &str) -> bool {
-    let found = Command::new("sh")
-        .arg("-c")
-        .arg(format!("command -v {bin}"))
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+    let found = spawn_output(
+        Command::new("sh")
+            .arg("-c")
+            .arg(format!("command -v {bin}")),
+    )
+    .map(|o| o.status.success())
+    .unwrap_or(false);
     if !found {
         eprintln!(
             "\n=== T-TIER SKIP: {test} ===\n\
@@ -842,11 +889,14 @@ pub fn wait_until<F: FnMut() -> bool>(timeout: Duration, cond: F) -> bool {
 /// [`release_after_compare`] lets it go.
 pub fn make_fifo(dir: &Path) -> PathBuf {
     let fifo = dir.join("release");
-    let made = Command::new("mkfifo")
-        .arg(&fifo)
-        .status()
+    let made = spawn_output(Command::new("mkfifo").arg(&fifo))
         .unwrap_or_else(|e| panic!("mkfifo could not run: {e}"));
-    assert!(made.success(), "mkfifo {}", fifo.display());
+    assert!(
+        made.status.success(),
+        "mkfifo {}: {}",
+        fifo.display(),
+        String::from_utf8_lossy(&made.stderr)
+    );
     fifo
 }
 

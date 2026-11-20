@@ -538,7 +538,9 @@ check_neutrality() {
     unchanged_since "$scope" "$nhead" "neutrality head" "${NEUTRALITY_INPUTS[@]}"
     metrics_dir="$qa_dir/$(jq -r '.metrics_dir // "neutrality"' "$report")"
     count="$(git ls-files -- "$metrics_dir/*.json" | wc -l | tr -d ' ')"
-    untracked="$(cd "$metrics_dir" 2>/dev/null && git ls-files --others --exclude-standard -- '*.json' | head -1)"
+    # From the root: a git hook exports GIT_DIR, which makes any cwd the work tree.
+    untracked="$(git ls-files --others --exclude-standard -- "$metrics_dir/*.json" | head -1)"
+    untracked="${untracked#"$metrics_dir"/}"
     if [[ -n "$untracked" ]]; then
         add_error "$scope: neutrality metric $metrics_dir/$untracked is not committed"
     elif [[ "$count" -eq 0 || "$count" != "$(jq -r .metrics "$report")" ]]; then

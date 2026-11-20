@@ -3912,4 +3912,97 @@ mod production_route_tests {
 
         harness.stop().await;
     }
+
+    /// LENS-R-042 at `max_runtime`: shux ends a group that outlives the
+    /// SIGTERM grace with SIGKILL, and removes the registry row only once the
+    /// group is dead. The reaper is held at its fired deadline until the
+    /// workload ignores SIGTERM, so it ends by SIGKILL however it is
+    /// scheduled. SIGTERM going first is `PtyHandle::end_group`'s contract.
+    #[tokio::test]
+    async fn production_max_runtime_reap_holds_its_row_until_the_group_is_dead() {
+        let harness = RpcHarness::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tag = format!("shuxlensreap{}", PaneId::new().to_string().replace('-', ""));
+        let ready = dir.path().join("ready");
+        // Ignored before `ready` exists, by the loop's children too.
+        let script = format!(
+            "TAG={tag}; trap '' TERM; : > {r}; while :; do sleep 0.2; done",
+            r = ready.display(),
+        );
+        let pause = test_hooks::Pause::arm(&test_hooks::PAUSE_BEFORE_REAP);
+        let run = dispatch_ok(
+            &harness.router,
+            "lens.run",
+            json!({"argv": ["sh", "-c", script], "max_runtime_ms": MIN_MAX_RUNTIME_MS}),
+        )
+        .await;
+        let sid: SessionId = run["session_id"].as_str().unwrap().parse().unwrap();
+        let pane = run["pane_id"].as_str().expect("pane_id").to_string();
+
+        tokio::time::timeout(shux_testkit::BUDGET, pause.reached.notified())
+            .await
+            .expect("the max_runtime deadline fires");
+        shux_testkit::wait_until_async("the workload to ignore SIGTERM", || async {
+            ready.exists()
+        })
+        .await;
+        assert!(count_procs_containing(&tag) >= 1, "the workload runs");
+        assert!(
+            harness.scratch_registry.ids().contains(&sid),
+            "the row is present before the reap"
+        );
+
+        // Read the row, THEN count: a row read as gone with the group alive
+        // afterwards was removed while the group lived.
+        let row_outlives_group = || {
+            let row = harness.scratch_registry.ids().contains(&sid);
+            let alive = count_procs_containing(&tag);
+            assert!(
+                row || alive == 0,
+                "the row went while {alive} process(es) of the group ran"
+            );
+            row
+        };
+        *test_hooks::PAUSE_BEFORE_REAP.lock().unwrap() = None;
+        pause.release.notify_one();
+
+        shux_testkit::wait_until_async("the row to go", || async { !row_outlives_group() }).await;
+        assert_eq!(count_procs_containing(&tag), 0, "the group is dead");
+        let exits: Vec<_> = harness
+            .bus
+            .history_filtered(usize::MAX, &["pane.exited".to_string()])
+            .into_iter()
+            .filter_map(|e| match e.data {
+                shux_core::event::EventData::PaneExited {
+                    pane_id,
+                    exit_status: Some(_),
+                    signal,
+                    by_shux,
+                    ..
+                } if pane_id.to_string() == pane => Some((signal, by_shux)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            exits,
+            [(Some(nix::libc::SIGKILL), true)],
+            "a group ignoring SIGTERM is ended by shux's SIGKILL"
+        );
+        assert!(
+            graph_scratch_sessions(&harness).is_empty(),
+            "the scratch session is reaped"
+        );
+        let audit = std::fs::read_to_string(harness._scratch_dir.path().join("lens-audit.ndjson"))
+            .expect("audit log");
+        assert!(
+            audit
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .any(|e| e["method"] == "scratch.reap"
+                    && e["reason"] == "max_runtime"
+                    && e["session_id"] == sid.to_string().as_str()),
+            "reap audited as max_runtime: {audit}"
+        );
+        harness.stop().await;
+    }
 }

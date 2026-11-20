@@ -61,8 +61,10 @@ impl Env {
         let bin = env.bin.display().to_string();
         let root = env.root.path().display().to_string();
         let redirect = redirect.replace("{root}", &root);
+        // Job control off: under load the host shell's setpgid for the client
+        // can fail, leaving it outside the terminal's foreground group.
         env.send_keys(&format!(
-            "XDG_RUNTIME_DIR={root}/runtime XDG_CONFIG_HOME={root}/config {env_vars} \
+            "set +m; XDG_RUNTIME_DIR={root}/runtime XDG_CONFIG_HOME={root}/config {env_vars} \
              {bin} session attach target {redirect}\n"
         ));
         // Only the attached UI draws the pane count; the shell's echo of the
@@ -259,8 +261,6 @@ fn the_help_overlay_names_the_configured_prefix_through_a_reload() {
 /// the reloaded prefix is on screen that line has been written, wherever
 /// the client writes it.
 #[test]
-// TODO(#281): flaky under load; fix the timing dependence, then remove the ignore.
-#[ignore = "flaky under load: see #281"]
 fn the_attached_client_logs_after_the_terminal_is_restored() {
     let env = Env::attached_with(
         &keys_config("ctrl-a"),

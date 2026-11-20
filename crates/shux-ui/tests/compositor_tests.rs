@@ -54,9 +54,6 @@ fn test_single_pane_renders_grid_content() {
 
     // First render must be a full redraw — every cell is dirty.
     assert_eq!(stats.dirty_cells, 50);
-    // Catastrophic-regression guard, not the PRD's 8ms budget — see the note on
-    // `test_performance_80x24_under_budget`.
-    assert!(stats.total_time_us < 100_000);
 }
 
 #[test]
@@ -291,23 +288,29 @@ fn test_complex_layout_renders_under_budget() {
         ..Default::default()
     };
     let mut compositor = RenderCompositor::new(80, 24, Cursor::new(Vec::new()), cfg);
-    let stats = compositor
-        .render_multi_pane(MultiPaneFrame {
-            layout: &layout,
-            zoom: None,
-            focused: a,
-            vts: &vts,
-            chrome: None,
-            status_bar: None,
-        })
-        .unwrap();
-    // Catastrophic-regression guard, not the PRD's 8ms budget — see the note on
-    // `test_performance_80x24_under_budget`.
-    assert!(
-        stats.total_time_us < 100_000,
-        "4-pane 80x24 took {}us — an order of magnitude over any sane cost",
-        stats.total_time_us
+    let frame = || MultiPaneFrame {
+        layout: &layout,
+        zoom: None,
+        focused: a,
+        vts: &vts,
+        chrome: None,
+        status_bar: None,
+    };
+    // Bounded by work, not time — see `test_performance_80x24_under_budget`.
+    let stats = compositor.render_multi_pane(frame()).unwrap();
+    assert_eq!(
+        stats.dirty_cells, stats.total_cells,
+        "a first frame draws every cell"
     );
+    // ~9.5 B/cell today (CUP + glyph + borders): one more escape per cell exceeds it.
+    let bytes = compositor.inner().get_ref().len();
+    assert!(
+        bytes <= stats.total_cells * 11,
+        "a 4-pane 80x24 frame wrote {bytes} bytes for {} cells",
+        stats.total_cells
+    );
+    let again = compositor.render_multi_pane(frame()).unwrap();
+    assert_eq!(again.dirty_cells, 0, "an unchanged frame redrew cells");
 }
 
 // Test the rect computation independently for completeness.

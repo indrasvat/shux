@@ -126,30 +126,36 @@ async fn render_bytes(h: &Harness, session: &str, graphics: bool) -> Vec<u8> {
     // the image alone stopped between the workload's two printfs, and failed
     // on a colour probe the daemon had not written yet. The workload draws
     // the image first, so once its colours arrive any picture already has.
-    read_renders_until(&mut framed, |seen| {
-        let probes = find(seen, b"38;2;120;220;180") && find(seen, b"38;5;208");
-        probes && (!graphics || find(seen, b"\x1b_Ga=T"))
-    })
-    .await
+    let mut needles: Vec<&[u8]> = vec![b"38;2;120;220;180", b"38;5;208"];
+    if graphics {
+        needles.push(b"\x1b_Ga=T");
+    }
+    read_renders_until(&mut framed, &needles).await
 }
 
-/// Collect render bytes until `done` holds for them, the daemon hangs up, or
-/// [`BUDGET`] runs out; the caller's assertions say which. Not a frame count:
-/// the daemon coalesces, so "how many frames" is not stable.
+/// Collect render bytes until every needle has arrived, the daemon hangs up,
+/// or [`BUDGET`] runs out; the caller's assertions say which. Not a frame
+/// count: the daemon coalesces, so "how many frames" is not stable. Each frame
+/// is searched once, with enough of the previous one to catch a needle split
+/// across them.
 async fn read_renders_until(
     framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
-    done: impl Fn(&[u8]) -> bool,
+    needles: &[&[u8]],
 ) -> Vec<u8> {
+    let overlap = needles.iter().map(|n| n.len()).max().unwrap_or(1) - 1;
+    let mut missing = needles.to_vec();
     let mut seen = Vec::new();
-    let deadline = tokio::time::Instant::now() + BUDGET;
-    while !done(&seen) {
-        let Ok(Some(Ok(frame))) = tokio::time::timeout_at(deadline, framed.next()).await else {
+    let deadline = shux_testkit::Deadline::start();
+    while !missing.is_empty() {
+        let Some(Some(Ok(frame))) = deadline.run(framed.next()).await else {
             break;
         };
         if let Ok(AttachServerFrame::Render { data, .. }) = serde_json::from_slice(&frame)
             && let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(&data)
         {
+            let from = seen.len().saturating_sub(overlap);
             seen.extend_from_slice(&raw);
+            missing.retain(|n| !find(&seen[from..], n));
         }
     }
     seen
@@ -335,8 +341,6 @@ fn dense_workload(dir: &Path, cols: usize, rows: usize, img: (u32, u32)) -> Stri
 }
 
 #[tokio::test]
-// TODO(#281): flaky under load; fix the timing dependence, then remove the ignore.
-#[ignore = "flaky under load: see #281"]
 async fn a_large_client_still_receives_frames_when_its_pane_holds_a_picture() {
     // The 6 MiB image budget bounds IMAGE bytes; a frame also carries cells, and
     // the sum is what the codec caps at MAX_FRAME_SIZE. The VT gate measured an
@@ -396,10 +400,7 @@ async fn a_large_client_still_receives_frames_when_its_pane_holds_a_picture() {
         AttachReady::Error { code, message } => panic!("attach denied: {code}: {message}"),
     }
 
-    let seen = read_renders_until(&mut framed, |seen| {
-        find(seen, b"\x1b_Ga=T") && find(seen, b"38;2;120;220;180")
-    })
-    .await;
+    let seen = read_renders_until(&mut framed, &[b"\x1b_Ga=T", b"38;2;120;220;180"]).await;
 
     assert!(
         find(&seen, b"\x1b_Ga=T"),

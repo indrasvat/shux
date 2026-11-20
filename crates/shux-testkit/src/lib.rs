@@ -161,6 +161,26 @@ where
     })
 }
 
+/// One [`BUDGET`] shared by a sequence of reads, such as the frames of a
+/// stream read until the one a test waits for. It bounds failure only: each
+/// read completes as soon as its future does.
+///
+/// The deadline is a tokio timer, so under a paused clock with auto-advance it
+/// fires as soon as the runtime idles.
+pub struct Deadline(tokio::time::Instant);
+
+impl Deadline {
+    /// Starts the budget now.
+    pub fn start() -> Self {
+        Self(tokio::time::Instant::now() + BUDGET)
+    }
+
+    /// `fut`'s output, or `None` once the budget has run out.
+    pub async fn run<F: Future>(&self, fut: F) -> Option<F::Output> {
+        tokio::time::timeout_at(self.0, fut).await.ok()
+    }
+}
+
 /// Whether every holder of the pipe whose read end is `read` closes its write
 /// end within [`BUDGET`]: EOF arrives only then. A pipe still held fails after
 /// the budget; one that closes passes as soon as it does.

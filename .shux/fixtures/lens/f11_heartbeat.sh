@@ -32,8 +32,9 @@ printf '\033[0m'
 
 # One repaint of the IDENTICAL heartbeat line (erase + redraw, byte-identical).
 beat() {
-	printf '\033[11;1H\033[2K\033[38;2;80;220;120mHEARTBEAT\033[0m'
-	printf '\033[24;80H'
+	# One write in DEC 2026 synchronized output: the repaint and the parked
+	# cursor are one revision, never a frame with the cursor mid-row.
+	printf '\033[?2026h\033[11;1H\033[2K\033[38;2;80;220;120mHEARTBEAT\033[0m\033[24;80H\033[?2026l'
 }
 
 # Initial frame so the pane is non-blank before the first token.

@@ -119,6 +119,7 @@ filter = '''
     (binary_id(=shux) & (
         test(=lens_scratch::production_route_tests::production_unconfirmed_kill_preserves_registry_row)
       + test(=lens_scratch::production_route_tests::production_lens_run_dropped_mid_core_leaves_no_orphan)
+      + test(=lens_scratch::production_route_tests::production_max_runtime_reap_holds_its_row_until_the_group_is_dead)
     ))
   + binary_id(=shux::scratch_reap_order)
   + (binary_id(=shux-plugin::plugin_lifecycle) & (
