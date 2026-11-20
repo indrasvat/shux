@@ -163,6 +163,14 @@ check-darwin: ## Clippy the workspace for macOS — catches cfg-gated code a Lin
 	@CLIPPY_CONF_DIR="$(CURDIR)" cargo clippy --workspace --all-targets --target aarch64-apple-darwin --color never -- -D warnings
 	@echo "$(COLOR_GREEN)✓ macOS clippy passed$(COLOR_RESET)"
 
+.PHONY: check-linux
+check-linux: ## Clippy the workspace for Linux — catches cfg-gated code a macOS build never sees
+	@echo "$(COLOR_BLUE)▶ Cross-checking x86_64-unknown-linux-gnu...$(COLOR_RESET)"
+	@rustup target list --installed | grep -qx x86_64-unknown-linux-gnu \
+	  || rustup target add x86_64-unknown-linux-gnu
+	@CLIPPY_CONF_DIR="$(CURDIR)" cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu --color never -- -D warnings
+	@echo "$(COLOR_GREEN)✓ Linux clippy passed$(COLOR_RESET)"
+
 .PHONY: check-test-groups
 check-test-groups: nextest-ready ## Assert every nextest test-group still matches the tests it bounds
 	@bash scripts/check-test-groups.sh

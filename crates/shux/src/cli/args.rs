@@ -1979,6 +1979,22 @@ impl Cli {
     }
 }
 
+/// `--wait` for the verbs that start a program in a new pane.
+#[derive(clap::Args, Debug, Clone, Default)]
+pub struct WaitArgs {
+    /// Wait for the new pane's program to exit and print how it ended, as
+    /// `pane wait-exit` does, with the same exit codes — a failed create
+    /// included. Without a command it waits for the shell to exit.
+    /// `session create --wait` does not attach.
+    #[arg(long)]
+    pub wait: bool,
+
+    /// Deadline for `--wait` (`30s`, `10m`); omitted waits as long as the
+    /// program runs.
+    #[arg(long = "wait-timeout", requires = "wait", value_parser = parse_duration_ms)]
+    pub wait_timeout: Option<u64>,
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -2789,20 +2805,4 @@ mod tests {
         assert!(help.contains("unfiltered"), "{help}");
         assert!(!help.contains("filtered to"), "{help}");
     }
-}
-
-/// `--wait` for the verbs that start a program in a new pane.
-#[derive(clap::Args, Debug, Clone, Default)]
-pub struct WaitArgs {
-    /// Wait for the new pane's program to exit and print how it ended, as
-    /// `pane wait-exit` does, with the same exit codes — a failed create
-    /// included. Without a command it waits for the shell to exit.
-    /// `session create --wait` does not attach.
-    #[arg(long)]
-    pub wait: bool,
-
-    /// Deadline for `--wait` (`30s`, `10m`); omitted waits as long as the
-    /// program runs.
-    #[arg(long = "wait-timeout", requires = "wait", value_parser = parse_duration_ms)]
-    pub wait_timeout: Option<u64>,
 }
