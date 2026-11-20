@@ -144,8 +144,9 @@ changes 20 times, next to twice as many CPU hogs as cores, on ubuntu and
 macOS (`make flake-gate BASE=origin/main`). "Changed" is an integration-test
 file, a shared helper under `tests/<dir>/` (every binary that declares it, by
 `mod` or `#[path]`), a hunk reaching a src file's `cfg(test)` code, a
-test-only src file (its module's tests, or the whole unit-test binary for a
-helper with none), or a fixture a test names. shux-testkit's dependents are
+test-only src file (its module's tests; for a helper with none, the tests of
+the modules that name it, and the whole unit-test binary only when none does),
+or a fixture a test names. shux-testkit's dependents are
 not re-run when it changes. Any failed run fails the
 job, and a run that outlasts the job's time limit fails it too. This replaces
 "stress it locally if you remember".

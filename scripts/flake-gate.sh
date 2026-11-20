@@ -9,7 +9,8 @@
 #   crates/<pkg>/src/<path>.rs         the unit tests under that module path, when a
 #                                      hunk reaches its `cfg(test)` code
 #   a test-only src file               (scripts/test-only-files.sh) its module's tests;
-#                                      the package's whole unit-test binary if it holds none
+#                                      if it holds none, the tests of the modules that
+#                                      name it, else the package's whole unit-test binary
 #   any other file under tests/ or     the tests whose sources name it (a proptest
 #   .shux/fixtures/                    regressions file: the binary it is named after)
 # shux-testkit's dependents are not re-run when it changes: that is most of the
@@ -70,6 +71,29 @@ touches_tests() {
 }
 
 terms=()
+# users_of <helper> <pkg>: the unit tests of every module in <pkg> that names
+# the test-only helper as `<leaf>::`; fails when none does, or when a user is
+# itself a helper with no tests, whose own users this does not follow.
+users_of() {
+    local f="$1" pkg="$2" leaf="${test_only[$1]##*::}" user path found=()
+    while IFS= read -r user; do
+        [[ -n "$user" && "$user" != "$f" ]] || continue
+        if [[ -n "${test_only[$user]+set}" ]]; then
+            grep -qE "$test_attr" "$user" || return 1
+            path="${test_only[$user]}"
+        else
+            path="${user#"crates/$pkg/src/"}"
+            path="${path%.rs}"
+            path="${path%/mod}"
+            [[ "$path" != lib && "$path" != main ]] || return 1
+            path="${path//\//::}"
+        fi
+        found+=("binary_id(=$pkg) & test(/^${path}::/)")
+    done < <(grep -rlE --include='*.rs' "(^|[^A-Za-z0-9_])${leaf}::" "crates/$pkg/src" || true)
+    ((${#found[@]})) || return 1
+    terms+=("${found[@]}")
+}
+
 # select_rs <file> [test]: the tests a change to this .rs file can break;
 # "test" when the change is known to reach test code (a fixture it names).
 select_rs() {
@@ -88,7 +112,7 @@ select_rs() {
         if [[ -f "$f" ]] && grep -qE "$test_attr" "$f"; then
             terms+=("binary_id(=$pkg) & test(/^${test_only[$f]}::/)")
         else
-            terms+=("binary_id(=$pkg)")
+            users_of "$f" "$pkg" || terms+=("binary_id(=$pkg)")
         fi
     else
         [[ "$known" == test ]] || touches_tests "$f" || return 0

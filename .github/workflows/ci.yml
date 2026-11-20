@@ -351,8 +351,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    # Loud, not skipped: a gate that runs out of time has gated nothing.
-    timeout-minutes: 90
+    # Loud, not skipped: a gate that runs out of time has gated nothing. #281's
+    # stack, about 1,100 selected tests, ran 4-5 min a run: twice that here.
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:

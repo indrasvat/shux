@@ -29,9 +29,11 @@ printf '#!/usr/bin/env bash\necho "FILTER: $STRESS_FILTER"\n' >scripts/test-stre
 w() { mkdir -p "$(dirname "$1")"; printf '%s\n' "${@:2}" >"$1"; }
 w crates/p/src/lib.rs 'pub mod foo;' '#[cfg(any(test, fuzzing))]' 'pub mod fz;' 'pub fn a() {}' \
     '#[cfg(test)]' 'mod tests {' '    #[test]' '    fn t() {}' '}'
-w crates/p/src/foo/mod.rs '#[cfg(test)]' 'mod tests;' '#[cfg(test)]' 'pub(crate) mod harness;' 'pub fn b() {}'
-w crates/p/src/foo/tests.rs '#[test]' 'fn t() { let x = 1; }'
+w crates/p/src/foo/mod.rs '#[cfg(test)]' 'mod tests;' '#[cfg(test)]' 'pub(crate) mod harness;' \
+    '#[cfg(test)]' 'pub(crate) mod lonely;' 'pub fn b() {}'
+w crates/p/src/foo/tests.rs '#[test]' 'fn t() { let x = 1; super::harness::h(); }'
 w crates/p/src/foo/harness.rs 'pub fn h() { let x = 1; }'
+w crates/p/src/foo/lonely.rs 'pub fn l() { let x = 1; }'
 w crates/p/src/fz.rs '#[test]' 'fn t() { let x = 1; }'
 w crates/p/src/allcfg.rs 'pub fn c() {}' '#[cfg(all(test, unix))]' 'mod tests {' '    #[test]' '    fn t() { let x = 1; }' '}'
 w crates/p/src/cmt.rs 'pub fn c() {}' '#[cfg(test)]' '// unit tests' 'mod tests {' '    #[test]' '    fn t() { let x = 1; }' '}'
@@ -86,7 +88,8 @@ edit() { perl -pi -e 's/let x = 1;/let x = 2;/' "$@"; }
 echo "flake-gate self-test"
 case_ "an integration-test binary" "edit crates/p/tests/old.rs; echo '// x' >>crates/p/tests/old.rs" 'binary_id(=p::old)'
 case_ "a test module in a file of its own" "edit crates/p/src/foo/tests.rs" 'binary_id(=p) & test(/^foo::tests::/)'
-case_ "a test-only helper with no tests: the whole unit-test binary" "edit crates/p/src/foo/harness.rs" 'binary_id(=p)'
+case_ "a test-only helper with no tests: the tests that name it" "edit crates/p/src/foo/harness.rs" 'binary_id(=p) & test(/^foo::tests::/)'
+case_ "a test-only helper nothing names: the whole unit-test binary" "edit crates/p/src/foo/lonely.rs" 'binary_id(=p)'
 case_ "a file its parent gates on cfg(any(test, fuzzing))" "edit crates/p/src/fz.rs" 'binary_id(=p) & test(/^fz::/)'
 case_ "a cfg(all(test, unix)) module" "edit crates/p/src/allcfg.rs" 'binary_id(=p) & test(/^allcfg::/)'
 case_ "a comment between cfg(test) and the module" "edit crates/p/src/cmt.rs" 'binary_id(=p) & test(/^cmt::/)'
