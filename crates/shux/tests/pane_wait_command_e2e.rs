@@ -708,7 +708,7 @@ fn pane_run_without_integration_uses_markers_and_says_so() {
 fn wait_command_output_is_exactly_what_the_command_wrote() {
     let (env, _rc, pane) = integrated(&bash());
     let floor = as_of(&env, &pane);
-    type_line(&env, "seq 1 200; printf '%0300d\\n' 7");
+    type_line(&env, "{ seq 1 200; } 2>/dev/null; printf '%0300d\\n' 7");
     let out = wait(&env, &pane, floor, "20s")
         .arg("--output")
         .output()
@@ -728,7 +728,12 @@ fn wait_command_output_is_exactly_what_the_command_wrote() {
     );
     assert!(r.get("stdout").is_none(), "{r}");
     // `pane run`'s stdout agrees with `wait-command --output` for the same text.
-    let (run, _) = pane_run(&env, &pane, "seq 1 200; printf '%0300d\\n' 7", &[]);
+    let (run, _) = pane_run(
+        &env,
+        &pane,
+        "{ seq 1 200; } 2>/dev/null; printf '%0300d\\n' 7",
+        &[],
+    );
     assert_eq!(run["stdout"].as_str(), Some(want.as_str()));
 }
 
@@ -740,7 +745,10 @@ fn pane_run_refuses_a_pane_not_at_its_prompt() {
     let floor = as_of(&env, &pane);
     type_line(
         &env,
-        "printf 'read''ing-275\\n'; read -rs secret; echo got-$secret",
+        // Echo goes off before the marker, so the answer below is never echoed;
+        // `{ …; } 2>/dev/null` keeps a fork's `child setpgid` warning out.
+        "{ stty -echo; } 2>/dev/null; printf 'read''ing-275\\n'; read -r secret; \
+         { stty echo; } 2>/dev/null; echo got-$secret",
     );
     env.wait_for("ws", &pane, "reading-275");
     let (r, code) = pane_run(&env, &pane, "echo leaked-275", &[]);
@@ -758,7 +766,11 @@ fn pane_run_refuses_a_pane_not_at_its_prompt() {
         "the refused line was typed into the prompt: {r}"
     );
 
-    type_line(&env, "printf 'sleep''ing-275\\n'; sleep 30");
+    // The child prints once it holds the terminal, not the shell before it forks.
+    type_line(
+        &env,
+        "sh -c 'printf \"sleep%sing-275\\n\" \"\"; exec sleep 30'",
+    );
     env.wait_for("ws", &pane, "sleeping-275");
     let (r, code) = pane_run(&env, &pane, "echo leaked-275", &[]);
     assert_eq!(code, Some(3), "{r}");
@@ -773,7 +785,11 @@ fn pane_run_refuses_a_program_in_front_of_a_shell_without_integration() {
     let env = Env::new(80, 24);
     let rc = tempfile::tempdir().expect("rc dir");
     let pane = start(&env, &rc, &bash(), false);
-    type_line(&env, "printf 'sleep''ing-275\\n'; sleep 30");
+    // The child prints once it holds the terminal, not the shell before it forks.
+    type_line(
+        &env,
+        "sh -c 'printf \"sleep%sing-275\\n\" \"\"; exec sleep 30'",
+    );
     env.wait_for("ws", &pane, "sleeping-275");
     // Without marks a program in front is waited out, up to the timeout.
     let (r, code) = pane_run(&env, &pane, "echo leaked-275", &["--timeout", "2"]);
@@ -876,12 +892,17 @@ fn a_line_submitted_and_not_yet_started_is_never_typed_behind() {
     let ps0 = format!("PS0='$(read -r _ < {})'\n", gate.display());
     let pane = start_with(&env, &rc, &bash(), true, &ps0);
     let floor = as_of(&env, &pane);
-    type_line(&env, "printf 'pass: '; read -rs x; echo got-$x");
+    type_line(
+        &env,
+        "{ stty -echo; } 2>/dev/null; printf 'pa''ss: '; read -r x; \
+         { stty echo; } 2>/dev/null; echo got-$x",
+    );
     env.wait_for("ws", &pane, "got-$x");
     let (r, code) = pane_run(&env, &pane, "echo leaked-275", &["--timeout", "5"]);
     assert_eq!(code, Some(3), "{r}");
     assert_eq!(r["error"]["data"]["reason"], "input_pending", "{r}");
     std::fs::write(&gate, "go\n").expect("release the line");
+    env.wait_for("ws", &pane, "pass:");
     type_line(&env, "pw");
     let r = result(
         &wait(&env, &pane, floor, "20s")
@@ -1126,7 +1147,7 @@ fn echo_off_is_not_taken_for_a_password_prompt() {
         &pane,
         // why: the sleep holds echo off while nothing reads; load only lengthens that window
         // ast-grep-ignore: test-sleep-then-act
-        "stty -echo; sleep 2; stty echo; echo done",
+        "{ stty -echo; sleep 2; stty echo; } 2>/dev/null; echo done",
         &["--timeout", "20"],
     );
     assert_eq!(
