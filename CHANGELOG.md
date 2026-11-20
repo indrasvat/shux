@@ -1,3 +1,10 @@
+## [0.57.3](https://github.com/indrasvat/shux/compare/v0.57.2...v0.57.3) (2026-11-20)
+
+
+### Bug Fixes
+
+* **test:** the tests disabled as flaky under load, fixed at their root cause ([#283](https://github.com/indrasvat/shux/issues/283)) ([15f4240](https://github.com/indrasvat/shux/commit/15f424091e595bf35e7d1d38bfe5b56aa0fbd1c2)), closes [#281](https://github.com/indrasvat/shux/issues/281) [#279](https://github.com/indrasvat/shux/issues/279) [#281](https://github.com/indrasvat/shux/issues/281) [#281](https://github.com/indrasvat/shux/issues/281) [#281](https://github.com/indrasvat/shux/issues/281) [#281](https://github.com/indrasvat/shux/issues/281) [#281](https://github.com/indrasvat/shux/issues/281) [#281](https://github.com/indrasvat/shux/issues/281) [#281](https://github.com/indrasvat/shux/issues/281) [#281](https://github.com/indrasvat/shux/issues/281) [#281](https://github.com/indrasvat/shux/issues/281) [#281](https://github.com/indrasvat/shux/issues/281) [#281](https://github.com/indrasvat/shux/issues/281) [#281](https://github.com/indrasvat/shux/issues/281) [#281](https://github.com/indrasvat/shux/issues/281) [#281](https://github.com/indrasvat/shux/issues/281) [#281](https://github.com/indrasvat/shux/issues/281)
+
 ## [0.57.2](https://github.com/indrasvat/shux/compare/v0.57.1...v0.57.2) (2026-11-19)
 
 
