@@ -464,6 +464,12 @@ unchanged_since() {
         add_error "$scope: $label '$sha' is not a commit in this repository"
         return
     fi
+    # A rebase leaves the old commit in the local object store, where the
+    # check above finds it; a CI clone does not have it.
+    if ! git merge-base --is-ancestor "$sha" HEAD; then
+        add_error "$scope: $label ${sha:0:10} is not in this branch's history; re-run on the current code"
+        return
+    fi
     for file in "$@"; do
         git diff --cached --quiet "$sha" -- "$file" || stale+=("$file")
     done
