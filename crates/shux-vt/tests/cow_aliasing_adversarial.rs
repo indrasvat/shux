@@ -187,6 +187,8 @@ impl SyncWatch {
     /// less than N deadlines of wall clock. Anything above that ceiling is the
     /// freeze releasing windows, not the machine being slow.
     fn assert_expiries_fit_the_clock(&self, what: &str) {
+        // why: a ceiling derived from elapsed time; load adds time, so it only loosens
+        // ast-grep-ignore: test-wall-clock
         let elapsed_ms = self.started.elapsed().as_millis() as u64;
         let budget = elapsed_ms / SYNC_UPDATE_TIMEOUT_MS + 1;
         assert!(

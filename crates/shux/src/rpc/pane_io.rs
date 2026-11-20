@@ -71,7 +71,7 @@ async fn send_to_pane(
 }
 
 /// Register pane I/O methods (send_keys, run_command, command_status, command_cancel, capture).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 pub(crate) fn register_pane_io_methods(
     builder: shux_rpc::RouterBuilder,
     graph: shux_core::graph::GraphHandle,

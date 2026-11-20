@@ -822,7 +822,7 @@ pub(crate) fn resolve_pane_spawn(
 /// `shux_pty::PtyError` (rather than an `RpcError`) so callers can map it
 /// to their own error code — `lens.run` needs `SPAWN_FAILED (-32014)`,
 /// every other caller keeps mapping to `internal()`.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 pub(crate) async fn spawn_pane_pty(
     pane_id: shux_core::model::PaneId,
     cwd: PathBuf,
@@ -1034,7 +1034,7 @@ pub(crate) async fn undo_window_create(graph: &shux_core::graph::GraphHandle, cr
 /// Like [`spawn_pane_pty`] but arms `cast_recorder` (a pre-opened recorder) BEFORE the read loop
 /// starts, so the recording captures the child's very first bytes — alt-screen setup, initial
 /// geometry, early output — with no post-spawn race (task 083 cast; council: arm at spawn).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 pub(crate) async fn spawn_pane_pty_with_recorder(
     pane_id: shux_core::model::PaneId,
     cwd: PathBuf,
@@ -1145,7 +1145,7 @@ impl Drop for SpawnTicket {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 async fn spawn_pane_pty_unshared(
     pane_id: shux_core::model::PaneId,
     cwd: PathBuf,
@@ -2264,10 +2264,10 @@ mod tests {
         .await
         .unwrap();
         let mut seen = Vec::new();
-        let deadline = tokio::time::Instant::now() + shux_testkit::BUDGET;
+        let deadline = shux_testkit::Deadline::start();
         while !String::from_utf8_lossy(&seen).contains("LAST") {
-            match tokio::time::timeout_at(deadline, sub.recv()).await {
-                Ok(Some(shux_core::bus::PaneOutputSubscriptionEvent::Chunk(c)))
+            match deadline.run(sub.recv()).await {
+                Some(Some(shux_core::bus::PaneOutputSubscriptionEvent::Chunk(c)))
                     if c.pane_id == pane =>
                 {
                     seen.extend(
@@ -2276,8 +2276,8 @@ mod tests {
                             .unwrap(),
                     );
                 }
-                Ok(Some(_)) => {}
-                Ok(None) | Err(_) => break,
+                Some(Some(_)) => {}
+                Some(None) | None => break,
             }
         }
         h.stop().await;
@@ -2507,9 +2507,8 @@ mod tests {
         let mut events = bus.subscribe_filtered(vec!["pane.zoomed".into()]);
         undo_split(&gh, new, prior).await;
         assert_eq!(zoom_focus(&gh, window), (None, a));
-        let stray =
-            tokio::time::timeout(std::time::Duration::from_millis(200), events.recv()).await;
-        assert!(stray.is_err(), "undo fired a zoom event: {stray:?}");
+        let stray = events.try_recv();
+        assert!(stray.is_none(), "undo fired a zoom event: {stray:?}");
         cancel.cancel();
     }
 

@@ -708,7 +708,7 @@ fn pane_run_without_integration_uses_markers_and_says_so() {
 fn wait_command_output_is_exactly_what_the_command_wrote() {
     let (env, _rc, pane) = integrated(&bash());
     let floor = as_of(&env, &pane);
-    type_line(&env, "seq 1 200; printf '%0300d\\n' 7");
+    type_line(&env, "{ seq 1 200; } 2>/dev/null; printf '%0300d\\n' 7");
     let out = wait(&env, &pane, floor, "20s")
         .arg("--output")
         .output()
@@ -728,7 +728,12 @@ fn wait_command_output_is_exactly_what_the_command_wrote() {
     );
     assert!(r.get("stdout").is_none(), "{r}");
     // `pane run`'s stdout agrees with `wait-command --output` for the same text.
-    let (run, _) = pane_run(&env, &pane, "seq 1 200; printf '%0300d\\n' 7", &[]);
+    let (run, _) = pane_run(
+        &env,
+        &pane,
+        "{ seq 1 200; } 2>/dev/null; printf '%0300d\\n' 7",
+        &[],
+    );
     assert_eq!(run["stdout"].as_str(), Some(want.as_str()));
 }
 
@@ -740,7 +745,10 @@ fn pane_run_refuses_a_pane_not_at_its_prompt() {
     let floor = as_of(&env, &pane);
     type_line(
         &env,
-        "printf 'read''ing-275\\n'; read -rs secret; echo got-$secret",
+        // Echo goes off before the marker, so the answer below is never echoed;
+        // `{ …; } 2>/dev/null` keeps a fork's `child setpgid` warning out.
+        "{ stty -echo; } 2>/dev/null; printf 'read''ing-275\\n'; read -r secret; \
+         { stty echo; } 2>/dev/null; echo got-$secret",
     );
     env.wait_for("ws", &pane, "reading-275");
     let (r, code) = pane_run(&env, &pane, "echo leaked-275", &[]);
@@ -758,7 +766,11 @@ fn pane_run_refuses_a_pane_not_at_its_prompt() {
         "the refused line was typed into the prompt: {r}"
     );
 
-    type_line(&env, "printf 'sleep''ing-275\\n'; sleep 30");
+    // The child prints once it holds the terminal, not the shell before it forks.
+    type_line(
+        &env,
+        "sh -c 'printf \"sleep%sing-275\\n\" \"\"; exec sleep 30'",
+    );
     env.wait_for("ws", &pane, "sleeping-275");
     let (r, code) = pane_run(&env, &pane, "echo leaked-275", &[]);
     assert_eq!(code, Some(3), "{r}");
@@ -773,7 +785,11 @@ fn pane_run_refuses_a_program_in_front_of_a_shell_without_integration() {
     let env = Env::new(80, 24);
     let rc = tempfile::tempdir().expect("rc dir");
     let pane = start(&env, &rc, &bash(), false);
-    type_line(&env, "printf 'sleep''ing-275\\n'; sleep 30");
+    // The child prints once it holds the terminal, not the shell before it forks.
+    type_line(
+        &env,
+        "sh -c 'printf \"sleep%sing-275\\n\" \"\"; exec sleep 30'",
+    );
     env.wait_for("ws", &pane, "sleeping-275");
     // Without marks a program in front is waited out, up to the timeout.
     let (r, code) = pane_run(&env, &pane, "echo leaked-275", &["--timeout", "2"]);
@@ -828,11 +844,12 @@ fn zsh_a_parse_error_is_not_run() {
 /// and `wait-command --after <as_of>` still gets it.
 #[test]
 fn a_timed_out_run_can_be_waited_on_to_its_end() {
-    let (env, _rc, pane) = integrated(&bash());
+    let (env, rc, pane) = integrated(&bash());
+    let gate = shux_testkit::gate(rc.path(), "late");
     let (r, code) = pane_run(
         &env,
         &pane,
-        "echo early; sleep 3; echo late",
+        &format!("echo early; read -r _ < {}; echo late", gate.display()),
         &["--timeout", "1"],
     );
     assert_eq!(
@@ -840,13 +857,16 @@ fn a_timed_out_run_can_be_waited_on_to_its_end() {
         (Some("timed_out"), Some(1)),
         "{r}"
     );
-    assert_eq!(
-        r["stdout"], "early\n",
-        "what it wrote before the timeout: {r}"
+    // The timeout races the command's first write; load only shortens this.
+    let frozen = r["stdout"].as_str().unwrap_or_default();
+    assert!(
+        "early\n".starts_with(frozen),
+        "what it wrote before the timeout, and nothing else: {r}"
     );
     let after = r["as_of"]
         .as_u64()
         .unwrap_or_else(|| panic!("no as_of: {r}"));
+    shux_testkit::open_gate(&gate);
     let r = result(
         &wait(&env, &pane, after, "20s")
             .arg("--output")
@@ -872,12 +892,17 @@ fn a_line_submitted_and_not_yet_started_is_never_typed_behind() {
     let ps0 = format!("PS0='$(read -r _ < {})'\n", gate.display());
     let pane = start_with(&env, &rc, &bash(), true, &ps0);
     let floor = as_of(&env, &pane);
-    type_line(&env, "printf 'pass: '; read -rs x; echo got-$x");
+    type_line(
+        &env,
+        "{ stty -echo; } 2>/dev/null; printf 'pa''ss: '; read -r x; \
+         { stty echo; } 2>/dev/null; echo got-$x",
+    );
     env.wait_for("ws", &pane, "got-$x");
     let (r, code) = pane_run(&env, &pane, "echo leaked-275", &["--timeout", "5"]);
     assert_eq!(code, Some(3), "{r}");
     assert_eq!(r["error"]["data"]["reason"], "input_pending", "{r}");
     std::fs::write(&gate, "go\n").expect("release the line");
+    env.wait_for("ws", &pane, "pass:");
     type_line(&env, "pw");
     let r = result(
         &wait(&env, &pane, floor, "20s")
@@ -1120,7 +1145,9 @@ fn echo_off_is_not_taken_for_a_password_prompt() {
     let (r, code) = pane_run(
         &env,
         &pane,
-        "stty -echo; sleep 2; stty echo; echo done",
+        // why: the sleep holds echo off while nothing reads; load only lengthens that window
+        // ast-grep-ignore: test-sleep-then-act
+        "{ stty -echo; sleep 2; stty echo; } 2>/dev/null; echo done",
         &["--timeout", "20"],
     );
     assert_eq!(
@@ -1326,6 +1353,8 @@ fn a_hook_reading_input_after_an_accepted_line_is_never_typed_into() {
     let (env, _rc, pane) = integrated(&bash());
     type_line(
         &env,
+        // why: the next line is accepted only after this one ends, so PS0 is set first however long the sleep runs
+        // ast-grep-ignore: test-sleep-then-act
         "sleep 2; PS0='$(printf \"HO\"\"LD>\" >&2; read -r gate)'\"$PS0\"",
     );
     type_line(&env, "printf OTHER");

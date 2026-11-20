@@ -16,34 +16,29 @@ fn text_cell(text: &str, row: usize, col: usize) -> Option<char> {
     text.lines().nth(row).and_then(|r| r.chars().nth(col))
 }
 
-/// Frame identity from the F3 checksum column (col 79) of a glance's text:
-/// frame A digits are r%10, frame B digits are (r+5)%10.
-fn checksum_frame(text: &str, rows: usize) -> Option<char> {
-    let mut is_a = true;
-    let mut is_b = true;
-    for r in 0..rows {
-        let want_a = std::char::from_digit((r % 10) as u32, 10).unwrap();
-        let want_b = std::char::from_digit(((r + 5) % 10) as u32, 10).unwrap();
-        match text_cell(text, r, 79) {
-            Some(c) if c == want_a && c != want_b => is_b = false,
-            Some(c) if c == want_b && c != want_a => is_a = false,
-            Some(c) if c == want_a && c == want_b => {}
-            _ => {
-                is_a = false;
-                is_b = false;
-            }
-        }
+/// The F3 frame a glance's text shows at (`row`, `col`): the fill letter, or
+/// in the checksum column (79) the row's digit, r%10 for A and (r+5)%10 for B.
+fn text_frame(text: &str, row: usize, col: usize) -> char {
+    let c = text_cell(text, row, col).expect("glance text cell");
+    if col != 79 {
+        assert!(c == 'A' || c == 'B', "F3 text at {row},{col} is {c:?}");
+        return c;
     }
-    match (is_a, is_b) {
-        (true, false) => Some('A'),
-        (false, true) => Some('B'),
-        _ => None,
+    let digit = |n: usize| std::char::from_digit((n % 10) as u32, 10).unwrap();
+    match c {
+        _ if c == digit(row) => 'A',
+        _ if c == digit(row + 5) => 'B',
+        _ => panic!("F3 checksum at row {row} is {c:?}"),
     }
 }
 
-/// Assert one glance envelope is an internally-consistent single F3 frame.
-/// Decodes the PNG exactly once (p0-council-r1 minor 14) and validates probe
-/// colors exactly (minor 13).
+/// Assert one glance's PNG and text show the same F3 frame at every probed
+/// cell, with exact probe colours and one PNG decode.
+///
+/// The presented grid itself may be torn: a writer stalled past
+/// `SYNC_UPDATE_TIMEOUT_MS` has the live grid shown mid-frame. F3 writes rows
+/// top to bottom, so such a grid changes frame once in row-major order, and a
+/// glance whose PNG and text came from different grids disagrees at a cell.
 fn assert_untorn_f3_glance(env: &RpcEnvelope, cw: u32, ch: u32, ctx: &str) {
     let g = env.expect_result(ctx);
     let text = g["text"].as_str().expect("glance text");
@@ -54,33 +49,36 @@ fn assert_untorn_f3_glance(env: &RpcEnvelope, cw: u32, ch: u32, ctx: &str) {
             .expect("decode glance png")
     };
     let img = decode_png(&png);
+    // The drawn cursor covers its cell's background; F3 parks it at 23,79.
+    let cursor = g["cursor"]["visible"]
+        .as_bool()
+        .expect("glance cursor.visible")
+        .then(|| (g["cursor"]["row"].as_u64(), g["cursor"]["col"].as_u64()));
 
-    // (a) PNG background at three cells → frame identity (exact colors).
-    let pa = classify_frame_exact(probe_cell_bg_img(&img, 0, 0, cw, ch), 0);
-    let pb = classify_frame_exact(probe_cell_bg_img(&img, 40, 12, cw, ch), 12);
-    let pc = classify_frame_exact(probe_cell_bg_img(&img, 40, 23, cw, ch), 23);
+    let mut frames = String::with_capacity(24 * 3);
+    for row in 0..24u32 {
+        for col in [0u32, 40, 79] {
+            let tx = text_frame(text, row as usize, col as usize);
+            if cursor == Some((Some(row.into()), Some(col.into()))) {
+                frames.push(tx);
+                continue;
+            }
+            let px = classify_frame_exact(probe_cell_bg_img(&img, col, row, cw, ch), row);
+            assert_eq!(
+                px, tx,
+                "{ctx}: PNG frame {px} != text frame {tx} at row {row} col {col} (torn glance)"
+            );
+            frames.push(px);
+        }
+    }
+    let switches = frames
+        .as_bytes()
+        .windows(2)
+        .filter(|w| w[0] != w[1])
+        .count();
     assert!(
-        pa == pb && pb == pc,
-        "{ctx}: PNG probes disagree: {pa}{pb}{pc}"
-    );
-
-    // (b) text chars at the same three cells.
-    let ta = text_cell(text, 0, 0).unwrap();
-    let tb = text_cell(text, 12, 40).unwrap();
-    let tc = text_cell(text, 23, 40).unwrap();
-    assert!(
-        ta == tb && tb == tc,
-        "{ctx}: text cells disagree: {ta}{tb}{tc}"
-    );
-
-    // (c) checksum column matches that frame.
-    let ck = checksum_frame(text, 24).expect("checksum column not a clean frame");
-    assert_eq!(ck, ta, "{ctx}: checksum frame != text frame");
-
-    // (d) PNG identity == text identity.
-    assert_eq!(
-        pa, ta,
-        "{ctx}: PNG frame {pa} != text frame {ta} (torn glance)"
+        switches <= 1,
+        "{ctx}: the presented frames switch {switches} times, row-major: {frames}"
     );
 }
 
@@ -111,11 +109,15 @@ fn g1_glance_atomicity_under_concurrent_flips() {
         // The pump returns true iff it stopped because the done-flag was set;
         // stopping at the deadline means late glances raced a quiet pane.
         let pump = scope.spawn(|| {
+            // why: bounds a pump whose sibling panicked; success is the done-flag, never the clock
+            // ast-grep-ignore: test-wall-clock
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
             loop {
                 if done.load(Ordering::Relaxed) {
                     break true; // stopped by flag — glances all finished first
                 }
+                // why: the panic bound set above; success is the done-flag, never the clock
+                // ast-grep-ignore: test-wall-clock
                 if std::time::Instant::now() >= deadline {
                     break false; // panic bound hit while glances still running
                 }

@@ -123,7 +123,6 @@ pub enum RunnerSignal {
 
 impl RunnerSignal {
     /// The wire tag (`signal` field value) — handy for tests (compare/bless assertions).
-    #[allow(dead_code)]
     pub fn kind(&self) -> &'static str {
         match self {
             RunnerSignal::ScenarioStart { .. } => "scenario_start",

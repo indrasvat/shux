@@ -104,10 +104,6 @@ struct EventBusInner {
     /// gap-detect each independently. Held across the send so chunks reach
     /// subscribers in seq order.
     data_seq: Mutex<u64>,
-
-    /// Configuration (kept for introspection).
-    #[allow(dead_code)]
-    config: EventBusConfig,
 }
 
 /// Ring buffer for event history.
@@ -138,12 +134,6 @@ impl EventHistory {
     /// Get the oldest sequence number in the history.
     fn oldest_seq(&self) -> Option<u64> {
         self.buffer.front().map(|e| e.meta.seq)
-    }
-
-    /// Get the newest sequence number in the history.
-    #[allow(dead_code)]
-    fn newest_seq(&self) -> Option<u64> {
-        self.buffer.back().map(|e| e.meta.seq)
     }
 
     /// Get events from a given sequence number onwards.
@@ -205,7 +195,6 @@ impl EventBus {
                 history: RwLock::new(EventHistory::new(config.history_capacity)),
                 data_plane,
                 data_seq: Mutex::new(1),
-                config,
             }),
         }
     }
@@ -420,6 +409,22 @@ impl Subscription {
                 Err(broadcast::error::RecvError::Closed) => {
                     return None;
                 }
+            }
+        }
+    }
+
+    /// The next already-published event matching the filters, without waiting.
+    /// `None` when none is queued or the bus is shut down. A graph mutation
+    /// publishes its events before it returns, so once it has, they are here.
+    pub fn try_recv(&mut self) -> Option<SubscriptionEvent> {
+        loop {
+            match self.receiver.try_recv() {
+                Ok(event) if self.matches(&event) => return Some(SubscriptionEvent::Event(event)),
+                Ok(_) => continue,
+                Err(broadcast::error::TryRecvError::Lagged(count)) => {
+                    return Some(SubscriptionEvent::Lagged(count));
+                }
+                Err(_) => return None,
             }
         }
     }
@@ -1026,11 +1031,12 @@ mod tests {
             },
             SubscriptionEvent::Lagged(_) => panic!("unexpected lag"),
         }
-        // No further control-plane event.
-        let nothing = tokio::time::timeout(Duration::from_millis(20), control_sub.recv()).await;
+        // Both were published before this read: a data-plane event that
+        // reached this subscriber would be queued behind SessionCreated.
+        let leaked = control_sub.try_recv();
         assert!(
-            nothing.is_err(),
-            "data-plane publish must NOT show up on control subscribers",
+            leaked.is_none(),
+            "data-plane publish must NOT show up on control subscribers: {leaked:?}",
         );
 
         // Data subscriber sees the chunk.

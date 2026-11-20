@@ -27,7 +27,7 @@ use crate::{onboarding, session_meta, statusbar_build, statusbar_runner};
 /// outputs; `populate_bar` appends them into the same StatusBar the
 /// attach loop assembles, so PNG snapshots match what an attached
 /// client renders.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 pub(crate) async fn build_snapshot_status_bar(
     snap: &shux_core::graph::SessionGraphSnapshot,
     session_id: &shux_core::model::SessionId,
@@ -209,7 +209,7 @@ pub(crate) type PaneRevisions = std::collections::HashMap<shux_core::model::Pane
 /// Compose every pane in `window_id` into a single ComposedFrame at
 /// `cols × rows`, rasterize it, and return the JSON `pane.snapshot`-shaped
 /// response (with `window_id` in place of `pane_id`).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 pub(crate) async fn snapshot_window(
     // The caller's graph snapshot — taken ONCE and shared with any metadata
     // the caller derives (lens council P1 major 5: session.snapshot's

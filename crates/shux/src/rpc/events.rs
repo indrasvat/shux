@@ -607,6 +607,8 @@ mod tests {
     ) -> (serde_json::Value, Duration) {
         let started = tokio::time::Instant::now();
         let result = dispatch_ok(&harness.router, "events.watch", params).await;
+        // why: every caller pauses the tokio clock, so this reads driven time, not load
+        // ast-grep-ignore: test-wall-clock-unit
         (result, started.elapsed())
     }
 

@@ -175,7 +175,10 @@ pub enum Command {
 
     /// Internal: start the daemon (used by auto-start, not for users)
     #[command(name = "__daemon", hide = true)]
-    #[allow(non_camel_case_types)]
+    #[expect(
+        non_camel_case_types,
+        reason = "the hidden subcommand's name is its argv spelling"
+    )]
     __daemon,
 }
 
@@ -1710,9 +1713,10 @@ above are pane primitives under `shux pane \u{2026}`, not `shux lens \u{2026}`."
 
 #[derive(Subcommand, Debug)]
 #[command(after_help = LENS_LOOP_RECIPE)]
-// A CLI arg enum parsed once per invocation, not stored hot — the `Gate` variant's rich
-// 082 flag set makes it larger than `Run`, but boxing clap-derived fields buys nothing.
-#[allow(clippy::large_enum_variant)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "clap-derived and parsed once; boxing fields buys nothing"
+)]
 pub enum LensCommand {
     /// Spawn `argv` directly (no shell, ever) in a hidden, quota-bounded
     /// scratch session. Mirrors `lens.run` RPC (lens PRD §8,
@@ -1973,6 +1977,22 @@ impl Cli {
         }
         crate::daemon::socket_path().unwrap_or_else(|_| PathBuf::from("/tmp/shux/shux.sock"))
     }
+}
+
+/// `--wait` for the verbs that start a program in a new pane.
+#[derive(clap::Args, Debug, Clone, Default)]
+pub struct WaitArgs {
+    /// Wait for the new pane's program to exit and print how it ended, as
+    /// `pane wait-exit` does, with the same exit codes — a failed create
+    /// included. Without a command it waits for the shell to exit.
+    /// `session create --wait` does not attach.
+    #[arg(long)]
+    pub wait: bool,
+
+    /// Deadline for `--wait` (`30s`, `10m`); omitted waits as long as the
+    /// program runs.
+    #[arg(long = "wait-timeout", requires = "wait", value_parser = parse_duration_ms)]
+    pub wait_timeout: Option<u64>,
 }
 
 #[cfg(test)]
@@ -2785,20 +2805,4 @@ mod tests {
         assert!(help.contains("unfiltered"), "{help}");
         assert!(!help.contains("filtered to"), "{help}");
     }
-}
-
-/// `--wait` for the verbs that start a program in a new pane.
-#[derive(clap::Args, Debug, Clone, Default)]
-pub struct WaitArgs {
-    /// Wait for the new pane's program to exit and print how it ended, as
-    /// `pane wait-exit` does, with the same exit codes — a failed create
-    /// included. Without a command it waits for the shell to exit.
-    /// `session create --wait` does not attach.
-    #[arg(long)]
-    pub wait: bool,
-
-    /// Deadline for `--wait` (`30s`, `10m`); omitted waits as long as the
-    /// program runs.
-    #[arg(long = "wait-timeout", requires = "wait", value_parser = parse_duration_ms)]
-    pub wait_timeout: Option<u64>,
 }

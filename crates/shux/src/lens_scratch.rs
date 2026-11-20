@@ -277,7 +277,6 @@ enum ChainAnchor<'a> {
 /// [`ChainAnchor`]), a `prev_hash` that does not match the running head,
 /// or a stored `hash` that does not match the recomputation over
 /// `sha256(prev_hash ‖ canonical(entry sans `hash`))`.
-#[allow(dead_code)]
 fn verify_chain_file(path: &Path, anchor: ChainAnchor<'_>) -> Result<(usize, String), String> {
     let text =
         std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
@@ -382,10 +381,8 @@ fn is_rotated_audit_path(path: &Path) -> bool {
 /// a direct rotated-file argument would resolve the wrong sibling set and
 /// self-justify its continuation header).
 ///
-/// Consumed by the unit + black-box test suites today (hence the
-/// dead-code allowance on the non-test build); the natural future surface
-/// is a `shux lens audit verify` CLI verb — P6 CLI-polish material.
-#[allow(dead_code)]
+/// Consumed by the unit + black-box test suites today; the natural future
+/// surface is a `shux lens audit verify` CLI verb — P6 CLI-polish material.
 pub fn verify_chain(path: &Path) -> Result<usize, String> {
     if is_rotated_audit_path(path) {
         return Err(format!(
@@ -427,7 +424,6 @@ pub fn verify_chain(path: &Path) -> Result<usize, String> {
 /// header — its predecessor was legitimately discarded by keep-5), so a
 /// prefix deletion inside the oldest file is caught too.
 /// Returns the total number of verified entries across the set.
-#[allow(dead_code)]
 pub fn verify_chain_set(live_path: &Path) -> Result<usize, String> {
     if is_rotated_audit_path(live_path) {
         return Err(format!(
@@ -1635,7 +1631,7 @@ async fn group_ended(ended: Option<tokio::sync::watch::Receiver<Option<bool>>>) 
 /// arm first so a simultaneous wake can never start a timer reap that an
 /// explicit kill already owns (P5 round-1 claude N6); the `claim()` below
 /// closes the remaining race window (both paths reap exactly once).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 async fn scratch_reaper(
     session_id: SessionId,
     pane_id: PaneId,

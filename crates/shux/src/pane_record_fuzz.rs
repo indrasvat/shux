@@ -315,15 +315,11 @@ impl Model {
         });
         // Path resolution runs on a blocking thread; wait until this start
         // has reserved or finished, so the run does not depend on how fast
-        // that thread is (bounded: a stuck start fails the run).
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        // that thread is. A stuck start hangs the run, and the test runner's
+        // or the fuzzer's own timeout fails it: the clock here is paused.
         while !done.load(std::sync::atomic::Ordering::SeqCst)
             && self.rec.entry_count() <= reservations
         {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "a start neither reserved nor finished"
-            );
             tokio::task::yield_now().await;
         }
     }

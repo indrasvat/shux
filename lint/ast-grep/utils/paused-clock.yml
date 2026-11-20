@@ -1,0 +1,43 @@
+# On a driven clock (paused tokio time, or shux-vt's test_clock seam), elapsed
+# time is deterministic. Only the real thing counts: a `#[tokio::test]`
+# attribute with `start_paused = true`, or a `tokio::time::pause();` /
+# `let _ = test_clock::Frozen::new();` statement that runs before the code in
+# its own or an enclosing block.
+id: paused-clock
+language: rust
+utils:
+  driven:
+    any:
+      - kind: expression_statement
+        has:
+          any:
+            - pattern: tokio::time::pause()
+            - pattern: time::pause()
+      - kind: let_declaration
+        has:
+          field: value
+          any:
+            - pattern: test_clock::Frozen::new()
+            - pattern: Frozen::new()
+rule:
+  any:
+    - inside:
+        stopBy: end
+        kind: function_item
+        follows:
+          stopBy:
+            not:
+              any:
+                - kind: attribute_item
+                - kind: line_comment
+                - kind: block_comment
+          kind: attribute_item
+          regex: '^#\[\s*(::)?tokio::test\s*\((?s:.)*\bstart_paused\s*=\s*true\b'
+    - follows:
+        stopBy: end
+        matches: driven
+    - inside:
+        stopBy: end
+        follows:
+          stopBy: end
+          matches: driven

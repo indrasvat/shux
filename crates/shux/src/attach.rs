@@ -341,7 +341,7 @@ async fn reserve_input(
 
 /// Run the attach UDS listener. Each accepted connection spawns an
 /// independent attach session task. Runs until `cancel` fires.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 pub async fn run_attach_server(
     socket_path: std::path::PathBuf,
     graph: GraphHandle,
@@ -426,7 +426,7 @@ trait AttachStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin 
 impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static> AttachStream for S {}
 
 /// Handle one attach connection: handshake, then run the streaming loop.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 async fn handle_attach_connection(
     stream: impl AttachStream,
     graph: GraphHandle,
@@ -872,7 +872,7 @@ async fn send_ready_error(
 
 /// Main attach loop after handshake. Owns the render compositor and
 /// dispatches all client frames.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 async fn run_attach_loop(
     framed: Framed<impl AttachStream, tokio_util::codec::LengthDelimitedCodec>,
     graph: GraphHandle,
@@ -1528,7 +1528,7 @@ async fn run_attach_loop(
 /// it grabs a fresh `SessionGraphSnapshot`, walks all panes in the
 /// active window, runs the multi-pane compositor over a `Vec<u8>`
 /// buffer, then ships the bytes as a `Render` frame.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 async fn run_render_loop(
     graph: GraphHandle,
     io_state: Arc<Mutex<PaneIoState>>,
@@ -2254,7 +2254,7 @@ fn border_at(
     None
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 async fn handle_mouse_selection(
     kind: MouseKind,
     button: ProtoMouseButton,
@@ -2462,7 +2462,7 @@ async fn handle_mouse_selection(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 async fn handle_copy_mode_mouse(
     kind: MouseKind,
     button: ProtoMouseButton,
@@ -2625,7 +2625,7 @@ async fn handle_copy_mode_mouse(
     Ok(true)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 async fn handle_mouse(
     kind: MouseKind,
     button: ProtoMouseButton,
@@ -2768,7 +2768,7 @@ enum AppMouseRoute {
 /// 5. a pane whose app never asked for the mouse is shux's
 /// 6. an app that cannot decode what shux would send keeps nothing — shux does
 /// 7. everything else belongs to the app
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 fn route_app_mouse(
     gesture: SelectionDrag,
     border_drag_active: bool,
@@ -2910,7 +2910,7 @@ fn holds(rect: Rect, col: u16, row: u16) -> bool {
 /// whose app asked for the mouse, the mouse is the app's. `handle_wheel` stays
 /// the sole authority on scroll ticks — this returns [`AppMouse::NotHandled`]
 /// for them so the scrollback, alt-scroll and forward tiers keep working.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 async fn handle_app_mouse(
     kind: MouseKind,
     button: ProtoMouseButton,
@@ -3353,7 +3353,7 @@ async fn forward_bytes_to_pane(
 /// Handle a scroll-wheel event while copy mode is NOT active. Returns `Ok(true)`
 /// if the event was a wheel event (and thus consumed), `Ok(false)` otherwise so
 /// the caller falls through to the layout/focus mouse handler.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 async fn handle_wheel(
     kind: MouseKind,
     col: u16,
@@ -3684,7 +3684,7 @@ async fn current_viewport(client_size: &ClientSize, config: &ConfigHandle) -> Re
 }
 
 /// Dispatch an Action keybinding from the client.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 async fn handle_action(
     kind: ActionKind,
     args: shux_rpc::attach::ActionArgs,
@@ -4524,6 +4524,8 @@ mod tests {
         let mut attached = fixture.attached.clone();
         attached.help_visible = true;
         // Past the seconds tier, so the uptime segment holds still.
+        // why: a start instant handed in as data; time passing only moves it further past the tier
+        // ast-grep-ignore: test-wall-clock-unit
         let daemon_start = std::time::Instant::now()
             .checked_sub(Duration::from_secs(61))
             .expect("monotonic clock past 61 s");
@@ -4545,14 +4547,14 @@ mod tests {
         ));
 
         let mut screen = shux_vt::VirtualTerminal::new(40, 100);
-        let deadline = tokio::time::Instant::now() + shux_testkit::BUDGET;
+        let deadline = shux_testkit::Deadline::start();
         while !screen.capture_text(None).contains("keybindings") {
-            match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(AttachServerFrame::Render { data, .. })) => {
+            match deadline.run(rx.recv()).await {
+                Some(Some(AttachServerFrame::Render { data, .. })) => {
                     screen.process(&BASE64.decode(data).expect("render base64"));
                 }
-                Ok(Some(_)) => {}
-                Ok(None) | Err(_) => panic!("the help sheet was never drawn"),
+                Some(Some(_)) => {}
+                Some(None) | None => panic!("the help sheet was never drawn"),
             }
         }
 
@@ -4583,16 +4585,16 @@ mod tests {
 
         let mut idle_frames = 0;
         let drew = loop {
-            match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(AttachServerFrame::Render { data, .. })) => {
+            match deadline.run(rx.recv()).await {
+                Some(Some(AttachServerFrame::Render { data, .. })) => {
                     screen.process(&BASE64.decode(data).expect("render base64"));
                     if screen.capture_text(None).contains("MARK") {
                         break true;
                     }
                     idle_frames += 1;
                 }
-                Ok(Some(_)) => {}
-                Ok(None) | Err(_) => break false,
+                Some(Some(_)) => {}
+                Some(None) | None => break false,
             }
         };
         assert!(drew, "the change after the idle frame was never drawn");
@@ -4660,17 +4662,17 @@ mod tests {
         drop(held);
 
         let mut screen = shux_vt::VirtualTerminal::new(24, 100);
-        let deadline = tokio::time::Instant::now() + shux_testkit::BUDGET;
+        let deadline = shux_testkit::Deadline::start();
         let drew = loop {
             if screen.capture_text(None).contains("MARK") {
                 break true;
             }
-            match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(AttachServerFrame::Render { data, .. })) => {
+            match deadline.run(rx.recv()).await {
+                Some(Some(AttachServerFrame::Render { data, .. })) => {
                     screen.process(&BASE64.decode(data).expect("render base64"));
                 }
-                Ok(Some(_)) => {}
-                Ok(None) | Err(_) => break false,
+                Some(Some(_)) => {}
+                Some(None) | None => break false,
             }
         };
         assert!(drew, "a bump that landed mid-frame was never drawn");
@@ -6600,7 +6602,7 @@ mod tests {
                 .await
         }
 
-        #[allow(clippy::too_many_arguments)]
+        #[expect(clippy::too_many_arguments, reason = "independent inputs")]
         async fn send_mod(
             &mut self,
             kind: MouseKind,
@@ -8522,10 +8524,8 @@ mod tests {
             &mut self,
             mut pred: impl FnMut(&AttachServerFrame, &str) -> bool,
         ) -> bool {
-            let deadline = tokio::time::Instant::now() + shux_testkit::BUDGET;
-            while let Ok(Some(Ok(buf))) =
-                tokio::time::timeout_at(deadline, self.framed.next()).await
-            {
+            let deadline = shux_testkit::Deadline::start();
+            while let Some(Some(Ok(buf))) = deadline.run(self.framed.next()).await {
                 let frame: AttachServerFrame = serde_json::from_slice(&buf).expect("server frame");
                 if let AttachServerFrame::Render { data, frame } = &frame {
                     let bytes = BASE64.decode(data.as_bytes()).expect("render base64");
@@ -8553,10 +8553,8 @@ mod tests {
         /// numbered one shows `needle`: a client that has not caught up yet,
         /// whose screen and mouse-event stamp stay where they were.
         async fn receive_unapplied(&mut self, needle: &str) {
-            let deadline = tokio::time::Instant::now() + shux_testkit::BUDGET;
-            while let Ok(Some(Ok(buf))) =
-                tokio::time::timeout_at(deadline, self.framed.next()).await
-            {
+            let deadline = shux_testkit::Deadline::start();
+            while let Some(Some(Ok(buf))) = deadline.run(self.framed.next()).await {
                 let frame: AttachServerFrame = serde_json::from_slice(&buf).expect("server frame");
                 let AttachServerFrame::Render { data, frame } = frame else {
                     continue;

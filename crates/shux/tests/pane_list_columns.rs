@@ -22,12 +22,13 @@ const COLOUR_PROBE: &str = "\\033[38;2;120;220;180mTRUECOLOR\\033[0m \\033[38;5;
 
 const DONE_MARKER: &str = "RENDER-DONE";
 
-/// Build the line to type so the shell prints [`DONE_MARKER`] once `line` has
-/// finished. The marker is SPLIT across a quote boundary so the echoed line
+/// Build the line to type so the shell prints `{DONE_MARKER}-{n}` once `line`
+/// has finished. The marker is SPLIT across a quote boundary so the echoed line
 /// cannot contain it; `the_completion_marker_cannot_be_satisfied_by_the_echoed_line`
-/// pins that.
-fn line_with_completion_marker(line: &str) -> String {
-    format!("{line}; printf 'RENDER''-DONE\\n'")
+/// pins that. `n` makes each wait's needle new, so an earlier wait's marker
+/// still on screen cannot satisfy it.
+fn line_with_completion_marker(line: &str, n: u32) -> String {
+    format!("{line}; printf 'RENDER''-DONE-{n}\\n'")
 }
 
 /// Keeps a pane's screen alive after the interesting part has run.
@@ -37,6 +38,7 @@ struct Env {
     bin: PathBuf,
     root: tempfile::TempDir,
     sessions: Vec<String>,
+    marks: std::cell::Cell<u32>,
 }
 
 impl Env {
@@ -49,6 +51,7 @@ impl Env {
             bin: PathBuf::from(env!("CARGO_BIN_EXE_shux")),
             root,
             sessions: Vec::new(),
+            marks: std::cell::Cell::new(0),
         }
     }
 
@@ -163,8 +166,16 @@ impl Env {
     /// (#167). So wait on a marker the shell emits only after the command exits.
     #[track_caller]
     fn run_line_and_wait(&self, session: &str, window: &str, line: &str) -> String {
-        self.type_line(session, window, &line_with_completion_marker(line));
-        self.wait_for(session, window, DONE_MARKER)
+        let n = self.marks.get() + 1;
+        self.marks.set(n);
+        let marker = format!("{DONE_MARKER}-{n}");
+        let screen = self.capture(session, window);
+        assert!(
+            !screen.contains(&marker),
+            "{marker:?} is already on screen, so the wait would return before the line runs:\n{screen}"
+        );
+        self.type_line(session, window, &line_with_completion_marker(line, n));
+        self.wait_for(session, window, &marker)
     }
 
     fn bin_str(&self) -> String {
@@ -326,7 +337,7 @@ fn a_shell_wrapped_cmd_pane_prints_its_script_as_one_argument() {
 /// that returned on the echo. Pin both halves by execution, not by eye.
 #[test]
 fn the_completion_marker_cannot_be_satisfied_by_the_echoed_line() {
-    let typed = line_with_completion_marker("shux pane list -s s -w 1 --format text");
+    let typed = line_with_completion_marker("shux pane list -s s -w 1 --format text", 7);
     assert!(
         !typed.contains(DONE_MARKER),
         "the echoed line contains {DONE_MARKER:?} verbatim, so the wait would \
@@ -335,12 +346,12 @@ fn the_completion_marker_cannot_be_satisfied_by_the_echoed_line() {
 
     let out = std::process::Command::new("sh")
         .arg("-c")
-        .arg(line_with_completion_marker("true"))
+        .arg(line_with_completion_marker("true", 7))
         .output()
         .expect("spawn sh");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
-        DONE_MARKER,
+        format!("{DONE_MARKER}-7"),
         "the shell no longer reassembles the marker, so the wait would time out"
     );
 }
@@ -655,25 +666,21 @@ fn a_control_byte_in_args_is_refused_and_leaves_the_pane_usable() {
 /// `shux-tui-qa` gate for task 095 found exactly such a disagreement that the
 /// entire unit suite was blind to.
 ///
-/// Ignored until #144 lands. shux-vt gives an emoji-presentation sequence
-/// (`⚠️` = U+26A0 U+FE0F) ONE cell while `UnicodeWidthStr` — and xterm, iTerm2
-/// and wezterm — give it two, so a title carrying one shifts its row a column
-/// left and the right border lands short. The fix belongs in shux-vt's cell
-/// allocation, not in this listing's padding: matching `style.rs` to shux-vt
-/// would square the frame inside a shux pane and break it in every other
-/// terminal. Un-ignore when #144 is fixed.
+/// Titled with wide CJK, whose width shux-vt, `UnicodeWidthStr` and real
+/// terminals agree on. An emoji-presentation sequence (`⚠️`) is no test of
+/// this: terminals disagree on its width (alacritty and shux-vt give 1 cell,
+/// xterm and iTerm2 give 2), so no frame is square in all of them (#144).
 #[test]
-#[ignore = "blocked on #144: shux-vt allocates 1 cell for VS16 emoji, real terminals allocate 2"]
 fn the_box_frame_is_square_on_the_rendered_grid() {
     let mut env = Env::new();
     let s = "t135f";
     // `shell_session` returns the live shell's PANE id — it lists itself below.
     let target = env.shell_session(s);
 
-    // Title it with an emoji-presentation sequence. The header and border rows
-    // are the control: they are pure ASCII, so a row that disagrees with them
+    // Title it with wide characters. The header and border rows are the
+    // control: they are pure ASCII, so a row that disagrees with them
     // disagrees because of its title.
-    env.ok(&["pane", "title", "-s", s, "-p", &target, "-t", "⚠️ build"]);
+    env.ok(&["pane", "title", "-s", s, "-p", &target, "-t", "漢字 build"]);
 
     env.ok(&[
         "pane", "set-size", "-s", s, "-p", &target, "--cols", "100", "--rows", "20",

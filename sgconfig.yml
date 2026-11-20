@@ -1,0 +1,4 @@
+# ast-grep project config: test-hygiene bans clippy cannot express.
+# Run from the repo root: ast-grep scan
+ruleDirs: [lint/ast-grep/rules]
+utilDirs: [lint/ast-grep/utils]

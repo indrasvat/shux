@@ -1,0 +1,27 @@
+id: test-sleep-then-act
+language: rust
+severity: error
+message: "a fixture script sleeps then acts; emit a marker after the state holds and wait on it"
+note: "docs/testing.md#which-wait-to-use"
+files:
+  - "crates/*/tests/**/*.rs"
+  - "crates/shux/src/rpc/test_harness.rs"
+  - "crates/shux/src/rpc/surface_tests.rs"
+  - "crates/shux/src/cli/test_support.rs"
+  - "crates/shux/src/pane_record_fuzz.rs"
+rule:
+  matches: sleep-then-act
+---
+id: test-sleep-then-act-unit
+language: rust
+severity: error
+message: "a fixture script sleeps then acts; emit a marker after the state holds and wait on it"
+note: "docs/testing.md#which-wait-to-use"
+files:
+  - "crates/*/src/**/*.rs"
+ignores:
+  - "crates/shux-testkit/**"
+rule:
+  all:
+    - matches: sleep-then-act
+    - matches: in-cfg-test

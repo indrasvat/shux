@@ -1,0 +1,92 @@
+# The expiry of a short wait is the asserted outcome: its result read as an
+# error (`is_err`, `unwrap_err`, `!is_ok`, an `Err(_)` pattern, an `Ok(_)` arm
+# that panics), directly or through the `let` that holds it. Macro bodies are
+# a token tree: matched by text.
+id: absence-by-timeout
+language: rust
+utils:
+  read-as-err:
+    any:
+      - kind: call_expression
+        has:
+          field: function
+          kind: field_expression
+          all:
+            - has: { field: value, matches: short-wait }
+            - has: { field: field, regex: '^(is_err|unwrap_err|expect_err|err)$' }
+      - kind: unary_expression
+        regex: '^!'
+        has:
+          kind: call_expression
+          has:
+            field: function
+            kind: field_expression
+            all:
+              - has: { field: value, matches: short-wait }
+              - has: { field: field, regex: '^is_ok$' }
+      - kind: let_declaration
+        all:
+          - has: { field: value, matches: short-wait }
+          - has: { field: pattern, regex: '^Err\b' }
+      - kind: let_condition
+        all:
+          - has: { field: value, matches: short-wait }
+          - has: { field: pattern, regex: '^(Err\b|Ok\s*\(\s*_\s*\)$)' }
+      - kind: match_expression
+        all:
+          - has: { field: value, matches: short-wait }
+          - has:
+              stopBy: end
+              kind: match_arm
+              all:
+                - has: { field: pattern, regex: '^Ok\b' }
+                - has: { field: value, regex: '^(panic|unreachable)!' }
+  held-wait:
+    all:
+      - kind: let_declaration
+      - has: { field: pattern, kind: identifier, pattern: $R }
+      - has: { field: value, matches: short-wait }
+      - precedes:
+          stopBy: end
+          has:
+            stopBy: end
+            any:
+              - pattern: $R.is_err()
+              - pattern: $R.unwrap_err()
+              - pattern: $R.expect_err($$$)
+              - pattern: $R.err()
+              - pattern: "!$R.is_ok()"
+              - pattern: let Err($$$) = $R
+              - kind: let_condition
+                all:
+                  - has: { field: value, pattern: $R }
+                  - has: { field: pattern, regex: '^(Err\b|Ok\s*\(\s*_\s*\)$)' }
+              - kind: macro_invocation
+                regex: '\b(is_err|unwrap_err|expect_err|is_ok|Err)\b'
+                has: { stopBy: end, kind: identifier, pattern: $R }
+rule:
+  all:
+    - any:
+        - matches: read-as-err
+        - matches: held-wait
+        - kind: macro_invocation
+          any:
+            - regex: '\btimeout(_at)?\s*\([^;{}]*?\.\s*await\s*(\.\s*(is_err|unwrap_err|expect_err|err)\s*\(|,\s*Err\b)'
+            - regex: '!\s*([\w:]*::)?timeout(_at)?\s*\([^;{}]*?\.\s*await\s*\.\s*is_ok\s*\('
+            - regex: '\btimeout(_at)?\s*\([^;{}]*?\.\s*await\s*\.\s*is_ok\(\)\s*,\s*false\b'
+            - regex: 'recv_timeout\s*\([^;{}]*?\)\s*\.\s*(is_err|unwrap_err|expect_err|err)\s*\('
+            - regex: '!\s*(shux_testkit::)?poll_until(_async)?\s*\(|\bpoll(_async)?\s*\([^;{}]*?\.\s*is_none\s*\('
+          not:
+            any:
+              - regex: '(timeout(_at)?|recv_timeout|poll(_until)?(_async)?)\s*\(\s*((std::time::)?Duration::ZERO|(shux_testkit::)?BUDGET)\s*[,)]'
+              - inside: { stopBy: end, kind: macro_invocation }
+        - all:
+            - any:
+                - pattern: "!poll_until($$$)"
+                - pattern: "!shux_testkit::poll_until($$$)"
+                - pattern: poll($$$).is_none()
+                - pattern: shux_testkit::poll($$$).is_none()
+            - not:
+                regex: '\(\s*(shux_testkit::)?BUDGET\s*,'
+    - not:
+        matches: paused-clock

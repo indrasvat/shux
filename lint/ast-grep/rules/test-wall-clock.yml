@@ -1,0 +1,27 @@
+id: test-wall-clock
+language: rust
+severity: error
+message: "a test reads the clock; success must not depend on elapsed time. Wait with shux_testkit, or drive a paused tokio clock / test_clock seam"
+note: "docs/testing.md#which-wait-to-use"
+files:
+  - "crates/*/tests/**/*.rs"
+  - "crates/shux/src/rpc/test_harness.rs"
+  - "crates/shux/src/rpc/surface_tests.rs"
+  - "crates/shux/src/cli/test_support.rs"
+  - "crates/shux/src/pane_record_fuzz.rs"
+rule:
+  matches: wall-clock-read
+---
+id: test-wall-clock-unit
+language: rust
+severity: error
+message: "a test reads the clock; success must not depend on elapsed time. Wait with shux_testkit, or drive a paused tokio clock / test_clock seam"
+note: "docs/testing.md#which-wait-to-use"
+files:
+  - "crates/*/src/**/*.rs"
+ignores:
+  - "crates/shux-testkit/**"
+rule:
+  all:
+    - matches: wall-clock-read
+    - matches: in-cfg-test

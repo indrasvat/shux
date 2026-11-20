@@ -1,0 +1,27 @@
+id: test-wall-clock-assert
+language: rust
+severity: error
+message: "an assertion on a measured duration fails under load; assert on an ordering or a count, or drive a paused clock"
+note: "docs/testing.md#which-wait-to-use"
+files:
+  - "crates/*/tests/**/*.rs"
+  - "crates/shux/src/rpc/test_harness.rs"
+  - "crates/shux/src/rpc/surface_tests.rs"
+  - "crates/shux/src/cli/test_support.rs"
+  - "crates/shux/src/pane_record_fuzz.rs"
+rule:
+  matches: wall-clock-assert
+---
+id: test-wall-clock-assert-unit
+language: rust
+severity: error
+message: "an assertion on a measured duration fails under load; assert on an ordering or a count, or drive a paused clock"
+note: "docs/testing.md#which-wait-to-use"
+files:
+  - "crates/*/src/**/*.rs"
+ignores:
+  - "crates/shux-testkit/**"
+rule:
+  all:
+    - matches: wall-clock-assert
+    - matches: in-cfg-test

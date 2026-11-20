@@ -19,7 +19,8 @@
 # can land mid-repaint and a reader legitimately observes a mixed A/B frame —
 # ContentRevision has no clean-frame concept, §4.2). shux-vt freezes the
 # presented grid on ?2026h and releases the accumulated writes as exactly one
-# Class-A batch on ?2026l.
+# Class-A batch on ?2026l. A write stalled past SYNC_UPDATE_TIMEOUT_MS (CPU
+# load) is the one exception: the deadline shows the live, half-drawn grid.
 
 printf '\033[2J\033[3J\033[H'
 # Echo OFF is load-bearing: an echoed token newline at the parked cursor

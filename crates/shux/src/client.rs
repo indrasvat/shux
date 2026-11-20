@@ -438,7 +438,6 @@ async fn wait_for_daemon(
 }
 
 /// Ensure the daemon is running (using default socket path) and return a connected socket.
-#[allow(dead_code)] // Available for backward compatibility
 pub async fn ensure_daemon_running() -> Result<UnixStream, ClientError> {
     let sock_path = daemon::socket_path()?;
     ensure_daemon_running_at(&sock_path).await

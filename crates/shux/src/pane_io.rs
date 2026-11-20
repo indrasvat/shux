@@ -866,6 +866,8 @@ mod tests {
         let prepared = shux_pty::CommandEngine::prepare("sleep 60", &[]);
         let permit = writer.reserve(prepared.line().len()).await.unwrap();
         // unwrap: any running machine has been up for more than 2 s.
+        // why: an ask instant handed in as data, already past the timeout; time passing only adds to that
+        // ast-grep-ignore: test-wall-clock-unit
         let asked = std::time::Instant::now()
             .checked_sub(std::time::Duration::from_secs(2))
             .unwrap();

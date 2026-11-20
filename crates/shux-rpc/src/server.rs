@@ -406,7 +406,6 @@ impl PeerDeathMonitor {
 ///   any still-queued frames are discarded (the accepted fire-and-forget
 ///   delta: a DEAD client's unprocessed requests are dropped; a half-closed
 ///   client's requests are all answered).
-#[allow(clippy::too_many_arguments)]
 async fn serve_connection<R, W>(
     read_half: R,
     write_half: W,
@@ -983,12 +982,25 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
     }
 
-    /// Shutdown removes the server's own socket and never one bound in its place.
+    /// Shutdown removes the server's own socket and never one bound in its
+    /// place, whether the cancel stops it or its socket check sees the
+    /// replacement first.
     #[tokio::test]
     async fn shutdown_leaves_a_socket_bound_in_its_place() {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("test.sock");
-        let (cancel, handle) = spawn_builtin_server(&socket_path).await;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let router = register_builtin_methods(Router::builder()).build();
+        let config = ServerConfig {
+            socket_path: socket_path.clone(),
+            tcp_addr: String::new(),
+            auth_token: None,
+        };
+        let bound = Server::new(config, router, cancel.clone())
+            .bind()
+            .await
+            .unwrap();
+        let handle = tokio::spawn(async move { bound.serve().await.map_err(|e| e.to_string()) });
         drop(UnixStream::connect(&socket_path).await.unwrap());
 
         // A rename replaces the path atomically, so the server never sees it missing.
@@ -997,10 +1009,13 @@ mod tests {
         std::fs::rename(&staged, &socket_path).unwrap();
 
         cancel.cancel();
-        tokio::time::timeout(shux_testkit::BUDGET, handle)
+        let ended = tokio::time::timeout(shux_testkit::BUDGET, handle)
             .await
             .expect("server stops")
             .unwrap();
+        if let Err(e) = ended {
+            assert!(e.contains("now belongs to another listener"), "{e}");
+        }
         assert!(
             std::os::unix::net::UnixStream::connect(&socket_path).is_ok(),
             "shutdown unlinked the socket that replaced its own"
@@ -1035,7 +1050,6 @@ mod tests {
     /// Router with a `test.hang` method that signals entry, then pends
     /// forever holding a HangGuard. Returns (router, entered, dropped,
     /// dropped_notify).
-    #[allow(clippy::type_complexity)]
     fn hang_router() -> (
         Router,
         Arc<tokio::sync::Notify>,

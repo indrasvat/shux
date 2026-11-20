@@ -1,0 +1,28 @@
+# Compiled only for tests: an item under a `cfg` that names `test` (`test`,
+# `all(test, …)`, `any(test, …)`, never `not(test)`), with other attributes
+# and comments allowed in between, or a file under `#![cfg(test)]`.
+id: in-cfg-test
+language: rust
+rule:
+  any:
+    - inside:
+        stopBy: end
+        follows:
+          stopBy:
+            not:
+              any:
+                - kind: attribute_item
+                - kind: line_comment
+                - kind: block_comment
+          kind: attribute_item
+          regex: '^#\[\s*cfg\s*\((?s:.)*\btest\b'
+          not:
+            regex: '\bnot\s*\(\s*test\s*\)'
+    - inside:
+        stopBy: end
+        kind: source_file
+        has:
+          kind: inner_attribute_item
+          regex: '^#!\[\s*cfg\s*\((?s:.)*\btest\b'
+          not:
+            regex: '\bnot\s*\(\s*test\s*\)'

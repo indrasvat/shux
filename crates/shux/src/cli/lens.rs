@@ -21,7 +21,7 @@ pub fn lens_glance_exit_code(rpc_error_code: i64) -> i32 {
 /// `shux pane glance` — atomic {png, text, revision} of one pane via
 /// `pane.glance` RPC (lens PRD §5, §10). No session/window resolution:
 /// `pane` is always a raw pane UUID, mirroring the RPC's `pane_id` param.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 pub async fn handle_pane_glance(
     stream: &mut tokio::net::UnixStream,
     pane: &str,
@@ -193,7 +193,6 @@ pub fn lens_wait_settled_exit_code(rpc_error_code: i64) -> i32 {
 /// `pane.wait_settled` RPC (lens PRD §6, §10). `quiet`/`timeout` arrive here
 /// already normalized to milliseconds by `parse_duration_ms`. Exit 0 when
 /// settled, exit 1 on timeout (`settled=false`, a RESULT not an error).
-#[allow(clippy::too_many_arguments)]
 pub async fn handle_pane_wait_settled(
     stream: &mut tokio::net::UnixStream,
     pane: &str,
@@ -519,7 +518,7 @@ pub fn lens_run_exit_code(rpc_error_code: i64) -> i32 {
 /// code — authoritatively, even if it collides with the exit table below
 /// (§10's documented precedence rule; scripts needing certainty parse
 /// `--format json`, where `exit_code` is present iff the child ran).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 pub async fn handle_lens_run(
     stream: &mut tokio::net::UnixStream,
     argv: &[String],

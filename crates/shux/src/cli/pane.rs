@@ -126,7 +126,7 @@ pub async fn handle_pane_list(
 }
 
 /// Handle the `shux pane split` command.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 pub async fn handle_pane_split(
     stream: &mut tokio::net::UnixStream,
     session_name: &str,
@@ -269,7 +269,7 @@ pub async fn handle_pane_focus_dir(
 }
 
 /// Handle the `shux pane resize` command.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 pub async fn handle_pane_resize(
     stream: &mut tokio::net::UnixStream,
     session_name: &str,
@@ -416,7 +416,7 @@ pub async fn handle_pane_swap(
 /// titles flow into the displayed title (orthogonal to the manual
 /// override, so you can pin auto OFF without clearing your manual
 /// title).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 pub async fn handle_pane_title(
     stream: &mut tokio::net::UnixStream,
     session_name: &str,
@@ -582,7 +582,7 @@ pub async fn handle_pane_watch(
 /// this command gets SIGINT, SIGTERM or SIGHUP (which stop it and report).
 /// If this command dies any other way, the daemon ends the recording with its
 /// connection; if the daemon goes away, this command fails at once.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 pub async fn handle_pane_record(
     stream: &mut tokio::net::UnixStream,
     socket_path: &std::path::Path,
@@ -896,7 +896,7 @@ pub async fn handle_pane_send_keys(
 }
 
 /// Handle the `shux pane run` command.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 pub async fn handle_pane_run(
     stream: &mut tokio::net::UnixStream,
     session_name: &str,

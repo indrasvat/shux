@@ -3,7 +3,10 @@
 //! same CLI an operator runs. The daemon is identified by pidfile and must be
 //! gone when the test ends.
 
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "shared by many test binaries, each using a subset"
+)]
 
 use std::path::PathBuf;
 use std::process::{Command, Output};

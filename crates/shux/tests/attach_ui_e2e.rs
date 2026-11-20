@@ -198,6 +198,21 @@ impl Env {
         )
     }
 
+    /// Where the target pane's cursor lands on the host: its one pane sits
+    /// inside a one-cell border.
+    fn pane_cursor_on_host(&self) -> (u64, u64, bool) {
+        let v: serde_json::Value = serde_json::from_str(
+            &self.ok(&["--format", "json", "pane", "capture", "-s", "target"]),
+        )
+        .expect("capture json");
+        let c = &v["cursor"];
+        (
+            c["row"].as_u64().expect("cursor.row") + 1,
+            c["col"].as_u64().expect("cursor.col") + 1,
+            true,
+        )
+    }
+
     /// The host screen row holding `needle`.
     #[track_caller]
     fn row_with(&self, needle: &str) -> String {
@@ -326,27 +341,24 @@ fn copy_mode_and_the_help_overlay_hide_the_terminal_cursor() {
 /// The selection overlay and its menu are written after the frame too, and
 /// must leave the terminal cursor on the pane's cursor, not where their last
 /// write ended.
+///
+/// The host pane can be read while a frame is still arriving, so each check
+/// waits for the cursor to settle on the pane's cursor; a frame that leaves
+/// it at the overlay never does.
 #[test]
 fn a_mouse_selection_leaves_the_terminal_cursor_on_the_pane_cursor() {
     let env = Env::attached(&keys_config("ctrl-a"));
-    wait_until("the pane's cursor to show", || env.cursor_visible());
-    let parked = env.cursor();
+    let parked = env.pane_cursor_on_host();
+    let on_pane_cursor = |what| wait_until(what, || env.cursor() == parked);
+    on_pane_cursor("the terminal cursor to sit on the pane's cursor");
 
     env.send_keys("\x1b[<0;3;2M\x1b[<32;8;2M\x1b[<0;8;2m");
     env.wait_for("copied selection");
-    assert_eq!(
-        env.cursor(),
-        parked,
-        "the selection moved the terminal cursor"
-    );
+    on_pane_cursor("the selection to leave the terminal cursor on the pane's cursor");
 
     env.send_keys("\x1b[<2;5;2M\x1b[<2;5;2m");
     env.wait_for("Copy");
-    assert_eq!(
-        env.cursor(),
-        parked,
-        "the selection menu moved the terminal cursor"
-    );
+    on_pane_cursor("the selection menu to leave the terminal cursor on the pane's cursor");
 }
 
 /// The copy-mode cursor shows the character under it, in the cursor colours,

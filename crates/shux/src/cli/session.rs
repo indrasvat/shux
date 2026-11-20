@@ -330,7 +330,7 @@ pub async fn handle_session_save(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 pub async fn handle_wait_for(
     stream: &mut tokio::net::UnixStream,
     session: Option<&str>,

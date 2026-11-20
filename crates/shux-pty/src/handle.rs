@@ -58,221 +58,6 @@ pub enum PtyError {
     Closed,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn declares_pixels_as_cells_times_the_cell_box() {
-        let ws = winsize_for(PtySize::new(100, 30));
-        assert_eq!((ws.ws_col, ws.ws_row), (100, 30));
-        assert_eq!(
-            (ws.ws_xpixel, ws.ws_ypixel),
-            (100 * DECLARED_CELL_PIXELS.0, 30 * DECLARED_CELL_PIXELS.1)
-        );
-    }
-
-    /// Overflow declares the honest `0` sentinel on both axes, never a
-    /// saturated number an app would divide into a believable cell size.
-    #[test]
-    fn overflow_declares_nothing_on_both_axes() {
-        let ws = winsize_for(PtySize::new(7282, 30));
-        assert_eq!((ws.ws_col, ws.ws_row), (7282, 30), "cells stay truthful");
-        assert_eq!((ws.ws_xpixel, ws.ws_ypixel), (0, 0));
-
-        // Vertical-only overflow must not leave the horizontal axis declared.
-        let ws = winsize_for(PtySize::new(100, 3450));
-        assert_eq!((ws.ws_xpixel, ws.ws_ypixel), (0, 0));
-
-        // One cell under the limit still declares.
-        let ws = winsize_for(PtySize::new(7281, 3449));
-        assert_eq!((ws.ws_xpixel, ws.ws_ypixel), (65529, 65531));
-    }
-
-    #[test]
-    fn a_zero_sized_pty_is_not_an_error() {
-        let ws = winsize_for(PtySize::new(0, 0));
-        assert_eq!((ws.ws_xpixel, ws.ws_ypixel), (0, 0));
-    }
-
-    fn create_terminfo_entry(root: &Path, term: &str) {
-        let first = term.as_bytes()[0];
-        let dir = root.join(format!("{first:x}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        File::create(dir.join(term)).unwrap();
-    }
-
-    #[test]
-    fn default_shell_argv_treats_a_blank_shell_as_unset() {
-        assert_eq!(
-            default_shell_argv(Some("/usr/bin/zsh")),
-            vec!["/usr/bin/zsh", "-l", "-i"]
-        );
-        // The three ways `$SHELL` fails to name a shell all land on /bin/sh.
-        for blank in [None, Some(""), Some("   "), Some("\t")] {
-            assert_eq!(
-                default_shell_argv(blank),
-                vec!["/bin/sh", "-l", "-i"],
-                "{blank:?} should fall back"
-            );
-        }
-    }
-
-    #[test]
-    fn an_explicit_command_is_never_replaced_by_the_shell() {
-        let cfg = PtyConfig::with_command(
-            vec!["nvim".to_string(), "a.rs".to_string()],
-            PathBuf::from("/tmp"),
-        );
-        assert_eq!(cfg.resolve_command(), vec!["nvim", "a.rs"]);
-    }
-
-    #[test]
-    fn resolve_pane_term_prefers_tmux_when_available() {
-        let root =
-            std::env::temp_dir().join(format!("shux-pty-term-prefers-tmux-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        create_terminfo_entry(&root, "xterm-256color");
-        create_terminfo_entry(&root, "screen-256color");
-        create_terminfo_entry(&root, "tmux-256color");
-
-        assert_eq!(
-            resolve_pane_term_from_roots(std::slice::from_ref(&root)),
-            "tmux-256color"
-        );
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn resolve_pane_term_falls_back_to_screen_before_xterm() {
-        let root = std::env::temp_dir().join(format!(
-            "shux-pty-term-fallback-screen-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        create_terminfo_entry(&root, "xterm-256color");
-        create_terminfo_entry(&root, "screen-256color");
-
-        assert_eq!(
-            resolve_pane_term_from_roots(std::slice::from_ref(&root)),
-            "screen-256color"
-        );
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn resolve_pane_term_uses_xterm_as_last_installed_candidate() {
-        let root = std::env::temp_dir().join(format!(
-            "shux-pty-term-fallback-xterm-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        create_terminfo_entry(&root, "xterm-256color");
-
-        assert_eq!(
-            resolve_pane_term_from_roots(std::slice::from_ref(&root)),
-            "xterm-256color"
-        );
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    // ── the drain loop at child exit (issue #162) ─────────────────────
-    //
-    // The sequences a pane's last read actually sees. These run the same code
-    // on every host, which is the point: the macOS-only arm is what lost a
-    // finished pane's output, and no Linux runner could reach it.
-
-    /// `read` returning a scripted sequence, one call at a time.
-    fn scripted(
-        steps: Vec<nix::Result<&'static [u8]>>,
-    ) -> impl FnMut(&mut [u8]) -> nix::Result<usize> {
-        let mut steps = steps.into_iter();
-        move |dst: &mut [u8]| match steps.next() {
-            Some(Ok(bytes)) => {
-                let n = bytes.len().min(dst.len());
-                dst[..n].copy_from_slice(&bytes[..n]);
-                Ok(n)
-            }
-            Some(Err(e)) => Err(e),
-            None => Err(nix::errno::Errno::EAGAIN),
-        }
-    }
-
-    #[test]
-    fn eio_is_pty_eof_on_every_unix() {
-        // Not just Linux: a macOS pane exit lands here too.
-        assert!(is_pty_eof_errno(nix::errno::Errno::EIO));
-        assert!(!is_pty_eof_errno(nix::errno::Errno::EAGAIN));
-    }
-
-    /// Kept under its original name so `check-test-inventory` sees no test
-    /// disappear. It asserted a platform gate that no longer exists; what
-    /// survives of it is the half that was always true, and the general
-    /// contract now lives in `eio_is_pty_eof_on_every_unix`.
-    #[test]
-    fn linux_eio_is_treated_as_pty_eof() {
-        assert!(is_pty_eof_errno(nix::errno::Errno::EIO));
-    }
-
-    #[test]
-    fn the_last_bytes_before_eof_survive() {
-        let mut buf = [0u8; 64];
-        let n = drain_with(
-            &mut buf,
-            scripted(vec![Ok(b"TRUECOLOR\n"), Err(nix::errno::Errno::EIO)]),
-        )
-        .expect("EOF after a short read is not an error");
-        assert_eq!(&buf[..n], b"TRUECOLOR\n");
-    }
-
-    #[test]
-    fn a_read_error_never_eats_the_bytes_already_read() {
-        // Any failing errno, not just the EOF one: the caller gets the data
-        // now and the error on the next call.
-        for errno in [nix::errno::Errno::ENXIO, nix::errno::Errno::EBADF] {
-            let mut buf = [0u8; 64];
-            let n = drain_with(&mut buf, scripted(vec![Ok(b"TRUECOLOR\n"), Err(errno)]))
-                .unwrap_or_else(|e| panic!("{errno:?} after a short read dropped the bytes: {e}"));
-            assert_eq!(&buf[..n], b"TRUECOLOR\n");
-        }
-    }
-
-    #[test]
-    fn an_error_with_nothing_buffered_is_still_an_error() {
-        let mut buf = [0u8; 64];
-        let err = drain_with(&mut buf, scripted(vec![Err(nix::errno::Errno::ENXIO)]))
-            .expect_err("a bare read failure must surface");
-        assert_eq!(err.raw_os_error(), Some(nix::errno::Errno::ENXIO as i32));
-
-        // …and EOF with nothing buffered is a clean zero, not an error.
-        assert_eq!(
-            drain_with(&mut buf, scripted(vec![Err(nix::errno::Errno::EIO)])).unwrap(),
-            0
-        );
-    }
-
-    #[test]
-    fn a_full_buffer_stops_the_drain() {
-        let mut buf = [0u8; 4];
-        assert_eq!(
-            drain_with(&mut buf, scripted(vec![Ok(b"ab"), Ok(b"cd"), Ok(b"ef")])).unwrap(),
-            4
-        );
-        assert_eq!(&buf, b"abcd");
-    }
-
-    #[test]
-    fn nothing_readable_yet_is_would_block() {
-        let mut buf = [0u8; 64];
-        let err = drain_with(&mut buf, scripted(vec![Err(nix::errno::Errno::EAGAIN)]))
-            .expect_err("an empty nonblocking read must not look like EOF");
-        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
-    }
-}
-
 /// Variables by which a terminal emulator or host advertises *itself*. shux is
 /// the terminal a pane talks to, so inside a pane these name the wrong one.
 ///
@@ -1406,5 +1191,220 @@ impl PtyHandle {
         {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn declares_pixels_as_cells_times_the_cell_box() {
+        let ws = winsize_for(PtySize::new(100, 30));
+        assert_eq!((ws.ws_col, ws.ws_row), (100, 30));
+        assert_eq!(
+            (ws.ws_xpixel, ws.ws_ypixel),
+            (100 * DECLARED_CELL_PIXELS.0, 30 * DECLARED_CELL_PIXELS.1)
+        );
+    }
+
+    /// Overflow declares the honest `0` sentinel on both axes, never a
+    /// saturated number an app would divide into a believable cell size.
+    #[test]
+    fn overflow_declares_nothing_on_both_axes() {
+        let ws = winsize_for(PtySize::new(7282, 30));
+        assert_eq!((ws.ws_col, ws.ws_row), (7282, 30), "cells stay truthful");
+        assert_eq!((ws.ws_xpixel, ws.ws_ypixel), (0, 0));
+
+        // Vertical-only overflow must not leave the horizontal axis declared.
+        let ws = winsize_for(PtySize::new(100, 3450));
+        assert_eq!((ws.ws_xpixel, ws.ws_ypixel), (0, 0));
+
+        // One cell under the limit still declares.
+        let ws = winsize_for(PtySize::new(7281, 3449));
+        assert_eq!((ws.ws_xpixel, ws.ws_ypixel), (65529, 65531));
+    }
+
+    #[test]
+    fn a_zero_sized_pty_is_not_an_error() {
+        let ws = winsize_for(PtySize::new(0, 0));
+        assert_eq!((ws.ws_xpixel, ws.ws_ypixel), (0, 0));
+    }
+
+    fn create_terminfo_entry(root: &Path, term: &str) {
+        let first = term.as_bytes()[0];
+        let dir = root.join(format!("{first:x}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        File::create(dir.join(term)).unwrap();
+    }
+
+    #[test]
+    fn default_shell_argv_treats_a_blank_shell_as_unset() {
+        assert_eq!(
+            default_shell_argv(Some("/usr/bin/zsh")),
+            vec!["/usr/bin/zsh", "-l", "-i"]
+        );
+        // The three ways `$SHELL` fails to name a shell all land on /bin/sh.
+        for blank in [None, Some(""), Some("   "), Some("\t")] {
+            assert_eq!(
+                default_shell_argv(blank),
+                vec!["/bin/sh", "-l", "-i"],
+                "{blank:?} should fall back"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_command_is_never_replaced_by_the_shell() {
+        let cfg = PtyConfig::with_command(
+            vec!["nvim".to_string(), "a.rs".to_string()],
+            PathBuf::from("/tmp"),
+        );
+        assert_eq!(cfg.resolve_command(), vec!["nvim", "a.rs"]);
+    }
+
+    #[test]
+    fn resolve_pane_term_prefers_tmux_when_available() {
+        let root =
+            std::env::temp_dir().join(format!("shux-pty-term-prefers-tmux-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        create_terminfo_entry(&root, "xterm-256color");
+        create_terminfo_entry(&root, "screen-256color");
+        create_terminfo_entry(&root, "tmux-256color");
+
+        assert_eq!(
+            resolve_pane_term_from_roots(std::slice::from_ref(&root)),
+            "tmux-256color"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolve_pane_term_falls_back_to_screen_before_xterm() {
+        let root = std::env::temp_dir().join(format!(
+            "shux-pty-term-fallback-screen-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        create_terminfo_entry(&root, "xterm-256color");
+        create_terminfo_entry(&root, "screen-256color");
+
+        assert_eq!(
+            resolve_pane_term_from_roots(std::slice::from_ref(&root)),
+            "screen-256color"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolve_pane_term_uses_xterm_as_last_installed_candidate() {
+        let root = std::env::temp_dir().join(format!(
+            "shux-pty-term-fallback-xterm-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        create_terminfo_entry(&root, "xterm-256color");
+
+        assert_eq!(
+            resolve_pane_term_from_roots(std::slice::from_ref(&root)),
+            "xterm-256color"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // ── the drain loop at child exit (issue #162) ─────────────────────
+    //
+    // The sequences a pane's last read actually sees. These run the same code
+    // on every host, which is the point: the macOS-only arm is what lost a
+    // finished pane's output, and no Linux runner could reach it.
+
+    /// `read` returning a scripted sequence, one call at a time.
+    fn scripted(
+        steps: Vec<nix::Result<&'static [u8]>>,
+    ) -> impl FnMut(&mut [u8]) -> nix::Result<usize> {
+        let mut steps = steps.into_iter();
+        move |dst: &mut [u8]| match steps.next() {
+            Some(Ok(bytes)) => {
+                let n = bytes.len().min(dst.len());
+                dst[..n].copy_from_slice(&bytes[..n]);
+                Ok(n)
+            }
+            Some(Err(e)) => Err(e),
+            None => Err(nix::errno::Errno::EAGAIN),
+        }
+    }
+
+    #[test]
+    fn eio_is_pty_eof_on_every_unix() {
+        // Not just Linux: a macOS pane exit lands here too.
+        assert!(is_pty_eof_errno(nix::errno::Errno::EIO));
+        assert!(!is_pty_eof_errno(nix::errno::Errno::EAGAIN));
+    }
+
+    /// Kept under its original name so `check-test-inventory` sees no test
+    /// disappear. It asserted a platform gate that no longer exists; what
+    /// survives of it is the half that was always true, and the general
+    /// contract now lives in `eio_is_pty_eof_on_every_unix`.
+    #[test]
+    fn linux_eio_is_treated_as_pty_eof() {
+        assert!(is_pty_eof_errno(nix::errno::Errno::EIO));
+    }
+
+    #[test]
+    fn the_last_bytes_before_eof_survive() {
+        let mut buf = [0u8; 64];
+        let n = drain_with(
+            &mut buf,
+            scripted(vec![Ok(b"TRUECOLOR\n"), Err(nix::errno::Errno::EIO)]),
+        )
+        .expect("EOF after a short read is not an error");
+        assert_eq!(&buf[..n], b"TRUECOLOR\n");
+    }
+
+    #[test]
+    fn a_read_error_never_eats_the_bytes_already_read() {
+        // Any failing errno, not just the EOF one: the caller gets the data
+        // now and the error on the next call.
+        for errno in [nix::errno::Errno::ENXIO, nix::errno::Errno::EBADF] {
+            let mut buf = [0u8; 64];
+            let n = drain_with(&mut buf, scripted(vec![Ok(b"TRUECOLOR\n"), Err(errno)]))
+                .unwrap_or_else(|e| panic!("{errno:?} after a short read dropped the bytes: {e}"));
+            assert_eq!(&buf[..n], b"TRUECOLOR\n");
+        }
+    }
+
+    #[test]
+    fn an_error_with_nothing_buffered_is_still_an_error() {
+        let mut buf = [0u8; 64];
+        let err = drain_with(&mut buf, scripted(vec![Err(nix::errno::Errno::ENXIO)]))
+            .expect_err("a bare read failure must surface");
+        assert_eq!(err.raw_os_error(), Some(nix::errno::Errno::ENXIO as i32));
+
+        // …and EOF with nothing buffered is a clean zero, not an error.
+        assert_eq!(
+            drain_with(&mut buf, scripted(vec![Err(nix::errno::Errno::EIO)])).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_full_buffer_stops_the_drain() {
+        let mut buf = [0u8; 4];
+        assert_eq!(
+            drain_with(&mut buf, scripted(vec![Ok(b"ab"), Ok(b"cd"), Ok(b"ef")])).unwrap(),
+            4
+        );
+        assert_eq!(&buf, b"abcd");
+    }
+
+    #[test]
+    fn nothing_readable_yet_is_would_block() {
+        let mut buf = [0u8; 64];
+        let err = drain_with(&mut buf, scripted(vec![Err(nix::errno::Errno::EAGAIN)]))
+            .expect_err("an empty nonblocking read must not look like EOF");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
     }
 }

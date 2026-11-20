@@ -15,7 +15,9 @@
     "",
     "SessionStart runs scripts/ensure-hooks.sh so a fresh checkout — cloud or local — has its git hooks before the first commit. An agent cannot forget to run `make hooks` if it never has to. The CI guard lives in that script, once, because these sessions can run inside GitHub Actions.",
     "",
-    "PostToolUse runs scripts/check-test-sleeps.sh on every edited file: a test waits for a condition, never for time (docs/testing.md). In crates/*/tests it flags qualified sleep calls and sleep imports on code lines without a statement-level #[expect(clippy::disallowed_methods)]; in any crates/ source or Cargo.toml it flags a waiver of the ban. It says so on stderr; clippy's disallowed-methods is the gate."
+    "PostToolUse runs scripts/check-test-sleeps.sh on every edited file: a test waits for a condition, never for time (docs/testing.md). In crates/*/tests it flags qualified sleep calls and sleep imports on code lines without a statement-level #[expect(clippy::disallowed_methods)]; in any crates/ source or Cargo.toml it flags a waiver of the ban. It says so on stderr; clippy's disallowed-methods is the gate.",
+    "",
+    "PostToolUse also runs scripts/check-test-timing.sh on every edited Rust file: the ast-grep rules in lint/ast-grep/ ban timing in disguise in test code (wall-clock deadlines and bounds, timed waits, absence by timeout, fixtures that sleep then act). An escape is `// why: …` directly above `// ast-grep-ignore: <rule>`. `make check-test-timing` is the gate."
   ],
   "hooks": {
     "PreToolUse": [
@@ -52,6 +54,12 @@
             "command": "bash \"$CLAUDE_PROJECT_DIR/scripts/check-test-sleeps.sh\" --hook",
             "timeout": 10,
             "statusMessage": "Checking for raw sleeps in test code..."
+          },
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/scripts/check-test-timing.sh\" --hook",
+            "timeout": 10,
+            "statusMessage": "Checking test code for timing in disguise..."
           }
         ]
       }

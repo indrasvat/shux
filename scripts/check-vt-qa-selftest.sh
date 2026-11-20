@@ -242,6 +242,13 @@ main_moved_vt() {
     git merge -q --no-edit "$GOV_BASE"
 }
 no_report() { git rm -q "$q/SOLID-QA.md"; }
+# A restack: the same trees on new commits, the recorded ones left dangling.
+rebased_away() {
+    local vt ev
+    vt="$(git commit-tree "${audited}^{tree}" -p "$GOV_BASE" -m "vt change, rebased")"
+    ev="$(git commit-tree "HEAD^{tree}" -p "$vt" -m "evidence, rebased")"
+    git checkout -q --detach "$ev"
+}
 # A council record committed in the base an audit is diffed against is an old
 # council's, whatever this change's scope says.
 # shellcheck disable=SC2016  # jq programs: $h and $b are jq variables
@@ -294,6 +301,7 @@ gov 2 "full tier with a layer that did not run" full fuzz_error "did not run cle
 gov 2 "a committed metric the report never wrote" full extra_metric "but the report wrote"
 gov 2 "a neutrality metric not from the comparator" full bogus_metric "does not look like"
 gov 2 "main moved VT code under the measurement" full main_moved_vt "neutrality head"
+gov 2 "a record naming commits a rebase left behind" trivial rebased_away "is not in this branch's history"
 gov 2 "final stage needs the gate's report" full no_report "SOLID-QA.md"
 GOV_STAGE=pregate gov 0 "pregate runs before the gate's report exists" full no_report
 GOV_STAGE=pregate gov 2 "pregate still catches a missing council record" full drop_council "council-design.json"

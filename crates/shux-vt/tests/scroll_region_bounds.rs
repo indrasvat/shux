@@ -397,10 +397,14 @@ fn bulk_scroll_reports_one_mutation_per_scrolled_line() {
 
 use shux_testkit::thread_cpu_ns;
 
+/// One column, so both arms' cost is row moves. Wider rows add blanking that
+/// only the bulk arm does at scale, and past the cache that reads superlinear.
+const COST_COLS: usize = 1;
+
 /// CPU nanoseconds for `reps` full-region scrolls on a `rows`-tall pane with a
 /// full default scrollback behind it.
 fn scroll_cost_ns(rows: usize, reps: usize) -> u128 {
-    let mut t = vt(rows);
+    let mut t = vt_rc(rows, COST_COLS);
     for i in 0..5000 {
         t.process(format!("sb{i}\r\n").as_bytes());
     }
@@ -419,7 +423,7 @@ fn scroll_cost_ns(rows: usize, reps: usize) -> u128 {
 /// machine, at this optimisation level, so it can serve as a calibrated upper
 /// reference rather than a number recorded once in a comment.
 fn per_line_scroll_cost_ns(rows: usize, reps: usize) -> u128 {
-    let mut t = vt(rows);
+    let mut t = vt_rc(rows, COST_COLS);
     for i in 0..5000 {
         t.process(format!("sb{i}\r\n").as_bytes());
     }
@@ -449,8 +453,8 @@ fn per_line_scroll_cost_ns(rows: usize, reps: usize) -> u128 {
 ///
 /// So the quadratic reference is measured too, from the per-line path that is
 /// genuinely O(height^2), and the verdict is which of the two the bulk path
-/// resembles. Both arms feel the same cache behaviour and the same codegen, so
-/// whatever moves one moves the other and the comparison survives it. The only
+/// resembles. Both arms run the same codegen and, at `COST_COLS`, touch the
+/// same row headers, so whatever moves one moves the other. The only
 /// way this test goes red is if bulk scrolling actually starts scaling like the
 /// per-line path — which is the regression it exists to catch.
 #[test]

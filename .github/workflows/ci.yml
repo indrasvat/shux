@@ -53,6 +53,10 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec  # stable branch
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
+      # After the cache: it restores ~/.cargo/bin, which can hold an unpinned nextest.
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32  # v2.88.0
+        with:
+          tool: nextest@0.9.133  # the pin in scripts/ensure-nextest.sh
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6.8.0
       - name: Install jq
         run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends jq
@@ -97,6 +101,13 @@ jobs:
         run: make clippy
       - name: No raw sleeps in tests
         run: make check-test-sleeps
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6.8.0
+      - name: No timing in disguise in tests
+        run: make check-test-timing
+      - name: Every ignored test names an open issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: make check-test-ignores
       - name: Actions pinned to commits
         run: make check-action-pins
       - name: Clippy (macOS cfg)
@@ -154,7 +165,7 @@ jobs:
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6.8.0
       - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32  # v2.88.0
         with:
-          tool: nextest
+          tool: nextest@0.9.133  # the pin in scripts/ensure-nextest.sh
 
       # The merge-base test list, published by main's own CI run (step at the
       # end of this job). Exact key, no `restore-keys`: a prefix fallback could
@@ -297,7 +308,7 @@ jobs:
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6.8.0
       - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32  # v2.88.0
         with:
-          tool: nextest
+          tool: nextest@0.9.133  # the pin in scripts/ensure-nextest.sh
       # `make check` runs this guard on macOS too, where /bin/bash is 3.2. After
       # the toolchain steps: the Makefile asks rustc and cargo for their versions.
       - name: Actions pinned to commits (Bash 3.2)
@@ -329,6 +340,40 @@ jobs:
       - name: Integration regressions (12 deterministic scenarios)
         run: SHUX="$PWD/target/debug/shux" .shux/scripts/no_leak_guard.sh bash .shux/scripts/integration.sh
 
+  flake-gate:
+    name: Flake gate (${{ matrix.os }})
+    # The tests a PR adds or changes, 20 runs each next to twice as many CPU
+    # hogs as cores: a test that only passes on an idle machine fails here,
+    # before it merges (docs/testing.md#the-flake-gate).
+    if: github.event_name == 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    # Loud, not skipped: a gate that runs out of time has gated nothing. #281's
+    # stack, about 1,100 selected tests, ran 4-5 min a run: twice that here.
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec  # stable branch
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32  # v2.88.0
+        with:
+          tool: nextest@0.9.133  # the pin in scripts/ensure-nextest.sh
+      # The lens binaries it can select launch pixel_verify.py through uv.
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6.8.0
+      - name: Install stress-ng
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends stress-ng
+      - name: Install stress-ng and bash 4.4+
+        if: runner.os == 'macOS'
+        run: brew install stress-ng bash
+      - name: New and changed tests under load
+        run: make flake-gate BASE=origin/${{ github.base_ref }}
+
   # No `needs:` on purpose. Coverage re-runs the whole suite itself under
   # instrumentation and consumes nothing from `test-ubuntu` — no artifact, no
   # target dir, its own rust-cache key. Gating it on that job bought one thing,
@@ -356,7 +401,7 @@ jobs:
           tool: cargo-llvm-cov
       - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32  # v2.88.0
         with:
-          tool: nextest
+          tool: nextest@0.9.133  # the pin in scripts/ensure-nextest.sh
 
       # Instrumented builds run several times slower than the uninstrumented
       # ones the `slow-timeout` in .config/nextest.toml was sized against, so
@@ -408,7 +453,10 @@ jobs:
   lint-beta:
     name: Clippy (beta — advisory)
     runs-on: ubuntu-latest
-    continue-on-error: true
+    # Advisory on PRs: a new beta lint is not the PR's defect. The Monday run
+    # fails for real, so a lint arriving with the next stable is seen and fixed
+    # before it turns every PR's Check red.
+    continue-on-error: ${{ github.event_name != 'schedule' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
       - uses: dtolnay/rust-toolchain@cfd9b706ae130cd7002f711c4a0614be17a387e5  # beta branch

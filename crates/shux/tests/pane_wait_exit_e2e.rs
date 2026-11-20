@@ -30,17 +30,20 @@ impl Env {
         env
     }
 
-    fn run(&self, args: &[&str]) -> Output {
-        Command::new(&self.bin)
-            .env("XDG_RUNTIME_DIR", self.root.path().join("runtime"))
+    fn command(&self, args: &[&str]) -> Command {
+        let mut cmd = Command::new(&self.bin);
+        cmd.env("XDG_RUNTIME_DIR", self.root.path().join("runtime"))
             .env("XDG_CONFIG_HOME", self.root.path().join("config"))
             .env_remove("SHUX_SOCKET")
             .env("NO_COLOR", "1")
             .env("SHELL", "/bin/sh")
             .current_dir(self.root.path().join("work"))
-            .args(args)
-            .output()
-            .expect("spawn shux")
+            .args(args);
+        cmd
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        self.command(args).output().expect("spawn shux")
     }
 
     #[track_caller]
@@ -110,11 +113,14 @@ fn show(out: &Output) -> String {
     )
 }
 
+/// The wait may start before or after the program exits: both answer the
+/// same, and the live wait is pinned in `rpc::wait_exit`'s unit tests, which
+/// can see the wait subscribe.
 #[test]
 fn wait_exit_reports_the_programs_own_code() {
     let env = Env::new();
     for code in [0, 7, 143] {
-        let pane = env.split(&format!("{PROBE}; sleep 0.3; exit {code}"));
+        let pane = env.split(&format!("{PROBE}; exit {code}"));
         let (exit, v) = env.wait_exit(&pane, &["--timeout", "30s"]);
         assert_eq!(exit, 0, "the wait itself succeeded: {v}");
         let r = &v["result"];

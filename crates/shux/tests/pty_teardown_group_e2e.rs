@@ -240,6 +240,8 @@ fn a_descendant_that_handles_the_hangup_finishes_its_cleanup() {
     let marker = env.file("cleaned");
     let started = env.file("started");
     let script = format!(
+        // why: the trap's sleep is the slow cleanup under test; load only lengthens it
+        // ast-grep-ignore: test-sleep-then-act
         "sh -c 'trap \"sleep 0.1; echo cleaned > {marker}; exit 0\" HUP; : > {started}; sleep 900 & wait' & sleep 900",
         marker = marker.display(),
         started = started.display(),

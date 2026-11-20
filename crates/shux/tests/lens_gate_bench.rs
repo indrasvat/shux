@@ -31,6 +31,8 @@ fn bench(n: usize) {
     // Capture N frames.
     let t0 = Instant::now();
     let frames: Vec<FrameEnvelope> = (0..n).map(frame).collect();
+    // why: throughput is printed, never asserted; the verdict rests on work done
+    // ast-grep-ignore: test-wall-clock
     let cap = t0.elapsed();
 
     // Cell-compare each frame against the next (wrap-around).
@@ -41,6 +43,8 @@ fn bench(n: usize) {
         let b = frames[(i + 1) % n].try_view().unwrap();
         changed += u64::from(compare_cell(&a, &b).diff.cells_changed);
     }
+    // why: throughput is printed, never asserted; the verdict rests on work done
+    // ast-grep-ignore: test-wall-clock
     let cmp = t1.elapsed();
 
     // Render N frames (pixel-tier cost).
@@ -50,6 +54,8 @@ fn bench(n: usize) {
     for f in &frames {
         px += render_envelope(&r, f).as_raw().len() as u64;
     }
+    // why: throughput is printed, never asserted; the verdict rests on work done
+    // ast-grep-ignore: test-wall-clock
     let render = t2.elapsed();
 
     let _tol = TolParams::default();

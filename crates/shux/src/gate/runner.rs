@@ -474,8 +474,7 @@ fn derive_terminal(signals: &[RunnerSignal]) -> Option<TerminalOutcome> {
 /// Drive a parsed scenario against a hidden scratch TUI, emit the raw-signal trace, and
 /// return the STRUCTURED outcome (design D1). Owns 081 MECHANICS only — no verdict, no
 /// stdout, no exit code. 082's `verdict` layer rolls the outcome into `report.json`.
-#[allow(clippy::too_many_arguments)] // one knob per gate CLI flag; a params struct here
-// would only rename the same list (established precedent: attach.rs, shux-rpc server.rs).
+#[expect(clippy::too_many_arguments, reason = "one knob per gate CLI flag")]
 pub async fn drive_scenario(
     socket_path: &Path,
     scenario: &Scenario,
@@ -753,7 +752,7 @@ pub async fn drive_scenario(
 
 /// Drive one step. Blocking waits race the exit monitor so a crash short-circuits
 /// before any visual compare (design D7).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 async fn drive_step(
     stream: &mut UnixStream,
     monitor: &ExitMonitor,
@@ -1268,7 +1267,10 @@ fn envelope_from_glance(cells: &serde_json::Value) -> Result<FrameEnvelope, Stri
 /// error whose signal the caller emits before stopping the run. `Ok` is the common path and is
 /// destructured immediately, so boxing it to equalize variant size would only add a per-capture
 /// allocation for no real benefit (same rationale as the `LensCommand` enum).
-#[allow(clippy::large_enum_variant)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "short-lived; boxing the frame would allocate on every capture"
+)]
 enum CaptureResult {
     Ok(FrameOutcome, RunnerSignal),
     Stop(RunnerSignal),
@@ -1276,7 +1278,7 @@ enum CaptureResult {
 
 /// One masked glance + golden compare for `expect_golden` (task 083 — the retry loop calls this
 /// once per attempt; the caller settles + checks child-exit first). Never retries anything itself.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 async fn capture_and_compare(
     stream: &mut UnixStream,
     pane_id: &str,

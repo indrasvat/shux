@@ -149,10 +149,16 @@ pub fn run_daemon(socket_override: Option<PathBuf>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A process's argv. Exactly one variant is built per platform, so the other is
-/// genuinely dead there -- hence the type-level allow under `-Dwarnings`.
+/// A process's argv. Exactly one variant is built per platform.
 #[derive(Debug)]
-#[allow(dead_code)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    expect(dead_code, reason = "`Exact` is read from /proc, which only Linux has")
+)]
+#[cfg_attr(
+    all(target_os = "linux", not(test)),
+    expect(dead_code, reason = "Linux builds `Joined` only in tests")
+)]
 enum ProcessArgv {
     /// From `/proc`: boundaries are real, and the cwd a relative `--socket`
     /// resolves against is known. Linux only.
@@ -205,7 +211,10 @@ fn process_argv(pid: u32) -> Option<ProcessArgv> {
 }
 
 /// A `uid args` line from `ps`, kept only when `uid` is ours.
-#[cfg_attr(target_os = "linux", allow(dead_code))]
+#[cfg_attr(
+    all(target_os = "linux", not(test)),
+    expect(dead_code, reason = "Linux reads `ps` output only in tests")
+)]
 fn joined_if_ours(line: &str) -> Option<ProcessArgv> {
     let (uid, args) = line.split_once(' ')?;
     let args = args.trim();

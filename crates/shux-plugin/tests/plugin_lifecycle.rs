@@ -666,14 +666,22 @@ done
 /// one-worker runtime, other tasks still run while its state read blocks.
 #[tokio::test]
 async fn a_plugin_request_stalled_on_disk_leaves_the_worker_free() {
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::fd::AsFd;
     let tmp = tempfile::tempdir().unwrap();
     let state_root = tmp.path().join("plugins");
     let go = tmp.path().join("go");
     std::fs::create_dir_all(state_root.join("stall")).unwrap();
-    // A FIFO: reading it blocks until a writer opens it, then until data.
+    // A FIFO: its reader blocks in read() until every writer closes.
     let state = state_root.join("stall").join("state.json");
     nix::unistd::mkfifo(&state, nix::sys::stat::Mode::S_IRWXU).unwrap();
+    // Held open before the request, so the plugin's open() never sleeps: on
+    // macOS a reader asleep in open() can miss a writer that opens and closes.
+    let mut fifo = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&state)
+        .unwrap();
+    std::io::Write::write_all(&mut fifo, b"null").unwrap();
     let script = format!(
         r#"#!/usr/bin/env bash
 set -u
@@ -697,23 +705,15 @@ done
     let (ran_tx, ran_rx) = std::sync::mpsc::channel::<()>();
     // An OS thread, so neither the verdict nor the release needs the worker.
     let judge = std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + BUDGET;
-        // A non-blocking writer opens only once the reader is blocked in
-        // open(); holding it open without writing keeps the read blocked.
-        let writer = loop {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits())
-                .open(&state)
-            {
-                Ok(w) => break w,
-                Err(_) if std::time::Instant::now() < deadline => std::thread::yield_now(),
-                Err(e) => panic!("the plugin never read its state: {e}"),
-            }
-        };
+        // Its bytes gone, the plugin has read them and now waits for EOF.
+        shux_testkit::wait_for("the plugin to read its state", || {
+            use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+            let mut fds = [PollFd::new(fifo.as_fd(), PollFlags::POLLIN)];
+            (poll(&mut fds, PollTimeout::ZERO).ok()? == 0).then_some(())
+        });
         let _ = blocked_tx.send(());
         let free = ran_rx.recv_timeout(BUDGET).is_ok();
-        drop(writer);
+        drop(fifo);
         free
     });
     std::fs::write(&go, b"").unwrap();

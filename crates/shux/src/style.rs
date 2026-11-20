@@ -17,7 +17,6 @@ use unicode_width::UnicodeWidthStr;
 // ── Terminal Context ────────────────────────────────────────────
 
 /// Captures terminal capabilities and format preferences for output rendering.
-#[allow(dead_code)]
 pub struct TerminalContext {
     pub is_tty: bool,
     pub colors: bool,
@@ -1787,7 +1786,7 @@ fn print_command_output(result: &serde_json::Value, field: &str, truncated: &str
 
 /// Print a `pane glance` summary (lens PRD §5/§10). PNG bytes are never
 /// printed here — only the file-write confirmation when `--png` was given.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 pub fn print_pane_glance(
     pane_id: &str,
     revision: u64,
@@ -2262,7 +2261,7 @@ pub fn print_lens_run(session_id: &str, pane_id: &str, revision: u64, exit_code:
 /// Print a `pane diff` summary (lens PRD §7/§10): the revision span and the
 /// structured delta. Diff is data, not a verdict, so this always reads as a
 /// neutral ✓ (the CLI exits 0 regardless of delta size).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
 pub fn print_pane_diff(
     pane_id: &str,
     from_revision: u64,

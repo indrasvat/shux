@@ -637,6 +637,8 @@ fn an_idle_attach_client_sleeps() {
         client.idle_polls(input, 4),
         "the client's input thread exited"
     );
+    // why: the window divides CPU time into a rate; load lengthens it, which only lowers the rate
+    // ast-grep-ignore: test-wall-clock
     let (end, window) = (cpu(client.pid()), started.elapsed());
     drop(client);
 
