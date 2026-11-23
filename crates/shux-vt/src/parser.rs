@@ -697,6 +697,9 @@ impl<'a> VtHandler<'a> {
             if width == 2 && col + 1 < cols {
                 row[col + 1] = Cell::wide_continuation();
             }
+            if col + width >= cols {
+                row.wide_gap = false;
+            }
         }
         self.set_active_grapheme_cell(cursor_row, col);
 

@@ -201,7 +201,7 @@ impl LogicalLine {
         let start = self.cells.len();
         self.cells.extend_from_slice(&cells[..=last]);
         self.pending_defaults = cells.len() - last - 1;
-        if let Some(idx) = cells[..=last].iter().rposition(is_content) {
+        if let Some(idx) = cells[..=last].iter().rposition(|cell| !is_padding(cell)) {
             self.content_len = start + idx + 1;
         }
     }
@@ -217,10 +217,6 @@ fn is_padding(cell: &Cell) -> bool {
         && cell.extended.is_none()
 }
 
-fn is_content(cell: &Cell) -> bool {
-    !is_padding(cell)
-}
-
 fn is_default_blank(cell: &Cell) -> bool {
     is_padding(cell) && cell.style.bg == Color::Default
 }
@@ -234,12 +230,14 @@ struct CursorAnchor {
 
 /// A visible position carried through a resize.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ResizePoint {
+pub(crate) struct ResizePoint {
     pub row: usize,
     pub col: usize,
     /// The point is just past the glyph at `col`, in the last column: a
     /// deferred wrap.
     pub past_glyph: bool,
+    /// The point's row stays on screen: content-free rows below it are kept.
+    pub holds_row: bool,
 }
 
 #[derive(Debug)]
@@ -1461,8 +1459,8 @@ impl Grid {
 
     /// Resize the grid, carrying `points` through it. A column change reflows
     /// soft-wrapped lines (see [`append_reflowed_line`]). Rows with no content
-    /// below every point give way before a row scrolls off the top.
-    pub fn resize_with_points(
+    /// below every row-holding point give way before a row scrolls off the top.
+    pub(crate) fn resize_with_points(
         &mut self,
         new_rows: usize,
         new_cols: usize,
@@ -1473,15 +1471,20 @@ impl Grid {
             return;
         }
 
+        // Points come only from `VirtualTerminal`, which never sizes to zero:
+        // here the width is unchanged.
         let sb = self.scrollback_len();
-        let floor = points.iter().map(|p| sb + p.row).max();
-        let old_cols = self.cols;
+        let floor = points
+            .iter()
+            .filter(|p| p.holds_row)
+            .map(|p| sb + p.row)
+            .max();
         self.resize_canvas_above(new_rows, new_cols, floor);
         for point in points.iter_mut() {
-            let (row, col) = self.visible_cursor_from_abs(sb + point.row, point.col);
-            point.past_glyph &= sb + point.row >= self.scrollback_len() && new_cols == old_cols;
-            point.row = row;
-            point.col = col;
+            let abs_row = sb + point.row;
+            let on_screen = (self.scrollback_len()..self.raw.len()).contains(&abs_row);
+            (point.row, point.col) = self.visible_cursor_from_abs(abs_row, point.col);
+            point.past_glyph &= on_screen;
         }
     }
 
@@ -1582,14 +1585,19 @@ impl Grid {
         for line in logical_lines {
             line_ranges.push(append_reflowed_line(&mut reflowed, line, new_cols));
         }
+        // Every anchor's row was read into a line that was then pushed.
         let mapped: Vec<_> = anchors
             .iter()
-            .filter_map(|a| {
-                let line = line_ranges.get(a.logical_line)?;
-                Some((a.point, line.position_for_offset(a.display_offset)))
+            .map(|a| {
+                let line = &line_ranges[a.logical_line];
+                (a.point, line.position_for_offset(a.display_offset))
             })
             .collect();
-        let floor = mapped.iter().map(|(_, (row, _, _))| *row).max();
+        let floor = mapped
+            .iter()
+            .filter(|(point, _)| points[*point].holds_row)
+            .map(|(_, (row, _, _))| *row)
+            .max();
 
         while reflowed.len() < new_rows {
             reflowed.push_back(Row::new(new_cols));
@@ -1618,15 +1626,16 @@ impl Grid {
         self.dirty.resize_rows(new_rows);
         self.dirty.mark_all();
 
-        let sb = self.scrollback_len();
+        // A point whose row left the screen is clamped onto it, without its wrap.
+        let visible = self.scrollback_len()..self.raw.len();
         for (point, (abs_row, col, past_glyph)) in mapped {
-            let abs_row = abs_row.saturating_sub(dropped_rows);
-            let (row, col) = self.visible_cursor_from_abs(abs_row, col);
-            points[point] = ResizePoint {
-                row,
-                col,
-                past_glyph: past_glyph && abs_row >= sb,
-            };
+            let on_screen = abs_row
+                .checked_sub(dropped_rows)
+                .is_some_and(|abs_row| visible.contains(&abs_row));
+            let (row, col) =
+                self.visible_cursor_from_abs(abs_row.saturating_sub(dropped_rows), col);
+            let p = &mut points[point];
+            (p.row, p.col, p.past_glyph) = (row, col, past_glyph && on_screen);
         }
     }
 
@@ -1685,7 +1694,7 @@ impl Row {
 }
 
 fn row_has_content(row: &Row) -> bool {
-    row.cells.iter().any(is_content)
+    row.cells.iter().any(|cell| !is_padding(cell))
 }
 
 fn display_width_until(cells: &[Cell], col: usize) -> usize {
@@ -1779,10 +1788,9 @@ fn append_reflowed_line(
 
     let end_row = rows.len();
     let end_col = col;
-    if !padding.is_empty() {
-        for (slot, cell) in row.cells_mut()[col.min(cols)..].iter_mut().zip(padding) {
-            *slot = cell;
-        }
+    // `col <= cols`: every placement above ends at or before the edge.
+    for (slot, cell) in row.cells_mut()[col..].iter_mut().zip(padding) {
+        *slot = cell;
     }
     rows.push_back(row);
     let end = rows.len();
@@ -1832,6 +1840,7 @@ impl Grid {
             *cell = Cell::default();
         }
         r.sanitize_wide_pairs(Color::Default);
+        r.wide_gap = false;
         if count > 0 && col < len {
             self.dirty
                 .mark_range(row, col.saturating_sub(1)..len, self.rows, self.cols);
@@ -1858,6 +1867,7 @@ impl Grid {
             *cell = Cell::default();
         }
         r.sanitize_wide_pairs(Color::Default);
+        r.wide_gap = false;
         self.dirty
             .mark_range(row, col.saturating_sub(1)..len, self.rows, self.cols);
     }
