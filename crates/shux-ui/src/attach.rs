@@ -157,6 +157,9 @@ pub async fn run_attach(socket_path: &Path, config: ClientConfig) -> Result<Exit
     // panic hook covers panics, `signals` covers kills.
     let mut signals = terminal::ShutdownSignals::install().context("install signal handlers")?;
     let mut guard = TerminalGuard::enter().context("enter raw mode")?;
+    if config.plain {
+        guard.leave_cursor_style();
+    }
     let result = tokio::select! {
         r = run_loop(&mut framed, &config, resized, (cols, rows)) => r,
         signo = signals.recv() => Ok(ExitReason::Signal(signo)),

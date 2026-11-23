@@ -2111,6 +2111,11 @@ async fn run_render_loop(
 
         // Take the bytes out (drain) and send them.
         let bytes = std::mem::take(compositor.inner_mut());
+        let bytes = if plain {
+            shux_ui::render::strip_hidden_controls(bytes)
+        } else {
+            bytes
+        };
         // Re-establish capacity for next frame.
         compositor.inner_mut().reserve(64 * 1024);
         drop(state);
@@ -10529,6 +10534,73 @@ mod tests {
                 "normal lacks {effect:?}: {normal:?}"
             );
         }
+        fixture.stop();
+    }
+
+    /// Every path that draws for a plain viewer, selection highlighting
+    /// included, leaves out invisible direction controls the pane printed.
+    #[tokio::test]
+    async fn a_plain_viewer_selecting_text_gets_no_direction_controls() {
+        let fixture = attach_fixture().await;
+        let _io = seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+        fixture
+            .io_state
+            .lock()
+            .await
+            .vts
+            .get_mut(&fixture.first_pane)
+            .expect("seeded vt")
+            .process("\x1b[2J\x1b[HSPOOF-A\u{202E}B\u{2066}C".as_bytes());
+        let onboarded = crate::onboarding::OnboardingHandle::from_state_for_test(
+            crate::onboarding::OnboardingState {
+                prefix_discovered: true,
+                welcome_toast_seen: true,
+            },
+        );
+        let mut c = Client::attach_onboarded(&fixture, 90, onboarded, true).await;
+        let mut raw = Vec::new();
+        let mut at = None;
+        assert!(
+            c.frames_until(|f, text| {
+                if let AttachServerFrame::Render { data, .. } = f {
+                    raw.extend(BASE64.decode(data.as_bytes()).expect("render base64"));
+                }
+                at = text.lines().enumerate().find_map(|(y, l)| {
+                    l.split_once("SPOOF")
+                        .map(|(before, _)| (before.chars().count() as u16, y as u16))
+                });
+                at.is_some()
+            })
+            .await
+        );
+        let (x, y) = at.expect("SPOOF on screen");
+        for (kind, col) in [(MouseKind::Down, x), (MouseKind::Drag, x + 9)] {
+            let frame = c.written_frame;
+            c.send(&AttachClientFrame::Mouse {
+                kind,
+                button: ProtoMouseButton::Left,
+                col,
+                row: y,
+                shift: false,
+                alt: false,
+                ctrl: false,
+                frame,
+            })
+            .await;
+        }
+        let _ = c
+            .frames_until(|f, _| {
+                if let AttachServerFrame::Render { data, .. } = f {
+                    raw.extend(BASE64.decode(data.as_bytes()).expect("render base64"));
+                }
+                matches!(f, AttachServerFrame::Render { frame: Some(_), .. })
+            })
+            .await;
+        let text = String::from_utf8_lossy(&raw);
+        for hidden in ['\u{202E}', '\u{2066}'] {
+            assert!(!text.contains(hidden), "a plain viewer was sent {hidden:?}");
+        }
+        c.stop().await;
         fixture.stop();
     }
 }

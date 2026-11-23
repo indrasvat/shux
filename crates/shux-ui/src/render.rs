@@ -32,8 +32,26 @@ pub struct RenderBackend<W: Write> {
     plain: bool,
 }
 
-/// Zero-width characters that reorder or hide text without drawing anything:
-/// bidi overrides and isolates, marks, and invisible spaces. ZWJ and ZWNJ
+/// A plain client's frame without the zero-width characters that reorder or
+/// hide text without drawing anything. Applied to the whole frame, so copy
+/// mode, selection and overlays are covered as well as cells.
+pub fn strip_hidden_controls(bytes: Vec<u8>) -> Vec<u8> {
+    let hidden = |chunk: std::str::Utf8Chunk<'_>| chunk.valid().chars().any(is_hidden_control);
+    if !bytes.utf8_chunks().any(hidden) {
+        return bytes;
+    }
+    let mut out = Vec::with_capacity(bytes.len());
+    for chunk in bytes.utf8_chunks() {
+        for c in chunk.valid().chars().filter(|&c| !is_hidden_control(c)) {
+            let mut b = [0; 4];
+            out.extend_from_slice(c.encode_utf8(&mut b).as_bytes());
+        }
+        out.extend_from_slice(chunk.invalid());
+    }
+    out
+}
+
+/// Bidi overrides and isolates, marks, and invisible spaces. ZWJ and ZWNJ
 /// are not here; emoji and conjuncts need them.
 fn is_hidden_control(c: char) -> bool {
     matches!(
@@ -194,6 +212,9 @@ impl<W: Write> RenderBackend<W> {
 
         // Begin synchronized update to prevent flicker
         self.out.queue(BeginSynchronizedUpdate)?;
+        // Autowrap off while drawing: a frame composed for a wider host than
+        // this one clips at its edge instead of wrapping onto the next row.
+        self.out.write_all(b"\x1b[?7l")?;
 
         // Where the host cursor is known to sit. Only a single-column ASCII
         // print advances it predictably on every terminal; after anything
@@ -211,13 +232,7 @@ impl<W: Write> RenderBackend<W> {
 
             // Print the full cell display text when the VT preserved a
             // multi-codepoint grapheme payload.
-            let text = cell.cell.display_text();
-            if self.plain && text.chars().any(is_hidden_control) {
-                let shown: String = text.chars().filter(|&c| !is_hidden_control(c)).collect();
-                self.out.queue(Print(shown))?;
-            } else {
-                self.out.queue(Print(text))?;
-            }
+            self.out.queue(Print(cell.cell.display_text()))?;
 
             let plain_ascii = (cell.cell.ch.is_ascii_graphic() || cell.cell.ch == ' ')
                 && cell
@@ -231,6 +246,7 @@ impl<W: Write> RenderBackend<W> {
         // Reset colors at the end so the terminal is in a clean state
         self.clear_hyperlink()?;
         self.out.queue(ResetColor)?;
+        self.out.write_all(b"\x1b[?7h")?;
 
         // End synchronized update
         self.out.queue(EndSynchronizedUpdate)?;
@@ -761,42 +777,49 @@ mod tests {
         );
     }
 
+    /// A frame composed for a wider terminal can land after the host shrank.
+    /// It must clip at the host's edge, as positioning every cell did, not
+    /// wrap onto the next row (or scroll the screen from the bottom one).
+    #[test]
+    fn a_frame_wider_than_the_host_clips_instead_of_wrapping() {
+        let dirty: Vec<DirtyCell> = "abcdefg"
+            .chars()
+            .enumerate()
+            .map(|(col, ch)| DirtyCell {
+                col: col as u16,
+                row: 0,
+                cell: RenderCell::text(ch),
+            })
+            .collect();
+        let mut output = Vec::new();
+        RenderBackend::new(&mut output).render_diff(&dirty).unwrap();
+        let mut host = shux_vt::VirtualTerminal::new(2, 4);
+        host.process(&output);
+        let row = |r: usize| -> String {
+            let cells = host.grid().visible_row(r);
+            (0..cells.len()).map(|c| cells[c].ch).collect()
+        };
+        assert_eq!(
+            row(1).trim(),
+            "",
+            "the frame wrapped: {:?} / {:?}",
+            row(0),
+            row(1)
+        );
+        assert!(row(0).starts_with("abc"), "{:?}", row(0));
+    }
+
     /// Invisible direction and spacing controls a pane printed can reorder
     /// or hide text in a guest's terminal; a plain viewer gets the visible
     /// text, and joiners that build emoji and conjuncts stay.
     #[test]
-    fn a_plain_backend_drops_invisible_direction_controls() {
-        let grapheme = |g: &str| {
-            Some(Arc::new(shux_vt::ExtendedAttrs {
-                grapheme: Some(g.to_string()),
-                hyperlink: None,
-                underline_color: None,
-                underline_style: shux_vt::UnderlineStyle::None,
-            }))
-        };
-        let mut output = Vec::new();
-        let mut backend = RenderBackend::new(&mut output);
-        backend.set_plain(true);
-        let cells = [
-            "A\u{202E}\u{200B}\u{2066}\u{FEFF}",
-            "\u{1F468}\u{200D}\u{1F469}",
-            "\u{0915}\u{094D}\u{200C}",
-        ];
-        let dirty: Vec<DirtyCell> = cells
-            .iter()
-            .enumerate()
-            .map(|(i, g)| {
-                let mut cell = RenderCell::text(g.chars().next().unwrap());
-                cell.extended = grapheme(g);
-                DirtyCell {
-                    col: (i * 2) as u16,
-                    row: 0,
-                    cell,
-                }
-            })
-            .collect();
-        backend.render_diff(&dirty).unwrap();
-        let out = String::from_utf8(output).unwrap();
+    fn stripping_drops_invisible_direction_controls_and_keeps_joiners() {
+        let frame = "\x1b[1;1HA\u{202E}\u{200B}\u{2066}\u{FEFF}\x1b[1;3H\u{1F468}\u{200D}\u{1F469}\u{0915}\u{094D}\u{200C}";
+        let mut bytes = frame.as_bytes().to_vec();
+        bytes.push(0xFF);
+        let out = strip_hidden_controls(bytes);
+        assert_eq!(out.last(), Some(&0xFF), "bytes that are not text were lost");
+        let out = String::from_utf8_lossy(&out).into_owned();
         for hidden in ['\u{202E}', '\u{200B}', '\u{2066}', '\u{FEFF}'] {
             assert!(!out.contains(hidden), "plain output carries {hidden:?}");
         }

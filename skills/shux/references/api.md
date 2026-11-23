@@ -87,6 +87,13 @@ NAMED that string; the ID wins when both match (a warning is printed).
 `session rename` / `session save` / `session attach` take NAMEs only. Raw
 RPC callers pick the field themselves per the shapes above.
 
+`shux session attach --plain` is for a terminal whose owner did not choose
+to run the panes' programs: the daemon sends it text and colour only, with
+no hyperlinks, cursor shape or colour, images, or invisible direction
+controls (bidi overrides, zero-width spaces). The viewer's own copy
+(OSC 52) still works. A daemon too old to promise this is refused, and
+`attach` exits non-zero.
+
 ## Attached clients
 
 ### `client.list` / `client.detach`

@@ -3050,6 +3050,31 @@ mod tests {
         assert_eq!(link(2), None);
     }
 
+    /// A link left open does not follow the program onto the other screen:
+    /// switching buffers (47, 1047, 1049, either way) closes it.
+    #[test]
+    fn an_open_link_does_not_cross_a_screen_switch() {
+        for mode in ["47", "1047", "1049"] {
+            let mut vt = VirtualTerminal::new(2, 40);
+            vt.process(b"\x1b]8;;https://example.invalid/x\x1b\\L");
+            vt.process(format!("\x1b[?{mode}hA\x1b[H").as_bytes());
+            let linked = |vt: &VirtualTerminal| {
+                vt.grid().visible_row(0)[0]
+                    .extended
+                    .as_ref()
+                    .and_then(|e| e.hyperlink.clone())
+            };
+            assert_eq!(
+                linked(&vt),
+                None,
+                "?{mode}h carried the link onto the alternate screen"
+            );
+            vt.process(b"\x1b]8;;https://example.invalid/y\x1b\\B");
+            vt.process(format!("\x1b[?{mode}l\x1b[HP").as_bytes());
+            assert_eq!(linked(&vt), None, "?{mode}l carried the link back");
+        }
+    }
+
     #[test]
     fn grapheme_combining_mark_is_stored_and_captured() {
         let mut vt = VirtualTerminal::new(2, 20);

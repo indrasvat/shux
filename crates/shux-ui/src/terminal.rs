@@ -30,6 +30,9 @@ pub struct TerminalGuard {
     mouse_capture: bool,
     bracketed_paste: bool,
     kitty_keyboard: bool,
+    /// Off for a plain attach, which never styled the cursor: then `leave`
+    /// restores no shape or colour the user may have set themselves.
+    restore_cursor_style: bool,
     /// Cleared by the first `leave`, so a later `leave` or `Drop` writes nothing.
     active: bool,
 }
@@ -44,6 +47,7 @@ impl TerminalGuard {
             mouse_capture: false,
             bracketed_paste: false,
             kitty_keyboard: false,
+            restore_cursor_style: true,
             active: true,
         };
 
@@ -110,16 +114,27 @@ impl TerminalGuard {
             let _ = disable_raw_mode();
         }
 
-        // Restore cursor presentation in case a pane requested a custom
-        // shape or OSC 12 cursor color during rendering.
-        let _ = execute!(io::stdout(), cursor::SetCursorStyle::DefaultUserShape);
-        let _ = execute!(io::stdout(), ResetCursorColor);
-        let _ = execute!(io::stdout(), cursor::Show);
+        self.restore_cursor(&mut io::stdout());
         // macOS discards a terminal's unread output when its session leader
         // exits, so the restore must be taken before this process can go.
         let _ = nix::sys::termios::tcdrain(io::stdout());
 
         Ok(())
+    }
+
+    /// A plain attach: no cursor shape or colour was ever sent, so none is
+    /// reset on the way out.
+    pub fn leave_cursor_style(&mut self) {
+        self.restore_cursor_style = false;
+    }
+
+    /// Undo a pane's custom cursor shape or OSC 12 colour, and show it.
+    fn restore_cursor(&self, out: &mut impl io::Write) {
+        if self.restore_cursor_style {
+            let _ = execute!(out, cursor::SetCursorStyle::DefaultUserShape);
+            let _ = execute!(out, ResetCursorColor);
+        }
+        let _ = execute!(out, cursor::Show);
     }
 
     /// Restore without waiting on stdout, for an exit that must happen even
@@ -152,7 +167,7 @@ struct CloseInterruptedFrame;
 
 impl Command for CloseInterruptedFrame {
     fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
-        f.write_str("\x1b\\\x1b[?2026l")
+        f.write_str("\x1b\\\x1b[?2026l\x1b[?7h")
     }
 }
 
@@ -349,6 +364,32 @@ mod tests {
             !ansi.contains("\x1b[?1003h"),
             "shux should not enable any-motion tracking"
         );
+    }
+
+    #[test]
+    fn a_plain_attach_leaves_the_cursor_style_alone() {
+        let mut guard = TerminalGuard {
+            raw_mode_enabled: false,
+            alternate_screen: false,
+            mouse_capture: false,
+            bracketed_paste: false,
+            kitty_keyboard: false,
+            restore_cursor_style: true,
+            active: false,
+        };
+        let restored = |guard: &TerminalGuard| {
+            let mut out = Vec::new();
+            guard.restore_cursor(&mut out);
+            String::from_utf8(out).unwrap()
+        };
+        assert!(restored(&guard).contains(" q") && restored(&guard).contains("\x1b]112"));
+        guard.leave_cursor_style();
+        let plain = restored(&guard);
+        assert!(
+            !plain.contains(" q") && !plain.contains("\x1b]112"),
+            "{plain:?}"
+        );
+        assert!(plain.contains("\x1b[?25h"), "the cursor was left hidden");
     }
 
     #[test]
