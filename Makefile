@@ -418,6 +418,8 @@ test-gui-terminal: test-gui-terminal-selftest ## Photograph shux in a real GUI t
 	@.shux/scripts/no_leak_guard.sh bash .shux/scripts/gui_terminal_check.sh --scenario plain
 	@echo "$(COLOR_BLUE)▶ ...and the emit path, which nothing shux renders can see...$(COLOR_RESET)"
 	@.shux/scripts/no_leak_guard.sh bash .shux/scripts/gui_terminal_check.sh --scenario image-pane
+	@echo "$(COLOR_BLUE)▶ ...and two clients at different sizes on one split session...$(COLOR_RESET)"
+	@.shux/scripts/no_leak_guard.sh bash .shux/scripts/gui_terminal_two_clients.sh
 	@echo "$(COLOR_GREEN)✓ GUI-terminal rig passed$(COLOR_RESET)"
 
 .PHONY: test-vt-dec-special-graphics
