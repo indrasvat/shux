@@ -350,14 +350,10 @@ impl<W: Write> RenderCompositor<W> {
         self.images.set_enabled(enabled);
     }
 
-    /// Draw cells and colours only, with no terminal effects: hyperlinks,
-    /// cursor shape and colour, images. For a client that shows pane output
-    /// to someone who did not choose to run it.
+    /// Cells and colours only; see `AttachHello::plain`. Images are the
+    /// caller's: `set_graphics(graphics && !plain)`.
     pub fn set_plain(&mut self, plain: bool) {
         self.backend.set_plain(plain);
-        if plain {
-            self.images.set_enabled(false);
-        }
     }
 
     /// Hide the terminal cursor from the next frame on, for an overlay that

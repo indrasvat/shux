@@ -84,7 +84,7 @@ pub(crate) async fn run_attach(
     let cfg_snapshot = live_config.current();
     // Held before the watcher starts: it logs as soon as it runs, on any
     // worker, and that line must not land on the terminal the UI takes over.
-    // Dropped after the outcome line, so held logs follow it.
+    // Dropped after a detach or end line, before a failure's error line.
     let hold_logs = crate::client_log::hold();
     let stop_reload = tokio_util::sync::CancellationToken::new();
     tokio::spawn(shux_core::config::run_hot_reload(

@@ -29,8 +29,6 @@ pub struct RenderBackend<W: Write> {
     last_underline_style: Option<shux_vt::UnderlineStyle>,
     last_underline_color: Option<Option<CtColor>>,
     last_hyperlink: Option<Option<String>>,
-    /// Cells and their colours only: no hyperlinks, cursor shape or cursor
-    /// colour reach this client's terminal.
     plain: bool,
 }
 
@@ -736,6 +734,31 @@ mod tests {
         vt.process(&output);
         assert_eq!(vt.grid().visible_row(0)[9].ch, 'z');
         assert_eq!(vt.grid().visible_row(1)[0].ch, 'a');
+    }
+
+    /// The host may draw a wide or composed glyph at another width than shux
+    /// does, so the cell after one is always positioned explicitly.
+    #[test]
+    fn a_cell_after_a_wide_glyph_is_positioned_explicitly() {
+        let mut output = Vec::new();
+        let dirty = [
+            DirtyCell {
+                col: 0,
+                row: 0,
+                cell: RenderCell::text('界'),
+            },
+            DirtyCell {
+                col: 2,
+                row: 0,
+                cell: RenderCell::text('a'),
+            },
+        ];
+        RenderBackend::new(&mut output).render_diff(&dirty).unwrap();
+        let out = String::from_utf8_lossy(&output).into_owned();
+        assert!(
+            out.contains("\x1b[1;3H"),
+            "no move after the wide glyph: {out:?}"
+        );
     }
 
     /// Invisible direction and spacing controls a pane printed can reorder

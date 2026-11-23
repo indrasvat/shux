@@ -1682,7 +1682,7 @@ async fn run_render_loop(
     };
     let buf: Vec<u8> = Vec::with_capacity(64 * 1024);
     let mut compositor: RenderCompositor<Vec<u8>> = RenderCompositor::new(cols, rows, buf, cfg);
-    compositor.set_graphics(graphics);
+    compositor.set_graphics(graphics && !plain);
     compositor.set_plain(plain);
 
     // Send a clear-screen ANSI prelude so the client terminal starts blank.
