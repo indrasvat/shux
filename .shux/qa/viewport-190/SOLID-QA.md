@@ -1,6 +1,8 @@
 VERDICT: PASS
 
-commit_under_audit: 417e0702d18d4353d7cb894a2e9e7c2f3d4aad04
+commit_under_audit: 4e2d942b68fedb03bbc08a963dad13cd542104c8
+The full audit ran at 417e070. A delta re-audit of 417e070..4e2d942 follows
+in the last section.
 merge_base: f1478e4b1e5dcc163aaeb635069dec0b901790d4
 branch: feat/190-viewport. Issue #190, PR B1 "viewport core". Full tier.
 Charters: shux-vt-solid-qa and shux-tui-qa, run once by one agent.
@@ -90,3 +92,47 @@ Sessions `o1`, `o2`, `o3` and `t190` were killed. `daemon stop` stopped PIDs
 dead. Both pidfiles are gone, and `ps` shows no process whose argv names
 `qb1cfg`, `qb1a` or `qb1o`. The real `~/.config/htop/htoprc` is untouched
 (mtime Oct 31).
+
+## Delta re-audit: 417e070..4e2d942
+
+The delta is one product change, 4e2d942 "fix(attach): a departed client takes
+its mouse-release waiters with it". Attach teardown now drops the departing
+client's `(pane, client)` entries from `PaneIoState.mouse_release_written`.
+The commit adds the test `a_departed_client_leaves_no_release_waiter`.
+
+- **The fix closes the leak.** Waiters are inserted only in
+  `forward_bytes_to_pane`, and only with `Some(client)`. After the input loop
+  ends, nothing can insert one for this client. Teardown's
+  `release_app_gesture(…, None)` runs after the `retain` but passes `None`, so
+  it adds no waiter. There is no early return between registration and
+  teardown. The per-pane `retain` on pane exit and respawn is unchanged.
+- **Red without the fix.** I removed only the teardown `retain` in a throwaway
+  worktree of 4e2d942, keeping the test, and ran `make test-focus`. It fails
+  with "a departed client left a release waiter behind". The worktree has been
+  removed.
+- **Green.** `make test-focus PKG=shux` on the departed-client, takeover,
+  driver-leaves, detach, release and gesture tests: 55 run, 55 passed. Log:
+  /tmp/qb1cfg/delta-green.log.
+- **Neutrality at 4e2d942** (`neutrality.json`, rewritten by the implementer's
+  fresh run): head 4e2d942, clean tree, every layer passed, 54 metrics at 0/0.
+  No metric file changed.
+- **Live, rebuilt binary at 4e2d942.** One pane runs a mouse probe that logs
+  each SGR report with the terminal size at read time. Two real clients attach,
+  at 160x48 and 90x28.
+  - Takeover click from the cropped viewer: press `<0;81;29M` and release
+    `<0;81;29m` land on the same cell, both at 158x45, with offsets (70,20).
+    After that the viewer drives.
+  - Driver leaves mid-drag: press `<0;19;7M`, then drag `<32;24;7M`, then the
+    driver's client is killed. The app receives release `<0;24;7m` at the last
+    cell, and the remaining client takes the panes at 158x45.
+  - A third client attaches after that departure and takes over by click,
+    pressing and releasing on one cell.
+  - A viewer's click within 1 s of the driver's own input does not take over.
+    It is reproduced with an immediate click (held) and a 1.5 s gap (taken).
+    This is the documented `SETTLE` hold in `clients.rs`, not a defect.
+  - One takeover's release was read after the app's SIGWINCH (88x25), on the
+    same cell as its press. This is the known P2 in the PR's list, not new.
+- **Cleanup.** Sessions are killed, and `daemon stop` ended PIDs 41973 and
+  42025. Both pidfiles are gone and no `qb1` processes remain.
+
+No new findings. The P3 notes above are unchanged.
