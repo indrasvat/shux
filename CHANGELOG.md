@@ -1,3 +1,10 @@
+## [0.58.1](https://github.com/indrasvat/shux/compare/v0.58.0...v0.58.1) (2026-11-23)
+
+
+### Bug Fixes
+
+* **client:** a CLI of another build never stops a daemon that holds sessions ([#292](https://github.com/indrasvat/shux/issues/292)) ([93142d5](https://github.com/indrasvat/shux/commit/93142d51080ed6f6af1d0cac979949b9b369efc2)), closes [#277](https://github.com/indrasvat/shux/issues/277) [#277](https://github.com/indrasvat/shux/issues/277) [#277](https://github.com/indrasvat/shux/issues/277)
+
 # [0.58.0](https://github.com/indrasvat/shux/compare/v0.57.5...v0.58.0) (2026-11-23)
 
 
