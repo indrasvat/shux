@@ -8,6 +8,7 @@
 #
 #   check-target-hygiene.sh [repo-root]           check (read-only)
 #   check-target-hygiene.sh --clean [repo-root]   empty the repo's build dirs
+#   check-target-hygiene.sh --list [repo-root]    print the dirs --clean would empty
 #
 # check, for every Cargo workspace root in the repo:
 #   1. the manifest pins split-debuginfo = "packed" for every profile that
@@ -26,8 +27,8 @@
 set -euo pipefail
 
 mode=check
-if [[ "${1:-}" == "--clean" ]]; then
-  mode=clean
+if [[ "${1:-}" == "--clean" || "${1:-}" == "--list" ]]; then
+  mode="${1#--}"
   shift
 fi
 ROOT="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
@@ -362,6 +363,8 @@ for path, manifest in roots:
         check_rustflags(rel, config)
         check_profiles(f"{rel} (as built here, with cargo config and CARGO_PROFILE_* env)", used)
     approved.append(os.path.join(wdir, "target"))
+    if mode == "list":
+        continue
     for t in (os.path.join(wdir, "target"), *metadata_dirs(path)):
         if os.path.realpath(t) not in scanned:
             scanned.append(os.path.realpath(t))
@@ -370,20 +373,36 @@ inventory = os.path.realpath(approved[-1])
 if os.path.isdir(inventory) and inventory not in scanned:
     scanned.append(inventory)
 
+def owned(t):
+    """True when t is a real directory inside the repo that --clean may empty."""
+    if not os.path.lexists(t):
+        return False
+    real = os.path.realpath(t)
+    if os.path.islink(t) or real != t or not real.startswith(root + os.sep):
+        print(f"⚠ target hygiene: not cleaning {t}: it is a symlink or resolves outside "
+              f"the repo ({real}); empty it yourself", file=sys.stderr)
+        return False
+    if not os.path.isdir(t):
+        fail(f"{t} is not a directory")
+        return False
+    return True
+
+
+if mode == "list":
+    owned_dirs = [t for t in approved if owned(t)]
+    if failures:
+        for f in failures:
+            print(f"✗ target hygiene: {f}", file=sys.stderr)
+        sys.exit(1)
+    for t in owned_dirs:
+        print(t)
+    sys.exit(0)
+
 if mode == "clean":
     emptied = 0
     for t in approved:
-        if not os.path.lexists(t):
-            continue
-        real = os.path.realpath(t)
-        if os.path.islink(t) or real != t or not real.startswith(root + os.sep):
-            print(f"⚠ target hygiene: not cleaning {t}: it is a symlink or resolves outside "
-                  f"the repo ({real}); empty it yourself", file=sys.stderr)
-            continue
-        if not os.path.isdir(t):
-            fail(f"{t} is not a directory")
-            continue
-        emptied += empty_dir(t)
+        if owned(t):
+            emptied += empty_dir(t)
     for t in scanned:
         if t not in (os.path.realpath(a) for a in approved):
             print(f"⚠ target hygiene: not cleaning configured target dir {t}; "

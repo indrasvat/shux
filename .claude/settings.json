@@ -17,7 +17,9 @@
     "",
     "PostToolUse runs scripts/check-test-sleeps.sh on every edited file: a test waits for a condition, never for time (docs/testing.md). In crates/*/tests it flags qualified sleep calls and sleep imports on code lines without a statement-level #[expect(clippy::disallowed_methods)]; in any crates/ source or Cargo.toml it flags a waiver of the ban. It says so on stderr; clippy's disallowed-methods is the gate.",
     "",
-    "PostToolUse also runs scripts/check-test-timing.sh on every edited Rust file: the ast-grep rules in lint/ast-grep/ ban timing in disguise in test code (wall-clock deadlines and bounds, timed waits, absence by timeout, fixtures that sleep then act). An escape is `// why: …` directly above `// ast-grep-ignore: <rule>`. `make check-test-timing` is the gate."
+    "PostToolUse also runs scripts/check-test-timing.sh on every edited Rust file: the ast-grep rules in lint/ast-grep/ ban timing in disguise in test code (wall-clock deadlines and bounds, timed waits, absence by timeout, fixtures that sleep then act). An escape is `// why: …` directly above `// ast-grep-ignore: <rule>`. `make check-test-timing` is the gate.",
+    "",
+    "SessionStart and Stop run `make disk-check` (docs/agents/disk.md): silent while the disk holding the repo has SHUX_DISK_MIN_GIB (default 40) free, one line naming `make prune` below it. At SessionStart the line is plain stdout, which Claude Code adds to the agent's context; at Stop it is {\"systemMessage\": ...}, shown to the user, so a low disk never keeps a finished turn going. Under HOOK= the script always exits 0: exit 2 from a Stop hook would block the stop."
   ],
   "hooks": {
     "PreToolUse": [
@@ -41,6 +43,22 @@
             "command": "bash \"$CLAUDE_PROJECT_DIR/scripts/ensure-hooks.sh\"",
             "timeout": 30,
             "statusMessage": "Ensuring git hooks are installed..."
+          },
+          {
+            "type": "command",
+            "command": "make -s --no-print-directory -C \"$CLAUDE_PROJECT_DIR\" disk-check HOOK=session",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "make -s --no-print-directory -C \"$CLAUDE_PROJECT_DIR\" disk-check HOOK=stop",
+            "timeout": 15
           }
         ]
       }

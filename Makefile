@@ -98,7 +98,7 @@ help: ## Show this help message
 	@awk 'BEGIN {FS = ":.*##"} /^(clippy|lint|fmt|check|ci|deny|fuzz|shellcheck)[a-zA-Z_-]*:.*?##/ { printf "  $(COLOR_GREEN)%-20s$(COLOR_RESET) %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 	@echo ""
 	@echo "$(COLOR_BOLD)Tooling:$(COLOR_RESET)"
-	@awk 'BEGIN {FS = ":.*##"} /^(setup|hooks|doc|clean|version|info|reap)[a-zA-Z_-]*:.*?##/ { printf "  $(COLOR_GREEN)%-20s$(COLOR_RESET) %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
+	@awk 'BEGIN {FS = ":.*##"} /^(setup|hooks|doc|clean|version|info|reap|prune|disk)[a-zA-Z_-]*:.*?##/ { printf "  $(COLOR_GREEN)%-20s$(COLOR_RESET) %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 	@echo ""
 	@echo "$(COLOR_BOLD)Spikes:$(COLOR_RESET)"
 	@awk 'BEGIN {FS = ":.*##"} /^spike[a-zA-Z0-9_-]*:.*?##/ { printf "  $(COLOR_GREEN)%-20s$(COLOR_RESET) %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
@@ -450,6 +450,21 @@ test-vt-dirty-regions: release ## Drive dirty-region tracking evidence, performa
 reap: ## Stop shux daemons from this checkout left behind by an interrupted run
 	@.shux/scripts/reap_daemons.sh
 
+.PHONY: prune
+prune: ## Report regenerable disk use (idle worktrees' builds, caches, stale scratch, dead runtime dirs); APPLY=1 removes it
+	@bash scripts/prune.sh $(if $(filter 1,$(APPLY)),--apply)
+
+.PHONY: disk-check
+disk-check: ## Warn, never fail, when free disk is below SHUX_DISK_MIN_GIB (default 40); HOOK=session|stop for Claude Code hooks
+	@bash scripts/disk-check.sh $(if $(HOOK),--hook $(HOOK))
+
+.PHONY: check-prune
+# PRUNE_BASH=/bin/bash runs both under macOS's Bash 3.2, as CI's macOS job does.
+PRUNE_BASH ?= bash
+check-prune: ## Prove make prune keeps dirty/unpushed/in-use trees and removes the safe set; prove disk-check warns (PRUNE_BASH)
+	@$(PRUNE_BASH) scripts/disk-check-selftest.sh
+	@$(PRUNE_BASH) scripts/prune-selftest.sh
+
 .PHONY: test-conductor
 test-conductor: build ## Conductor reads program status where a pane reports it, and scrapes only where it does not
 	@.shux/scripts/no_leak_guard.sh bash .shux/scripts/conductor_status_check.sh
@@ -770,7 +785,7 @@ fmt: ## Format all code
 	@echo "$(COLOR_GREEN)✓ Formatting complete$(COLOR_RESET)"
 
 .PHONY: check-after-hygiene
-check-after-hygiene: lint shellcheck check-test-sleeps check-test-timing check-test-ignores check-darwin test check-build-rerun check-test-groups check-test-opt-out check-test-inventory check-ci-parity test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-lens-frozen check-no-bin-mods check-action-pins check-vt-corpus-scratch
+check-after-hygiene: lint shellcheck check-test-sleeps check-test-timing check-test-ignores check-darwin test check-build-rerun check-test-groups check-test-opt-out check-test-inventory check-ci-parity test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-lens-frozen check-no-bin-mods check-action-pins check-vt-corpus-scratch check-prune
 
 .PHONY: check
 check: hooks-check check-target-hygiene ## Run lint + test + process/QA guards (what pre-commit runs)
@@ -782,7 +797,7 @@ check: hooks-check check-target-hygiene ## Run lint + test + process/QA guards (
 	@echo ""
 
 .PHONY: ci
-ci: lint shellcheck check-test-sleeps check-test-timing check-test-ignores check-darwin test check-test-groups check-test-inventory check-ci-parity test-doc test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-no-bin-mods check-action-pins check-vt-corpus-scratch ## Run the CI pipeline locally (lint + full test + doc tests + process/QA guards)
+ci: lint shellcheck check-test-sleeps check-test-timing check-test-ignores check-darwin test check-test-groups check-test-inventory check-ci-parity test-doc test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-no-bin-mods check-action-pins check-vt-corpus-scratch check-prune ## Run the CI pipeline locally (lint + full test + doc tests + process/QA guards)
 	@echo ""
 	@echo "$(COLOR_GREEN)$(COLOR_BOLD)✓ CI pipeline passed!$(COLOR_RESET)"
 	@echo ""
