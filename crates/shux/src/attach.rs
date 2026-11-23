@@ -922,29 +922,36 @@ async fn run_attach_loop(
     let (client_activity, mut activity) = watch::channel(());
 
     let writer_cancel = conn.clone();
-    let mut writer = tokio::spawn(async move {
+    // Removal is acted on here, not by the read loop, which may be stuck
+    // queueing a frame behind the very backlog removal must drop.
+    let writer_removed = removed.clone();
+    let writer = tokio::spawn(async move {
         use crate::write_progress::{Sent, send_while_progressing};
 
-        #[expect(clippy::disallowed_methods, reason = "idle protocol deadline")]
-        let idle = tokio::time::sleep(PING_INTERVAL);
-        tokio::pin!(idle);
+        // A ping every interval; a client that sent nothing since the last
+        // one is gone, however many screens it was sent meanwhile.
+        let mut ping =
+            tokio::time::interval_at(tokio::time::Instant::now() + PING_INTERVAL, PING_INTERVAL);
+        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut awaiting_reply = false;
         loop {
             let (frame, finishing) = tokio::select! {
                 biased;
                 _ = writer_cancel.cancelled() => break,
+                () = writer_removed.cancelled() => {
+                    (AttachServerFrame::SessionEnded { reason: "removed".into() }, true)
+                }
                 frame = &mut finish_rx => {
                     let Ok(frame) = frame else { break };
                     (frame, true)
                 }
                 frame = out_rx.recv() => {
                     let Some(frame) = frame else { break };
-                    awaiting_reply = false;
                     (frame, false)
                 }
-                () = &mut idle => {
+                _ = ping.tick() => {
                     if awaiting_reply && !activity.has_changed().unwrap_or(false) {
-                        warn!("attach: idle client did not answer its ping; dropping it");
+                        warn!("attach: client did not answer its ping; dropping it");
                         break;
                     }
                     activity.borrow_and_update();
@@ -980,10 +987,6 @@ async fn run_attach_loop(
                     break;
                 }
             }
-            // A congested connection uses the write-progress deadline. Start
-            // the idle interval only after the current frame is on the wire.
-            idle.as_mut()
-                .reset(tokio::time::Instant::now() + PING_INTERVAL);
         }
         writer_cancel.cancel();
     });
@@ -1591,14 +1594,9 @@ async fn run_attach_loop(
         }
     }
 
-    if let Some(frame) = final_frame {
-        let _ = finish_tx.send(frame);
-    } else {
-        conn.cancel();
-    }
     renderer.abort();
-    // Gone the moment its loop ends: a socket nobody reads can hold the last
-    // frames for a whole write stall, and the list must not wait for it.
+    // Gone before the client hears it is: a detach ack or a socket nobody
+    // reads must not outrun the list, the events, or a held mouse button.
     drop(registered);
     if let Some(bus) = &bus {
         bus.publish(shux_core::event::EventData::ClientDisconnected {
@@ -1620,15 +1618,15 @@ async fn run_attach_loop(
     close_open_pastes(&io_state, client_id).await;
     release_app_gesture(&io_state, &mut selection_drag).await;
 
-    // Finish at most the frame already being written, then send the final
-    // frame. Bound the drain even if a removed viewer keeps reading slowly.
-    if tokio::time::timeout(WRITE_STALL, &mut writer)
-        .await
-        .is_err()
-    {
-        conn.cancel();
-        let _ = writer.await;
+    // The writer finishes the frame on the wire, sends the final one and
+    // ends; a stalled socket ends it at the write stall.
+    match final_frame {
+        Some(frame) => {
+            let _ = finish_tx.send(frame);
+        }
+        None => conn.cancel(),
     }
+    let _ = writer.await;
     info!(session = %session.name, "attach session ended");
     Ok(())
 }
@@ -10092,6 +10090,138 @@ mod tests {
             .expect("an unresponsive idle client was still held")
             .expect("server task")
             .expect("attach connection");
+        fixture.stop();
+    }
+
+    /// Screens that keep changing do not stand in for a reply: a client that
+    /// reads but never answers a ping is let go, however busy the pane.
+    #[tokio::test(start_paused = true)]
+    async fn a_client_that_never_answers_is_dropped_while_screens_change() {
+        let fixture = attach_fixture().await;
+        let _io = seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+        let mut client = Client::attach(&fixture, 90).await;
+        let mut ended = false;
+        for i in 0..60 {
+            let pulse = {
+                let mut io = fixture.io_state.lock().await;
+                io.vts
+                    .get_mut(&fixture.first_pane)
+                    .expect("seeded vt")
+                    .process(format!("tick-{i}\r\n").as_bytes());
+                io.render_pulse.clone()
+            };
+            pulse.bump();
+            if !client
+                .frames_until(|f, _| matches!(f, AttachServerFrame::Render { .. }))
+                .await
+            {
+                ended = true;
+                break;
+            }
+            idle_for(Duration::from_secs(1)).await;
+        }
+        assert!(
+            ended && client.server.is_finished(),
+            "a client that never answered a ping was held for a minute of redraws"
+        );
+        fixture.stop();
+    }
+
+    /// Removal reaches the writer even while the read loop is stuck queueing
+    /// a copy behind a full backlog: the client gets the notice, not the queue.
+    #[tokio::test(start_paused = true)]
+    async fn a_client_removed_while_its_copy_waits_gets_no_backlog() {
+        let fixture = attach_fixture().await;
+        let _io = seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+        let (server_stream, client_stream) = tokio::io::duplex(1024);
+        let server = tokio::spawn(handle_attach_connection(
+            server_stream,
+            fixture.graph.clone(),
+            fixture.io_state.clone(),
+            test_config(),
+            SegmentCache::new(),
+            crate::session_meta::SessionMetaCache::new(),
+            crate::onboarding::OnboardingHandle::from_state_for_test(
+                crate::onboarding::OnboardingState {
+                    prefix_discovered: true,
+                    welcome_toast_seen: true,
+                },
+            ),
+            std::time::Instant::now(),
+            fixture.cancel.child_token(),
+        ));
+        let mut framed = Framed::new(client_stream, create_codec());
+        let hello = AttachHello {
+            protocol: ATTACH_PROTOCOL_VERSION,
+            session_name: Some(fixture.attached.name.clone()),
+            cols: 200,
+            rows: 60,
+            client_version: "copy-then-removed".to_string(),
+            graphics: false,
+        };
+        let send = |f: &AttachClientFrame| Bytes::from(serde_json::to_vec(f).expect("frame json"));
+        framed
+            .send(Bytes::from(serde_json::to_vec(&hello).expect("hello json")))
+            .await
+            .expect("send hello");
+        shux_testkit::Deadline::start()
+            .run(framed.next())
+            .await
+            .expect("ready timeout")
+            .expect("ready frame")
+            .expect("ready bytes");
+        // More screens than the outbound queue holds, none of them read.
+        for i in 0..(OUTBOUND_FRAMES + 8) {
+            let pulse = {
+                let mut io = fixture.io_state.lock().await;
+                io.vts
+                    .get_mut(&fixture.first_pane)
+                    .expect("seeded vt")
+                    .process(format!("queued-{i}\r\n").as_bytes());
+                io.render_pulse.clone()
+            };
+            pulse.bump();
+            idle_for(Duration::from_millis(50)).await;
+        }
+        // A yank now waits on the full queue.
+        framed
+            .send(send(&AttachClientFrame::Action {
+                kind: ActionKind::EnterCopyMode,
+                args: Default::default(),
+            }))
+            .await
+            .expect("enter copy mode");
+        for key in [&b"k"[..], b"v", b"lllll", b"y"] {
+            framed
+                .send(send(&AttachClientFrame::Input {
+                    data: BASE64.encode(key),
+                }))
+                .await
+                .expect("copy key");
+        }
+        idle_for(Duration::from_millis(200)).await;
+        let clients = fixture.io_state.lock().await.clients.clone();
+        assert!(clients.remove(clients.list()[0].id));
+
+        let (mut screens, mut told) = (0, None);
+        let deadline = shux_testkit::Deadline::start();
+        while let Some(Some(Ok(buf))) = deadline.run(framed.next()).await {
+            match serde_json::from_slice::<AttachServerFrame>(&buf).expect("server frame") {
+                AttachServerFrame::Render { frame: Some(_), .. } => screens += 1,
+                AttachServerFrame::SessionEnded { reason } => told = Some(reason),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            told.as_deref(),
+            Some("removed"),
+            "never told it was removed"
+        );
+        assert!(
+            screens <= 2,
+            "a removed client was sent {screens} queued screens"
+        );
+        let _ = shux_testkit::Deadline::start().run(server).await;
         fixture.stop();
     }
 
