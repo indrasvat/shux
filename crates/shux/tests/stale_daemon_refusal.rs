@@ -3,6 +3,8 @@
 //! The "other build" is this binary's own daemon started with
 //! `SHUX_TEST_DAEMON_GIT_SHA`, which debug builds honour: it then answers the
 //! version check as another commit, or with no version at all for `-`.
+//! Release builds compile that hook out, so these run in debug builds only.
+#![cfg(debug_assertions)]
 
 use std::fs::File;
 use std::io::Read;
@@ -234,7 +236,7 @@ fn an_empty_daemon_of_another_build_is_replaced() {
     let old = h.daemon_pid();
     let note = text(&h.run(&["version"]).stdout);
     assert!(
-        note.contains("holds no sessions, so the next shux command replaces it"),
+        note.contains("holds no sessions now, so the next shux command replaces it"),
         "{note}"
     );
 
@@ -267,6 +269,128 @@ fn a_daemon_whose_version_answer_is_unreadable_is_left_alone() {
     assert!(alive(daemon), "a daemon it could not identify was stopped");
 }
 
+/// The stop the refusal names reaches the daemon it refused, not the default
+/// one beside it.
+#[test]
+fn the_refusal_names_a_stop_for_the_socket_it_refused() {
+    let h = Harness::new();
+    let ours = h.run(&["session", "list"]);
+    assert!(ours.status.success(), "{}", text(&ours.stderr));
+    let default_daemon = h.daemon_pid();
+
+    let custom = h.runtime.path().join("its here.sock");
+    let custom = custom.to_str().expect("utf-8 path");
+    let secs = format!("{}", 866_000 + std::process::id());
+    let created = h.run_as_other_build(
+        OTHER_SHA,
+        &[
+            "--socket", custom, "session", "create", "victim", "-d", "--", "sleep", &secs,
+        ],
+    );
+    assert!(created.status.success(), "{}", text(&created.stderr));
+    let other = shux_testkit::wait_for("the other build's daemon", || {
+        live_pidfiles(&h.pid_dir())
+            .into_iter()
+            .find(|p| *p != default_daemon)
+    });
+
+    let listed = h.run(&["--socket", custom, "session", "list"]);
+    let stderr = text(&listed.stderr);
+    assert_eq!(listed.status.code(), Some(DAEMON_IN_USE), "{stderr}");
+    let stop = stderr
+        .split("Run `")
+        .nth(1)
+        .and_then(|rest| rest.split('`').next())
+        .unwrap_or_else(|| panic!("the refusal names no command to run: {stderr}"));
+    let version = text(&h.run(&["--socket", custom, "version"]).stdout);
+    assert!(
+        version.contains(stop),
+        "version names {stop:?} too: {version}"
+    );
+
+    // As a user would run it: pasted into a shell with `shux` on PATH and
+    // none of this test's environment.
+    let bin_dir = tempfile::tempdir().expect("bin dir");
+    std::os::unix::fs::symlink(&h.bin, bin_dir.path().join("shux")).expect("symlink shux");
+    let ran = Command::new("/bin/sh")
+        .args(["-c", stop])
+        .env_clear()
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", bin_dir.path().display()),
+        )
+        .env("HOME", h.runtime.path())
+        .output()
+        .expect("run the named stop");
+    assert!(
+        ran.status.success(),
+        "`{stop}`: {} {}",
+        text(&ran.stdout),
+        text(&ran.stderr)
+    );
+    shux_testkit::wait_until("the refused daemon to exit", || !alive(other));
+    assert!(
+        alive(default_daemon),
+        "`{stop}` stopped the default daemon instead"
+    );
+}
+
+/// `lens gate` refuses like every other command, before it writes anything.
+#[test]
+fn lens_gate_is_refused_before_it_writes_anything() {
+    let h = Harness::new();
+    let (pane, needle) = occupy(&h);
+    let work = tempfile::tempdir().expect("work dir");
+    let scenario = work.path().join("s.toml");
+    std::fs::write(&scenario, "name = \"s\"\ncommand = [\"true\"]\n").expect("scenario");
+    let trace = work.path().join("trace.ndjson");
+    std::fs::write(&trace, "kept\n").expect("trace");
+    let path = |p: &Path| p.to_str().expect("utf-8 path").to_string();
+
+    let gate = h.run(&[
+        "--format",
+        "json",
+        "lens",
+        "gate",
+        &path(&scenario),
+        "--trace",
+        &path(&trace),
+    ]);
+    assert_eq!(
+        gate.status.code(),
+        Some(DAEMON_IN_USE),
+        "{} {}",
+        text(&gate.stdout),
+        text(&gate.stderr)
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&gate.stdout)
+        .unwrap_or_else(|e| panic!("not JSON ({e}): {}", text(&gate.stdout)));
+    assert_eq!(parsed["error"]["code"], -32015, "{parsed}");
+    assert_eq!(
+        std::fs::read_to_string(&trace).expect("trace"),
+        "kept\n",
+        "the refused gate rewrote its trace"
+    );
+
+    let init = h.run(&["lens", "gate", "init", "demo", "--dir", &path(work.path())]);
+    let out = text(&init.stdout);
+    assert_eq!(
+        init.status.code(),
+        Some(DAEMON_IN_USE),
+        "{out} {}",
+        text(&init.stderr)
+    );
+    assert!(!out.contains("scaffolded"), "{out}");
+    assert!(
+        !work.path().join("demo.toml").exists(),
+        "the refused init left a scenario behind"
+    );
+    assert!(
+        shux_testkit::running(pane, &needle),
+        "the pane's process was killed"
+    );
+}
+
 /// `shux session attach <session>` on a PTY that is its controlling
 /// terminal; its exit code and what it wrote.
 fn attach_on_a_pty(h: &Harness, session: &str) -> (Option<i32>, String) {
@@ -291,6 +415,9 @@ fn attach_on_a_pty(h: &Harness, session: &str) -> (Option<i32>, String) {
         });
     }
     let mut child = cmd.spawn().expect("spawn attach");
+    // The Command holds dups of the slave too: the master reads EIO only once
+    // every slave fd outside the child is closed.
+    drop(cmd);
     drop(pty.slave);
     let mut master = File::from(pty.master);
     let reader = std::thread::spawn(move || {
@@ -307,6 +434,10 @@ fn attach_on_a_pty(h: &Harness, session: &str) -> (Option<i32>, String) {
             child.wait().expect("reap attach")
         }
     };
+    assert!(
+        shux_testkit::poll_until(shux_testkit::BUDGET, || reader.is_finished()),
+        "the PTY master never reached EOF after attach exited"
+    );
     let seen = reader.join().expect("pty reader");
     (status.code(), text(&seen))
 }

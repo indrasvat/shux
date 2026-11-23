@@ -223,7 +223,11 @@ One CLI-side exit code holds for every command but `shux version`:
 
 | Exit | Meaning |
 |---|---|
-| `10` | The running daemon is another shux build and holds sessions, or could not say whether it does or which build it is. It was left running and the command did not run. `--format json` prints `{"error": {"code": -32015, "message", "data": {"kind": "daemon_in_use", "exit_code": 10, "daemon_version", "daemon_git_sha", "client_version", "client_git_sha", "sessions", "stoppable"}}}`. `shux daemon stop` ends its sessions so this build can start; or use the CLI that matches it. An empty daemon of another build is replaced without asking. |
+| `10` | The running daemon is another shux build and holds sessions, or could not say whether it does or which build it is, or holds none but no shux daemon process serves the socket. It was left running and the command did not run. `--format json` prints `{"error": {"code": -32015, "message", "data": {"kind": "daemon_in_use", "exit_code": 10, "daemon_version", "daemon_git_sha", "client_version", "client_git_sha", "sessions", "stoppable"}}}`. The message names the `shux daemon stop` for that socket and runtime dir, shell-quoted (a bare one may stop a different daemon); or use the CLI that matches it. An empty daemon of another build is replaced without asking. Every command that reaches the daemon checks this, `lens gate` and `gate init` included, before writing any file; `daemon stop`/`status` and `version` do not. A daemon that does not answer the check is exit 1 (unresponsive), not 10. |
+
+Tell this refusal apart by `error.code == -32015`, not by the exit code alone: `lens run --wait` forwards its program's exit status, so a program that exits 10 gives `result.exit_code == 10` and exit 10.
+
+A daemon of this build or later retires itself (`daemon.retire_if_idle`): it checks for sessions and refuses every new one in one step, so a session created while it is being replaced is refused, never lost. A daemon from before that call is counted and then stopped, and a session created between the two is lost: a window that exists once, on the upgrade from such a build.
 
 ## Events
 

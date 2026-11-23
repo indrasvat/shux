@@ -84,8 +84,9 @@ pub async fn handle_version(
     let cli = (env!("CARGO_PKG_VERSION"), shux_rpc::GIT_SHA);
     // `daemon`: `None` when no daemon serves the socket, `Err` when one is
     // there but did not say which build. `mismatch`: whether it is not this
-    // build, as far as it said.
-    let (daemon, mismatch) = match crate::client::ask_daemon_version(socket_path).await {
+    // build, as far as it said. `held`: its sessions at the time of asking.
+    let (answer, held) = crate::client::ask_daemon_version(socket_path).await;
+    let (daemon, mismatch) = match answer {
         DaemonAnswer::Absent => (None, None),
         DaemonAnswer::Answered(dv) => {
             let stale = !dv.is_current();
@@ -119,6 +120,7 @@ pub async fn handle_version(
                     "status": "running",
                     "version": dv.version,
                     "git_sha": dv.git_sha,
+                    "sessions": held,
                 }),
                 Some(Err((status, error))) => serde_json::json!({
                     "status": status,
@@ -163,35 +165,25 @@ pub async fn handle_version(
                  refuse to run until whatever serves it is stopped"
                     .to_string()
             } else {
-                let held = match &daemon {
-                    Some(Ok(_)) => crate::client::count_sessions(socket_path).await,
-                    _ => None,
-                };
-                let matching = match &daemon {
-                    Some(Ok(dv)) => format!("the shux {} ({}) CLI", dv.version, dv.git_sha),
-                    _ => "the shux CLI that started it".to_string(),
-                };
+                let found = daemon.as_ref().and_then(|d| d.as_ref().ok());
                 match held {
-                    Some(0) => "it holds no sessions, so the next shux command replaces it \
-                                with this build"
+                    Some(0) => "it holds no sessions now, so the next shux command replaces \
+                                it with this build"
                         .to_string(),
                     held => format!(
-                        "{}, so shux commands refuse to run against it: `shux daemon stop` \
-                         ends them and starts this build, or use {matching}",
-                        match held {
-                            Some(1) => "it holds 1 session".to_string(),
-                            Some(n) => format!("it holds {n} sessions"),
-                            None => "it may hold sessions".to_string(),
-                        }
+                        "{}, so shux commands refuse to run against it: `{}` ends them \
+                         and the next command starts this build, or use {}",
+                        crate::client::holding(held),
+                        crate::client::stop_command(socket_path),
+                        crate::client::matching_cli(found)
                     ),
                 }
             };
-            let next = || next.as_str();
             match &daemon {
                 None => {}
                 Some(Ok(dv)) => {
-                    let note = (mismatch == Some(true))
-                        .then(|| format!("differs from this CLI; {}", next()));
+                    let note =
+                        (mismatch == Some(true)).then(|| format!("differs from this CLI; {next}"));
                     crate::style::print_daemon_version(
                         Some((&dv.version, &dv.git_sha)),
                         note.as_deref(),
@@ -199,7 +191,7 @@ pub async fn handle_version(
                 }
                 Some(Err((_, error))) => {
                     let note = if mismatch == Some(true) {
-                        format!("{error}; {}", next())
+                        format!("{error}; {next}")
                     } else {
                         error.clone()
                     };

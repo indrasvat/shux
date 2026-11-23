@@ -747,7 +747,8 @@ fn try_authenticate(
 /// Debug builds only: a daemon started with this set reports that git SHA as
 /// its build, or no version at all when it is `-`, so tests can stand up a
 /// daemon of "another build" from this one.
-pub const TEST_DAEMON_GIT_SHA_ENV: &str = "SHUX_TEST_DAEMON_GIT_SHA";
+#[cfg(debug_assertions)]
+const TEST_DAEMON_GIT_SHA_ENV: &str = "SHUX_TEST_DAEMON_GIT_SHA";
 
 fn version_answer() -> serde_json::Value {
     let answer = serde_json::json!({

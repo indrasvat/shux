@@ -24,6 +24,7 @@ use crate::pane_io::PaneIoState;
 const EXPECTED_SURFACE: &[&str] = &[
     "client.detach => Grantable",
     "client.list => Public",
+    "daemon.retire_if_idle => PluginsForbidden",
     "events.history => ContentRead",
     "events.watch => ParamAware(broad=ContentRead, self_scoped=Public)",
     "lens.run => Grantable",

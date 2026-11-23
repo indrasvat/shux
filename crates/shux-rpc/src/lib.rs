@@ -7,6 +7,10 @@
 /// The short git SHA this build came from (`unknown` outside a checkout).
 pub const GIT_SHA: &str = env!("SHUX_GIT_SHA");
 
+/// Asks a daemon with no sessions to refuse every new one and shut down:
+/// `{"retired": bool, "sessions": n}`. Builds before it answer -32601.
+pub const RETIRE_IF_IDLE: &str = "daemon.retire_if_idle";
+
 pub mod attach;
 pub mod caller;
 pub mod codec;

@@ -12,6 +12,8 @@ use std::io;
 use std::path::Path;
 use std::time::Duration;
 
+use serde_json::json;
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tracing::{debug, info, warn};
@@ -91,12 +93,6 @@ pub enum ClientError {
     )]
     StaleDaemonsKeepStarting,
     #[error(
-        "{} is served by something other than a shux daemon of this build, and no \
-         shux daemon process serves it; stop that process and retry",
-        .0.display()
-    )]
-    StaleDaemonUnidentified(std::path::PathBuf),
-    #[error(
         "waited {:?} for another shux client to start the daemon (lock {}); if no other shux \
          command is running, retry",
         start_lock_timeout(), .0.display()
@@ -115,13 +111,15 @@ pub const DAEMON_IN_USE_CODE: i64 = -32015;
 /// A daemon of another build that may hold sessions, left running.
 #[derive(Debug)]
 pub struct DaemonInUse {
-    /// Its version and git SHA, when it said.
-    pub daemon: Option<(String, String)>,
+    /// Its build, when it said.
+    pub daemon: Option<DaemonVersion>,
     /// Its sessions, scratch included, when they could be counted.
     pub sessions: Option<usize>,
     /// Whether a shux daemon process serves the socket, so `shux daemon stop`
     /// can end it.
     pub stoppable: bool,
+    /// The `shux daemon stop` that reaches it, shell-quoted.
+    pub stop: String,
 }
 
 impl DaemonInUse {
@@ -142,8 +140,8 @@ impl DaemonInUse {
                 "data": {
                     "kind": "daemon_in_use",
                     "exit_code": DAEMON_IN_USE_EXIT,
-                    "daemon_version": self.daemon.as_ref().map(|d| &d.0),
-                    "daemon_git_sha": self.daemon.as_ref().map(|d| &d.1),
+                    "daemon_version": self.daemon.as_ref().map(|d| &d.version),
+                    "daemon_git_sha": self.daemon.as_ref().map(|d| &d.git_sha),
                     "client_version": CLIENT_VERSION,
                     "client_git_sha": CLIENT_GIT_SHA,
                     "sessions": self.sessions,
@@ -158,21 +156,21 @@ impl std::fmt::Display for DaemonInUse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let this = format!("shux {CLIENT_VERSION} ({CLIENT_GIT_SHA})");
         match &self.daemon {
-            Some((v, sha)) => write!(
+            Some(dv) => write!(
                 f,
-                "the running daemon is shux {v} ({sha}) and this CLI is {this}"
+                "the running daemon is shux {} ({}) and this CLI is {this}",
+                dv.version, dv.git_sha
             )?,
             None => write!(
                 f,
                 "the running daemon did not say which shux build it is, and this CLI is {this}"
             )?,
         }
-        match self.sessions {
-            Some(1) => write!(f, "; it holds 1 session")?,
-            Some(n) => write!(f, "; it holds {n} sessions")?,
-            None => write!(f, "; its sessions could not be counted")?,
-        }
-        write!(f, ", so it was left running and this command did not run")?;
+        write!(
+            f,
+            "; {}, so it was left running and this command did not run",
+            holding(self.sessions)
+        )?;
         if !self.stoppable {
             return write!(
                 f,
@@ -181,13 +179,50 @@ impl std::fmt::Display for DaemonInUse {
         }
         write!(
             f,
-            ". Run `shux daemon stop` to end its sessions and start this build"
-        )?;
-        match &self.daemon {
-            Some((v, sha)) => write!(f, ", or use the shux {v} ({sha}) CLI that matches it"),
-            None => write!(f, ", or use the shux CLI that started it"),
-        }
+            ". Run `{}` to end its sessions and start this build, or use {}",
+            self.stop,
+            matching_cli(self.daemon.as_ref())
+        )
     }
+}
+
+/// How many sessions a daemon holds, as the refusal and `shux version` say it.
+pub(crate) fn holding(sessions: Option<usize>) -> String {
+    match sessions {
+        Some(0) => "it holds no sessions".to_string(),
+        Some(1) => "it holds 1 session".to_string(),
+        Some(n) => format!("it holds {n} sessions"),
+        None => "its sessions could not be counted".to_string(),
+    }
+}
+
+/// The CLI that matches `daemon`.
+pub(crate) fn matching_cli(daemon: Option<&DaemonVersion>) -> String {
+    match daemon {
+        Some(dv) => format!("the shux {} ({}) CLI", dv.version, dv.git_sha),
+        None => "the shux CLI that started it".to_string(),
+    }
+}
+
+/// `shux daemon stop` for the daemon on `socket`, runtime dir included:
+/// a bare one stops the default daemon, which may be another.
+pub(crate) fn stop_command(socket: &Path) -> String {
+    use shux_pty::shell_quote_arg as quote;
+    let mut cmd = String::new();
+    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+        cmd.push_str(&format!(
+            "XDG_RUNTIME_DIR={} ",
+            quote(&dir.to_string_lossy())
+        ));
+    }
+    cmd.push_str("shux ");
+    let default = daemon::socket_path().map(|d| daemon::socket_key(&d));
+    if default.ok() != Some(daemon::socket_key(socket)) {
+        let endpoint = daemon::socket_endpoint(socket);
+        cmd.push_str(&format!("--socket {} ", quote(&endpoint.to_string_lossy())));
+    }
+    cmd.push_str("daemon stop");
+    cmd
 }
 
 /// Probe the daemon socket. Returns a connected `UnixStream` if successful.
@@ -196,14 +231,14 @@ async fn probe_socket(socket_path: &Path) -> Result<UnixStream, io::Error> {
 }
 
 /// Version info returned by the daemon's `system.version` RPC call.
-pub(crate) struct DaemonVersion {
+#[derive(Debug)]
+pub struct DaemonVersion {
     pub version: String,
     pub git_sha: String,
 }
 
 impl DaemonVersion {
-    /// Whether the daemon is this very build: any other is replaced by the
-    /// next command that needs it.
+    /// Whether the daemon is this very build.
     pub fn is_current(&self) -> bool {
         self.version == CLIENT_VERSION && self.git_sha == CLIENT_GIT_SHA
     }
@@ -223,43 +258,45 @@ pub(crate) enum DaemonAnswer {
     Unreachable(io::Error),
 }
 
-/// Asks the daemon serving `socket_path` which build it is. Never starts one.
-pub(crate) async fn ask_daemon_version(socket_path: &Path) -> DaemonAnswer {
+/// Asks the daemon serving `socket_path` which build it is and, when it says,
+/// how many sessions it holds, scratch included, on one connection. Never
+/// starts or stops one.
+pub(crate) async fn ask_daemon_version(socket_path: &Path) -> (DaemonAnswer, Option<usize>) {
+    let (mut stream, asked) = match ask_version(socket_path).await {
+        Ok(asked) => asked,
+        Err(unanswered) => return (unanswered, None),
+    };
+    let Some(dv) = (match asked {
+        Asked::Result(result) => version_in(&result),
+        _ => None,
+    }) else {
+        return (DaemonAnswer::Unreadable, None);
+    };
+    let params = json!({ "include_scratch": true });
+    let listed = ask(&mut stream, "session-count", "session.list", params);
+    let sessions = match tokio::time::timeout(crate::patience::peer_patience(), listed).await {
+        Ok(Asked::Result(r)) => r.get("sessions").and_then(|s| s.as_array()).map(Vec::len),
+        _ => None,
+    };
+    (DaemonAnswer::Answered(dv), sessions)
+}
+
+/// The connection that asked `socket_path`'s daemon which build it is, and its
+/// reply. `Err` holds only `Absent`, `Unresponsive` and `Unreachable`.
+async fn ask_version(socket_path: &Path) -> Result<(UnixStream, Asked), DaemonAnswer> {
     let mut stream = match probe_socket(socket_path).await {
         Ok(stream) => stream,
-        Err(e) if is_connection_refused_or_not_found(&e) => return DaemonAnswer::Absent,
-        Err(e) => return DaemonAnswer::Unreachable(e),
+        Err(e) if is_connection_refused_or_not_found(&e) => return Err(DaemonAnswer::Absent),
+        Err(e) => return Err(DaemonAnswer::Unreachable(e)),
     };
-    let patience = crate::patience::peer_patience();
-    match tokio::time::timeout(patience, check_daemon_version(&mut stream)).await {
-        Err(_) => DaemonAnswer::Unresponsive,
-        Ok(None) => DaemonAnswer::Unreadable,
-        Ok(Some(dv)) => DaemonAnswer::Answered(dv),
+    let asked = ask(&mut stream, "version-check", "system.version", json!({}));
+    match tokio::time::timeout(crate::patience::peer_patience(), asked).await {
+        Err(_) => Err(DaemonAnswer::Unresponsive),
+        Ok(asked) => Ok((stream, asked)),
     }
 }
 
-/// How many sessions, scratch included, the daemon serving `socket_path`
-/// holds; `None` when it did not say, which callers must treat as some.
-/// Every daemon build answers `session.list`.
-pub(crate) async fn count_sessions(socket_path: &Path) -> Option<usize> {
-    let mut stream = probe_socket(socket_path).await.ok()?;
-    let params = serde_json::json!({ "include_scratch": true });
-    let asked = ask(&mut stream, "session-count", "session.list", params);
-    let result = tokio::time::timeout(crate::patience::peer_patience(), asked)
-        .await
-        .ok()??;
-    Some(result.get("sessions")?.as_array()?.len())
-}
-
-/// Check the daemon's version via `system.version` RPC call.
-async fn check_daemon_version(stream: &mut UnixStream) -> Option<DaemonVersion> {
-    let result = ask(
-        stream,
-        "version-check",
-        "system.version",
-        serde_json::json!({}),
-    )
-    .await?;
+fn version_in(result: &serde_json::Value) -> Option<DaemonVersion> {
     let version = result.get("version")?.as_str()?.to_string();
     let git_sha = result
         .get("git_sha")
@@ -269,82 +306,82 @@ async fn check_daemon_version(stream: &mut UnixStream) -> Option<DaemonVersion> 
     Some(DaemonVersion { version, git_sha })
 }
 
-/// One request on `stream`; its `result`, or `None` for anything else.
-async fn ask(
-    stream: &mut UnixStream,
-    id: &str,
-    method: &str,
-    params: serde_json::Value,
-) -> Option<serde_json::Value> {
-    let request = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "method": method,
-        "params": params,
-    });
-    let payload = serde_json::to_vec(&request).ok()?;
-
-    // Write length-prefixed frame
-    let len = payload.len() as u32;
-    stream.write_all(&len.to_be_bytes()).await.ok()?;
-    stream.write_all(&payload).await.ok()?;
-    stream.flush().await.ok()?;
-
-    // Read response
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).await.ok()?;
-    let resp_len = u32::from_be_bytes(len_buf) as usize;
-    if resp_len > 1024 * 1024 {
-        return None;
-    }
-    let mut resp_buf = vec![0u8; resp_len];
-    stream.read_exact(&mut resp_buf).await.ok()?;
-
-    let mut response: serde_json::Value = serde_json::from_slice(&resp_buf).ok()?;
-    Some(response.get_mut("result")?.take())
+/// The reply to one request.
+enum Asked {
+    Result(serde_json::Value),
+    /// A JSON-RPC `error` object.
+    Error(serde_json::Value),
+    /// The connection ended before a reply.
+    Gone,
+    /// A reply that is not JSON-RPC.
+    Malformed,
 }
 
-/// Stop the stale daemon for `socket`, and wait for it to exit.
+async fn ask(stream: &mut UnixStream, id: &str, method: &str, params: serde_json::Value) -> Asked {
+    let request = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+    let Ok(payload) = serde_json::to_vec(&request) else {
+        return Asked::Malformed;
+    };
+    let sent = async {
+        stream
+            .write_all(&(payload.len() as u32).to_be_bytes())
+            .await?;
+        stream.write_all(&payload).await?;
+        stream.flush().await?;
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).await?;
+        Ok::<_, io::Error>(u32::from_be_bytes(len_buf) as usize)
+    };
+    let resp_len = match sent.await {
+        Ok(n) if n <= 1024 * 1024 => n,
+        Ok(_) => return Asked::Malformed,
+        Err(_) => return Asked::Gone,
+    };
+    let mut resp_buf = vec![0u8; resp_len];
+    if stream.read_exact(&mut resp_buf).await.is_err() {
+        return Asked::Gone;
+    }
+    let Ok(mut response) = serde_json::from_slice::<serde_json::Value>(&resp_buf) else {
+        return Asked::Malformed;
+    };
+    if let Some(result) = response.get_mut("result") {
+        return Asked::Result(result.take());
+    }
+    match response.get_mut("error") {
+        Some(error) => Asked::Error(error.take()),
+        None => Asked::Malformed,
+    }
+}
+
+/// Stop our stale daemon for `socket`, and wait for it to exit.
 ///
 /// Identity rather than bare liveness: a zombie under a non-reaping init still
-/// answers `kill(pid, 0)`. A server that is not one of our daemons is left
-/// alone: unlinking its socket would strand it running and unreachable.
+/// answers `kill(pid, 0)`.
 async fn stop_stale_daemon(socket: &Path) -> Result<(), ClientError> {
-    if let Some(pid) = crate::daemon_boot::our_live_daemon(socket) {
-        // ESRCH means it is already gone, which the wait below sees too.
-        if nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(pid as i32),
-            nix::sys::signal::Signal::SIGTERM,
-        )
-        .is_ok()
-        {
-            info!(pid, "Sent SIGTERM to stale daemon");
-        }
-        let deadline = tokio::time::Instant::now() + crate::patience::peer_patience();
-        while crate::daemon_boot::is_live_shux_daemon(pid, socket) {
-            if tokio::time::Instant::now() >= deadline {
-                return Err(ClientError::StaleDaemonAlive(pid));
-            }
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "another process's exit has no event to wait on; poll its identity"
-            )]
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+    let Some(pid) = crate::daemon_boot::our_live_daemon(socket) else {
         return Ok(());
+    };
+    // ESRCH means it is already gone, which the wait below sees too.
+    if nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .is_ok()
+    {
+        info!(pid, "Sent SIGTERM to stale daemon");
     }
     let deadline = tokio::time::Instant::now() + crate::patience::peer_patience();
-    while tokio::time::Instant::now() < deadline {
-        if probe_socket(socket).await.is_err() {
-            return Ok(());
+    while crate::daemon_boot::is_live_shux_daemon(pid, socket) {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ClientError::StaleDaemonAlive(pid));
         }
         #[expect(
             clippy::disallowed_methods,
-            reason = "poll interval while an unidentified server lets go of the socket"
+            reason = "another process's exit has no event to wait on; poll its identity"
         )]
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    Err(ClientError::StaleDaemonUnidentified(socket.to_path_buf()))
+    Ok(())
 }
 
 /// `" (pid N)"` for our daemon on `socket`, for error messages.
@@ -355,37 +392,47 @@ fn holder(socket: &Path) -> String {
 
 /// What a probe of the socket found.
 enum Probe {
-    /// A daemon of this build answered; the stream is fresh and unused.
+    /// A daemon of this build answered on this connection.
     Current(UnixStream),
-    /// A daemon answered, but it is another build, or did not say which
-    /// (`None`).
-    Stale(Option<DaemonVersion>),
+    /// A daemon answered on this connection, but it is another build, or did
+    /// not say which (`None`).
+    Stale(Option<DaemonVersion>, UnixStream),
     /// Nothing is listening.
     Absent,
+    /// It closed the connection before answering: probe again.
+    Gone,
     /// Something accepted the connection and never answered.
     Unresponsive,
 }
 
 async fn probe_daemon(socket_path: &Path) -> Result<Probe, ClientError> {
-    match ask_daemon_version(socket_path).await {
-        DaemonAnswer::Absent => Ok(Probe::Absent),
-        DaemonAnswer::Unreachable(e) => Err(ClientError::Io(e)),
-        DaemonAnswer::Unresponsive => Ok(Probe::Unresponsive),
-        DaemonAnswer::Answered(dv) if dv.is_current() => {
+    let (stream, asked) = match ask_version(socket_path).await {
+        Ok(asked) => asked,
+        Err(DaemonAnswer::Unreachable(e)) => return Err(ClientError::Io(e)),
+        Err(DaemonAnswer::Unresponsive) => return Ok(Probe::Unresponsive),
+        Err(_) => return Ok(Probe::Absent),
+    };
+    let found = match asked {
+        Asked::Gone => return Ok(Probe::Gone),
+        Asked::Result(result) => version_in(&result),
+        Asked::Error(_) | Asked::Malformed => None,
+    };
+    match found {
+        Some(dv) if dv.is_current() => {
             debug!(
                 version = CLIENT_VERSION,
                 git_sha = CLIENT_GIT_SHA,
                 "Daemon version matches"
             );
-            // A fresh connection, not the probe's: one that fails here is a
-            // daemon that stopped serving after it answered, and is replaced.
+            // The verified connection is the one returned; this one only
+            // asks whether the daemon still serves the socket.
             match probe_socket(socket_path).await {
-                Ok(stream) => Ok(Probe::Current(stream)),
+                Ok(_) => Ok(Probe::Current(stream)),
                 Err(e) if is_connection_refused_or_not_found(&e) => Ok(Probe::Absent),
                 Err(e) => Err(ClientError::Io(e)),
             }
         }
-        DaemonAnswer::Answered(dv) => {
+        Some(dv) => {
             warn!(
                 daemon_version = dv.version,
                 daemon_sha = dv.git_sha,
@@ -393,30 +440,95 @@ async fn probe_daemon(socket_path: &Path) -> Result<Probe, ClientError> {
                 client_sha = CLIENT_GIT_SHA,
                 "Daemon version mismatch"
             );
-            Ok(Probe::Stale(Some(dv)))
+            Ok(Probe::Stale(Some(dv), stream))
         }
-        DaemonAnswer::Unreadable => {
+        None => {
             warn!("Could not check daemon version");
-            Ok(Probe::Stale(None))
+            Ok(Probe::Stale(None, stream))
         }
     }
 }
 
-/// A stale daemon may be replaced only when it said which build it is and
-/// that it holds no sessions; anything else is refused.
-async fn refuse_if_in_use(socket: &Path, found: Option<DaemonVersion>) -> Result<(), ClientError> {
-    let sessions = match found {
-        Some(_) => count_sessions(socket).await,
-        None => None,
+/// What a daemon of another build agreed to.
+enum Verdict {
+    /// It refuses new sessions and is shutting down.
+    Retiring,
+    /// A build without [`shux_rpc::RETIRE_IF_IDLE`] that held no sessions when
+    /// asked; only stopping it remains.
+    LegacyIdle,
+    /// It closed the connection before answering: probe again.
+    Gone,
+}
+
+/// Asks the stale daemon on `stream`, the connection that identified it, to
+/// retire; refused unless it agrees or is a legacy build that is idle.
+///
+/// A legacy build is counted and then stopped: a session created between the
+/// two is lost. That window closes once daemons answer the retire call.
+async fn verdict(
+    socket: &Path,
+    found: Option<DaemonVersion>,
+    mut stream: UnixStream,
+) -> Result<Verdict, ClientError> {
+    let refuse = |daemon, sessions, stoppable| {
+        ClientError::DaemonInUse(Box::new(DaemonInUse {
+            daemon,
+            sessions,
+            stoppable,
+            stop: stop_command(socket),
+        }))
     };
-    if found.is_some() && sessions == Some(0) {
-        return Ok(());
+    let ours = || crate::daemon_boot::our_live_daemon(socket).is_some();
+    let Some(dv) = found else {
+        return Err(unidentified(socket));
+    };
+    let patience = crate::patience::peer_patience();
+    let unresponsive = || ClientError::DaemonUnresponsive(holder(socket), socket.to_path_buf());
+
+    let retire = ask(&mut stream, "retire", shux_rpc::RETIRE_IF_IDLE, json!({}));
+    match tokio::time::timeout(patience, retire).await {
+        Err(_) => return Err(unresponsive()),
+        Ok(Asked::Gone) => return Ok(Verdict::Gone),
+        Ok(Asked::Result(r)) => {
+            let sessions = r.get("sessions").and_then(|n| n.as_u64());
+            return match r.get("retired").and_then(|b| b.as_bool()) {
+                Some(true) => Ok(Verdict::Retiring),
+                Some(false) if sessions.is_some_and(|n| n > 0) => {
+                    Err(refuse(Some(dv), sessions.map(|n| n as usize), ours()))
+                }
+                _ => Err(refuse(Some(dv), None, ours())),
+            };
+        }
+        Ok(Asked::Error(e)) if e.get("code").and_then(|c| c.as_i64()) == Some(METHOD_NOT_FOUND) => {
+        }
+        Ok(_) => return Err(refuse(Some(dv), None, ours())),
     }
-    Err(ClientError::DaemonInUse(Box::new(DaemonInUse {
-        daemon: found.map(|dv| (dv.version, dv.git_sha)),
-        sessions,
+
+    let params = json!({ "include_scratch": true });
+    let listed = ask(&mut stream, "session-count", "session.list", params);
+    let sessions = match tokio::time::timeout(patience, listed).await {
+        Err(_) => return Err(unresponsive()),
+        Ok(Asked::Gone) => return Ok(Verdict::Gone),
+        Ok(Asked::Result(r)) => r.get("sessions").and_then(|s| s.as_array()).map(Vec::len),
+        Ok(_) => None,
+    };
+    let stoppable = ours();
+    if sessions == Some(0) && stoppable {
+        return Ok(Verdict::LegacyIdle);
+    }
+    Err(refuse(Some(dv), sessions, stoppable))
+}
+
+const METHOD_NOT_FOUND: i64 = -32601;
+
+/// The refusal of a server on `socket` that did not say which build it is.
+fn unidentified(socket: &Path) -> ClientError {
+    ClientError::DaemonInUse(Box::new(DaemonInUse {
+        daemon: None,
+        sessions: None,
         stoppable: crate::daemon_boot::our_live_daemon(socket).is_some(),
-    })))
+        stop: stop_command(socket),
+    }))
 }
 
 /// Under the start lock: the daemon serving `socket`, or `None` once nothing
@@ -429,7 +541,16 @@ async fn claim_socket(socket: &Path) -> Result<Option<UnixStream>, ClientError> 
     let lock_path = daemon::instance_lock_path_for(socket)?;
     let mut deadline = tokio::time::Instant::now() + crate::patience::peer_patience();
     let mut stops = 0;
+    // A departing daemon stops accepting; one that keeps accepting and hanging
+    // up is not departing, and is refused on the second hang-up.
+    let mut hung_up = false;
     loop {
+        let hang_up = |hung_up: &mut bool| {
+            if std::mem::replace(hung_up, true) {
+                return Err(unidentified(socket));
+            }
+            Ok(())
+        };
         match probe_daemon(socket).await? {
             Probe::Current(stream) => return Ok(Some(stream)),
             Probe::Unresponsive => {
@@ -438,16 +559,21 @@ async fn claim_socket(socket: &Path) -> Result<Option<UnixStream>, ClientError> 
                     socket.to_path_buf(),
                 ));
             }
-            Probe::Stale(found) => {
-                refuse_if_in_use(socket, found).await?;
-                if stops == MAX_STALE_STOPS {
-                    return Err(ClientError::StaleDaemonsKeepStarting);
+            Probe::Stale(found, stream) => match verdict(socket, found, stream).await? {
+                // It exits on its own; wait for the socket below.
+                Verdict::Retiring => {}
+                Verdict::Gone => hang_up(&mut hung_up)?,
+                Verdict::LegacyIdle => {
+                    if stops == MAX_STALE_STOPS {
+                        return Err(ClientError::StaleDaemonsKeepStarting);
+                    }
+                    stops += 1;
+                    stop_stale_daemon(socket).await?;
+                    deadline = tokio::time::Instant::now() + crate::patience::peer_patience();
+                    continue;
                 }
-                stops += 1;
-                stop_stale_daemon(socket).await?;
-                deadline = tokio::time::Instant::now() + crate::patience::peer_patience();
-                continue;
-            }
+            },
+            Probe::Gone => hang_up(&mut hung_up)?,
             Probe::Absent => {
                 if daemon::try_lock_file(&lock_path)?.is_some() {
                     return Ok(None);
@@ -492,8 +618,8 @@ async fn acquire_start_lock(socket: &Path) -> Result<std::fs::File, ClientError>
 ///
 /// 1. Try to connect to the UDS; a daemon of this build is used as is
 /// 2. Otherwise take the start lock, so concurrent clients start one daemon
-/// 3. Under the lock, use the daemon another client started, or stop a stale
-///    one that holds no sessions and wait until nothing owns the socket; one
+/// 3. Under the lock, use the daemon another client started, or have a stale
+///    one with no sessions retire and wait until nothing owns the socket; one
 ///    that holds any, or cannot say, is refused
 /// 4. Spawn, and retry with exponential backoff until connected
 pub async fn ensure_daemon_running_at(socket_path: &Path) -> Result<UnixStream, ClientError> {
@@ -506,8 +632,10 @@ pub async fn ensure_daemon_running_at(socket_path: &Path) -> Result<UnixStream, 
             ));
         }
         // Refused before the start lock too, so a refusal never waits on it.
-        Probe::Stale(found) => refuse_if_in_use(socket_path, found).await?,
-        Probe::Absent => {}
+        Probe::Stale(found, stream) => {
+            verdict(socket_path, found, stream).await?;
+        }
+        Probe::Gone | Probe::Absent => {}
     }
 
     // Held until this function returns, i.e. until the daemon it started (or
@@ -530,6 +658,19 @@ pub async fn ensure_daemon_running_at(socket_path: &Path) -> Result<UnixStream, 
     // still be on its way out, since the daemon can bind before it exits.
     std::thread::spawn(move || child.wait());
     connected
+}
+
+/// The refusal [`ensure_daemon_running_at`] would return for `socket_path`, if
+/// any, for a command that must not write anything first. Starts nothing;
+/// any other failure is left for the command's own connect to report.
+pub async fn refuse_if_incompatible(socket_path: &Path) -> Result<(), ClientError> {
+    if let Ok(Probe::Stale(found, stream)) = probe_daemon(socket_path).await
+        && let Err(refused @ ClientError::DaemonInUse(_)) =
+            verdict(socket_path, found, stream).await
+    {
+        return Err(refused);
+    }
+    Ok(())
 }
 
 /// Probe `socket_path` with backoff until the daemon accepts a connection.
@@ -661,6 +802,138 @@ mod tests {
         server.await.unwrap();
     }
 
+    /// A daemon stub on `socket`: on its `n`th connection (from 0) each request
+    /// for `method` is answered with `reply(n, method)`, a `result` or `error`
+    /// member; `None` closes that connection.
+    fn stub(
+        socket: &Path,
+        reply: impl Fn(usize, &str) -> Option<serde_json::Value> + Send + Sync + 'static,
+    ) {
+        let listener = tokio::net::UnixListener::bind(socket).unwrap();
+        let reply = std::sync::Arc::new(reply);
+        tokio::spawn(async move {
+            for n in 0.. {
+                let Ok((mut conn, _)) = listener.accept().await else {
+                    return;
+                };
+                let reply = reply.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let mut len = [0u8; 4];
+                        if conn.read_exact(&mut len).await.is_err() {
+                            return;
+                        }
+                        let mut req = vec![0u8; u32::from_be_bytes(len) as usize];
+                        if conn.read_exact(&mut req).await.is_err() {
+                            return;
+                        }
+                        let req: serde_json::Value = serde_json::from_slice(&req).unwrap();
+                        let Some(mut resp) = reply(n, req["method"].as_str().unwrap()) else {
+                            return;
+                        };
+                        resp["jsonrpc"] = "2.0".into();
+                        resp["id"] = req["id"].clone();
+                        let resp = serde_json::to_vec(&resp).unwrap();
+                        let framed = [&(resp.len() as u32).to_be_bytes()[..], &resp].concat();
+                        if conn.write_all(&framed).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    fn version(sha: &str) -> serde_json::Value {
+        json!({ "result": { "version": CLIENT_VERSION, "git_sha": sha } })
+    }
+
+    fn sessions(n: usize) -> serde_json::Value {
+        json!({ "result": { "sessions": vec![json!({}); n] } })
+    }
+
+    fn refusal(r: Result<UnixStream, ClientError>) -> Box<DaemonInUse> {
+        match r {
+            Err(ClientError::DaemonInUse(refusal)) => refusal,
+            other => panic!("expected a daemon_in_use refusal, got {other:?}"),
+        }
+    }
+
+    /// The sessions weighed are those of the daemon that said which build it
+    /// is, asked on that connection: a second connection can reach another
+    /// daemon, or the same one after a session arrived.
+    #[tokio::test]
+    async fn the_sessions_weighed_are_those_of_the_daemon_that_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("d.sock");
+        stub(&socket, |n, method| match method {
+            "system.version" => Some(version("0ther00")),
+            "session.list" => Some(sessions(if n == 0 { 1 } else { 0 })),
+            _ => Some(json!({ "result": { "retired": false, "sessions": 1 } })),
+        });
+        let refused = refusal(ensure_daemon_running_at(&socket).await);
+        assert_eq!(refused.sessions, Some(1), "{refused}");
+    }
+
+    /// A daemon that closes the connection mid-probe is probed again, not
+    /// refused: the one serving the socket now is this build.
+    #[tokio::test]
+    async fn a_daemon_that_leaves_mid_probe_is_probed_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("d.sock");
+        stub(&socket, |n, method| match (n, method) {
+            (0, "system.version") => Some(version("0ther00")),
+            (0, _) => None,
+            (_, "system.version") => Some(version(CLIENT_GIT_SHA)),
+            _ => Some(sessions(3)),
+        });
+        let connected = ensure_daemon_running_at(&socket).await;
+        assert!(connected.is_ok(), "{connected:?}");
+    }
+
+    /// An idle daemon of a build without the retire call, that no shux daemon
+    /// process serves, cannot be stopped: refused at once, not waited on.
+    #[tokio::test]
+    async fn an_idle_legacy_daemon_nothing_can_stop_is_refused_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("d.sock");
+        stub(&socket, |_, method| match method {
+            "system.version" => Some(version("0ther00")),
+            "session.list" => Some(sessions(0)),
+            _ => Some(json!({ "error": { "code": -32601, "message": "method not found" } })),
+        });
+        let refused = refusal(ensure_daemon_running_at(&socket).await);
+        assert_eq!(refused.sessions, Some(0), "{refused}");
+        assert!(!refused.stoppable, "{refused}");
+    }
+
+    /// A retire answer that is not one is refused, not taken as consent.
+    #[tokio::test]
+    async fn a_malformed_retire_answer_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("d.sock");
+        stub(&socket, |_, method| match method {
+            "system.version" => Some(version("0ther00")),
+            "session.list" => Some(sessions(0)),
+            _ => Some(json!({ "result": { "retired": "yes" } })),
+        });
+        let refused = refusal(ensure_daemon_running_at(&socket).await);
+        assert_eq!(refused.sessions, None, "{refused}");
+    }
+
+    /// The recovery command names the socket and runtime dir it is for.
+    #[test]
+    fn the_stop_command_targets_the_socket_it_is_for() {
+        let cmd = stop_command(Path::new("/nonexistent/it's here/d.sock"));
+        assert!(
+            cmd.ends_with(" --socket '/nonexistent/it'\\''s here/d.sock' daemon stop"),
+            "{cmd}"
+        );
+        let default = stop_command(&daemon::socket_path().unwrap());
+        assert!(default.ends_with("shux daemon stop"), "{default}");
+        assert!(!default.contains("--socket"), "{default}");
+    }
+
     /// A daemon too busy to answer the version check for 6s is waited for,
     /// not reported as stopped or wedged.
     #[tokio::test]
@@ -669,7 +942,15 @@ mod tests {
         let socket = dir.path().join("d.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let path = socket.clone();
-        let client = tokio::spawn(async move { ask_daemon_version(&path).await });
+        let client = tokio::spawn(async move {
+            match ask_version(&path).await {
+                Ok((_, Asked::Result(r))) => {
+                    version_in(&r).map_or(DaemonAnswer::Unreadable, DaemonAnswer::Answered)
+                }
+                Ok(_) => DaemonAnswer::Unreadable,
+                Err(e) => e,
+            }
+        });
         let (mut conn, _) = listener.accept().await.unwrap();
         let mut len = [0u8; 4];
         conn.read_exact(&mut len).await.unwrap();
