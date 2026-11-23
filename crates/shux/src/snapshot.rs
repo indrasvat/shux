@@ -34,6 +34,7 @@ pub(crate) async fn build_snapshot_status_bar(
     window_id: shux_core::model::WindowId,
     cols: u16,
     attached: usize,
+    size_label: Option<&shux_ui::viewport::SizeLabel>,
     live_cfg: &shux_core::config::Config,
     meta_cache: &session_meta::SessionMetaCache,
     onboarding: &onboarding::OnboardingHandle,
@@ -104,6 +105,7 @@ pub(crate) async fn build_snapshot_status_bar(
         cols,
     );
     statusbar_build::append_watchers(&mut bar, attached, &theme, cols, false);
+    statusbar_build::append_viewing(&mut bar, size_label, None, &theme, cols, false);
     bar
 }
 
@@ -254,13 +256,12 @@ pub(crate) async fn snapshot_window(
     // rasterizing. The caller's `revision_panes` content_revisions are read
     // inside the SAME critical section so the rendered pixels and the
     // published revisions are provably same-lock (no VT-side tear).
-    let (pane_data, revisions, attached): (Vec<PaneSnapshotData>, PaneRevisions, usize) = {
+    let pane_ids = window.layout.tree.pane_ids();
+    let (pane_data, revisions, sizing, driven, now_ns) = {
         let state = io.lock().await;
-        let pane_data = window
-            .layout
-            .tree
-            .pane_ids()
-            .into_iter()
+        let pane_data: Vec<PaneSnapshotData> = pane_ids
+            .iter()
+            .copied()
             .filter_map(|pid| {
                 state.vts.get(&pid).map(|vt| {
                     let mut grid = vt.grid().clone();
@@ -270,22 +271,36 @@ pub(crate) async fn snapshot_window(
                 })
             })
             .collect();
-        let revisions = revision_panes
+        let revisions: PaneRevisions = revision_panes
             .iter()
             .filter_map(|pid| state.vts.get(pid).map(|vt| (*pid, vt.content_revision())))
             .collect();
         (
             pane_data,
             revisions,
-            state.clients.count_for(window.session_id),
+            state
+                .clients
+                .session_view(window.session_id, None, &pane_ids),
+            state
+                .layout_basis
+                .get(&window.session_id)
+                .map(|(cols, rows, _)| (*cols, *rows)),
+            // The latch reads the cursors' stamps against the time they
+            // were captured at.
+            shux_vt::monotonic_now_ns(),
         )
     };
 
     // Compose with the user's outline style: `compose` derives the pane viewport
     // from it, so a hardcoded style crops panes under `border_style = "none"`.
     let border_style = shux_ui::BorderStyle::parse(&cfg.appearance.border_style);
-    let (fitted_tree, natural) = natural_frame(&window.layout, &pane_data, border_style)
-        .unwrap_or_else(|| (window.layout.tree.clone(), FALLBACK_DIMS));
+    // A session a client has sized shows what its driver last saw. One never
+    // driven has no such size: the frame that fits its panes whole.
+    let (default_tree, natural) = match driven {
+        Some(size) => (window.layout.tree.clone(), size),
+        None => natural_frame(&window.layout, &pane_data, border_style)
+            .unwrap_or_else(|| (window.layout.tree.clone(), FALLBACK_DIMS)),
+    };
     let defaulted = cols.is_none() || rows.is_none();
     let (cols, rows) = (cols.unwrap_or(natural.0), rows.unwrap_or(natural.1));
 
@@ -297,8 +312,8 @@ pub(crate) async fn snapshot_window(
     const MAX_PIXELS: u64 = 16_000_000;
     if pixel_count > MAX_PIXELS {
         let hint = if defaulted {
-            "; the default is the window's own size, so pass --cols/--rows (RPC \
-             `cols`/`rows`) for a smaller frame"
+            "; the default is the driving client's size, or the window's own, so \
+             pass --cols/--rows (RPC `cols`/`rows`) for a smaller frame"
         } else {
             ""
         };
@@ -312,11 +327,27 @@ pub(crate) async fn snapshot_window(
     // ratios cannot promise for grids never sized from them. Explicit dims on
     // both axes show the live layout's proportions.
     let layout_tree = if defaulted {
-        fitted_tree
+        default_tree
     } else {
         window.layout.tree.clone()
     };
     let zoom_state = window.layout.zoom.clone();
+    let geometry = shux_ui::prepare_frame(&shux_ui::FrameInputs {
+        layout: &layout_tree,
+        zoom: zoom_state.as_ref(),
+        cols,
+        rows,
+        status_bar_height: STATUS_BAR_ROWS,
+        border_style,
+        panes: &pane_data
+            .iter()
+            .map(|(p, g, c, _)| (*p, shux_ui::PresentedPane::of(g, c)))
+            .collect(),
+        now_ns,
+    });
+    let mut chrome = chrome;
+    let bar_label =
+        crate::pane_chrome::size_labels(&mut chrome, &geometry, &sizing.pinned, window.active_pane);
 
     // Build the same status bar `shux attach` would render so the snapshot
     // matches what a user sees attached. We don't have the live attached
@@ -329,7 +360,8 @@ pub(crate) async fn snapshot_window(
         &window.session_id,
         window_id,
         cols,
-        attached,
+        sizing.attached,
+        bar_label.as_ref(),
         &cfg,
         meta_cache,
         onboarding,
@@ -360,6 +392,7 @@ pub(crate) async fn snapshot_window(
             panes: &panes,
             chrome: Some(&chrome),
             status_bar: Some(&status_bar),
+            geometry: Some(&geometry),
         };
         let composed = shux_ui::compose(
             &inputs,
@@ -792,6 +825,7 @@ mod tests {
             window_id,
             120,
             2,
+            None,
             &config.current(),
             &meta,
             &onb,

@@ -1,0 +1,13 @@
+{
+  "solid_qa_report": "SOLID-QA.md",
+  "commit_under_audit": "4e2d942b68fedb03bbc08a963dad13cd542104c8",
+  "tier": "full",
+  "neutrality": "neutrality.json",
+  "dootsabha_design": "council-design.md",
+  "dootsabha_implementation": "council-implementation.md",
+  "screenshots": [],
+  "pixel_metrics": [
+    "pixel-window-snapshot-default-is-driver-size.json",
+    "pixel-session-snapshot-default-is-driver-size.json"
+  ]
+}

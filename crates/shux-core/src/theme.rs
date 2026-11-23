@@ -61,6 +61,9 @@ pub struct ThemeConfig {
     /// Program-status badges and the "waiting" segment: blocked on you.
     #[serde(default)]
     pub status_attention: Option<String>,
+    /// The shared-session mark: a client watching panes another drives.
+    #[serde(default)]
+    pub status_shared: Option<String>,
 }
 
 /// A single RGB color, kept as a plain triple so renderers in
@@ -96,6 +99,7 @@ pub struct Theme {
     pub status_ok: Rgb,
     pub status_error: Rgb,
     pub status_attention: Rgb,
+    pub status_shared: Rgb,
 }
 
 impl Theme {
@@ -124,6 +128,8 @@ impl Theme {
         status_error: Rgb::new(237, 135, 150),
         // Yellow #eed49f
         status_attention: Rgb::new(238, 212, 159),
+        // Peach #f5a97f
+        status_shared: Rgb::new(245, 169, 127),
     };
 
     /// Resolve `cfg` against `Theme::DEFAULT`. Unparseable hex strings
@@ -143,6 +149,7 @@ impl Theme {
             status_ok: parse_or(cfg.status_ok.as_deref(), d.status_ok),
             status_error: parse_or(cfg.status_error.as_deref(), d.status_error),
             status_attention: parse_or(cfg.status_attention.as_deref(), d.status_attention),
+            status_shared: parse_or(cfg.status_shared.as_deref(), d.status_shared),
         }
     }
 }
@@ -220,8 +227,10 @@ mod tests {
             status_ok: None,
             status_error: None,
             status_attention: None,
+            status_shared: Some("#123456".into()),
         };
         let t = Theme::resolve(&cfg);
+        assert_eq!(t.status_shared, Rgb::new(0x12, 0x34, 0x56));
         assert_eq!(t.border_focused, Rgb::new(255, 0, 0));
         assert_eq!(t.border_unfocused, Rgb::new(0, 255, 0));
         assert_eq!(t.status_bg, Rgb::new(0, 0, 255));

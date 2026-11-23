@@ -46,4 +46,6 @@ pub use keys::{KeyPress, KeyValue, Modifiers, NamedKey};
 pub use render::RenderBackend;
 pub use statusbar::{StatusBar, StatusSegment};
 pub use terminal::TerminalGuard;
-pub use viewport::pane_view_row_offset;
+pub use viewport::{
+    FrameGeometry, FrameInputs, PaneViewport, PresentedPane, follow_offset, prepare_frame,
+};

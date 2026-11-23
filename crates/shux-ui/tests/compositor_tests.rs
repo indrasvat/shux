@@ -49,6 +49,7 @@ fn test_single_pane_renders_grid_content() {
             vts: &vts,
             chrome: None,
             status_bar: None,
+            geometry: None,
         })
         .unwrap();
 
@@ -85,6 +86,7 @@ fn test_two_panes_split_vertical_have_borders() {
             vts: &vts,
             chrome: None,
             status_bar: None,
+            geometry: None,
         })
         .unwrap();
 
@@ -124,6 +126,7 @@ fn test_zoom_renders_only_zoomed_pane() {
             vts: &vts,
             chrome: None,
             status_bar: None,
+            geometry: None,
         })
         .unwrap();
 
@@ -163,6 +166,7 @@ fn test_status_bar_renders_at_bottom_row() {
             vts: &vts,
             chrome: None,
             status_bar: Some(&bar),
+            geometry: None,
         })
         .unwrap();
 
@@ -195,6 +199,7 @@ fn test_diff_render_skips_unchanged_cells() {
             vts: &vts,
             chrome: None,
             status_bar: None,
+            geometry: None,
         })
         .unwrap();
     let stats = compositor
@@ -205,6 +210,7 @@ fn test_diff_render_skips_unchanged_cells() {
             vts: &vts,
             chrome: None,
             status_bar: None,
+            geometry: None,
         })
         .unwrap();
     // Second identical frame: zero dirty cells.
@@ -228,6 +234,7 @@ fn test_resize_invalidates_buffer() {
             vts: &vts,
             chrome: None,
             status_bar: None,
+            geometry: None,
         })
         .unwrap();
     compositor.resize(20, 10);
@@ -239,6 +246,7 @@ fn test_resize_invalidates_buffer() {
             vts: &vts,
             chrome: None,
             status_bar: None,
+            geometry: None,
         })
         .unwrap();
     assert_eq!(stats.dirty_cells, 200);
@@ -295,6 +303,7 @@ fn test_complex_layout_renders_under_budget() {
         vts: &vts,
         chrome: None,
         status_bar: None,
+        geometry: None,
     };
     // Bounded by work, not time — see `test_performance_80x24_under_budget`.
     let stats = compositor.render_multi_pane(frame()).unwrap();

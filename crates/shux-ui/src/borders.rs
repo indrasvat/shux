@@ -162,10 +162,12 @@ impl BorderStyle {
 /// tokens (`shux_core::theme::Theme`); the `Default` impl mirrors
 /// `Theme::DEFAULT` for code paths that don't have a theme yet (tests
 /// + the `terminal_demo` example).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BorderColors {
     pub focused: Color,
     pub unfocused: Color,
+    /// Fills the part of a pane's rect its grid does not cover.
+    pub surplus: Color,
 }
 
 impl BorderColors {
@@ -176,6 +178,7 @@ impl BorderColors {
         Self {
             focused: rgb(theme.border_focused),
             unfocused: rgb(theme.border_unfocused),
+            surplus: rgb(theme.status_bg),
         }
     }
 }

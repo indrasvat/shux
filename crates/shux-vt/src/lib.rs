@@ -234,8 +234,9 @@ pub fn monotonic_now_ns() -> u64 {
     (start.elapsed().as_nanos() as u64).max(1)
 }
 
-/// The clock the synchronized-output deadline reads. Tests freeze and advance
-/// it with [`test_clock::Frozen`] so a deadline test never races the scheduler.
+/// The clock the synchronized-output deadline and the hidden-cursor stamp
+/// read. Tests freeze and advance it with [`test_clock::Frozen`] so a deadline
+/// test never races the scheduler.
 fn sync_clock_ns() -> u64 {
     #[cfg(test)]
     if let Some(now) = test_clock::now() {
@@ -1149,7 +1150,19 @@ impl VirtualTerminal {
             self.sync_opened_ns = 0;
             self.sync_bytes = 0;
         }
+        self.stamp_hidden_cursor();
         responses
+    }
+
+    /// Give a streak this batch started its time: one clock read per batch,
+    /// however often the batch toggles the cursor.
+    fn stamp_hidden_cursor(&mut self) {
+        let mut now = None;
+        for cursor in std::iter::once(&mut self.cursor).chain(self.frozen_cursor.as_mut()) {
+            if !cursor.visible && cursor.hidden_since_ns == 0 {
+                cursor.hidden_since_ns = *now.get_or_insert_with(sync_clock_ns);
+            }
+        }
     }
 
     /// Advance ContentRevision by exactly one BATCH (§4.2 batching rule) and
@@ -1460,6 +1473,7 @@ impl VirtualTerminal {
             self.screen_swap().leave(true);
             self.modes.alternate_screen = false;
         }
+        self.stamp_hidden_cursor();
     }
 
     /// Clear the scrollback buffer.
@@ -2278,6 +2292,58 @@ mod tests {
     // -----------------------------------------------------------------
     // Issue #115: a window cannot be held open for ever
     // -----------------------------------------------------------------
+
+    /// A hidden cursor's streak starts at the batch that hid it. A show between
+    /// two hides, even inside one batch, and a swap back to a hidden primary
+    /// cursor start it again; a synchronized frame keeps the stamp it froze.
+    #[test]
+    fn a_hidden_cursor_is_stamped_by_the_batch_that_hid_it() {
+        let clock = test_clock::Frozen::new();
+        let t0 = sync_clock_ns();
+        let ms = |n: u64| t0 + n * 1_000_000;
+        let mut vt = VirtualTerminal::new(3, 10);
+        assert_eq!(vt.cursor().hidden_for_ns(t0), None);
+        vt.process(b"\x1b[?25l");
+        assert_eq!(vt.cursor().hidden_since_ns, t0);
+        clock.advance_ms(100);
+        vt.process(b"\x1b[?25l");
+        assert_eq!(vt.cursor().hidden_for_ns(ms(100)), Some(ms(100) - t0));
+        vt.process(b"\x1b[?25h\x1b[?25l");
+        assert_eq!(
+            vt.cursor().hidden_since_ns,
+            ms(100),
+            "a show inside the batch"
+        );
+
+        clock.advance_ms(10);
+        vt.process(b"\x1b[?2026h\x1b[?25h\x1b[?25l\x1b[2;2H");
+        assert_eq!(
+            vt.cursor().hidden_since_ns,
+            ms(100),
+            "the frozen frame's own"
+        );
+        vt.process(b"\x1b[?2026l");
+        assert_eq!(
+            vt.cursor().hidden_since_ns,
+            ms(110),
+            "the live one, stamped"
+        );
+
+        clock.advance_ms(10);
+        vt.process(b"\x1b[?1049h");
+        assert!(vt.cursor().visible);
+        clock.advance_ms(10);
+        vt.process(b"\x1b[?1049l");
+        assert_eq!(
+            vt.cursor().hidden_since_ns,
+            ms(130),
+            "restored from the parked screen"
+        );
+        clock.advance_ms(10);
+        vt.enter_alternate_screen();
+        vt.leave_alternate_screen();
+        assert_eq!(vt.cursor().hidden_since_ns, ms(140), "the API swap too");
+    }
 
     /// Parsed late is not sent late: a batch parsed past the deadline must not tear a
     /// frame the pane finished. Only the sweep releases a window on time.

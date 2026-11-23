@@ -16,7 +16,7 @@ use shux_vt::{
 use crate::borders::{BorderColors, BorderStyle, compute_borders};
 use crate::buffer::RenderCell;
 use crate::statusbar::StatusBar;
-use crate::viewport::pane_view_row_offset;
+use crate::viewport::{FrameGeometry, FrameInputs, PaneViewport, PresentedPane};
 use crate::vt_convert::crossterm_to_vt;
 
 /// A fully composed window frame ready for ANSI emission or rasterization.
@@ -45,6 +45,9 @@ pub struct ComposeInputs<'a> {
     pub panes: &'a HashMap<PaneId, (&'a Grid, &'a Cursor)>,
     pub chrome: Option<&'a HashMap<PaneId, crate::chrome::PaneChrome>>,
     pub status_bar: Option<&'a StatusBar>,
+    /// This frame's geometry, prepared for these panes at the size passed to
+    /// [`compose`]; `None` prepares it there, now.
+    pub geometry: Option<&'a FrameGeometry>,
 }
 
 /// Compose `inputs` into a `ComposedFrame` at the given outer dimensions.
@@ -66,33 +69,47 @@ pub fn compose(
         },
     );
 
-    let content_height = rows.saturating_sub(status_bar_height);
-    let content = Rect::new(0, 0, cols, content_height);
-
-    let zoomed = inputs.zoom.is_some();
-    // The compositor's rule, not a third copy: snapshot/web-preview must place
-    // panes exactly where live attach does.
-    let borders_on = crate::compositor::borders_visible(content, border_style, zoomed);
-    let pane_viewport = crate::compositor::pane_viewport(content, border_style, zoomed);
-
-    let pane_rects: Vec<(PaneId, Rect)> = if let Some(zoom) = inputs.zoom {
-        vec![(zoom.zoomed_pane, content)]
-    } else {
-        inputs.layout.compute_rects(pane_viewport)
+    // The live compositor's preparation, not a copy: snapshot/web-preview must
+    // place and slice panes exactly where live attach does.
+    let prepared;
+    let geometry = match inputs.geometry {
+        Some(geometry) => geometry,
+        None => {
+            prepared = crate::viewport::prepare_frame(&FrameInputs {
+                layout: inputs.layout,
+                zoom: inputs.zoom,
+                cols,
+                rows,
+                status_bar_height,
+                border_style,
+                panes: &inputs
+                    .panes
+                    .iter()
+                    .map(|(p, (g, c))| (*p, PresentedPane::of(g, c)))
+                    .collect(),
+                now_ns: shux_vt::monotonic_now_ns(),
+            });
+            &prepared
+        }
     };
+    let content = geometry.content;
+    let borders_on = geometry.borders_on;
+    let pane_rects = &geometry.rects;
+    let surplus = crossterm_to_vt(border_colors.surplus);
 
     let mut placements: Vec<ComposedPlacement> = Vec::new();
-    for (pid, rect) in &pane_rects {
-        if let Some((src_grid, src_cursor)) = inputs.panes.get(pid) {
-            let row_offset = compose_pane(&mut grid, *rect, src_grid, src_cursor);
-            placements.extend(resolve_placements(*rect, src_grid, row_offset));
+    for (pid, rect) in pane_rects {
+        if let (Some((src_grid, _)), Some(view)) = (inputs.panes.get(pid), geometry.views.get(pid))
+        {
+            compose_pane(&mut grid, view, src_grid, surplus);
+            placements.extend(resolve_placements(view, src_grid));
         } else {
             compose_placeholder(&mut grid, *rect, "(no output)");
         }
     }
 
     if borders_on {
-        let segments = compute_borders(&pane_rects, inputs.focused, content, border_style);
+        let segments = compute_borders(pane_rects, inputs.focused, content, border_style);
         for seg in &segments {
             let fg = if seg.focused {
                 crossterm_to_vt(border_colors.focused)
@@ -111,7 +128,7 @@ pub fn compose(
         }
 
         if let Some(chrome) = inputs.chrome {
-            for (pid, rect) in &pane_rects {
+            for (pid, rect) in pane_rects {
                 let Some(pane_chrome) = chrome.get(pid) else {
                     continue;
                 };
@@ -167,28 +184,13 @@ pub fn compose(
         }
     }
 
-    let cursor = pane_rects
-        .iter()
-        .find(|(id, _)| *id == inputs.focused)
-        .and_then(|(_, rect)| {
-            let (src_grid, cur) = inputs.panes.get(&inputs.focused)?;
-            if !cur.visible {
-                return None;
-            }
-            // Map the cursor through the SAME vertical viewport the pane
-            // content used (issue #108) so the two never disagree.
-            let row_offset = pane_view_row_offset(src_grid.rows(), rect.height as usize, cur.row);
-            let vy = (cur.row.saturating_sub(row_offset) as u16).min(rect.height.saturating_sub(1));
-            let sx = rect
-                .x
-                .saturating_add((cur.col as u16).min(rect.width.saturating_sub(1)));
-            let sy = rect.y.saturating_add(vy);
-            (sx < rect.x.saturating_add(rect.width)
-                && sy < rect.y.saturating_add(rect.height)
-                && sx < cols
-                && sy < rows)
-                .then_some((sy as usize, sx as usize))
-        });
+    let cursor = inputs
+        .panes
+        .get(&inputs.focused)
+        .zip(geometry.views.get(&inputs.focused))
+        .and_then(|((_, cur), view)| view.cursor_cell(cur))
+        .filter(|&(x, y)| x < cols && y < rows)
+        .map(|(x, y)| (usize::from(y), usize::from(x)));
 
     ComposedFrame {
         grid,
@@ -209,61 +211,59 @@ fn cell_rect(r: Rect) -> CellRect {
     }
 }
 
-/// Rebase one pane's placements into the frame that shows it. `row_offset` is
-/// the vertical clip the caller applied to the pane's cells.
-pub(crate) fn resolve_placements(
-    rect: Rect,
-    src: &Grid,
-    row_offset: usize,
-) -> Vec<ComposedPlacement> {
-    // `min` with the source dims: a pane grid can be smaller than its rect
-    // during a resize lag, and a picture must not paint area it does not own.
+/// Rebase one pane's placements into the frame that shows it through `view`,
+/// clipped to the cells it shows. A picture whose origin lies left of the
+/// slice is omitted: placements cannot start at a negative column.
+pub(crate) fn resolve_placements(view: &PaneViewport, src: &Grid) -> Vec<ComposedPlacement> {
+    let rect = view.rect;
     let clip = CellRect {
         col: rect.x as usize,
         row: rect.y as usize,
-        cols: (rect.width as usize).min(src.cols()),
-        rows: (rect.height as usize).min(src.rows()),
+        cols: view.shown_cols(),
+        rows: view.shown_rows(),
     };
     src.placements()
         .iter()
-        .map(|p| ComposedPlacement {
-            image: p.image.clone(),
-            // `viewport_row` undoes the source grid's own base, `row_offset`
-            // undoes the vertical clip applied to the cells, and `rect.y`
-            // rebases into this frame.
-            row: p.viewport_row(src) - row_offset as i64 + i64::from(rect.y),
-            col: p.col + rect.x as usize,
-            clip,
-            geometry: p.geometry,
+        .filter_map(|p| {
+            Some(ComposedPlacement {
+                image: p.image.clone(),
+                // `viewport_row` undoes the source grid's own base, the offset
+                // undoes the slice, and `rect.y` rebases into this frame.
+                row: p.viewport_row(src) - view.row_offset as i64 + i64::from(rect.y),
+                col: p.col.checked_sub(view.col_offset)? + rect.x as usize,
+                clip,
+                geometry: p.geometry,
+            })
         })
         .collect()
 }
 
-fn compose_pane(grid: &mut Grid, rect: Rect, src: &Grid, cursor: &Cursor) -> usize {
-    let total_rows = src.rows();
-    let total_cols = src.cols();
-    let visible_rows = rect.height as usize;
-    let visible_cols = rect.width as usize;
-    // Cursor-following viewport: show the region the cursor lives in, so
-    // content and cursor agree and top-of-grid content never renders blank
-    // (issue #108). Degrades to top-anchored for a top cursor, bottom-anchored
-    // for a bottom cursor.
-    let row_offset = pane_view_row_offset(total_rows, visible_rows, cursor.row);
-
-    for r in 0..visible_rows {
-        let src_row_idx = row_offset + r;
-        if src_row_idx >= total_rows {
-            continue;
-        }
+fn compose_pane(grid: &mut Grid, view: &PaneViewport, src: &Grid, surplus: Color) {
+    let rect = view.rect;
+    let (shown_rows, shown_cols) = (view.shown_rows(), view.shown_cols());
+    for r in 0..usize::from(rect.height) {
         let dst_row_idx = rect.y as usize + r;
         if dst_row_idx >= grid.rows() {
             break;
         }
-        let src_row_cells: Vec<Cell> = (0..visible_cols.min(total_cols))
-            .map(|c| src.visible_row(src_row_idx)[c].clone())
+        let cells: Vec<Cell> = (0..usize::from(rect.width))
+            .map(|c| {
+                if r < shown_rows && c < shown_cols {
+                    let row = src.visible_row(view.row_offset + r);
+                    view.shown_cell(row, view.col_offset + c).into_owned()
+                } else {
+                    Cell {
+                        style: CellStyle {
+                            bg: surplus,
+                            ..CellStyle::default()
+                        },
+                        ..Cell::default()
+                    }
+                }
+            })
             .collect();
         let mut dst_row = grid.visible_row_mut(dst_row_idx);
-        for (c, cell) in src_row_cells.into_iter().enumerate() {
+        for (c, cell) in cells.into_iter().enumerate() {
             let dst_col = rect.x as usize + c;
             if dst_col >= dst_row.len() {
                 break;
@@ -271,7 +271,6 @@ fn compose_pane(grid: &mut Grid, rect: Rect, src: &Grid, cursor: &Cursor) -> usi
             dst_row[dst_col] = cell;
         }
     }
-    row_offset
 }
 
 fn compose_placeholder(grid: &mut Grid, rect: Rect, text: &str) {
@@ -398,6 +397,7 @@ mod tests {
             panes: &panes,
             chrome: None,
             status_bar: None,
+            geometry: None,
         };
         let composed = compose(
             &inputs,
@@ -446,6 +446,7 @@ mod tests {
                     panes: &panes,
                     chrome: Some(&chrome),
                     status_bar: None,
+                    geometry: None,
                 };
                 let plain = ComposeInputs {
                     chrome: None,
@@ -484,6 +485,7 @@ mod tests {
             panes: &panes,
             chrome: None,
             status_bar: None,
+            geometry: None,
         };
         let composed = compose(
             &inputs,
@@ -513,6 +515,7 @@ mod tests {
             panes: &panes,
             chrome: None,
             status_bar: None,
+            geometry: None,
         };
         let composed = compose(
             &inputs,
@@ -559,6 +562,7 @@ mod tests {
             panes: &panes,
             chrome: Some(&titles),
             status_bar: None,
+            geometry: None,
         };
         let composed = compose(
             &inputs,
@@ -618,6 +622,7 @@ mod tests {
             panes: &panes,
             chrome: None,
             status_bar: Some(&bar),
+            geometry: None,
         };
         let composed = compose(
             &inputs,
@@ -657,6 +662,7 @@ mod tests {
             panes: &panes,
             chrome: None,
             status_bar: None,
+            geometry: None,
         };
         // Rounded border + 1 status row → pane viewport is (1,1,118,33): the
         // 60-row grid overflows its 33-row rect.
@@ -703,6 +709,7 @@ mod tests {
             panes: &panes,
             chrome: None,
             status_bar: None,
+            geometry: None,
         };
         let composed = compose(
             &inputs,
@@ -757,6 +764,7 @@ mod tests {
             panes: &panes,
             chrome: None,
             status_bar: None,
+            geometry: None,
         };
         let composed = compose(
             &inputs,

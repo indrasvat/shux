@@ -109,6 +109,26 @@ it would measure the union of their outlines and an image spilling from one pane
 into its neighbour would score zero pixels outside. Per-pane rects are the
 extension to make when that case matters.
 
+### Two clients on one split session
+
+`.shux/scripts/gui_terminal_two_clients.sh` (the last step of `make
+test-gui-terminal`) is the multi-pane case for #190. One kitty at 1100x700
+attaches first and drives, and a second at 640x400 attaches only to view. Each
+pane paints a solid block at its top-left with its cursor at home. Both windows
+are photographed side by side on one Xvfb screen, before and after the viewer
+attaches. `lib/kitty_two_clients_verdict.py` finds each window's outline and its
+vertical separator, which gives per-pane rects, and asserts:
+
+| Assertion | What a failure means |
+|---|---|
+| `unchanged` | the driving window's panes moved when the viewer attached |
+| `block` | a pane's block is not drawn whole at its pane's top-left in either window |
+| `contained` | a pane's colour is painted outside that pane, including into its neighbour |
+| `label` | the viewer's left border does not hold ` ⤡ W×H` more than the driver's, or the driver's holds more than its title |
+
+It was proven able to fail by building it with the size label turned off: the
+viewer's border then held no more than the driver's, and `label` went red.
+
 ### Tools
 
 `kitty`, `Xvfb`, `xdotool`, ImageMagick's `import`, `python3`, `uv`. The rig

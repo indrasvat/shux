@@ -35,6 +35,8 @@ const SLOTS: usize = 256;
 pub struct PaneInput {
     pub(crate) bytes: Vec<u8>,
     budget: Option<OwnedSemaphorePermit>,
+    /// Dropped with the chunk: once it is written, or will never be.
+    _done: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl PaneInput {
@@ -55,6 +57,7 @@ impl From<Vec<u8>> for PaneInput {
         Self {
             bytes,
             budget: None,
+            _done: None,
         }
     }
 }
@@ -135,6 +138,7 @@ pub struct InputPermit {
     queued: Arc<std::sync::atomic::AtomicUsize>,
     slot: Option<OwnedSemaphorePermit>,
     budget: Option<OwnedSemaphorePermit>,
+    done: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 /// A pane's input channel with the default bounds.
@@ -231,6 +235,7 @@ impl PaneWriter {
             queued: self.queued.clone(),
             slot,
             budget,
+            done: None,
         }
     }
 
@@ -264,6 +269,7 @@ impl InputPermit {
         let input = PaneInput {
             bytes,
             budget: self.budget,
+            _done: self.done,
         };
         // Counted before it can be received, so the count never goes below 0.
         self.queued
@@ -280,6 +286,14 @@ impl InputPermit {
                 .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         }
         sent
+    }
+
+    /// Resolves once what this permit sends has been written to the program,
+    /// or will never be.
+    pub fn watch(&mut self) -> tokio::sync::oneshot::Receiver<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.done = Some(tx);
+        rx
     }
 
     /// Whether this is room in `writer`'s channel.

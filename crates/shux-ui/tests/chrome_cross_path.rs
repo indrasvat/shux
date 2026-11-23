@@ -29,6 +29,7 @@ fn colors() -> BorderColors {
             g: 90,
             b: 120,
         },
+        ..BorderColors::default()
     }
 }
 
@@ -59,6 +60,7 @@ fn attach_and_snapshot_draw_identical_chrome() {
                         b: 159,
                     },
                 }),
+                label: None,
             },
         ),
         (right, PaneChrome::titled("日本 e\u{301}")),
@@ -95,6 +97,7 @@ fn attach_and_snapshot_draw_identical_chrome() {
         vts: &vts,
         chrome: Some(&chrome),
         status_bar: Some(&bar),
+        geometry: None,
     })
     .unwrap();
     let mut seen = VirtualTerminal::new(ROWS as usize, COLS as usize);
@@ -112,6 +115,7 @@ fn attach_and_snapshot_draw_identical_chrome() {
             panes: &panes,
             chrome: Some(&chrome),
             status_bar: Some(&bar),
+            geometry: None,
         },
         COLS,
         ROWS,
@@ -168,6 +172,7 @@ fn overlapping_status_zones_draw_identically() {
             vts: &vts,
             chrome: None,
             status_bar: Some(&bar),
+            geometry: None,
         })
         .unwrap();
         let mut seen = VirtualTerminal::new(5, 6);
@@ -181,6 +186,7 @@ fn overlapping_status_zones_draw_identically() {
                 panes: &panes,
                 chrome: None,
                 status_bar: Some(&bar),
+                geometry: None,
             },
             6,
             5,

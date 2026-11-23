@@ -394,6 +394,7 @@ fn attach_and_snapshot_draw_the_tee() {
             g: 90,
             b: 120,
         },
+        ..BorderColors::default()
     };
     let layout = two_over_one();
     let content = Rect::new(0, 0, COLS, ROWS - 1);
@@ -426,6 +427,7 @@ fn attach_and_snapshot_draw_the_tee() {
             vts: &vts,
             chrome: None,
             status_bar: None,
+            geometry: None,
         })
         .unwrap();
         let mut seen = VirtualTerminal::new(ROWS as usize, COLS as usize);
@@ -443,6 +445,7 @@ fn attach_and_snapshot_draw_the_tee() {
                 panes: &panes,
                 chrome: None,
                 status_bar: None,
+                geometry: None,
             },
             COLS,
             ROWS,

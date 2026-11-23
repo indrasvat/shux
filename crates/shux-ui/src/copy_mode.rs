@@ -18,7 +18,11 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 
 use shux_core::layout::Rect;
 use shux_core::theme::{Rgb, Theme};
-use shux_vt::{CellFlags, Color, Row, VirtualTerminal};
+use std::borrow::Cow;
+
+use shux_vt::{Cell, CellFlags, Color, Row, VirtualTerminal};
+
+use crate::viewport::PaneViewport;
 
 /// Per-attach session copy-mode state. `None` means the user is in
 /// normal pane-input mode.
@@ -531,12 +535,23 @@ pub fn view_start(total_lines: usize, pane_rows: u16, scroll_offset: usize) -> u
         .saturating_sub(scroll_offset.min(max_scroll_offset(total_lines, pane_rows)))
 }
 
+/// The slice modal copy mode draws its pane with: rows following the cursor
+/// from column 0, whatever the frame shows. Its cursor, highlight, search and
+/// yank all read the grid through this.
+pub fn copy_mode_view(view: PaneViewport, vt: &VirtualTerminal) -> PaneViewport {
+    view.with_offsets(copy_row_offset(vt, view.rect.height), 0)
+}
+
+fn copy_row_offset(vt: &VirtualTerminal, pane_rows: u16) -> usize {
+    crate::viewport::follow_offset(vt.grid().rows(), pane_rows.into(), vt.cursor().row)
+}
+
 /// The number of lines the copy-mode viewport spans for `vt` at `pane_rows` —
 /// scrollback plus the region the live attach frame actually shows.
 ///
 /// Issue #108 made the attach/snapshot frame **cursor-following**: when a pane's
 /// grid is taller than the rect it is drawn into, the frame shows the
-/// `pane_view_row_offset` window rather than the bottom `pane_rows`. Copy mode
+/// cursor-following window rather than the bottom `pane_rows`. Copy mode
 /// maps a screen selection to a grid line off the BOTTOM (`total_lines`), so on
 /// such a pane the row you see and the row you yank diverge. Anchoring copy
 /// mode's coordinate space to this value (instead of `grid.total_lines()`) keeps
@@ -556,7 +571,7 @@ pub fn effective_total_lines(vt: &VirtualTerminal, pane_rows: u16) -> usize {
     if grid_rows <= visible {
         return total; // grid fits — coordinate space is unchanged
     }
-    let row_offset = crate::viewport::pane_view_row_offset(grid_rows, visible, vt.cursor().row);
+    let row_offset = copy_row_offset(vt, pane_rows);
     // Scrollback lines + the live viewport's bottom edge. Excludes any grid rows
     // below the live frame (they are past the visible screen), matching what the
     // attach frame shows. `row_offset + visible <= grid_rows`, so this never
@@ -623,6 +638,44 @@ fn row_for_view(
     vt.presented_row(abs)
 }
 
+/// Which grid cell a selection's pane-local cell names.
+#[derive(Clone, Copy)]
+enum Slice<'a> {
+    /// Modal copy mode's own: the cursor-following rows from column 0.
+    Copy { pane: Rect, scroll_offset: usize },
+    /// The slice a frame showed, so a mouse selection reads what it covered.
+    Frame(&'a PaneViewport),
+}
+
+impl Slice<'_> {
+    fn cell<'v>(&self, vt: &'v VirtualTerminal, x: u16, y: u16) -> Option<Cow<'v, Cell>> {
+        match *self {
+            Slice::Copy {
+                pane,
+                scroll_offset,
+            } => {
+                let cell = row_for_view(vt, pane.height, scroll_offset, y)?.get(usize::from(x))?;
+                // A wide glyph on the pane's last column would spill into the
+                // neighbour: drawn, and yanked, as its blank half.
+                Some(if cell.width == 2 && x + 1 >= pane.width {
+                    Cow::Owned(crate::viewport::blank_like(cell))
+                } else {
+                    Cow::Borrowed(cell)
+                })
+            }
+            Slice::Frame(view) => {
+                let (x, y) = (usize::from(x), usize::from(y));
+                let (row, col) = (view.row_offset + y, view.col_offset + x);
+                // A view from before a resize can name cells the grid no
+                // longer has.
+                let on_grid = row < vt.grid().rows() && col < vt.grid().cols();
+                (on_grid && y < view.shown_rows() && x < view.shown_cols())
+                    .then(|| view.shown_cell(vt.grid().visible_row(row), col))
+            }
+        }
+    }
+}
+
 trait BoolExt {
     fn then_updated(self) -> CopyKey;
 }
@@ -648,6 +701,31 @@ pub fn extract_selection(
     state: &CopyModeState,
     pane_cols: u16,
     pane_rows: u16,
+) -> String {
+    let slice = Slice::Copy {
+        pane: Rect::new(0, 0, pane_cols, pane_rows),
+        scroll_offset: state.scroll_offset,
+    };
+    extract_from(vt, state, pane_cols, pane_rows, slice)
+}
+
+/// [`extract_selection`] for a mouse selection made over `view`: the cells
+/// that frame drew, cut glyphs at its edges blank as drawn.
+pub fn extract_frame_selection(
+    vt: &VirtualTerminal,
+    state: &CopyModeState,
+    view: &PaneViewport,
+) -> String {
+    let (cols, rows) = (view.shown_cols() as u16, view.shown_rows() as u16);
+    extract_from(vt, state, cols, rows, Slice::Frame(view))
+}
+
+fn extract_from(
+    vt: &VirtualTerminal,
+    state: &CopyModeState,
+    pane_cols: u16,
+    pane_rows: u16,
+    slice: Slice<'_>,
 ) -> String {
     let cursor = state.cursor;
     let anchor = state.anchor.unwrap_or(cursor);
@@ -688,15 +766,16 @@ pub fn extract_selection(
             (line_start, line_end)
         };
 
-        let Some(row_ref) = row_for_view(vt, pane_rows, state.scroll_offset, row) else {
+        if slice.cell(vt, 0, row).is_none() {
             continue;
-        };
-        let row_len = row_ref.len() as u16;
+        }
         for col in col_lo..=col_hi {
-            if col >= max_col || col >= row_len {
+            if col >= max_col {
                 break;
             }
-            let cell = &row_ref[col as usize];
+            let Some(cell) = slice.cell(vt, col, row) else {
+                break;
+            };
             if cell.is_wide_continuation() {
                 continue;
             }
@@ -726,25 +805,22 @@ pub fn render_copy_view_into(
     if pane.width == 0 || pane.height == 0 {
         return;
     }
-    // #108: match the cursor-following frame region (see effective_total_lines).
-    let start = view_start(
-        effective_total_lines(vt, pane.height),
-        pane.height,
-        state.scroll_offset,
-    );
+    let slice = Slice::Copy {
+        pane,
+        scroll_offset: state.scroll_offset,
+    };
     for row in 0..pane.height {
-        let abs = start + row as usize;
-        let Some(row_ref) = vt.presented_row(abs) else {
+        if slice.cell(vt, 0, row).is_none() {
             continue;
-        };
+        }
         let _ = write!(buf, "\x1b[{};{}H", pane.y + row + 1, pane.x + 1);
         for col in 0..pane.width {
-            let cell = row_ref.get(col as usize);
-            match cell {
-                Some(cell) if !cell.is_wide_continuation() => {
-                    write_cell(buf, cell);
-                }
-                _ => {
+            match slice.cell(vt, col, row) {
+                // The wide glyph before it covered this cell; a space here
+                // would push the rest of the row one column right.
+                Some(cell) if cell.is_wide_continuation() => {}
+                Some(cell) => write_cell(buf, &cell),
+                None => {
                     let _ = write!(buf, " ");
                 }
             }
@@ -837,15 +913,23 @@ pub fn render_copy_overlay_with_vt_into(
 /// Draw only the selected text, without the copy-mode cursor or status hint.
 ///
 /// This is used by the human mouse-selection path: a selected range can remain
-/// visible while normal pane input keeps flowing to the PTY.
+/// visible while normal pane input keeps flowing to the PTY. It reads the
+/// cells `view` showed, as [`extract_frame_selection`] yanks them.
 pub fn render_selection_overlay_with_vt_into(
     buf: &mut Vec<u8>,
-    pane: Rect,
+    view: &PaneViewport,
     vt: &VirtualTerminal,
     state: &CopyModeState,
     theme: &Theme,
 ) {
-    render_selection_overlay_inner(buf, pane, Some(vt), state, theme);
+    // Only cells the frame drew: a run is not highlighted across surplus.
+    let shown = Rect::new(
+        view.rect.x,
+        view.rect.y,
+        view.shown_cols() as u16,
+        view.shown_rows() as u16,
+    );
+    render_selection_overlay_inner(buf, shown, Some(vt), state, theme, Slice::Frame(view));
 }
 
 /// Variant of [`render_selection_overlay_with_vt_into`] used when the VT has
@@ -856,7 +940,11 @@ pub fn render_selection_overlay_into(
     state: &CopyModeState,
     theme: &Theme,
 ) {
-    render_selection_overlay_inner(buf, pane, None, state, theme);
+    let slice = Slice::Copy {
+        pane,
+        scroll_offset: state.scroll_offset,
+    };
+    render_selection_overlay_inner(buf, pane, None, state, theme, slice);
 }
 
 fn render_copy_overlay_inner(
@@ -870,7 +958,11 @@ fn render_copy_overlay_inner(
         return;
     }
 
-    render_selection_overlay_inner(buf, pane, vt, state, theme);
+    let slice = Slice::Copy {
+        pane,
+        scroll_offset: state.scroll_offset,
+    };
+    render_selection_overlay_inner(buf, pane, vt, state, theme, slice);
 
     // Status-line hint at the bottom row of the pane: shows current
     // mode and dismiss/yank shortcuts. The text width changes with
@@ -928,6 +1020,7 @@ fn render_selection_overlay_inner(
     vt: Option<&VirtualTerminal>,
     state: &CopyModeState,
     theme: &Theme,
+    slice: Slice<'_>,
 ) {
     if pane.width < 1 || pane.height < 1 {
         return;
@@ -956,7 +1049,7 @@ fn render_selection_overlay_inner(
                 let ctx = SelectionRenderCtx {
                     pane,
                     vt,
-                    state,
+                    slice,
                     theme,
                 };
                 selection_text_run(buf, ctx, col_lo, col_hi, row);
@@ -1037,7 +1130,7 @@ pub fn render_copy_menu_into(
 struct SelectionRenderCtx<'a> {
     pane: Rect,
     vt: &'a VirtualTerminal,
-    state: &'a CopyModeState,
+    slice: Slice<'a>,
     theme: &'a Theme,
 }
 
@@ -1048,7 +1141,7 @@ fn selection_text_run(
     col_hi: u16,
     row: u16,
 ) {
-    let Some(row_ref) = row_for_view(ctx.vt, ctx.pane.height, ctx.state.scroll_offset, row) else {
+    if ctx.slice.cell(ctx.vt, 0, row).is_none() {
         highlight_run(
             buf,
             ctx.pane,
@@ -1059,13 +1152,19 @@ fn selection_text_run(
             ctx.theme.status_accent,
         );
         return;
-    };
+    }
     let col_hi = col_hi.min(ctx.pane.width.saturating_sub(1));
     for col in col_lo..=col_hi {
-        let text = row_ref
-            .get(col as usize)
+        let cell = ctx.slice.cell(ctx.vt, col, row);
+        // A wide glyph drawn at its lead covers this cell; a space here would
+        // erase it. A run that starts on the right half has no lead to draw.
+        let continuation = cell.as_ref().is_some_and(|c| c.is_wide_continuation());
+        if continuation && col > col_lo {
+            continue;
+        }
+        let text = cell
             .filter(|cell| !cell.is_wide_continuation())
-            .map(shown_text)
+            .map(|cell| shown_text(&cell))
             .unwrap_or_else(|| " ".to_string());
         let _ = write!(
             buf,
@@ -1663,7 +1762,8 @@ mod tests {
             ..Default::default()
         };
         let mut buf = Vec::new();
-        render_selection_overlay_with_vt_into(&mut buf, pane, &vt, &state, &Theme::DEFAULT);
+        let view = PaneViewport::of(pane, &vt, 0);
+        render_selection_overlay_with_vt_into(&mut buf, &view, &vt, &state, &Theme::DEFAULT);
         let rendered = String::from_utf8_lossy(&buf);
         let plain = strip_ansi(&rendered);
         assert!(plain.contains("abc"));
@@ -1758,5 +1858,155 @@ mod tests {
             vt2.process(b"line\r\n");
         }
         assert_eq!(effective_total_lines(&vt2, 24), vt2.grid().total_lines());
+    }
+    /// A mouse selection over a slice cropped on both axes highlights and
+    /// yanks the same cells: those the frame drew, a glyph cut by the left
+    /// edge blank in both.
+    #[test]
+    fn a_frame_selection_highlights_and_yanks_the_slice_it_was_made_over() {
+        let mut vt = VirtualTerminal::new(8, 30);
+        for r in 0..8 {
+            vt.process(format!("\x1b[{};1H{r}abcdefghi界jklmnopqrstuvw", r + 1).as_bytes());
+        }
+        // Rows 3..=5 and columns 11..=16 shown in a 6x3 rect at (2, 1): column
+        // 11 is the right half of 界.
+        let view = PaneViewport {
+            rect: Rect::new(2, 1, 6, 3),
+            grid_rows: 8,
+            grid_cols: 30,
+            row_offset: 3,
+            col_offset: 11,
+        };
+        let state = CopyModeState {
+            anchor: Some((0, 0)),
+            cursor: (3, 1),
+            ..Default::default()
+        };
+        assert_eq!(extract_frame_selection(&vt, &state, &view), " jklmn\n jkl");
+        let mut buf = Vec::new();
+        render_selection_overlay_with_vt_into(&mut buf, &view, &vt, &state, &Theme::DEFAULT);
+        let mut screen = VirtualTerminal::new(5, 10);
+        screen.process(&buf);
+        let line =
+            |y: usize| -> String { (2..8).map(|x| screen.grid().visible_row(y)[x].ch).collect() };
+        assert_eq!(line(1), " jklmn");
+        assert_eq!(&line(2)[..4], " jkl");
+    }
+
+    /// A highlighted run keeps every wide glyph it covers whole on screen: a
+    /// space written over the right half erases the glyph in the terminal,
+    /// though the yank still copies it.
+    #[test]
+    fn a_selection_highlight_keeps_its_wide_glyphs() {
+        let text = "A界😀B";
+        let mut vt = VirtualTerminal::new(3, 20);
+        vt.process(text.as_bytes());
+        let view = PaneViewport::of(Rect::new(0, 0, 20, 3), &vt, 0);
+        let state = CopyModeState {
+            anchor: Some((0, 0)),
+            cursor: (5, 0),
+            ..Default::default()
+        };
+        assert_eq!(extract_frame_selection(&vt, &state, &view), text);
+        let mut buf = Vec::new();
+        render_selection_overlay_with_vt_into(&mut buf, &view, &vt, &state, &Theme::DEFAULT);
+        let mut screen = VirtualTerminal::new(3, 20);
+        screen.process(text.as_bytes());
+        screen.process(&buf);
+        let row = screen.grid().visible_row(0);
+        let shown: String = (0..6)
+            .filter(|&c| !row[c].is_wide_continuation())
+            .map(|c| row[c].display_text())
+            .collect();
+        assert_eq!(shown, text, "the highlight erased a glyph");
+    }
+
+    /// A selection's view from before a resize names cells the grid no longer
+    /// has, on either axis: reading it finds none rather than indexing past
+    /// the grid.
+    #[test]
+    fn a_frame_selection_over_a_shrunk_grid_reads_no_cell_past_it() {
+        let view = PaneViewport {
+            rect: Rect::new(0, 0, 6, 3),
+            grid_rows: 8,
+            grid_cols: 30,
+            row_offset: 3,
+            col_offset: 11,
+        };
+        let state = CopyModeState {
+            anchor: Some((0, 0)),
+            cursor: (5, 2),
+            ..Default::default()
+        };
+        for (rows, cols) in [(4, 30), (8, 12)] {
+            let mut vt = VirtualTerminal::new(8, 30);
+            vt.process(b"abcdefghijklmnopqrstuvwxyz");
+            vt.resize(rows, cols);
+            let _ = extract_frame_selection(&vt, &state, &view);
+            let mut buf = Vec::new();
+            render_selection_overlay_with_vt_into(&mut buf, &view, &vt, &state, &Theme::DEFAULT);
+        }
+    }
+
+    /// Review of #190: modal copy mode draws and yanks wide glyphs by one rule.
+    /// An intact glyph leaves the rest of its row in place; one on the pane's
+    /// last column would spill into the neighbour, so it is its blank half on
+    /// screen and in the yank.
+    #[test]
+    fn modal_copy_mode_draws_and_yanks_wide_glyphs_as_shown() {
+        let mut vt = VirtualTerminal::new(2, 10);
+        // a | 界 1-2 | b 3 | 界 4-5 | ...: the pane's last column is 4.
+        vt.process("a界b界xyz".as_bytes());
+        let pane = Rect::new(0, 0, 5, 2);
+        let mut buf = Vec::new();
+        render_copy_view_into(&mut buf, pane, &vt, &CopyModeState::default());
+        let mut screen = VirtualTerminal::new(2, 8);
+        screen.process(b"\x1b[1;6HNN");
+        screen.process(&buf);
+        let row = screen.grid().visible_row(0);
+        let shown: String = (0..7)
+            .filter(|&c| !row[c].is_wide_continuation())
+            .map(|c| row[c].display_text())
+            .collect();
+        assert_eq!(shown, "a界b NN", "a glyph shifted or spilled");
+        let state = CopyModeState {
+            anchor: Some((0, 0)),
+            cursor: (4, 0),
+            ..Default::default()
+        };
+        assert_eq!(
+            extract_selection(&vt, &state, 5, 2),
+            "a界b",
+            "yanked what was not shown"
+        );
+    }
+
+    /// Review of #190: a multi-line selection over a grid narrower than its
+    /// rect highlights only the cells the frame drew, not the surplus beside.
+    #[test]
+    fn a_frame_selection_highlights_no_surplus() {
+        let mut vt = VirtualTerminal::new(3, 4);
+        vt.process(b"abcd\r\nefgh");
+        let view = PaneViewport {
+            rect: Rect::new(0, 0, 10, 3),
+            grid_rows: 3,
+            grid_cols: 4,
+            row_offset: 0,
+            col_offset: 0,
+        };
+        let state = CopyModeState {
+            anchor: Some((1, 0)),
+            cursor: (2, 1),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        render_selection_overlay_with_vt_into(&mut buf, &view, &vt, &state, &Theme::DEFAULT);
+        let mut screen = VirtualTerminal::new(3, 10);
+        screen.process(&buf);
+        let row = screen.grid().visible_row(0);
+        let lit: Vec<usize> = (0..10)
+            .filter(|&c| row[c].style.bg != Color::Default)
+            .collect();
+        assert_eq!(lit, vec![1, 2, 3], "highlighted past the grid");
     }
 }

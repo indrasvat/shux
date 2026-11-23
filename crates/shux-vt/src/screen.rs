@@ -135,6 +135,9 @@ impl ScreenSwap<'_> {
         if restore_cursor {
             if let Some(primary_cursor) = self.stashed_cursor.take() {
                 *self.cursor = primary_cursor;
+                if !self.cursor.visible {
+                    self.cursor.hidden_since_ns = 0;
+                }
             }
         } else {
             self.stashed_cursor.take();

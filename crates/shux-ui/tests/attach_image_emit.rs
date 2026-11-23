@@ -68,6 +68,7 @@ fn frame<'a>(
         vts,
         chrome: None,
         status_bar: None,
+        geometry: None,
     }
 }
 
@@ -222,6 +223,8 @@ fn a_second_panes_picture_stays_out_of_its_neighbour() {
     // 30 cells wide in a 20-cell pane. Sized to OVERFLOW: at exactly pane
     // width the horizontal bound is a no-op and this test cannot fail.
     va.process(&kitty_rgb(270, 190, [200, 40, 40]));
+    // Cursor home, so the slice starts at column 0 rather than following it.
+    va.process(b"\x1b[H");
     let vb = VirtualTerminal::new(10, 40);
     let mut vts = HashMap::new();
     vts.insert(a, &va);
@@ -665,4 +668,41 @@ fn a_clipped_scaled_put_keeps_its_scale_on_the_host() {
         (w as f64 - 36.0).abs() <= scale && (h as f64 - 17.0).abs() <= scale + 1.0,
         "the clipped slice was drawn {w}x{h}, not about 36x17"
     );
+}
+
+/// A pane cropped on both axes shows its picture at the cell the slice draws
+/// it in; once the picture's origin is left of the slice it is taken down from
+/// the attached terminal, not shifted onto other cells.
+#[test]
+fn a_picture_moves_with_the_slice_on_both_axes_and_leaves_with_its_origin() {
+    let p = pane(1);
+    let layout = LayoutNode::leaf(p);
+    let mut vt = VirtualTerminal::new(12, 60);
+    // One 9x19 cell at row 8, column 30; then the cursor to row 10, column 35.
+    vt.process(b"\x1b[9;31H");
+    vt.process(&kitty_rgb(9, 19, [0, 200, 0]));
+    vt.process(b"\x1b[11;36H");
+    let mut c = make_compositor(20, 6);
+    {
+        let vts = HashMap::from([(p, &vt)]);
+        c.render_multi_pane(frame(&layout, &vts, p)).unwrap();
+        assert_eq!(c.pane_views()[&p].col_offset, 16);
+        assert_eq!(c.pane_views()[&p].row_offset, 5);
+    }
+    let out = drain(&mut c);
+    assert!(
+        out.contains("\x1b[4;15H\x1b_Ga=T"),
+        "placed at row 8-5, column 30-16: {:?}",
+        graphics(&out)
+    );
+
+    vt.process(b"\x1b[11;56H");
+    {
+        let vts = HashMap::from([(p, &vt)]);
+        c.render_multi_pane(frame(&layout, &vts, p)).unwrap();
+        assert_eq!(c.pane_views()[&p].col_offset, 36);
+    }
+    let cmds = graphics(&drain(&mut c));
+    assert_eq!(cmds.len(), 1, "{cmds:?}");
+    assert!(cmds[0].starts_with("a=d"), "taken down: {cmds:?}");
 }
