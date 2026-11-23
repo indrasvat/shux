@@ -618,3 +618,61 @@ fn a_borderless_window_snapshot_draws_the_pane_as_its_pane_snapshot_does() {
         "the pane's crop of the window snapshot differs from its pane snapshot"
     );
 }
+
+/// Four opaque columns of `w` px each, one colour per declared cell.
+fn kitty_column_bands(colours: [[u8; 3]; 4]) -> Vec<u8> {
+    let (w, h) = (36u32, 19u32);
+    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+    for _ in 0..h {
+        for x in 0..w {
+            let c = colours[(x / 9) as usize];
+            rgba.extend_from_slice(&[c[0], c[1], c[2], 255]);
+        }
+    }
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&rgba);
+    format!("\x1b_Ga=T,f=32,t=d,s={w},v={h},i=7,C=1;{b64}\x1b\\").into_bytes()
+}
+
+/// A picture whose origin lies left of its pane's slice is drawn cropped from
+/// the pane's left edge: the right-hand pane of a split shows the third and
+/// fourth bands where its first two cells are, and nothing of the first two
+/// lands in the neighbour or on the border.
+#[test]
+fn a_picture_left_of_its_slice_is_drawn_cropped_not_dropped() {
+    const BANDS: [[u8; 3]; 4] = [[250, 20, 20], [20, 250, 20], [20, 20, 250], [250, 250, 20]];
+    let s = split();
+    let width = s.right_rect.width as usize;
+    let mut rvt = VirtualTerminal::new(s.right_rect.height as usize, width + 40);
+    probe_text(&mut rvt);
+    rvt.process(b"\x1b[3;11H");
+    rvt.process(&kitty_column_bands(BANDS));
+    // Cursor-follow puts the slice's first column two right of the origin.
+    rvt.process(format!("\x1b[3;{}H", 12 + width).as_bytes());
+    let mut lvt = VirtualTerminal::new(s.left_rect.height as usize, s.left_rect.width as usize);
+    probe_text(&mut lvt);
+    let (lg, rg) = (lvt.grid().clone_visible(), rvt.grid().clone_visible());
+    let (lc, rc) = (lvt.cursor().clone(), rvt.cursor().clone());
+    let (img, cw, ch) = window_png(&s, (&lg, &lc), (&rg, &rc), 14.0);
+    assert_probes_survived(&img, "left-cropped picture");
+
+    let (x0, y) = (
+        u32::from(s.right_rect.x) * cw,
+        (u32::from(s.right_rect.y) + 2) * ch + ch / 2,
+    );
+    let at = |x: u32| {
+        let p = img.get_pixel(x, y).0;
+        [p[0], p[1], p[2]]
+    };
+    assert_eq!(
+        [at(x0 + cw / 2), at(x0 + cw + cw / 2)],
+        [BANDS[2], BANDS[3]],
+        "the pane's first two cells do not show the picture's last two bands"
+    );
+    let painted = |rgb: [u8; 3]| BANDS.contains(&rgb);
+    assert!(
+        !painted(at(x0 + 2 * cw + cw / 2)),
+        "the picture ran past its fourth band"
+    );
+    let leaked = (0..x0).filter(|&x| painted(at(x))).count();
+    assert_eq!(leaked, 0, "the cropped bands landed left of the pane");
+}

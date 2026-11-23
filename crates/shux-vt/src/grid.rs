@@ -659,7 +659,9 @@ pub struct ComposedPlacement {
     /// Composed-frame row of the image's top. Negative means the top is above
     /// `clip`: draw from `clip.row`, skipping that many cell rows of bitmap.
     pub row: i64,
-    pub col: usize,
+    /// Composed-frame column of the image's left edge. It may lie left of
+    /// `clip.col`, below zero even, and is cropped there as `row` is above.
+    pub col: i64,
     pub clip: CellRect,
     pub geometry: ImageGeometry,
 }

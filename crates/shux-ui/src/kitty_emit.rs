@@ -10,7 +10,10 @@ use std::io::{self, Write};
 use std::sync::Arc;
 
 use base64::Engine as _;
-use shux_vt::{ComposedPlacement, DECLARED_CELL_PIXELS, ImageFormat, StoredImage};
+use shux_core::model::PaneId;
+use shux_vt::{ComposedPlacement, DECLARED_CELL_PIXELS, Grid, ImageFormat, StoredImage};
+
+use crate::viewport::PaneViewport;
 
 /// Base64 bytes per chunk: the protocol's maximum, and konsole caps control
 /// data at 1024 so nothing larger is portable anyway.
@@ -30,14 +33,69 @@ const FRAME_IMAGE_BUDGET: usize = 6 * 1024 * 1024;
 struct Placed {
     row: u16,
     col: u16,
-    /// Source rectangle as `x, y, w, h`. The left edge is the placement's own
-    /// crop: a placement never starts left of its clip, the same invariant
-    /// `shux-raster`'s `blit` relies on.
+    /// Source rectangle as `x, y, w, h`: what of the crop the clip leaves.
     src: (u32, u32, u32, u32),
     cells: (u16, u16),
 }
 
+/// Which placement of which pane a composed one is, from frame to frame,
+/// whatever else that frame clips.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlacementKey {
+    /// One its application can address again, and so move.
+    Addressed {
+        pane: PaneId,
+        image: u32,
+        placement: u32,
+    },
+    /// One nothing can move: its anchor, and how many earlier ones share it.
+    Anchored {
+        pane: PaneId,
+        row: u64,
+        col: usize,
+        nth: usize,
+    },
+}
+
+pub(crate) struct Keyed {
+    key: PlacementKey,
+    placement: ComposedPlacement,
+}
+
+/// `pane`'s placements in the frame that shows it through `view`.
+pub(crate) fn keyed(pane: PaneId, view: &PaneViewport, src: &Grid) -> Vec<Keyed> {
+    let all = src.placements();
+    let addressed = |q: &shux_vt::Placement| q.image_id != 0 && q.placement_id != 0;
+    all.iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let key = if addressed(p) {
+                PlacementKey::Addressed {
+                    pane,
+                    image: p.image_id,
+                    placement: p.placement_id,
+                }
+            } else {
+                let same = |q: &&shux_vt::Placement| {
+                    !addressed(q) && (q.abs_row, q.col) == (p.abs_row, p.col)
+                };
+                PlacementKey::Anchored {
+                    pane,
+                    row: p.abs_row,
+                    col: p.col,
+                    nth: all[..i].iter().filter(same).count(),
+                }
+            };
+            Keyed {
+                key,
+                placement: crate::composed::resolve_placement(view, src, p),
+            }
+        })
+        .collect()
+}
+
 struct Live {
+    key: PlacementKey,
     /// Held, not just compared by address: dropping it would let the allocator
     /// hand the same address to the next image and make a changed picture
     /// compare equal.
@@ -71,18 +129,18 @@ impl KittyEmitter {
     pub(crate) fn emit(
         &mut self,
         out: &mut impl Write,
-        placements: &[ComposedPlacement],
+        placements: &[Keyed],
         replace_all: bool,
     ) -> io::Result<bool> {
         let mut spent = 0usize;
-        let want: Vec<(&ComposedPlacement, Placed)> = placements
+        let want: Vec<(&Keyed, Placed)> = placements
             .iter()
-            .filter_map(|p| resolve(p).map(|r| (p, r)))
-            // Charged whether or not this frame re-transmits it: `want[i]`
-            // pairs with `live[i]` positionally, so any resolved placement can
-            // be forced into a full re-transmit on any frame, and that frame is
-            // the one that has to fit.
-            .filter(|(p, _)| {
+            .filter_map(|k| resolve(&k.placement).map(|r| (k, r)))
+            // Charged whether or not this frame re-transmits it: any resolved
+            // placement can be sent whole on any frame, and that frame is the
+            // one that has to fit.
+            .filter(|(k, _)| {
+                let p = &k.placement;
                 let cost = p.image.payload.len().div_ceil(3) * 4;
                 if spent + cost > FRAME_IMAGE_BUDGET {
                     return false;
@@ -95,43 +153,43 @@ impl KittyEmitter {
             return Ok(false);
         }
         let mut wrote = false;
-
-        for (i, (p, placed)) in want.iter().enumerate() {
-            match self.live.get(i) {
-                Some(live) if Arc::ptr_eq(&live.image, &p.image) => {
-                    if live.placed == *placed && !replace_all {
-                        continue;
+        let mut was = std::mem::take(&mut self.live);
+        for (k, placed) in want {
+            let p = &k.placement;
+            match was.iter().position(|l| l.key == k.key) {
+                Some(i) if Arc::ptr_eq(&was[i].image, &p.image) => {
+                    let mut live = was.swap_remove(i);
+                    if live.placed != placed || replace_all {
+                        // Same pixels, new geometry. Re-putting under the same
+                        // image AND placement id replaces the placement in
+                        // place, which is the protocol's own answer to flicker.
+                        cup(out, &placed)?;
+                        write!(out, "\x1b_Ga=p,i={},{}\x1b\\", live.host_id, keys(&placed))?;
+                        live.placed = placed;
+                        wrote = true;
                     }
-                    // Same pixels, new geometry. Re-putting under the same
-                    // image AND placement id replaces the placement in place,
-                    // which is the protocol's own answer to flicker.
-                    let id = live.host_id;
-                    cup(out, placed)?;
-                    write!(out, "\x1b_Ga=p,i={id},{}\x1b\\", keys(placed))?;
-                    self.live[i].placed = *placed;
+                    self.live.push(live);
                 }
-                _ => {
+                old => {
                     let id = self.take_id();
-                    transmit(out, id, &p.image, placed)?;
+                    transmit(out, id, &p.image, &placed)?;
                     // Transmit first, then retire: the old id must stay live
                     // until the replacement is up.
-                    let fresh = Live {
+                    if let Some(i) = old {
+                        delete(out, was.swap_remove(i).host_id)?;
+                    }
+                    self.live.push(Live {
+                        key: k.key,
                         image: p.image.clone(),
                         host_id: id,
-                        placed: *placed,
-                    };
-                    if let Some(old) = self.live.get(i) {
-                        delete(out, old.host_id)?;
-                        self.live[i] = fresh;
-                    } else {
-                        self.live.push(fresh);
-                    }
+                        placed,
+                    });
+                    wrote = true;
                 }
             }
-            wrote = true;
         }
 
-        for gone in self.live.drain(want.len()..) {
+        for gone in was {
             delete(out, gone.host_id)?;
             wrote = true;
         }
@@ -155,7 +213,7 @@ fn resolve(p: &ComposedPlacement) -> Option<Placed> {
         return None;
     }
     let (cw, ch) = DECLARED_CELL_PIXELS;
-    let clip_top = p.clip.row as i64;
+    let (clip_top, clip_left) = (p.clip.row as i64, p.clip.col as i64);
     // The cells the fitted picture covers, not the box it was fitted into:
     // with both `c` and `r` kitty 0.32 stretches where the protocol now
     // letterboxes, and a box of the picture's own shape is drawn alike by both.
@@ -171,8 +229,12 @@ fn resolve(p: &ComposedPlacement) -> Option<Placed> {
         .saturating_add(nat_rows)
         .min(clip_top + p.clip.rows as i64);
     let rows = (bottom - top).max(0);
-    let right = ((p.col + nat_cols as usize).min(p.clip.col + p.clip.cols)) as i64;
-    let cols = (right - p.col as i64).max(0);
+    let left = p.col.max(clip_left);
+    let right = p
+        .col
+        .saturating_add(nat_cols)
+        .min(clip_left + p.clip.cols as i64);
+    let cols = (right - left).max(0);
     if rows == 0 || cols == 0 {
         return None;
     }
@@ -180,8 +242,9 @@ fn resolve(p: &ComposedPlacement) -> Option<Placed> {
     let (dest_w, dest_h) = (u64::from(dest_w), u64::from(dest_h));
     let vy0 = (top - p.row) as u64 * u64::from(ch);
     let vy1 = (vy0 + rows as u64 * u64::from(ch)).min(dest_h);
-    let vx1 = (cols as u64 * u64::from(cw)).min(dest_w);
-    if vy0 >= vy1 || vx1 == 0 {
+    let vx0 = (left - p.col) as u64 * u64::from(cw);
+    let vx1 = (vx0 + cols as u64 * u64::from(cw)).min(dest_w);
+    if vy0 >= vy1 || vx0 >= vx1 {
         return None;
     }
     let crop = p.geometry.crop;
@@ -191,14 +254,15 @@ fn resolve(p: &ComposedPlacement) -> Option<Placed> {
     let to_src_end = |v: u64, extent: u32, dest: u64| (v * u64::from(extent)).div_ceil(dest) as u32;
     let y = crop.y + to_src(vy0, crop.h, dest_h);
     let h = to_src_end(vy1, crop.h, dest_h) - to_src(vy0, crop.h, dest_h);
-    let w = to_src_end(vx1, crop.w, dest_w);
+    let x = crop.x + to_src(vx0, crop.w, dest_w);
+    let w = to_src_end(vx1, crop.w, dest_w) - to_src(vx0, crop.w, dest_w);
     if w == 0 || h == 0 {
         return None;
     }
     Some(Placed {
         row: u16::try_from(top).ok()?,
-        col: u16::try_from(p.col).ok()?,
-        src: (crop.x, y, w, h),
+        col: u16::try_from(left).ok()?,
+        src: (x, y, w, h),
         cells: (u16::try_from(cols).ok()?, u16::try_from(rows).ok()?),
     })
 }

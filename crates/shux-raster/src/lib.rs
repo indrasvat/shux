@@ -466,13 +466,13 @@ impl Rasterizer {
         let mut budget = MAX_PANE_DECODE_BYTES;
         for p in grid.placements() {
             let top = p.viewport_row(grid) * i64::from(self.cell_h);
+            let left = (p.col as i64).saturating_mul(i64::from(self.cell_w));
             self.blit(
                 img,
                 &p.image,
                 &p.geometry,
-                top,
-                p.col as u32 * self.cell_w,
-                (0, w, h),
+                (left, top),
+                (0, 0, w, h),
                 &mut budget,
             );
         }
@@ -496,21 +496,22 @@ impl Rasterizer {
                     &mut budgets.last_mut().expect("just pushed").1
                 }
             };
+            let px = |cells: usize, size: u32| {
+                u32::try_from(cells)
+                    .unwrap_or(u32::MAX)
+                    .saturating_mul(size)
+            };
             let clip = (
-                c.row as u32 * self.cell_h,
-                (c.col + c.cols) as u32 * self.cell_w,
-                (c.row + c.rows) as u32 * self.cell_h,
+                px(c.col, self.cell_w),
+                px(c.row, self.cell_h),
+                px(c.col.saturating_add(c.cols), self.cell_w),
+                px(c.row.saturating_add(c.rows), self.cell_h),
             );
-            let top = p.row * i64::from(self.cell_h);
-            self.blit(
-                img,
-                &p.image,
-                &p.geometry,
-                top,
-                p.col as u32 * self.cell_w,
-                clip,
-                budget,
+            let origin = (
+                p.col.saturating_mul(i64::from(self.cell_w)),
+                p.row.saturating_mul(i64::from(self.cell_h)),
             );
+            self.blit(img, &p.image, &p.geometry, origin, clip, budget);
         }
     }
 
@@ -518,39 +519,34 @@ impl Rasterizer {
     /// which is what keeps a cell-stated clip exact under any `appearance.font`,
     /// instead of dropping whole image rows.
     ///
-    /// Has no left clip, and needs none: every producer derives `ox` and the
-    /// clip's left edge from the same pane origin, so a picture cannot start
-    /// left of its own clip.
+    /// The origin is signed on both axes: a picture may start above or left
+    /// of its clip, even off the canvas, and only what lies inside is drawn.
     ///
     /// Only the placement's crop is drawn, at the size its geometry gives
     /// for this cell box: the client's bitmap converted through the DECLARED
     /// cell box (`appearance.font` changes the drawn one), or fitted to the
     /// cells it asked for.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "one placement's pixels, geometry, position and clip"
-    )]
     fn blit(
         &self,
         img: &mut RgbaImage,
         stored: &shux_vt::StoredImage,
         geometry: &shux_vt::ImageGeometry,
-        top: i64,
-        ox: u32,
-        (y0, x1, y1): (u32, u32, u32),
+        (left, top): (i64, i64),
+        (x0, y0, x1, y1): (u32, u32, u32, u32),
         budget: &mut u64,
     ) {
         let (x1, y1) = (x1.min(img.width()), y1.min(img.height()));
-        if y0 >= y1 || ox >= x1 || top >= i64::from(y1) {
+        if x0 >= x1 || y0 >= y1 || left >= i64::from(x1) || top >= i64::from(y1) {
             return;
         }
         let (dest_w, dest_h) = geometry.drawn_px(self.cell_w, self.cell_h);
-        // Both visibility tests run on the size the geometry gives, before any
-        // decode: a placement outside the clip is discarded without inflating
-        // its payload. `decode_placement` refuses a payload that does not
-        // match the declared size, so the crop lies inside anything drawn.
-        let skip = (i64::from(y0) - top).max(0);
-        if skip >= i64::from(dest_h) {
+        // Every visibility test runs on the size the geometry gives, before
+        // any decode: a placement outside the clip is discarded without
+        // inflating its payload. `decode_placement` refuses a payload that does
+        // not match the declared size, so the crop lies inside anything drawn.
+        let skip_y = (i64::from(y0) - top).max(0);
+        let skip_x = (i64::from(x0) - left).max(0);
+        if skip_y >= i64::from(dest_h) || skip_x >= i64::from(dest_w) {
             return;
         }
         // Charged AFTER the cheap declared-size tests and BEFORE the decode, so
@@ -578,16 +574,17 @@ impl Rasterizer {
         } else {
             image::imageops::resize(&src, dest_w, dest_h, image::imageops::Triangle)
         };
-        let skip = skip as u32;
-        if skip >= src.height() {
+        let (skip_x, skip_y) = (skip_x as u32, skip_y as u32);
+        if skip_x >= src.width() || skip_y >= src.height() {
             return;
         }
+        let ox = left.max(i64::from(x0)) as u32;
         let oy = top.max(i64::from(y0)) as u32;
-        let rows = (src.height() - skip).min(y1.saturating_sub(oy));
-        let cols = src.width().min(x1.saturating_sub(ox));
+        let rows = (src.height() - skip_y).min(y1.saturating_sub(oy));
+        let cols = (src.width() - skip_x).min(x1.saturating_sub(ox));
         for y in 0..rows {
             for x in 0..cols {
-                let s = src.get_pixel(x, y + skip).0;
+                let s = src.get_pixel(x + skip_x, y + skip_y).0;
                 let a = u32::from(s[3]);
                 if a == 0 {
                     continue;

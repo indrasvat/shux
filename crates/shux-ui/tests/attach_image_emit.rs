@@ -671,10 +671,10 @@ fn a_clipped_scaled_put_keeps_its_scale_on_the_host() {
 }
 
 /// A pane cropped on both axes shows its picture at the cell the slice draws
-/// it in; once the picture's origin is left of the slice it is taken down from
+/// it in; once the whole picture is left of the slice it is taken down from
 /// the attached terminal, not shifted onto other cells.
 #[test]
-fn a_picture_moves_with_the_slice_on_both_axes_and_leaves_with_its_origin() {
+fn a_picture_moves_with_the_slice_on_both_axes_and_leaves_once_past_it() {
     let p = pane(1);
     let layout = LayoutNode::leaf(p);
     let mut vt = VirtualTerminal::new(12, 60);
@@ -705,4 +705,200 @@ fn a_picture_moves_with_the_slice_on_both_axes_and_leaves_with_its_origin() {
     let cmds = graphics(&drain(&mut c));
     assert_eq!(cmds.len(), 1, "{cmds:?}");
     assert!(cmds[0].starts_with("a=d"), "taken down: {cmds:?}");
+}
+
+/// The host id an `a=T` in `cmds` transmitted.
+fn transmitted_id(cmds: &[String]) -> String {
+    let t = cmds
+        .iter()
+        .find(|k| k.starts_with("a=T"))
+        .unwrap_or_else(|| panic!("nothing transmitted: {cmds:?}"));
+    t.split(',')
+        .find_map(|k| k.strip_prefix("i="))
+        .expect("an id")
+        .to_string()
+}
+
+/// A slice scrolled two cells right of and one below a cropped picture's
+/// origin shows its bottom-right part from the pane's top-left cell, under
+/// the host id it already has: a put, no pixels. Scrolling back re-puts it
+/// whole.
+#[test]
+fn a_picture_left_of_and_above_the_slice_is_cropped_in_place() {
+    let p = pane(1);
+    let layout = LayoutNode::leaf(p);
+    let mut vt = VirtualTerminal::new(12, 60);
+    // 54x76 px, shown as its (9,19,36,38) crop: 4x2 cells at row 3, column 10.
+    vt.process(b"\x1b[4;11H");
+    vt.process(&transmit_then_put(
+        5,
+        54,
+        76,
+        "a=p,i=5,x=9,y=19,w=36,h=38,C=1",
+    ));
+    vt.process(b"\x1b[1;1H");
+    let mut c = make_compositor(20, 6);
+    c.render_multi_pane(frame(&layout, &HashMap::from([(p, &vt)]), p))
+        .unwrap();
+    let first = graphics(&drain(&mut c));
+    assert_eq!(first.len(), 1, "{first:?}");
+    assert!(first[0].contains("x=9,y=19,w=36,h=38,c=4,r=2"), "{first:?}");
+    let id = transmitted_id(&first);
+
+    // Cursor at row 9, column 31: the slice starts at row 4, column 12.
+    vt.process(b"\x1b[10;32H");
+    c.render_multi_pane(frame(&layout, &HashMap::from([(p, &vt)]), p))
+        .unwrap();
+    let out = drain(&mut c);
+    assert_eq!(c.pane_views()[&p].row_offset, 4);
+    assert_eq!(c.pane_views()[&p].col_offset, 12);
+    let put =
+        format!("\x1b[1;1H\x1b_Ga=p,i={id},p=1,C=1,q=2,z=-1,x=27,y=38,w=18,h=19,c=2,r=1\x1b\\");
+    assert!(
+        out.contains(&put),
+        "expected {put:?} in {:?}",
+        graphics(&out)
+    );
+    assert_eq!(graphics(&out).len(), 1, "{:?}", graphics(&out));
+
+    vt.process(b"\x1b[1;1H");
+    c.render_multi_pane(frame(&layout, &HashMap::from([(p, &vt)]), p))
+        .unwrap();
+    let out = drain(&mut c);
+    let put =
+        format!("\x1b[4;11H\x1b_Ga=p,i={id},p=1,C=1,q=2,z=-1,x=9,y=19,w=36,h=38,c=4,r=2\x1b\\");
+    assert!(
+        out.contains(&put),
+        "expected {put:?} in {:?}",
+        graphics(&out)
+    );
+    assert_eq!(graphics(&out).len(), 1, "{:?}", graphics(&out));
+}
+
+/// A whole picture cropped from the left and then restored is put back with
+/// no `x=`, as it was first placed.
+#[test]
+fn a_restored_picture_omits_a_zero_source_x() {
+    let p = pane(1);
+    let layout = LayoutNode::leaf(p);
+    let mut vt = VirtualTerminal::new(12, 60);
+    vt.process(b"\x1b[4;11H");
+    vt.process(&kitty_rgb(36, 38, [40, 200, 40]));
+    vt.process(b"\x1b[1;1H");
+    let mut c = make_compositor(20, 6);
+    c.render_multi_pane(frame(&layout, &HashMap::from([(p, &vt)]), p))
+        .unwrap();
+    let id = transmitted_id(&graphics(&drain(&mut c)));
+
+    vt.process(b"\x1b[1;32H");
+    c.render_multi_pane(frame(&layout, &HashMap::from([(p, &vt)]), p))
+        .unwrap();
+    let out = drain(&mut c);
+    let put =
+        format!("\x1b[4;1H\x1b_Ga=p,i={id},p=1,C=1,q=2,z=-1,x=18,y=0,w=18,h=38,c=2,r=2\x1b\\");
+    assert!(
+        out.contains(&put),
+        "expected {put:?} in {:?}",
+        graphics(&out)
+    );
+
+    vt.process(b"\x1b[1;1H");
+    c.render_multi_pane(frame(&layout, &HashMap::from([(p, &vt)]), p))
+        .unwrap();
+    let out = drain(&mut c);
+    let put = format!("\x1b[4;11H\x1b_Ga=p,i={id},p=1,C=1,q=2,z=-1,y=0,w=36,h=38,c=4,r=2\x1b\\");
+    assert!(
+        out.contains(&put),
+        "expected {put:?} in {:?}",
+        graphics(&out)
+    );
+}
+
+/// In a right-hand pane a picture left of its slice still sits at a positive
+/// frame column; it is cropped at its own pane's left edge, never drawn over
+/// the neighbour.
+#[test]
+fn a_right_hand_panes_picture_is_cropped_at_its_own_left_edge() {
+    let (a, b) = (pane(1), pane(2));
+    let mut wl = WindowLayout::new(a);
+    wl.split_pane(a, b, Direction::Vertical, 0.5);
+    let layout = wl.tree.clone();
+    let rect = layout
+        .compute_rects(shux_ui::pane_viewport(
+            shux_core::layout::Rect::new(0, 0, 40, 6),
+            BorderStyle::None,
+            false,
+        ))
+        .into_iter()
+        .find(|(id, _)| *id == b)
+        .unwrap()
+        .1;
+    let va = VirtualTerminal::new(6, 20);
+    let mut vb = VirtualTerminal::new(12, 60);
+    vb.process(b"\x1b[4;11H");
+    vb.process(&kitty_rgb(36, 38, [40, 200, 40]));
+    // The slice starts two columns right of the picture's origin.
+    let cursor_col = 10 + 2 + usize::from(rect.width) - 1;
+    vb.process(format!("\x1b[1;{}H", cursor_col + 1).as_bytes());
+    let mut c = make_compositor(40, 6);
+    c.render_multi_pane(frame(&layout, &HashMap::from([(a, &va), (b, &vb)]), b))
+        .unwrap();
+    assert_eq!(c.pane_views()[&b].col_offset, 12);
+    let out = drain(&mut c);
+    let cmds = graphics(&out);
+    assert_eq!(cmds.len(), 1, "{cmds:?}");
+    assert!(cmds[0].contains("x=18,y=0,w=18,h=38,c=2,r=2"), "{cmds:?}");
+    let cup = format!("\x1b[4;{}H\x1b_Ga=T", rect.x + 1);
+    assert!(
+        out.contains(&cup),
+        "not at the pane's left edge: {cup:?} {cmds:?}"
+    );
+}
+
+/// A picture that scrolls clean out of its slice is taken down; the one
+/// beside it, still on screen, is moved under the id it already has rather
+/// than sent again.
+#[test]
+fn retiring_one_picture_does_not_re_send_the_next() {
+    let p = pane(1);
+    let layout = LayoutNode::leaf(p);
+    let mut vt = VirtualTerminal::new(12, 60);
+    vt.process(b"\x1b[1;1H");
+    vt.process(&kitty_rgb(9, 19, [200, 40, 40]));
+    vt.process(b"\x1b[1;5H");
+    vt.process(&kitty_rgb(36, 19, [40, 40, 200]));
+    vt.process(b"\x1b[1;1H");
+    let mut c = make_compositor(20, 6);
+    c.render_multi_pane(frame(&layout, &HashMap::from([(p, &vt)]), p))
+        .unwrap();
+    let first = graphics(&drain(&mut c));
+    assert_eq!(first.len(), 2, "{first:?}");
+    let ids: Vec<String> = first
+        .iter()
+        .map(|k| {
+            k.split(',')
+                .find_map(|f| f.strip_prefix("i="))
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+
+    // The slice starts at column 3: the first picture is gone, the second
+    // moves from column 4 to 1.
+    vt.process(b"\x1b[1;23H");
+    c.render_multi_pane(frame(&layout, &HashMap::from([(p, &vt)]), p))
+        .unwrap();
+    let out = drain(&mut c);
+    let mut cmds = graphics(&out);
+    cmds.sort();
+    let put = format!("a=p,i={},p=1,C=1,q=2,z=-1,y=0,w=36,h=19,c=4,r=1", ids[1]);
+    let delete = format!("a=d,d=I,i={},q=2\x1b\\", ids[0]);
+    assert_eq!(cmds.len(), 2, "{cmds:?}");
+    assert!(
+        cmds[0].starts_with(&delete) && cmds[1].starts_with(&put),
+        "expected a delete of {} and a put of {}: {cmds:?}",
+        ids[0],
+        ids[1]
+    );
+    assert!(out.contains(&format!("\x1b[1;2H\x1b_G{put}")), "{cmds:?}");
 }

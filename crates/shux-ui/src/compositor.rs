@@ -493,7 +493,7 @@ impl<W: Write> RenderCompositor<W> {
                 self.pane_views.insert(*pid, *view);
                 self.compose_pane(*view, vt);
                 if self.images.enabled() {
-                    placements.extend(crate::composed::resolve_placements(view, vt.grid()));
+                    placements.extend(crate::kitty_emit::keyed(*pid, view, vt.grid()));
                 }
             } else {
                 // Missing VT: render an "(no output)" placeholder so the
