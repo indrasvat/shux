@@ -40,12 +40,13 @@ pub enum Role {
 }
 
 impl Role {
-    /// The status bar's words for it; a driver needs none.
-    pub fn status(self) -> Option<&'static str> {
+    /// The status bar's words beside its mark, longest first down to none;
+    /// a driver shows nothing.
+    pub fn words(self) -> Option<&'static [&'static str]> {
         match self {
             Role::Driving => None,
-            Role::Viewing => Some("viewing · type to drive"),
-            Role::ReadOnly => Some("read-only"),
+            Role::Viewing => Some(&["viewing · type to drive", "viewing", ""]),
+            Role::ReadOnly => Some(&["read-only", ""]),
         }
     }
 }
@@ -66,6 +67,24 @@ struct Entry {
 }
 
 impl State {
+    fn count(&self, session: SessionId) -> usize {
+        let ours = |e: &&Entry| e.info.session_id == session;
+        self.clients.values().filter(ours).count()
+    }
+
+    /// The session's voters in attach order, and who of them drives now.
+    fn voters_and_elected(&self, session: SessionId) -> (Vec<&ClientInfo>, Option<ClientId>) {
+        let mut voters: Vec<&Entry> = self
+            .clients
+            .values()
+            .filter(|e| e.info.session_id == session && e.info.votes)
+            .collect();
+        voters.sort_by_key(|e| e.seq);
+        let infos: Vec<&ClientInfo> = voters.iter().map(|e| &e.info).collect();
+        let elected = elect(self.drivers.get(&session).copied(), &infos);
+        (infos, elected)
+    }
+
     /// Take a client off the list; a session left with none forgets its driver.
     fn unlist(&mut self, id: ClientId) -> Option<Entry> {
         let entry = self.clients.remove(&id)?;
@@ -170,11 +189,7 @@ impl ClientRegistry {
     }
 
     pub fn count_for(&self, session: SessionId) -> usize {
-        self.state()
-            .clients
-            .values()
-            .filter(|e| e.info.session_id == session)
-            .count()
+        self.state().count(session)
     }
 
     pub fn set_size(&self, id: ClientId, cols: u16, rows: u16) {
@@ -245,15 +260,8 @@ impl ClientRegistry {
     /// when no voting client is attached: sizes then stay as they are.
     pub fn driver(&self, session: SessionId) -> Option<ClientInfo> {
         let mut s = self.state();
-        let mut voters: Vec<&Entry> = s
-            .clients
-            .values()
-            .filter(|e| e.info.session_id == session && e.info.votes)
-            .collect();
-        voters.sort_by_key(|e| e.seq);
-        let infos: Vec<&ClientInfo> = voters.iter().map(|e| &e.info).collect();
-        let elected = elect(s.drivers.get(&session).copied(), &infos);
-        let info = elected.and_then(|id| infos.iter().find(|c| c.id == id).map(|c| (*c).clone()));
+        let (voters, elected) = s.voters_and_elected(session);
+        let info = elected.and_then(|id| voters.into_iter().find(|c| c.id == id).cloned());
         match elected {
             Some(id) => s.drivers.insert(session, id),
             None => s.drivers.remove(&session),
@@ -272,14 +280,7 @@ impl ClientRegistry {
         panes: &[PaneId],
     ) -> SessionView {
         let s = self.state();
-        let mut voters: Vec<&Entry> = s
-            .clients
-            .values()
-            .filter(|e| e.info.session_id == session && e.info.votes)
-            .collect();
-        voters.sort_by_key(|e| e.seq);
-        let infos: Vec<&ClientInfo> = voters.iter().map(|e| &e.info).collect();
-        let driver = elect(s.drivers.get(&session).copied(), &infos);
+        let (_, driver) = s.voters_and_elected(session);
         let role = client.and_then(|id| s.clients.get(&id)).map(|e| {
             if !e.info.votes {
                 Role::ReadOnly
@@ -290,11 +291,7 @@ impl ClientRegistry {
             }
         });
         SessionView {
-            attached: s
-                .clients
-                .values()
-                .filter(|e| e.info.session_id == session)
-                .count(),
+            attached: s.count(session),
             role,
             pinned: panes
                 .iter()
@@ -521,8 +518,7 @@ mod tests {
         assert_eq!(view.role, None);
         assert_eq!(view.attached, 3);
         assert_eq!(view.pinned, [pinned].into_iter().collect());
-        assert_eq!(Role::Viewing.status(), Some("viewing · type to drive"));
-        assert_eq!(Role::Driving.status(), None);
+        assert_eq!(Role::Driving.words(), None);
         assert!(reg.has_voter(s) && !reg.has_voter(SessionId::new()));
     }
 

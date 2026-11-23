@@ -148,6 +148,8 @@ mod strict {
         pub status_error: Option<HexColor>,
         #[serde(default)]
         pub status_attention: Option<HexColor>,
+        #[serde(default)]
+        pub status_shared: Option<HexColor>,
     }
 
     /// A `#rrggbb` colour. The daemon falls back to the default for anything

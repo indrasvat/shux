@@ -19,7 +19,7 @@ use crate::borders::{BorderColors, BorderStyle, compute_borders};
 use crate::buffer::{FrameBuffer, RenderAttrs, RenderCell};
 use crate::render::RenderBackend;
 use crate::statusbar::StatusBar;
-use crate::viewport::{FrameGeometry, FrameInputs, PaneViewport};
+use crate::viewport::{FrameGeometry, FrameInputs, PaneViewport, PresentedPane};
 
 /// Whether the 1-cell outline ring is actually drawn for `content`.
 ///
@@ -474,7 +474,7 @@ impl<W: Write> RenderCompositor<W> {
                     rows: self.buffer.height(),
                     status_bar_height: self.config.status_bar_height,
                     border_style: self.config.border_style,
-                    panes: &crate::viewport::presented_panes(frame.vts),
+                    panes: &PresentedPane::of_vts(frame.vts),
                     now_ns: shux_vt::monotonic_now_ns(),
                 });
                 &prepared

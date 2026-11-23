@@ -63,7 +63,7 @@ pub fn size_labels(
     geometry: &shux_ui::FrameGeometry,
     pinned: &HashSet<PaneId>,
     focused: PaneId,
-) -> Option<String> {
+) -> Option<shux_ui::viewport::SizeLabel> {
     let label = |pid: &PaneId| {
         let view = geometry.views.get(pid)?;
         shux_ui::viewport::size_label(view, pinned.contains(pid))
@@ -72,8 +72,8 @@ pub fn size_labels(
         return label(&focused);
     }
     for (pid, _) in &geometry.rects {
-        if let Some(text) = label(pid) {
-            chrome.entry(*pid).or_default().label = Some(text);
+        if let Some(size) = label(pid) {
+            chrome.entry(*pid).or_default().label = Some(size.text());
         }
     }
     None
@@ -440,7 +440,7 @@ mod tests {
         let mut chrome = HashMap::new();
         let none = shux_ui::BorderStyle::None;
         let bar = size_labels(&mut chrome, &frame(none, fits), &pinned, a);
-        assert_eq!(bar.as_deref(), Some("pinned 200×50"));
+        assert_eq!(bar.map(|l| l.text()).as_deref(), Some("pinned 200×50"));
         assert!(chrome.is_empty(), "no border to draw a label on");
     }
 

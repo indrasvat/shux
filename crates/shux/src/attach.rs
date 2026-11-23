@@ -1188,6 +1188,8 @@ async fn run_attach_loop(
     // the layout split ratio.
     let mut mouse_drag: Option<DragState> = None;
     let mut selection_drag = SelectionDrag::None;
+    // A press an app got, not yet counted as input: its gesture is open.
+    let mut gesture_input = false;
     // `appearance.border_style` moves every pane's rect, and a pane's PTY only
     // learns its size on attach, a client resize, or a layout-changing action.
     // Fire the fan-out on the EDGE of a style change so the two cannot drift.
@@ -1621,9 +1623,15 @@ async fn run_attach_loop(
                         .await
                         {
                             Ok(AppMouse::Consumed { redraw, input }) => {
-                                // A press or wheel the app received is input.
-                                if input
-                                    && matches!(kind, MouseKind::Down | MouseKind::ScrollUp | MouseKind::ScrollDown)
+                                // A press or wheel the app received is input. A
+                                // press counts once its gesture ends: taking the
+                                // panes resizes them, and a release mapped after
+                                // that names another cell than its press.
+                                gesture_input |= input
+                                    && matches!(kind, MouseKind::Down | MouseKind::ScrollUp | MouseKind::ScrollDown);
+                                if gesture_input
+                                    && !matches!(selection_drag, SelectionDrag::App { .. })
+                                    && std::mem::take(&mut gesture_input)
                                     && clients.mark_input(registry_id, tokio::time::Instant::now())
                                 {
                                     reconcile_session(&graph, &io_state, &config, session.session_id).await;
@@ -1715,6 +1723,7 @@ async fn run_attach_loop(
                             &client_size,
                             &config,
                             &mut mouse_drag,
+                            frame,
                         )
                         .await
                         {
@@ -1957,6 +1966,9 @@ async fn run_render_loop(
             _ = tick.tick() => {}
         }
 
+        // For the wait after the frame that finds it: a frame not drawn (its
+        // window gone) must not leave a past deadline waking this at once.
+        latch_at = None;
         last_frame = Some(tokio::time::Instant::now());
 
         // Resize from authoritative client_size, NOT from VT grid (which
@@ -2082,7 +2094,7 @@ async fn run_render_loop(
             rows,
             status_bar_height: STATUS_BAR_ROWS,
             border_style: BorderStyle::parse(&last_border_style),
-            panes: &shux_ui::presented_panes(&vt_refs),
+            panes: &shux_ui::PresentedPane::of_vts(&vt_refs),
             now_ns: now(),
         });
         if attached.copy_mode.is_some()
@@ -2091,7 +2103,7 @@ async fn run_render_loop(
                 vt_refs.get(&attached.active_pane_id),
             )
         {
-            *view = copy_mode_view(*view, vt);
+            *view = shux_ui::copy_mode::copy_mode_view(*view, vt);
         }
         latch_at = geometry.deadline_ns;
         // A selection reads the slice it was made over; once the pane shows
@@ -2182,11 +2194,11 @@ async fn run_render_loop(
         );
         crate::statusbar_build::append_viewing(
             &mut bar,
-            bar_label.as_deref(),
-            sizing.role.and_then(crate::clients::Role::status),
+            bar_label.as_ref(),
+            sizing.role,
             &live_theme,
             cols,
-            has_notice,
+            plain,
         );
         if has_notice {
             crate::statusbar_build::make_room_for_notice(&mut bar, cols);
@@ -2400,13 +2412,6 @@ async fn run_render_loop(
             }
         }
     }
-}
-
-/// The view modal copy mode draws its pane with: its own cursor-following
-/// rows from column 0, which its cursor, highlight and yank all assume.
-fn copy_mode_view(view: PaneViewport, vt: &shux_vt::VirtualTerminal) -> PaneViewport {
-    let rows = shux_ui::follow_offset(view.grid_rows, view.rect.height.into(), vt.cursor().row);
-    view.with_offsets(rows, 0)
 }
 
 /// Send one composited frame as `Render` parts, the last numbered `frame`.
@@ -3064,6 +3069,7 @@ async fn handle_mouse(
     client_size: &ClientSize,
     config: &ConfigHandle,
     drag: &mut Option<DragState>,
+    frame: Option<u64>,
 ) -> anyhow::Result<bool> {
     let attached = session.lock().await.clone();
     let viewport = current_viewport(client_size, config).await;
@@ -3097,7 +3103,13 @@ async fn handle_mouse(
                     let _ = graph.focus_pane(pid).await;
                     let mut s = session.lock().await;
                     s.active_pane_id = pid;
-                    acted = true;
+                    // Focus moves either way; only a click on a cell the
+                    // client was shown is input that may take the panes.
+                    acted = attached.shown.views(frame).is_none_or(|views| {
+                        views
+                            .get(&pid)
+                            .is_some_and(|view| view_point(view, col, row, false).is_some())
+                    });
                 }
                 *drag = None;
             }
@@ -3542,12 +3554,13 @@ async fn handle_app_mouse(
     }
     let Some((view, (local_col, local_row))) = cell else {
         // No cell (surplus, or past the grid): a press only selects the pane,
-        // and motion is dropped. In the focused pane that is nothing at all.
+        // and motion is dropped. It reached no app, so it is no input: taking
+        // the panes for it would resize everyone's view for a click on nothing.
         let redraw = action == ButtonAction::Press
             && select_pane_on_press(graph, session, attached.active_pane_id, pane_id).await;
         return Ok(AppMouse::Consumed {
             redraw,
-            input: moves_focus,
+            input: false,
         });
     };
 
@@ -6165,6 +6178,7 @@ mod tests {
             &client_size,
             &test_config(),
             &mut drag,
+            None,
         )
         .await
         .expect("focus second pane");
@@ -6182,6 +6196,7 @@ mod tests {
             &client_size,
             &test_config(),
             &mut drag,
+            None,
         )
         .await
         .expect("arm border drag");
@@ -6199,6 +6214,7 @@ mod tests {
             &client_size,
             &test_config(),
             &mut drag,
+            None,
         )
         .await
         .expect("drag border");
@@ -6214,6 +6230,7 @@ mod tests {
             &client_size,
             &test_config(),
             &mut drag,
+            None,
         )
         .await
         .expect("release border");
@@ -6236,6 +6253,7 @@ mod tests {
             &client_size,
             &test_config(),
             &mut drag,
+            None,
         )
         .await
         .expect("zoomed mouse noop");
@@ -7442,6 +7460,7 @@ mod tests {
             &h.client_size,
             &test_config(),
             &mut border,
+            None,
         )
         .await
         .expect("click");
@@ -7466,6 +7485,7 @@ mod tests {
             &h.client_size,
             &test_config(),
             &mut border,
+            None,
         )
         .await
         .expect("click");
@@ -7562,6 +7582,86 @@ mod tests {
         let data = numbered(&mut rx, &deadline).await;
         assert_eq!(offsets(&*session.lock().await), Some((0, 0)));
         assert_eq!(data, "", "only the slice moved");
+
+        cancel.cancel();
+        render.await.expect("render loop");
+        fixture.stop();
+    }
+
+    static SPIN_CLOCK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static SPIN_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn spin_clock() -> u64 {
+        SPIN_READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        SPIN_CLOCK.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// A latch deadline lives for the wait after the frame that found it.
+    /// Once its session is gone the loop draws nothing, and a deadline kept
+    /// from before woke it at once, for ever. The paused clock moves only
+    /// when every task waits, so `idle_for` returning is the loop at rest.
+    #[tokio::test(start_paused = true)]
+    async fn a_latch_deadline_does_not_outlive_the_window_it_was_for() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let fixture = attach_fixture().await;
+        let pane = fixture.first_pane;
+        let hidden_since = {
+            let mut vt = shux_vt::VirtualTerminal::new(200, 400);
+            vt.process(b"\x1b[200;400H\x1b[?25l");
+            let at = vt.cursor().hidden_since_ns;
+            fixture.io_state.lock().await.vts.insert(pane, vt);
+            at
+        };
+        SPIN_CLOCK.store(hidden_since + 1_000_000, SeqCst);
+        let onboarding = crate::onboarding::OnboardingHandle::from_state_for_test(
+            crate::onboarding::OnboardingState {
+                prefix_discovered: true,
+                welcome_toast_seen: true,
+            },
+        );
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = fixture.cancel.child_token();
+        let render = tokio::spawn(run_render_loop(
+            fixture.graph.clone(),
+            fixture.io_state.clone(),
+            test_config(),
+            SegmentCache::new(),
+            crate::session_meta::SessionMetaCache::new(),
+            onboarding,
+            std::time::Instant::now(),
+            Arc::new(Mutex::new(fixture.attached.clone())),
+            Arc::new(Mutex::new((100, 40))),
+            tx,
+            cancel.clone(),
+            false,
+            false,
+            Duration::from_secs(3600),
+            WELCOME_TOAST_DWELL,
+            spin_clock,
+        ));
+        let deadline = shux_testkit::Deadline::start();
+        loop {
+            match deadline.run(rx.recv()).await {
+                Some(Some(AttachServerFrame::Render { frame: Some(_), .. })) => break,
+                Some(Some(_)) => {}
+                Some(None) | None => panic!("no first frame"),
+            }
+        }
+
+        // The deadline is due and the window it was for is gone.
+        SPIN_CLOCK.store(
+            hidden_since + shux_ui::viewport::HIDDEN_CURSOR_LATCH_NS,
+            SeqCst,
+        );
+        fixture
+            .graph
+            .destroy_session(fixture.session_id, None)
+            .await
+            .expect("destroy the session");
+        idle_for(QUIET).await;
+        let reads = SPIN_READS.load(SeqCst);
+        idle_for(QUIET).await;
+        assert_eq!(SPIN_READS.load(SeqCst), reads, "the loop kept waking");
 
         cancel.cancel();
         render.await.expect("render loop");
@@ -9305,6 +9405,21 @@ mod tests {
                 .send(Bytes::from(serde_json::to_vec(frame).expect("frame json")))
                 .await
                 .expect("send frame");
+        }
+
+        /// Applies every frame that has arrived, as a client keeping up does.
+        async fn catch_up(&mut self) {
+            while let Ok(Some(Ok(buf))) = tokio::time::timeout(QUIET, self.framed.next()).await {
+                let frame: AttachServerFrame = serde_json::from_slice(&buf).expect("server frame");
+                if let AttachServerFrame::Render { data, frame } = frame {
+                    let bytes = BASE64.decode(data.as_bytes()).expect("render base64");
+                    self.screen.process(&bytes);
+                    self.shadow.process(&bytes);
+                    if frame.is_some() {
+                        self.written_frame = frame;
+                    }
+                }
+            }
         }
 
         async fn key(&mut self, bytes: &[u8]) {
@@ -11435,6 +11550,176 @@ mod tests {
             by_a,
             "a click that moved focus did not take the panes"
         );
+        fixture.stop();
+    }
+
+    /// The cell under `client`'s corner of `pane`, as an 80-column client lays
+    /// the fixture's window out: its last visible column and row.
+    async fn corner_of(fixture: &AttachFixture, pane: PaneId) -> (u16, u16) {
+        let viewport = current_viewport(&Arc::new(Mutex::new((80, 24))), &test_config()).await;
+        let rect = fixture.graph.snapshot().windows[&fixture.first_window]
+            .layout
+            .compute_rects(viewport)
+            .into_iter()
+            .find_map(|(p, r)| (p == pane).then_some(r))
+            .expect("the pane's rect");
+        (rect.x + rect.width - 1, rect.y + rect.height - 1)
+    }
+
+    fn left_button(
+        kind: MouseKind,
+        (col, row): (u16, u16),
+        frame: Option<u64>,
+    ) -> AttachClientFrame {
+        AttachClientFrame::Mouse {
+            kind,
+            button: ProtoMouseButton::Left,
+            col,
+            row,
+            shift: false,
+            alt: false,
+            ctrl: false,
+            frame,
+        }
+    }
+
+    /// Review of #190: a click that makes its client drive still presses and
+    /// releases one cell. The panes change hands when the gesture ends; a
+    /// resize between its press and release moved the release to another cell.
+    #[tokio::test(start_paused = true)]
+    async fn a_takeover_click_presses_and_releases_the_same_cell() {
+        let fixture = attach_fixture().await;
+        let pane = fixture.first_pane;
+        let (mut writes, rx, _s) = seed_io_for_pane(&fixture.io_state, pane).await;
+        let (_w2, rx2, _s2) = seed_io_for_pane(&fixture.io_state, fixture.second_pane).await;
+        let log = fake_pty(&fixture.io_state, pane, rx);
+        let _log2 = fake_pty(&fixture.io_state, fixture.second_pane, rx2);
+        let last = || {
+            *log.lock()
+                .unwrap()
+                .last()
+                .expect("the pane was never sized")
+        };
+        let _a = Client::attach(&fixture, 200).await;
+        idle_for(QUIET).await;
+        let by_a = last();
+        // An SGR mouse app with its cursor on the grid's last cell: a smaller
+        // client's view follows it to the bottom-right.
+        fixture
+            .io_state
+            .lock()
+            .await
+            .vts
+            .get_mut(&pane)
+            .expect("pane vt")
+            .process(format!("\x1b[?1002h\x1b[?1006h\x1b[{};{}H", by_a.1, by_a.0).as_bytes());
+        let mut b = Client::attach(&fixture, 80).await;
+        idle_for(QUIET).await;
+        b.catch_up().await;
+
+        let corner = corner_of(&fixture, pane).await;
+        b.send(&left_button(MouseKind::Down, corner, b.written_frame))
+            .await;
+        idle_for(QUIET).await;
+        b.catch_up().await;
+        b.send(&left_button(MouseKind::Up, corner, b.written_frame))
+            .await;
+        idle_for(QUIET).await;
+
+        let sent = drain(&mut writes);
+        let reports: Vec<&str> = sent.split("\x1b[<0;").skip(1).collect();
+        let at = |r: &str| r[..r.len() - 1].to_string();
+        assert_eq!(reports.len(), 2, "{sent:?}");
+        assert_eq!(
+            at(reports[0]),
+            format!("{};{}", by_a.0, by_a.1),
+            "the press names the cell shown there"
+        );
+        assert_eq!(
+            at(reports[1]),
+            at(reports[0]),
+            "the release moved: {sent:?}"
+        );
+        assert_ne!(last(), by_a, "the click did not hand the panes over");
+        fixture.stop();
+    }
+
+    /// Review of #190: a press on another pane's surplus reaches no app; it
+    /// is no input, so it does not resize everyone's panes to the clicker,
+    /// whether that pane's app tracks the mouse or not.
+    #[tokio::test(start_paused = true)]
+    async fn a_press_on_another_panes_surplus_does_not_take_the_panes() {
+        let fixture = attach_fixture().await;
+        let active = fixture.graph.snapshot().windows[&fixture.first_window].active_pane;
+        let other = if active == fixture.first_pane {
+            fixture.second_pane
+        } else {
+            fixture.first_pane
+        };
+        let (_wa, rxa, _sa) = seed_io_for_pane(&fixture.io_state, active).await;
+        let (mut writes, rxo, _so) = seed_io_for_pane(&fixture.io_state, other).await;
+        let log = fake_pty(&fixture.io_state, active, rxa);
+        let _log_other = fake_pty(&fixture.io_state, other, rxo);
+        let last = || {
+            *log.lock()
+                .unwrap()
+                .last()
+                .expect("the pane was never sized")
+        };
+        let _a = Client::attach(&fixture, 200).await;
+        idle_for(QUIET).await;
+        let by_a = last();
+        {
+            let mut io = fixture.io_state.lock().await;
+            io.clients.pin(other);
+            let vt = io.vts.get_mut(&other).expect("pane vt");
+            vt.resize(4, 12);
+            vt.process(b"\x1b[?1002h\x1b[?1006h");
+        }
+        let mut b = Client::attach(&fixture, 80).await;
+        idle_for(QUIET).await;
+        b.catch_up().await;
+        let viewport = current_viewport(&Arc::new(Mutex::new((80, 24))), &test_config()).await;
+        let rect = fixture.graph.snapshot().windows[&fixture.first_window]
+            .layout
+            .compute_rects(viewport)
+            .into_iter()
+            .find_map(|(p, r)| (p == other).then_some(r))
+            .expect("the pane's rect");
+
+        for (tracking, point) in [
+            (true, (rect.x + 13, rect.y + 1)),
+            (false, (rect.x + 1, rect.y + 6)),
+        ] {
+            if !tracking {
+                fixture
+                    .io_state
+                    .lock()
+                    .await
+                    .vts
+                    .get_mut(&other)
+                    .expect("pane vt")
+                    .process(b"\x1b[?1002l\x1b[?1006l");
+                let _ = fixture.graph.focus_pane(active).await;
+                idle_for(QUIET).await;
+                b.catch_up().await;
+            }
+            b.send(&left_button(MouseKind::Down, point, b.written_frame))
+                .await;
+            b.send(&left_button(MouseKind::Up, point, b.written_frame))
+                .await;
+            idle_for(QUIET).await;
+            assert_eq!(
+                drain(&mut writes),
+                "",
+                "tracking {tracking}: the app got a report"
+            );
+            assert_eq!(
+                last(),
+                by_a,
+                "tracking {tracking}: the surplus press took the panes"
+            );
+        }
         fixture.stop();
     }
 

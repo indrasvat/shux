@@ -34,7 +34,7 @@ pub(crate) async fn build_snapshot_status_bar(
     window_id: shux_core::model::WindowId,
     cols: u16,
     attached: usize,
-    size_label: Option<&str>,
+    size_label: Option<&shux_ui::viewport::SizeLabel>,
     live_cfg: &shux_core::config::Config,
     meta_cache: &session_meta::SessionMetaCache,
     onboarding: &onboarding::OnboardingHandle,
@@ -332,20 +332,19 @@ pub(crate) async fn snapshot_window(
         window.layout.tree.clone()
     };
     let zoom_state = window.layout.zoom.clone();
-    let geometry = {
-        let panes: std::collections::HashMap<_, _> =
-            pane_data.iter().map(|(p, g, c, _)| (*p, (g, c))).collect();
-        shux_ui::prepare_frame(&shux_ui::FrameInputs {
-            layout: &layout_tree,
-            zoom: zoom_state.as_ref(),
-            cols,
-            rows,
-            status_bar_height: STATUS_BAR_ROWS,
-            border_style,
-            panes: &shux_ui::presented_grids(&panes),
-            now_ns,
-        })
-    };
+    let geometry = shux_ui::prepare_frame(&shux_ui::FrameInputs {
+        layout: &layout_tree,
+        zoom: zoom_state.as_ref(),
+        cols,
+        rows,
+        status_bar_height: STATUS_BAR_ROWS,
+        border_style,
+        panes: &pane_data
+            .iter()
+            .map(|(p, g, c, _)| (*p, shux_ui::PresentedPane::of(g, c)))
+            .collect(),
+        now_ns,
+    });
     let mut chrome = chrome;
     let bar_label =
         crate::pane_chrome::size_labels(&mut chrome, &geometry, &sizing.pinned, window.active_pane);
@@ -362,7 +361,7 @@ pub(crate) async fn snapshot_window(
         window_id,
         cols,
         sizing.attached,
-        bar_label.as_deref(),
+        bar_label.as_ref(),
         &cfg,
         meta_cache,
         onboarding,

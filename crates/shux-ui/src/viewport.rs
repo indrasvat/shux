@@ -111,21 +111,12 @@ impl PaneViewport {
             .min(self.rect.width.into())
     }
 
-    /// Whether the grid overflows the rect on either axis.
-    pub fn overflows(&self) -> bool {
-        self.grid_rows > usize::from(self.rect.height)
-            || self.grid_cols > usize::from(self.rect.width)
-    }
-
-    /// Whether the grid is exactly the rect's size.
-    pub fn fits_exactly(&self) -> bool {
-        (self.grid_cols, self.grid_rows) == (self.rect.width.into(), self.rect.height.into())
-    }
-
     /// When the hidden-cursor latch will move this viewport, if it is pending.
     pub fn latch_deadline(&self, cursor: &Cursor, now_ns: u64) -> Option<u64> {
         let hidden = cursor.hidden_for_ns(now_ns)?;
-        (self.overflows() && hidden < HIDDEN_CURSOR_LATCH_NS)
+        let overflows = self.grid_rows > usize::from(self.rect.height)
+            || self.grid_cols > usize::from(self.rect.width);
+        (overflows && hidden < HIDDEN_CURSOR_LATCH_NS)
             .then(|| cursor.hidden_since_ns + HIDDEN_CURSOR_LATCH_NS)
     }
 
@@ -178,16 +169,41 @@ fn blank_like(cell: &Cell) -> Cell {
     }
 }
 
-/// `pinned W×H` or `⤡ W×H` for a pane whose grid is not its rect's size.
-pub fn size_label(view: &PaneViewport, pinned: bool) -> Option<String> {
-    if view.fits_exactly() {
-        return None;
+/// The size of a pane whose grid is not its rect's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SizeLabel {
+    pub cols: usize,
+    pub rows: usize,
+    /// Held there by a pin rather than sized by another client.
+    pub pinned: bool,
+}
+
+impl SizeLabel {
+    /// Longest first, each keeping what tells pinned and cropped apart:
+    /// `pinned W×H`, `W×H`; or `⤡ W×H`, `⤡`.
+    pub fn ladder(&self) -> [String; 2] {
+        let size = format!("{}×{}", self.cols, self.rows);
+        if self.pinned {
+            [format!("pinned {size}"), size]
+        } else {
+            [format!("⤡ {size}"), "⤡".to_string()]
+        }
     }
-    let size = format!("{}×{}", view.grid_cols, view.grid_rows);
-    Some(if pinned {
-        format!("pinned {size}")
-    } else {
-        format!("⤡ {size}")
+
+    pub fn text(&self) -> String {
+        let [full, _] = self.ladder();
+        full
+    }
+}
+
+/// The label of a pane whose grid is not its rect's size.
+pub fn size_label(view: &PaneViewport, pinned: bool) -> Option<SizeLabel> {
+    let fits =
+        (view.grid_cols, view.grid_rows) == (view.rect.width.into(), view.rect.height.into());
+    (!fits).then_some(SizeLabel {
+        cols: view.grid_cols,
+        rows: view.grid_rows,
+        pinned,
     })
 }
 
@@ -199,20 +215,23 @@ pub struct PresentedPane<'a> {
     pub cursor: &'a Cursor,
 }
 
-/// What each pane in `vts` presents.
-pub fn presented_panes<'a>(
-    vts: &HashMap<PaneId, &'a shux_vt::VirtualTerminal>,
-) -> HashMap<PaneId, PresentedPane<'a>> {
-    vts.iter()
-        .map(|(pid, vt)| {
-            let pane = PresentedPane {
-                rows: vt.grid().rows(),
-                cols: vt.grid().cols(),
-                cursor: vt.cursor(),
-            };
-            (*pid, pane)
-        })
-        .collect()
+impl<'a> PresentedPane<'a> {
+    pub fn of(grid: &shux_vt::Grid, cursor: &'a Cursor) -> Self {
+        Self {
+            rows: grid.rows(),
+            cols: grid.cols(),
+            cursor,
+        }
+    }
+
+    /// What each pane in `vts` presents.
+    pub fn of_vts(
+        vts: &HashMap<PaneId, &'a shux_vt::VirtualTerminal>,
+    ) -> HashMap<PaneId, PresentedPane<'a>> {
+        vts.iter()
+            .map(|(pid, vt)| (*pid, Self::of(vt.grid(), vt.cursor())))
+            .collect()
+    }
 }
 
 /// Everything about one frame's geometry, prepared once before anything is
@@ -365,7 +384,6 @@ mod tests {
         let view = PaneViewport::new(Rect::new(0, 0, 10, 8), 4, 30, &cursor_at(3, 25), 0);
         assert_eq!((view.row_offset, view.col_offset), (0, 16));
         assert_eq!((view.shown_rows(), view.shown_cols()), (4, 10));
-        assert!(view.overflows() && !view.fits_exactly());
     }
 
     /// The cursor lands where its cell is drawn on both axes, and is not drawn
@@ -436,15 +454,21 @@ mod tests {
         };
         assert_eq!(size_label(&view(24, 80), true), None);
         assert_eq!(size_label(&view(24, 80), false), None);
+        let ladder = |rows, cols, pinned| size_label(&view(rows, cols), pinned).map(|l| l.ladder());
         assert_eq!(
-            size_label(&view(37, 118), false).as_deref(),
-            Some("⤡ 118×37")
+            ladder(37, 118, false),
+            Some(["⤡ 118×37".into(), "⤡".into()])
         );
         assert_eq!(
-            size_label(&view(50, 200), true).as_deref(),
-            Some("pinned 200×50")
+            ladder(50, 200, true),
+            Some(["pinned 200×50".into(), "200×50".into()])
         );
-        assert_eq!(size_label(&view(24, 79), false).as_deref(), Some("⤡ 79×24"));
+        assert_eq!(
+            size_label(&view(24, 79), false)
+                .map(|l| l.text())
+                .as_deref(),
+            Some("⤡ 79×24")
+        );
     }
 
     /// The frame's deadline is the earliest pending latch; a latched or
@@ -792,7 +816,7 @@ mod tests {
             rows,
             status_bar_height: 1,
             border_style: BorderStyle::Rounded,
-            panes: &presented_panes(&vts),
+            panes: &PresentedPane::of_vts(&vts),
             now_ns: 0,
         });
         let view = geometry.views[&big];

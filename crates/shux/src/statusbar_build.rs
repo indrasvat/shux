@@ -16,6 +16,7 @@ use shux_core::model::{PaneId, SessionId, WindowId};
 use shux_core::theme::{Rgb, Theme};
 use shux_ui::{StatusBar, StatusSegment};
 
+use crate::clients::Role;
 use crate::onboarding::OnboardingState;
 use crate::session_meta::SessionMeta;
 
@@ -315,28 +316,86 @@ pub fn append_watchers(
     insert_at_head(bar, segment, cols, has_notice);
 }
 
-/// What this client sees of the panes' sizing, ahead of everything on the
-/// right: the focused pane's size label when no border shows it, and the
-/// client's role when it does not drive. Ranks as [`append_watchers`] does.
+/// What this client sees of the panes' sizing, at the head of the right zone:
+/// the focused pane's size label when no border shows it, and the client's
+/// role when it does not drive. Each sheds words to fit the room the bar
+/// leaves, the label first, and is dropped whole rather than cut: the role
+/// `◉ viewing · type to drive` → `◉ viewing` → `◉`, the label `pinned W×H` →
+/// `W×H`, `⤡ W×H` → `⤡`. A plain client gets `*` for `◉`, which has no colour
+/// there to carry it.
 pub fn append_viewing(
     bar: &mut StatusBar,
-    label: Option<&str>,
-    role: Option<&str>,
+    label: Option<&shux_ui::viewport::SizeLabel>,
+    role: Option<Role>,
     theme: &Theme,
     cols: u16,
-    has_notice: bool,
+    plain: bool,
 ) {
-    let parts: Vec<&str> = label.into_iter().chain(role).collect();
-    if parts.is_empty() {
-        return;
+    let rgb = |Rgb { r, g, b }: Rgb| Color::Rgb { r, g, b };
+    let mark = if plain { "*" } else { "◉" };
+    // Each part's forms, longest first, and an empty last one: not drawn.
+    let roles: Vec<Vec<StatusSegment>> = match role.and_then(Role::words) {
+        Some(words) => words
+            .iter()
+            .map(|w| {
+                vec![
+                    StatusSegment::styled(mark, rgb(theme.status_shared), false),
+                    StatusSegment::styled(
+                        if w.is_empty() {
+                            " ".to_string()
+                        } else {
+                            format!(" {w} ")
+                        },
+                        rgb(theme.status_fg),
+                        false,
+                    ),
+                ]
+            })
+            .chain([Vec::new()])
+            .collect(),
+        None => vec![Vec::new()],
+    };
+    let labels: Vec<Vec<StatusSegment>> = match label {
+        Some(size) => size
+            .ladder()
+            .into_iter()
+            .map(|t| {
+                vec![StatusSegment::styled(
+                    format!("{t} "),
+                    rgb(theme.status_attention),
+                    false,
+                )]
+            })
+            .chain([Vec::new()])
+            .collect(),
+        None => vec![Vec::new()],
+    };
+    let width = StatusBar::segments_width;
+    let (lw, cw, rw) = (width(&bar.left), width(&bar.center), width(&bar.right));
+    let gaps = if cw > 0 { 2 } else { 1 };
+    let room = usize::from(cols).saturating_sub(lw + cw + rw + gaps);
+    // The label sheds its words, then the role its, then the label goes, then
+    // the role.
+    let (rl, ll) = (roles.len() - 1, labels.len() - 1);
+    let (mut r, mut l) = (0, 0);
+    let mut order = vec![(r, l)];
+    while l + 1 < ll {
+        l += 1;
+        order.push((r, l));
     }
-    let Rgb { r, g, b } = theme.status_attention;
-    let segment = StatusSegment::styled(
-        format!("{} ", parts.join(" · ")),
-        Color::Rgb { r, g, b },
-        false,
-    );
-    insert_at_head(bar, segment, cols, has_notice);
+    while r + 1 < rl {
+        r += 1;
+        order.push((r, l));
+    }
+    order.extend([(r, ll), (rl, ll)]);
+    for (r, l) in order {
+        let (role, label) = (&roles[r], &labels[l]);
+        if width(role) + width(label) <= room {
+            let unit: Vec<StatusSegment> = label.iter().chain(role).cloned().collect();
+            bar.right.splice(0..0, unit);
+            return;
+        }
+    }
 }
 
 /// Put `segment` first on the right, and make the bar fit around it.
@@ -554,6 +613,81 @@ mod tests {
     }
 
     use super::*;
+
+    /// Review of #190: a viewer's role and the focused pane's size label shed
+    /// words to fit the room the bar leaves, whole units only, the role kept
+    /// longest; nothing is cut mid-word. The mark is the theme's shared colour,
+    /// the words the bar's text colour, and a plain client gets `*`.
+    #[test]
+    fn the_viewing_segments_follow_a_width_ladder() {
+        use shux_ui::viewport::SizeLabel;
+        let pinned = SizeLabel {
+            cols: 60,
+            rows: 8,
+            pinned: true,
+        };
+        let cropped = SizeLabel {
+            cols: 118,
+            rows: 37,
+            pinned: false,
+        };
+        let right = |label: Option<&SizeLabel>, cols: u16, plain: bool| {
+            let mut b = StatusBar::new();
+            b.left.push(StatusSegment::plain("s "));
+            append_viewing(
+                &mut b,
+                label,
+                Some(Role::Viewing),
+                &Theme::DEFAULT,
+                cols,
+                plain,
+            );
+            let text: String = b.right.iter().map(|s| s.text.as_str()).collect();
+            let row: String = b.render_row(cols).iter().map(|c| c.ch).collect();
+            assert!(
+                row.contains(text.trim_end()),
+                "{cols} cols: {row:?} cut {text:?}"
+            );
+            (text, b)
+        };
+        for (cols, want) in [
+            (120, "pinned 60×8 ◉ viewing · type to drive "),
+            (80, "pinned 60×8 ◉ viewing · type to drive "),
+            (50, "pinned 60×8 ◉ viewing · type to drive "),
+            (40, "60×8 ◉ viewing · type to drive "),
+            (30, "60×8 ◉ viewing "),
+            (12, "60×8 ◉ "),
+            (8, "◉ "),
+            (4, ""),
+        ] {
+            assert_eq!(right(Some(&pinned), cols, false).0, want, "{cols} cols");
+        }
+        for (cols, want) in [
+            (80, "⤡ 118×37 ◉ viewing · type to drive "),
+            (30, "⤡ ◉ viewing "),
+            (8, "⤡ ◉ "),
+        ] {
+            assert_eq!(right(Some(&cropped), cols, false).0, want, "{cols} cols");
+        }
+        assert_eq!(right(None, 30, false).0, "◉ viewing · type to drive ");
+
+        let (_, b) = right(None, 80, false);
+        let rgb = |Rgb { r, g, b }: Rgb| Some(Color::Rgb { r, g, b });
+        assert_eq!(b.right[0].fg, rgb(Theme::DEFAULT.status_shared));
+        assert_eq!(Theme::DEFAULT.status_shared, Rgb::new(0xf5, 0xa9, 0x7f));
+        assert_eq!(b.right[1].fg, rgb(Theme::DEFAULT.status_fg));
+        assert_eq!(right(Some(&pinned), 30, true).0, "60×8 * viewing ", "plain");
+        let mut driver = StatusBar::new();
+        append_viewing(
+            &mut driver,
+            None,
+            Some(Role::Driving),
+            &Theme::DEFAULT,
+            80,
+            false,
+        );
+        assert!(driver.right.is_empty(), "a driver has no role to show");
+    }
 
     #[test]
     fn prefix_display_canonical_forms() {

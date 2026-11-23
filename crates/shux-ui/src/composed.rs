@@ -50,23 +50,6 @@ pub struct ComposeInputs<'a> {
     pub geometry: Option<&'a FrameGeometry>,
 }
 
-/// What each pane in `panes` presents.
-pub fn presented_grids<'a>(
-    panes: &HashMap<PaneId, (&'a Grid, &'a Cursor)>,
-) -> HashMap<PaneId, PresentedPane<'a>> {
-    panes
-        .iter()
-        .map(|(pid, (grid, cursor))| {
-            let pane = PresentedPane {
-                rows: grid.rows(),
-                cols: grid.cols(),
-                cursor,
-            };
-            (*pid, pane)
-        })
-        .collect()
-}
-
 /// Compose `inputs` into a `ComposedFrame` at the given outer dimensions.
 /// Pure function — no I/O, no state.
 pub fn compose(
@@ -99,7 +82,11 @@ pub fn compose(
                 rows,
                 status_bar_height,
                 border_style,
-                panes: &presented_grids(inputs.panes),
+                panes: &inputs
+                    .panes
+                    .iter()
+                    .map(|(p, (g, c))| (*p, PresentedPane::of(g, c)))
+                    .collect(),
                 now_ns: shux_vt::monotonic_now_ns(),
             });
             &prepared

@@ -535,6 +535,17 @@ pub fn view_start(total_lines: usize, pane_rows: u16, scroll_offset: usize) -> u
         .saturating_sub(scroll_offset.min(max_scroll_offset(total_lines, pane_rows)))
 }
 
+/// The slice modal copy mode draws its pane with: rows following the cursor
+/// from column 0, whatever the frame shows. Its cursor, highlight, search and
+/// yank all read the grid through this.
+pub fn copy_mode_view(view: PaneViewport, vt: &VirtualTerminal) -> PaneViewport {
+    view.with_offsets(copy_row_offset(vt, view.rect.height), 0)
+}
+
+fn copy_row_offset(vt: &VirtualTerminal, pane_rows: u16) -> usize {
+    crate::viewport::follow_offset(vt.grid().rows(), pane_rows.into(), vt.cursor().row)
+}
+
 /// The number of lines the copy-mode viewport spans for `vt` at `pane_rows` —
 /// scrollback plus the region the live attach frame actually shows.
 ///
@@ -560,8 +571,7 @@ pub fn effective_total_lines(vt: &VirtualTerminal, pane_rows: u16) -> usize {
     if grid_rows <= visible {
         return total; // grid fits — coordinate space is unchanged
     }
-    // Modal copy mode keeps this legacy row-only slice, whatever the frame shows.
-    let row_offset = crate::viewport::follow_offset(grid_rows, visible, vt.cursor().row);
+    let row_offset = copy_row_offset(vt, pane_rows);
     // Scrollback lines + the live viewport's bottom edge. Excludes any grid rows
     // below the live frame (they are past the visible screen), matching what the
     // attach frame shows. `row_offset + visible <= grid_rows`, so this never
@@ -1137,9 +1147,14 @@ fn selection_text_run(
     }
     let col_hi = col_hi.min(ctx.pane.width.saturating_sub(1));
     for col in col_lo..=col_hi {
-        let text = ctx
-            .slice
-            .cell(ctx.vt, col, row)
+        let cell = ctx.slice.cell(ctx.vt, col, row);
+        // A wide glyph drawn at its lead covers this cell; a space here would
+        // erase it. A run that starts on the right half has no lead to draw.
+        let continuation = cell.as_ref().is_some_and(|c| c.is_wide_continuation());
+        if continuation && col > col_lo {
+            continue;
+        }
+        let text = cell
             .filter(|cell| !cell.is_wide_continuation())
             .map(|cell| shown_text(&cell))
             .unwrap_or_else(|| " ".to_string());
@@ -1868,5 +1883,33 @@ mod tests {
             |y: usize| -> String { (2..8).map(|x| screen.grid().visible_row(y)[x].ch).collect() };
         assert_eq!(line(1), " jklmn");
         assert_eq!(&line(2)[..4], " jkl");
+    }
+
+    /// A highlighted run keeps every wide glyph it covers whole on screen: a
+    /// space written over the right half erases the glyph in the terminal,
+    /// though the yank still copies it.
+    #[test]
+    fn a_selection_highlight_keeps_its_wide_glyphs() {
+        let text = "A界😀B";
+        let mut vt = VirtualTerminal::new(3, 20);
+        vt.process(text.as_bytes());
+        let view = PaneViewport::of(Rect::new(0, 0, 20, 3), &vt, 0);
+        let state = CopyModeState {
+            anchor: Some((0, 0)),
+            cursor: (5, 0),
+            ..Default::default()
+        };
+        assert_eq!(extract_frame_selection(&vt, &state, &view), text);
+        let mut buf = Vec::new();
+        render_selection_overlay_with_vt_into(&mut buf, &view, &vt, &state, &Theme::DEFAULT);
+        let mut screen = VirtualTerminal::new(3, 20);
+        screen.process(text.as_bytes());
+        screen.process(&buf);
+        let row = screen.grid().visible_row(0);
+        let shown: String = (0..6)
+            .filter(|&c| !row[c].is_wide_continuation())
+            .map(|c| row[c].display_text())
+            .collect();
+        assert_eq!(shown, text, "the highlight erased a glyph");
     }
 }

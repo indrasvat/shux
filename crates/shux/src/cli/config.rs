@@ -114,6 +114,7 @@ status_bar = true
 # status_ok        = "#a6da95"   # Catppuccin Green: done badge
 # status_error     = "#ed8796"   # Catppuccin Red: error badge
 # status_attention = "#eed49f"   # Catppuccin Yellow: blocked badge, "waiting"
+# status_shared    = "#f5a97f"   # Catppuccin Peach: ◉ watching panes another client drives
 
 # ─────────────────────────────────────────────────────────────────────
 # Status-bar segments. Each entry runs `command` every `interval_ms`
