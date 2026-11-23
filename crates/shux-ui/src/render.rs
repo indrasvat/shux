@@ -34,6 +34,23 @@ pub struct RenderBackend<W: Write> {
     plain: bool,
 }
 
+/// Zero-width characters that reorder or hide text without drawing anything:
+/// bidi overrides and isolates, marks, and invisible spaces. ZWJ and ZWNJ
+/// are not here; emoji and conjuncts need them.
+fn is_hidden_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}'
+            | '\u{200B}'
+            | '\u{200E}'
+            | '\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SetAnsiForegroundColor(CtColor);
 
@@ -196,7 +213,13 @@ impl<W: Write> RenderBackend<W> {
 
             // Print the full cell display text when the VT preserved a
             // multi-codepoint grapheme payload.
-            self.out.queue(Print(cell.cell.display_text()))?;
+            let text = cell.cell.display_text();
+            if self.plain && text.chars().any(is_hidden_control) {
+                let shown: String = text.chars().filter(|&c| !is_hidden_control(c)).collect();
+                self.out.queue(Print(shown))?;
+            } else {
+                self.out.queue(Print(text))?;
+            }
 
             let plain_ascii = (cell.cell.ch.is_ascii_graphic() || cell.cell.ch == ' ')
                 && cell
@@ -684,6 +707,81 @@ mod tests {
                 "plain output carries {effect:?}: {out:?}"
             );
         }
+    }
+
+    /// A cell in the last column leaves the host cursor in its pending-wrap
+    /// state, so the next row's first cell is always positioned explicitly.
+    #[test]
+    fn a_cell_after_the_last_column_is_positioned_explicitly() {
+        let mut output = Vec::new();
+        let dirty = [
+            DirtyCell {
+                col: 9,
+                row: 0,
+                cell: RenderCell::text('z'),
+            },
+            DirtyCell {
+                col: 0,
+                row: 1,
+                cell: RenderCell::text('a'),
+            },
+        ];
+        RenderBackend::new(&mut output).render_diff(&dirty).unwrap();
+        let out = String::from_utf8_lossy(&output).into_owned();
+        assert!(
+            out.contains("\x1b[2;1H"),
+            "no move to the next row: {out:?}"
+        );
+        let mut vt = shux_vt::VirtualTerminal::new(3, 10);
+        vt.process(&output);
+        assert_eq!(vt.grid().visible_row(0)[9].ch, 'z');
+        assert_eq!(vt.grid().visible_row(1)[0].ch, 'a');
+    }
+
+    /// Invisible direction and spacing controls a pane printed can reorder
+    /// or hide text in a guest's terminal; a plain viewer gets the visible
+    /// text, and joiners that build emoji and conjuncts stay.
+    #[test]
+    fn a_plain_backend_drops_invisible_direction_controls() {
+        let grapheme = |g: &str| {
+            Some(Arc::new(shux_vt::ExtendedAttrs {
+                grapheme: Some(g.to_string()),
+                hyperlink: None,
+                underline_color: None,
+                underline_style: shux_vt::UnderlineStyle::None,
+            }))
+        };
+        let mut output = Vec::new();
+        let mut backend = RenderBackend::new(&mut output);
+        backend.set_plain(true);
+        let cells = [
+            "A\u{202E}\u{200B}\u{2066}\u{FEFF}",
+            "\u{1F468}\u{200D}\u{1F469}",
+            "\u{0915}\u{094D}\u{200C}",
+        ];
+        let dirty: Vec<DirtyCell> = cells
+            .iter()
+            .enumerate()
+            .map(|(i, g)| {
+                let mut cell = RenderCell::text(g.chars().next().unwrap());
+                cell.extended = grapheme(g);
+                DirtyCell {
+                    col: (i * 2) as u16,
+                    row: 0,
+                    cell,
+                }
+            })
+            .collect();
+        backend.render_diff(&dirty).unwrap();
+        let out = String::from_utf8(output).unwrap();
+        for hidden in ['\u{202E}', '\u{200B}', '\u{2066}', '\u{FEFF}'] {
+            assert!(!out.contains(hidden), "plain output carries {hidden:?}");
+        }
+        assert!(
+            out.contains("\u{1F468}\u{200D}\u{1F469}"),
+            "a ZWJ emoji was broken"
+        );
+        assert!(out.contains("\u{094D}\u{200C}"), "a ZWNJ was dropped");
     }
 
     #[test]

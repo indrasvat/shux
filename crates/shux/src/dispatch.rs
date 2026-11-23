@@ -118,10 +118,10 @@ pub(crate) async fn run_attach(
                     println!("[removed from session '{session_name}' by `shux client detach`]");
                 }
                 shux_ui::ExitReason::ConnectionLost => {
-                    eprintln!("[connection to daemon lost]");
+                    anyhow::bail!("connection to daemon lost");
                 }
                 shux_ui::ExitReason::Error(msg) => {
-                    eprintln!("[attach error: {msg}]");
+                    anyhow::bail!("attach error: {msg}");
                 }
                 shux_ui::ExitReason::Signal(signo) => {
                     hold_logs.release_within(std::time::Duration::from_millis(200));
