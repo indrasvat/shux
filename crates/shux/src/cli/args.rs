@@ -108,6 +108,13 @@ pub enum Command {
         command: PluginCommand,
     },
 
+    /// Attached clients: who is watching which session, and ending one.
+    /// Mirrors `client.*` RPC.
+    Client {
+        #[command(subcommand)]
+        command: ClientCommand,
+    },
+
     /// Typed bus events — `shux events watch` long-polls, `shux events
     /// history` returns the ring buffer. Mirrors `events.*` RPC.
     Events {
@@ -430,6 +437,17 @@ pub enum ConfigCommand {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum ClientCommand {
+    /// List every attached client: id, session, size, and when it attached.
+    List,
+    /// End one client's connection; it is told it was removed. A unique id prefix works.
+    Detach {
+        /// The client id, or a unique prefix of it, from `shux client list`.
+        id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 pub enum EventsCommand {
     /// Stream events from the daemon. Long-polls in a loop, printing one JSON
     /// Line per event to stdout. Suitable for piping into jq, grep, or an

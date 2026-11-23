@@ -35,6 +35,7 @@ pub(crate) fn register_session_methods(
     let g5 = graph.clone();
     let g6 = graph.clone();
 
+    let io_list = io_state.clone();
     let io_create = io_state.clone();
     let io_kill = io_state.clone();
     let io_ensure = io_state;
@@ -55,7 +56,9 @@ pub(crate) fn register_session_methods(
             move |params: Option<serde_json::Value>| {
                 let gh = g1.clone();
                 let registry = scratch_list.clone();
+                let io = io_list.clone();
                 async move {
+                    let clients = io.lock().await.clients.clone();
                     // LENS-R-041: scratch sessions are excluded from the
                     // default listing; `include_scratch: true` reveals them
                     // flagged `scratch: true`. Visibility is not
@@ -74,6 +77,7 @@ pub(crate) fn register_session_methods(
                         .filter(|s| include_scratch || !scratch_ids.contains(&s.id))
                         .map(|s| {
                             let mut json = session_to_json(s, &snap);
+                            json["attached"] = clients.count_for(s.id).into();
                             if include_scratch {
                                 json["scratch"] =
                                     serde_json::Value::Bool(scratch_ids.contains(&s.id));

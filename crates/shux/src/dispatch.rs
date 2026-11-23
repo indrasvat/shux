@@ -112,6 +112,9 @@ pub(crate) async fn run_attach(
                 shux_ui::ExitReason::SessionEnded => {
                     println!("[session '{session_name}' ended]");
                 }
+                shux_ui::ExitReason::Removed => {
+                    println!("[removed from session '{session_name}' by `shux client detach`]");
+                }
                 shux_ui::ExitReason::ConnectionLost => {
                     eprintln!("[connection to daemon lost]");
                 }
@@ -1068,6 +1071,16 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
 
         Some(Command::Plugin { command: pl_cmd }) => {
             features::plugin::dispatch(pl_cmd, &socket_path, args.format).await
+        }
+
+        Some(Command::Client { command: cl_cmd }) => {
+            let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
+            match cl_cmd {
+                cli::ClientCommand::List => cli::handle_client_list(&mut stream, args.format).await,
+                cli::ClientCommand::Detach { id } => {
+                    cli::handle_client_detach(&mut stream, &id, args.format).await
+                }
+            }
         }
 
         Some(Command::Events { command: ev_cmd }) => {

@@ -467,7 +467,10 @@ pub async fn populate_bar(
         for &idx in idxs {
             let bytes = cache.get(idx).await;
             let parsed = ansi_to_segments(&bytes);
-            zone_segments.extend(parsed);
+            zone_segments.extend(parsed.into_iter().map(|s| StatusSegment {
+                group: idx + 1,
+                ..s
+            }));
         }
         if zone_segments.is_empty() {
             continue;
@@ -569,6 +572,7 @@ fn cell_to_seg(cell: &Cell) -> StatusSegment {
         fg: vt_color(cell.style.fg),
         bg: vt_color(cell.style.bg),
         bold: cell.style.flags.contains(CellFlags::BOLD),
+        group: 0,
     }
 }
 

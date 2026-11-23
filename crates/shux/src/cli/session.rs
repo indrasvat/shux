@@ -88,7 +88,10 @@ pub async fn handle_ls(
                                 id,
                                 window_count,
                                 created,
-                                is_active: false, // no attach tracking yet
+                                attached: s
+                                    .get("attached")
+                                    .and_then(|v| v.as_u64())
+                                    .map_or(0, |n| n as usize),
                                 scratch,
                             }
                         })

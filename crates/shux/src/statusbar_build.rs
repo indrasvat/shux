@@ -292,6 +292,87 @@ pub fn append_waiting(
     }
 }
 
+/// "◉ N attached" at the head of the right zone while more than one client
+/// shows this session, so nobody is watched without seeing it. It outranks
+/// every segment but the session name, and yields only to a passing notice:
+/// on a full bar the others give way.
+pub fn append_watchers(
+    bar: &mut StatusBar,
+    attached: usize,
+    theme: &Theme,
+    cols: u16,
+    has_notice: bool,
+) {
+    if attached < 2 {
+        return;
+    }
+    let Rgb { r, g, b } = theme.status_accent;
+    bar.right.insert(
+        0,
+        StatusSegment::styled(
+            format!("◉ {attached} attached "),
+            Color::Rgb { r, g, b },
+            true,
+        ),
+    );
+    let width = StatusBar::segments_width;
+    let gaps = |bar: &StatusBar| {
+        usize::from(width(&bar.left) > 0)
+            + usize::from(width(&bar.center) > 0)
+            + usize::from(width(&bar.right) > 0)
+            - 1
+    };
+    while width(&bar.left) + width(&bar.center) + width(&bar.right) + gaps(bar) > usize::from(cols)
+    {
+        if bar.right.len() > 1 {
+            pop_unit(&mut bar.right);
+        } else if bar.left.len() > 1 {
+            pop_unit(&mut bar.left);
+        } else if has_notice {
+            return;
+        } else if !bar.center.is_empty() {
+            bar.center.clear();
+        } else {
+            // Only the session name is left: it gives up its tail, not the count.
+            let room = usize::from(cols).saturating_sub(width(&bar.right) + 1);
+            if let Some(name) = bar.left.first_mut()
+                && let Some(text) = shortened(&name.text, room)
+            {
+                name.text = text;
+            } else {
+                bar.left.clear();
+            }
+            return;
+        }
+    }
+}
+
+/// Drop the zone's last segment, and with it every other run its script printed.
+fn pop_unit(zone: &mut Vec<StatusSegment>) {
+    if let Some(last) = zone.pop()
+        && last.group != 0
+    {
+        while zone.last().is_some_and(|s| s.group == last.group) {
+            zone.pop();
+        }
+    }
+}
+
+/// Fit `seg` in `max` columns, ending in "…".
+fn shortened(text: &str, max: usize) -> Option<String> {
+    let mut kept = String::new();
+    let mut used = 0;
+    for (cell, w) in shux_ui::text_cells(text) {
+        if used + usize::from(w) + 1 > max {
+            break;
+        }
+        used += usize::from(w);
+        kept.push_str(&cell);
+    }
+    let kept = kept.trim_end();
+    (!kept.is_empty()).then(|| format!("{kept}…"))
+}
+
 /// Clear segments, innermost first, right zone before left, until a transient
 /// notice in the centre fits whole: it is shown for a moment and says
 /// something the user has to read, so it outranks both zones for that moment.
@@ -304,9 +385,16 @@ pub fn make_room_for_notice(bar: &mut StatusBar, cols: u16) {
     while width(&bar.left) + width(&bar.center) + width(&bar.right) + gaps(bar) > usize::from(cols)
     {
         if !bar.right.is_empty() {
-            bar.right.remove(0);
-        } else if bar.left.pop().is_none() {
+            let first = bar.right.remove(0);
+            if first.group != 0 {
+                while bar.right.first().is_some_and(|s| s.group == first.group) {
+                    bar.right.remove(0);
+                }
+            }
+        } else if bar.left.is_empty() {
             return;
+        } else {
+            pop_unit(&mut bar.left);
         }
     }
 }
@@ -359,6 +447,83 @@ mod tests {
         let mut none = full.clone();
         append_waiting(&mut none, 0, &Theme::DEFAULT, false, 200);
         assert_eq!(none.right.len(), 1, "nothing waiting, no segment");
+    }
+
+    #[test]
+    fn a_second_client_is_shown_and_a_lone_one_is_not() {
+        let mut alone = bar("left", "", "right");
+        append_watchers(&mut alone, 1, &Theme::DEFAULT, 80, false);
+        assert_eq!(alone.right.len(), 1, "a lone client sees a watcher count");
+        let mut watched = bar("left", "", "right");
+        append_watchers(&mut watched, 3, &Theme::DEFAULT, 80, false);
+        assert_eq!(watched.right[0].text, "◉ 3 attached ");
+    }
+
+    #[test]
+    fn watcher_count_yields_only_when_a_notice_needs_its_space() {
+        let notice = format!(" [{}] ", "x".repeat(59));
+        for (cols, show_count) in [(80, false), (100, true)] {
+            let mut b = bar(" ◆ project ", &notice, "up 42m");
+            append_watchers(&mut b, 2, &Theme::DEFAULT, cols, true);
+            make_room_for_notice(&mut b, cols);
+            let text: String = b.render_row(cols).iter().map(|c| c.ch).collect();
+            assert!(text.contains(&notice), "{text:?}");
+            assert_eq!(text.contains("◉ 2 attached"), show_count, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn shortening_keeps_a_visible_prefix_and_trims_its_padding() {
+        assert_eq!(shortened(" ◆ demo ", 2), None);
+        assert_eq!(shortened(" ◆ demo ", 4).as_deref(), Some(" ◆…"));
+        assert_eq!(shortened("日本", 2), None);
+    }
+
+    #[test]
+    fn a_full_bar_gives_way_to_the_watcher_count() {
+        // A user's script segments fill the bar: 4 + 6 + 30 + two gaps = 42.
+        let mut b = bar("left", "centre", &"x".repeat(30));
+        append_watchers(&mut b, 2, &Theme::DEFAULT, 42, false);
+        let text: String = b.render_row(42).iter().map(|c| c.ch).collect();
+        assert!(
+            text.contains("◉ 2 attached"),
+            "being watched was hidden: {text:?}"
+        );
+        assert!(
+            text.starts_with("left"),
+            "the session name was cleared: {text:?}"
+        );
+    }
+
+    #[test]
+    fn a_long_session_name_on_a_narrow_bar_still_shows_the_count() {
+        let mut b = bar(&"日本".repeat(14), "", "r");
+        append_watchers(&mut b, 9, &Theme::DEFAULT, 30, false);
+        let text: String = b.render_row(30).iter().map(|c| c.ch).collect();
+        assert!(text.contains("◉ 9 attached"), "the count was cut: {text:?}");
+        assert!(text.starts_with('日') && text.contains('…'), "{text:?}");
+    }
+
+    #[test]
+    fn a_script_segment_gives_way_whole_not_word_by_word() {
+        let mut b = bar("left", "centre", "");
+        for (text, group) in [("up 3h ", 0), ("via ", 7), ("v1.97.1 ", 7)] {
+            b.right.push(StatusSegment {
+                group,
+                ..StatusSegment::plain(text)
+            });
+        }
+        // Room for the count and "up 3h", not for the script's two runs.
+        append_watchers(&mut b, 2, &Theme::DEFAULT, 35, false);
+        let text: String = b.render_row(35).iter().map(|c| c.ch).collect();
+        assert!(
+            text.contains("◉ 2 attached") && text.contains("up 3h"),
+            "{text:?}"
+        );
+        assert!(
+            !text.contains("via"),
+            "half a script segment was left: {text:?}"
+        );
     }
 
     use super::*;

@@ -17,6 +17,9 @@ pub struct StatusSegment {
     pub fg: Option<Color>,
     pub bg: Option<Color>,
     pub bold: bool,
+    /// Runs with the same nonzero group came from one script segment, and are
+    /// dropped together when the bar runs out of room.
+    pub group: usize,
 }
 
 impl StatusSegment {
@@ -26,6 +29,7 @@ impl StatusSegment {
             fg: None,
             bg: None,
             bold: false,
+            group: 0,
         }
     }
 
@@ -35,6 +39,7 @@ impl StatusSegment {
             fg: Some(fg),
             bg: None,
             bold,
+            group: 0,
         }
     }
 }
@@ -336,6 +341,7 @@ mod tests {
             fg: None,
             bg: None,
             bold: true,
+            group: 0,
         });
         let row = bar.render_row(5);
         assert!(row[0].attrs.bold);

@@ -6,6 +6,7 @@
 //! the handlers that noun's subcommands dispatch to.
 
 pub mod args;
+pub mod client;
 pub mod config;
 pub mod events;
 pub mod help;
@@ -28,6 +29,7 @@ mod test_support;
 // The handler surface is flat to its callers: `cli::handle_pane_split`, not
 // `cli::pane::handle_pane_split`. Splitting the file did not change the API.
 pub use args::*;
+pub use client::*;
 pub use config::*;
 pub use events::*;
 pub use help::*;

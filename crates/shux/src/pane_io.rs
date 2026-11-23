@@ -177,6 +177,8 @@ pub struct PaneIoState {
     /// test harnesses that don't wire an event bus. Cheap to clone
     /// (Arc internally).
     pub event_bus: Option<shux_core::bus::EventBus>,
+    /// Every attached client, for `client.list` / `client.detach`.
+    pub clients: crate::clients::ClientRegistry,
     /// Lossless pane-output recordings. The PTY read task awaits these sends
     /// before sampled publishing, so this path is byte-exact and
     /// intentionally applies backpressure.
@@ -267,6 +269,7 @@ impl PaneIoState {
             program_status_enabled: true,
             status_sealed: Default::default(),
             open_pastes: HashMap::new(),
+            clients: Default::default(),
         }
     }
 

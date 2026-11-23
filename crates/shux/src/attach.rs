@@ -25,7 +25,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -147,6 +147,10 @@ fn clamp_client_dims(cols: u16, rows: u16) -> (u16, u16) {
 
 /// How often the daemon pings the client to detect dead peers.
 const PING_INTERVAL: Duration = Duration::from_secs(15);
+/// How often a blocked write checks that the client took bytes; a whole
+/// check with none and it is gone, 10–20 s after its last byte. A stopped
+/// reader must not hold its connection, a slow one must not lose it.
+const WRITE_STALL: Duration = Duration::from_secs(10);
 
 /// How often a render loop redraws with no pulse, so clocks and status
 /// segments move on an idle screen.
@@ -438,6 +442,7 @@ async fn handle_attach_connection(
     daemon_start: std::time::Instant,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
+    let (stream, taken) = crate::write_progress::Metered::new(stream);
     let mut framed = Framed::new(stream, create_codec());
 
     // Step 1: Receive the hello frame, bounded so a hung peer cannot hold
@@ -547,6 +552,21 @@ async fn handle_attach_connection(
     // the whole screen.
     apply_resize_to_window(&graph, &io_state, &session, &config, hello.cols, hello.rows).await;
 
+    // Listed before it is told it is attached, so it can find itself.
+    let removed = CancellationToken::new();
+    let (cols, rows) = clamp_client_dims(hello.cols, hello.rows);
+    let clients = io_state.lock().await.clients.clone();
+    let registered = clients.register(
+        crate::clients::ClientInfo {
+            id: shux_core::event::ClientId::new(),
+            session_id: session.session_id,
+            cols,
+            rows,
+            attached_at: std::time::SystemTime::now(),
+        },
+        removed.clone(),
+    );
+
     // Step 3: Send AttachReady::Ok.
     let ready = AttachReady::Ok {
         session_id: session.session_id.to_string(),
@@ -573,6 +593,8 @@ async fn handle_attach_connection(
         daemon_start,
         session,
         hello,
+        taken,
+        (registered, removed),
         cancel,
     )
     .await
@@ -884,45 +906,116 @@ async fn run_attach_loop(
     daemon_start: std::time::Instant,
     mut session: AttachedSession,
     hello: AttachHello,
+    taken: Arc<std::sync::atomic::AtomicU64>,
+    (registered, removed): (crate::clients::Registered, CancellationToken),
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     let (mut sink, mut stream) = framed.split();
 
     let (out_tx, mut out_rx) = mpsc::channel::<AttachServerFrame>(OUTBOUND_FRAMES);
 
-    // Spawn the writer task: pulls from out_rx, frames + sends.
-    let writer_cancel = cancel.clone();
+    // This connection's own lifetime: the writer ends it when the client
+    // stops reading, so the read loop and teardown never wait on a dead peer.
+    let conn = cancel.child_token();
+    let _conn_guard = conn.clone().drop_guard();
+    let (finish_tx, mut finish_rx) = oneshot::channel();
+    let (client_activity, mut activity) = watch::channel(());
+
+    let writer_cancel = conn.clone();
+    // Removal is acted on here, not by the read loop, which may be stuck
+    // queueing a frame behind the very backlog removal must drop.
+    let writer_removed = removed.clone();
     let writer = tokio::spawn(async move {
+        use crate::write_progress::{Sent, send_while_progressing};
+
+        // A ping every interval; a client that sent nothing since the last
+        // one is gone, however many screens it was sent meanwhile.
+        let mut ping =
+            tokio::time::interval_at(tokio::time::Instant::now() + PING_INTERVAL, PING_INTERVAL);
+        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut awaiting_reply = false;
         loop {
-            tokio::select! {
+            let (frame, finishing) = tokio::select! {
+                biased;
                 _ = writer_cancel.cancelled() => break,
-                // Matched inside the arm, not in its pattern: a pattern that
-                // refuses `None` disables the arm and leaves `cancelled()`
-                // pending forever, so the writer never ends on its own.
+                () = writer_removed.cancelled() => {
+                    (AttachServerFrame::SessionEnded { reason: "removed".into() }, true)
+                }
+                frame = &mut finish_rx => {
+                    let Ok(frame) = frame else { break };
+                    (frame, true)
+                }
                 frame = out_rx.recv() => {
                     let Some(frame) = frame else { break };
-                    let bytes = match serde_json::to_vec(&frame) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            warn!(error = %e, "attach: serialize failed");
-                            continue;
-                        }
-                    };
-                    if sink.send(Bytes::from(bytes)).await.is_err() {
-                        debug!("attach: client closed (writer)");
+                    (frame, false)
+                }
+                _ = ping.tick() => {
+                    if awaiting_reply && !activity.has_changed().unwrap_or(false) {
+                        warn!("attach: client did not answer its ping; dropping it");
                         break;
                     }
+                    activity.borrow_and_update();
+                    awaiting_reply = true;
+                    (AttachServerFrame::Ping, false)
+                }
+            };
+            let bytes = match serde_json::to_vec(&frame) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    warn!(%error, "attach: serialize failed");
+                    break;
+                }
+            };
+            match send_while_progressing(
+                &mut sink,
+                Bytes::from(bytes),
+                &taken,
+                WRITE_STALL,
+                &writer_cancel,
+            )
+            .await
+            {
+                Sent::Done if finishing => break,
+                Sent::Done => {}
+                Sent::Cancelled => break,
+                Sent::Closed => {
+                    debug!("attach: client closed (writer)");
+                    break;
+                }
+                Sent::Stalled => {
+                    warn!("attach: client took no bytes for {WRITE_STALL:?}; dropping it");
+                    break;
                 }
             }
         }
+        writer_cancel.cancel();
     });
 
     // Authoritative client screen size. Updated only by Resize frames;
     // the renderer reads but never writes it.
     let client_size: ClientSize = Arc::new(Mutex::new(clamp_client_dims(hello.cols, hello.rows)));
+    let registry_id = registered.id();
+    let (clients, bus) = {
+        let io = io_state.lock().await;
+        (io.clients.clone(), io.event_bus.clone())
+    };
+    let (cols0, rows0) = *client_size.lock().await;
+    if let Some(bus) = &bus {
+        bus.publish(shux_core::event::EventData::ClientConnected {
+            client_id: registry_id,
+            terminal_cols: cols0,
+            terminal_rows: rows0,
+        });
+        bus.publish(shux_core::event::EventData::SessionAttached {
+            session_id: session.session_id,
+            client_id: registry_id,
+        });
+    }
+    let mut end_reason = "detached";
+    io_state.lock().await.render_pulse.clone().bump();
 
     // Spawn the renderer task.
-    let render_cancel = cancel.child_token();
+    let render_cancel = conn.child_token();
     let render_io = io_state.clone();
     let render_graph = graph.clone();
     let render_tx = out_tx.clone();
@@ -953,27 +1046,7 @@ async fn run_attach_loop(
         .await;
     });
 
-    // Periodic ping so a dead client is detected within ~PING_INTERVAL.
-    let ping_tx = out_tx.clone();
-    let ping_cancel = cancel.clone();
-    let pinger = tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(PING_INTERVAL);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        ticker.tick().await; // skip first immediate tick
-        loop {
-            tokio::select! {
-                _ = ping_cancel.cancelled() => break,
-                _ = ticker.tick() => {
-                    if ping_tx.send(AttachServerFrame::Ping).await.is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    });
-
     // Read client frames.
-    let mut detached = false;
     // Mouse drag state: when a drag starts on a border cell, we remember
     // which boundary it's grabbing so subsequent Drag events can adjust
     // the layout split ratio.
@@ -994,16 +1067,30 @@ async fn run_attach_loop(
     // its own; otherwise it waits on the next keystroke or Pong.
     let mut alive_tick = tokio::time::interval(Duration::from_millis(200));
     alive_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // Sent at teardown, once nothing else can queue a frame behind it.
     let mut final_frame = None;
     let mut input_backlogs: HashMap<PaneId, InputBacklog> = HashMap::new();
     let client_id = NEXT_CLIENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // The paste whose pieces are arriving with its pane, and how many this
     // client has sent.
     let (mut pasting, mut pastes): (Option<(u64, PaneId)>, u64) = (None, 0);
-    while !detached {
+    loop {
         tokio::select! {
-            _ = cancel.cancelled() => break,
+            _ = conn.cancelled() => {
+                // The writer ends `conn` after sending a removal notice too.
+                end_reason = if removed.is_cancelled() {
+                    "removed"
+                } else if cancel.is_cancelled() {
+                    "daemon_stopped"
+                } else {
+                    "connection_lost"
+                };
+                break;
+            }
+            _ = removed.cancelled() => {
+                end_reason = "removed";
+                final_frame = Some(AttachServerFrame::SessionEnded { reason: "removed".into() });
+                break;
+            }
             _ = alive_tick.tick() => {}
             () = &mut cfg_listener => {
                 cfg_listener = Box::pin(cfg_changed.notified());
@@ -1025,10 +1112,12 @@ async fn run_attach_loop(
                     Some(Ok(b)) => b,
                     Some(Err(e)) => {
                         warn!(error = %e, "attach: read error");
+                        end_reason = "closed";
                         break;
                     }
                     None => {
                         debug!("attach: client disconnected");
+                        end_reason = "closed";
                         break;
                     }
                 };
@@ -1039,6 +1128,7 @@ async fn run_attach_loop(
                         continue;
                     }
                 };
+                client_activity.send_replace(());
                 match parsed {
                     frame @ (AttachClientFrame::Input { .. } | AttachClientFrame::Paste { .. }) => {
                         let (data, paste) = match frame {
@@ -1225,7 +1315,7 @@ async fn run_attach_loop(
                         if let Some(tx) = writer {
                             let backlog = input_backlogs.entry(target).or_default();
                             let budget = INPUT_STALL.saturating_sub(backlog.waited);
-                            match reserve_input(&tx, bytes.len(), budget, &cancel).await {
+                            match reserve_input(&tx, bytes.len(), budget, &conn).await {
                                 // Room the moment it was asked for: caught up.
                                 Room::Ready(permit, waited) => {
                                     backlog.waited = if waited.is_zero() {
@@ -1261,9 +1351,17 @@ async fn run_attach_loop(
                     }
                     AttachClientFrame::Resize { cols, rows } => {
                         let (cols, rows) = clamp_client_dims(cols, rows);
-                        {
-                            let mut cs = client_size.lock().await;
-                            *cs = (cols, rows);
+                        let (old_cols, old_rows) =
+                            std::mem::replace(&mut *client_size.lock().await, (cols, rows));
+                        clients.set_size(registry_id, cols, rows);
+                        if let Some(bus) = bus.as_ref().filter(|_| (old_cols, old_rows) != (cols, rows)) {
+                            bus.publish(shux_core::event::EventData::ClientResized {
+                                client_id: registry_id,
+                                old_cols,
+                                old_rows,
+                                new_cols: cols,
+                                new_rows: rows,
+                            });
                         }
                         let attached = render_session.lock().await.clone();
                         apply_resize_to_window(&graph, &io_state, &attached, &config, cols, rows).await;
@@ -1353,6 +1451,10 @@ async fn run_attach_loop(
                             selection_drag = SelectionDrag::None;
                             continue;
                         }
+                        let unhandled_mouse = |error| {
+                            warn!(?kind, %error, "attach: mouse handle failed");
+                            false
+                        };
                         match handle_app_mouse(
                             kind,
                             button,
@@ -1370,16 +1472,17 @@ async fn run_attach_loop(
                             &mouse_drag,
                             &mut selection_drag,
                         )
-                        .await?
+                        .await
                         {
-                            AppMouse::Consumed { redraw } => {
+                            Ok(AppMouse::Consumed { redraw }) => {
                                 if redraw {
                                     let pulse = io_state.lock().await.render_pulse.clone();
                                     pulse.bump();
                                 }
                                 continue;
                             }
-                            AppMouse::NotHandled => {}
+                            Ok(AppMouse::NotHandled) => {}
+                            Err(error) => { unhandled_mouse(error); }
                         }
                         if handle_mouse_selection(
                             kind,
@@ -1394,7 +1497,7 @@ async fn run_attach_loop(
                             &out_tx,
                             &mut selection_drag,
                         )
-                        .await?
+                        .await.unwrap_or_else(unhandled_mouse)
                         {
                             let pulse = io_state.lock().await.render_pulse.clone();
                             pulse.bump();
@@ -1413,7 +1516,7 @@ async fn run_attach_loop(
                             &out_tx,
                             &mut selection_drag,
                         )
-                        .await?
+                        .await.unwrap_or_else(unhandled_mouse)
                         {
                             let pulse = io_state.lock().await.render_pulse.clone();
                             pulse.bump();
@@ -1432,7 +1535,7 @@ async fn run_attach_loop(
                             &client_size,
                             &config,
                         )
-                        .await?
+                        .await.unwrap_or_else(unhandled_mouse)
                         {
                             let pulse = io_state.lock().await.render_pulse.clone();
                             pulse.bump();
@@ -1460,8 +1563,8 @@ async fn run_attach_loop(
                     AttachClientFrame::Detach => {
                         // Detach implies the user found the prefix too.
                         onboarding.mark_prefix_discovered().await;
-                        detached = true;
                         final_frame = Some(AttachServerFrame::DetachAck);
+                        break;
                     }
                     AttachClientFrame::PrefixTapped => {
                         // Authoritative signal: user has discovered the
@@ -1490,12 +1593,30 @@ async fn run_attach_loop(
         // the next iteration's snapshot lookup.
         let still_alive = sync_focus(&graph, &mut session, &render_session).await;
         if !still_alive {
-            final_frame.get_or_insert(AttachServerFrame::SessionEnded {
+            end_reason = "session_destroyed";
+            final_frame = Some(AttachServerFrame::SessionEnded {
                 reason: "session_destroyed".into(),
             });
             break;
         }
     }
+
+    renderer.abort();
+    // Gone before the client hears it is: a detach ack or a socket nobody
+    // reads must not outrun the list, the events, or a held mouse button.
+    drop(registered);
+    if let Some(bus) = &bus {
+        bus.publish(shux_core::event::EventData::ClientDisconnected {
+            client_id: registry_id,
+            reason: end_reason.into(),
+        });
+        bus.publish(shux_core::event::EventData::SessionDetached {
+            session_id: session.session_id,
+            client_id: registry_id,
+        });
+    }
+    let _ = renderer.await;
+    io_state.lock().await.render_pulse.clone().bump();
 
     // A gesture forwarded to a pane app outlives the attach: the PTY does not
     // go away when the client does. Detaching mid-drag without this leaves the
@@ -1504,17 +1625,14 @@ async fn run_attach_loop(
     close_open_pastes(&io_state, client_id).await;
     release_app_gesture(&io_state, &mut selection_drag).await;
 
-    // Stop every other holder of `out_tx` first, so the final frame is the
-    // last one queued: the writer drains it and ends only once the last
-    // sender is gone, which is what hangs up on the client.
-    renderer.abort();
-    pinger.abort();
-    let _ = renderer.await;
-    let _ = pinger.await;
-    if let Some(frame) = final_frame {
-        let _ = out_tx.send(frame).await;
+    // The writer finishes the frame on the wire, sends the final one and
+    // ends; a stalled socket ends it at the write stall.
+    match final_frame {
+        Some(frame) => {
+            let _ = finish_tx.send(frame);
+        }
+        None => conn.cancel(),
     }
-    drop(out_tx);
     let _ = writer.await;
     info!(session = %session.name, "attach session ended");
     Ok(())
@@ -1546,7 +1664,10 @@ async fn run_render_loop(
     toast_dwell: Duration,
 ) {
     // Before anything else: a receiver starts at the current generation.
-    let mut pulse = io_state.lock().await.render_pulse.subscribe();
+    let (mut pulse, clients) = {
+        let io = io_state.lock().await;
+        (io.render_pulse.subscribe(), io.clients.clone())
+    };
     let (mut cols, mut rows) = *client_size.lock().await;
     let initial = config.current();
     let initial_theme = shux_core::theme::Theme::resolve(&initial.theme);
@@ -1768,7 +1889,11 @@ async fn run_render_loop(
         let last_action_ref = attached.last_action.as_ref().map(|(s, i)| (s.as_str(), *i));
         let render_ctx = StatusBarCtx {
             session_id: attached.session_id,
-            session_name: &attached.name,
+            // The graph, not the name cached at attach: a rename shows at once.
+            session_name: snap
+                .sessions
+                .get(&attached.session_id)
+                .map_or(attached.name.as_str(), |s| s.name.as_str()),
             active_window_id: attached.active_window_id,
             active_pane_id: attached.active_pane_id,
             session_meta: &session_meta,
@@ -1781,6 +1906,10 @@ async fn run_render_loop(
             last_action: last_action_ref,
             action_error: attached.action_error.as_deref(),
         };
+        let has_notice = attached.action_error.is_some()
+            || last_action_ref.is_some_and(|(_, at)| {
+                at.elapsed() < crate::statusbar_build::ACTION_FEEDBACK_DWELL
+            });
         let mut bar = build_status_bar_shared(&snap, &live_theme, &render_ctx);
         populate_bar(&mut bar, &live_cfg, &segments).await;
         crate::statusbar_build::append_waiting(
@@ -1790,10 +1919,14 @@ async fn run_render_loop(
             nerd_fonts,
             cols,
         );
-        if attached.action_error.is_some()
-            || last_action_ref
-                .is_some_and(|(_, at)| at.elapsed() < crate::statusbar_build::ACTION_FEEDBACK_DWELL)
-        {
+        crate::statusbar_build::append_watchers(
+            &mut bar,
+            clients.count_for(attached.session_id),
+            &live_theme,
+            cols,
+            has_notice,
+        );
+        if has_notice {
             crate::statusbar_build::make_room_for_notice(&mut bar, cols);
         }
 
@@ -9749,5 +9882,588 @@ mod tests {
                 got.len().saturating_sub(1)
             );
         }
+    }
+
+    /// A client that has ended is unlisted and reported gone at once, even
+    /// while its last frames are still stuck on a socket nobody reads.
+    #[tokio::test(start_paused = true)]
+    async fn a_detached_client_is_unlisted_before_its_socket_drains() {
+        use tokio::io::AsyncReadExt;
+
+        let fixture = attach_fixture().await;
+        let _io = seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+        let mut vt = shux_vt::VirtualTerminal::new(58, 198);
+        for _ in 0..50 {
+            vt.process(&[b'x'; 180]);
+            vt.process(b"\r\n");
+        }
+        fixture
+            .io_state
+            .lock()
+            .await
+            .vts
+            .insert(fixture.first_pane, vt);
+        let bus = shux_core::bus::EventBus::new();
+        let mut events = bus.subscribe_filtered(vec!["client.disconnected".into()]);
+        fixture.io_state.lock().await.event_bus = Some(bus);
+        let (server_stream, client_stream) = tokio::io::duplex(1024);
+        let server = tokio::spawn(handle_attach_connection(
+            server_stream,
+            fixture.graph.clone(),
+            fixture.io_state.clone(),
+            test_config(),
+            SegmentCache::new(),
+            crate::session_meta::SessionMetaCache::new(),
+            crate::onboarding::OnboardingHandle::from_state_for_test(
+                crate::onboarding::OnboardingState {
+                    prefix_discovered: true,
+                    welcome_toast_seen: true,
+                },
+            ),
+            std::time::Instant::now(),
+            fixture.cancel.child_token(),
+        ));
+        let mut framed = Framed::new(client_stream, create_codec());
+        let hello = AttachHello {
+            protocol: ATTACH_PROTOCOL_VERSION,
+            session_name: Some(fixture.attached.name.clone()),
+            cols: 200,
+            rows: 60,
+            client_version: "detach-then-stop".to_string(),
+            graphics: false,
+        };
+        framed
+            .send(Bytes::from(serde_json::to_vec(&hello).expect("hello json")))
+            .await
+            .expect("send hello");
+        shux_testkit::Deadline::start()
+            .run(framed.next())
+            .await
+            .expect("ready timeout")
+            .expect("ready frame")
+            .expect("ready bytes");
+        shux_testkit::Deadline::start()
+            .run(framed.next())
+            .await
+            .expect("prelude timeout")
+            .expect("prelude frame")
+            .expect("prelude bytes");
+        let mut parts = framed.into_parts();
+        let buffered = std::mem::take(&mut parts.read_buf);
+        let buffered_len = buffered.len();
+        let mut read = std::io::Cursor::new(buffered).chain(&mut parts.io);
+        let render_len = shux_testkit::Deadline::start()
+            .run(read.read_u32())
+            .await
+            .expect("render header timeout")
+            .expect("render header") as usize;
+        assert!(
+            render_len > buffered_len + 1024,
+            "render could fit in the socket"
+        );
+        let mut framed = Framed::from_parts(parts);
+        // The render has started and cannot finish until the peer reads again.
+        framed
+            .send(Bytes::from(
+                serde_json::to_vec(&AttachClientFrame::Detach).expect("detach json"),
+            ))
+            .await
+            .expect("send detach");
+
+        let gone = shux_testkit::Deadline::start().run(events.recv()).await;
+        assert!(gone.is_some(), "no client.disconnected");
+        assert!(
+            !server.is_finished(),
+            "the client was reported gone only once its socket gave up"
+        );
+        assert_eq!(
+            fixture
+                .io_state
+                .lock()
+                .await
+                .clients
+                .count_for(fixture.session_id),
+            0,
+            "a detached client is still listed"
+        );
+        drop(framed);
+        shux_testkit::Deadline::start()
+            .run(server)
+            .await
+            .expect("server stayed open")
+            .expect("server task")
+            .expect("attach connection");
+        fixture.stop();
+    }
+
+    /// A removed client gets at most the frame already on the wire, then the
+    /// notice: the screens queued behind it are dropped, not delivered.
+    #[tokio::test(start_paused = true)]
+    async fn a_removed_client_is_not_sent_its_backlog() {
+        let fixture = attach_fixture().await;
+        let _io = seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+        let (server_stream, client_stream) = tokio::io::duplex(1024);
+        let server = tokio::spawn(handle_attach_connection(
+            server_stream,
+            fixture.graph.clone(),
+            fixture.io_state.clone(),
+            test_config(),
+            SegmentCache::new(),
+            crate::session_meta::SessionMetaCache::new(),
+            crate::onboarding::OnboardingHandle::from_state_for_test(
+                crate::onboarding::OnboardingState {
+                    prefix_discovered: true,
+                    welcome_toast_seen: true,
+                },
+            ),
+            std::time::Instant::now(),
+            fixture.cancel.child_token(),
+        ));
+        let mut framed = Framed::new(client_stream, create_codec());
+        let hello = AttachHello {
+            protocol: ATTACH_PROTOCOL_VERSION,
+            session_name: Some(fixture.attached.name.clone()),
+            cols: 200,
+            rows: 60,
+            client_version: "slow-then-removed".to_string(),
+            graphics: false,
+        };
+        framed
+            .send(Bytes::from(serde_json::to_vec(&hello).expect("hello json")))
+            .await
+            .expect("send hello");
+        shux_testkit::Deadline::start()
+            .run(framed.next())
+            .await
+            .expect("ready timeout")
+            .expect("ready frame")
+            .expect("ready bytes");
+
+        // Screens pile up while the client reads nothing.
+        for i in 0..6 {
+            let pulse = {
+                let mut io = fixture.io_state.lock().await;
+                io.vts
+                    .get_mut(&fixture.first_pane)
+                    .expect("seeded vt")
+                    .process(format!("queued-{i}\r\n").as_bytes());
+                io.render_pulse.clone()
+            };
+            pulse.bump();
+            idle_for(Duration::from_millis(100)).await;
+        }
+        let clients = fixture.io_state.lock().await.clients.clone();
+        let id = clients.list()[0].id;
+        assert!(clients.remove(id));
+
+        let mut renders_after = 0;
+        let mut told = None;
+        let deadline = shux_testkit::Deadline::start();
+        while let Some(Some(Ok(buf))) = deadline.run(framed.next()).await {
+            match serde_json::from_slice::<AttachServerFrame>(&buf).expect("server frame") {
+                AttachServerFrame::Render { .. } => renders_after += 1,
+                AttachServerFrame::SessionEnded { reason } => told = Some(reason),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            told.as_deref(),
+            Some("removed"),
+            "never told it was removed"
+        );
+        assert!(
+            renders_after <= 2,
+            "a removed client was sent {renders_after} queued screens"
+        );
+        let _ = shux_testkit::Deadline::start().run(server).await;
+        fixture.stop();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_client_is_released_when_it_stops_answering_pings() {
+        let fixture = attach_fixture().await;
+        let _io = seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+        let mut client = Client::attach(&fixture, 90).await;
+        let is_ping = |frame: &AttachServerFrame, _: &str| matches!(frame, AttachServerFrame::Ping);
+        assert!(client.frames_until(is_ping).await, "no idle ping");
+        client.send(&AttachClientFrame::Pong).await;
+        assert!(
+            client.frames_until(is_ping).await,
+            "pong did not keep the client attached"
+        );
+        shux_testkit::Deadline::start()
+            .run(&mut client.server)
+            .await
+            .expect("an unresponsive idle client was still held")
+            .expect("server task")
+            .expect("attach connection");
+        fixture.stop();
+    }
+
+    /// Screens that keep changing do not stand in for a reply: a client that
+    /// reads but never answers a ping is let go, however busy the pane.
+    #[tokio::test(start_paused = true)]
+    async fn a_client_that_never_answers_is_dropped_while_screens_change() {
+        let fixture = attach_fixture().await;
+        let _io = seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+        let mut client = Client::attach(&fixture, 90).await;
+        let mut ended = false;
+        for i in 0..60 {
+            let pulse = {
+                let mut io = fixture.io_state.lock().await;
+                io.vts
+                    .get_mut(&fixture.first_pane)
+                    .expect("seeded vt")
+                    .process(format!("tick-{i}\r\n").as_bytes());
+                io.render_pulse.clone()
+            };
+            pulse.bump();
+            if !client
+                .frames_until(|f, _| matches!(f, AttachServerFrame::Render { .. }))
+                .await
+            {
+                ended = true;
+                break;
+            }
+            idle_for(Duration::from_secs(1)).await;
+        }
+        assert!(
+            ended && client.server.is_finished(),
+            "a client that never answered a ping was held for a minute of redraws"
+        );
+        fixture.stop();
+    }
+
+    /// Removal reaches the writer even while the read loop is stuck queueing
+    /// a copy behind a full backlog: the client gets the notice, not the queue.
+    #[tokio::test(start_paused = true)]
+    async fn a_client_removed_while_its_copy_waits_gets_no_backlog() {
+        let fixture = attach_fixture().await;
+        let _io = seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+        let bus = shux_core::bus::EventBus::new();
+        let mut events = bus.subscribe_filtered(vec!["client.disconnected".into()]);
+        fixture.io_state.lock().await.event_bus = Some(bus);
+        let (server_stream, client_stream) = tokio::io::duplex(1024);
+        let server = tokio::spawn(handle_attach_connection(
+            server_stream,
+            fixture.graph.clone(),
+            fixture.io_state.clone(),
+            test_config(),
+            SegmentCache::new(),
+            crate::session_meta::SessionMetaCache::new(),
+            crate::onboarding::OnboardingHandle::from_state_for_test(
+                crate::onboarding::OnboardingState {
+                    prefix_discovered: true,
+                    welcome_toast_seen: true,
+                },
+            ),
+            std::time::Instant::now(),
+            fixture.cancel.child_token(),
+        ));
+        let mut framed = Framed::new(client_stream, create_codec());
+        let hello = AttachHello {
+            protocol: ATTACH_PROTOCOL_VERSION,
+            session_name: Some(fixture.attached.name.clone()),
+            cols: 200,
+            rows: 60,
+            client_version: "copy-then-removed".to_string(),
+            graphics: false,
+        };
+        let send = |f: &AttachClientFrame| Bytes::from(serde_json::to_vec(f).expect("frame json"));
+        framed
+            .send(Bytes::from(serde_json::to_vec(&hello).expect("hello json")))
+            .await
+            .expect("send hello");
+        shux_testkit::Deadline::start()
+            .run(framed.next())
+            .await
+            .expect("ready timeout")
+            .expect("ready frame")
+            .expect("ready bytes");
+        // More screens than the outbound queue holds, none of them read.
+        for i in 0..(OUTBOUND_FRAMES + 8) {
+            let pulse = {
+                let mut io = fixture.io_state.lock().await;
+                io.vts
+                    .get_mut(&fixture.first_pane)
+                    .expect("seeded vt")
+                    .process(format!("queued-{i}\r\n").as_bytes());
+                io.render_pulse.clone()
+            };
+            pulse.bump();
+            idle_for(Duration::from_millis(50)).await;
+        }
+        // A yank now waits on the full queue.
+        framed
+            .send(send(&AttachClientFrame::Action {
+                kind: ActionKind::EnterCopyMode,
+                args: Default::default(),
+            }))
+            .await
+            .expect("enter copy mode");
+        for key in [&b"k"[..], b"v", b"lllll", b"y"] {
+            framed
+                .send(send(&AttachClientFrame::Input {
+                    data: BASE64.encode(key),
+                }))
+                .await
+                .expect("copy key");
+        }
+        idle_for(Duration::from_millis(200)).await;
+        let clients = fixture.io_state.lock().await.clients.clone();
+        assert!(clients.remove(clients.list()[0].id));
+
+        let (mut screens, mut told) = (0, None);
+        let deadline = shux_testkit::Deadline::start();
+        while let Some(Some(Ok(buf))) = deadline.run(framed.next()).await {
+            match serde_json::from_slice::<AttachServerFrame>(&buf).expect("server frame") {
+                AttachServerFrame::Render { frame: Some(_), .. } => screens += 1,
+                AttachServerFrame::SessionEnded { reason } => told = Some(reason),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            told.as_deref(),
+            Some("removed"),
+            "never told it was removed"
+        );
+        assert!(
+            screens <= 2,
+            "a removed client was sent {screens} queued screens"
+        );
+        let _ = shux_testkit::Deadline::start().run(server).await;
+        let reason = match events.try_recv() {
+            Some(shux_core::bus::SubscriptionEvent::Event(e)) => match e.data {
+                shux_core::event::EventData::ClientDisconnected { reason, .. } => reason,
+                other => panic!("unexpected event {other:?}"),
+            },
+            other => panic!("no client.disconnected: {other:?}"),
+        };
+        assert_eq!(reason, "removed", "a removal was published as {reason:?}");
+        fixture.stop();
+    }
+
+    /// Issue #287: a client that stops reading is let go, instead of its
+    /// writer waiting on the socket for as long as the daemon runs.
+    #[tokio::test(start_paused = true)]
+    async fn a_client_that_stops_reading_is_released() {
+        let fixture = attach_fixture().await;
+        let _io = seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+        // Far less room than one full-screen frame.
+        let (server_stream, client_stream) = tokio::io::duplex(1024);
+        let server = tokio::spawn(handle_attach_connection(
+            server_stream,
+            fixture.graph.clone(),
+            fixture.io_state.clone(),
+            test_config(),
+            SegmentCache::new(),
+            crate::session_meta::SessionMetaCache::new(),
+            crate::onboarding::OnboardingHandle::from_state_for_test(
+                crate::onboarding::OnboardingState {
+                    prefix_discovered: true,
+                    welcome_toast_seen: true,
+                },
+            ),
+            std::time::Instant::now(),
+            fixture.cancel.child_token(),
+        ));
+        let mut framed = Framed::new(client_stream, create_codec());
+        let hello = AttachHello {
+            protocol: ATTACH_PROTOCOL_VERSION,
+            session_name: Some(fixture.attached.name.clone()),
+            cols: 200,
+            rows: 60,
+            client_version: "stopped-reader".to_string(),
+            graphics: false,
+        };
+        framed
+            .send(Bytes::from(serde_json::to_vec(&hello).expect("hello json")))
+            .await
+            .expect("send hello");
+        let ready = shux_testkit::Deadline::start()
+            .run(framed.next())
+            .await
+            .expect("ready timeout")
+            .expect("ready frame")
+            .expect("ready bytes");
+        assert!(matches!(
+            serde_json::from_slice::<AttachReady>(&ready).expect("ready json"),
+            AttachReady::Ok { .. }
+        ));
+
+        // From here on the client reads nothing.
+        let ended = shux_testkit::Deadline::start().run(server).await;
+        assert!(
+            ended.is_some(),
+            "a client that stopped reading was still held"
+        );
+        drop(framed);
+        fixture.stop();
+    }
+
+    /// A session renamed while a client watches it is shown by its new name.
+    #[tokio::test(start_paused = true)]
+    async fn an_attached_client_follows_a_session_rename() {
+        let mut h = InputHarness::new(8).await;
+        assert!(
+            h.frames_until(|_, text| text.contains("attach-test")).await,
+            "the old name was never shown"
+        );
+        h.fixture
+            .graph
+            .rename_session(h.fixture.session_id, "renamed-live".to_string(), None)
+            .await
+            .expect("rename");
+        assert!(
+            h.frames_until(|_, text| text.contains("renamed-live"))
+                .await,
+            "the bar kept the old name"
+        );
+        h.stop().await;
+    }
+
+    /// A pane split from an attached client belongs to the session, not to
+    /// that connection: it keeps running after the client detaches.
+    #[tokio::test]
+    async fn a_pane_split_from_a_client_outlives_the_client() {
+        let fixture = attach_fixture().await;
+        let panes = |f: &AttachFixture| {
+            f.graph.snapshot().windows[&f.first_window]
+                .layout
+                .tree
+                .pane_ids()
+        };
+        let before = panes(&fixture);
+        let mut c = Client::attach(&fixture, 120).await;
+        c.send(&AttachClientFrame::Action {
+            kind: ActionKind::SplitSmart,
+            args: Default::default(),
+        })
+        .await;
+        assert!(
+            c.frames_until(|_, _| panes(&fixture).len() > before.len())
+                .await,
+            "the split never happened"
+        );
+        let new_pane = *panes(&fixture)
+            .iter()
+            .find(|p| !before.contains(p))
+            .expect("a new pane");
+
+        c.detach().await;
+        let Client { framed, server, .. } = c;
+        drop(framed);
+        assert!(
+            shux_testkit::Deadline::start().run(server).await.is_some(),
+            "the connection never ended"
+        );
+        let shutdown = fixture
+            .io_state
+            .lock()
+            .await
+            .shutdowns
+            .get(&new_pane)
+            .cloned();
+        assert!(
+            shutdown.is_some_and(|t| !t.is_cancelled()),
+            "the split pane was torn down with the client that made it"
+        );
+        fixture.stop();
+    }
+
+    /// Issue #287: every client is listed; removing one ends exactly that
+    /// one, tells it why, and publishes who came and went.
+    #[tokio::test(start_paused = true)]
+    async fn removing_a_client_ends_only_it_and_says_why() {
+        let bus = shux_core::bus::EventBus::new();
+        let mut events = bus.subscribe_filtered(vec![
+            "client.".into(),
+            "session.attached".into(),
+            "session.detached".into(),
+        ]);
+        let mut h = InputHarness::new(8).await;
+        assert!(
+            h.frames_until(|f, _| matches!(f, AttachServerFrame::Render { .. }))
+                .await
+        );
+        h.fixture.io_state.lock().await.event_bus = Some(bus);
+        let clients = h.fixture.io_state.lock().await.clients.clone();
+        let first = clients.list();
+        let mut a = h.peer().await;
+        let a_id = clients
+            .list()
+            .iter()
+            .map(|c| c.id)
+            .find(|id| !first.iter().any(|c| c.id == *id))
+            .expect("the peer is listed");
+        let mut b = h.peer().await;
+        assert!(
+            b.frames_until(|f, _| matches!(f, AttachServerFrame::Render { .. }))
+                .await
+        );
+        assert_eq!(clients.count_for(h.fixture.session_id), 3);
+
+        assert!(clients.remove(a_id));
+        assert!(
+            a.frames_until(|f, _| matches!(f, AttachServerFrame::SessionEnded { reason } if reason == "removed"))
+                .await,
+            "the removed client was not told why"
+        );
+        // The others are still served.
+        b.send(&AttachClientFrame::Action {
+            kind: ActionKind::Redraw,
+            args: Default::default(),
+        })
+        .await;
+        assert!(
+            b.frames_until(|f, _| matches!(f, AttachServerFrame::Render { .. }))
+                .await,
+            "removing one client stopped another"
+        );
+        h.key(b"still-here").await;
+        assert_eq!(h.next_input().await, b"still-here");
+
+        // Detached is the last thing a connection publishes.
+        let mut seen = Vec::new();
+        let deadline = shux_testkit::Deadline::start();
+        while let Some(Some(shux_core::bus::SubscriptionEvent::Event(e))) =
+            deadline.run(events.recv()).await
+        {
+            let last = matches!(e.data, shux_core::event::EventData::SessionDetached { .. });
+            seen.push(e.data);
+            if last {
+                break;
+            }
+        }
+        let disconnected: Vec<_> = seen
+            .iter()
+            .filter_map(|d| match d {
+                shux_core::event::EventData::ClientDisconnected { client_id, reason } => {
+                    Some((*client_id, reason.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(disconnected, vec![(a_id, "removed")], "events: {seen:?}");
+        assert!(seen.iter().any(|d| matches!(
+            d,
+            shux_core::event::EventData::SessionDetached { client_id, session_id }
+                if *client_id == a_id && *session_id == h.fixture.session_id
+        )));
+        assert_eq!(
+            seen.iter()
+                .filter(|d| matches!(d, shux_core::event::EventData::SessionAttached { .. }))
+                .count(),
+            2,
+            "the bus was set after the first client attached: {seen:?}"
+        );
+        assert_eq!(clients.count_for(h.fixture.session_id), 2);
+        assert!(
+            !clients.list().iter().any(|c| c.id == a_id),
+            "the removed client is still listed"
+        );
+        b.stop().await;
+        a.stop().await;
+        h.stop().await;
     }
 }

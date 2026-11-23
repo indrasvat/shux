@@ -100,6 +100,8 @@ pub enum ExitReason {
     Detached,
     /// The session ended (last pane exited).
     SessionEnded,
+    /// Another client ended this one (`shux client detach`).
+    Removed,
     /// The daemon connection was lost.
     ConnectionLost,
     /// An error occurred.
@@ -308,7 +310,7 @@ pub async fn run_client(config: ClientConfig) -> Result<ExitReason, anyhow::Erro
         ExitReason::Detached => {
             println!("[detached from session '{}']", config.session_name);
         }
-        ExitReason::SessionEnded => {
+        ExitReason::SessionEnded | ExitReason::Removed => {
             println!("[session '{}' ended]", config.session_name);
         }
         ExitReason::ConnectionLost => {

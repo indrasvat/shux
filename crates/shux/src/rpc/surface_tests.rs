@@ -22,6 +22,8 @@ use crate::pane_io::PaneIoState;
 /// of its branches are resolved and printed — a closure that collapsed to one
 /// tier would otherwise read as unchanged.
 const EXPECTED_SURFACE: &[&str] = &[
+    "client.detach => Grantable",
+    "client.list => Public",
     "events.history => ContentRead",
     "events.watch => ParamAware(broad=ContentRead, self_scoped=Public)",
     "lens.run => Grantable",
