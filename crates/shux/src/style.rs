@@ -2300,6 +2300,33 @@ pub fn print_pane_diff(
     }
 }
 
+/// One attached client per line: short id, session, size, and when it
+/// attached.
+pub fn print_clients(clients: &[serde_json::Value]) -> Printed {
+    let mut out = io::stdout().lock();
+    if clients.is_empty() {
+        writeln!(out, "{}", muted("no clients attached"))?;
+    }
+    for c in clients {
+        let s = |k: &str| c.get(k).and_then(|v| v.as_str()).unwrap_or("?");
+        let n = |k: &str| c.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+        let since = crate::cli::session::format_created_at(
+            c.get("attached_at").unwrap_or(&serde_json::Value::Null),
+        );
+        writeln!(
+            out,
+            "{}  {}  {}x{}  {}",
+            accent(short_id(s("id"))),
+            bold(safe_label(s("session"))),
+            n("cols"),
+            n("rows"),
+            muted(format!("attached {since}")),
+        )?;
+    }
+    out.flush()?;
+    Ok(())
+}
+
 // ── Tests ──────────────────────────────────────────────────────
 
 #[cfg(test)]

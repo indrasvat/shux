@@ -65,7 +65,7 @@ Spawn a new session with an initial window + pane.
 ```json
 // session.list — scratch sessions (from lens.run) are excluded unless
 // include_scratch is true; scratch entries carry "scratch": true.
-{ "include_scratch": false } → { "sessions": [{...}, ...] }
+{ "include_scratch": false } → { "sessions": [{..., "attached": 2}, ...] }  // attached = clients on it
 
 // session.kill — `id` is a STRICT UUID; names go via the separate `name`
 // field. Pass exactly one of the two. expected_version optional.
@@ -86,6 +86,30 @@ and resolve it client-side: session ID first, falling back to a session
 NAMED that string; the ID wins when both match (a warning is printed).
 `session rename` / `session save` / `session attach` take NAMEs only. Raw
 RPC callers pick the field themselves per the shapes above.
+
+## Attached clients
+
+### `client.list` / `client.detach`
+
+Every terminal attached with `shux session attach` is a client. The status
+bar of a session shows `◉ N attached` once two or more are on it.
+
+```json
+// client.list (shux client list)
+{} → { "clients": [{ "id": "<uuid>", "session_id": "<uuid>", "session": "demo",
+                     "cols": 120, "rows": 40, "attached_at": 1778... }] }
+
+// client.detach (shux client detach <id>): ends that one connection; the
+// client is told "removed". A unique id prefix works; an ambiguous one is
+// invalid_params, an unknown one not_found.
+{ "id": "3f2a" } → { "detached": "<uuid>" }
+```
+
+A client that takes no bytes at all for 10–20 s (progress is checked every 10 s) is dropped; a slow one that
+keeps reading stays. Events: `client.connected`, `client.resized`,
+`client.disconnected` (`reason`: `detached`, `closed`, `removed`,
+`connection_lost`, `session_destroyed`, `daemon_stopped`), and
+`session.attached` / `session.detached` with the session id.
 
 ## Window
 

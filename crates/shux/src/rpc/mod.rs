@@ -11,6 +11,7 @@ use tokio::sync::Mutex;
 
 use crate::pane_io::PaneIoState;
 
+pub(crate) mod client;
 pub(crate) mod convert;
 pub(crate) mod events;
 pub(crate) mod pane;
@@ -55,15 +56,19 @@ pub(crate) fn build_router(
                         crate::rpc::pane_io::register_pane_io_methods(
                             crate::rpc::pane::register_pane_methods(
                                 crate::rpc::window::register_window_methods(
-                                    crate::rpc::session::register_session_methods(
-                                        shux_rpc::server::register_builtin_methods(
-                                            shux_rpc::Router::builder(),
+                                    crate::rpc::client::register_client_methods(
+                                        crate::rpc::session::register_session_methods(
+                                            shux_rpc::server::register_builtin_methods(
+                                                shux_rpc::Router::builder(),
+                                            ),
+                                            graph.clone(),
+                                            io_state.clone(),
+                                            cancel.clone(),
+                                            session_meta.clone(),
+                                            scratch_registry.clone(),
                                         ),
                                         graph.clone(),
                                         io_state.clone(),
-                                        cancel.clone(),
-                                        session_meta.clone(),
-                                        scratch_registry.clone(),
                                     ),
                                     graph.clone(),
                                     io_state.clone(),

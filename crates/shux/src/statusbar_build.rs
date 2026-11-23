@@ -292,6 +292,44 @@ pub fn append_waiting(
     }
 }
 
+/// "◉ N attached" at the head of the right zone while more than one client
+/// shows this session, so nobody is watched without seeing it. It outranks
+/// every segment but the session name, and yields only to a passing notice:
+/// on a full bar the others give way.
+pub fn append_watchers(bar: &mut StatusBar, attached: usize, theme: &Theme, cols: u16) {
+    if attached < 2 {
+        return;
+    }
+    let Rgb { r, g, b } = theme.status_accent;
+    bar.right.insert(
+        0,
+        StatusSegment::styled(
+            format!("◉ {attached} attached "),
+            Color::Rgb { r, g, b },
+            true,
+        ),
+    );
+    let width = StatusBar::segments_width;
+    let gaps = |bar: &StatusBar| {
+        usize::from(width(&bar.left) > 0)
+            + usize::from(width(&bar.center) > 0)
+            + usize::from(width(&bar.right) > 0)
+            - 1
+    };
+    while width(&bar.left) + width(&bar.center) + width(&bar.right) + gaps(bar) > usize::from(cols)
+    {
+        if bar.right.len() > 1 {
+            bar.right.pop();
+        } else if bar.left.len() > 1 {
+            bar.left.pop();
+        } else if !bar.center.is_empty() {
+            bar.center.clear();
+        } else {
+            return;
+        }
+    }
+}
+
 /// Clear segments, innermost first, right zone before left, until a transient
 /// notice in the centre fits whole: it is shown for a moment and says
 /// something the user has to read, so it outranks both zones for that moment.
@@ -359,6 +397,32 @@ mod tests {
         let mut none = full.clone();
         append_waiting(&mut none, 0, &Theme::DEFAULT, false, 200);
         assert_eq!(none.right.len(), 1, "nothing waiting, no segment");
+    }
+
+    #[test]
+    fn a_second_client_is_shown_and_a_lone_one_is_not() {
+        let mut alone = bar("left", "", "right");
+        append_watchers(&mut alone, 1, &Theme::DEFAULT, 80);
+        assert_eq!(alone.right.len(), 1, "a lone client sees a watcher count");
+        let mut watched = bar("left", "", "right");
+        append_watchers(&mut watched, 3, &Theme::DEFAULT, 80);
+        assert_eq!(watched.right[0].text, "◉ 3 attached ");
+    }
+
+    #[test]
+    fn a_full_bar_gives_way_to_the_watcher_count() {
+        // A user's script segments fill the bar: 4 + 6 + 30 + two gaps = 42.
+        let mut b = bar("left", "centre", &"x".repeat(30));
+        append_watchers(&mut b, 2, &Theme::DEFAULT, 42);
+        let text: String = b.render_row(42).iter().map(|c| c.ch).collect();
+        assert!(
+            text.contains("◉ 2 attached"),
+            "being watched was hidden: {text:?}"
+        );
+        assert!(
+            text.starts_with("left"),
+            "the session name was cleared: {text:?}"
+        );
     }
 
     use super::*;

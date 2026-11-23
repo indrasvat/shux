@@ -117,6 +117,8 @@ impl RpcHarness {
             scratch_registry.clone(),
         );
 
+        let builder =
+            crate::rpc::client::register_client_methods(builder, graph.clone(), io.clone());
         let builder = crate::rpc::program_status::register_program_status_methods(
             builder,
             graph.clone(),

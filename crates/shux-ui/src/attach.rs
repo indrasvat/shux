@@ -314,6 +314,9 @@ where
                     }
                     AttachServerFrame::Notice { text: _ } => {}
                     AttachServerFrame::DetachAck => return Ok(ExitReason::Detached),
+                    AttachServerFrame::SessionEnded { reason } if reason == "removed" => {
+                        return Ok(ExitReason::Removed);
+                    }
                     AttachServerFrame::SessionEnded { .. } => return Ok(ExitReason::SessionEnded),
                     AttachServerFrame::Ping => {
                         let _ = sink
