@@ -39,6 +39,10 @@ pub struct Cursor {
     pub shape: CursorShape,
     /// Whether the cursor is visible.
     pub visible: bool,
+    /// While hidden: the [`crate::monotonic_now_ns`] reading at the end of the
+    /// batch that hid it, or 0 inside that batch. A hide from visible and a
+    /// screen swap that brings back a hidden cursor both start a new streak.
+    pub hidden_since_ns: u64,
     /// Whether a wrap is pending (cursor is past the right margin but hasn't wrapped yet).
     /// This is the "auto-wrap pending" state described in VT102 behavior.
     pub auto_wrap_pending: bool,
@@ -55,9 +59,16 @@ impl Cursor {
             extended: None,
             shape: CursorShape::Block,
             visible: true,
+            hidden_since_ns: 0,
             auto_wrap_pending: false,
             saved: None,
         }
+    }
+
+    /// How long the cursor has been hidden at `now_ns` on the
+    /// [`crate::monotonic_now_ns`] clock; `None` while it shows.
+    pub fn hidden_for_ns(&self, now_ns: u64) -> Option<u64> {
+        (!self.visible).then(|| now_ns.saturating_sub(self.hidden_since_ns))
     }
 
     /// Save cursor state (DECSC -- ESC 7).

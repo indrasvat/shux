@@ -1066,6 +1066,9 @@ impl<'a> VtHandler<'a> {
             // DECTCEM -- Text cursor enable.
             25 => {
                 self.modes.cursor_visible = enable;
+                if !enable && self.cursor.visible {
+                    self.cursor.hidden_since_ns = 0;
+                }
                 self.cursor.visible = enable;
             }
             // Mouse tracking: normal (1000).
