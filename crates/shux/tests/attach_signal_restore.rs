@@ -712,3 +712,50 @@ async fn a_resize_during_the_handshake_reaches_the_daemon() {
         }
     }
 }
+
+/// A daemon that drops the client mid-frame (as it does a viewer released
+/// for not reading) reads as a lost connection, not a codec error.
+#[tokio::test]
+async fn a_connection_cut_mid_frame_is_reported_as_lost() {
+    let h = Harness::new();
+    h.create_session("cut-mid-frame");
+    let sock = h.runtime_dir().join("shux").join("attach.sock");
+    std::fs::rename(&sock, sock.with_extension("real")).expect("move the real attach socket");
+    let listener = tokio::net::UnixListener::bind(&sock).expect("bind stand-in");
+
+    let mut client = AttachedClient::spawn(&h, "cut-mid-frame");
+    let (stream, _) = tokio::time::timeout(BUDGET, listener.accept())
+        .await
+        .expect("the client never connected")
+        .expect("accept");
+    let mut framed = Framed::new(stream, shux_rpc::create_codec());
+    tokio::time::timeout(BUDGET, framed.next())
+        .await
+        .expect("no hello")
+        .expect("closed before the hello")
+        .expect("read hello");
+    let ready = AttachReady::Ok {
+        session_id: "stand-in".into(),
+        session_name: "cut-mid-frame".into(),
+        active_window_id: "stand-in".into(),
+        active_pane_id: "stand-in".into(),
+        protocol: ATTACH_PROTOCOL_VERSION,
+    };
+    framed
+        .send(Bytes::from(serde_json::to_vec(&ready).unwrap()))
+        .await
+        .expect("send ready");
+    // A length prefix promising more than ever arrives, then the hang-up.
+    let mut stream = framed.into_inner();
+    tokio::io::AsyncWriteExt::write_all(&mut stream, &[0, 0, 1, 0, b'{', b'"'])
+        .await
+        .expect("partial frame");
+    drop(stream);
+
+    client.wait_for_exit();
+    let seen = String::from_utf8_lossy(&client.seen()).into_owned();
+    assert!(
+        seen.contains("connection to daemon lost") && !seen.contains("framing error"),
+        "a hang-up mid-frame was reported as: {seen:?}"
+    );
+}

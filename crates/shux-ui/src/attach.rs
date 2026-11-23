@@ -287,7 +287,12 @@ where
             frame = stream.next() => {
                 let buf = match frame {
                     Some(Ok(b)) => b,
-                    Some(Err(e)) => return Ok(ExitReason::Error(format!("framing error: {e}"))),
+                    // A hang-up mid-frame is the daemon letting this client go;
+                    // only data it cannot read is a protocol error.
+                    Some(Err(e)) if e.kind() == std::io::ErrorKind::InvalidData => {
+                        return Ok(ExitReason::Error(format!("framing error: {e}")));
+                    }
+                    Some(Err(_)) => return Ok(ExitReason::ConnectionLost),
                     None => return Ok(ExitReason::ConnectionLost),
                 };
                 let parsed: AttachServerFrame = match serde_json::from_slice(&buf) {
