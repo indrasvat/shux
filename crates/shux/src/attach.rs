@@ -7474,6 +7474,14 @@ mod tests {
         )
         .await
         .expect("second pane rect");
+        let _second = install_app(&h, h.fixture.second_pane, (60, 200), b"").await;
+        ship_frame(
+            &h.fixture.graph,
+            &h.fixture.io_state,
+            &h.session,
+            &h.client_size,
+        )
+        .await;
         let acted = handle_mouse(
             MouseKind::Down,
             ProtoMouseButton::Left,
@@ -8017,8 +8025,9 @@ mod tests {
             outcome,
             AppMouse::Consumed {
                 redraw: true,
-                input: true
-            }
+                input: false
+            },
+            "it focuses, but a click on no cell takes no panes"
         );
         assert_no_bytes(&mut wr, "no grid cell under the click").await;
         assert_eq!(
