@@ -923,3 +923,34 @@ fn a_json_watch_ended_by_its_daemon_stays_one_object_per_line() {
         );
     }
 }
+
+/// A daemon that cannot be reached fails a JSON command before it prints, so
+/// the failure is the JSON error on stdout too.
+#[test]
+fn an_unreachable_daemon_is_a_json_error() {
+    let env = Env::new();
+    let out = env.run(&[
+        "--format",
+        "json",
+        "--socket",
+        "/dev/null/no.sock",
+        "pane",
+        "capture",
+        "-s",
+        "x",
+    ]);
+    assert!(!out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!(
+            "stdout is not JSON ({e}):\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    assert_eq!(v["error"]["code"], -32603, "{v}");
+    assert!(
+        out.stderr.is_empty(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

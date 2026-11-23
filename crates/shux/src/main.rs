@@ -144,9 +144,9 @@ fn report_fatal(e: &anyhow::Error, format: cli::OutputFormat) -> ! {
     }
 
     // Under `--format json` an RPC error (a name the daemon or the CLI could
-    // not resolve, a refused call) is `{"error": {code, message, data}}` on
-    // stdout, as `rpc call` prints it. Only those: they end a command before
-    // it prints, while a stream or a printed result that fails later keeps
+    // not resolve, a refused call) or an unreachable daemon is
+    // `{"error": {code, message, data}}` on stdout, as `rpc call` prints it.
+    // Only those: they end a command before it prints, while a stream or a printed result that fails later keeps
     // its stdout one document and reports on stderr.
     let rpc = e.chain().find_map(|c| match c.downcast_ref() {
         Some(cli::rpc::RpcClientError::Rpc {
@@ -162,8 +162,14 @@ fn report_fatal(e: &anyhow::Error, format: cli::OutputFormat) -> ! {
         }
         _ => None,
     });
+    // A daemon that could not be reached fails the command before it prints.
+    let unreachable = || {
+        e.chain()
+            .any(|c| c.downcast_ref::<shux::client::ClientError>().is_some())
+            .then(|| serde_json::json!({ "code": -32603, "message": format!("{e:#}") }))
+    };
     let json = matches!(format, cli::OutputFormat::Json)
-        .then_some(rpc)
+        .then(|| rpc.or_else(unreachable))
         .flatten()
         .and_then(|error| {
             serde_json::to_string_pretty(&serde_json::json!({ "error": error })).ok()
