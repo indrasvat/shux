@@ -143,24 +143,33 @@ fn report_fatal(e: &anyhow::Error, format: cli::OutputFormat) -> ! {
         die_of_sigpipe();
     }
 
-    if matches!(format, cli::OutputFormat::Json) {
-        // The documented contract: `{"error": {code, message, data}}` on
-        // stdout, nothing on stderr, whoever raised it.
-        let rpc = e.chain().find_map(|c| match c.downcast_ref() {
-            Some(cli::rpc::RpcClientError::Rpc {
-                code,
-                message,
-                data,
-            }) => Some(serde_json::json!({ "code": code, "message": message, "data": data })),
-            _ => None,
-        });
-        let error = rpc.unwrap_or_else(
-            || serde_json::json!({ "code": -32603, "message": format!("{e:#}"), "data": null }),
-        );
-        match serde_json::to_string_pretty(&serde_json::json!({ "error": error })) {
-            Ok(s) => println!("{}", style::json_safe(&s)),
-            Err(_) => style::print_error(&format!("{e:#}")),
+    // Under `--format json` an RPC error (a name the daemon or the CLI could
+    // not resolve, a refused call) is `{"error": {code, message, data}}` on
+    // stdout, as `rpc call` prints it. Only those: they end a command before
+    // it prints, while a stream or a printed result that fails later keeps
+    // its stdout one document and reports on stderr.
+    let rpc = e.chain().find_map(|c| match c.downcast_ref() {
+        Some(cli::rpc::RpcClientError::Rpc {
+            code,
+            message,
+            data,
+        }) => {
+            let mut error = serde_json::json!({ "code": code, "message": message });
+            if let Some(data) = data {
+                error["data"] = data.clone();
+            }
+            Some(error)
         }
+        _ => None,
+    });
+    let json = matches!(format, cli::OutputFormat::Json)
+        .then_some(rpc)
+        .flatten()
+        .and_then(|error| {
+            serde_json::to_string_pretty(&serde_json::json!({ "error": error })).ok()
+        });
+    if let Some(s) = json {
+        println!("{}", style::json_safe(&s));
     } else {
         // `{:#}` walks the anyhow chain onto one line; `print_error` owns the
         // marker, the colour and the NO_COLOR check.

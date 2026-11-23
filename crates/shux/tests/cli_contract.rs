@@ -835,3 +835,91 @@ fn resize_rejects_a_delta_outside_the_documented_range() {
         ]);
     }
 }
+
+/// The RPC itself refuses a delta that is not a number or out of range,
+/// before the layout changes: a string used to apply the 0.1 default.
+#[test]
+fn the_resize_rpc_refuses_a_bad_delta_before_moving_anything() {
+    let mut env = Env::new();
+    let s = env.session("delta-rpc");
+    env.ok(&["pane", "split", "-s", &s, "-d", "horizontal"]);
+    let versions = |env: &Env| env.json(&["pane", "list", "-s", &s]).to_string();
+    let before = versions(&env);
+    let pane = env.json(&["pane", "list", "-s", &s])[0]["id"]
+        .as_str()
+        .expect("pane id")
+        .to_string();
+    for bad in [r#""big""#, "4", "-2", "true"] {
+        let params = format!(r#"{{"pane_id":"{pane}","direction":"horizontal","delta":{bad}}}"#);
+        let out = env.run(&[
+            "--format",
+            "json",
+            "rpc",
+            "call",
+            "pane.resize",
+            "--params",
+            &params,
+        ]);
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json reply");
+        assert_eq!(v["error"]["code"], -32602, "delta {bad}: {v}");
+    }
+    assert_eq!(
+        versions(&env),
+        before,
+        "a refused delta still changed the layout"
+    );
+}
+
+/// A JSON event stream whose daemon goes away stays one JSON object per
+/// line: the end is reported on stderr, never as a document on stdout.
+#[test]
+fn a_json_watch_ended_by_its_daemon_stays_one_object_per_line() {
+    use std::io::BufRead as _;
+    let mut env = Env::new();
+    env.session("watched");
+    let mut watch = env
+        .shux()
+        .args(["--format", "json", "events", "watch"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn events watch");
+    let stdout = watch.stdout.take().expect("stdout");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut lines = Vec::new();
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            let _ = tx.send(());
+            lines.push(line);
+        }
+        lines
+    });
+    // A session created now is an event the watch prints once it is
+    // connected; created until one arrives, as the watch may not be yet.
+    let mut n = 0;
+    let first = shux_testkit::poll_until(shux_testkit::BUDGET, || {
+        if rx.try_recv().is_ok() {
+            return true;
+        }
+        n += 1;
+        env.session(&format!("ev{n}"));
+        false
+    });
+    assert!(first, "the watch printed no event");
+    env.ok(&["daemon", "stop"]);
+    let _ = watch.wait();
+    for line in reader
+        .join()
+        .expect("reader")
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+    {
+        assert!(
+            serde_json::from_str::<serde_json::Value>(line).is_ok(),
+            "stdout is no longer one JSON object per line: {line:?}"
+        );
+    }
+}

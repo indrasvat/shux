@@ -257,10 +257,12 @@ pub(crate) fn register_pane_methods(
                     }
                 };
 
-                let delta = params
-                    .get("delta")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.1);
+                let delta = match params.get("delta") {
+                    None | Some(serde_json::Value::Null) => 0.1,
+                    Some(v) => v.as_f64().ok_or_else(|| {
+                        shux_rpc::RpcError::invalid_params("'delta' must be a number")
+                    })?,
+                };
                 crate::pane_command::check_delta(delta)
                     .map_err(|e| shux_rpc::RpcError::invalid_params(&format!("delta: {e}")))?;
                 let delta = delta as f32;
