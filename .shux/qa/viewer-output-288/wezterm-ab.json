@@ -1,0 +1,101 @@
+{
+  "base v0.57.3": {
+    "rows_differing": [
+      1,
+      9
+    ],
+    "diffs": [
+      {
+        "row": 1,
+        "shux": "❤️ x界1👍y 🇯🇵 st 👩‍💻 uv क्षि wx",
+        "wezterm": "❤️x界1👍y 🇯🇵 st 👩‍💻 uv क्ष wx"
+      },
+      {
+        "row": 9,
+        "shux": "frame 6: ab界cd❤️ef🇯🇵gh",
+        "wezterm": "frame 6: ab界cd ef🇯🇵gh"
+      }
+    ],
+    "inner": [
+      "ab界cd👍ef✓g─h│ij é kl ｱm Ａn",
+      "❤️x界1👍y 🇯🇵 st 👩‍💻 uv क्ष wx",
+      "plainx界2👍yrun: the quick brown fox 0123456789",
+      "漢字かなx界3👍y  and ascii after it 42",
+      "é̂ stacked mx界4👍yen text",
+      "→ ← ↑ ↓ ⇒ ½ ¼ x界5👍y ascii",
+      "🧑‍🤝‍🧑 zwj then asciix界6👍yen ascii",
+      "tab     separated       columns here",
+      "",
+      "frame 6: ab界cd ef🇯🇵gh",
+      "",
+      "WIDE-DONE-42"
+    ],
+    "screen": "╭─ bash ───────────────────────────────────────────────────────────────────────────────────────────╮\n│ab界cd👍ef✓g─h│ij é kl ｱm Ａn                                                                     │\n│❤️x界1👍y 🇯🇵 st 👩‍💻 uv क्ष wx                                                                      │\n│plainx界2👍yrun: the quick brown fox 0123456789                                                   │\n│漢字かなx界3👍y  and ascii after it 42                                                            │\n│é̂ stacked mx界4👍yen text                                                                         │\n│→ ← ↑ ↓ ⇒ ½ ¼ x界5👍y ascii                                                                       │\n│🧑‍🤝‍🧑 zwj then asciix界6👍yen ascii                                                                  │\n│tab     separated       columns here                                                              │\n│                                                                                                  │\n│frame 6: ab界cd ef🇯🇵gh                                                                            │\n│                                                                                                  │\n│WIDE-DONE-42                                                                                      │\n│bash-5.3$                                                                                         │\n│                                                                                                  │\n│                                                                                                  │\n│                                                                                                  │\n│                                                                                                  │\n│                                                                                                  │\n│                                                                                                  │\n│                                                                                                  │\n│                                                                                                  │\n│                                                                                                  │\n│                                                                                                  │\n╰──────────────────────────────────────────────────────────────────────────────────────────────────╯\n  demo  claude/remote-session-sharing-research-79d74d 󱃾 docker-desktop via  v1.97.1 via  v24.14.0…\n"
+  },
+  "#288 head": {
+    "rows_differing": [
+      1,
+      9
+    ],
+    "diffs": [
+      {
+        "row": 1,
+        "shux": "❤️ x界1👍y 🇯🇵 st 👩‍💻 uv क्षि wx",
+        "wezterm": "❤️x界1👍y 🇯🇵 st 👩‍💻 uv क्ष wx"
+      },
+      {
+        "row": 9,
+        "shux": "frame 6: ab界cd❤️ef🇯🇵gh",
+        "wezterm": "frame 6: ab界cd ef🇯🇵gh"
+      }
+    ],
+    "inner": [
+      "ab界cd👍ef✓g─h│ij é kl ｱm Ａn",
+      "❤️x界1👍y 🇯🇵 st 👩‍💻 uv क्ष wx",
+      "plainx界2👍yrun: the quick brown fox 0123456789",
+      "漢字かなx界3👍y  and ascii after it 42",
+      "é̂ stacked mx界4👍yen text",
+      "→ ← ↑ ↓ ⇒ ½ ¼ x界5👍y ascii",
+      "🧑‍🤝‍🧑 zwj then asciix界6👍yen ascii",
+      "tab     separated       columns here",
+      "",
+      "frame 6: ab界cd ef🇯🇵gh",
+      "",
+      "WIDE-DONE-42"
+    ],
+    "screen": "╭─ bash ───────────────────────────────────────────────────────────────────────────────────────────╮\n│ab界cd👍ef✓g─h│ij é kl ｱm Ａn                                                                     │\n│❤️x界1👍y 🇯🇵 st 👩‍💻 uv क्ष wx                                                                      │\n│plainx界2👍yrun: the quick brown fox 0123456789                                                   │\n│漢字かなx界3👍y  and ascii after it 42                                                            │\n│é̂ stacked mx界4👍yen text                                                                         │\n│→ ← ↑ ↓ ⇒ ½ ¼ x界5👍y ascii                                                                       │\n│🧑‍🤝‍🧑 zwj then asciix界6👍yen ascii                                                                  │\n│tab     separated       columns here                                                              │\n│                                                                                                  │\n│frame 6: ab界cd ef🇯🇵gh                                                                            │\n│                                                                                                  │\n│WIDE-DONE-42                                                                                      │\n│bash-5.3$                                                                                         │\n│                                                                                                  │\n│                                                                                                  │\n│                                                                                                  │\n│                                                                                                  │\n│                                                                                                  │\n│                                                                                                  │\n│                                                                                                  │\n│                                                                                                  │\n│                                                                                                  │\n│                                                                                                  │\n╰──────────────────────────────────────────────────────────────────────────────────────────────────╯\n  demo  claude/remote-session-sharing-research-79d74d 󱃾 docker-desktop via  v1.97.1 via  v24.14.0…\n"
+  },
+  "sabotage": {
+    "rows_differing": [
+      1,
+      9
+    ],
+    "diffs": [
+      {
+        "row": 1,
+        "shux": "❤️ x界1👍y 🇯🇵 st 👩‍💻 uv क्षि wx",
+        "wezterm": "❤️x界1👍y 🇯🇵 st 👩‍💻 uv क्षि  wx"
+      },
+      {
+        "row": 9,
+        "shux": "frame 6: ab界cd❤️ef🇯🇵gh",
+        "wezterm": "frame 6: ab界cd ef🇯🇵gh"
+      }
+    ],
+    "inner": [
+      "ab界cd👍ef✓g─h│ij é kl ｱm Ａn",
+      "❤️x界1👍y 🇯🇵 st 👩‍💻 uv क्षि  wx",
+      "plainx界2👍yrun: the quick brown fox 0123456789",
+      "漢字かなx界3👍y  and ascii after it 42",
+      "é̂ stacked mx界4👍yen text",
+      "→ ← ↑ ↓ ⇒ ½ ¼ x界5👍y ascii",
+      "🧑‍🤝‍🧑 zwj then asciix界6👍yen ascii",
+      "tab     separated       columns here",
+      "",
+      "frame 6: ab界cd ef🇯🇵gh",
+      "",
+      "WIDE-DONE-42"
+    ],
+    "screen": "╭─ bash ───────────────────────────────────────────────────────────────────────────────────────────╮\n│ab界cd👍ef✓g─h│ij é kl ｱm Ａn                                                                     │\n│❤️x界1👍y 🇯🇵 st 👩‍💻 uv क्षि  wx                                                                      │\n│plainx界2👍yrun: the quick brown fox 0123456789                                                   │\n│漢字かなx界3👍y  and ascii after it 42                                                            │\n│é̂ stacked mx界4👍yen text                                                                         │\n│→ ← ↑ ↓ ⇒ ½ ¼ x界5👍y ascii                                                                       │\n│🧑‍🤝‍🧑 zwj then asciix界6👍yen ascii                                                                  │\n│tab     separated       columns here                                                              │\n│                                                                                                  │\n│frame 6: ab界cd ef🇯🇵gh                                                                            │\n│                                                                                                  │\n│WIDE-DONE-42                                                                                      │\n│bash-5.3$                                                                                         │\n│                                                                                                  │\n│                                                                                                  │\n│                                                                                                  │\n│                                                                                                  │\n│                                                                                                  │\n│                                                                                                  │\n│                                                                                                  │\n│                                                                                                  │\n│                                                                                                  │\n│                                                                                                  │\n╰──────────────────────────────────────────────────────────────────────────────────────────────────╯\n  demo  claude/remote-session-sharing-research-79d74d 󱃾 docker-desktop via  v1.97.1 via  v24.14.0…\n"
+  }
+}
