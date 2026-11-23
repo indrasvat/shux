@@ -126,3 +126,5 @@ BASE=f61f664` re-run at 7bff949: 0/0 on every layer. `make check` green at
 7bff949. The pixel metrics and WezTerm A/B above were measured before the
 rebase; #289 changes nothing a single viewer draws ("◉ N attached" appears
 only with two or more).
+
+Rebased again onto 91ab639 (the v0.57.4 release commit, version bumps only); commit_under_audit is now 8595c2b, its rebased copy. `make vt-neutrality BASE=91ab639` re-run at the new head: 0/0 on every layer.
