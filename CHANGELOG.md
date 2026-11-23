@@ -1,3 +1,10 @@
+## [0.57.4](https://github.com/indrasvat/shux/compare/v0.57.3...v0.57.4) (2026-11-23)
+
+
+### Bug Fixes
+
+* **attach:** release stuck viewers; see and detach who is attached ([#289](https://github.com/indrasvat/shux/issues/289)) ([f61f664](https://github.com/indrasvat/shux/commit/f61f6643d2ae6a897e101fabb85c6528f7e17843)), closes [#287](https://github.com/indrasvat/shux/issues/287) [#287](https://github.com/indrasvat/shux/issues/287) [#287](https://github.com/indrasvat/shux/issues/287)
+
 ## [0.57.3](https://github.com/indrasvat/shux/compare/v0.57.2...v0.57.3) (2026-11-20)
 
 
