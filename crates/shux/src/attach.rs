@@ -1862,6 +1862,11 @@ async fn run_attach_loop(
         });
     }
     let _ = renderer.await;
+    io_state
+        .lock()
+        .await
+        .mouse_release_written
+        .retain(|(_, client), _| *client != registry_id);
     // The next voter takes the panes the moment this one is gone.
     reconcile_session(&graph, &io_state, &config, session.session_id).await;
     io_state.lock().await.render_pulse.clone().bump();
@@ -12677,6 +12682,32 @@ mod tests {
         );
         cancel.cancel();
         render.await.expect("render loop");
+        fixture.stop();
+    }
+
+    /// A client that leaves takes its mouse-release waiters with it, so a
+    /// long-lived pane collects none from clients that come and go.
+    #[tokio::test(start_paused = true)]
+    async fn a_departed_client_leaves_no_release_waiter() {
+        let fixture = attach_fixture().await;
+        let (_w, _r, _s) = seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+        let client = Client::attach(&fixture, 100).await;
+        idle_for(QUIET).await;
+        let id = {
+            let io = fixture.io_state.lock().await;
+            io.clients.list().first().expect("the attached client").id
+        };
+        let (_tx, rx) = tokio::sync::oneshot::channel();
+        fixture
+            .io_state
+            .lock()
+            .await
+            .mouse_release_written
+            .insert((fixture.first_pane, id), rx);
+        client.stop().await;
+        idle_for(QUIET).await;
+        let left = fixture.io_state.lock().await.mouse_release_written.len();
+        assert_eq!(left, 0, "a departed client left a release waiter behind");
         fixture.stop();
     }
 
