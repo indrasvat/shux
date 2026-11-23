@@ -12133,9 +12133,11 @@ mod tests {
         b.catch_up().await;
         b.send(&left_button(MouseKind::Up, corner, b.written_frame))
             .await;
-        idle_for(QUIET).await;
-
+        // The program reads its input: the release is written, within the
+        // bound the takeover waits for it.
+        idle_for(Duration::from_millis(10)).await;
         let sent = drain(&mut writes);
+        idle_for(QUIET).await;
         let reports: Vec<&str> = sent.split("\x1b[<0;").skip(1).collect();
         let at = |r: &str| r[..r.len() - 1].to_string();
         assert_eq!(reports.len(), 2, "{sent:?}");
