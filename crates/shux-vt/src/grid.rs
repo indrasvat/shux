@@ -214,7 +214,7 @@ fn is_padding(cell: &Cell) -> bool {
         && cell.width == 1
         && cell.style.fg == Color::Default
         && cell.style.flags == Default::default()
-        && cell.extended.is_none()
+        && cell.visible_extended().is_none()
 }
 
 fn is_default_blank(cell: &Cell) -> bool {
@@ -296,8 +296,6 @@ pub struct Row {
     pub(crate) cells: Arc<Vec<Cell>>,
     /// Whether this row soft-wraps into the next row.
     pub wrapped: bool,
-    /// The last cell is the gap left where a wide glyph wrapped early.
-    pub(crate) wide_gap: bool,
 }
 
 /// Mutable access to one visible row.
@@ -341,7 +339,6 @@ impl Row {
         Row {
             cells: Arc::new(vec![Cell::default(); cols]),
             wrapped: false,
-            wide_gap: false,
         }
     }
 
@@ -371,7 +368,6 @@ impl Row {
     /// Resize the row, filling new cells with the given template.
     pub fn resize(&mut self, cols: usize, template: Cell) {
         self.cells_mut().resize(cols, template);
-        self.wide_gap = false;
     }
 
     /// Return the row to the state of `Row::new(cols)`, keeping the cell
@@ -383,7 +379,6 @@ impl Row {
         cells.clear();
         cells.resize(cols, Cell::default());
         self.wrapped = false;
-        self.wide_gap = false;
     }
 
     /// Reset all cells in the row to the given background color.
@@ -392,7 +387,6 @@ impl Row {
             cell.reset(bg);
         }
         self.wrapped = false;
-        self.wide_gap = false;
     }
 
     /// Overwrite every cell with the DECALN alignment pattern (issue #117).
@@ -409,7 +403,6 @@ impl Row {
     pub(crate) fn fill_alignment_pattern(&mut self) {
         self.cells_mut().fill(Cell::ALIGNMENT);
         self.wrapped = false;
-        self.wide_gap = false;
     }
 
     pub(crate) fn clear_wide_pair_around(&mut self, col: usize, bg: Color) {
@@ -1690,15 +1683,10 @@ impl ReflowedLineMap {
 }
 
 impl Row {
-    /// The cells a reflow reads: all of them, less a wide-glyph wrap gap
-    /// that still holds the blank it was left with.
+    /// The cells a reflow reads: all of them, less a wide-gap blank that
+    /// still ends a soft-wrapped row.
     fn reflow_cells(&self) -> &[Cell] {
-        let gap = self.wrapped
-            && self.wide_gap
-            && self
-                .cells
-                .last()
-                .is_some_and(|cell| cell.ch == ' ' && cell.width == 1 && cell.extended.is_none());
+        let gap = self.wrapped && self.cells.last().is_some_and(Cell::is_wide_gap);
         &self.cells[..self.cells.len() - usize::from(gap)]
     }
 }
@@ -1774,7 +1762,7 @@ fn append_reflowed_line(
         }
         if col + width > cols && col > 0 {
             row.wrapped = true;
-            row.wide_gap = true;
+            row[col] = Cell::wide_gap(Cell::default());
             rows.push_back(row);
             row = Row::new(cols);
             col = 0;
@@ -1850,7 +1838,6 @@ impl Grid {
             *cell = Cell::default();
         }
         r.sanitize_wide_pairs(Color::Default);
-        r.wide_gap = false;
         if count > 0 && col < len {
             self.dirty
                 .mark_range(row, col.saturating_sub(1)..len, self.rows, self.cols);
@@ -1867,15 +1854,21 @@ impl Grid {
         if actual == 0 {
             return;
         }
-        // Shift left.
+        // Shift left. A wide gap belongs to the edge, so it stays there.
         let cells = r.cells_mut();
+        let edge_gap = cells[len - 1].is_wide_gap();
         for i in col..(len - actual) {
             cells[i] = cells[i + actual].clone();
+            if cells[i].is_wide_gap() {
+                cells[i].extended = None;
+            }
         }
         // Fill right edge with blanks.
-        // The last cell is a fresh blank, so a wide-gap mark still holds.
         for cell in cells.iter_mut().skip(len - actual) {
             *cell = Cell::default();
+        }
+        if edge_gap {
+            cells[len - 1] = Cell::wide_gap(Cell::default());
         }
         r.sanitize_wide_pairs(Color::Default);
         self.dirty

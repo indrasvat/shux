@@ -568,14 +568,11 @@ impl<'a> VtHandler<'a> {
         }
     }
 
-    /// `wide_gap`: the last cell was left blank for a wide glyph that did not fit.
-    fn wrap_to_next_line(&mut self, wide_gap: bool) {
+    fn wrap_to_next_line(&mut self) {
         self.clear_active_grapheme_cell();
         self.cursor.col = 0;
         self.cursor.auto_wrap_pending = false;
-        let row = self.grid.visible_row_mut_marked(self.cursor.row);
-        row.wrapped = true;
-        row.wide_gap = wide_gap;
+        self.grid.visible_row_mut_marked(self.cursor.row).wrapped = true;
         if self.cursor.row == self.scroll_region.bottom {
             self.grid
                 .scroll_up(self.scroll_region.top, self.scroll_region.bottom);
@@ -623,7 +620,7 @@ impl<'a> VtHandler<'a> {
         // Handle auto-wrap pending state.
         if self.cursor.auto_wrap_pending {
             if self.modes.auto_wrap {
-                self.wrap_to_next_line(false);
+                self.wrap_to_next_line();
             } else {
                 // No auto-wrap: overwrite last column.
                 self.cursor.col = cols.saturating_sub(1);
@@ -646,7 +643,6 @@ impl<'a> VtHandler<'a> {
                 let row = self.grid.visible_row_mut_marked(self.cursor.row);
                 row.clear_wide_pair_around(col, self.cursor.style.bg);
                 row[col] = blank;
-                row.wide_gap = false;
             }
             self.cursor.auto_wrap_pending = false;
             self.clear_active_grapheme_cell();
@@ -659,12 +655,15 @@ impl<'a> VtHandler<'a> {
             {
                 let row = self.grid.visible_row_mut_marked(self.cursor.row);
                 row.clear_wide_pair_around(col, self.cursor.style.bg);
-                row[col] = blank;
-                // A gap only once the wrap below happens.
-                row.wide_gap = false;
+                // A gap only when the wrap below happens.
+                row[col] = if self.modes.auto_wrap {
+                    Cell::wide_gap(blank)
+                } else {
+                    blank
+                };
             }
             if self.modes.auto_wrap {
-                self.wrap_to_next_line(true);
+                self.wrap_to_next_line();
             } else {
                 self.cursor.auto_wrap_pending = false;
                 self.clear_active_grapheme_cell();
@@ -699,9 +698,6 @@ impl<'a> VtHandler<'a> {
             // For wide characters, write a continuation cell.
             if width == 2 && col + 1 < cols {
                 row[col + 1] = Cell::wide_continuation();
-            }
-            if col + width >= cols {
-                row.wide_gap = false;
             }
         }
         self.set_active_grapheme_cell(cursor_row, col);

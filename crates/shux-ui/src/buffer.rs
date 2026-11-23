@@ -124,7 +124,7 @@ impl RenderCell {
                 hidden: flags.contains(shux_vt::CellFlags::HIDDEN),
                 strikethrough: flags.contains(shux_vt::CellFlags::STRIKETHROUGH),
             },
-            extended: cell.extended.clone(),
+            extended: cell.visible_extended().cloned(),
             wide_continuation: cell.is_wide_continuation(),
         }
     }

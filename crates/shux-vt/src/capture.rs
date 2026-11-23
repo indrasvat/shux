@@ -846,7 +846,7 @@ fn cell_is_blank_default(cell: &Cell) -> bool {
     cell.ch == ' '
         && cell.width == 1
         && cell.style == CellStyle::default()
-        && cell.extended.is_none()
+        && cell.visible_extended().is_none()
 }
 
 struct RunBuilder {

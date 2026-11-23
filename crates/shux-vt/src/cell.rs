@@ -83,7 +83,7 @@ pub struct CellStyle {
 /// For the initial implementation, we use a slightly larger struct (approx 16 bytes)
 /// to prioritize correctness, but the API hides this detail so internal representation
 /// can be optimized later without breaking consumers.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Cell {
     /// The character.
     pub ch: char,
@@ -91,9 +91,27 @@ pub struct Cell {
     pub width: u8,
     /// Style attributes.
     pub style: CellStyle,
-    /// Extended attributes (hyperlink, underline color, etc.).
+    /// Extended attributes (hyperlink, underline color, etc.). Read it through
+    /// [`Cell::visible_extended`]: it may hold the wide-gap mark.
     pub extended: Option<Arc<ExtendedAttrs>>,
 }
+
+/// Equality ignores the wide-gap mark: it never changes what a cell shows.
+impl PartialEq for Cell {
+    fn eq(&self, other: &Self) -> bool {
+        self.ch == other.ch
+            && self.width == other.width
+            && self.style == other.style
+            && self.visible_extended() == other.visible_extended()
+    }
+}
+
+impl Eq for Cell {}
+
+/// The mark on the blank a wrap leaves where a wide glyph did not fit: all
+/// default attributes, told apart by identity.
+static WIDE_GAP: std::sync::LazyLock<Arc<ExtendedAttrs>> =
+    std::sync::LazyLock::new(|| Arc::new(ExtendedAttrs::default()));
 
 /// Extended attributes that are rare enough to be heap-allocated.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,6 +195,29 @@ impl Cell {
     /// Whether this cell is a wide-character continuation placeholder.
     pub fn is_wide_continuation(&self) -> bool {
         self.width == 0
+    }
+
+    /// `blank`, marked as the gap a wrap leaves before a wide glyph. Reflow
+    /// drops it; every reader sees `blank`.
+    pub(crate) fn wide_gap(blank: Cell) -> Cell {
+        Cell {
+            extended: Some(WIDE_GAP.clone()),
+            ..blank
+        }
+    }
+
+    pub(crate) fn is_wide_gap(&self) -> bool {
+        self.extended
+            .as_ref()
+            .is_some_and(|ext| Arc::ptr_eq(ext, &WIDE_GAP))
+    }
+
+    /// The extended attributes this cell shows: `extended` less the wide-gap
+    /// mark.
+    pub fn visible_extended(&self) -> Option<&Arc<ExtendedAttrs>> {
+        self.extended
+            .as_ref()
+            .filter(|ext| !Arc::ptr_eq(ext, &WIDE_GAP))
     }
 
     /// Whether this cell is a wide character (width 2).

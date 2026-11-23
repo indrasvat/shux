@@ -1975,6 +1975,31 @@ mod tests {
     }
 
     #[test]
+    fn a_blank_shifted_into_the_last_column_is_not_a_gap() {
+        let mut vt = VirtualTerminal::new(2, 3);
+        vt.process("ab界c\x1b[1;2H🇺🇸\x1b[1;1H\x1b[1P\x1b[1;3H".as_bytes());
+        vt.resize(2, 8);
+        vt.process(b"Z");
+        let row = vt.grid().visible_row(0);
+        let text: String = (2..row.len()).map(|c| row[c].ch).collect();
+        assert_eq!(text.trim_end(), "Z界 c");
+    }
+
+    #[test]
+    fn the_wide_gap_mark_is_invisible_to_equality_and_capture() {
+        let mut gap = VirtualTerminal::new(2, 3);
+        gap.process("ab界".as_bytes());
+        let mut plain = VirtualTerminal::new(2, 3);
+        plain.process("ab \r\n界".as_bytes());
+        let (g, p) = (
+            &gap.grid().visible_row(0)[2],
+            &plain.grid().visible_row(0)[2],
+        );
+        assert_eq!(g, p);
+        assert_eq!(gap.capture_text(None), plain.capture_text(None));
+    }
+
+    #[test]
     fn row_shrink_without_a_parked_cursor_lets_erase_fill_yield() {
         let mut vt = VirtualTerminal::new(6, 10);
         vt.process(b"\x1b[44m\x1b[2J\x1b[0mAB\x1b7\x1b[?1047h");
