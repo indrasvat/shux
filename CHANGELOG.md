@@ -1,3 +1,10 @@
+## [0.57.5](https://github.com/indrasvat/shux/compare/v0.57.4...v0.57.5) (2026-11-23)
+
+
+### Bug Fixes
+
+* **vt,attach:** links survive a colour reset; plain viewers; leaner redraws ([#290](https://github.com/indrasvat/shux/issues/290)) ([32ce0d0](https://github.com/indrasvat/shux/commit/32ce0d00ab7a40d1e55d7072f4033c7642646d30)), closes [#288](https://github.com/indrasvat/shux/issues/288) [#191](https://github.com/indrasvat/shux/issues/191) [#288](https://github.com/indrasvat/shux/issues/288) [#287](https://github.com/indrasvat/shux/issues/287) [#288](https://github.com/indrasvat/shux/issues/288) [#288](https://github.com/indrasvat/shux/issues/288) [#289](https://github.com/indrasvat/shux/issues/289)
+
 ## [0.57.4](https://github.com/indrasvat/shux/compare/v0.57.3...v0.57.4) (2026-11-23)
 
 
