@@ -33,6 +33,7 @@ pub(crate) async fn build_snapshot_status_bar(
     session_id: &shux_core::model::SessionId,
     window_id: shux_core::model::WindowId,
     cols: u16,
+    attached: usize,
     live_cfg: &shux_core::config::Config,
     meta_cache: &session_meta::SessionMetaCache,
     onboarding: &onboarding::OnboardingHandle,
@@ -102,6 +103,7 @@ pub(crate) async fn build_snapshot_status_bar(
         nerd_fonts,
         cols,
     );
+    statusbar_build::append_watchers(&mut bar, attached, &theme, cols, false);
     bar
 }
 
@@ -252,7 +254,7 @@ pub(crate) async fn snapshot_window(
     // rasterizing. The caller's `revision_panes` content_revisions are read
     // inside the SAME critical section so the rendered pixels and the
     // published revisions are provably same-lock (no VT-side tear).
-    let (pane_data, revisions): (Vec<PaneSnapshotData>, PaneRevisions) = {
+    let (pane_data, revisions, attached): (Vec<PaneSnapshotData>, PaneRevisions, usize) = {
         let state = io.lock().await;
         let pane_data = window
             .layout
@@ -272,7 +274,11 @@ pub(crate) async fn snapshot_window(
             .iter()
             .filter_map(|pid| state.vts.get(pid).map(|vt| (*pid, vt.content_revision())))
             .collect();
-        (pane_data, revisions)
+        (
+            pane_data,
+            revisions,
+            state.clients.count_for(window.session_id),
+        )
     };
 
     // Compose with the user's outline style: `compose` derives the pane viewport
@@ -323,6 +329,7 @@ pub(crate) async fn snapshot_window(
         &window.session_id,
         window_id,
         cols,
+        attached,
         &cfg,
         meta_cache,
         onboarding,
@@ -784,6 +791,7 @@ mod tests {
             &session_id,
             window_id,
             120,
+            2,
             &config.current(),
             &meta,
             &onb,
@@ -792,6 +800,7 @@ mod tests {
         .await;
 
         let right_text: String = bar.right.iter().map(|s| s.text.clone()).collect();
+        assert!(right_text.contains("◉ 2 attached"), "{right_text:?}");
         assert!(
             right_text.contains("shux-test-sentinel"),
             "expected snapshot status bar's right zone to contain the \

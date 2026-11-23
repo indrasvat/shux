@@ -67,6 +67,7 @@ pub enum RefKind {
     Session,
     Window,
     Pane,
+    Client,
 }
 
 impl RefKind {
@@ -76,6 +77,7 @@ impl RefKind {
             RefKind::Session => "session",
             RefKind::Window => "window",
             RefKind::Pane => "pane",
+            RefKind::Client => "client",
         }
     }
 }

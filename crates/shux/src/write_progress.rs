@@ -11,7 +11,7 @@ use futures::{Sink, SinkExt};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_util::sync::CancellationToken;
 
-/// A stream that counts the bytes its peer has taken.
+/// A stream that counts bytes accepted by its underlying writer.
 pub struct Metered<S> {
     inner: S,
     taken: Arc<AtomicU64>,
@@ -90,6 +90,8 @@ where
     check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
+            // Give a writable socket its turn before judging the interval.
+            biased;
             _ = cancel.cancelled() => return Sent::Cancelled,
             sent = &mut send => return if sent.is_ok() { Sent::Done } else { Sent::Closed },
             _ = check.tick() => {
@@ -165,6 +167,24 @@ mod tests {
             send_while_progressing(&mut sink, frame, &taken, STALL, &CancellationToken::new())
                 .await;
         assert_eq!(sent, Sent::Stalled);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_writable_socket_gets_polled_before_the_stall_check() {
+        let (mut sink, taken, mut peer) = slow_link();
+        let cancel = CancellationToken::new();
+        let frame = Bytes::from(vec![b'x'; 1024]);
+        let send = send_while_progressing(&mut sink, frame, &taken, STALL, &cancel);
+        tokio::pin!(send);
+
+        assert!(futures::poll!(&mut send).is_pending());
+        tokio::time::advance(STALL).await;
+        assert!(futures::poll!(&mut send).is_pending());
+        peer.read_exact(&mut [0; 1024])
+            .await
+            .expect("free socket space");
+        tokio::time::advance(STALL).await;
+        assert_eq!(futures::poll!(&mut send), Poll::Ready(Sent::Done));
     }
 
     #[tokio::test(start_paused = true)]

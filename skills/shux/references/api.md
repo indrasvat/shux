@@ -109,8 +109,12 @@ bar of a session shows `◉ N attached` once two or more are on it.
 `attached_at` is Unix seconds. `--format plain` prints one tab-separated
 line per client: id, session, `COLSxROWS`, `attached_at`.
 
-A client that takes no bytes at all for 10–20 s (progress is checked every
-10 s) is dropped; a slow one that keeps reading stays. Events:
+A client is dropped when a frame it is sent makes no progress for 10–20 s
+(checked every 10 s), or when, after 15 s with nothing to send, it does not
+answer the daemon's `ping` (any client frame counts; reply `{"type":"pong"}`)
+within another 15 s. A slow client that keeps reading stays. A removed
+client gets at most the frame already on the wire, then `session_ended`
+`{"reason":"removed"}`; its queued screens are dropped. Events:
 `client.connected` (`terminal_cols`, `terminal_rows`), `client.resized`,
 `client.disconnected` (`reason`: `detached`, `closed`, `removed`,
 `connection_lost`, `session_destroyed`, `daemon_stopped`), and

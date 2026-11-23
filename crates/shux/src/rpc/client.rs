@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use shux_core::idref::{self, ParsedRef, RefKind};
 use shux_rpc::{Policy, Sensitivity};
 use tokio::sync::Mutex;
 
@@ -55,14 +56,7 @@ pub(crate) fn register_client_methods(
                 async move {
                     let params = params.unwrap_or_default();
                     let raw = match params.get("id") {
-                        Some(serde_json::Value::String(s)) if !s.trim().is_empty() => {
-                            s.trim().to_ascii_lowercase()
-                        }
-                        Some(serde_json::Value::String(_)) => {
-                            return Err(shux_rpc::RpcError::invalid_params(
-                                "'id' is empty; `shux client list` shows the ids",
-                            ));
-                        }
+                        Some(serde_json::Value::String(s)) => s,
                         Some(_) => {
                             return Err(shux_rpc::RpcError::invalid_params(
                                 "'id' must be a string",
@@ -75,40 +69,31 @@ pub(crate) fn register_client_methods(
                             shux_rpc::ErrorCode::NotFound,
                             serde_json::json!({
                                 "resource": "client",
-                                "id": raw,
+                                "id": raw.trim(),
                                 "hint": "`shux client list` shows the attached clients",
                             }),
                         )
                     };
+                    let parsed = idref::parse_ref(RefKind::Client, raw)
+                        .map_err(|e| super::params::ref_error_to_rpc(e, "id"))?;
                     let clients = io.lock().await.clients.clone();
-                    // A unique prefix works, like the short ids `client list` prints.
-                    let matches: Vec<String> = clients
-                        .list()
-                        .into_iter()
-                        .map(|c| c.id.0.to_string())
-                        .filter(|id| id.starts_with(&raw))
-                        .collect();
-                    let [target] = matches.as_slice() else {
-                        return Err(if matches.is_empty() {
-                            not_found()
-                        } else {
-                            shux_rpc::RpcError::ambiguous_ref(
-                                "client",
-                                &raw,
-                                &matches,
-                                matches.len(),
-                            )
-                        });
+                    let target = match parsed {
+                        ParsedRef::Exact(id) => id,
+                        ParsedRef::Prefix(prefix) => idref::match_prefix(
+                            RefKind::Client,
+                            raw,
+                            &prefix,
+                            clients.list().into_iter().map(|c| c.id.0),
+                        )
+                        .map_err(|e| match e {
+                            idref::RefError::NotFound { .. } => not_found(),
+                            _ => super::params::ref_error_to_rpc(e, "id"),
+                        })?,
                     };
-                    let id = shux_core::event::ClientId::from(
-                        uuid::Uuid::parse_str(target)
-                            .map_err(|e| shux_rpc::RpcError::internal(&e.to_string()))?,
-                    );
-                    if !clients.remove(id) {
+                    if !clients.remove(target.into()) {
                         return Err(not_found());
                     }
-                    let target = target.clone();
-                    Ok(serde_json::json!({ "detached": target }))
+                    Ok(serde_json::json!({ "detached": target.to_string() }))
                 }
             },
         )
@@ -171,7 +156,7 @@ mod tests {
         let missing = dispatch_err(
             &h.router,
             "client.detach",
-            serde_json::json!({"id": "zzzz"}),
+            serde_json::json!({"id": "bbbb"}),
         )
         .await;
         assert_eq!(
@@ -218,5 +203,20 @@ mod tests {
             "{empty:?}"
         );
         assert!(!end_b.is_cancelled(), "an empty id detached a client");
+
+        for raw in ["a", "zzzz"] {
+            let err =
+                dispatch_err(&h.router, "client.detach", serde_json::json!({"id": raw})).await;
+            assert_eq!(err.code, shux_rpc::ErrorCode::InvalidParams.code());
+            assert!(!end_b.is_cancelled());
+        }
+        let done = dispatch_ok(
+            &h.router,
+            "client.detach",
+            serde_json::json!({"id": b.simple().to_string()}),
+        )
+        .await;
+        assert_eq!(done["detached"], b.to_string());
+        assert!(end_b.is_cancelled());
     }
 }
