@@ -81,8 +81,12 @@ thin pipe:
 - **Client → daemon**: keystrokes encoded by crossterm, mouse events,
   resize notifications.
 
-This is the same architecture tmux uses. Multiple clients can attach
-independently; they all see the same session state.
+Multiple clients can attach independently; they all see the same session
+state, each laid out at its own terminal size. A pane's PTY has one size, so
+one client per session drives it: the one whose input is most recent (see
+`pane.set_size` in skills/shux/references/api.md). One daemon task applies
+the driver's size after any change to clients, pins or layout; panes pinned
+with `pane set-size` keep theirs.
 
 ## Events as integration surface
 

@@ -7,6 +7,7 @@ use std::time::Duration;
 use shux_rpc::{Policy, Sensitivity};
 use tokio::sync::Mutex;
 
+use crate::clients::PinGuard;
 use crate::lens_render::{
     glance_row_text, lens_pixel_budget_check, parse_glance_masks, render_lens_heat_png,
 };
@@ -1866,6 +1867,36 @@ pub(crate) fn register_pane_io_methods(
                 async move {
                     let params = params.unwrap_or_default();
                     let pane_id = resolve_pane_id_from_params(&gh, &params)?;
+                    let clients = io.lock().await.clients.clone();
+                    // `unpin`: back to the layout's size, from the next reconcile.
+                    let unpin = match params.get("unpin") {
+                        None | Some(serde_json::Value::Bool(false)) => false,
+                        Some(serde_json::Value::Bool(true)) => true,
+                        Some(_) => {
+                            return Err(shux_rpc::RpcError::invalid_params(
+                                "'unpin' must be true or false",
+                            ));
+                        }
+                    };
+                    if unpin {
+                        if !gh.snapshot().panes.contains_key(&pane_id) {
+                            return Err(shux_rpc::RpcError::not_found(
+                                "pane",
+                                &pane_id.to_string(),
+                            ));
+                        }
+                        if params.get("cols").is_some() || params.get("rows").is_some() {
+                            return Err(shux_rpc::RpcError::invalid_params(
+                                "'unpin' takes no 'cols' or 'rows'",
+                            ));
+                        }
+                        let was = clients.unpin(pane_id);
+                        return Ok(serde_json::json!({
+                            "pane_id": pane_id.to_string(),
+                            "pinned": false,
+                            "was_pinned": was,
+                        }));
+                    }
                     // Validate in u64-space BEFORE narrowing — `as u16` silently
                     // wraps `cols=66536` to 1000 and lets it through (codex
                     // review). Sanity bounds: 4..=1000 cols, 2..=1000 rows.
@@ -1900,18 +1931,35 @@ pub(crate) fn register_pane_io_methods(
                     let resizer = resizer.ok_or_else(|| {
                         shux_rpc::RpcError::not_found("pane resizer", &pane_id.to_string())
                     })?;
-                    resizer
-                        .send(ResizeRequest {
-                            size: pty_size,
-                            ack: Some(ack_tx),
-                        })
+                    // The slot is reserved first, then the pin and the send
+                    // happen in one sizing turn: a layout resize is either
+                    // queued ahead of this one or sees the pin.
+                    let permit = resizer
+                        .reserve()
                         .await
                         .map_err(|_| shux_rpc::RpcError::internal("pane resize channel closed"))?;
+                    let pin = {
+                        let _turn = clients.sizing_turn().await;
+                        let mut state = io.lock().await;
+                        // No await from here to the send: a cancel cannot
+                        // leave the size recorded but unsent, or sent but
+                        // unrecorded.
+                        let pin = PinGuard::take(&clients, pane_id);
+                        state.requested_sizes.insert(pane_id, pty_size);
+                        permit.send(ResizeRequest {
+                            size: pty_size,
+                            ack: Some(ack_tx),
+                        });
+                        pin
+                    };
                     resize_acked(ack_rx).await?;
+                    pin.keep();
                     Ok(serde_json::json!({
                         "pane_id": pane_id.to_string(),
                         "rows": rows,
                         "cols": cols,
+                        // An unpin that landed meanwhile wins; say so.
+                        "pinned": clients.is_pinned(pane_id),
                     }))
                 }
             },

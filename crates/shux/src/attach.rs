@@ -546,12 +546,6 @@ async fn handle_attach_connection(
             }
         }
     }
-    // Resize every pane in the active window to its real layout rect, not
-    // the full client size. Multi-pane TUIs (vim, htop, less) read TIOCGWINSZ
-    // and will lay themselves out wrong if every pane PTY pretends to be
-    // the whole screen.
-    apply_resize_to_window(&graph, &io_state, &session, &config, hello.cols, hello.rows).await;
-
     // Listed before it is told it is attached, so it can find itself.
     let removed = CancellationToken::new();
     let (cols, rows) = clamp_client_dims(hello.cols, hello.rows);
@@ -563,9 +557,13 @@ async fn handle_attach_connection(
             cols,
             rows,
             attached_at: std::time::SystemTime::now(),
+            votes: true,
+            last_input: None,
         },
         removed.clone(),
     );
+    // Panes take the driver's size: this client's only if it is the first.
+    reconcile_session(&graph, &io_state, &config, session.session_id).await;
 
     // Step 3: Send AttachReady::Ok.
     let ready = AttachReady::Ok {
@@ -808,74 +806,188 @@ async fn resolve_or_create_session(
 async fn apply_resize_to_window(
     graph: &GraphHandle,
     io_state: &Arc<Mutex<PaneIoState>>,
-    session: &AttachedSession,
+    window_id: WindowId,
     config: &ConfigHandle,
     cols: u16,
     rows: u16,
-) {
-    let (cols, rows) = clamp_client_dims(cols, rows);
+) -> bool {
     let snap = graph.snapshot();
-    let win = match snap.windows.get(&session.active_window_id) {
-        Some(w) => w,
-        None => return,
+    let Some(win) = snap.windows.get(&window_id) else {
+        return false;
     };
-    let content_h = rows.saturating_sub(STATUS_BAR_ROWS);
-    let content = Rect::new(0, 0, cols, content_h);
-    let viewport = shux_ui::pane_viewport(
-        content,
-        BorderStyle::parse(&config.current().appearance.border_style),
-        false,
-    );
-
-    // Drain the resizer senders out from under the lock so we never await
-    // a channel send while still holding the PaneIoState mutex. Attach
-    // fan-out is fire-and-forget (ack=None); the synchronous path is
-    // `pane.set_size` RPC which constructs its own oneshot.
-    let mut to_send: Vec<(mpsc::Sender<crate::pane_io::ResizeRequest>, PtySize)> = Vec::new();
-
-    if win.layout.is_zoomed() {
-        // Zoomed: every pane in the tree reports the full content area
-        // size so apps in the zoomed pane lay out correctly, while
-        // others stay at the same nominal size (cheap, harmless).
-        //
-        // The floor matters as much here as in the tiled branch below: the
-        // client picks `rows`, and a zoomed window subtracts the status bar
-        // from it with no layout arithmetic in between, so `rows <= 1` used to
-        // reach the PTY and the VT as a pane of height 0 (issue #107).
-        let state = io_state.lock().await;
-        let pane_ids = win
-            .layout
-            .zoom
-            .as_ref()
-            .map(|zoom| zoom.saved_layout.pane_ids())
-            .unwrap_or_else(|| win.layout.tree.pane_ids());
-        for pid in pane_ids {
-            if let Some(tx) = state.resizers.get(&pid) {
-                to_send.push((
-                    tx.clone(),
-                    PtySize::new(
-                        content.width.max(MIN_PANE_COLS),
-                        content.height.max(MIN_PANE_ROWS),
-                    ),
-                ));
-            }
+    let border = BorderStyle::parse(&config.current().appearance.border_style);
+    let sizes = window_sizes(&win.layout, border, cols, rows);
+    let mut state = io_state.lock().await;
+    let mut resized = false;
+    for (pid, size) in sizes {
+        if !needs_size(&state, pid, size) {
+            continue;
         }
-    } else {
-        let rects = win.layout.tree.compute_rects(viewport);
-        let state = io_state.lock().await;
-        for (pid, rect) in rects {
-            if let Some(tx) = state.resizers.get(&pid) {
-                let r_cols = rect.width.max(MIN_PANE_COLS);
-                let r_rows = rect.height.max(MIN_PANE_ROWS);
-                to_send.push((tx.clone(), PtySize::new(r_cols, r_rows)));
+        let Some(tx) = state.resizers.get(&pid).cloned() else {
+            continue;
+        };
+        // Never wait on a pane's queue: a backpressured pane would stall
+        // every session's sizing. A full queue retries once it has room.
+        match tx.try_send(crate::pane_io::ResizeRequest { size, ack: None }) {
+            Ok(()) => {
+                state.requested_sizes.insert(pid, size);
+                resized = true;
             }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                let clients = state.clients.clone();
+                tokio::spawn(async move {
+                    if tx.reserve().await.is_ok() {
+                        clients.touch();
+                    }
+                });
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
         }
     }
+    resized
+}
 
-    for (tx, size) in to_send {
-        let _ = tx
-            .send(crate::pane_io::ResizeRequest { size, ack: None })
-            .await;
+/// Each shown pane's size in a window laid out for a `cols`x`rows` client.
+/// Zoomed: the zoomed pane takes the full content area; the hidden ones keep
+/// their sizes, so their programs see no SIGWINCH for a zoom they cannot see.
+/// Sizes are floored: `rows <= 1` once reached a PTY as height 0 (issue #107).
+fn window_sizes(
+    layout: &shux_core::layout::WindowLayout,
+    border: BorderStyle,
+    cols: u16,
+    rows: u16,
+) -> Vec<(PaneId, PtySize)> {
+    let (cols, rows) = clamp_client_dims(cols, rows);
+    let content = Rect::new(0, 0, cols, rows.saturating_sub(STATUS_BAR_ROWS));
+    let floor = |w: u16, h: u16| PtySize::new(w.max(MIN_PANE_COLS), h.max(MIN_PANE_ROWS));
+    if layout.is_zoomed() {
+        let size = floor(content.width, content.height);
+        return layout.zoom.iter().map(|z| (z.zoomed_pane, size)).collect();
+    }
+    layout
+        .tree
+        .compute_rects(shux_ui::pane_viewport(content, border, false))
+        .into_iter()
+        .map(|(pid, rect)| (pid, floor(rect.width, rect.height)))
+        .collect()
+}
+
+/// The size a pane about to spawn should start at: its rect for its session's
+/// driver, as last sized. None when nothing sizes it (no driver yet, or pinned).
+pub(crate) async fn spawn_size(
+    graph: &GraphHandle,
+    io_state: &Arc<Mutex<PaneIoState>>,
+    pane: PaneId,
+) -> Option<PtySize> {
+    let snap = graph.snapshot();
+    let window = snap.windows.get(&snap.panes.get(&pane)?.window_id)?;
+    let state = io_state.lock().await;
+    if state.clients.is_pinned(pane) {
+        return None;
+    }
+    let (cols, rows, border) = state.layout_basis.get(&window.session_id)?.clone();
+    window_sizes(&window.layout, BorderStyle::parse(&border), cols, rows)
+        .into_iter()
+        .find_map(|(pid, size)| (pid == pane).then_some(size))
+}
+
+/// A pane takes the layout's size unless it is pinned or was last asked for
+/// that size; a queued request counts, so a correction is never skipped.
+fn needs_size(state: &PaneIoState, pane: PaneId, size: PtySize) -> bool {
+    let want = (usize::from(size.cols), usize::from(size.rows));
+    let have = match state.requested_sizes.get(&pane) {
+        Some(s) => Some((usize::from(s.cols), usize::from(s.rows))),
+        None => state
+            .vts
+            .get(&pane)
+            .map(|vt| (vt.grid().cols(), vt.grid().rows())),
+    };
+    !state.clients.is_pinned(pane) && have != Some(want)
+}
+
+/// Size a session's active window by its driver, the client whose input is
+/// most recent; with no voting client attached, sizes stay as they are.
+pub(crate) async fn reconcile_session(
+    graph: &GraphHandle,
+    io_state: &Arc<Mutex<PaneIoState>>,
+    config: &ConfigHandle,
+    session: SessionId,
+) -> bool {
+    let clients = io_state.lock().await.clients.clone();
+    let _turn = clients.sizing_turn().await;
+    let Some(driver) = clients.driver(session) else {
+        // Nobody sizes it now: a pane spawned later starts at its default.
+        io_state.lock().await.layout_basis.remove(&session);
+        return false;
+    };
+    let Some(window) = graph
+        .snapshot()
+        .sessions
+        .get(&session)
+        .map(|s| s.active_window)
+    else {
+        return false;
+    };
+    let border = config.current().appearance.border_style.clone();
+    io_state
+        .lock()
+        .await
+        .layout_basis
+        .insert(session, (driver.cols, driver.rows, border));
+    apply_resize_to_window(graph, io_state, window, config, driver.cols, driver.rows).await
+}
+
+/// The daemon's one sizing loop for changes no attach connection sees: a pin,
+/// a pane that just became resizable, a window focused or split over RPC.
+/// Each pass sizes every session by its driver and wakes the render loops,
+/// so an idle client draws the window its session now shows.
+pub(crate) async fn run_size_reconciler(
+    graph: GraphHandle,
+    io_state: Arc<Mutex<PaneIoState>>,
+    config: ConfigHandle,
+    cancel: CancellationToken,
+) {
+    let (clients, bus) = {
+        let io = io_state.lock().await;
+        (io.clients.clone(), io.event_bus.clone())
+    };
+    let mut changed = clients.changed();
+    let mut layout = bus.map(|bus| {
+        bus.subscribe_filtered(vec![
+            "pane.created".into(),
+            "pane.exited".into(),
+            "pane.zoomed".into(),
+            "window.".into(),
+        ])
+    });
+    loop {
+        let mut redraw = false;
+        tokio::select! {
+            () = cancel.cancelled() => return,
+            r = changed.changed() => {
+                if r.is_err() {
+                    return;
+                }
+            }
+            ev = async {
+                match layout.as_mut() {
+                    Some(sub) => sub.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if ev.is_none() {
+                    layout = None;
+                }
+                redraw = true;
+            }
+        }
+        let sessions: Vec<SessionId> = graph.snapshot().sessions.keys().copied().collect();
+        for session in sessions {
+            redraw |= reconcile_session(&graph, &io_state, &config, session).await;
+        }
+        if redraw {
+            io_state.lock().await.render_pulse.clone().bump();
+        }
     }
 }
 
@@ -1099,12 +1211,7 @@ async fn run_attach_loop(
                 let live = config.current().appearance.border_style.clone();
                 if live != last_border_style {
                     last_border_style = live;
-                    let attached = render_session.lock().await.clone();
-                    let (cols, rows) = *client_size.lock().await;
-                    apply_resize_to_window(
-                        &graph, &io_state, &attached, &config, cols, rows,
-                    )
-                    .await;
+                    reconcile_session(&graph, &io_state, &config, session.session_id).await;
                     let pulse = io_state.lock().await.render_pulse.clone();
                     pulse.bump();
                 }
@@ -1142,6 +1249,11 @@ async fn run_attach_loop(
                             Ok(b) => b,
                             Err(_) => continue,
                         };
+                        // A key, or a paste's first piece, goes to the pane
+                        // focused now; a paste stays with the pane it began in.
+                        if paste.is_none() || pasting.is_none() {
+                            sync_focus(&graph, &mut session, &render_session).await;
+                        }
                         // Help-overlay capture: while the cheat sheet
                         // is on screen, every keystroke either dismisses
                         // (Esc 0x1b, 'q' 0x71) or is swallowed. We must
@@ -1325,8 +1437,14 @@ async fn run_attach_loop(
                                     } else {
                                         backlog.waited + waited
                                     };
-                                    let mut state = io_state.lock().await;
-                                    send_input(&mut state, target, permit, bytes, paste, client_id);
+                                    {
+                                        let mut state = io_state.lock().await;
+                                        send_input(&mut state, target, permit, bytes, paste, client_id);
+                                    }
+                                    // Typing is what makes a client the driver.
+                                    if clients.mark_input(registry_id, tokio::time::Instant::now()) {
+                                        reconcile_session(&graph, &io_state, &config, session.session_id).await;
+                                    }
                                 }
                                 Room::Closed => {
                                     input_backlogs.remove(&target);
@@ -1365,12 +1483,13 @@ async fn run_attach_loop(
                                 new_rows: rows,
                             });
                         }
-                        let attached = render_session.lock().await.clone();
-                        apply_resize_to_window(&graph, &io_state, &attached, &config, cols, rows).await;
+                        // Only the driver's size reaches the panes.
+                        reconcile_session(&graph, &io_state, &config, session.session_id).await;
                         let pulse = io_state.lock().await.render_pulse.clone();
                         pulse.bump();
                     }
                     AttachClientFrame::Action { kind, args } => {
+                        sync_focus(&graph, &mut session, &render_session).await;
                         // The user pressed prefix + key — onboarding hint
                         // can dismiss. Cheap idempotent write; first call
                         // persists, subsequent ones short-circuit.
@@ -1413,13 +1532,16 @@ async fn run_attach_loop(
                             let mut s = render_session.lock().await;
                             s.last_action = Some((label.into(), std::time::Instant::now()));
                         }
-                        // Layout-changing actions invalidate per-pane PTY
-                        // sizes. Re-fan the winsizes so vim/htop/etc. inside
-                        // each pane learn their new dimensions.
-                        if action_changes_layout(kind) {
-                            let attached = render_session.lock().await.clone();
-                            let (cols, rows) = *client_size.lock().await;
-                            apply_resize_to_window(&graph, &io_state, &attached, &config, cols, rows).await;
+                        // An action that did something is input, and may have
+                        // changed the layout the panes are sized from.
+                        let committed = action_result.is_ok()
+                            && !matches!(
+                                kind,
+                                ActionKind::Redraw | ActionKind::ToggleHelp | ActionKind::EnterCopyMode
+                            );
+                        if committed {
+                            clients.mark_input(registry_id, tokio::time::Instant::now());
+                            reconcile_session(&graph, &io_state, &config, session.session_id).await;
                         }
                         let pulse = io_state.lock().await.render_pulse.clone();
                         pulse.bump();
@@ -1477,6 +1599,12 @@ async fn run_attach_loop(
                         .await
                         {
                             Ok(AppMouse::Consumed { redraw }) => {
+                                // A press or wheel the app received is input.
+                                if matches!(kind, MouseKind::Down | MouseKind::ScrollUp | MouseKind::ScrollDown)
+                                    && clients.mark_input(registry_id, tokio::time::Instant::now())
+                                {
+                                    reconcile_session(&graph, &io_state, &config, session.session_id).await;
+                                }
                                 if redraw {
                                     let pulse = io_state.lock().await.render_pulse.clone();
                                     pulse.bump();
@@ -1486,6 +1614,7 @@ async fn run_attach_loop(
                             Ok(AppMouse::NotHandled) => {}
                             Err(error) => { unhandled_mouse(error); }
                         }
+                        let focus_before = focused_pane(&graph, session.session_id);
                         if handle_mouse_selection(
                             kind,
                             button,
@@ -1501,6 +1630,14 @@ async fn run_attach_loop(
                         )
                         .await.unwrap_or_else(unhandled_mouse)
                         {
+                            // A press that focused another pane is input; a
+                            // selection inside the focused one is not.
+                            if kind == MouseKind::Down
+                                && focused_pane(&graph, session.session_id) != focus_before
+                                && clients.mark_input(registry_id, tokio::time::Instant::now())
+                            {
+                                reconcile_session(&graph, &io_state, &config, session.session_id).await;
+                            }
                             let pulse = io_state.lock().await.render_pulse.clone();
                             pulse.bump();
                             continue;
@@ -1558,6 +1695,11 @@ async fn run_attach_loop(
                         .await
                         {
                             warn!(?kind, error = %e, "attach: mouse handle failed");
+                        }
+                        // Click-to-focus and a border drag are input too.
+                        if matches!(kind, MouseKind::Down | MouseKind::Drag) {
+                            clients.mark_input(registry_id, tokio::time::Instant::now());
+                            reconcile_session(&graph, &io_state, &config, session.session_id).await;
                         }
                         let pulse = io_state.lock().await.render_pulse.clone();
                         pulse.bump();
@@ -1618,6 +1760,8 @@ async fn run_attach_loop(
         });
     }
     let _ = renderer.await;
+    // The next voter takes the panes the moment this one is gone.
+    reconcile_session(&graph, &io_state, &config, session.session_id).await;
     io_state.lock().await.render_pulse.clone().bump();
 
     // A gesture forwarded to a pane app outlives the attach: the PTY does not
@@ -1784,7 +1928,20 @@ async fn run_render_loop(
 
         // Build a multi-pane frame snapshot.
         let snap = graph.snapshot();
-        let attached = session.lock().await.clone();
+        // Show the window and pane the session shows, though another client
+        // or an RPC moved them and this one has sent nothing since.
+        // Drawn from this snapshot only: the input loop owns the cached
+        // focus, and a stale frame must not write an old window back.
+        let attached = {
+            let mut s = session.lock().await.clone();
+            if let Some(sess) = snap.sessions.get(&s.session_id)
+                && let Some(w) = snap.windows.get(&sess.active_window)
+            {
+                s.active_window_id = sess.active_window;
+                s.active_pane_id = w.active_pane;
+            }
+            s
+        };
 
         // Toggling the help overlay needs a full redraw — the diffing
         // backend would otherwise leave overlay glyphs on screen after
@@ -3336,6 +3493,13 @@ async fn select_pane_on_press(
     redraw
 }
 
+/// The pane a session shows focused now, from the graph.
+fn focused_pane(graph: &GraphHandle, session: SessionId) -> Option<PaneId> {
+    let snap = graph.snapshot();
+    let window = snap.sessions.get(&session)?.active_window;
+    snap.windows.get(&window).map(|w| w.active_pane)
+}
+
 /// Copy the session's live focus into this client's cache. `false` once the
 /// session is gone.
 async fn sync_focus(
@@ -3625,28 +3789,6 @@ fn pane_local_point_clamped(rect: Rect, col: u16, row: u16) -> (u16, u16) {
     let local_col = col.saturating_sub(rect.x).min(max_col);
     let local_row = row.saturating_sub(rect.y).min(max_row);
     (local_col, local_row)
-}
-
-/// True if an action mutates the pane layout in a way that changes the
-/// rect size of one or more visible panes. Used to decide whether to
-/// re-fan PTY winsize after dispatching the action.
-fn action_changes_layout(kind: ActionKind) -> bool {
-    matches!(
-        kind,
-        ActionKind::SplitSmart
-            | ActionKind::SplitVertical
-            | ActionKind::SplitHorizontal
-            | ActionKind::ToggleZoom
-            | ActionKind::KillPane
-            | ActionKind::ResizeLeft
-            | ActionKind::ResizeRight
-            | ActionKind::ResizeUp
-            | ActionKind::ResizeDown
-            | ActionKind::NewWindow
-            | ActionKind::NextWindow
-            | ActionKind::PrevWindow
-            | ActionKind::SwitchToWindow
-    )
 }
 
 /// Compute the focused pane's content rect (cols, rows) — the size
@@ -5062,7 +5204,7 @@ mod tests {
         apply_resize_to_window(
             &fixture.graph,
             &fixture.io_state,
-            &fixture.attached,
+            fixture.attached.active_window_id,
             &test_config(),
             100,
             30,
@@ -5094,7 +5236,7 @@ mod tests {
         apply_resize_to_window(
             &fixture.graph,
             &fixture.io_state,
-            &fixture.attached,
+            fixture.attached.active_window_id,
             &test_config(),
             100,
             30,
@@ -5102,13 +5244,92 @@ mod tests {
         .await;
 
         let first_zoomed = first_resize_rx.recv().await.expect("first zoom resize");
-        let second_zoomed = second_resize_rx.recv().await.expect("second zoom resize");
         assert_eq!((first_zoomed.size.cols, first_zoomed.size.rows), (100, 29));
-        assert_eq!(
-            (second_zoomed.size.cols, second_zoomed.size.rows),
-            (100, 29)
+        assert!(
+            second_resize_rx.try_recv().is_err(),
+            "zoom resized the hidden pane"
         );
 
+        fixture.stop();
+    }
+
+    /// A resize still queued counts: sizing back to what the terminal shows
+    /// now must still go out, or the pane is left at the queued size.
+    #[tokio::test]
+    async fn a_correction_behind_a_queued_resize_is_sent() {
+        let fixture = attach_fixture().await;
+        let (_, mut rx, _) = seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+        fixture
+            .graph
+            .zoom_pane(fixture.first_pane, None)
+            .await
+            .expect("zoom");
+        let window = fixture.attached.active_window_id;
+        apply_resize_to_window(
+            &fixture.graph,
+            &fixture.io_state,
+            window,
+            &test_config(),
+            100,
+            30,
+        )
+        .await;
+        // The seeded terminal is 40x6: this asks for exactly that, while
+        // 100x29 is still queued.
+        apply_resize_to_window(
+            &fixture.graph,
+            &fixture.io_state,
+            window,
+            &test_config(),
+            40,
+            7,
+        )
+        .await;
+        let sizes: Vec<(u16, u16)> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|r| (r.size.cols, r.size.rows))
+            .collect();
+        assert_eq!(
+            sizes,
+            vec![(100, 29), (40, 6)],
+            "the correction was skipped"
+        );
+        fixture.stop();
+    }
+
+    /// A pane whose resize queue is full holds up no other sizing: the call
+    /// returns at once and the size goes out once the queue has room.
+    #[tokio::test]
+    async fn a_full_resize_queue_blocks_nothing() {
+        let fixture = attach_fixture().await;
+        let (_, mut rx, _) = seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+        let tx = fixture.io_state.lock().await.resizers[&fixture.first_pane].clone();
+        while tx
+            .try_send(crate::pane_io::ResizeRequest {
+                size: PtySize::new(50, 10),
+                ack: None,
+            })
+            .is_ok()
+        {}
+        let mut changed = fixture.io_state.lock().await.clients.changed();
+        changed.borrow_and_update();
+        tokio::time::timeout(
+            shux_testkit::BUDGET,
+            apply_resize_to_window(
+                &fixture.graph,
+                &fixture.io_state,
+                fixture.attached.active_window_id,
+                &test_config(),
+                100,
+                30,
+            ),
+        )
+        .await
+        .expect("sizing waited on a full queue");
+        rx.recv().await.expect("a queued resize");
+        tokio::time::timeout(shux_testkit::BUDGET, changed.changed())
+            .await
+            .expect("room in the queue never woke the sizer")
+            .expect("registry alive");
         fixture.stop();
     }
 
@@ -5152,20 +5373,28 @@ mod tests {
                 (1200, 1200),
                 (4000, 4000),
             ] {
+                // Sizes that clamp alike would be skipped as already asked for.
+                fixture.io_state.lock().await.requested_sizes.clear();
                 apply_resize_to_window(
                     &fixture.graph,
                     &fixture.io_state,
-                    &fixture.attached,
+                    fixture.attached.active_window_id,
                     &test_config(),
                     cols,
                     rows,
                 )
                 .await;
 
-                for (label, rx) in [
-                    ("first", &mut first_resize_rx),
-                    ("second", &mut second_resize_rx),
-                ] {
+                // Zoomed, the hidden pane keeps its size and gets no resize.
+                let panes = if zoomed {
+                    vec![("first", &mut first_resize_rx)]
+                } else {
+                    vec![
+                        ("first", &mut first_resize_rx),
+                        ("second", &mut second_resize_rx),
+                    ]
+                };
+                for (label, rx) in panes {
                     let req = tokio::time::timeout(shux_testkit::BUDGET, rx.recv())
                         .await
                         .unwrap_or_else(|_| panic!("{label} resize (zoomed={zoomed})"))
@@ -5966,11 +6195,18 @@ mod tests {
             ))
             .await
             .expect("send resize");
-        let resized = tokio::time::timeout(shux_testkit::BUDGET, resize_rx.recv())
-            .await
-            .expect("resize timeout")
-            .expect("resize request");
-        assert_eq!(resized.size.rows, 27);
+        // Nothing applies the sizes here, so earlier ones may be re-sent first.
+        let deadline = shux_testkit::Deadline::start();
+        loop {
+            let resized = deadline
+                .run(resize_rx.recv())
+                .await
+                .expect("resize timeout")
+                .expect("resize request");
+            if resized.size.rows == 27 {
+                break;
+            }
+        }
 
         framed
             .send(Bytes::from(
@@ -7931,6 +8167,7 @@ mod tests {
             {
                 let mut state = fixture.io_state.lock().await;
                 state.resizers.clear();
+                state.requested_sizes.clear();
                 for (pid, _) in marks {
                     let (tx, rx) = mpsc::channel(8);
                     state.resizers.insert(pid, tx);
@@ -7940,7 +8177,7 @@ mod tests {
             apply_resize_to_window(
                 &fixture.graph,
                 &fixture.io_state,
-                &fixture.attached,
+                fixture.attached.active_window_id,
                 &config,
                 100,
                 30,
@@ -7989,7 +8226,7 @@ mod tests {
         apply_resize_to_window(
             &fixture.graph,
             &fixture.io_state,
-            &fixture.attached,
+            fixture.attached.active_window_id,
             &config,
             cols,
             rows,
@@ -8012,7 +8249,7 @@ mod tests {
         apply_resize_to_window(
             &fixture.graph,
             &fixture.io_state,
-            &fixture.attached,
+            fixture.attached.active_window_id,
             &config,
             cols,
             rows,
@@ -10605,6 +10842,215 @@ mod tests {
             assert!(!text.contains(hidden), "a plain viewer was sent {hidden:?}");
         }
         c.stop().await;
+        fixture.stop();
+    }
+
+    /// A pane task stand-in: applies each resize to the pane's VT, as the PTY
+    /// task does, and logs the sizes it was handed.
+    fn fake_pty(
+        io_state: &Arc<Mutex<PaneIoState>>,
+        pane: PaneId,
+        mut rx: mpsc::Receiver<crate::pane_io::ResizeRequest>,
+    ) -> Arc<std::sync::Mutex<Vec<(u16, u16)>>> {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (io, seen) = (io_state.clone(), log.clone());
+        tokio::spawn(async move {
+            while let Some(req) = rx.recv().await {
+                let (cols, rows) = (req.size.cols, req.size.rows);
+                if let Some(vt) = io.lock().await.vts.get_mut(&pane) {
+                    vt.resize(usize::from(rows), usize::from(cols));
+                }
+                seen.lock().unwrap().push((cols, rows));
+                if let Some(ack) = req.ack {
+                    let _ = ack.send(());
+                }
+            }
+        });
+        log
+    }
+
+    /// Issue #190: the panes take the size of the client with the most recent
+    /// input, not of whichever client attached or resized last.
+    #[tokio::test(start_paused = true)]
+    async fn panes_follow_the_client_that_types_not_the_one_that_resizes() {
+        let fixture = attach_fixture().await;
+        let (_w, resize_rx, _s) = seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+        let log = fake_pty(&fixture.io_state, fixture.first_pane, resize_rx);
+        let last = || {
+            *log.lock()
+                .unwrap()
+                .last()
+                .expect("the pane was never sized")
+        };
+        let settled = || idle_for(QUIET);
+
+        let mut a = Client::attach(&fixture, 200).await;
+        settled().await;
+        let by_a = last();
+        let mut b = Client::attach(&fixture, 80).await;
+        settled().await;
+        assert_eq!(last(), by_a, "a client that only attached took the panes");
+        b.send(&AttachClientFrame::Resize { cols: 90, rows: 30 })
+            .await;
+        settled().await;
+        assert_eq!(last(), by_a, "a client that only resized took the panes");
+
+        b.key(b"x").await;
+        settled().await;
+        let by_b = last();
+        assert_ne!(by_b, by_a, "the typing client never took the panes");
+
+        // A's key inside the settle window does not take them back.
+        a.key(b"y").await;
+        settled().await;
+        assert_eq!(last(), by_b, "alternating keys flipped the size");
+        idle_for(crate::clients::SETTLE).await;
+        a.key(b"z").await;
+        settled().await;
+        assert_eq!(
+            last(),
+            by_a,
+            "a quiet driver kept the panes from a typing client"
+        );
+
+        // B leaves: nothing moves while A still drives. A leaves too: sizes stay.
+        b.stop().await;
+        settled().await;
+        assert_eq!(last(), by_a);
+        let sized = log.lock().unwrap().len();
+        a.stop().await;
+        settled().await;
+        assert_eq!(
+            log.lock().unwrap().len(),
+            sized,
+            "the last client leaving resized the panes"
+        );
+        fixture.stop();
+    }
+
+    /// A paste from a client that has sent nothing since another window was
+    /// focused over RPC goes to the window the session now shows.
+    #[tokio::test(start_paused = true)]
+    async fn a_paste_after_an_rpc_window_switch_goes_to_the_shown_window() {
+        let fixture = attach_fixture().await;
+        let (mut first, _r1, _s1) = seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+        let (mut shown, _r2, _s2) =
+            seed_io_for_pane(&fixture.io_state, fixture.second_window_pane).await;
+        let mut client = Client::attach(&fixture, 100).await;
+        idle_for(QUIET).await;
+        let window = fixture.graph.snapshot().panes[&fixture.second_window_pane].window_id;
+        fixture
+            .graph
+            .focus_window(window, None)
+            .await
+            .expect("focus the other window");
+        client
+            .send(&AttachClientFrame::Paste {
+                data: BASE64.encode(b"pasted"),
+                more: false,
+            })
+            .await;
+        idle_for(QUIET).await;
+        assert!(
+            first.try_recv().is_err(),
+            "the paste went to the window no longer shown"
+        );
+        assert_eq!(shown.try_recv().ok(), Some(b"pasted".to_vec()));
+        fixture.stop();
+    }
+
+    /// A click that moves focus to another pane hands that client the panes,
+    /// as a key would; a client that only attached does not.
+    #[tokio::test(start_paused = true)]
+    async fn a_click_that_focuses_another_pane_takes_the_panes() {
+        let fixture = attach_fixture().await;
+        let (_w1, rx1, _s1) = seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+        let (_w2, rx2, _s2) = seed_io_for_pane(&fixture.io_state, fixture.second_pane).await;
+        let log = fake_pty(&fixture.io_state, fixture.first_pane, rx1);
+        let _log2 = fake_pty(&fixture.io_state, fixture.second_pane, rx2);
+        let last = || {
+            *log.lock()
+                .unwrap()
+                .last()
+                .expect("the pane was never sized")
+        };
+        let focused = || {
+            let snap = fixture.graph.snapshot();
+            snap.windows[&fixture.first_window].active_pane
+        };
+
+        let _a = Client::attach(&fixture, 200).await;
+        idle_for(QUIET).await;
+        let by_a = last();
+        let mut b = Client::attach(&fixture, 80).await;
+        idle_for(QUIET).await;
+        assert_eq!(last(), by_a);
+
+        let viewport = current_viewport(&Arc::new(Mutex::new((80, 24))), &test_config()).await;
+        let (first_point, second_point, _) =
+            find_pane_and_border_points(&fixture.graph, fixture.first_window, viewport);
+        let before = focused();
+        let target = if before == fixture.first_pane {
+            second_point
+        } else {
+            first_point
+        };
+        for kind in [MouseKind::Down, MouseKind::Up] {
+            b.send(&AttachClientFrame::Mouse {
+                kind,
+                button: ProtoMouseButton::Left,
+                col: target.0,
+                row: target.1,
+                shift: false,
+                alt: false,
+                ctrl: false,
+                frame: b.written_frame,
+            })
+            .await;
+        }
+        idle_for(QUIET).await;
+        assert_ne!(focused(), before, "the click did not move focus");
+        assert_ne!(
+            last(),
+            by_a,
+            "a click that moved focus did not take the panes"
+        );
+        fixture.stop();
+    }
+
+    /// Issue #190: when the driver leaves, the next client takes the panes at
+    /// once, and a pinned pane keeps its size through all of it.
+    #[tokio::test(start_paused = true)]
+    async fn the_next_client_drives_when_the_driver_leaves_and_pins_hold() {
+        let fixture = attach_fixture().await;
+        let (_w1, rx1, _s1) = seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+        let (_w2, rx2, _s2) = seed_io_for_pane(&fixture.io_state, fixture.second_pane).await;
+        let first = fake_pty(&fixture.io_state, fixture.first_pane, rx1);
+        let second = fake_pty(&fixture.io_state, fixture.second_pane, rx2);
+        let clients = fixture.io_state.lock().await.clients.clone();
+        clients.pin(fixture.second_pane);
+
+        let a = Client::attach(&fixture, 200).await;
+        idle_for(QUIET).await;
+        let by_a = *first.lock().unwrap().last().expect("sized by A");
+        let mut b = Client::attach(&fixture, 80).await;
+        b.key(b"x").await;
+        idle_for(QUIET).await;
+        let by_b = *first.lock().unwrap().last().unwrap();
+        assert_ne!(by_b, by_a);
+        b.stop().await;
+        idle_for(QUIET).await;
+        assert_eq!(
+            *first.lock().unwrap().last().unwrap(),
+            by_a,
+            "the driver left and its size stayed"
+        );
+        assert!(
+            second.lock().unwrap().is_empty(),
+            "a pinned pane was resized: {:?}",
+            second.lock().unwrap()
+        );
+        a.stop().await;
         fixture.stop();
     }
 }

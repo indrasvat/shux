@@ -33,6 +33,8 @@ pub(crate) fn register_pane_methods(
     let g9 = graph.clone();
 
     let io_split = io_state.clone();
+    let io_resize = io_state.clone();
+    let io_swap = io_state.clone();
     let io_kill = io_state;
     let cancel_split = cancel;
 
@@ -231,8 +233,9 @@ pub(crate) fn register_pane_methods(
                 }
             },
         )
-        .register_with_policy("pane.resize", Policy::fixed(Sensitivity::OwnedMutation), move |params: Option<serde_json::Value>| {
+        .register_to_completion("pane.resize", Policy::fixed(Sensitivity::OwnedMutation), move |params: Option<serde_json::Value>| {
             let gh = g5.clone();
+            let io = io_resize.clone();
             async move {
                 let params = params.unwrap_or_default();
                 let pane_id = resolve_pane_id_from_params(&gh, &params)?;
@@ -264,6 +267,8 @@ pub(crate) fn register_pane_methods(
                 gh.resize_pane(pane_id, direction, delta, expected_version)
                     .await
                     .map_err(graph_error_to_rpc)?;
+                // New rects: the panes take them from the session's driver.
+                io.lock().await.clients.touch();
 
                 Ok(serde_json::json!({ "pane_id": pane_id.to_string() }))
             }
@@ -286,8 +291,9 @@ pub(crate) fn register_pane_methods(
                 }))
             }
         })
-        .register_with_policy("pane.swap", Policy::fixed(Sensitivity::OwnedMutation), move |params: Option<serde_json::Value>| {
+        .register_to_completion("pane.swap", Policy::fixed(Sensitivity::OwnedMutation), move |params: Option<serde_json::Value>| {
             let gh = g7.clone();
+            let io = io_swap.clone();
             async move {
                 let params = params.unwrap_or_default();
                 let pane_id_str = required_str(&params, "pane_id")?;
@@ -301,6 +307,7 @@ pub(crate) fn register_pane_methods(
                 gh.swap_panes(pane_a, pane_b, expected_version)
                     .await
                     .map_err(graph_error_to_rpc)?;
+                io.lock().await.clients.touch();
 
                 Ok(serde_json::json!({
                     "pane_a": pane_a.to_string(),

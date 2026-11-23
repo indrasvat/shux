@@ -303,6 +303,12 @@ fn real_attach_window_switch_preserves_checkpoints_and_diff_exact() {
         "pane.set_size",
         serde_json::json!({ "pane_id": pane_id, "cols": 80, "rows": 24 }),
     );
+    // `set_size` pins; this test is about the attach re-fan, so hand the pane
+    // back to the layout at that size.
+    h.rpc_ok(
+        "pane.set_size",
+        serde_json::json!({ "pane_id": pane_id, "unpin": true }),
+    );
     let abs = h.fixture_abs("f4_keys.sh");
     h.rpc_ok(
         "pane.send_keys",

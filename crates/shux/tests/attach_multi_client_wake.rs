@@ -243,3 +243,211 @@ async fn one_output_chunk_redraws_every_attached_client() {
         "one output chunk redrew only some clients: clients {missed:?} of 3 never drew MARK"
     );
 }
+
+/// Issue #190: a window focused over RPC is drawn by an attached client that
+/// has sent nothing since. With no fallback tick, only a wake can draw it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_idle_client_follows_a_window_focused_over_rpc() {
+    let h = Harness::new();
+    let created = h.rpc(
+        "session.create",
+        serde_json::json!({
+            "name": "follow",
+            "command": ["/bin/sh", "-c", "printf 'FIR%sST\\n' ''; read x"],
+        }),
+    );
+    let session = created["result"]["id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let first_window = created["result"]["window_id"]
+        .as_str()
+        .expect("window id")
+        .to_string();
+    let second = h.rpc(
+        "window.create",
+        serde_json::json!({
+            "session_id": session,
+            "name": "second",
+            "command": ["/bin/sh", "-c", "printf 'SEC%sOND\\n' ''; read x"],
+        }),
+    );
+    let second_window = second["result"]["id"]
+        .as_str()
+        .expect("new window id")
+        .to_string();
+    h.rpc("window.focus", serde_json::json!({ "id": first_window }));
+
+    let mut client = Client::attach(&h, "follow").await;
+    assert!(
+        client.draws("FIRST").await,
+        "the client never drew the first window"
+    );
+    h.rpc("window.focus", serde_json::json!({ "id": second_window }));
+    assert!(
+        client.draws("SECOND").await,
+        "an idle client kept drawing the window it attached to"
+    );
+}
+
+/// Issue #190: a pane split over RPC takes its share of the attached
+/// client's screen, not the 80x24 every new pane is born with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pane_split_over_rpc_takes_its_rect() {
+    let h = Harness::new();
+    let created = h.rpc(
+        "session.create",
+        serde_json::json!({
+            "name": "split",
+            "command": ["/bin/sh", "-c", "printf 'RE%sADY\\n' ''; read x"],
+        }),
+    );
+    let pane = created["result"]["pane_id"]
+        .as_str()
+        .expect("pane id")
+        .to_string();
+    let mut client = Client::attach(&h, "split").await;
+    assert!(client.draws("READY").await);
+
+    let split = h.rpc(
+        "pane.split",
+        serde_json::json!({ "pane_id": pane, "direction": "horizontal" }),
+    );
+    let new_pane = split["result"]["pane"]["id"]
+        .as_str()
+        .expect("new pane id")
+        .to_string();
+    let size = |id: &str| {
+        let snap = h.rpc("pane.snapshot", serde_json::json!({ "pane_id": id }));
+        (
+            snap["result"]["cols"].as_u64(),
+            snap["result"]["rows"].as_u64(),
+        )
+    };
+    shux_testkit::wait_until("the split panes to share the client's screen", || {
+        let (old, new) = (size(&pane), size(&new_pane));
+        new != (Some(80), Some(24)) && new.0 == old.0 && new.0 < Some(u64::from(COLS))
+    });
+}
+
+/// Two stacked panes under one attached client, sized to its screen.
+async fn stacked(h: &Harness, name: &str) -> (Client, String, String) {
+    let created = h.rpc(
+        "session.create",
+        serde_json::json!({
+            "name": name,
+            "command": ["/bin/sh", "-c", "printf 'RE%sADY\\n' ''; read x"],
+        }),
+    );
+    let top = created["result"]["pane_id"]
+        .as_str()
+        .expect("pane id")
+        .to_string();
+    let mut client = Client::attach(h, name).await;
+    assert!(client.draws("READY").await);
+    let split = h.rpc(
+        "pane.split",
+        serde_json::json!({ "pane_id": top, "direction": "horizontal" }),
+    );
+    let bottom = split["result"]["pane"]["id"]
+        .as_str()
+        .expect("new pane id")
+        .to_string();
+    shux_testkit::wait_until("the split to take the client's screen", || {
+        size(h, &bottom) != (80, 24) && size(h, &bottom).0 == size(h, &top).0
+    });
+    (client, top, bottom)
+}
+
+fn size(h: &Harness, id: &str) -> (u64, u64) {
+    let snap = h.rpc("pane.snapshot", serde_json::json!({ "pane_id": id }));
+    (
+        snap["result"]["cols"].as_u64().expect("cols"),
+        snap["result"]["rows"].as_u64().expect("rows"),
+    )
+}
+
+/// Moving a split over RPC resizes both panes' terminals with no client input.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_split_moved_over_rpc_resizes_its_panes() {
+    let h = Harness::new();
+    let (_client, top, bottom) = stacked(&h, "moved").await;
+    let before = (size(&h, &top), size(&h, &bottom));
+    h.rpc(
+        "pane.resize",
+        serde_json::json!({ "pane_id": top, "direction": "horizontal", "delta": 0.2 }),
+    );
+    shux_testkit::wait_until("the moved split to resize both terminals", || {
+        let (t, b) = (size(&h, &top), size(&h, &bottom));
+        t.1 != before.0.1 && b.1 != before.1.1
+    });
+}
+
+/// Zooming sizes the zoomed pane to the screen and leaves the hidden one be.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn zoom_resizes_only_the_zoomed_pane() {
+    let h = Harness::new();
+    let (_client, top, bottom) = stacked(&h, "zoomed").await;
+    let hidden = size(&h, &bottom);
+    h.rpc("pane.zoom", serde_json::json!({ "pane_id": top }));
+    shux_testkit::wait_until("the zoomed pane to fill the screen", || {
+        size(&h, &top).1 > hidden.1 + 2
+    });
+    assert_eq!(size(&h, &bottom), hidden, "zoom resized a hidden pane");
+}
+
+/// Renames wake the size reconciler; none of them may resize a pane. The
+/// pane counts the SIGWINCHes it receives and prints the count on demand.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rename_storm_resizes_nothing() {
+    let h = Harness::new();
+    let fifo = h.work.path().join("count");
+    nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).expect("mkfifo");
+    let program = format!(
+        "n=0; r=0; trap 'n=$((n+1))' WINCH; printf 'RE%sADY\\n' ''; \
+         while :; do if read x < '{}'; then r=$((r+1)); printf 'ROUND%s=%s\\n' \"$r\" \"$n\"; fi; done",
+        fifo.display()
+    );
+    let created = h.rpc(
+        "session.create",
+        serde_json::json!({ "name": "storm", "command": ["/bin/sh", "-c", program] }),
+    );
+    let pane = created["result"]["pane_id"]
+        .as_str()
+        .expect("pane id")
+        .to_string();
+    let window = created["result"]["window_id"]
+        .as_str()
+        .expect("window id")
+        .to_string();
+    let mut client = Client::attach(&h, "storm").await;
+    assert!(client.draws("READY").await);
+    shux_testkit::wait_until("the pane to take the client's size", || {
+        size(&h, &pane) != (80, 24)
+    });
+    let count = |round: u32| {
+        release(&fifo);
+        let needle = format!("ROUND{round}=");
+        let mut seen = None;
+        shux_testkit::wait_until("the pane to report its SIGWINCH count", || {
+            let text =
+                h.rpc("pane.capture", serde_json::json!({ "pane_id": pane }))["result"]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+            seen = text
+                .lines()
+                .find_map(|l| l.trim().strip_prefix(&needle).map(str::to_string));
+            seen.is_some()
+        });
+        seen.expect("count")
+    };
+    let before = count(1);
+    for i in 0..30 {
+        h.rpc(
+            "window.rename",
+            serde_json::json!({ "id": window, "name": format!("t{i}") }),
+        );
+    }
+    assert_eq!(count(2), before, "a rename resized the pane");
+}

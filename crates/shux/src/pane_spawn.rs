@@ -475,17 +475,8 @@ async fn run_pane_pty_task(
                     let rev_state = if !current {
                         None
                     } else if let Some(vt) = state.vts.get_mut(&pane_id) {
-                        // P4 convergence round 1 (claude blocker): gate the
-                        // invalidation on an ACTUAL dimension change, exactly
-                        // like the process branch gates on alt_switched. The
-                        // attach render loop re-fans EVERY pane of the active
-                        // window at its computed size on attach, client
-                        // resize, window switch, and zoom toggle — at an
-                        // unchanged client size those are no-op resizes, and
-                        // ungated invalidation made merely attaching (or a
-                        // same-size pane.set_size) destroy every checkpoint.
-                        // §4.2: only a dims change is the Class-A "pane
-                        // resize"; only that invalidates (LENS-R-032).
+                        // Only a dims change is a Class-A "pane resize"
+                        // (LENS-R-032); a same-size resize keeps checkpoints.
                         let dims_before = (vt.grid().rows(), vt.grid().cols());
                         vt.resize(req.size.rows as usize, req.size.cols as usize);
                         let dims_changed = (vt.grid().rows(), vt.grid().cols()) != dims_before;
@@ -708,6 +699,7 @@ async fn run_pane_pty_task(
     if state.is_current(pane_id, incarnation) {
         state.writers.remove(&pane_id);
         state.resizers.remove(&pane_id);
+        state.requested_sizes.remove(&pane_id);
         state.shutdowns.remove(&pane_id);
         state.pty_done.remove(&pane_id);
     }
@@ -1088,6 +1080,15 @@ pub(crate) async fn spawn_pane_pty_with_recorder(
         ticket.ok = true;
         return Ok(());
     }
+    // A pane given no size of its own starts at its rect, not 80x24.
+    let default = shux_pty::handle::PtySize::default();
+    let size = if (size.cols, size.rows) == (default.cols, default.rows) {
+        crate::attach::spawn_size(&graph, &io_state, pane_id)
+            .await
+            .unwrap_or(size)
+    } else {
+        size
+    };
     let spawned = spawn_pane_pty_unshared(
         pane_id,
         cwd,
@@ -1256,6 +1257,9 @@ async fn spawn_pane_pty_unshared(
             }
         }
         state.resizers.insert(pane_id, resize_tx);
+        state.requested_sizes.remove(&pane_id);
+        // Now resizable: a pane created from the CLI takes its rect.
+        state.clients.touch();
         state.pty_done.insert(pane_id, done_rx);
         let replaced = state.vts.insert(pane_id, vt).is_some();
         state.status_sealed.remove(&pane_id);
@@ -2587,6 +2591,44 @@ mod tests {
             "undoing the split reverted a focus that landed before it"
         );
         assert_eq!(snap.windows[&window].layout.tree.pane_count(), 2);
+        h.stop().await;
+    }
+
+    /// A split under a sized session is born at its rect: its program's
+    /// first look at the terminal is not 80x24 followed by a SIGWINCH.
+    #[tokio::test]
+    async fn a_split_is_born_at_its_rect() {
+        let h = crate::rpc::test_harness::RpcHarness::new();
+        let (session, _window, a) = h.seed_session("born").await;
+        let border = h.config.current().appearance.border_style.clone();
+        h.io.lock()
+            .await
+            .layout_basis
+            .insert(session, (100, 30, border));
+        let split = crate::rpc::test_harness::dispatch_ok(
+            &h.router,
+            "pane.split",
+            serde_json::json!({
+                "pane_id": a.to_string(),
+                "direction": "horizontal",
+                "command": ["/bin/sh", "-c", "read x"],
+            }),
+        )
+        .await;
+        let new: shux_core::model::PaneId = split["pane"]["id"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .expect("new pane id");
+        let born = {
+            let io = h.io.lock().await;
+            let vt = io.vts.get(&new).expect("the split's terminal");
+            (vt.grid().cols(), vt.grid().rows())
+        };
+        assert_ne!(born, (80, 24), "the split was born at 80x24");
+        assert!(
+            born.0 <= 100 && born.1 < 30,
+            "born outside the client: {born:?}"
+        );
         h.stop().await;
     }
 

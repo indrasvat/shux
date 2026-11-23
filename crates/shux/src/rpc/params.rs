@@ -216,7 +216,34 @@ pub(crate) fn resolve_pane_id_from_params(
     params: &serde_json::Value,
 ) -> Result<shux_core::model::PaneId, shux_rpc::RpcError> {
     if let Some(pane_id_str) = optional_ref_param(params, "pane_id")? {
-        return resolve_pane_ref(gh, pane_id_str);
+        let pane_id = resolve_pane_ref(gh, pane_id_str)?;
+        // A pane named with a session or window must be in that session: the
+        // CLI names the active window beside `-p`, so any window of it passes.
+        let named_window = optional_ref_param(params, "window_id")?
+            .map(|w| resolve_window_ref(gh, w, "window_id"))
+            .transpose()?;
+        let named_session = optional_ref_param(params, "session_id")?
+            .map(|s| resolve_session_ref(gh, s, "session_id"))
+            .transpose()?;
+        if named_window.is_none() && named_session.is_none() {
+            return Ok(pane_id);
+        }
+        let snap = gh.snapshot();
+        let session_of = |w| snap.windows.get(&w).map(|w| w.session_id);
+        let pane_session = snap
+            .panes
+            .get(&pane_id)
+            .and_then(|p| session_of(p.window_id))
+            .ok_or_else(|| shux_rpc::RpcError::not_found("pane", pane_id_str))?;
+        let named = named_session
+            .into_iter()
+            .chain(named_window.and_then(session_of));
+        if named.into_iter().any(|s| s != pane_session) {
+            return Err(shux_rpc::RpcError::invalid_params(&format!(
+                "pane {pane_id_str} is not in the session named with it"
+            )));
+        }
+        return Ok(pane_id);
     }
 
     // Fall back to active pane of the resolved window

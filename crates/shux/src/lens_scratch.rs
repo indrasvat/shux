@@ -1964,7 +1964,12 @@ async fn spawn_scratch_core(
         None => None,
     };
     let (ended_tx, ended) = tokio::sync::watch::channel(None);
-    io_state.lock().await.scratch_ends.insert(pane_id, ended_tx);
+    {
+        let mut io = io_state.lock().await;
+        io.scratch_ends.insert(pane_id, ended_tx);
+        // A scratch pane keeps its declared size, whoever attaches to it.
+        io.clients.pin(pane_id);
+    }
     let spawn_result = crate::pane_spawn::spawn_pane_pty_with_recorder(
         pane_id,
         cwd,
@@ -1983,7 +1988,11 @@ async fn spawn_scratch_core(
         // LENS-R-040/045: SPAWN_FAILED rolls back the allocation completely
         // — no session, no pane, no PTY, absent from `--include-scratch`
         // (and the quota reservation releases via Drop).
-        io_state.lock().await.scratch_ends.remove(&pane_id);
+        {
+            let mut io = io_state.lock().await;
+            io.scratch_ends.remove(&pane_id);
+            io.clients.unpin(pane_id);
+        }
         let _ = graph.destroy_session(session_id, None).await;
         return Err(shux_rpc::RpcError::spawn_failed(&e.to_string()));
     }

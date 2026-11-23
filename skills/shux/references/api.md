@@ -174,17 +174,29 @@ Send keystrokes to a pane's PTY.
 
 ### `pane.set_size`
 
-Synchronous PTY + VT resize. The RPC returns only after `vt.resize` has
-been applied, so the next `pane.snapshot` is guaranteed to capture at the
-requested dimensions. 2-second internal timeout on the ack.
+Synchronous PTY + VT resize, and a **pin**: the pane keeps that size until
+`unpin`, whoever attaches, resizes or types. The RPC returns only after
+`vt.resize` has been applied, so the next `pane.snapshot` is guaranteed to
+capture at the requested dimensions. 2-second internal timeout on the ack;
+a resize that never lands leaves no pin. Pin a live pane before
+checkpointing it, or a person attaching can change its size under you.
 
 ```json
 // Request
 { "pane_id": "uuid", "cols": 200, "rows": 60 }    // cols 4..=1000, rows 2..=1000
+{ "pane_id": "uuid", "unpin": true }               // released: the next driving client resizes it
 
 // Response
-{ "pane_id": "uuid", "cols": 200, "rows": 60 }
+{ "pane_id": "uuid", "cols": 200, "rows": 60, "pinned": true }
+{ "pane_id": "uuid", "pinned": false, "was_pinned": true }
 ```
+
+**Who sizes unpinned panes.** With several clients attached, a session's
+panes take the size of the client that most recently typed, pasted, ran a
+layout action or clicked into a pane. Attaching or resizing a terminal does
+not take them; the driver keeps them until it has been quiet for 1 s, so two
+people typing do not flip sizes on alternate keys. Before anyone types, the
+first client to attach drives; when the driver leaves, the next takes over.
 
 ### `pane.snapshot`
 

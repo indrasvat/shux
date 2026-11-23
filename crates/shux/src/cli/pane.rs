@@ -1058,17 +1058,21 @@ pub async fn handle_pane_set_size(
     session_name: &str,
     window_spec: Option<&str>,
     pane_spec: Option<&str>,
-    cols: u16,
-    rows: u16,
+    size: Option<(u16, u16)>,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
     let (session_id, window_id) = resolve_pane_window_id(stream, session_name, window_spec).await?;
     let mut params = serde_json::json!({
         "session_id": session_id,
         "window_id": window_id,
-        "cols": cols,
-        "rows": rows,
     });
+    match size {
+        Some((cols, rows)) => {
+            params["cols"] = cols.into();
+            params["rows"] = rows.into();
+        }
+        None => params["unpin"] = true.into(),
+    }
     if let Some(pid) = pane_spec {
         params["pane_id"] = serde_json::Value::String(pid.to_string());
     }
@@ -1082,14 +1086,13 @@ pub async fn handle_pane_set_size(
                 crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
             );
         }
-        OutputFormat::Text | OutputFormat::Plain => {
-            println!(
-                "{} pane resized to {}×{}",
-                crate::style::success("✓"),
-                cols,
-                rows,
-            );
-        }
+        OutputFormat::Text | OutputFormat::Plain => crate::style::print_pane_size_set(
+            size,
+            result
+                .get("was_pinned")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        )?,
     }
     Ok(())
 }
@@ -1231,8 +1234,7 @@ mod tests {
             "dev",
             Some("main"),
             Some(pane),
-            100,
-            30,
+            Some((100, 30)),
             OutputFormat::Json,
         )
         .await
