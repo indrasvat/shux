@@ -7,6 +7,7 @@ shux: terminal multiplexer in Rust. Tiny core, plugin system, typed API, pixel-p
 | | |
 |---|---|
 | Requirements | `docs/PRD.md` |
+| Vision (long-horizon direction) | `vision.md` |
 | Task archive | `docs/tasks/NNN-*.md` — historical record; don't add new ones |
 | API + crate notes | `docs/agents/api-notes.md` |
 | Releases | `docs/agents/releases.md` |
