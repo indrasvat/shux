@@ -1868,7 +1868,22 @@ pub(crate) fn register_pane_io_methods(
                     let pane_id = resolve_pane_id_from_params(&gh, &params)?;
                     let clients = io.lock().await.clients.clone();
                     // `unpin`: back to the layout's size, from the next reconcile.
-                    if params.get("unpin").and_then(|v| v.as_bool()) == Some(true) {
+                    let unpin = match params.get("unpin") {
+                        None | Some(serde_json::Value::Bool(false)) => false,
+                        Some(serde_json::Value::Bool(true)) => true,
+                        Some(_) => {
+                            return Err(shux_rpc::RpcError::invalid_params(
+                                "'unpin' must be true or false",
+                            ));
+                        }
+                    };
+                    if unpin {
+                        if !gh.snapshot().panes.contains_key(&pane_id) {
+                            return Err(shux_rpc::RpcError::not_found(
+                                "pane",
+                                &pane_id.to_string(),
+                            ));
+                        }
                         if params.get("cols").is_some() || params.get("rows").is_some() {
                             return Err(shux_rpc::RpcError::invalid_params(
                                 "'unpin' takes no 'cols' or 'rows'",
@@ -1918,7 +1933,7 @@ pub(crate) fn register_pane_io_methods(
                     // Pinned before the resize lands, so no client's size can
                     // slip in between; taken back if the resize fails.
                     let was_pinned = clients.is_pinned(pane_id);
-                    clients.pin(pane_id);
+                    let generation = clients.pin(pane_id);
                     let sent = resizer
                         .send(ResizeRequest {
                             size: pty_size,
@@ -1932,7 +1947,7 @@ pub(crate) fn register_pane_io_methods(
                     };
                     if let Err(e) = acked {
                         if !was_pinned {
-                            clients.unpin(pane_id);
+                            clients.release(pane_id, generation);
                         }
                         return Err(e);
                     }
@@ -1940,7 +1955,8 @@ pub(crate) fn register_pane_io_methods(
                         "pane_id": pane_id.to_string(),
                         "rows": rows,
                         "cols": cols,
-                        "pinned": true,
+                        // An unpin that landed meanwhile wins; say so.
+                        "pinned": clients.is_pinned(pane_id),
                     }))
                 }
             },

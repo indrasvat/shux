@@ -934,14 +934,14 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     pane,
                     cols,
                     rows,
-                    unpin,
+                    unpin: _,
                 } => {
                     cli::handle_pane_set_size(
                         &mut stream,
                         &session,
                         window.as_deref(),
                         pane.as_deref(),
-                        cols.zip(rows).filter(|_| !unpin),
+                        cols.zip(rows),
                         args.format,
                     )
                     .await

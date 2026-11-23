@@ -1086,7 +1086,13 @@ pub async fn handle_pane_set_size(
                 crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
             );
         }
-        OutputFormat::Text | OutputFormat::Plain => crate::style::print_pane_size_set(size)?,
+        OutputFormat::Text | OutputFormat::Plain => crate::style::print_pane_size_set(
+            size,
+            result
+                .get("was_pinned")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        )?,
     }
     Ok(())
 }

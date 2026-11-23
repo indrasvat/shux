@@ -329,3 +329,69 @@ async fn a_pane_split_over_rpc_takes_its_rect() {
         new != (Some(80), Some(24)) && new.0 == old.0 && new.0 < Some(u64::from(COLS))
     });
 }
+
+/// Two stacked panes under one attached client, sized to its screen.
+async fn stacked(h: &Harness, name: &str) -> (Client, String, String) {
+    let created = h.rpc(
+        "session.create",
+        serde_json::json!({
+            "name": name,
+            "command": ["/bin/sh", "-c", "printf 'RE%sADY\\n' ''; read x"],
+        }),
+    );
+    let top = created["result"]["pane_id"]
+        .as_str()
+        .expect("pane id")
+        .to_string();
+    let mut client = Client::attach(h, name).await;
+    assert!(client.draws("READY").await);
+    let split = h.rpc(
+        "pane.split",
+        serde_json::json!({ "pane_id": top, "direction": "horizontal" }),
+    );
+    let bottom = split["result"]["pane"]["id"]
+        .as_str()
+        .expect("new pane id")
+        .to_string();
+    shux_testkit::wait_until("the split to take the client's screen", || {
+        size(h, &bottom) != (80, 24) && size(h, &bottom).0 == size(h, &top).0
+    });
+    (client, top, bottom)
+}
+
+fn size(h: &Harness, id: &str) -> (u64, u64) {
+    let snap = h.rpc("pane.snapshot", serde_json::json!({ "pane_id": id }));
+    (
+        snap["result"]["cols"].as_u64().expect("cols"),
+        snap["result"]["rows"].as_u64().expect("rows"),
+    )
+}
+
+/// Moving a split over RPC resizes both panes' terminals with no client input.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_split_moved_over_rpc_resizes_its_panes() {
+    let h = Harness::new();
+    let (_client, top, bottom) = stacked(&h, "moved").await;
+    let before = (size(&h, &top), size(&h, &bottom));
+    h.rpc(
+        "pane.resize",
+        serde_json::json!({ "pane_id": top, "direction": "horizontal", "delta": 0.2 }),
+    );
+    shux_testkit::wait_until("the moved split to resize both terminals", || {
+        let (t, b) = (size(&h, &top), size(&h, &bottom));
+        t.1 != before.0.1 && b.1 != before.1.1
+    });
+}
+
+/// Zooming sizes the zoomed pane to the screen and leaves the hidden one be.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn zoom_resizes_only_the_zoomed_pane() {
+    let h = Harness::new();
+    let (_client, top, bottom) = stacked(&h, "zoomed").await;
+    let hidden = size(&h, &bottom);
+    h.rpc("pane.zoom", serde_json::json!({ "pane_id": top }));
+    shux_testkit::wait_until("the zoomed pane to fill the screen", || {
+        size(&h, &top).1 > hidden.1 + 2
+    });
+    assert_eq!(size(&h, &bottom), hidden, "zoom resized a hidden pane");
+}

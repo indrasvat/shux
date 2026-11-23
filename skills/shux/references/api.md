@@ -184,7 +184,7 @@ checkpointing it, or a person attaching can change its size under you.
 ```json
 // Request
 { "pane_id": "uuid", "cols": 200, "rows": 60 }    // cols 4..=1000, rows 2..=1000
-{ "pane_id": "uuid", "unpin": true }               // back to the layout (no cols/rows)
+{ "pane_id": "uuid", "unpin": true }               // released: the next driving client resizes it
 
 // Response
 { "pane_id": "uuid", "cols": 200, "rows": 60, "pinned": true }

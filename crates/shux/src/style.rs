@@ -2309,7 +2309,7 @@ pub fn print_pane_diff(
 }
 
 /// `pane set-size`: the new size and that it is pinned, or that it is not.
-pub fn print_pane_size_set(size: Option<(u16, u16)>) -> Printed {
+pub fn print_pane_size_set(size: Option<(u16, u16)>, was_pinned: bool) -> Printed {
     let mut out = io::stdout().lock();
     match size {
         Some((cols, rows)) => writeln!(
@@ -2318,11 +2318,12 @@ pub fn print_pane_size_set(size: Option<(u16, u16)>) -> Printed {
             success("✓"),
             muted("(pinned: attached clients no longer resize it; --unpin releases it)"),
         )?,
-        None => writeln!(
+        None if was_pinned => writeln!(
             out,
-            "{} pane unpinned: it follows the layout again",
+            "{} pane unpinned: the next client to drive its session resizes it",
             success("✓")
         )?,
+        None => writeln!(out, "{} pane was not pinned", muted("·"))?,
     }
     out.flush()?;
     Ok(())

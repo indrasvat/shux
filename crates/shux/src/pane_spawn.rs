@@ -475,17 +475,8 @@ async fn run_pane_pty_task(
                     let rev_state = if !current {
                         None
                     } else if let Some(vt) = state.vts.get_mut(&pane_id) {
-                        // P4 convergence round 1 (claude blocker): gate the
-                        // invalidation on an ACTUAL dimension change, exactly
-                        // like the process branch gates on alt_switched. The
-                        // attach render loop re-fans EVERY pane of the active
-                        // window at its computed size on attach, client
-                        // resize, window switch, and zoom toggle — at an
-                        // unchanged client size those are no-op resizes, and
-                        // ungated invalidation made merely attaching (or a
-                        // same-size pane.set_size) destroy every checkpoint.
-                        // §4.2: only a dims change is the Class-A "pane
-                        // resize"; only that invalidates (LENS-R-032).
+                        // Only a dims change is a Class-A "pane resize"
+                        // (LENS-R-032); a same-size resize keeps checkpoints.
                         let dims_before = (vt.grid().rows(), vt.grid().cols());
                         vt.resize(req.size.rows as usize, req.size.cols as usize);
                         let dims_changed = (vt.grid().rows(), vt.grid().cols()) != dims_before;

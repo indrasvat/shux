@@ -832,21 +832,16 @@ async fn apply_resize_to_window(
     let mut to_send: Vec<(mpsc::Sender<crate::pane_io::ResizeRequest>, PtySize)> = Vec::new();
 
     if win.layout.is_zoomed() {
-        // Zoomed: every pane in the tree reports the full content area
-        // size so apps in the zoomed pane lay out correctly, while
-        // others stay at the same nominal size (cheap, harmless).
+        // Zoomed: the zoomed pane takes the full content area; the hidden
+        // ones keep their sizes, so their programs see no SIGWINCH for a
+        // zoom they cannot see.
         //
         // The floor matters as much here as in the tiled branch below: the
         // client picks `rows`, and a zoomed window subtracts the status bar
         // from it with no layout arithmetic in between, so `rows <= 1` used to
         // reach the PTY and the VT as a pane of height 0 (issue #107).
         let state = io_state.lock().await;
-        let pane_ids = win
-            .layout
-            .zoom
-            .as_ref()
-            .map(|zoom| zoom.saved_layout.pane_ids())
-            .unwrap_or_else(|| win.layout.tree.pane_ids());
+        let pane_ids: Vec<PaneId> = win.layout.zoom.iter().map(|z| z.zoomed_pane).collect();
         let size = PtySize::new(
             content.width.max(MIN_PANE_COLS),
             content.height.max(MIN_PANE_ROWS),
@@ -900,7 +895,8 @@ pub(crate) async fn reconcile_session(
     session: SessionId,
 ) -> bool {
     let clients = io_state.lock().await.clients.clone();
-    let Some(driver) = clients.driver(session, tokio::time::Instant::now()) else {
+    let _turn = clients.sizing_turn().await;
+    let Some(driver) = clients.driver(session) else {
         return false;
     };
     let Some(window) = graph
@@ -1414,8 +1410,9 @@ async fn run_attach_loop(
                                         send_input(&mut state, target, permit, bytes, paste, client_id);
                                     }
                                     // Typing is what makes a client the driver.
-                                    clients.mark_input(registry_id, tokio::time::Instant::now());
-                                    reconcile_session(&graph, &io_state, &config, session.session_id).await;
+                                    if clients.mark_input(registry_id, tokio::time::Instant::now()) {
+                                        reconcile_session(&graph, &io_state, &config, session.session_id).await;
+                                    }
                                 }
                                 Room::Closed => {
                                     input_backlogs.remove(&target);
@@ -1502,17 +1499,15 @@ async fn run_attach_loop(
                             let mut s = render_session.lock().await;
                             s.last_action = Some((label.into(), std::time::Instant::now()));
                         }
-                        // Layout-changing actions invalidate per-pane PTY
-                        // sizes. Re-fan the winsizes so vim/htop/etc. inside
-                        // each pane learn their new dimensions.
-                        let committed = !matches!(
-                            kind,
-                            ActionKind::Redraw | ActionKind::ToggleHelp | ActionKind::EnterCopyMode
-                        );
+                        // An action that did something is input, and may have
+                        // changed the layout the panes are sized from.
+                        let committed = action_result.is_ok()
+                            && !matches!(
+                                kind,
+                                ActionKind::Redraw | ActionKind::ToggleHelp | ActionKind::EnterCopyMode
+                            );
                         if committed {
                             clients.mark_input(registry_id, tokio::time::Instant::now());
-                        }
-                        if committed || action_changes_layout(kind) {
                             reconcile_session(&graph, &io_state, &config, session.session_id).await;
                         }
                         let pulse = io_state.lock().await.render_pulse.clone();
@@ -1572,8 +1567,9 @@ async fn run_attach_loop(
                         {
                             Ok(AppMouse::Consumed { redraw }) => {
                                 // A press or wheel the app received is input.
-                                if matches!(kind, MouseKind::Down | MouseKind::ScrollUp | MouseKind::ScrollDown) {
-                                    clients.mark_input(registry_id, tokio::time::Instant::now());
+                                if matches!(kind, MouseKind::Down | MouseKind::ScrollUp | MouseKind::ScrollDown)
+                                    && clients.mark_input(registry_id, tokio::time::Instant::now())
+                                {
                                     reconcile_session(&graph, &io_state, &config, session.session_id).await;
                                 }
                                 if redraw {
@@ -3745,28 +3741,6 @@ fn pane_local_point_clamped(rect: Rect, col: u16, row: u16) -> (u16, u16) {
     (local_col, local_row)
 }
 
-/// True if an action mutates the pane layout in a way that changes the
-/// rect size of one or more visible panes. Used to decide whether to
-/// re-fan PTY winsize after dispatching the action.
-fn action_changes_layout(kind: ActionKind) -> bool {
-    matches!(
-        kind,
-        ActionKind::SplitSmart
-            | ActionKind::SplitVertical
-            | ActionKind::SplitHorizontal
-            | ActionKind::ToggleZoom
-            | ActionKind::KillPane
-            | ActionKind::ResizeLeft
-            | ActionKind::ResizeRight
-            | ActionKind::ResizeUp
-            | ActionKind::ResizeDown
-            | ActionKind::NewWindow
-            | ActionKind::NextWindow
-            | ActionKind::PrevWindow
-            | ActionKind::SwitchToWindow
-    )
-}
-
 /// Compute the focused pane's content rect (cols, rows) — the size
 /// copy mode uses to clamp cursor motion. Returns (0, 0) when the
 /// pane is not in the active window's layout, which keeps `handle_key`
@@ -5220,11 +5194,10 @@ mod tests {
         .await;
 
         let first_zoomed = first_resize_rx.recv().await.expect("first zoom resize");
-        let second_zoomed = second_resize_rx.recv().await.expect("second zoom resize");
         assert_eq!((first_zoomed.size.cols, first_zoomed.size.rows), (100, 29));
-        assert_eq!(
-            (second_zoomed.size.cols, second_zoomed.size.rows),
-            (100, 29)
+        assert!(
+            second_resize_rx.try_recv().is_err(),
+            "zoom resized the hidden pane"
         );
 
         fixture.stop();
@@ -5280,10 +5253,16 @@ mod tests {
                 )
                 .await;
 
-                for (label, rx) in [
-                    ("first", &mut first_resize_rx),
-                    ("second", &mut second_resize_rx),
-                ] {
+                // Zoomed, the hidden pane keeps its size and gets no resize.
+                let panes = if zoomed {
+                    vec![("first", &mut first_resize_rx)]
+                } else {
+                    vec![
+                        ("first", &mut first_resize_rx),
+                        ("second", &mut second_resize_rx),
+                    ]
+                };
+                for (label, rx) in panes {
                     let req = tokio::time::timeout(shux_testkit::BUDGET, rx.recv())
                         .await
                         .unwrap_or_else(|_| panic!("{label} resize (zoomed={zoomed})"))

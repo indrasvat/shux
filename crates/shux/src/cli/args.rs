@@ -1663,7 +1663,8 @@ pub enum PaneCommand {
         /// New height in cells (2..=1000).
         #[arg(long, required_unless_present = "unpin")]
         rows: Option<u16>,
-        /// Release a pinned pane: it takes the layout's size again.
+        /// Release a pinned pane: the next client to drive its session
+        /// resizes it to the layout.
         #[arg(long, conflicts_with_all = ["cols", "rows"])]
         unpin: bool,
     },

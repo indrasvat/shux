@@ -1,7 +1,7 @@
 //! The attached clients: who is watching which session, who sizes its panes,
 //! which panes are pinned, and a way to end one client.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
 
@@ -37,11 +37,26 @@ struct Entry {
     seq: u64,
 }
 
+impl State {
+    /// Take a client off the list; a session left with none forgets its driver.
+    fn unlist(&mut self, id: ClientId) -> Option<Entry> {
+        let entry = self.clients.remove(&id)?;
+        let session = entry.info.session_id;
+        if !self.clients.values().any(|e| e.info.session_id == session) {
+            self.drivers.remove(&session);
+        }
+        Some(entry)
+    }
+}
+
 #[derive(Default)]
 struct State {
     clients: HashMap<ClientId, Entry>,
     drivers: HashMap<SessionId, ClientId>,
-    pins: HashSet<PaneId>,
+    /// Each pin carries the generation that set it, so a failed resize can
+    /// take back only its own.
+    pins: HashMap<PaneId, u64>,
+    next_pin: u64,
     next_seq: u64,
 }
 
@@ -51,6 +66,9 @@ struct State {
 pub struct ClientRegistry {
     state: Arc<Mutex<State>>,
     changed: Arc<watch::Sender<u64>>,
+    /// One sizing pass at a time: deciding the driver and writing its sizes
+    /// is one step, so two passes cannot interleave stale sizes.
+    sizing: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Default for ClientRegistry {
@@ -58,6 +76,7 @@ impl Default for ClientRegistry {
         Self {
             state: Arc::default(),
             changed: Arc::new(watch::channel(0).0),
+            sizing: Arc::default(),
         }
     }
 }
@@ -70,6 +89,11 @@ impl ClientRegistry {
 
     fn bump(&self) {
         self.changed.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// Hold for a whole sizing pass.
+    pub async fn sizing_turn(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.sizing.clone().lock_owned().await
     }
 
     /// Wakes whenever a size decision may have changed.
@@ -128,22 +152,41 @@ impl ClientRegistry {
         }
     }
 
-    /// The client committed input to its session just now.
-    pub fn mark_input(&self, id: ClientId, now: Instant) {
-        if let Some(e) = self.state().clients.get_mut(&id) {
+    /// The client committed input to its session just now. True when that
+    /// may hand it the panes. Input from another client while the driver is
+    /// within [`SETTLE`] of its own last input is not recorded at all, so a
+    /// takeover only ever happens on the new driver's own input, never later
+    /// on some unrelated change.
+    pub fn mark_input(&self, id: ClientId, now: Instant) -> bool {
+        let mut s = self.state();
+        let Some(session) = s.clients.get(&id).map(|e| e.info.session_id) else {
+            return false;
+        };
+        let driver = s.drivers.get(&session).copied();
+        let held = driver.filter(|d| *d != id).is_some_and(|d| {
+            s.clients
+                .get(&d)
+                .and_then(|e| e.info.last_input)
+                .is_some_and(|t| now.duration_since(t) < SETTLE)
+        });
+        if held {
+            return false;
+        }
+        if let Some(e) = s.clients.get_mut(&id) {
             e.info.last_input = Some(now);
         }
-        self.bump();
+        drop(s);
+        // The driver typing changes nothing about who drives.
+        let takes = driver != Some(id);
+        if takes {
+            self.bump();
+        }
+        takes
     }
 
     /// Unlist a client and end its connection. False when none is attached.
     pub fn remove(&self, id: ClientId) -> bool {
-        let gone = self
-            .state()
-            .clients
-            .remove(&id)
-            .map(|e| e.end.cancel())
-            .is_some();
+        let gone = self.state().unlist(id).map(|e| e.end.cancel()).is_some();
         if gone {
             self.bump();
         }
@@ -152,7 +195,7 @@ impl ClientRegistry {
 
     /// The client whose size the session's panes take, decided now. None
     /// when no voting client is attached: sizes then stay as they are.
-    pub fn driver(&self, session: SessionId, now: Instant) -> Option<ClientInfo> {
+    pub fn driver(&self, session: SessionId) -> Option<ClientInfo> {
         let mut s = self.state();
         let mut voters: Vec<&Entry> = s
             .clients
@@ -161,7 +204,7 @@ impl ClientRegistry {
             .collect();
         voters.sort_by_key(|e| e.seq);
         let infos: Vec<&ClientInfo> = voters.iter().map(|e| &e.info).collect();
-        let elected = elect(s.drivers.get(&session).copied(), &infos, now);
+        let elected = elect(s.drivers.get(&session).copied(), &infos);
         let info = elected.and_then(|id| infos.iter().find(|c| c.id == id).map(|c| (*c).clone()));
         match elected {
             Some(id) => s.drivers.insert(session, id),
@@ -171,19 +214,42 @@ impl ClientRegistry {
     }
 
     pub fn is_pinned(&self, pane: PaneId) -> bool {
-        self.state().pins.contains(&pane)
+        self.state().pins.contains_key(&pane)
     }
 
     /// Pin a pane at the size it was set to: no client's size moves it.
-    pub fn pin(&self, pane: PaneId) {
-        if self.state().pins.insert(pane) {
+    /// Returns the pin's generation, for [`ClientRegistry::release`].
+    pub fn pin(&self, pane: PaneId) -> u64 {
+        let (generation, new) = {
+            let mut s = self.state();
+            s.next_pin += 1;
+            let generation = s.next_pin;
+            (generation, s.pins.insert(pane, generation).is_none())
+        };
+        if new {
+            self.bump();
+        }
+        generation
+    }
+
+    /// Take back the pin `generation` set, unless a later pin replaced it.
+    pub fn release(&self, pane: PaneId, generation: u64) {
+        let released = {
+            let mut s = self.state();
+            let ours = s.pins.get(&pane) == Some(&generation);
+            if ours {
+                s.pins.remove(&pane);
+            }
+            ours
+        };
+        if released {
             self.bump();
         }
     }
 
     /// Hand a pane back to the layout. True when it was pinned.
     pub fn unpin(&self, pane: PaneId) -> bool {
-        let was = self.state().pins.remove(&pane);
+        let was = self.state().pins.remove(&pane).is_some();
         if was {
             self.bump();
         }
@@ -192,12 +258,11 @@ impl ClientRegistry {
 }
 
 /// Who drives a session, given the current driver and the voters in the
-/// order they attached. The client with the most recent input drives, but
-/// the current driver keeps the panes until it has been quiet for
-/// [`SETTLE`]. Before anyone types, the first voter drives; when the driver
-/// leaves, the next takes over at once.
-fn elect(current: Option<ClientId>, voters: &[&ClientInfo], now: Instant) -> Option<ClientId> {
-    let current = current.and_then(|id| voters.iter().find(|c| c.id == id));
+/// order they attached: the most recent recorded input (the settle rule
+/// lives in [`ClientRegistry::mark_input`]). Before anyone types, the
+/// current driver keeps the panes, or the first voter takes them; when the
+/// driver leaves, the next takes over at once.
+fn elect(current: Option<ClientId>, voters: &[&ClientInfo]) -> Option<ClientId> {
     // Ties go to the earlier attach: `voters` is in attach order and
     // `max_by_key` keeps the last maximum, so iterate in reverse.
     let latest = voters
@@ -205,17 +270,10 @@ fn elect(current: Option<ClientId>, voters: &[&ClientInfo], now: Instant) -> Opt
         .rev()
         .filter(|c| c.last_input.is_some())
         .max_by_key(|c| c.last_input);
-    match (current, latest) {
-        (Some(cur), Some(new)) if new.id != cur.id && new.last_input > cur.last_input => {
-            let settled = cur
-                .last_input
-                .is_none_or(|t| now.duration_since(t) >= SETTLE);
-            Some(if settled { new.id } else { cur.id })
-        }
-        (Some(cur), _) => Some(cur.id),
-        (None, Some(new)) => Some(new.id),
-        (None, None) => voters.first().map(|c| c.id),
-    }
+    latest
+        .or_else(|| current.and_then(|id| voters.iter().find(|c| c.id == id)))
+        .or_else(|| voters.first())
+        .map(|c| c.id)
 }
 
 /// Removes its client from the registry when dropped, however the
@@ -233,7 +291,7 @@ impl Registered {
 
 impl Drop for Registered {
     fn drop(&mut self) {
-        let gone = self.registry.state().clients.remove(&self.id).is_some();
+        let gone = self.registry.state().unlist(self.id).is_some();
         if gone {
             self.registry.bump();
         }
@@ -287,7 +345,7 @@ mod tests {
         let (a, b) = (info(s), info(s));
         let _ga = reg.register(a.clone(), CancellationToken::new());
         let gb = reg.register(b.clone(), CancellationToken::new());
-        let driver = |reg: &ClientRegistry| reg.driver(s, Instant::now()).map(|c| c.id);
+        let driver = |reg: &ClientRegistry| reg.driver(s).map(|c| c.id);
         assert_eq!(
             driver(&reg),
             Some(a.id),
@@ -309,11 +367,21 @@ mod tests {
             Some(b.id),
             "alternating keys flipped the driver"
         );
+        // A key refused inside the window is not banked: once B settles,
+        // nothing but A's next input hands A the panes.
         tokio::time::advance(SETTLE).await;
+        reg.set_size(a.id, 120, 40);
+        reg.pin(PaneId::new());
+        let _late = reg.register(info(s), CancellationToken::new());
+        assert_eq!(
+            driver(&reg),
+            Some(b.id),
+            "a refused key took the panes later"
+        );
+        reg.mark_input(a.id, Instant::now());
         assert_eq!(driver(&reg), Some(a.id), "a settled driver kept the panes");
 
         drop(gb);
-        reg.mark_input(a.id, Instant::now());
         assert_eq!(driver(&reg), Some(a.id));
     }
 
@@ -327,7 +395,7 @@ mod tests {
         };
         let _g = reg.register(watcher.clone(), CancellationToken::new());
         reg.mark_input(watcher.id, Instant::now());
-        assert_eq!(reg.driver(s, Instant::now()), None);
+        assert_eq!(reg.driver(s), None);
     }
 
     #[test]
@@ -371,7 +439,7 @@ mod tests {
                         _ => tokio::time::advance(Duration::from_millis(ms)).await,
                     }
                     let voters: Vec<&ClientInfo> = guards.iter().map(|(c, _)| c).filter(|c| c.votes).collect();
-                    let d = reg.driver(s, Instant::now());
+                    let d = reg.driver(s);
                     prop_assert_eq!(d.is_some(), !voters.is_empty());
                     if let Some(d) = d {
                         prop_assert!(d.votes);

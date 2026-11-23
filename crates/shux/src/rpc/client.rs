@@ -258,4 +258,93 @@ mod tests {
         .await;
         assert_eq!(both.code, shux_rpc::ErrorCode::InvalidParams.code());
     }
+
+    /// Unpinning a pane that does not exist is an error, not a quiet success.
+    #[tokio::test]
+    async fn unpinning_a_missing_pane_fails() {
+        let h = RpcHarness::new();
+        let gone = shux_core::model::PaneId::new();
+        let err = dispatch_err(
+            &h.router,
+            "pane.set_size",
+            serde_json::json!({ "pane_id": gone.to_string(), "unpin": true }),
+        )
+        .await;
+        assert_eq!(err.code, shux_rpc::ErrorCode::NotFound.code(), "{err:?}");
+    }
+
+    /// A pane named with a session it is not in is refused, not acted on.
+    #[tokio::test]
+    async fn a_pane_from_another_session_is_refused() {
+        let h = RpcHarness::new();
+        let (_a, _wa, pane_a) = h.seed_session("alpha").await;
+        let (b, _wb, _pane_b) = h.seed_session("beta").await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::pane_io::ResizeRequest>(4);
+        h.io.lock().await.resizers.insert(pane_a, tx);
+        tokio::spawn(async move {
+            while let Some(req) = rx.recv().await {
+                if let Some(ack) = req.ack {
+                    let _ = ack.send(());
+                }
+            }
+        });
+        let err = dispatch_err(
+            &h.router,
+            "pane.set_size",
+            serde_json::json!({ "session_id": b.to_string(), "pane_id": pane_a.to_string(), "cols": 90, "rows": 30 }),
+        )
+        .await;
+        assert_eq!(
+            err.code,
+            shux_rpc::ErrorCode::InvalidParams.code(),
+            "{err:?}"
+        );
+        let clients = h.io.lock().await.clients.clone();
+        assert!(
+            !clients.is_pinned(pane_a),
+            "the other session's pane was pinned"
+        );
+    }
+
+    /// Two set_size calls race: one fails after the other succeeded. The
+    /// pane stays pinned, as the successful call said.
+    #[tokio::test]
+    async fn a_failed_set_size_does_not_undo_a_concurrent_pin() {
+        let h = RpcHarness::new();
+        let (_s, _w, pane) = h.seed_session("race").await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::pane_io::ResizeRequest>(4);
+        h.io.lock().await.resizers.insert(pane, tx);
+        // Holds both requests, then fails the first and lands the second.
+        tokio::spawn(async move {
+            let first = rx.recv().await.expect("first resize");
+            let second = rx.recv().await.expect("second resize");
+            drop(first);
+            if let Some(ack) = second.ack {
+                let _ = ack.send(());
+            }
+        });
+        let set = |cols: u64| {
+            let router = h.router.clone();
+            let id = pane.to_string();
+            tokio::spawn(async move {
+                router
+                    .dispatch(
+                        "pane.set_size",
+                        Some(serde_json::json!({ "pane_id": id, "cols": cols, "rows": 30 })),
+                    )
+                    .await
+            })
+        };
+        let first = set(90);
+        tokio::task::yield_now().await;
+        let second = set(100);
+        let (first, second) = (first.await.unwrap(), second.await.unwrap());
+        assert!(first.is_err(), "the first resize was meant to fail");
+        assert_eq!(second.expect("second lands")["pinned"], true);
+        let clients = h.io.lock().await.clients.clone();
+        assert!(
+            clients.is_pinned(pane),
+            "a failed set_size undid a pin another call had made"
+        );
+    }
 }
