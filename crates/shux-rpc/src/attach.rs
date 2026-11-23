@@ -40,6 +40,11 @@ pub struct AttachHello {
     /// client, which never decided, silent.
     #[serde(default)]
     pub graphics: bool,
+    /// Text and colour only: no hyperlinks, cursor shape or colour, or images
+    /// reach this client, whatever the panes print. For a terminal whose
+    /// owner did not choose to run the pane's program.
+    #[serde(default)]
+    pub plain: bool,
 }
 
 /// Daemon's reply to the hello.
@@ -52,6 +57,10 @@ pub enum AttachReady {
         active_window_id: String,
         active_pane_id: String,
         protocol: u32,
+        /// The daemon strips terminal effects for this client. A client that
+        /// asked for `plain` and does not see it here must not run.
+        #[serde(default)]
+        plain: bool,
     },
     Error {
         code: String,
@@ -292,6 +301,7 @@ mod tests {
             rows: 30,
             client_version: "0.1.0".into(),
             graphics: true,
+            plain: false,
         };
         let s = serde_json::to_string(&hello).unwrap();
         let back: AttachHello = serde_json::from_str(&s).unwrap();
@@ -309,6 +319,7 @@ mod tests {
             active_window_id: "w".into(),
             active_pane_id: "p".into(),
             protocol: ATTACH_PROTOCOL_VERSION,
+            plain: false,
         };
         let s = serde_json::to_string(&ok).unwrap();
         assert!(s.contains("\"kind\":\"ok\""));

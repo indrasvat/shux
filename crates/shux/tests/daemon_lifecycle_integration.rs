@@ -310,6 +310,7 @@ async fn attach_detach_does_not_orphan_or_kill_pane_child() {
         rows: 30,
         client_version: "test".to_string(),
         graphics: false,
+        plain: false,
     };
     framed
         .send(Bytes::from(serde_json::to_vec(&hello).expect("hello JSON")))

@@ -83,6 +83,16 @@ fn terminal_can_draw_images() -> bool {
         .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()))
 }
 
+/// A mode the client asked for that the daemon's reply does not confirm. A
+/// daemon that predates `plain` ignores it, so its echo is the only proof.
+fn unmet_mode(asked_plain: bool, granted_plain: bool) -> Option<String> {
+    (asked_plain && !granted_plain).then(|| {
+        "the running daemon cannot strip terminal effects, so --plain would not \
+         hold; it is older than this shux"
+            .to_string()
+    })
+}
+
 /// Public entry point: connect to the daemon's attach socket, do the
 /// handshake, and run the bidirectional loop until detach or session
 /// end. Restores the terminal automatically.
@@ -109,6 +119,7 @@ pub async fn run_attach(socket_path: &Path, config: ClientConfig) -> Result<Exit
         rows,
         client_version: env!("CARGO_PKG_VERSION").to_string(),
         graphics,
+        plain: config.plain,
     };
     framed
         .send(Bytes::from(serde_json::to_vec(&hello)?))
@@ -126,8 +137,14 @@ pub async fn run_attach(socket_path: &Path, config: ClientConfig) -> Result<Exit
         AttachReady::Ok {
             session_id,
             session_name,
+            plain,
             ..
-        } => (session_id, session_name),
+        } => {
+            if let Some(why) = unmet_mode(config.plain, plain) {
+                return Ok(ExitReason::Error(why));
+            }
+            (session_id, session_name)
+        }
         AttachReady::Error { code, message } => {
             return Ok(ExitReason::Error(format!(
                 "attach denied: {code}: {message}"
@@ -660,6 +677,22 @@ impl WrittenFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_unconfirmed_by_the_daemon_refuses_to_attach() {
+        assert!(unmet_mode(true, false).is_some());
+        assert!(unmet_mode(true, true).is_none());
+        assert!(unmet_mode(false, false).is_none());
+        // An old daemon's reply has no `plain`; serde reads it as false.
+        let old: AttachReady = serde_json::from_str(
+            r#"{"kind":"ok","session_id":"s","session_name":"n","active_window_id":"w","active_pane_id":"p","protocol":1}"#,
+        )
+        .unwrap();
+        let AttachReady::Ok { plain, .. } = old else {
+            panic!("ok reply");
+        };
+        assert!(unmet_mode(true, plain).is_some());
+    }
 
     #[test]
     fn test_prefix_actions() {

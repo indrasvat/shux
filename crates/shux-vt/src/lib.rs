@@ -3026,6 +3026,30 @@ mod tests {
         assert!(vt.grid().visible_row(0)[1].extended.is_none());
     }
 
+    /// A link ends at OSC 8 with an empty URI, not at an SGR reset: `ls
+    /// --hyperlink`, compilers and shux's own renderer reset colours inside a
+    /// link, and every real terminal keeps the link across that reset.
+    #[test]
+    fn osc8_hyperlink_survives_sgr_reset() {
+        let mut vt = VirtualTerminal::new(2, 40);
+        vt.process(b"\x1b]8;;https://example.invalid/x\x1b\\\x1b[1mA\x1b[0mB\x1b]8;;\x1b\\C");
+
+        let row = vt.grid().visible_row(0);
+        let link = |c: usize| {
+            row[c]
+                .extended
+                .as_ref()
+                .and_then(|e| e.hyperlink.as_deref())
+        };
+        assert_eq!(link(0), Some("https://example.invalid/x"));
+        assert_eq!(
+            link(1),
+            Some("https://example.invalid/x"),
+            "SGR 0 ended the link"
+        );
+        assert_eq!(link(2), None);
+    }
+
     #[test]
     fn grapheme_combining_mark_is_stored_and_captured() {
         let mut vt = VirtualTerminal::new(2, 20);

@@ -503,6 +503,7 @@ async fn headless_attach(
         rows: 30,
         client_version: "attach-teardown-test".to_string(),
         graphics: false,
+        plain: false,
     };
     framed
         .send(Bytes::from(serde_json::to_vec(&hello).unwrap()))
@@ -666,6 +667,7 @@ async fn a_resize_during_the_handshake_reaches_the_daemon() {
         active_window_id: "stand-in".into(),
         active_pane_id: "stand-in".into(),
         protocol: ATTACH_PROTOCOL_VERSION,
+        plain: false,
     };
     framed
         .send(Bytes::from(serde_json::to_vec(&ready).unwrap()))

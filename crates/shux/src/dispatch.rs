@@ -76,6 +76,7 @@ pub(crate) fn default_session_name() -> String {
 pub(crate) async fn run_attach(
     jsonrpc_socket: &std::path::Path,
     session_name: String,
+    plain: bool,
 ) -> anyhow::Result<()> {
     let attach_path = daemon::attach_socket_path_for(jsonrpc_socket)?;
     let cfg_path = shux_core::config::default_config_path();
@@ -102,6 +103,7 @@ pub(crate) async fn run_attach(
         ),
         keybindings: cfg_snapshot.keybindings.clone(),
         live_config: Some(live_config),
+        plain,
     };
     match shux_ui::attach::run_attach(&attach_path, cfg).await {
         Ok(reason) => {
@@ -200,7 +202,7 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
             }
             let _ = client::ensure_daemon_running_at(&socket_path).await?;
             let session_name = pick_attach_target(&socket_path).await;
-            run_attach(&socket_path, session_name).await
+            run_attach(&socket_path, session_name, false).await
         }
 
         // `shux session <verb>` — canonical session lifecycle.
@@ -259,7 +261,7 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
                 cli::or_wait_failed(created, waiting, "session create", args.format)?;
                 drop(stream);
                 if !detached {
-                    run_attach(&socket_path, session_name).await
+                    run_attach(&socket_path, session_name, false).await
                 } else {
                     Ok(())
                 }
@@ -290,7 +292,11 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
                 cli::handle_rename(&mut stream, &session, &name, expected_version, args.format)
                     .await
             }
-            cli::SessionCommand::Attach { name_pos, session } => {
+            cli::SessionCommand::Attach {
+                name_pos,
+                session,
+                plain,
+            } => {
                 // Refuse before touching the terminal. `run_attach` drives
                 // crossterm raw mode, and crossterm opens `/dev/tty` DIRECTLY —
                 // it resolves through the process's controlling terminal and
@@ -317,7 +323,7 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
                 let session_name = name_pos
                     .or(session)
                     .unwrap_or_else(|| "default".to_string());
-                run_attach(&socket_path, session_name).await
+                run_attach(&socket_path, session_name, plain).await
             }
             cli::SessionCommand::Snapshot {
                 session,

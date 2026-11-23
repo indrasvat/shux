@@ -574,6 +574,7 @@ async fn handle_attach_connection(
         active_window_id: session.active_window_id.to_string(),
         active_pane_id: session.active_pane_id.to_string(),
         protocol: ATTACH_PROTOCOL_VERSION,
+        plain: hello.plain,
     };
     framed
         .send(Bytes::from(serde_json::to_vec(&ready)?))
@@ -1040,6 +1041,7 @@ async fn run_attach_loop(
             render_tx,
             render_cancel,
             hello.graphics,
+            hello.plain,
             fallback_tick(),
             WELCOME_TOAST_DWELL,
         )
@@ -1660,6 +1662,7 @@ async fn run_render_loop(
     out_tx: mpsc::Sender<AttachServerFrame>,
     cancel: CancellationToken,
     graphics: bool,
+    plain: bool,
     tick_period: Duration,
     toast_dwell: Duration,
 ) {
@@ -1680,6 +1683,7 @@ async fn run_render_loop(
     let buf: Vec<u8> = Vec::with_capacity(64 * 1024);
     let mut compositor: RenderCompositor<Vec<u8>> = RenderCompositor::new(cols, rows, buf, cfg);
     compositor.set_graphics(graphics);
+    compositor.set_plain(plain);
 
     // Send a clear-screen ANSI prelude so the client terminal starts blank.
     let _ = out_tx
@@ -4675,6 +4679,7 @@ mod tests {
             tx,
             cancel.clone(),
             false,
+            false,
             Duration::from_secs(3600),
             WELCOME_TOAST_DWELL,
         ));
@@ -4769,6 +4774,7 @@ mod tests {
             tx,
             cancel.clone(),
             false,
+            false,
             Duration::from_secs(3600),
             WELCOME_TOAST_DWELL,
         ));
@@ -4846,6 +4852,7 @@ mod tests {
             Arc::new(Mutex::new((100, 24))),
             tx,
             cancel.clone(),
+            false,
             false,
             Duration::from_secs(3600),
             Duration::ZERO,
@@ -5868,6 +5875,7 @@ mod tests {
             rows: 24,
             client_version: "test".to_string(),
             graphics: false,
+            plain: false,
         };
         framed
             .send(Bytes::from(serde_json::to_vec(&hello).expect("hello json")))
@@ -6018,7 +6026,8 @@ mod tests {
                     welcome_toast_seen: false,
                 },
             );
-            let mut client = Client::attach_onboarded(&fixture, 90, onboarding.clone()).await;
+            let mut client =
+                Client::attach_onboarded(&fixture, 90, onboarding.clone(), false).await;
 
             client.send(&first).await;
             // Frames are handled in order, so the pane receiving this proves
@@ -8574,13 +8583,14 @@ mod tests {
                     welcome_toast_seen: true,
                 },
             );
-            Self::attach_onboarded(fixture, cols, onboarding).await
+            Self::attach_onboarded(fixture, cols, onboarding, false).await
         }
 
         async fn attach_onboarded(
             fixture: &AttachFixture,
             cols: u16,
             onboarding: crate::onboarding::OnboardingHandle,
+            plain: bool,
         ) -> Self {
             let (server_stream, client_stream) = tokio::io::duplex(1 << 20);
             let cancel = fixture.cancel.child_token();
@@ -8603,6 +8613,7 @@ mod tests {
                 rows: 24,
                 client_version: "input-test".to_string(),
                 graphics: false,
+                plain,
             };
             framed
                 .send(Bytes::from(serde_json::to_vec(&hello).expect("hello json")))
@@ -8615,7 +8626,7 @@ mod tests {
                 .expect("ready bytes");
             assert!(matches!(
                 serde_json::from_slice::<AttachReady>(&ready).expect("ready json"),
-                AttachReady::Ok { .. }
+                AttachReady::Ok { plain: echoed, .. } if echoed == plain
             ));
             Self {
                 framed,
@@ -10465,5 +10476,59 @@ mod tests {
         b.stop().await;
         a.stop().await;
         h.stop().await;
+    }
+
+    /// Issue #288: a plain viewer gets the pane's text and colour, and none
+    /// of the effects a pane can set in a terminal; a normal viewer of the
+    /// same pane still gets them.
+    #[tokio::test]
+    async fn a_plain_viewer_gets_text_and_colour_but_no_terminal_effects() {
+        let fixture = attach_fixture().await;
+        let _io = seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+        fixture
+            .io_state
+            .lock()
+            .await
+            .vts
+            .get_mut(&fixture.first_pane)
+            .expect("seeded vt")
+            .process(
+                b"\x1b[31m\x1b]8;;https://example.invalid/p\x1b\\LINKED\x1b]8;;\x1b\\\x1b[0m\x1b]12;#ff0000\x1b\\\x1b[6 q",
+            );
+        let onboarded = || {
+            crate::onboarding::OnboardingHandle::from_state_for_test(
+                crate::onboarding::OnboardingState {
+                    prefix_discovered: true,
+                    welcome_toast_seen: true,
+                },
+            )
+        };
+        let mut seen = Vec::new();
+        for plain in [true, false] {
+            let mut c = Client::attach_onboarded(&fixture, 90, onboarded(), plain).await;
+            let mut raw = Vec::new();
+            assert!(
+                c.frames_until(|f, text| {
+                    if let AttachServerFrame::Render { data, .. } = f {
+                        raw.extend(BASE64.decode(data.as_bytes()).expect("render base64"));
+                    }
+                    text.contains("LINKED")
+                })
+                .await,
+                "plain={plain}: the pane's text never arrived"
+            );
+            seen.push(String::from_utf8_lossy(&raw).into_owned());
+            c.stop().await;
+        }
+        let (plain, normal) = (&seen[0], &seen[1]);
+        assert!(plain.contains("\x1b[38;"), "plain lost colour: {plain:?}");
+        for effect in ["\x1b]8;;https", "\x1b]12;", "\x1b[6 q"] {
+            assert!(!plain.contains(effect), "plain got {effect:?}");
+            assert!(
+                normal.contains(effect),
+                "normal lacks {effect:?}: {normal:?}"
+            );
+        }
+        fixture.stop();
     }
 }

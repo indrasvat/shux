@@ -988,7 +988,15 @@ impl<'a> VtHandler<'a> {
         match param {
             0 => {
                 self.cursor.style = CellStyle::default();
-                self.cursor.extended = None;
+                // A hyperlink is not graphic rendition: only OSC 8 ends it.
+                let link = self
+                    .cursor
+                    .extended
+                    .take()
+                    .and_then(|e| e.hyperlink.clone());
+                if link.is_some() {
+                    self.set_cursor_hyperlink(link);
+                }
             }
             1 => self.cursor.style.flags.set(CellFlags::BOLD),
             2 => self.cursor.style.flags.set(CellFlags::DIM),

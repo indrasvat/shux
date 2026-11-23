@@ -111,6 +111,7 @@ async fn render_bytes(h: &Harness, session: &str, graphics: bool) -> Vec<u8> {
         rows: 30,
         client_version: "image-retransmit-test".to_string(),
         graphics,
+        plain: false,
     };
     framed
         .send(Bytes::from(serde_json::to_vec(&hello).unwrap()))
@@ -389,6 +390,7 @@ async fn a_large_client_still_receives_frames_when_its_pane_holds_a_picture() {
                 rows: 250,
                 client_version: "image-big-frame-test".to_string(),
                 graphics: true,
+                plain: false,
             })
             .unwrap(),
         ))
