@@ -22,6 +22,9 @@ pub struct SavedCursor {
     pub auto_wrap_pending: bool,
     pub origin_mode: bool,
     pub charsets: TerminalCharsets,
+    /// Saved on the alternate screen: its position is in that screen's
+    /// coordinates, which no reflow moves.
+    pub on_alternate: bool,
 }
 
 /// Terminal cursor state.
@@ -81,6 +84,7 @@ impl Cursor {
             auto_wrap_pending: self.auto_wrap_pending,
             origin_mode,
             charsets,
+            on_alternate: false,
         });
     }
 

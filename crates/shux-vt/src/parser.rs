@@ -387,6 +387,9 @@ impl<'a> VtHandler<'a> {
 
     fn save_cursor_state(&mut self) {
         self.cursor.save(self.modes.origin_mode, *self.charsets);
+        if let Some(saved) = &mut self.cursor.saved {
+            saved.on_alternate = self.modes.alternate_screen;
+        }
     }
 
     fn restore_cursor_state(&mut self) {
@@ -565,11 +568,14 @@ impl<'a> VtHandler<'a> {
         }
     }
 
-    fn wrap_to_next_line(&mut self) {
+    /// `wide_gap`: the last cell was left blank for a wide glyph that did not fit.
+    fn wrap_to_next_line(&mut self, wide_gap: bool) {
         self.clear_active_grapheme_cell();
         self.cursor.col = 0;
         self.cursor.auto_wrap_pending = false;
-        self.grid.visible_row_mut_marked(self.cursor.row).wrapped = true;
+        let row = self.grid.visible_row_mut_marked(self.cursor.row);
+        row.wrapped = true;
+        row.wide_gap = wide_gap;
         if self.cursor.row == self.scroll_region.bottom {
             self.grid
                 .scroll_up(self.scroll_region.top, self.scroll_region.bottom);
@@ -617,7 +623,7 @@ impl<'a> VtHandler<'a> {
         // Handle auto-wrap pending state.
         if self.cursor.auto_wrap_pending {
             if self.modes.auto_wrap {
-                self.wrap_to_next_line();
+                self.wrap_to_next_line(false);
             } else {
                 // No auto-wrap: overwrite last column.
                 self.cursor.col = cols.saturating_sub(1);
@@ -655,7 +661,7 @@ impl<'a> VtHandler<'a> {
                 row[col] = blank;
             }
             if self.modes.auto_wrap {
-                self.wrap_to_next_line();
+                self.wrap_to_next_line(true);
             } else {
                 self.cursor.auto_wrap_pending = false;
                 self.clear_active_grapheme_cell();

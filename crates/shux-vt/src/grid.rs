@@ -176,18 +176,70 @@ impl DirtyState {
     }
 }
 
+/// A logical line read for reflow: `cells[..content_len]` is content and the
+/// rest is padding. Default blanks after the last attributed cell are not
+/// stored.
 #[derive(Debug, Default)]
 struct LogicalLine {
     cells: Vec<Cell>,
-    display_width: usize,
-    /// Blanks after the last glyph of a hard line: kept where they fit, never wrapped.
-    trailing: Vec<Cell>,
+    content_len: usize,
+    /// Display width of every cell read so far, unstored default blanks included.
+    read_width: usize,
+    /// Default blanks read but not stored yet.
+    pending_defaults: usize,
+}
+
+impl LogicalLine {
+    fn push_row(&mut self, cells: &[Cell]) {
+        self.read_width += display_width(cells);
+        let Some(last) = cells.iter().rposition(|cell| !is_default_blank(cell)) else {
+            self.pending_defaults += cells.len();
+            return;
+        };
+        self.cells
+            .extend(std::iter::repeat_n(Cell::default(), self.pending_defaults));
+        let start = self.cells.len();
+        self.cells.extend_from_slice(&cells[..=last]);
+        self.pending_defaults = cells.len() - last - 1;
+        if let Some(idx) = cells[..=last].iter().rposition(is_content) {
+            self.content_len = start + idx + 1;
+        }
+    }
+}
+
+/// A cell an erase could have produced: a plain space whose only attribute is
+/// its background.
+fn is_padding(cell: &Cell) -> bool {
+    cell.ch == ' '
+        && cell.width == 1
+        && cell.style.fg == Color::Default
+        && cell.style.flags == Default::default()
+        && cell.extended.is_none()
+}
+
+fn is_content(cell: &Cell) -> bool {
+    !is_padding(cell)
+}
+
+fn is_default_blank(cell: &Cell) -> bool {
+    is_padding(cell) && cell.style.bg == Color::Default
 }
 
 #[derive(Debug, Clone, Copy)]
 struct CursorAnchor {
+    point: usize,
     logical_line: usize,
     display_offset: usize,
+}
+
+/// A visible position carried through a resize.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResizePoint {
+    pub row: usize,
+    pub col: usize,
+    /// The point is just past the glyph at `col`, in the last column: a
+    /// deferred wrap.
+    pub past_glyph: bool,
 }
 
 #[derive(Debug)]
@@ -195,8 +247,10 @@ struct ReflowedLineMap {
     range: std::ops::Range<usize>,
     cells: Vec<ReflowedCellPosition>,
     end_row: usize,
+    /// Column after the last content cell; equals the width when it fills the row.
     end_col: usize,
     display_width: usize,
+    cols: usize,
 }
 
 #[derive(Debug)]
@@ -235,6 +289,8 @@ pub struct Row {
     pub(crate) cells: Arc<Vec<Cell>>,
     /// Whether this row soft-wraps into the next row.
     pub wrapped: bool,
+    /// The last cell is the gap left where a wide glyph wrapped early.
+    pub(crate) wide_gap: bool,
 }
 
 /// Mutable access to one visible row.
@@ -278,6 +334,7 @@ impl Row {
         Row {
             cells: Arc::new(vec![Cell::default(); cols]),
             wrapped: false,
+            wide_gap: false,
         }
     }
 
@@ -307,6 +364,7 @@ impl Row {
     /// Resize the row, filling new cells with the given template.
     pub fn resize(&mut self, cols: usize, template: Cell) {
         self.cells_mut().resize(cols, template);
+        self.wide_gap = false;
     }
 
     /// Return the row to the state of `Row::new(cols)`, keeping the cell
@@ -318,6 +376,7 @@ impl Row {
         cells.clear();
         cells.resize(cols, Cell::default());
         self.wrapped = false;
+        self.wide_gap = false;
     }
 
     /// Reset all cells in the row to the given background color.
@@ -326,6 +385,7 @@ impl Row {
             cell.reset(bg);
         }
         self.wrapped = false;
+        self.wide_gap = false;
     }
 
     /// Overwrite every cell with the DECALN alignment pattern (issue #117).
@@ -342,6 +402,7 @@ impl Row {
     pub(crate) fn fill_alignment_pattern(&mut self) {
         self.cells_mut().fill(Cell::ALIGNMENT);
         self.wrapped = false;
+        self.wide_gap = false;
     }
 
     pub(crate) fn clear_wide_pair_around(&mut self, col: usize, bg: Color) {
@@ -1395,30 +1456,44 @@ impl Grid {
     /// otherwise new blank lines are appended.
     /// Column resize: soft-wrapped logical lines are reflowed.
     pub fn resize(&mut self, new_rows: usize, new_cols: usize) {
-        self.resize_with_cursor(new_rows, new_cols, None);
+        self.resize_with_points(new_rows, new_cols, &mut []);
     }
 
-    /// Resize the grid and remap an optional visible cursor position through
-    /// column reflow. Returns the new visible cursor position when one was
-    /// supplied.
-    pub fn resize_with_cursor(
+    /// Resize the grid, carrying `points` through it. A column change reflows
+    /// soft-wrapped lines (see [`append_reflowed_line`]). Rows with no content
+    /// below every point give way before a row scrolls off the top.
+    pub fn resize_with_points(
         &mut self,
         new_rows: usize,
         new_cols: usize,
-        cursor: Option<(usize, usize)>,
-    ) -> Option<(usize, usize)> {
+        points: &mut [ResizePoint],
+    ) {
         if new_cols != self.cols && new_cols > 0 && new_rows > 0 {
-            return self.resize_reflowing_columns(new_rows, new_cols, cursor);
+            self.resize_reflowing_columns(new_rows, new_cols, points);
+            return;
         }
 
-        let old_abs_cursor = cursor.map(|(row, col)| (self.scrollback_len() + row, col));
-        self.resize_canvas(new_rows, new_cols);
-        old_abs_cursor.map(|(abs_row, col)| self.visible_cursor_from_abs(abs_row, col))
+        let sb = self.scrollback_len();
+        let floor = points.iter().map(|p| sb + p.row).max();
+        let old_cols = self.cols;
+        self.resize_canvas_above(new_rows, new_cols, floor);
+        for point in points.iter_mut() {
+            let (row, col) = self.visible_cursor_from_abs(sb + point.row, point.col);
+            point.past_glyph &= sb + point.row >= self.scrollback_len() && new_cols == old_cols;
+            point.row = row;
+            point.col = col;
+        }
     }
 
     /// Resize without column reflow. This is used for fixed-canvas alternate
     /// screen buffers where fullscreen apps redraw after SIGWINCH.
     pub fn resize_canvas(&mut self, new_rows: usize, new_cols: usize) {
+        self.resize_canvas_above(new_rows, new_cols, None);
+    }
+
+    /// [`Grid::resize_canvas`], where a row shrink drops only content-free
+    /// rows below `floor` (an absolute row) when one is given.
+    fn resize_canvas_above(&mut self, new_rows: usize, new_cols: usize, floor: Option<usize>) {
         let resized = new_rows != self.rows || new_cols != self.cols;
         if new_cols != self.cols {
             for row in self.raw.iter_mut() {
@@ -1435,13 +1510,13 @@ impl Grid {
             // as scrollback (they remain in the VecDeque and scrollback_len grows).
             let excess = self.rows - new_rows;
             let mut removed = 0;
-            while removed < excess {
-                // Remove blank rows from the bottom of the visible area.
-                if let Some(back) = self.raw.back()
-                    && back.is_blank()
-                {
-                    self.raw.pop_back();
-                }
+            while removed < excess
+                && self.raw.back().is_some_and(|back| match floor {
+                    Some(floor) => self.raw.len() - 1 > floor && !row_has_content(back),
+                    None => back.is_blank(),
+                })
+            {
+                self.raw.pop_back();
                 removed += 1;
             }
             // Ensure we still have at least new_rows lines.
@@ -1471,54 +1546,35 @@ impl Grid {
         &mut self,
         new_rows: usize,
         new_cols: usize,
-        cursor: Option<(usize, usize)>,
-    ) -> Option<(usize, usize)> {
+        points: &mut [ResizePoint],
+    ) {
         let old_scrollback_len = self.scrollback_len();
-        let cursor_abs = cursor.map(|(row, col)| (old_scrollback_len + row, col));
-        let mut cursor_anchor = None;
+        let mut anchors = Vec::with_capacity(points.len());
         let mut logical_lines = Vec::new();
         let mut current = LogicalLine::default();
 
         for (abs_row, row) in self.raw.iter().enumerate() {
-            let is_tail = !row.wrapped;
-            let content_len = if is_tail {
-                content_len(&row.cells)
-            } else {
-                row.cells.len()
-            };
-            let row_cells = &row.cells[..content_len];
-
-            if let Some((cursor_row, cursor_col)) = cursor_abs
-                && cursor_row == abs_row
-            {
-                let row_offset = display_width_until(&row.cells, cursor_col);
-                cursor_anchor = Some(CursorAnchor {
-                    logical_line: logical_lines.len(),
-                    display_offset: current.display_width + row_offset,
-                });
+            let cells = row.reflow_cells();
+            for (point, p) in points.iter().enumerate() {
+                if old_scrollback_len + p.row == abs_row {
+                    let col = p.col + usize::from(p.past_glyph);
+                    anchors.push(CursorAnchor {
+                        point,
+                        logical_line: logical_lines.len(),
+                        display_offset: current.read_width + display_width_until(cells, col),
+                    });
+                }
             }
-
-            current.display_width += display_width(row_cells);
-            current.cells.extend_from_slice(row_cells);
-
-            if is_tail {
-                current.trailing = row.cells[content_len..].to_vec();
+            current.push_row(cells);
+            if !row.wrapped {
                 logical_lines.push(std::mem::take(&mut current));
             }
         }
-        if !current.cells.is_empty() {
+        if current.read_width > 0 {
             logical_lines.push(current);
         }
         if logical_lines.is_empty() {
             logical_lines.push(LogicalLine::default());
-        }
-
-        if let Some(anchor) = &mut cursor_anchor
-            && let Some(line) = logical_lines.get(anchor.logical_line)
-        {
-            anchor.display_offset = anchor
-                .display_offset
-                .min(line.display_width + line.trailing.len());
         }
 
         let mut reflowed = VecDeque::new();
@@ -1526,12 +1582,23 @@ impl Grid {
         for line in logical_lines {
             line_ranges.push(append_reflowed_line(&mut reflowed, line, new_cols));
         }
+        let mapped: Vec<_> = anchors
+            .iter()
+            .filter_map(|a| {
+                let line = line_ranges.get(a.logical_line)?;
+                Some((a.point, line.position_for_offset(a.display_offset)))
+            })
+            .collect();
+        let floor = mapped.iter().map(|(_, (row, _, _))| *row).max();
 
         while reflowed.len() < new_rows {
             reflowed.push_back(Row::new(new_cols));
         }
         let min_total_to_keep = old_scrollback_len.min(self.config.max_scrollback) + new_rows;
-        while reflowed.len() > min_total_to_keep && reflowed.back().is_some_and(Row::is_blank) {
+        while reflowed.len() > min_total_to_keep
+            && floor.is_none_or(|floor| reflowed.len() - 1 > floor)
+            && reflowed.back().is_some_and(|row| !row_has_content(row))
+        {
             reflowed.pop_back();
         }
         while reflowed.len() < new_rows {
@@ -1551,10 +1618,16 @@ impl Grid {
         self.dirty.resize_rows(new_rows);
         self.dirty.mark_all();
 
-        cursor_anchor.map(|anchor| {
-            let (abs_row, col) = self.abs_cursor_for_anchor(&line_ranges, anchor, dropped_rows);
-            self.visible_cursor_from_abs(abs_row, col)
-        })
+        let sb = self.scrollback_len();
+        for (point, (abs_row, col, past_glyph)) in mapped {
+            let abs_row = abs_row.saturating_sub(dropped_rows);
+            let (row, col) = self.visible_cursor_from_abs(abs_row, col);
+            points[point] = ResizePoint {
+                row,
+                col,
+                past_glyph: past_glyph && abs_row >= sb,
+            };
+        }
     }
 
     fn visible_cursor_from_abs(&self, abs_row: usize, col: usize) -> (usize, usize) {
@@ -1562,19 +1635,6 @@ impl Grid {
         let visible_row = abs_row.saturating_sub(sb).min(self.rows.saturating_sub(1));
         let visible_col = col.min(self.cols.saturating_sub(1));
         (visible_row, visible_col)
-    }
-
-    fn abs_cursor_for_anchor(
-        &self,
-        line_ranges: &[ReflowedLineMap],
-        anchor: CursorAnchor,
-        dropped_rows: usize,
-    ) -> (usize, usize) {
-        let Some(line) = line_ranges.get(anchor.logical_line) else {
-            return (self.scrollback_len(), 0);
-        };
-        let (abs_row, col) = line.position_for_offset(anchor.display_offset);
-        (abs_row.saturating_sub(dropped_rows), col)
     }
 
     /// Clear the scrollback buffer entirely.
@@ -1588,27 +1648,44 @@ impl Grid {
 }
 
 impl ReflowedLineMap {
-    fn position_for_offset(&self, offset: usize) -> (usize, usize) {
+    /// `(abs_row, col, past_glyph)` for a display offset into the logical
+    /// line. Past the content, the offset counts on along the final row.
+    fn position_for_offset(&self, offset: usize) -> (usize, usize, bool) {
+        let last_col = self.cols.saturating_sub(1);
         if offset >= self.display_width {
-            return (self.end_row, self.end_col + (offset - self.display_width));
+            let extra = offset - self.display_width;
+            if extra == 0 && self.end_col >= self.cols && self.display_width > 0 {
+                return (self.end_row, last_col, true);
+            }
+            return (self.end_row, (self.end_col + extra).min(last_col), false);
         }
 
         for cell in &self.cells {
             if offset >= cell.offset && offset < cell.offset + cell.width {
-                return (cell.row, cell.col + (offset - cell.offset));
+                return (cell.row, cell.col + (offset - cell.offset), false);
             }
         }
 
-        (self.range.start, 0)
+        (self.range.start, 0, false)
     }
 }
 
-fn content_len(cells: &[Cell]) -> usize {
-    cells
-        .iter()
-        .rposition(|cell| cell.ch != ' ' || cell.is_wide_continuation())
-        .map(|idx| idx + 1)
-        .unwrap_or(0)
+impl Row {
+    /// The cells a reflow reads: all of them, less a wide-glyph wrap gap
+    /// that still holds the blank it was left with.
+    fn reflow_cells(&self) -> &[Cell] {
+        let gap = self.wrapped
+            && self.wide_gap
+            && self
+                .cells
+                .last()
+                .is_some_and(|cell| cell.ch == ' ' && cell.width == 1 && cell.extended.is_none());
+        &self.cells[..self.cells.len() - usize::from(gap)]
+    }
+}
+
+fn row_has_content(row: &Row) -> bool {
+    row.cells.iter().any(is_content)
 }
 
 fn display_width_until(cells: &[Cell], col: usize) -> usize {
@@ -1623,6 +1700,14 @@ fn display_width(cells: &[Cell]) -> usize {
     cells.iter().map(|cell| usize::from(cell.width)).sum()
 }
 
+/// Lay one logical line out at `cols`.
+///
+/// Content wraps. Padding — the blanks after the last content cell, across
+/// soft wraps, that an erase could have produced ([`is_padding`]) — never
+/// wraps and never adds a row: the final row keeps, in order, as much of it
+/// as fits after the content, and the rest is dropped. A space carrying
+/// anything an erase does not write (a foreground, a flag, a hyperlink) is
+/// content.
 fn append_reflowed_line(
     rows: &mut VecDeque<Row>,
     line: LogicalLine,
@@ -1631,10 +1716,12 @@ fn append_reflowed_line(
     debug_assert!(cols > 0);
 
     let LogicalLine {
-        cells,
-        display_width,
-        trailing,
+        mut cells,
+        content_len,
+        ..
     } = line;
+    let padding = cells.split_off(content_len);
+    let display_width = display_width(&cells);
     let start = rows.len();
     let mut row = Row::new(cols);
     let mut col = 0;
@@ -1668,6 +1755,7 @@ fn append_reflowed_line(
         }
         if col + width > cols && col > 0 {
             row.wrapped = true;
+            row.wide_gap = true;
             rows.push_back(row);
             row = Row::new(cols);
             col = 0;
@@ -1690,9 +1778,11 @@ fn append_reflowed_line(
     }
 
     let end_row = rows.len();
-    let end_col = col.min(cols.saturating_sub(1));
-    for (slot, cell) in row.cells_mut()[col.min(cols)..].iter_mut().zip(trailing) {
-        *slot = cell;
+    let end_col = col;
+    if !padding.is_empty() {
+        for (slot, cell) in row.cells_mut()[col.min(cols)..].iter_mut().zip(padding) {
+            *slot = cell;
+        }
     }
     rows.push_back(row);
     let end = rows.len();
@@ -1703,6 +1793,7 @@ fn append_reflowed_line(
         end_row,
         end_col,
         display_width,
+        cols,
     }
 }
 
