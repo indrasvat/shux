@@ -1614,6 +1614,7 @@ async fn run_attach_loop(
                             Ok(AppMouse::NotHandled) => {}
                             Err(error) => { unhandled_mouse(error); }
                         }
+                        let focus_before = focused_pane(&graph, session.session_id);
                         if handle_mouse_selection(
                             kind,
                             button,
@@ -1629,6 +1630,14 @@ async fn run_attach_loop(
                         )
                         .await.unwrap_or_else(unhandled_mouse)
                         {
+                            // A press that focused another pane is input; a
+                            // selection inside the focused one is not.
+                            if kind == MouseKind::Down
+                                && focused_pane(&graph, session.session_id) != focus_before
+                                && clients.mark_input(registry_id, tokio::time::Instant::now())
+                            {
+                                reconcile_session(&graph, &io_state, &config, session.session_id).await;
+                            }
                             let pulse = io_state.lock().await.render_pulse.clone();
                             pulse.bump();
                             continue;
@@ -3482,6 +3491,13 @@ async fn select_pane_on_press(
         redraw = true;
     }
     redraw
+}
+
+/// The pane a session shows focused now, from the graph.
+fn focused_pane(graph: &GraphHandle, session: SessionId) -> Option<PaneId> {
+    let snap = graph.snapshot();
+    let window = snap.sessions.get(&session)?.active_window;
+    snap.windows.get(&window).map(|w| w.active_pane)
 }
 
 /// Copy the session's live focus into this client's cache. `false` once the
@@ -10940,6 +10956,65 @@ mod tests {
             "the paste went to the window no longer shown"
         );
         assert_eq!(shown.try_recv().ok(), Some(b"pasted".to_vec()));
+        fixture.stop();
+    }
+
+    /// A click that moves focus to another pane hands that client the panes,
+    /// as a key would; a client that only attached does not.
+    #[tokio::test(start_paused = true)]
+    async fn a_click_that_focuses_another_pane_takes_the_panes() {
+        let fixture = attach_fixture().await;
+        let (_w1, rx1, _s1) = seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+        let (_w2, rx2, _s2) = seed_io_for_pane(&fixture.io_state, fixture.second_pane).await;
+        let log = fake_pty(&fixture.io_state, fixture.first_pane, rx1);
+        let _log2 = fake_pty(&fixture.io_state, fixture.second_pane, rx2);
+        let last = || {
+            *log.lock()
+                .unwrap()
+                .last()
+                .expect("the pane was never sized")
+        };
+        let focused = || {
+            let snap = fixture.graph.snapshot();
+            snap.windows[&fixture.first_window].active_pane
+        };
+
+        let _a = Client::attach(&fixture, 200).await;
+        idle_for(QUIET).await;
+        let by_a = last();
+        let mut b = Client::attach(&fixture, 80).await;
+        idle_for(QUIET).await;
+        assert_eq!(last(), by_a);
+
+        let viewport = current_viewport(&Arc::new(Mutex::new((80, 24))), &test_config()).await;
+        let (first_point, second_point, _) =
+            find_pane_and_border_points(&fixture.graph, fixture.first_window, viewport);
+        let before = focused();
+        let target = if before == fixture.first_pane {
+            second_point
+        } else {
+            first_point
+        };
+        for kind in [MouseKind::Down, MouseKind::Up] {
+            b.send(&AttachClientFrame::Mouse {
+                kind,
+                button: ProtoMouseButton::Left,
+                col: target.0,
+                row: target.1,
+                shift: false,
+                alt: false,
+                ctrl: false,
+                frame: b.written_frame,
+            })
+            .await;
+        }
+        idle_for(QUIET).await;
+        assert_ne!(focused(), before, "the click did not move focus");
+        assert_ne!(
+            last(),
+            by_a,
+            "a click that moved focus did not take the panes"
+        );
         fixture.stop();
     }
 
