@@ -267,11 +267,10 @@ impl ClientRegistry {
         generation
     }
 
-    /// Confirm a pane's pin: its set_size reported success.
+    /// Confirm a pane's pin: its set_size reported success. Placed again if a
+    /// cancelled call overlapping this one took it back meanwhile.
     fn keep(&self, pane: PaneId) {
-        if let Some(p) = self.state().pins.get_mut(&pane) {
-            p.kept = true;
-        }
+        self.place_pin(pane, true);
     }
 
     /// Take back the provisional pin `generation` placed, unless a later pin
@@ -495,6 +494,20 @@ mod tests {
         let _g = reg.register(watcher.clone(), CancellationToken::new());
         reg.mark_input(watcher.id, Instant::now());
         assert_eq!(reg.driver(s), None);
+    }
+
+    /// Two set_size calls overlap; the later one is cancelled and takes its
+    /// pin back; the earlier one then succeeds. It reported a pin, so the
+    /// pane is pinned.
+    #[test]
+    fn a_success_keeps_its_pin_though_a_cancelled_call_took_one_back() {
+        let reg = ClientRegistry::default();
+        let pane = PaneId::new();
+        let first = PinGuard::take(&reg, pane);
+        let second = PinGuard::take(&reg, pane);
+        drop(second);
+        first.keep();
+        assert!(reg.is_pinned(pane), "a successful set_size left no pin");
     }
 
     #[test]
