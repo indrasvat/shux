@@ -3,9 +3,10 @@
 //! The CLI probes the UDS. On `ConnectionRefused` or `NotFound`, it spawns
 //! the daemon via re-exec, then retries with exponential backoff (PRD 4.5).
 //!
-//! On successful connection, the client performs a version handshake: if the
-//! running daemon's version differs from the client binary's version (e.g.,
-//! after a rebuild), the stale daemon is killed and a fresh one is spawned.
+//! On successful connection, the client performs a version handshake. A
+//! daemon of another build (e.g. after an upgrade) is replaced only when it
+//! holds no sessions; one that holds any, or cannot say, is left running and
+//! the command is refused with [`ClientError::DaemonInUse`].
 
 use std::io;
 use std::path::Path;
@@ -101,6 +102,92 @@ pub enum ClientError {
         start_lock_timeout(), .0.display()
     )]
     StartLockTimeout(std::path::PathBuf),
+    #[error("{0}")]
+    DaemonInUse(Box<DaemonInUse>),
+}
+
+/// Exit code of a command refused with [`ClientError::DaemonInUse`].
+pub const DAEMON_IN_USE_EXIT: i32 = 10;
+
+/// `error.code` of that refusal under `--format json`.
+pub const DAEMON_IN_USE_CODE: i64 = -32015;
+
+/// A daemon of another build that may hold sessions, left running.
+#[derive(Debug)]
+pub struct DaemonInUse {
+    /// Its version and git SHA, when it said.
+    pub daemon: Option<(String, String)>,
+    /// Its sessions, scratch included, when they could be counted.
+    pub sessions: Option<usize>,
+    /// Whether a shux daemon process serves the socket, so `shux daemon stop`
+    /// can end it.
+    pub stoppable: bool,
+}
+
+impl DaemonInUse {
+    /// The refusal in `e`'s chain, if it is one.
+    pub fn find(e: &anyhow::Error) -> Option<&Self> {
+        e.chain()
+            .find_map(|c| match c.downcast_ref::<ClientError>() {
+                Some(ClientError::DaemonInUse(r)) => Some(&**r),
+                _ => None,
+            })
+    }
+
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "error": {
+                "code": DAEMON_IN_USE_CODE,
+                "message": self.to_string(),
+                "data": {
+                    "kind": "daemon_in_use",
+                    "exit_code": DAEMON_IN_USE_EXIT,
+                    "daemon_version": self.daemon.as_ref().map(|d| &d.0),
+                    "daemon_git_sha": self.daemon.as_ref().map(|d| &d.1),
+                    "client_version": CLIENT_VERSION,
+                    "client_git_sha": CLIENT_GIT_SHA,
+                    "sessions": self.sessions,
+                    "stoppable": self.stoppable,
+                },
+            }
+        })
+    }
+}
+
+impl std::fmt::Display for DaemonInUse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let this = format!("shux {CLIENT_VERSION} ({CLIENT_GIT_SHA})");
+        match &self.daemon {
+            Some((v, sha)) => write!(
+                f,
+                "the running daemon is shux {v} ({sha}) and this CLI is {this}"
+            )?,
+            None => write!(
+                f,
+                "the running daemon did not say which shux build it is, and this CLI is {this}"
+            )?,
+        }
+        match self.sessions {
+            Some(1) => write!(f, "; it holds 1 session")?,
+            Some(n) => write!(f, "; it holds {n} sessions")?,
+            None => write!(f, "; its sessions could not be counted")?,
+        }
+        write!(f, ", so it was left running and this command did not run")?;
+        if !self.stoppable {
+            return write!(
+                f,
+                "; no shux daemon process serves it, so stop whatever does and retry"
+            );
+        }
+        write!(
+            f,
+            ". Run `shux daemon stop` to end its sessions and start this build"
+        )?;
+        match &self.daemon {
+            Some((v, sha)) => write!(f, ", or use the shux {v} ({sha}) CLI that matches it"),
+            None => write!(f, ", or use the shux CLI that started it"),
+        }
+    }
 }
 
 /// Probe the daemon socket. Returns a connected `UnixStream` if successful.
@@ -151,13 +238,49 @@ pub(crate) async fn ask_daemon_version(socket_path: &Path) -> DaemonAnswer {
     }
 }
 
+/// How many sessions, scratch included, the daemon serving `socket_path`
+/// holds; `None` when it did not say, which callers must treat as some.
+/// Every daemon build answers `session.list`.
+pub(crate) async fn count_sessions(socket_path: &Path) -> Option<usize> {
+    let mut stream = probe_socket(socket_path).await.ok()?;
+    let params = serde_json::json!({ "include_scratch": true });
+    let asked = ask(&mut stream, "session-count", "session.list", params);
+    let result = tokio::time::timeout(crate::patience::peer_patience(), asked)
+        .await
+        .ok()??;
+    Some(result.get("sessions")?.as_array()?.len())
+}
+
 /// Check the daemon's version via `system.version` RPC call.
 async fn check_daemon_version(stream: &mut UnixStream) -> Option<DaemonVersion> {
+    let result = ask(
+        stream,
+        "version-check",
+        "system.version",
+        serde_json::json!({}),
+    )
+    .await?;
+    let version = result.get("version")?.as_str()?.to_string();
+    let git_sha = result
+        .get("git_sha")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    Some(DaemonVersion { version, git_sha })
+}
+
+/// One request on `stream`; its `result`, or `None` for anything else.
+async fn ask(
+    stream: &mut UnixStream,
+    id: &str,
+    method: &str,
+    params: serde_json::Value,
+) -> Option<serde_json::Value> {
     let request = serde_json::json!({
         "jsonrpc": "2.0",
-        "id": "version-check",
-        "method": "system.version",
-        "params": {}
+        "id": id,
+        "method": method,
+        "params": params,
     });
     let payload = serde_json::to_vec(&request).ok()?;
 
@@ -177,15 +300,8 @@ async fn check_daemon_version(stream: &mut UnixStream) -> Option<DaemonVersion> 
     let mut resp_buf = vec![0u8; resp_len];
     stream.read_exact(&mut resp_buf).await.ok()?;
 
-    let response: serde_json::Value = serde_json::from_slice(&resp_buf).ok()?;
-    let result = response.get("result")?;
-    let version = result.get("version")?.as_str()?.to_string();
-    let git_sha = result
-        .get("git_sha")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown")
-        .to_string();
-    Some(DaemonVersion { version, git_sha })
+    let mut response: serde_json::Value = serde_json::from_slice(&resp_buf).ok()?;
+    Some(response.get_mut("result")?.take())
 }
 
 /// Stop the stale daemon for `socket`, and wait for it to exit.
@@ -241,8 +357,9 @@ fn holder(socket: &Path) -> String {
 enum Probe {
     /// A daemon of this build answered; the stream is fresh and unused.
     Current(UnixStream),
-    /// A daemon answered, but it is another build or did not say which.
-    Stale,
+    /// A daemon answered, but it is another build, or did not say which
+    /// (`None`).
+    Stale(Option<DaemonVersion>),
     /// Nothing is listening.
     Absent,
     /// Something accepted the connection and never answered.
@@ -274,15 +391,32 @@ async fn probe_daemon(socket_path: &Path) -> Result<Probe, ClientError> {
                 daemon_sha = dv.git_sha,
                 client_version = CLIENT_VERSION,
                 client_sha = CLIENT_GIT_SHA,
-                "Daemon version mismatch — restarting daemon"
+                "Daemon version mismatch"
             );
-            Ok(Probe::Stale)
+            Ok(Probe::Stale(Some(dv)))
         }
         DaemonAnswer::Unreadable => {
-            warn!("Could not check daemon version — restarting daemon");
-            Ok(Probe::Stale)
+            warn!("Could not check daemon version");
+            Ok(Probe::Stale(None))
         }
     }
+}
+
+/// A stale daemon may be replaced only when it said which build it is and
+/// that it holds no sessions; anything else is refused.
+async fn refuse_if_in_use(socket: &Path, found: Option<DaemonVersion>) -> Result<(), ClientError> {
+    let sessions = match found {
+        Some(_) => count_sessions(socket).await,
+        None => None,
+    };
+    if found.is_some() && sessions == Some(0) {
+        return Ok(());
+    }
+    Err(ClientError::DaemonInUse(Box::new(DaemonInUse {
+        daemon: found.map(|dv| (dv.version, dv.git_sha)),
+        sessions,
+        stoppable: crate::daemon_boot::our_live_daemon(socket).is_some(),
+    })))
 }
 
 /// Under the start lock: the daemon serving `socket`, or `None` once nothing
@@ -304,10 +438,11 @@ async fn claim_socket(socket: &Path) -> Result<Option<UnixStream>, ClientError> 
                     socket.to_path_buf(),
                 ));
             }
-            Probe::Stale if stops == MAX_STALE_STOPS => {
-                return Err(ClientError::StaleDaemonsKeepStarting);
-            }
-            Probe::Stale => {
+            Probe::Stale(found) => {
+                refuse_if_in_use(socket, found).await?;
+                if stops == MAX_STALE_STOPS {
+                    return Err(ClientError::StaleDaemonsKeepStarting);
+                }
                 stops += 1;
                 stop_stale_daemon(socket).await?;
                 deadline = tokio::time::Instant::now() + crate::patience::peer_patience();
@@ -358,7 +493,8 @@ async fn acquire_start_lock(socket: &Path) -> Result<std::fs::File, ClientError>
 /// 1. Try to connect to the UDS; a daemon of this build is used as is
 /// 2. Otherwise take the start lock, so concurrent clients start one daemon
 /// 3. Under the lock, use the daemon another client started, or stop a stale
-///    one and wait until nothing owns the socket
+///    one that holds no sessions and wait until nothing owns the socket; one
+///    that holds any, or cannot say, is refused
 /// 4. Spawn, and retry with exponential backoff until connected
 pub async fn ensure_daemon_running_at(socket_path: &Path) -> Result<UnixStream, ClientError> {
     match probe_daemon(socket_path).await? {
@@ -369,7 +505,9 @@ pub async fn ensure_daemon_running_at(socket_path: &Path) -> Result<UnixStream, 
                 socket_path.to_path_buf(),
             ));
         }
-        Probe::Stale | Probe::Absent => {}
+        // Refused before the start lock too, so a refusal never waits on it.
+        Probe::Stale(found) => refuse_if_in_use(socket_path, found).await?,
+        Probe::Absent => {}
     }
 
     // Held until this function returns, i.e. until the daemon it started (or

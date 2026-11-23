@@ -11,6 +11,8 @@ use std::fmt;
 ///
 /// Standard codes (-32600..-32699) as defined by the JSON-RPC 2.0 spec.
 /// Custom codes (-32001..-32099) for shux-specific errors (PRD §8.3).
+/// -32015 is taken by the CLI's own `daemon_in_use` refusal, which no daemon
+/// sends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorCode {
     // ── Standard JSON-RPC 2.0 codes ───────────────────────────

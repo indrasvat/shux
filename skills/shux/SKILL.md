@@ -326,6 +326,30 @@ shux daemon stop                    # then stop the daemon itself
   the runtime dir is not in its argv, so that matches nothing and reports success while the
   daemon lives on.
 
+## After an upgrade: daemons of the old build
+
+Upgrading replaces the binary, not the daemons already running. A CLI of the new build
+meets a daemon of the old one (another version or git SHA) and then:
+
+- **It holds no sessions:** the command stops it and starts the new build, as if nothing
+  had been running.
+- **It holds any session (scratch ones too), or cannot say:** the command does **not**
+  run and the daemon is left untouched. It exits **10**, names both builds and the
+  session count; under `--format json` stdout is
+  `{"error": {"code": -32015, "message", "data": {"kind": "daemon_in_use",
+  "exit_code": 10, "daemon_version", "daemon_git_sha", "client_version",
+  "client_git_sha", "sessions", "stoppable"}}}` (`sessions` is `null` when they could
+  not be counted, `daemon_version` when it did not say). Read-only
+  commands and `session attach` refuse the same way.
+
+`shux version` never starts or stops anything and says which of the two applies. Ways
+forward, both deliberate:
+
+```bash
+shux daemon stop          # ends those sessions and their programs; the next command starts the new build
+<old-shux> session list   # or keep working with the old build's CLI until its sessions are done
+```
+
 ## lens — prove a TUI change worked, with pixel proof
 
 You fixed a rendering bug, or built a new TUI screen, and need to *prove*

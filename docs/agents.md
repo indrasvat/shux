@@ -214,9 +214,16 @@ Stable codes:
 | `-32004` | not_found | Resource (session/window/pane) doesn't exist |
 | `-32007` | name_conflict | Name already taken |
 | `-32008` | version_conflict | Optimistic concurrency mismatch |
+| `-32015` | daemon_in_use | CLI-side, exit 10: the daemon is another build and holds sessions (below) |
 
 CLI translates these to exit code 1 with a human-readable message;
 `--format json` returns the full error object so you can switch on `code`.
+
+One CLI-side exit code holds for every command but `shux version`:
+
+| Exit | Meaning |
+|---|---|
+| `10` | The running daemon is another shux build and holds sessions, or could not say whether it does or which build it is. It was left running and the command did not run. `--format json` prints `{"error": {"code": -32015, "message", "data": {"kind": "daemon_in_use", "exit_code": 10, "daemon_version", "daemon_git_sha", "client_version", "client_git_sha", "sessions", "stoppable"}}}`. `shux daemon stop` ends its sessions so this build can start; or use the CLI that matches it. An empty daemon of another build is replaced without asking. |
 
 ## Events
 

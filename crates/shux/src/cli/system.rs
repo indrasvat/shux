@@ -55,6 +55,24 @@ pub async fn handle_api(
     }
 }
 
+/// Report a command refused because the daemon is another build that may hold
+/// sessions, and exit [`crate::client::DAEMON_IN_USE_EXIT`]. With
+/// `--format json` the refusal is the JSON document on stdout.
+pub fn exit_daemon_in_use(refusal: &crate::client::DaemonInUse, format: OutputFormat) -> ! {
+    use std::io::Write as _;
+    match format {
+        OutputFormat::Json => match serde_json::to_string_pretty(&refusal.to_json()) {
+            Ok(s) => println!("{}", crate::style::json_safe(&s)),
+            Err(e) => crate::style::print_error(&format!("{refusal} ({e})")),
+        },
+        OutputFormat::Text | OutputFormat::Plain => {
+            crate::style::print_error(&refusal.to_string());
+        }
+    }
+    let _ = std::io::stdout().flush();
+    std::process::exit(crate::client::DAEMON_IN_USE_EXIT)
+}
+
 /// Handle the `shux version` command: this CLI's build, and the daemon's
 /// beside it when one serves `socket_path`. Never starts a daemon.
 pub async fn handle_version(
@@ -136,16 +154,39 @@ pub async fn handle_version(
                 Some(cli.1),
                 daemon.is_none().then_some("daemon not running"),
             )?;
-            // Only a shux daemon process is stopped and replaced; anything else
-            // on the socket makes the next command refuse instead.
-            let next = || {
-                if crate::daemon_boot::our_live_daemon(socket_path).is_some() {
-                    "the next shux command restarts it, ending its sessions"
-                } else {
-                    "no shux daemon process serves this socket, so shux commands \
-                     refuse to run until whatever serves it is stopped"
+            // What the next command does, as `client::ensure_daemon_running_at`
+            // decides it: only an empty shux daemon of another build is replaced.
+            let next = if mismatch != Some(true) {
+                String::new()
+            } else if crate::daemon_boot::our_live_daemon(socket_path).is_none() {
+                "no shux daemon process serves this socket, so shux commands \
+                 refuse to run until whatever serves it is stopped"
+                    .to_string()
+            } else {
+                let held = match &daemon {
+                    Some(Ok(_)) => crate::client::count_sessions(socket_path).await,
+                    _ => None,
+                };
+                let matching = match &daemon {
+                    Some(Ok(dv)) => format!("the shux {} ({}) CLI", dv.version, dv.git_sha),
+                    _ => "the shux CLI that started it".to_string(),
+                };
+                match held {
+                    Some(0) => "it holds no sessions, so the next shux command replaces it \
+                                with this build"
+                        .to_string(),
+                    held => format!(
+                        "{}, so shux commands refuse to run against it: `shux daemon stop` \
+                         ends them and starts this build, or use {matching}",
+                        match held {
+                            Some(1) => "it holds 1 session".to_string(),
+                            Some(n) => format!("it holds {n} sessions"),
+                            None => "it may hold sessions".to_string(),
+                        }
+                    ),
                 }
             };
+            let next = || next.as_str();
             match &daemon {
                 None => {}
                 Some(Ok(dv)) => {
