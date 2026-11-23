@@ -1956,6 +1956,47 @@ mod tests {
         assert!(row[2].style.flags.contains(CellFlags::INVERSE));
     }
 
+    #[test]
+    fn a_blank_written_for_an_unwrapped_wide_glyph_is_not_a_gap() {
+        let mut vt = VirtualTerminal::new(4, 3);
+        vt.process("ab界\x1b[1;3H\x1b[?7l\x1b[7m界\x1b[m".as_bytes());
+        vt.resize(4, 8);
+        assert_eq!(visible_text(&vt, 0), "ab 界");
+        let row = vt.grid().visible_row(0);
+        assert!(row[2].style.flags.contains(CellFlags::INVERSE));
+    }
+
+    #[test]
+    fn deleting_the_wide_gap_leaves_a_gap() {
+        let mut vt = no_scrollback(2, 3);
+        vt.process("ab界c\x1b[1;3H\x1b[1P".as_bytes());
+        vt.resize(1, 5);
+        assert_eq!(visible_text(&vt, 0), "ab界c");
+    }
+
+    #[test]
+    fn row_shrink_without_a_parked_cursor_lets_erase_fill_yield() {
+        let mut vt = VirtualTerminal::new(6, 10);
+        vt.process(b"\x1b[44m\x1b[2J\x1b[0mAB\x1b7\x1b[?1047h");
+        vt.resize(3, 10);
+        vt.process(b"\x1b[?1047l");
+        assert_eq!(visible_text(&vt, 0), "AB");
+        assert_eq!(vt.scrollback_len(), 0);
+    }
+
+    #[test]
+    fn row_shrink_without_a_parked_cursor_keeps_linked_blanks() {
+        let mut vt = VirtualTerminal::new(2, 10);
+        vt.process(b"A\x1b7\r\n\x1b]8;;https://x.test\x1b\\ \x1b]8;;\x1b\\\x1b[?1047h");
+        vt.resize(1, 10);
+        vt.process(b"\x1b[?1047l");
+        let grid = vt.grid();
+        let linked = (0..grid.total_lines())
+            .filter_map(|r| grid.row(r))
+            .any(|row| (0..row.len()).any(|c| row[c].extended.is_some()));
+        assert!(linked, "the linked blank was dropped");
+    }
+
     fn assert_grid_wide_invariants(grid: &Grid) {
         for row_idx in 0..grid.total_lines() {
             let row = grid.row(row_idx).expect("row exists");

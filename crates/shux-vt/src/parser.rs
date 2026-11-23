@@ -646,6 +646,7 @@ impl<'a> VtHandler<'a> {
                 let row = self.grid.visible_row_mut_marked(self.cursor.row);
                 row.clear_wide_pair_around(col, self.cursor.style.bg);
                 row[col] = blank;
+                row.wide_gap = false;
             }
             self.cursor.auto_wrap_pending = false;
             self.clear_active_grapheme_cell();
@@ -659,6 +660,8 @@ impl<'a> VtHandler<'a> {
                 let row = self.grid.visible_row_mut_marked(self.cursor.row);
                 row.clear_wide_pair_around(col, self.cursor.style.bg);
                 row[col] = blank;
+                // A gap only once the wrap below happens.
+                row.wide_gap = false;
             }
             if self.modes.auto_wrap {
                 self.wrap_to_next_line(true);

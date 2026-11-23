@@ -228,6 +228,15 @@ struct CursorAnchor {
     display_offset: usize,
 }
 
+/// Which rows a canvas row shrink drops from the bottom.
+#[derive(Debug, Clone, Copy)]
+enum RowTrim {
+    /// Default-blank rows: the alternate screen, which its app redraws.
+    Blank,
+    /// Rows without content (by [`is_padding`]) below this absolute row, if any.
+    BelowContent(Option<usize>),
+}
+
 /// A visible position carried through a resize.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ResizePoint {
@@ -1479,7 +1488,7 @@ impl Grid {
             .filter(|p| p.holds_row)
             .map(|p| sb + p.row)
             .max();
-        self.resize_canvas_above(new_rows, new_cols, floor);
+        self.resize_canvas_trimming(new_rows, new_cols, RowTrim::BelowContent(floor));
         for point in points.iter_mut() {
             let abs_row = sb + point.row;
             let on_screen = (self.scrollback_len()..self.raw.len()).contains(&abs_row);
@@ -1491,12 +1500,10 @@ impl Grid {
     /// Resize without column reflow. This is used for fixed-canvas alternate
     /// screen buffers where fullscreen apps redraw after SIGWINCH.
     pub fn resize_canvas(&mut self, new_rows: usize, new_cols: usize) {
-        self.resize_canvas_above(new_rows, new_cols, None);
+        self.resize_canvas_trimming(new_rows, new_cols, RowTrim::Blank);
     }
 
-    /// [`Grid::resize_canvas`], where a row shrink drops only content-free
-    /// rows below `floor` (an absolute row) when one is given.
-    fn resize_canvas_above(&mut self, new_rows: usize, new_cols: usize, floor: Option<usize>) {
+    fn resize_canvas_trimming(&mut self, new_rows: usize, new_cols: usize, trim: RowTrim) {
         let resized = new_rows != self.rows || new_cols != self.cols;
         if new_cols != self.cols {
             for row in self.raw.iter_mut() {
@@ -1514,9 +1521,12 @@ impl Grid {
             let excess = self.rows - new_rows;
             let mut removed = 0;
             while removed < excess
-                && self.raw.back().is_some_and(|back| match floor {
-                    Some(floor) => self.raw.len() - 1 > floor && !row_has_content(back),
-                    None => back.is_blank(),
+                && self.raw.back().is_some_and(|back| match trim {
+                    RowTrim::Blank => back.is_blank(),
+                    RowTrim::BelowContent(floor) => {
+                        floor.is_none_or(|floor| self.raw.len() - 1 > floor)
+                            && !row_has_content(back)
+                    }
                 })
             {
                 self.raw.pop_back();
@@ -1863,11 +1873,11 @@ impl Grid {
             cells[i] = cells[i + actual].clone();
         }
         // Fill right edge with blanks.
+        // The last cell is a fresh blank, so a wide-gap mark still holds.
         for cell in cells.iter_mut().skip(len - actual) {
             *cell = Cell::default();
         }
         r.sanitize_wide_pairs(Color::Default);
-        r.wide_gap = false;
         self.dirty
             .mark_range(row, col.saturating_sub(1)..len, self.rows, self.cols);
     }
