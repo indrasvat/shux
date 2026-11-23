@@ -911,6 +911,16 @@ pub fn parse_ratio(s: &str) -> Result<f64, String> {
     Ok(v)
 }
 
+/// Parse `pane resize --delta`: a fraction of the split, -1.0 to 1.0.
+pub fn parse_delta(s: &str) -> Result<f64, String> {
+    let v: f64 = s
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid delta {s:?} (expected a number from -1.0 to 1.0)"))?;
+    crate::pane_command::check_delta(v).map_err(|e| format!("delta {e}"))?;
+    Ok(v)
+}
+
 /// Parse a `pane glance --mask ROW,COL,WIDTH` redaction rect (task 080). All three are
 /// `u16`; `WIDTH == 0` is rejected (a zero-width mask redacts nothing — likely a typo).
 pub fn parse_mask_rect(s: &str) -> Result<(u16, u16, u16), String> {
@@ -1035,8 +1045,9 @@ pub enum PaneCommand {
         #[arg(short, long)]
         direction: String,
 
-        /// Resize amount (0.0-1.0, default 0.1)
-        #[arg(long)]
+        /// Resize amount: a fraction of the split from -1.0 to 1.0, negative to
+        /// shrink (default 0.1)
+        #[arg(long, value_parser = parse_delta, allow_hyphen_values = true)]
         delta: Option<f64>,
 
         /// Optimistic concurrency: only succeed if the pane is at

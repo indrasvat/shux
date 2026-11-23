@@ -51,7 +51,7 @@ fn main() {
         if let Some(refusal) = shux::client::DaemonInUse::find(&e) {
             cli::exit_daemon_in_use(refusal, format);
         }
-        report_fatal(&e);
+        report_fatal(&e, format);
     }
 }
 
@@ -132,7 +132,7 @@ fn die_of_sigpipe() -> ! {
 /// Exiting here means the `Termination` path is never reached, so the message
 /// an operator sees is the one we chose to write. The backtrace stays
 /// reachable behind the standard opt-in, for whoever is actually debugging.
-fn report_fatal(e: &anyhow::Error) -> ! {
+fn report_fatal(e: &anyhow::Error, format: cli::OutputFormat) -> ! {
     use std::io::Write as _;
 
     let closed = e
@@ -143,9 +143,44 @@ fn report_fatal(e: &anyhow::Error) -> ! {
         die_of_sigpipe();
     }
 
-    // `{:#}` walks the anyhow chain onto one line; `print_error` owns the
-    // marker, the colour and the NO_COLOR check.
-    style::print_error(&format!("{e:#}"));
+    // Under `--format json` an RPC error (a name the daemon or the CLI could
+    // not resolve, a refused call) or an unreachable daemon is
+    // `{"error": {code, message, data}}` on stdout, as `rpc call` prints it.
+    // Only those: they end a command before it prints, while a stream or a printed result that fails later keeps
+    // its stdout one document and reports on stderr.
+    let rpc = e.chain().find_map(|c| match c.downcast_ref() {
+        Some(cli::rpc::RpcClientError::Rpc {
+            code,
+            message,
+            data,
+        }) => {
+            let mut error = serde_json::json!({ "code": code, "message": message });
+            if let Some(data) = data {
+                error["data"] = data.clone();
+            }
+            Some(error)
+        }
+        _ => None,
+    });
+    // A daemon that could not be reached fails the command before it prints.
+    let unreachable = || {
+        e.chain()
+            .any(|c| c.downcast_ref::<shux::client::ClientError>().is_some())
+            .then(|| serde_json::json!({ "code": -32603, "message": format!("{e:#}") }))
+    };
+    let json = matches!(format, cli::OutputFormat::Json)
+        .then(|| rpc.or_else(unreachable))
+        .flatten()
+        .and_then(|error| {
+            serde_json::to_string_pretty(&serde_json::json!({ "error": error })).ok()
+        });
+    if let Some(s) = json {
+        println!("{}", style::json_safe(&s));
+    } else {
+        // `{:#}` walks the anyhow chain onto one line; `print_error` owns the
+        // marker, the colour and the NO_COLOR check.
+        style::print_error(&format!("{e:#}"));
+    }
 
     if std::env::var_os("RUST_BACKTRACE").is_some_and(|v| !v.is_empty() && v != "0") {
         // anyhow's Debug is exactly what Termination used to print — chain

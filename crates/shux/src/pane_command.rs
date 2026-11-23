@@ -258,6 +258,14 @@ pub(crate) fn check_ratio(ratio: f64) -> Result<(), String> {
     Ok(())
 }
 
+/// A split resize step: a fraction of the split, negative to shrink.
+pub(crate) fn check_delta(delta: f64) -> Result<(), String> {
+    if !delta.is_finite() || !(-1.0..=1.0).contains(&delta) {
+        return Err(format!("{delta} is out of range: must be from -1.0 to 1.0"));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_ops(ops: &[shux_core::apply::Op]) -> Result<(), RpcError> {
     use shux_core::apply::Op;
     for (i, op) in ops.iter().enumerate() {
