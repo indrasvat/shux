@@ -1,3 +1,10 @@
+# [0.58.0](https://github.com/indrasvat/shux/compare/v0.57.5...v0.58.0) (2026-11-23)
+
+
+### Features
+
+* **attach:** panes follow the client that types; set-size pins ([#291](https://github.com/indrasvat/shux/issues/291)) ([cbf7df7](https://github.com/indrasvat/shux/commit/cbf7df7e6af20a47fe743f758414335566e3aa76)), closes [#190](https://github.com/indrasvat/shux/issues/190) [#190](https://github.com/indrasvat/shux/issues/190)
+
 ## [0.57.5](https://github.com/indrasvat/shux/compare/v0.57.4...v0.57.5) (2026-11-23)
 
 
