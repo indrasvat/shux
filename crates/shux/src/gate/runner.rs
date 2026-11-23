@@ -1488,6 +1488,29 @@ mod tests {
         );
     }
 
+    /// A trace written to a FIFO (or a device) gets its lines: only a regular
+    /// file is emptied first, and a pipe cannot be.
+    #[test]
+    fn a_trace_to_a_fifo_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("trace.fifo");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+        let reader = {
+            let fifo = fifo.clone();
+            std::thread::spawn(move || std::fs::read_to_string(fifo).unwrap())
+        };
+        let mut trace = Trace::open(Some(TraceTarget::Path(fifo))).unwrap();
+        trace.emit(RunnerSignal::NoVisualCheck);
+        trace.arm();
+        drop(trace);
+        let line = RunnerSignal::NoVisualCheck.to_ndjson();
+        assert_eq!(
+            reader.join().unwrap(),
+            format!("{line}\n"),
+            "the FIFO got nothing"
+        );
+    }
+
     /// A busy daemon of another build that takes over before the connection
     /// that spawns the child refuses the run, and the trace is left as it was.
     #[tokio::test]

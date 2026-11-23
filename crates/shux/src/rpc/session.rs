@@ -476,7 +476,9 @@ pub(crate) fn register_session_methods(
                 }
             },
         )
-        .register_with_policy(
+        // To completion: a caller that hangs up after the graph step must not
+        // leave a daemon that refuses every session and never exits.
+        .register_to_completion(
             shux_rpc::RETIRE_IF_IDLE,
             Policy::fixed(Sensitivity::PluginsForbidden),
             move |_params: Option<serde_json::Value>| {
@@ -513,6 +515,21 @@ mod tests {
 
     use crate::rpc::test_harness::{RpcHarness, dispatch_err, dispatch_ok};
     use shux_core::layout::Direction;
+
+    /// A caller that hangs up mid-retire does not leave a daemon that refuses
+    /// every new session and never exits: the retire runs to its end.
+    #[tokio::test]
+    async fn a_retire_whose_caller_hangs_up_still_ends_the_daemon() {
+        let h = RpcHarness::new();
+        let mut call = Box::pin(h.router.dispatch(shux_rpc::RETIRE_IF_IDLE, None));
+        assert!(futures::poll!(&mut call).is_pending());
+        drop(call);
+        shux_testkit::wait_until_async("the retire to end the daemon", || {
+            let ended = h.cancel.is_cancelled();
+            async move { ended }
+        })
+        .await;
+    }
 
     /// The listing follows creation even when the wall clock does not: it
     /// stepped back between creates, or read the same instant for two.
