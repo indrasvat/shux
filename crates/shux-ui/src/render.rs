@@ -29,6 +29,42 @@ pub struct RenderBackend<W: Write> {
     last_underline_style: Option<shux_vt::UnderlineStyle>,
     last_underline_color: Option<Option<CtColor>>,
     last_hyperlink: Option<Option<String>>,
+    plain: bool,
+}
+
+/// A plain client's frame without the zero-width characters that reorder or
+/// hide text without drawing anything. Applied to the whole frame, so copy
+/// mode, selection and overlays are covered as well as cells.
+pub fn strip_hidden_controls(bytes: Vec<u8>) -> Vec<u8> {
+    let hidden = |chunk: std::str::Utf8Chunk<'_>| chunk.valid().chars().any(is_hidden_control);
+    if !bytes.utf8_chunks().any(hidden) {
+        return bytes;
+    }
+    let mut out = Vec::with_capacity(bytes.len());
+    for chunk in bytes.utf8_chunks() {
+        for c in chunk.valid().chars().filter(|&c| !is_hidden_control(c)) {
+            let mut b = [0; 4];
+            out.extend_from_slice(c.encode_utf8(&mut b).as_bytes());
+        }
+        out.extend_from_slice(chunk.invalid());
+    }
+    out
+}
+
+/// Bidi overrides and isolates, marks, and invisible spaces. ZWJ and ZWNJ
+/// are not here; emoji and conjuncts need them.
+fn is_hidden_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}'
+            | '\u{200B}'
+            | '\u{200E}'
+            | '\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,7 +179,12 @@ impl<W: Write> RenderBackend<W> {
             last_underline_style: None,
             last_underline_color: None,
             last_hyperlink: None,
+            plain: false,
         }
+    }
+
+    pub fn set_plain(&mut self, plain: bool) {
+        self.plain = plain;
     }
 
     /// Borrow the underlying writer (used for inspecting captured bytes
@@ -171,10 +212,19 @@ impl<W: Write> RenderBackend<W> {
 
         // Begin synchronized update to prevent flicker
         self.out.queue(BeginSynchronizedUpdate)?;
+        // Autowrap off while drawing: a frame composed for a wider host than
+        // this one clips at its edge instead of wrapping onto the next row.
+        self.out.write_all(b"\x1b[?7l")?;
 
+        // Where the host cursor is known to sit. Only a single-column ASCII
+        // print advances it predictably on every terminal; after anything
+        // else the next cell is positioned explicitly, so a width the host
+        // disagrees with heals at once.
+        let mut cursor: Option<(u16, u16)> = None;
         for cell in dirty {
-            // Move cursor to the cell position
-            self.out.queue(MoveTo(cell.col, cell.row))?;
+            if cursor != Some((cell.col, cell.row)) {
+                self.out.queue(MoveTo(cell.col, cell.row))?;
+            }
 
             // Apply style changes (only emit commands when style differs
             // from the last emitted style to reduce output volume)
@@ -183,11 +233,20 @@ impl<W: Write> RenderBackend<W> {
             // Print the full cell display text when the VT preserved a
             // multi-codepoint grapheme payload.
             self.out.queue(Print(cell.cell.display_text()))?;
+
+            let plain_ascii = (cell.cell.ch.is_ascii_graphic() || cell.cell.ch == ' ')
+                && cell
+                    .cell
+                    .extended
+                    .as_ref()
+                    .is_none_or(|attrs| attrs.grapheme.is_none());
+            cursor = plain_ascii.then(|| (cell.col.saturating_add(1), cell.row));
         }
 
         // Reset colors at the end so the terminal is in a clean state
         self.clear_hyperlink()?;
         self.out.queue(ResetColor)?;
+        self.out.write_all(b"\x1b[?7h")?;
 
         // End synchronized update
         self.out.queue(EndSynchronizedUpdate)?;
@@ -357,6 +416,9 @@ impl<W: Write> RenderBackend<W> {
     }
 
     fn apply_hyperlink(&mut self, hyperlink: Option<&str>) -> io::Result<()> {
+        if self.plain {
+            return Ok(());
+        }
         let next = hyperlink.map(str::to_string);
         if self.last_hyperlink.is_none() && next.is_none() {
             return Ok(());
@@ -406,6 +468,9 @@ impl<W: Write> RenderBackend<W> {
 
     /// Set the host terminal cursor shape to match the focused pane's VT cursor.
     pub fn set_cursor_shape(&mut self, shape: shux_vt::CursorShape) -> io::Result<()> {
+        if self.plain {
+            return Ok(());
+        }
         let style = match shape {
             shux_vt::CursorShape::Block => SetCursorStyle::SteadyBlock,
             shux_vt::CursorShape::Underline => SetCursorStyle::SteadyUnderScore,
@@ -420,6 +485,9 @@ impl<W: Write> RenderBackend<W> {
     /// Crossterm does not expose OSC 12, so write the xterm-compatible
     /// sequence directly. `None` resets to the user's terminal default.
     pub fn set_cursor_color(&mut self, color: Option<shux_vt::Rgb>) -> io::Result<()> {
+        if self.plain {
+            return Ok(());
+        }
         match color {
             Some([r, g, b]) => write!(self.out, "\x1b]12;#{r:02x}{g:02x}{b:02x}\x1b\\")?,
             None => self.out.write_all(b"\x1b]112\x1b\\")?,
@@ -491,6 +559,90 @@ mod tests {
         assert!(output_str.contains("e\u{0301}"));
     }
 
+    /// Skipping the cursor move between adjacent cells must leave the screen
+    /// exactly as positioning every cell does, for any mix of cells.
+    #[test]
+    fn render_diff_skipping_moves_draws_the_same_screen() {
+        const W: u16 = 14;
+        const H: u16 = 3;
+        let mut seed: u64 = 0x5eed_cafe;
+        let mut next = move |n: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        let ext = |grapheme: Option<&str>, link: Option<&str>| {
+            Some(Arc::new(shux_vt::ExtendedAttrs {
+                grapheme: grapheme.map(str::to_string),
+                hyperlink: link.map(str::to_string),
+                underline_color: None,
+                underline_style: shux_vt::UnderlineStyle::None,
+            }))
+        };
+        for _ in 0..2000 {
+            let mut dirty = Vec::new();
+            for row in 0..H {
+                let mut col = 0;
+                while col < W {
+                    let skip = next(4) == 0;
+                    let mut cell = RenderCell::text(char::from(b'a' + next(26) as u8));
+                    let mut width = 1;
+                    match next(9) {
+                        0 => cell.ch = ' ',
+                        1 if col + 1 < W => {
+                            cell.ch = '界';
+                            width = 2;
+                        }
+                        2 if col + 1 < W => {
+                            cell.ch = '👍';
+                            width = 2;
+                        }
+                        3 => cell.extended = ext(Some("e\u{0301}"), None),
+                        4 => cell.extended = ext(None, Some("https://example.invalid/x")),
+                        5 => {
+                            cell.fg = Some(crossterm::style::Color::Rgb {
+                                r: 200,
+                                g: 10,
+                                b: next(255) as u8,
+                            })
+                        }
+                        6 => cell.attrs.bold = true,
+                        _ => {}
+                    }
+                    if !skip {
+                        dirty.push(DirtyCell { col, row, cell });
+                    }
+                    col += width;
+                }
+            }
+            let mut old = Vec::new();
+            {
+                let mut b = RenderBackend::new(&mut old);
+                for d in &dirty {
+                    b.render_diff(std::slice::from_ref(d)).unwrap();
+                }
+            }
+            let mut new = Vec::new();
+            RenderBackend::new(&mut new).render_diff(&dirty).unwrap();
+            let (mut a, mut b) = (
+                shux_vt::VirtualTerminal::new(H.into(), W.into()),
+                shux_vt::VirtualTerminal::new(H.into(), W.into()),
+            );
+            a.process(&old);
+            b.process(&new);
+            for r in 0..usize::from(H) {
+                for c in 0..usize::from(W) {
+                    assert_eq!(
+                        a.grid().visible_row(r).get(c),
+                        b.grid().visible_row(r).get(c),
+                        "cell ({r},{c}) differs for {dirty:?}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_empty_diff_produces_no_output() {
         let mut output = Vec::new();
@@ -535,6 +687,147 @@ mod tests {
 
         backend.set_cursor(10, 20).unwrap();
         assert!(!output.is_empty());
+    }
+
+    #[test]
+    fn a_plain_backend_draws_text_and_colour_but_no_terminal_effects() {
+        let mut output = Vec::new();
+        let mut backend = RenderBackend::new(&mut output);
+        backend.set_plain(true);
+        let mut cell = RenderCell::text('L');
+        cell.fg = Some(CtColor::Rgb { r: 1, g: 2, b: 3 });
+        cell.extended = Some(Arc::new(shux_vt::ExtendedAttrs {
+            grapheme: None,
+            hyperlink: Some("https://example.invalid/x".to_string()),
+            underline_color: None,
+            underline_style: shux_vt::UnderlineStyle::None,
+        }));
+        backend
+            .render_diff(&[DirtyCell {
+                col: 0,
+                row: 0,
+                cell,
+            }])
+            .unwrap();
+        backend.set_cursor_shape(shux_vt::CursorShape::Bar).unwrap();
+        backend.set_cursor_color(Some([9, 9, 9])).unwrap();
+        backend.set_cursor_color(None).unwrap();
+
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains('L') && out.contains("38;2;1;2;3"), "{out:?}");
+        for effect in ["\x1b]8;", "\x1b]12;", "\x1b]112", " q"] {
+            assert!(
+                !out.contains(effect),
+                "plain output carries {effect:?}: {out:?}"
+            );
+        }
+    }
+
+    /// A cell in the last column leaves the host cursor in its pending-wrap
+    /// state, so the next row's first cell is always positioned explicitly.
+    #[test]
+    fn a_cell_after_the_last_column_is_positioned_explicitly() {
+        let mut output = Vec::new();
+        let dirty = [
+            DirtyCell {
+                col: 9,
+                row: 0,
+                cell: RenderCell::text('z'),
+            },
+            DirtyCell {
+                col: 0,
+                row: 1,
+                cell: RenderCell::text('a'),
+            },
+        ];
+        RenderBackend::new(&mut output).render_diff(&dirty).unwrap();
+        let out = String::from_utf8_lossy(&output).into_owned();
+        assert!(
+            out.contains("\x1b[2;1H"),
+            "no move to the next row: {out:?}"
+        );
+        let mut vt = shux_vt::VirtualTerminal::new(3, 10);
+        vt.process(&output);
+        assert_eq!(vt.grid().visible_row(0)[9].ch, 'z');
+        assert_eq!(vt.grid().visible_row(1)[0].ch, 'a');
+    }
+
+    /// The host may draw a wide or composed glyph at another width than shux
+    /// does, so the cell after one is always positioned explicitly.
+    #[test]
+    fn a_cell_after_a_wide_glyph_is_positioned_explicitly() {
+        let mut output = Vec::new();
+        let dirty = [
+            DirtyCell {
+                col: 0,
+                row: 0,
+                cell: RenderCell::text('界'),
+            },
+            DirtyCell {
+                col: 2,
+                row: 0,
+                cell: RenderCell::text('a'),
+            },
+        ];
+        RenderBackend::new(&mut output).render_diff(&dirty).unwrap();
+        let out = String::from_utf8_lossy(&output).into_owned();
+        assert!(
+            out.contains("\x1b[1;3H"),
+            "no move after the wide glyph: {out:?}"
+        );
+    }
+
+    /// A frame composed for a wider terminal can land after the host shrank.
+    /// It must clip at the host's edge, as positioning every cell did, not
+    /// wrap onto the next row (or scroll the screen from the bottom one).
+    #[test]
+    fn a_frame_wider_than_the_host_clips_instead_of_wrapping() {
+        let dirty: Vec<DirtyCell> = "abcdefg"
+            .chars()
+            .enumerate()
+            .map(|(col, ch)| DirtyCell {
+                col: col as u16,
+                row: 0,
+                cell: RenderCell::text(ch),
+            })
+            .collect();
+        let mut output = Vec::new();
+        RenderBackend::new(&mut output).render_diff(&dirty).unwrap();
+        let mut host = shux_vt::VirtualTerminal::new(2, 4);
+        host.process(&output);
+        let row = |r: usize| -> String {
+            let cells = host.grid().visible_row(r);
+            (0..cells.len()).map(|c| cells[c].ch).collect()
+        };
+        assert_eq!(
+            row(1).trim(),
+            "",
+            "the frame wrapped: {:?} / {:?}",
+            row(0),
+            row(1)
+        );
+        assert!(row(0).starts_with("abc"), "{:?}", row(0));
+    }
+
+    /// Invisible direction and spacing controls a pane printed can reorder
+    /// or hide text in a guest's terminal; a plain viewer gets the visible
+    /// text, and joiners that build emoji and conjuncts stay.
+    #[test]
+    fn stripping_drops_invisible_direction_controls_and_keeps_joiners() {
+        let frame = "\x1b[1;1HA\u{202E}\u{200B}\u{2066}\u{FEFF}\x1b[1;3H\u{1F468}\u{200D}\u{1F469}\u{0915}\u{094D}\u{200C}";
+        let mut bytes = frame.as_bytes().to_vec();
+        bytes.push(0xFF);
+        let out = strip_hidden_controls(bytes);
+        assert_eq!(out.last(), Some(&0xFF), "bytes that are not text were lost");
+        let out = String::from_utf8_lossy(&out).into_owned();
+        for hidden in ['\u{202E}', '\u{200B}', '\u{2066}', '\u{FEFF}'] {
+            assert!(!out.contains(hidden), "plain output carries {hidden:?}");
+        }
+        assert!(
+            out.contains("\u{1F468}\u{200D}\u{1F469}"),
+            "a ZWJ emoji was broken"
+        );
+        assert!(out.contains("\u{094D}\u{200C}"), "a ZWNJ was dropped");
     }
 
     #[test]

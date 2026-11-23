@@ -207,6 +207,10 @@ impl Reader {
 
 impl AttachedClient {
     fn spawn(h: &Harness, session: &str) -> Self {
+        Self::spawn_args(h, &["session", "attach", session])
+    }
+
+    fn spawn_args(h: &Harness, args: &[&str]) -> Self {
         let size = nix::pty::Winsize {
             ws_row: 30,
             ws_col: 100,
@@ -221,7 +225,7 @@ impl AttachedClient {
             .env("COLORTERM", "truecolor")
             .env_remove("NO_COLOR")
             .env_remove("SHUX")
-            .args(["session", "attach", session])
+            .args(args)
             .stdin(dup(&pty.slave))
             .stdout(dup(&pty.slave))
             .stderr(dup(&pty.slave));
@@ -503,6 +507,7 @@ async fn headless_attach(
         rows: 30,
         client_version: "attach-teardown-test".to_string(),
         graphics: false,
+        plain: false,
     };
     framed
         .send(Bytes::from(serde_json::to_vec(&hello).unwrap()))
@@ -666,6 +671,7 @@ async fn a_resize_during_the_handshake_reaches_the_daemon() {
         active_window_id: "stand-in".into(),
         active_pane_id: "stand-in".into(),
         protocol: ATTACH_PROTOCOL_VERSION,
+        plain: false,
     };
     framed
         .send(Bytes::from(serde_json::to_vec(&ready).unwrap()))
@@ -740,6 +746,7 @@ async fn a_connection_cut_mid_frame_is_reported_as_lost() {
         active_window_id: "stand-in".into(),
         active_pane_id: "stand-in".into(),
         protocol: ATTACH_PROTOCOL_VERSION,
+        plain: false,
     };
     framed
         .send(Bytes::from(serde_json::to_vec(&ready).unwrap()))
@@ -757,5 +764,56 @@ async fn a_connection_cut_mid_frame_is_reported_as_lost() {
     assert!(
         seen.contains("connection to daemon lost") && !seen.contains("framing error"),
         "a hang-up mid-frame was reported as: {seen:?}"
+    );
+}
+
+/// Issue #288: `--plain` against a daemon that does not confirm it refuses
+/// before taking over the terminal, and says so with a failing exit status.
+#[tokio::test]
+async fn plain_unconfirmed_by_the_daemon_fails_without_touching_the_terminal() {
+    let h = Harness::new();
+    h.create_session("plain-refused");
+    let sock = h.runtime_dir().join("shux").join("attach.sock");
+    std::fs::rename(&sock, sock.with_extension("real")).expect("move the real attach socket");
+    let listener = tokio::net::UnixListener::bind(&sock).expect("bind stand-in");
+
+    let mut client =
+        AttachedClient::spawn_args(&h, &["session", "attach", "--plain", "plain-refused"]);
+    let (stream, _) = tokio::time::timeout(BUDGET, listener.accept())
+        .await
+        .expect("the client never connected")
+        .expect("accept");
+    let mut framed = Framed::new(stream, shux_rpc::create_codec());
+    let hello = tokio::time::timeout(BUDGET, framed.next())
+        .await
+        .expect("no hello")
+        .expect("closed before the hello")
+        .expect("read hello");
+    let hello: AttachHello = serde_json::from_slice(&hello).expect("parse hello");
+    assert!(hello.plain, "--plain was not asked for");
+    // A daemon that predates `plain` answers without it.
+    let ready = AttachReady::Ok {
+        session_id: "stand-in".into(),
+        session_name: "plain-refused".into(),
+        active_window_id: "stand-in".into(),
+        active_pane_id: "stand-in".into(),
+        protocol: ATTACH_PROTOCOL_VERSION,
+        plain: false,
+    };
+    framed
+        .send(Bytes::from(serde_json::to_vec(&ready).unwrap()))
+        .await
+        .expect("send ready");
+
+    let status = client.wait_for_exit();
+    let seen = client.seen();
+    assert!(
+        !status.success(),
+        "a refused --plain attach exited {status:?}: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    assert!(
+        !find(&seen, b"\x1b[?1049h"),
+        "the terminal was taken over before the refusal"
     );
 }

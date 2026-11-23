@@ -340,6 +340,13 @@ pub enum SessionCommand {
 
         #[arg(short, long, conflicts_with = "name_pos")]
         session: Option<String>,
+
+        /// Text and colour only: the daemon sends this terminal no
+        /// hyperlinks, cursor shape or colour, images, or invisible
+        /// direction controls. For a terminal whose owner did not choose to
+        /// run the panes' programs.
+        #[arg(long)]
+        plain: bool,
     },
 
     /// Rasterize a session's active window to a composed PNG.
@@ -2266,7 +2273,10 @@ mod tests {
         let cli = Cli::try_parse_from(["shux", "session", "attach", "dev"]).unwrap();
         match cli.command {
             Some(Command::Session {
-                command: SessionCommand::Attach { name_pos, session },
+                command:
+                    SessionCommand::Attach {
+                        name_pos, session, ..
+                    },
             }) => {
                 assert_eq!(name_pos, Some("dev".to_string()));
                 assert!(session.is_none());

@@ -888,6 +888,17 @@ impl<'a> VtHandler<'a> {
         self.prune_cursor_extended();
     }
 
+    fn close_cursor_hyperlink(&mut self) {
+        if self
+            .cursor
+            .extended
+            .as_ref()
+            .is_some_and(|e| e.hyperlink.is_some())
+        {
+            self.set_cursor_hyperlink(None);
+        }
+    }
+
     fn set_underline_style(&mut self, underline_style: UnderlineStyle) {
         self.cursor_extended_mut().underline_style = underline_style;
         self.prune_cursor_extended();
@@ -988,7 +999,15 @@ impl<'a> VtHandler<'a> {
         match param {
             0 => {
                 self.cursor.style = CellStyle::default();
-                self.cursor.extended = None;
+                // A hyperlink is not graphic rendition: only OSC 8 ends it.
+                let link = self
+                    .cursor
+                    .extended
+                    .take()
+                    .and_then(|e| e.hyperlink.clone());
+                if link.is_some() {
+                    self.set_cursor_hyperlink(link);
+                }
             }
             1 => self.cursor.style.flags.set(CellFlags::BOLD),
             2 => self.cursor.style.flags.set(CellFlags::DIM),
@@ -1115,6 +1134,7 @@ impl<'a> VtHandler<'a> {
                             *self.cursor = Cursor::new();
                             self.cursor.saved = saved;
                         }
+                        self.close_cursor_hyperlink();
                         return;
                     }
                     // Enter alternate screen: swap grids. 1049 parks the
@@ -1132,6 +1152,8 @@ impl<'a> VtHandler<'a> {
                         self.restore_cursor_state();
                     }
                 }
+                // A link never crosses screens, either way.
+                self.close_cursor_hyperlink();
             }
             // Bracketed paste mode (2004).
             2004 => self.modes.bracketed_paste = enable,

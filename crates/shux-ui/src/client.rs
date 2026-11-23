@@ -78,6 +78,8 @@ pub struct ClientConfig {
     /// The live config `prefix` and `keybindings` were read from. When set,
     /// the attach loop rebuilds its bindings whenever it reloads.
     pub live_config: Option<shux_core::config::ConfigHandle>,
+    /// Ask the daemon for text and colour only (`session attach --plain`).
+    pub plain: bool,
 }
 
 impl Default for ClientConfig {
@@ -89,6 +91,7 @@ impl Default for ClientConfig {
             prefix_key: KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL),
             keybindings: std::collections::HashMap::new(),
             live_config: None,
+            plain: false,
         }
     }
 }
