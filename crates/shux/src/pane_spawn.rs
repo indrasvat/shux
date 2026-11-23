@@ -2605,6 +2605,20 @@ mod tests {
             .await
             .layout_basis
             .insert(session, (100, 30, border));
+        // The client that sized it is still attached.
+        let clients = h.io.lock().await.clients.clone();
+        let _driver = clients.register(
+            crate::clients::ClientInfo {
+                id: shux_core::event::ClientId::new(),
+                session_id: session,
+                cols: 100,
+                rows: 30,
+                attached_at: std::time::SystemTime::now(),
+                votes: true,
+                last_input: None,
+            },
+            tokio_util::sync::CancellationToken::new(),
+        );
         let split = crate::rpc::test_harness::dispatch_ok(
             &h.router,
             "pane.split",
