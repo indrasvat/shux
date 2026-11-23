@@ -1333,12 +1333,13 @@ pub fn print_daemon_version(found: Option<(&str, &str)>, note: Option<&str>) -> 
 }
 
 /// `shux version --format plain`: `cli<TAB>version<TAB>sha`, then
-/// `daemon<TAB>status<TAB>version<TAB>sha<TAB>match`, `-` where unknown.
+/// `daemon<TAB>status<TAB>version<TAB>sha<TAB>match<TAB>sessions`, `-` where unknown.
 pub fn print_version_plain(
     cli: (&str, &str),
     status: &str,
     daemon: Option<(&str, &str)>,
     mismatch: Option<bool>,
+    sessions: Option<usize>,
 ) -> Printed {
     let mut out = io::stdout().lock();
     writeln!(out, "cli\t{}\t{}", cli.0, cli.1)?;
@@ -1350,7 +1351,11 @@ pub fn print_version_plain(
         Some(false) => "match",
         None => "-",
     };
-    writeln!(out, "daemon\t{status}\t{version}\t{sha}\t{matched}")?;
+    let sessions = sessions.map_or("-".to_string(), |n| n.to_string());
+    writeln!(
+        out,
+        "daemon\t{status}\t{version}\t{sha}\t{matched}\t{sessions}"
+    )?;
     out.flush()?;
     Ok(())
 }

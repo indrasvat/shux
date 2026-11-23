@@ -455,6 +455,8 @@ pub struct SessionGraph {
     /// typed event to subscribers. Held as `Option` so legacy unit tests can
     /// continue to call `SessionGraph::new()` without setting up a bus.
     event_bus: Option<EventBus>,
+    /// Set by [`Self::retire_if_empty`]: no session is created after it.
+    retiring: std::sync::atomic::AtomicBool,
 }
 
 impl SessionGraph {
@@ -476,8 +478,33 @@ impl SessionGraph {
             status_generations: Default::default(),
             pty_owners: Default::default(),
             event_bus,
+            retiring: Default::default(),
         };
         (graph, state)
+    }
+
+    /// With no sessions, refuse every session created from now on and
+    /// return `Ok`; otherwise the session count. Run on the graph task, so
+    /// no create lands between the check and the refusal.
+    pub fn retire_if_empty(&self) -> Result<(), usize> {
+        use std::sync::atomic::Ordering;
+        if self.retiring.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        match self.current().sessions.len() {
+            0 => {
+                self.retiring.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+            n => Err(n),
+        }
+    }
+
+    fn refuse_if_retiring(&self) -> Result<(), GraphError> {
+        if self.retiring.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(GraphError::Shutdown);
+        }
+        Ok(())
     }
 
     /// The committed state, as a transaction sees it between its own writes.
@@ -544,6 +571,8 @@ impl SessionGraph {
                     initial_command,
                     initial_window_title,
                 } => {
+                    self.refuse_if_retiring()
+                        .map_err(|source| BatchError::OpFailed { op_index, source })?;
                     let resolved_name = match name {
                         Some(n) => n.clone(),
                         None => {
@@ -772,6 +801,7 @@ impl SessionGraph {
         cwd: std::path::PathBuf,
         command: Vec<String>,
     ) -> Result<SessionId, GraphError> {
+        self.refuse_if_retiring()?;
         Self::validate_session_name(&name)?;
 
         let current = self.current();
@@ -3301,6 +3331,42 @@ mod tests {
         assert_eq!(snap.sessions[&sid].name, "work");
         assert_eq!(snap.windows.len(), 1);
         assert_eq!(snap.panes.len(), 1);
+    }
+
+    /// A retired graph takes no session, by either path; one that holds a
+    /// session is not retired.
+    #[test]
+    fn a_retired_graph_refuses_every_new_session() {
+        use crate::apply::{BatchError, Op};
+        let (graph, _state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        assert_eq!(graph.retire_if_empty(), Err(1));
+        graph.destroy_session(sid, None).unwrap();
+        assert_eq!(graph.retire_if_empty(), Ok(()));
+        assert_eq!(graph.retire_if_empty(), Ok(()), "retiring is idempotent");
+
+        let created = graph.create_session("late".into(), home());
+        assert!(
+            matches!(created, Err(GraphError::Shutdown)),
+            "session.create after retiring: {created:?}"
+        );
+        let applied = graph.apply_batch(vec![Op::CreateSession {
+            name: Some("late".into()),
+            cwd: home(),
+            initial_command: vec![],
+            initial_window_title: None,
+        }]);
+        assert!(
+            matches!(
+                applied,
+                Err(BatchError::OpFailed {
+                    source: GraphError::Shutdown,
+                    ..
+                })
+            ),
+            "state.apply after retiring: {applied:?}"
+        );
+        assert!(graph.current().sessions.is_empty());
     }
 
     #[test]

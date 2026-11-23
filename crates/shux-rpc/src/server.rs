@@ -744,6 +744,30 @@ fn try_authenticate(
     Ok(token == Some(expected.as_str()))
 }
 
+/// Debug builds only: a daemon started with this set reports that git SHA as
+/// its build, or no version at all when it is `-`, so tests can stand up a
+/// daemon of "another build" from this one.
+#[cfg(debug_assertions)]
+const TEST_DAEMON_GIT_SHA_ENV: &str = "SHUX_TEST_DAEMON_GIT_SHA";
+
+fn version_answer() -> serde_json::Value {
+    let answer = serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "git_sha": crate::GIT_SHA,
+        "name": "shux",
+    });
+    #[cfg(debug_assertions)]
+    if let Ok(sha) = std::env::var(TEST_DAEMON_GIT_SHA_ENV) {
+        if sha == "-" {
+            return serde_json::json!({ "name": "shux" });
+        }
+        let mut answer = answer;
+        answer["git_sha"] = sha.into();
+        return answer;
+    }
+    answer
+}
+
 /// Register the system-level built-in methods on a router builder.
 ///
 /// System methods (always available, no state dependency):
@@ -761,13 +785,7 @@ pub fn register_builtin_methods(
         .register_with_policy(
             "system.version",
             Policy::fixed(Sensitivity::Public),
-            |_params: Option<serde_json::Value>| async {
-                Ok(serde_json::json!({
-                    "version": env!("CARGO_PKG_VERSION"),
-                    "git_sha": crate::GIT_SHA,
-                    "name": "shux",
-                }))
-            },
+            |_params: Option<serde_json::Value>| async { Ok(version_answer()) },
         )
         .register_with_policy(
             "system.health",

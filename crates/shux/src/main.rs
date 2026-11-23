@@ -22,6 +22,7 @@ fn main() {
         .after_long_help(cli::agent_help());
     let matches = cmd.try_get_matches().unwrap_or_else(|e| exit_from_clap(&e));
     let args = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    let format = args.format;
 
     let result = if let Err(e) = shux::patience::init() {
         Err(e)
@@ -47,6 +48,9 @@ fn main() {
     };
 
     if let Err(e) = result {
+        if let Some(refusal) = shux::client::DaemonInUse::find(&e) {
+            cli::exit_daemon_in_use(refusal, format);
+        }
         report_fatal(&e);
     }
 }

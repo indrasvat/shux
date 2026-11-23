@@ -61,6 +61,10 @@ pub enum TraceTarget {
 /// prefix of the run, possibly ending in a partial line) and is kept for the driver.
 pub struct Trace {
     sink: Option<Box<dyn std::io::Write + Send>>,
+    /// The sink until [`Self::arm`]: a refused run leaves an existing trace as it was.
+    held: Option<Box<dyn std::io::Write + Send>>,
+    /// The trace file, emptied by [`Self::arm`] rather than at open.
+    truncate: Option<std::fs::File>,
     /// Every signal, retained for the provisional exit decision + a minimal summary.
     signals: Vec<RunnerSignal>,
     label: String,
@@ -70,32 +74,73 @@ pub struct Trace {
 impl Trace {
     /// No trace: signals are only retained.
     pub fn none() -> Self {
-        Self::with_sink(None, String::new())
+        Self::held(None, None, String::new())
     }
 
-    /// Err is a diagnostic naming the target.
+    /// Err is a diagnostic naming the target. Nothing is written, nor an existing
+    /// file emptied, until [`Self::arm`].
     pub fn open(target: Option<TraceTarget>) -> Result<Self, String> {
         Ok(match target {
             None => Self::none(),
-            Some(TraceTarget::Stdout) => Self::with_sink(
+            Some(TraceTarget::Stdout) => Self::held(
                 Some(Box::new(std::io::stdout())),
+                None,
                 "the trace stream".to_string(),
             ),
             Some(TraceTarget::Path(p)) => {
                 let label = format!("the trace file {}", p.display());
-                let file = std::fs::File::create(&p)
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(&p)
+                    .and_then(|f| Ok((f.try_clone()?, f)))
                     .map_err(|e| format!("could not open {label}: {e}"))?;
-                Self::with_sink(Some(Box::new(file)), label)
+                Self::held(Some(Box::new(file.1)), Some(file.0), label)
             }
         })
     }
 
-    fn with_sink(sink: Option<Box<dyn std::io::Write + Send>>, label: String) -> Self {
+    fn held(
+        held: Option<Box<dyn std::io::Write + Send>>,
+        truncate: Option<std::fs::File>,
+        label: String,
+    ) -> Self {
         Self {
-            sink,
+            sink: None,
+            held,
+            truncate,
             signals: Vec::new(),
             label,
             failure: None,
+        }
+    }
+
+    /// Start writing: the daemon that runs the scenario was reached, or the run
+    /// failed for a reason of its own. Signals so far are written first.
+    pub fn arm(&mut self) {
+        let Some(mut w) = self.held.take() else {
+            return;
+        };
+        let written = (|| {
+            // Only a regular file is emptied: a FIFO or a device cannot be,
+            // and Linux refuses to try.
+            if let Some(file) = self.truncate.take()
+                && file.metadata()?.is_file()
+            {
+                file.set_len(0)?;
+            }
+            if self.signals.is_empty() {
+                return Ok(());
+            }
+            for sig in &self.signals {
+                writeln!(w, "{}", sig.to_ndjson())?;
+            }
+            w.flush()
+        })();
+        match written {
+            Ok(()) => self.sink = Some(w),
+            Err(e) => self.failure = Some(e),
         }
     }
 
@@ -553,6 +598,8 @@ pub async fn drive_scenario(
 
     // 4. Spawn the child (deny-by-default env; async — the runner monitors exit).
     let mut stream = crate::client::ensure_daemon_running_at(socket_path).await?;
+    // The daemon that spawns the child is reached: the trace is this run's now.
+    trace.arm();
     let env_obj: serde_json::Map<String, serde_json::Value> = plan
         .env
         .iter()
@@ -1419,6 +1466,129 @@ mod tests {
     use super::*;
     use crate::gate::scenario;
 
+    /// A gate refused before it reaches its daemon leaves an existing trace as
+    /// it was; once armed, the trace is the run's.
+    #[test]
+    fn a_trace_file_is_kept_until_the_run_reaches_its_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.ndjson");
+        std::fs::write(&path, "kept\n").unwrap();
+        let open = || Trace::open(Some(TraceTarget::Path(path.clone()))).unwrap();
+
+        let mut refused = open();
+        refused.emit(RunnerSignal::NoVisualCheck);
+        drop(refused);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "kept\n");
+
+        let mut ran = open();
+        ran.emit(RunnerSignal::NoVisualCheck);
+        ran.arm();
+        ran.emit(RunnerSignal::NoVisualCheck);
+        drop(ran);
+        let line = RunnerSignal::NoVisualCheck.to_ndjson();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("{line}\n{line}\n")
+        );
+    }
+
+    /// A trace written to a FIFO (or a device) gets its lines: only a regular
+    /// file is emptied first, and a pipe cannot be.
+    #[test]
+    fn a_trace_to_a_fifo_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("trace.fifo");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+        let reader = {
+            let fifo = fifo.clone();
+            std::thread::spawn(move || std::fs::read_to_string(fifo).unwrap())
+        };
+        let mut trace = Trace::open(Some(TraceTarget::Path(fifo))).unwrap();
+        trace.emit(RunnerSignal::NoVisualCheck);
+        trace.arm();
+        drop(trace);
+        let line = RunnerSignal::NoVisualCheck.to_ndjson();
+        assert_eq!(
+            reader.join().unwrap(),
+            format!("{line}\n"),
+            "the FIFO got nothing"
+        );
+    }
+
+    /// A busy daemon of another build that takes over before the connection
+    /// that spawns the child refuses the run, and the trace is left as it was.
+    #[tokio::test]
+    async fn a_takeover_before_the_spawn_connection_keeps_the_trace() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("d.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        // Connections 0 and 1 are this build (asked twice); every later one is
+        // another build holding a session.
+        tokio::spawn(async move {
+            for n in 0.. {
+                let Ok((mut conn, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    loop {
+                        let mut len = [0u8; 4];
+                        if conn.read_exact(&mut len).await.is_err() {
+                            return;
+                        }
+                        let mut req = vec![0u8; u32::from_be_bytes(len) as usize];
+                        if conn.read_exact(&mut req).await.is_err() {
+                            return;
+                        }
+                        let req: serde_json::Value = serde_json::from_slice(&req).unwrap();
+                        let sha = if n < 2 { shux_rpc::GIT_SHA } else { "0ther00" };
+                        let result = match req["method"].as_str().unwrap() {
+                            "system.version" => serde_json::json!({
+                                "version": env!("CARGO_PKG_VERSION"), "git_sha": sha,
+                            }),
+                            "events.watch" => serde_json::json!({ "next_seq": 0 }),
+                            _ => serde_json::json!({ "retired": false, "sessions": 1 }),
+                        };
+                        let resp = serde_json::to_vec(&serde_json::json!({
+                            "jsonrpc": "2.0", "id": req["id"], "result": result,
+                        }))
+                        .unwrap();
+                        let framed = [&(resp.len() as u32).to_be_bytes()[..], &resp].concat();
+                        if conn.write_all(&framed).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let scn = scenario::parse("name = \"t\"\ncommand = [\"true\"]\n").unwrap();
+        let path = dir.path().join("t.ndjson");
+        std::fs::write(&path, "kept\n").unwrap();
+        let mut trace = Trace::open(Some(TraceTarget::Path(path.clone()))).unwrap();
+        let ran = drive_scenario(
+            &socket,
+            &scn,
+            dir.path(),
+            &["true".to_string()],
+            &dir.path().join("goldens"),
+            &mut trace,
+            0,
+            None,
+        )
+        .await;
+        let refused = ran
+            .as_ref()
+            .err()
+            .and_then(crate::client::DaemonInUse::find);
+        assert!(
+            refused.is_some(),
+            "the run was not refused: {:?}",
+            ran.err()
+        );
+        drop(trace);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "kept\n");
+    }
+
     /// Accepts `ok_writes` writes, then fails every write; or fails only on flush.
     struct Flaky {
         ok_writes: usize,
@@ -1455,7 +1625,8 @@ mod tests {
                 fail_flush,
                 calls: calls.clone(),
             };
-            let mut trace = Trace::with_sink(Some(Box::new(sink)), "the trace file t".into());
+            let mut trace = Trace::held(Some(Box::new(sink)), None, "the trace file t".into());
+            trace.arm();
             assert_eq!(trace.failure(), None);
             while trace.failure().is_none() {
                 trace.emit(RunnerSignal::NoVisualCheck);

@@ -44,6 +44,9 @@
 #   scripts/check-test-inventory.sh [BASE_REF]     # default: origin/main
 #   scripts/check-test-inventory.sh --write-baseline
 set -euo pipefail
+# `sort` and `comm` order by the locale: a cached baseline sorted under one
+# and a listing sorted under another disagree on unchanged tests.
+export LC_ALL=C
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
