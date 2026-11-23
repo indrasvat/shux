@@ -179,7 +179,8 @@ impl std::fmt::Display for DaemonInUse {
         }
         write!(
             f,
-            ". Run `{}` to end its sessions and start this build, or use {}",
+            ". Run `{}` to end its sessions, and the next shux command starts this build; \
+             or use {}",
             self.stop,
             matching_cli(self.daemon.as_ref())
         )
@@ -215,13 +216,12 @@ pub(crate) fn stop_command(socket: &Path) -> String {
             quote(&dir.to_string_lossy())
         ));
     }
-    cmd.push_str("shux ");
-    let default = daemon::socket_path().map(|d| daemon::socket_key(&d));
-    if default.ok() != Some(daemon::socket_key(socket)) {
-        let endpoint = daemon::socket_endpoint(socket);
-        cmd.push_str(&format!("--socket {} ", quote(&endpoint.to_string_lossy())));
-    }
-    cmd.push_str("daemon stop");
+    // Named even when it is the default: an inherited SHUX_SOCKET would redirect it.
+    let endpoint = daemon::socket_endpoint(socket);
+    cmd.push_str(&format!(
+        "shux --socket {} daemon stop",
+        quote(&endpoint.to_string_lossy())
+    ));
     cmd
 }
 
@@ -406,6 +406,10 @@ enum Probe {
 }
 
 async fn probe_daemon(socket_path: &Path) -> Result<Probe, ClientError> {
+    probe(socket_path, false).await
+}
+
+async fn probe(socket_path: &Path, confirmed: bool) -> Result<Probe, ClientError> {
     let (stream, asked) = match ask_version(socket_path).await {
         Ok(asked) => asked,
         Err(DaemonAnswer::Unreachable(e)) => return Err(ClientError::Io(e)),
@@ -418,20 +422,17 @@ async fn probe_daemon(socket_path: &Path) -> Result<Probe, ClientError> {
         Asked::Error(_) | Asked::Malformed => None,
     };
     match found {
-        Some(dv) if dv.is_current() => {
+        Some(dv) if dv.is_current() && confirmed => {
             debug!(
                 version = CLIENT_VERSION,
                 git_sha = CLIENT_GIT_SHA,
                 "Daemon version matches"
             );
-            // The verified connection is the one returned; this one only
-            // asks whether the daemon still serves the socket.
-            match probe_socket(socket_path).await {
-                Ok(_) => Ok(Probe::Current(stream)),
-                Err(e) if is_connection_refused_or_not_found(&e) => Ok(Probe::Absent),
-                Err(e) => Err(ClientError::Io(e)),
-            }
+            Ok(Probe::Current(stream))
         }
+        // Asked again on a new connection, which is the one returned: a
+        // daemon that answered and then left is not handed back.
+        Some(dv) if dv.is_current() => Box::pin(probe(socket_path, true)).await,
         Some(dv) => {
             warn!(
                 daemon_version = dv.version,
@@ -465,10 +466,14 @@ enum Verdict {
 ///
 /// A legacy build is counted and then stopped: a session created between the
 /// two is lost. That window closes once daemons answer the retire call.
+///
+/// Without `retire` nothing is asked to change: every daemon is only counted,
+/// as a legacy one is.
 async fn verdict(
     socket: &Path,
     found: Option<DaemonVersion>,
     mut stream: UnixStream,
+    retire: bool,
 ) -> Result<Verdict, ClientError> {
     let refuse = |daemon, sessions, stoppable| {
         ClientError::DaemonInUse(Box::new(DaemonInUse {
@@ -485,8 +490,14 @@ async fn verdict(
     let patience = crate::patience::peer_patience();
     let unresponsive = || ClientError::DaemonUnresponsive(holder(socket), socket.to_path_buf());
 
-    let retire = ask(&mut stream, "retire", shux_rpc::RETIRE_IF_IDLE, json!({}));
-    match tokio::time::timeout(patience, retire).await {
+    let asked = async {
+        if !retire {
+            return Ok(Asked::Error(json!({ "code": METHOD_NOT_FOUND })));
+        }
+        let retire = ask(&mut stream, "retire", shux_rpc::RETIRE_IF_IDLE, json!({}));
+        tokio::time::timeout(patience, retire).await
+    };
+    match asked.await {
         Err(_) => return Err(unresponsive()),
         Ok(Asked::Gone) => return Ok(Verdict::Gone),
         Ok(Asked::Result(r)) => {
@@ -559,7 +570,7 @@ async fn claim_socket(socket: &Path) -> Result<Option<UnixStream>, ClientError> 
                     socket.to_path_buf(),
                 ));
             }
-            Probe::Stale(found, stream) => match verdict(socket, found, stream).await? {
+            Probe::Stale(found, stream) => match verdict(socket, found, stream, true).await? {
                 // It exits on its own; wait for the socket below.
                 Verdict::Retiring => {}
                 Verdict::Gone => hang_up(&mut hung_up)?,
@@ -633,7 +644,7 @@ pub async fn ensure_daemon_running_at(socket_path: &Path) -> Result<UnixStream, 
         }
         // Refused before the start lock too, so a refusal never waits on it.
         Probe::Stale(found, stream) => {
-            verdict(socket_path, found, stream).await?;
+            verdict(socket_path, found, stream, true).await?;
         }
         Probe::Gone | Probe::Absent => {}
     }
@@ -661,16 +672,20 @@ pub async fn ensure_daemon_running_at(socket_path: &Path) -> Result<UnixStream, 
 }
 
 /// The refusal [`ensure_daemon_running_at`] would return for `socket_path`, if
-/// any, for a command that must not write anything first. Starts nothing;
-/// any other failure is left for the command's own connect to report.
+/// any, or that the daemon did not answer, for a command that must not write
+/// anything first. Starts, stops and retires nothing; any other failure is left
+/// for the command's own connect to report.
 pub async fn refuse_if_incompatible(socket_path: &Path) -> Result<(), ClientError> {
-    if let Ok(Probe::Stale(found, stream)) = probe_daemon(socket_path).await
-        && let Err(refused @ ClientError::DaemonInUse(_)) =
-            verdict(socket_path, found, stream).await
-    {
-        return Err(refused);
+    let unresponsive =
+        || ClientError::DaemonUnresponsive(holder(socket_path), socket_path.to_path_buf());
+    match probe_daemon(socket_path).await {
+        Ok(Probe::Unresponsive) => Err(unresponsive()),
+        Ok(Probe::Stale(found, stream)) => match verdict(socket_path, found, stream, false).await {
+            Err(e @ (ClientError::DaemonInUse(_) | ClientError::DaemonUnresponsive(..))) => Err(e),
+            _ => Ok(()),
+        },
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 /// Probe `socket_path` with backoff until the daemon accepts a connection.
@@ -891,6 +906,25 @@ mod tests {
         assert!(connected.is_ok(), "{connected:?}");
     }
 
+    /// A daemon of this build that answers and then leaves, as a successor
+    /// binds, is not the connection handed back.
+    #[tokio::test]
+    async fn the_connection_returned_is_one_that_still_serves() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("d.sock");
+        stub(&socket, |n, method| match (n, method) {
+            (_, "system.version") => Some(version(CLIENT_GIT_SHA)),
+            (0, _) => None,
+            _ => Some(sessions(0)),
+        });
+        let mut stream = ensure_daemon_running_at(&socket).await.unwrap();
+        let listed = ask(&mut stream, "l", "session.list", json!({})).await;
+        assert!(
+            matches!(listed, Asked::Result(_)),
+            "the returned connection was the departed daemon's"
+        );
+    }
+
     /// An idle daemon of a build without the retire call, that no shux daemon
     /// process serves, cannot be stopped: refused at once, not waited on.
     #[tokio::test]
@@ -929,9 +963,15 @@ mod tests {
             cmd.ends_with(" --socket '/nonexistent/it'\\''s here/d.sock' daemon stop"),
             "{cmd}"
         );
-        let default = stop_command(&daemon::socket_path().unwrap());
-        assert!(default.ends_with("shux daemon stop"), "{default}");
-        assert!(!default.contains("--socket"), "{default}");
+        // The default socket is named too, so an inherited SHUX_SOCKET cannot
+        // redirect the stop to another daemon.
+        let socket = daemon::socket_path().unwrap();
+        let default = stop_command(&socket);
+        let named = shux_pty::shell_quote_arg(&daemon::socket_endpoint(&socket).to_string_lossy());
+        assert!(
+            default.ends_with(&format!("shux --socket {named} daemon stop")),
+            "{default}"
+        );
     }
 
     /// A daemon too busy to answer the version check for 6s is waited for,

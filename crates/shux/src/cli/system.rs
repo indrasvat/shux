@@ -148,7 +148,7 @@ pub async fn handle_version(
                 Some(Ok(dv)) => ("running", Some((dv.version.as_str(), dv.git_sha.as_str()))),
                 Some(Err((status, _))) => (*status, None),
             };
-            crate::style::print_version_plain(cli, status, found, mismatch)?;
+            crate::style::print_version_plain(cli, status, found, mismatch, held)?;
         }
         OutputFormat::Text => {
             crate::style::print_version(

@@ -142,7 +142,8 @@ fn a_daemon_of_another_build_holding_a_session_is_refused_not_stopped() {
         OTHER_SHA,
         shux_rpc::GIT_SHA,
         "1 session",
-        "shux daemon stop",
+        " daemon stop",
+        "the next shux command starts this build",
     ] {
         assert!(stderr.contains(want), "refusal lacks {want:?}: {stderr}");
     }
@@ -181,8 +182,13 @@ fn a_daemon_of_another_build_holding_a_session_is_refused_not_stopped() {
 
     let version = text(&h.run(&["version"]).stdout);
     assert!(
-        version.contains("holds 1 session") && version.contains("shux daemon stop"),
+        version.contains("holds 1 session") && version.contains(" daemon stop"),
         "version says what the next command does: {version}"
+    );
+    let plain = text(&h.run(&["--format", "plain", "version"]).stdout);
+    assert!(
+        plain.contains("\tmismatch\t1\n"),
+        "plain version counts the sessions too: {plain:?}"
     );
 
     let attach = attach_on_a_pty(&h, "victim");
@@ -263,7 +269,7 @@ fn a_daemon_whose_version_answer_is_unreadable_is_left_alone() {
     let stderr = text(&listed.stderr);
     assert_eq!(listed.status.code(), Some(DAEMON_IN_USE), "{stderr}");
     assert!(
-        stderr.contains("shux daemon stop"),
+        stderr.contains(" daemon stop"),
         "the refusal names the way forward: {stderr}"
     );
     assert!(alive(daemon), "a daemon it could not identify was stopped");
@@ -389,6 +395,84 @@ fn lens_gate_is_refused_before_it_writes_anything() {
         shux_testkit::running(pane, &needle),
         "the pane's process was killed"
     );
+}
+
+/// A daemon that does not answer the gate's check leaves no scaffold behind.
+#[test]
+fn gate_init_writes_nothing_when_the_daemon_does_not_answer() {
+    let h = Harness::new();
+    let started = h.run(&["session", "list"]);
+    assert!(started.status.success(), "{}", text(&started.stderr));
+    let daemon = h.daemon_pid();
+    kill(Pid::from_raw(daemon), Signal::SIGSTOP).expect("stop the daemon");
+    let work = tempfile::tempdir().expect("work dir");
+    let init = h
+        .shux()
+        .env("SHUX_PEER_PATIENCE_MS", "150")
+        .args(["lens", "gate", "init", "timedout", "--dir"])
+        .arg(work.path())
+        .output()
+        .expect("run gate init");
+    kill(Pid::from_raw(daemon), Signal::SIGCONT).expect("resume the daemon");
+    let out = text(&init.stdout);
+    assert!(!init.status.success(), "{out}");
+    assert!(!out.contains("scaffolded"), "{out}");
+    assert!(
+        !work.path().join("timedout.toml").exists(),
+        "gate init wrote its scenario before the daemon answered"
+    );
+}
+
+/// The gate's check retires nothing: an idle daemon of another build is still
+/// there when the gate stops at its own validation.
+#[test]
+fn the_gate_check_retires_nothing_before_the_gate_validates() {
+    let h = Harness::new();
+    let started = h.run_as_other_build(OTHER_SHA, &["session", "list"]);
+    assert!(started.status.success(), "{}", text(&started.stderr));
+    let old = h.daemon_pid();
+    let work = tempfile::tempdir().expect("work dir");
+    let missing = work.path().join("missing.toml");
+    let gate = h.run(&["lens", "gate", missing.to_str().expect("utf-8 path")]);
+    assert_eq!(gate.status.code(), Some(2), "{}", text(&gate.stderr));
+    // Straight to the old daemon, not through a CLI that would replace it: a
+    // retired one refuses this, or is gone.
+    let created = raw_call(
+        &h.pid_dir().join("shux.sock"),
+        "session.create",
+        serde_json::json!({ "name": "after" }),
+    );
+    assert!(
+        created.get("result").is_some(),
+        "a gate that never ran retired the daemon: {created}"
+    );
+    assert!(alive(old));
+}
+
+/// One JSON-RPC request on a fresh connection to `socket`; the response, or
+/// `{"gone": ...}` when there is none.
+fn raw_call(socket: &Path, method: &str, params: serde_json::Value) -> serde_json::Value {
+    use std::io::Write;
+    let gone = |e: std::io::Error| serde_json::json!({ "gone": e.to_string() });
+    let mut conn = match std::os::unix::net::UnixStream::connect(socket) {
+        Ok(conn) => conn,
+        Err(e) => return gone(e),
+    };
+    let req = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
+    let req = serde_json::to_vec(&req).expect("json");
+    let mut len = [0u8; 4];
+    let read = conn
+        .write_all(&(req.len() as u32).to_be_bytes())
+        .and_then(|()| conn.write_all(&req))
+        .and_then(|()| conn.read_exact(&mut len));
+    if let Err(e) = read {
+        return gone(e);
+    }
+    let mut resp = vec![0u8; u32::from_be_bytes(len) as usize];
+    if let Err(e) = conn.read_exact(&mut resp) {
+        return gone(e);
+    }
+    serde_json::from_slice(&resp).expect("json response")
 }
 
 /// `shux session attach <session>` on a PTY that is its controlling

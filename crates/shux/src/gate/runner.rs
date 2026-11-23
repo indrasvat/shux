@@ -61,6 +61,10 @@ pub enum TraceTarget {
 /// prefix of the run, possibly ending in a partial line) and is kept for the driver.
 pub struct Trace {
     sink: Option<Box<dyn std::io::Write + Send>>,
+    /// The sink until [`Self::arm`]: a refused run leaves an existing trace as it was.
+    held: Option<Box<dyn std::io::Write + Send>>,
+    /// The trace file, emptied by [`Self::arm`] rather than at open.
+    truncate: Option<std::fs::File>,
     /// Every signal, retained for the provisional exit decision + a minimal summary.
     signals: Vec<RunnerSignal>,
     label: String,
@@ -70,32 +74,69 @@ pub struct Trace {
 impl Trace {
     /// No trace: signals are only retained.
     pub fn none() -> Self {
-        Self::with_sink(None, String::new())
+        Self::held(None, None, String::new())
     }
 
-    /// Err is a diagnostic naming the target.
+    /// Err is a diagnostic naming the target. Nothing is written, nor an existing
+    /// file emptied, until [`Self::arm`].
     pub fn open(target: Option<TraceTarget>) -> Result<Self, String> {
         Ok(match target {
             None => Self::none(),
-            Some(TraceTarget::Stdout) => Self::with_sink(
+            Some(TraceTarget::Stdout) => Self::held(
                 Some(Box::new(std::io::stdout())),
+                None,
                 "the trace stream".to_string(),
             ),
             Some(TraceTarget::Path(p)) => {
                 let label = format!("the trace file {}", p.display());
-                let file = std::fs::File::create(&p)
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(&p)
+                    .and_then(|f| Ok((f.try_clone()?, f)))
                     .map_err(|e| format!("could not open {label}: {e}"))?;
-                Self::with_sink(Some(Box::new(file)), label)
+                Self::held(Some(Box::new(file.1)), Some(file.0), label)
             }
         })
     }
 
-    fn with_sink(sink: Option<Box<dyn std::io::Write + Send>>, label: String) -> Self {
+    fn held(
+        held: Option<Box<dyn std::io::Write + Send>>,
+        truncate: Option<std::fs::File>,
+        label: String,
+    ) -> Self {
         Self {
-            sink,
+            sink: None,
+            held,
+            truncate,
             signals: Vec::new(),
             label,
             failure: None,
+        }
+    }
+
+    /// Start writing: the daemon that runs the scenario was reached, or the run
+    /// failed for a reason of its own. Signals so far are written first.
+    pub fn arm(&mut self) {
+        let Some(mut w) = self.held.take() else {
+            return;
+        };
+        let written = (|| {
+            if let Some(file) = self.truncate.take() {
+                file.set_len(0)?;
+            }
+            if self.signals.is_empty() {
+                return Ok(());
+            }
+            for sig in &self.signals {
+                writeln!(w, "{}", sig.to_ndjson())?;
+            }
+            w.flush()
+        })();
+        match written {
+            Ok(()) => self.sink = Some(w),
+            Err(e) => self.failure = Some(e),
         }
     }
 
@@ -520,6 +561,7 @@ pub async fn drive_scenario(
 
     // Pre-spawn cursor (design D7): head seq BEFORE lens.run.
     let mut mstream = crate::client::ensure_daemon_running_at(socket_path).await?;
+    trace.arm();
     let from_seq = rpc_call(
         &mut mstream,
         "events.watch",
@@ -1419,6 +1461,32 @@ mod tests {
     use super::*;
     use crate::gate::scenario;
 
+    /// A gate refused before it reaches its daemon leaves an existing trace as
+    /// it was; once armed, the trace is the run's.
+    #[test]
+    fn a_trace_file_is_kept_until_the_run_reaches_its_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.ndjson");
+        std::fs::write(&path, "kept\n").unwrap();
+        let open = || Trace::open(Some(TraceTarget::Path(path.clone()))).unwrap();
+
+        let mut refused = open();
+        refused.emit(RunnerSignal::NoVisualCheck);
+        drop(refused);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "kept\n");
+
+        let mut ran = open();
+        ran.emit(RunnerSignal::NoVisualCheck);
+        ran.arm();
+        ran.emit(RunnerSignal::NoVisualCheck);
+        drop(ran);
+        let line = RunnerSignal::NoVisualCheck.to_ndjson();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("{line}\n{line}\n")
+        );
+    }
+
     /// Accepts `ok_writes` writes, then fails every write; or fails only on flush.
     struct Flaky {
         ok_writes: usize,
@@ -1455,7 +1523,8 @@ mod tests {
                 fail_flush,
                 calls: calls.clone(),
             };
-            let mut trace = Trace::with_sink(Some(Box::new(sink)), "the trace file t".into());
+            let mut trace = Trace::held(Some(Box::new(sink)), None, "the trace file t".into());
+            trace.arm();
             assert_eq!(trace.failure(), None);
             while trace.failure().is_none() {
                 trace.emit(RunnerSignal::NoVisualCheck);

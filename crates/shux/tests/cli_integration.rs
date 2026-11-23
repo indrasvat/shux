@@ -587,7 +587,7 @@ async fn version_names_the_cli_and_a_daemon_of_another_version() {
     assert_eq!(
         stdout,
         format!(
-            "cli\t{}\t{}\ndaemon\trunning\t0.0.1\tb623470\tmismatch\n",
+            "cli\t{}\t{}\ndaemon\trunning\t0.0.1\tb623470\tmismatch\t-\n",
             env!("CARGO_PKG_VERSION"),
             shux_rpc::GIT_SHA
         ),

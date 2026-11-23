@@ -346,7 +346,7 @@ meets a daemon of the old one (another version or git SHA) and then:
   Match on `error.code`: `lens run --wait` also exits 10 when its program does.
 
 `shux version` never starts or stops anything and says which of the two applies, as of
-the moment it asked. Ways forward, both deliberate:
+the moment it asked (`--format json` adds `daemon.sessions`, `--format plain` a sixth column). Ways forward, both deliberate:
 
 ```bash
 shux daemon stop          # ends those sessions; the next command starts the new build

@@ -321,6 +321,7 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
             // greppable `parse_error` in the trace.
             let (lost_trace, reader_left) = match Trace::open(trace_target(opts.trace.clone())) {
                 Ok(mut trace) => {
+                    trace.arm();
                     trace.parse_error(&e.to_string());
                     if trace.reader_left() {
                         (None, true)
@@ -427,10 +428,18 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
     )
     .await
     {
-        Ok(outcome) => outcome,
+        Ok(outcome) => {
+            trace.arm();
+            outcome
+        }
+        // Refused before it ran: the trace is left as it was.
+        Err(e) if crate::client::DaemonInUse::find(&e).is_some() => return Err(e),
         // No verdict: the error exits 3, but the trace still ends as it would.
-        Err(_) if trace.reader_left() => return Err(broken_pipe()),
         Err(e) => {
+            trace.arm();
+            if trace.reader_left() {
+                return Err(broken_pipe());
+            }
             if let Some(why) = trace.failure() {
                 report_lost_trace(&why);
             }

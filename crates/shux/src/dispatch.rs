@@ -995,7 +995,12 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
                 },
         }) => {
             // Before the gate writes a scenario, trace or report.
-            client::refuse_if_incompatible(&socket_path).await?;
+            if let Err(e) = client::refuse_if_incompatible(&socket_path).await {
+                if matches!(e, client::ClientError::DaemonInUse(_)) {
+                    return Err(e.into());
+                }
+                std::process::exit(gate::driver::infra_failure(&e.into()));
+            }
             let ran = match sub {
                 Some(cli::GateSubcommand::Review {
                     scenario,
