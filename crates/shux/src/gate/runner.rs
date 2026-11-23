@@ -561,7 +561,6 @@ pub async fn drive_scenario(
 
     // Pre-spawn cursor (design D7): head seq BEFORE lens.run.
     let mut mstream = crate::client::ensure_daemon_running_at(socket_path).await?;
-    trace.arm();
     let from_seq = rpc_call(
         &mut mstream,
         "events.watch",
@@ -595,6 +594,8 @@ pub async fn drive_scenario(
 
     // 4. Spawn the child (deny-by-default env; async — the runner monitors exit).
     let mut stream = crate::client::ensure_daemon_running_at(socket_path).await?;
+    // The daemon that spawns the child is reached: the trace is this run's now.
+    trace.arm();
     let env_obj: serde_json::Map<String, serde_json::Value> = plan
         .env
         .iter()
@@ -1485,6 +1486,80 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             format!("{line}\n{line}\n")
         );
+    }
+
+    /// A busy daemon of another build that takes over before the connection
+    /// that spawns the child refuses the run, and the trace is left as it was.
+    #[tokio::test]
+    async fn a_takeover_before_the_spawn_connection_keeps_the_trace() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("d.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        // Connections 0 and 1 are this build (asked twice); every later one is
+        // another build holding a session.
+        tokio::spawn(async move {
+            for n in 0.. {
+                let Ok((mut conn, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    loop {
+                        let mut len = [0u8; 4];
+                        if conn.read_exact(&mut len).await.is_err() {
+                            return;
+                        }
+                        let mut req = vec![0u8; u32::from_be_bytes(len) as usize];
+                        if conn.read_exact(&mut req).await.is_err() {
+                            return;
+                        }
+                        let req: serde_json::Value = serde_json::from_slice(&req).unwrap();
+                        let sha = if n < 2 { shux_rpc::GIT_SHA } else { "0ther00" };
+                        let result = match req["method"].as_str().unwrap() {
+                            "system.version" => serde_json::json!({
+                                "version": env!("CARGO_PKG_VERSION"), "git_sha": sha,
+                            }),
+                            "events.watch" => serde_json::json!({ "next_seq": 0 }),
+                            _ => serde_json::json!({ "retired": false, "sessions": 1 }),
+                        };
+                        let resp = serde_json::to_vec(&serde_json::json!({
+                            "jsonrpc": "2.0", "id": req["id"], "result": result,
+                        }))
+                        .unwrap();
+                        let framed = [&(resp.len() as u32).to_be_bytes()[..], &resp].concat();
+                        if conn.write_all(&framed).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let scn = scenario::parse("name = \"t\"\ncommand = [\"true\"]\n").unwrap();
+        let path = dir.path().join("t.ndjson");
+        std::fs::write(&path, "kept\n").unwrap();
+        let mut trace = Trace::open(Some(TraceTarget::Path(path.clone()))).unwrap();
+        let ran = drive_scenario(
+            &socket,
+            &scn,
+            dir.path(),
+            &["true".to_string()],
+            &dir.path().join("goldens"),
+            &mut trace,
+            0,
+            None,
+        )
+        .await;
+        let refused = ran
+            .as_ref()
+            .err()
+            .and_then(crate::client::DaemonInUse::find);
+        assert!(
+            refused.is_some(),
+            "the run was not refused: {:?}",
+            ran.err()
+        );
+        drop(trace);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "kept\n");
     }
 
     /// Accepts `ok_writes` writes, then fails every write; or fails only on flush.
