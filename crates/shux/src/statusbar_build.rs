@@ -307,14 +307,41 @@ pub fn append_watchers(
         return;
     }
     let Rgb { r, g, b } = theme.status_accent;
-    bar.right.insert(
-        0,
-        StatusSegment::styled(
-            format!("◉ {attached} attached "),
-            Color::Rgb { r, g, b },
-            true,
-        ),
+    let segment = StatusSegment::styled(
+        format!("◉ {attached} attached "),
+        Color::Rgb { r, g, b },
+        true,
     );
+    insert_at_head(bar, segment, cols, has_notice);
+}
+
+/// What this client sees of the panes' sizing, ahead of everything on the
+/// right: the focused pane's size label when no border shows it, and the
+/// client's role when it does not drive. Ranks as [`append_watchers`] does.
+pub fn append_viewing(
+    bar: &mut StatusBar,
+    label: Option<&str>,
+    role: Option<&str>,
+    theme: &Theme,
+    cols: u16,
+    has_notice: bool,
+) {
+    let parts: Vec<&str> = label.into_iter().chain(role).collect();
+    if parts.is_empty() {
+        return;
+    }
+    let Rgb { r, g, b } = theme.status_attention;
+    let segment = StatusSegment::styled(
+        format!("{} ", parts.join(" · ")),
+        Color::Rgb { r, g, b },
+        false,
+    );
+    insert_at_head(bar, segment, cols, has_notice);
+}
+
+/// Put `segment` first on the right, and make the bar fit around it.
+fn insert_at_head(bar: &mut StatusBar, segment: StatusSegment, cols: u16, has_notice: bool) {
+    bar.right.insert(0, segment);
     let width = StatusBar::segments_width;
     let gaps = |bar: &StatusBar| {
         usize::from(width(&bar.left) > 0)

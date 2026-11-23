@@ -10,6 +10,9 @@ use unicode_width::UnicodeWidthChar;
 pub struct PaneChrome {
     pub title: String,
     pub badge: Option<StatusBadge>,
+    /// The pane's size label ([`crate::viewport::size_label`]): drawn whole
+    /// after the title, which is cut first to make room, or not at all.
+    pub label: Option<String>,
 }
 
 impl PaneChrome {
@@ -17,6 +20,7 @@ impl PaneChrome {
         Self {
             title: title.into(),
             badge: None,
+            label: None,
         }
     }
 }
@@ -72,11 +76,16 @@ pub fn title_overlay(
         body.push((badge.glyph.to_string(), w as u8, Some(badge.color)));
         used = w;
     }
+    let label = chrome.label.as_deref().map(text_cells).unwrap_or_default();
+    let label_w: usize = label.iter().map(|(_, w)| usize::from(*w)).sum();
+    let label_fits = !label.is_empty() && used + usize::from(used > 0) + label_w <= avail;
+    // The label's cells and the space before it come out of the title's room.
+    let reserved = if label_fits { label_w + 1 } else { 0 };
     let separator = usize::from(chrome.badge.is_some());
     let mut title = Vec::new();
     let mut title_used = 0usize;
     for (text, w) in text_cells(&chrome.title) {
-        if used + separator + title_used + usize::from(w) > avail {
+        if used + separator + title_used + usize::from(w) + reserved > avail {
             break;
         }
         title_used += usize::from(w);
@@ -87,6 +96,12 @@ pub fn title_overlay(
             body.push((" ".to_string(), 1, None));
         }
         body.extend(title);
+    }
+    if label_fits {
+        if !body.is_empty() {
+            body.push((" ".to_string(), 1, None));
+        }
+        body.extend(label.into_iter().map(|(text, w)| (text, w, None)));
     }
     if body.is_empty() {
         return Vec::new();
@@ -172,6 +187,7 @@ mod tests {
         let chrome = PaneChrome {
             title: "build".into(),
             badge: Some(BLOCKED),
+            label: None,
         };
         let glyphs = title_overlay(&chrome, viewport(40), &[]);
         assert_eq!(text(&glyphs), " ◆ build ");
@@ -185,6 +201,7 @@ mod tests {
         let chrome = PaneChrome {
             title: String::new(),
             badge: Some(BLOCKED),
+            label: None,
         };
         assert_eq!(text(&title_overlay(&chrome, viewport(40), &[])), " ◆ ");
     }
@@ -194,6 +211,7 @@ mod tests {
         let chrome = PaneChrome {
             title: "build".into(),
             badge: Some(BLOCKED),
+            label: None,
         };
         // Six columns leave two: the badge, and no room for space + title.
         assert_eq!(text(&title_overlay(&chrome, viewport(6), &[])), " ◆ ");
@@ -206,6 +224,7 @@ mod tests {
         let chrome = PaneChrome {
             title: "日".repeat(64),
             badge: Some(BLOCKED),
+            label: None,
         };
         let glyphs = title_overlay(&chrome, viewport(200), &[]);
         assert_eq!(glyphs.iter().filter(|g| g.text == "日").count(), 64);
@@ -221,6 +240,7 @@ mod tests {
         let chrome = PaneChrome {
             title: "build".into(),
             badge: Some(BLOCKED),
+            label: None,
         };
         let flat = Rect {
             height: 0,
@@ -270,5 +290,31 @@ mod tests {
     fn nothing_is_drawn_without_a_title_or_badge() {
         assert!(title_overlay(&PaneChrome::default(), viewport(40), &[]).is_empty());
         assert!(title_overlay(&PaneChrome::titled("x"), viewport(5), &[]).is_empty());
+    }
+
+    /// The size label is drawn whole in the border colour after the title; the
+    /// title gives up its cells first, and a label with no room is dropped.
+    #[test]
+    fn the_size_label_is_drawn_whole_and_the_title_is_cut_first() {
+        let chrome = PaneChrome {
+            title: "building".into(),
+            badge: Some(BLOCKED),
+            label: Some("⤡ 118×37".into()),
+        };
+        let shown = |width| text(&title_overlay(&chrome, viewport(width), &[]));
+        assert_eq!(shown(40), " ◆ building ⤡ 118×37 ");
+        assert_eq!(shown(19), " ◆ buil ⤡ 118×37 ");
+        assert_eq!(shown(14), " ◆ ⤡ 118×37 ", "no room for a title cell");
+        assert_eq!(shown(13), " ◆ buildin ", "no room for the label");
+        let glyphs = title_overlay(&chrome, viewport(40), &[]);
+        assert!(glyphs[3..].iter().all(|g| g.color.is_none()));
+        let alone = PaneChrome {
+            label: Some("pinned 200×50".into()),
+            ..PaneChrome::default()
+        };
+        assert_eq!(
+            text(&title_overlay(&alone, viewport(40), &[])),
+            " pinned 200×50 "
+        );
     }
 }

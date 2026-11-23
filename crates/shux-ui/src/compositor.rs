@@ -19,7 +19,7 @@ use crate::borders::{BorderColors, BorderStyle, compute_borders};
 use crate::buffer::{FrameBuffer, RenderAttrs, RenderCell};
 use crate::render::RenderBackend;
 use crate::statusbar::StatusBar;
-use crate::viewport::PaneView;
+use crate::viewport::{FrameGeometry, FrameInputs, PaneViewport};
 
 /// Whether the 1-cell outline ring is actually drawn for `content`.
 ///
@@ -117,6 +117,9 @@ pub struct MultiPaneFrame<'a> {
     /// Optional status bar (renders into the rows reserved by
     /// `CompositorConfig::status_bar_height`).
     pub status_bar: Option<&'a StatusBar>,
+    /// This frame's geometry, prepared by the caller for these `vts` at this
+    /// compositor's size; `None` prepares it here, now.
+    pub geometry: Option<&'a FrameGeometry>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,7 +163,7 @@ pub struct RenderCompositor<W: Write> {
     cursor_hidden: bool,
     images: crate::kitty_emit::KittyEmitter,
     /// What each pane showed in the last `render_multi_pane` frame.
-    pane_views: HashMap<PaneId, PaneView>,
+    pane_views: HashMap<PaneId, PaneViewport>,
 }
 
 impl<W: Write> RenderCompositor<W> {
@@ -434,12 +437,7 @@ impl<W: Write> RenderCompositor<W> {
     /// Live-swap the border colors. Mirrors `set_border_style` for the
     /// theme engine (`[theme] border_focused / border_unfocused`).
     pub fn set_border_colors(&mut self, colors: BorderColors) {
-        // BorderColors is Copy + uses crossterm's Color (PartialEq).
-        if (
-            self.config.border_colors.focused,
-            self.config.border_colors.unfocused,
-        ) != (colors.focused, colors.unfocused)
-        {
+        if self.config.border_colors != colors {
             self.config.border_colors = colors;
             self.force_full_redraw = true;
         }
@@ -458,15 +456,6 @@ impl<W: Write> RenderCompositor<W> {
         self.backend.inner_mut()
     }
 
-    /// Compute the content rect (everything above the status bar).
-    fn content_rect(&self) -> Rect {
-        let h = self
-            .buffer
-            .height()
-            .saturating_sub(self.config.status_bar_height);
-        Rect::new(0, 0, self.buffer.width(), h)
-    }
-
     /// Render a full multi-pane frame. Replaces the single-pane path of
     /// `render_frame` for any window with more than one pane (or one pane
     /// inside a layout). Honors zoom state and the configured border style.
@@ -474,37 +463,37 @@ impl<W: Write> RenderCompositor<W> {
         let frame_start = Instant::now();
         let compose_start = Instant::now();
 
-        let content = self.content_rect();
-        self.buffer.clear_current();
-
-        let zoomed = frame.zoom.is_some();
-        let borders_on = borders_visible(content, self.config.border_style, zoomed);
-        let pane_viewport = pane_viewport(content, self.config.border_style, zoomed);
-
-        // 1. Compute pane rects.
-        // When zoomed: only the zoomed pane is shown filling the content
-        // area; we deliberately bypass borders so the pane really fills the
-        // window (matches tmux behavior).
-        let pane_rects: Vec<(PaneId, Rect)> = if let Some(zoom) = frame.zoom {
-            vec![(zoom.zoomed_pane, content)]
-        } else {
-            frame.layout.compute_rects(pane_viewport)
+        let prepared;
+        let geometry = match frame.geometry {
+            Some(geometry) => geometry,
+            None => {
+                prepared = crate::viewport::prepare_frame(&FrameInputs {
+                    layout: frame.layout,
+                    zoom: frame.zoom,
+                    cols: self.buffer.width(),
+                    rows: self.buffer.height(),
+                    status_bar_height: self.config.status_bar_height,
+                    border_style: self.config.border_style,
+                    panes: &crate::viewport::presented_panes(frame.vts),
+                    now_ns: shux_vt::monotonic_now_ns(),
+                });
+                &prepared
+            }
         };
+        let content = geometry.content;
+        self.buffer.clear_current();
+        let borders_on = geometry.borders_on;
+        let pane_rects = &geometry.rects;
 
-        // 2. Render each pane's VT cells into the framebuffer.
+        // Each pane's cells, through the viewport the frame prepared for it.
         let mut placements = Vec::new();
         self.pane_views.clear();
-        for (pid, rect) in &pane_rects {
-            if let Some(vt) = frame.vts.get(pid) {
-                let view = PaneView::of(*rect, vt);
-                self.pane_views.insert(*pid, view);
-                self.compose_pane(view, vt);
+        for (pid, rect) in pane_rects {
+            if let (Some(vt), Some(view)) = (frame.vts.get(pid), geometry.views.get(pid)) {
+                self.pane_views.insert(*pid, *view);
+                self.compose_pane(*view, vt);
                 if self.images.enabled() {
-                    placements.extend(crate::composed::resolve_placements(
-                        *rect,
-                        vt.grid(),
-                        view.row_offset,
-                    ));
+                    placements.extend(crate::composed::resolve_placements(view, vt.grid()));
                 }
             } else {
                 // Missing VT: render an "(no output)" placeholder so the
@@ -519,12 +508,8 @@ impl<W: Write> RenderCompositor<W> {
         // while still drawing inter-pane separators in the gaps reserved
         // by `compute_rects`.
         if borders_on {
-            let segments = compute_borders(
-                &pane_rects,
-                frame.focused,
-                content,
-                self.config.border_style,
-            );
+            let segments =
+                compute_borders(pane_rects, frame.focused, content, self.config.border_style);
             for seg in &segments {
                 let cell = RenderCell {
                     ch: seg.ch,
@@ -543,7 +528,7 @@ impl<W: Write> RenderCompositor<W> {
 
             // Pane titles and status badges, on each pane's top border row.
             if let Some(chrome) = frame.chrome {
-                for (pid, rect) in &pane_rects {
+                for (pid, rect) in pane_rects {
                     let Some(pane_chrome) = chrome.get(pid) else {
                         continue;
                     };
@@ -631,51 +616,22 @@ impl<W: Write> RenderCompositor<W> {
 
         let render_start = Instant::now();
 
-        // Position the cursor inside the focused pane.
-        // Cursor at the *exact* right edge (col == width) is valid —
-        // that's a "wrap pending" terminal state. Use ≤ on the upper
-        // bound so we don't hide it.
-        let target_cursor =
-            if let Some((_, rect)) = pane_rects.iter().find(|(id, _)| *id == frame.focused) {
-                if let Some(vt) = frame.vts.get(&frame.focused) {
-                    let cur = vt.cursor();
-                    let defaults = vt.default_colors();
-                    // Same cursor-following viewport the pane content used, so
-                    // the cursor lands on the row that actually shows it (#108).
-                    let row_offset = crate::viewport::pane_view_row_offset(
-                        vt.grid().rows(),
-                        rect.height as usize,
-                        cur.row,
-                    );
-                    let vy = (cur.row.saturating_sub(row_offset) as u16)
-                        .min(rect.height.saturating_sub(1));
-                    let sx = rect
-                        .x
-                        .saturating_add((cur.col as u16).min(rect.width.saturating_sub(1)));
-                    let sy = rect.y.saturating_add(vy);
-                    if cur.visible
-                        && sx < rect.x.saturating_add(rect.width)
-                        && sy < rect.y.saturating_add(rect.height)
-                        && sx < self.buffer.width()
-                        && sy < self.buffer.height()
-                    {
-                        Some(CursorTarget {
-                            x: sx,
-                            y: sy,
-                            visual: CursorVisual {
-                                shape: cur.shape,
-                                color: defaults.cursor,
-                            },
-                        })
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
+        // The focused pane's cursor, where its viewport drew its cell.
+        let target_cursor = frame
+            .vts
+            .get(&frame.focused)
+            .zip(geometry.views.get(&frame.focused))
+            .and_then(|(vt, view)| {
+                let (x, y) = view.cursor_cell(vt.cursor())?;
+                (x < self.buffer.width() && y < self.buffer.height()).then(|| CursorTarget {
+                    x,
+                    y,
+                    visual: CursorVisual {
+                        shape: vt.cursor().shape,
+                        color: vt.default_colors().cursor,
+                    },
+                })
+            });
         let target_cursor = target_cursor.filter(|_| !self.cursor_hidden);
         self.render_dirty_and_cursor(&dirty, target_cursor)?;
         // Pictures go out AFTER the cells: a terminal that treats an image as a
@@ -709,29 +665,25 @@ impl<W: Write> RenderCompositor<W> {
     }
 
     /// Compose a single pane's VT grid into the framebuffer through `view`.
-    fn compose_pane(&mut self, view: PaneView, vt: &shux_vt::VirtualTerminal) {
+    fn compose_pane(&mut self, view: PaneViewport, vt: &shux_vt::VirtualTerminal) {
         let rect = view.rect;
         let grid = vt.grid();
         let defaults = vt.default_colors();
-        let total_rows = grid.rows();
-        let total_cols = grid.cols();
-        let visible_rows = rect.height as usize;
-        let visible_cols = rect.width as usize;
-
-        let row_offset = view.row_offset;
-
-        for r in 0..visible_rows {
-            let grid_row = row_offset + r;
-            if grid_row >= total_rows {
-                continue;
-            }
-            let row = grid.visible_row(grid_row);
-            for c in 0..visible_cols {
-                if c >= total_cols {
-                    break;
-                }
-                let cell = &row[c];
-                let rcell = RenderCell::from_vt_cell_with_defaults(cell, defaults);
+        let (shown_rows, shown_cols) = (view.shown_rows(), view.shown_cols());
+        let surplus = RenderCell {
+            bg: Some(self.config.border_colors.surplus),
+            ..RenderCell::default()
+        };
+        for r in 0..usize::from(rect.height) {
+            let row = (r < shown_rows).then(|| grid.visible_row(view.row_offset + r));
+            for c in 0..usize::from(rect.width) {
+                let rcell = match row {
+                    Some(row) if c < shown_cols => RenderCell::from_vt_cell_with_defaults(
+                        &view.shown_cell(row, view.col_offset + c),
+                        defaults,
+                    ),
+                    _ => surplus.clone(),
+                };
                 self.buffer
                     .set_cell(rect.x + c as u16, rect.y + r as u16, rcell);
             }
@@ -771,7 +723,7 @@ impl<W: Write> RenderCompositor<W> {
 
     /// What each pane showed in the last `render_multi_pane` frame, so input
     /// can name the cell the client sees rather than one drawn since.
-    pub fn pane_views(&self) -> &HashMap<PaneId, PaneView> {
+    pub fn pane_views(&self) -> &HashMap<PaneId, PaneViewport> {
         &self.pane_views
     }
 
@@ -1135,6 +1087,7 @@ mod tests {
             vts: &vts,
             chrome: None,
             status_bar: None,
+            geometry: None,
         };
         let mut compositor = RenderCompositor::new(10, 3, Vec::new(), CompositorConfig::default());
 
@@ -1172,6 +1125,7 @@ mod tests {
             vts: &vts,
             chrome: None,
             status_bar: None,
+            geometry: None,
         };
         let mut compositor = RenderCompositor::new(
             12,
@@ -1220,6 +1174,7 @@ mod tests {
             vts: &vts,
             chrome: None,
             status_bar: None,
+            geometry: None,
         };
         let mut compositor = RenderCompositor::new(10, 3, Vec::new(), CompositorConfig::default());
 
@@ -1276,6 +1231,7 @@ mod tests {
             vts: &vts,
             chrome: None,
             status_bar: None,
+            geometry: None,
         };
         // No border / status bar so the pane rect is the whole 200x36 buffer:
         // isolates compose_pane's vertical clipping.

@@ -2,7 +2,7 @@
 //! and the window/session snapshots cannot disagree about a pane's title or
 //! status badge.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use shux_core::config::ProgramStatusConfig;
 use shux_core::graph::SessionGraphSnapshot;
@@ -48,10 +48,35 @@ pub fn pane_chrome(
             let chrome = PaneChrome {
                 title: pane.title.clone(),
                 badge: badge(pane, status, nerd_fonts, theme),
+                label: None,
             };
             Some((pid, chrome))
         })
         .collect()
+}
+
+/// Label every pane whose grid is not its rect's size, on its border. A frame
+/// with no borders has nowhere to put them: the focused pane's label is
+/// returned for the status bar instead.
+pub fn size_labels(
+    chrome: &mut HashMap<PaneId, PaneChrome>,
+    geometry: &shux_ui::FrameGeometry,
+    pinned: &HashSet<PaneId>,
+    focused: PaneId,
+) -> Option<String> {
+    let label = |pid: &PaneId| {
+        let view = geometry.views.get(pid)?;
+        shux_ui::viewport::size_label(view, pinned.contains(pid))
+    };
+    if !geometry.borders_on {
+        return label(&focused);
+    }
+    for (pid, _) in &geometry.rects {
+        if let Some(text) = label(pid) {
+            chrome.entry(*pid).or_default().label = Some(text);
+        }
+    }
+    None
 }
 
 /// The config is checked as well as the pane: an exited pane keeps its final
@@ -348,6 +373,112 @@ mod tests {
         let img = window_png(&h, window).await;
         let red = img.pixels().filter(|p| p.0 == [255, 0, 0]).count();
         assert!(red > 0, "no border pixel in the theme's #ff0000");
+        h.stop().await;
+    }
+
+    /// A pane whose grid is not its rect's size is labelled on its border,
+    /// `pinned` when a pin holds it; a frame with no borders sends the focused
+    /// pane's label to the status bar instead.
+    #[test]
+    fn size_labels_go_on_the_border_or_to_the_status_bar() {
+        use shux_ui::{FrameInputs, PresentedPane, prepare_frame};
+        let (a, b) = (PaneId::new(), PaneId::new());
+        let layout = shux_core::layout::LayoutNode::split(
+            shux_core::layout::Direction::Vertical,
+            0.5,
+            shux_core::layout::LayoutNode::leaf(a),
+            shux_core::layout::LayoutNode::leaf(b),
+        );
+        let cursor = shux_vt::Cursor::new();
+        let frame = |style, b_size: (usize, usize)| {
+            let panes = HashMap::from([
+                (
+                    a,
+                    PresentedPane {
+                        rows: 50,
+                        cols: 200,
+                        cursor: &cursor,
+                    },
+                ),
+                (
+                    b,
+                    PresentedPane {
+                        rows: b_size.0,
+                        cols: b_size.1,
+                        cursor: &cursor,
+                    },
+                ),
+            ]);
+            prepare_frame(&FrameInputs {
+                layout: &layout,
+                zoom: None,
+                cols: 80,
+                rows: 24,
+                status_bar_height: 1,
+                border_style: style,
+                panes: &panes,
+                now_ns: 0,
+            })
+        };
+        let rounded = shux_ui::BorderStyle::Rounded;
+        let rect = frame(rounded, (1, 1)).views[&b].rect;
+        let fits = (usize::from(rect.height), usize::from(rect.width));
+        let pinned = HashSet::from([a]);
+
+        let mut chrome = HashMap::new();
+        let bar = size_labels(&mut chrome, &frame(rounded, fits), &pinned, a);
+        assert_eq!(bar, None);
+        assert_eq!(chrome[&a].label.as_deref(), Some("pinned 200×50"));
+        assert!(!chrome.contains_key(&b), "a fitting pane has no label");
+
+        let mut chrome = HashMap::new();
+        let bar = size_labels(&mut chrome, &frame(rounded, (9, 9)), &HashSet::new(), b);
+        assert_eq!(bar, None);
+        assert_eq!(chrome[&a].label.as_deref(), Some("⤡ 200×50"));
+        assert_eq!(chrome[&b].label.as_deref(), Some("⤡ 9×9"));
+
+        let mut chrome = HashMap::new();
+        let none = shux_ui::BorderStyle::None;
+        let bar = size_labels(&mut chrome, &frame(none, fits), &pinned, a);
+        assert_eq!(bar.as_deref(), Some("pinned 200×50"));
+        assert!(chrome.is_empty(), "no border to draw a label on");
+    }
+
+    /// A window snapshot defaults to the size its session's driver last sized
+    /// it at, with the live layout, an explicit axis winning; a session never
+    /// sized fits its panes, as before.
+    #[tokio::test]
+    async fn a_window_snapshot_defaults_to_the_last_driver_size() {
+        let h = RpcHarness::new();
+        let (session, window, _) = h.seed_session("driven").await;
+        let dims = |v: &serde_json::Value| (v["cols"].as_u64(), v["rows"].as_u64());
+        let window_shot = |extra: serde_json::Value| {
+            let mut params = serde_json::json!({ "window_id": window.to_string() });
+            params
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            dispatch_ok(&h.router, "window.snapshot", params)
+        };
+        let never = window_shot(serde_json::json!({})).await;
+        assert_ne!(dims(&never), (Some(90), Some(30)));
+
+        let border = h.config.current().appearance.border_style.clone();
+        h.io.lock()
+            .await
+            .layout_basis
+            .insert(session, (90, 30, border));
+        let driven = window_shot(serde_json::json!({})).await;
+        assert_eq!(dims(&driven), (Some(90), Some(30)));
+        let narrow = window_shot(serde_json::json!({ "cols": 60 })).await;
+        assert_eq!(dims(&narrow), (Some(60), Some(30)), "an explicit axis wins");
+        let whole = dispatch_ok(
+            &h.router,
+            "session.snapshot",
+            serde_json::json!({ "session_id": session.to_string() }),
+        )
+        .await;
+        assert_eq!(dims(&whole), (Some(90), Some(30)));
         h.stop().await;
     }
 }

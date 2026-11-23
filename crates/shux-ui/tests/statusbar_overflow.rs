@@ -234,6 +234,7 @@ fn a_crowded_bar_draws_identically_live_and_in_snapshots() {
     let colors = BorderColors {
         focused: Color::Rgb { r: 9, g: 9, b: 9 },
         unfocused: Color::Rgb { r: 8, g: 8, b: 8 },
+        ..BorderColors::default()
     };
     let cases = [
         ("a-very-long-session ", " ▶ #1/1 1 shell", " 12:34:56 "),
@@ -265,6 +266,7 @@ fn a_crowded_bar_draws_identically_live_and_in_snapshots() {
                 vts: &vts,
                 chrome: None,
                 status_bar: Some(&bar),
+                geometry: None,
             })
             .expect("render into a Vec");
             let mut seen = VirtualTerminal::new(3, usize::from(cols));
@@ -278,6 +280,7 @@ fn a_crowded_bar_draws_identically_live_and_in_snapshots() {
                     panes: &panes,
                     chrome: None,
                     status_bar: Some(&bar),
+                    geometry: None,
                 },
                 cols,
                 3,

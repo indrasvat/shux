@@ -360,12 +360,13 @@ pub enum SessionCommand {
         /// Output PNG path. If omitted, base64 is printed to stdout.
         #[arg(short, long)]
         output: Option<std::path::PathBuf>,
-        /// Snapshot grid width in cells (4..=1000). Default: the window's
-        /// current width, so the outline fits its panes.
+        /// Snapshot grid width in cells (4..=1000). Default: the width of the
+        /// client that last sized the session, or the width that fits the
+        /// window's panes when none has.
         #[arg(long)]
         cols: Option<u16>,
-        /// Snapshot grid height in cells (2..=1000). Default: the window's
-        /// current height.
+        /// Snapshot grid height in cells (2..=1000). Default: the height of
+        /// the client that last sized the session, or the window's own.
         #[arg(long)]
         rows: Option<u16>,
     },
@@ -815,12 +816,13 @@ pub enum WindowCommand {
         /// Output PNG path. If omitted, base64 is printed to stdout.
         #[arg(short, long)]
         output: Option<std::path::PathBuf>,
-        /// Snapshot grid width in cells (4..=1000). Default: the window's
-        /// current width, so the outline fits its panes.
+        /// Snapshot grid width in cells (4..=1000). Default: the width of the
+        /// client that last sized the session, or the width that fits the
+        /// window's panes when none has.
         #[arg(long)]
         cols: Option<u16>,
-        /// Snapshot grid height in cells (2..=1000). Default: the window's
-        /// current height.
+        /// Snapshot grid height in cells (2..=1000). Default: the height of
+        /// the client that last sized the session, or the window's own.
         #[arg(long)]
         rows: Option<u16>,
     },

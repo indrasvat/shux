@@ -18,7 +18,11 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 
 use shux_core::layout::Rect;
 use shux_core::theme::{Rgb, Theme};
-use shux_vt::{CellFlags, Color, Row, VirtualTerminal};
+use std::borrow::Cow;
+
+use shux_vt::{Cell, CellFlags, Color, Row, VirtualTerminal};
+
+use crate::viewport::PaneViewport;
 
 /// Per-attach session copy-mode state. `None` means the user is in
 /// normal pane-input mode.
@@ -536,7 +540,7 @@ pub fn view_start(total_lines: usize, pane_rows: u16, scroll_offset: usize) -> u
 ///
 /// Issue #108 made the attach/snapshot frame **cursor-following**: when a pane's
 /// grid is taller than the rect it is drawn into, the frame shows the
-/// `pane_view_row_offset` window rather than the bottom `pane_rows`. Copy mode
+/// cursor-following window rather than the bottom `pane_rows`. Copy mode
 /// maps a screen selection to a grid line off the BOTTOM (`total_lines`), so on
 /// such a pane the row you see and the row you yank diverge. Anchoring copy
 /// mode's coordinate space to this value (instead of `grid.total_lines()`) keeps
@@ -556,7 +560,8 @@ pub fn effective_total_lines(vt: &VirtualTerminal, pane_rows: u16) -> usize {
     if grid_rows <= visible {
         return total; // grid fits — coordinate space is unchanged
     }
-    let row_offset = crate::viewport::pane_view_row_offset(grid_rows, visible, vt.cursor().row);
+    // Modal copy mode keeps this legacy row-only slice, whatever the frame shows.
+    let row_offset = crate::viewport::follow_offset(grid_rows, visible, vt.cursor().row);
     // Scrollback lines + the live viewport's bottom edge. Excludes any grid rows
     // below the live frame (they are past the visible screen), matching what the
     // attach frame shows. `row_offset + visible <= grid_rows`, so this never
@@ -623,6 +628,40 @@ fn row_for_view(
     vt.presented_row(abs)
 }
 
+/// Which grid cell a selection's pane-local cell names.
+#[derive(Clone, Copy)]
+enum Slice<'a> {
+    /// Modal copy mode's own: the cursor-following rows from column 0.
+    Copy {
+        pane_rows: u16,
+        scroll_offset: usize,
+    },
+    /// The slice a frame showed, so a mouse selection reads what it covered.
+    Frame(&'a PaneViewport),
+}
+
+impl Slice<'_> {
+    fn cell<'v>(&self, vt: &'v VirtualTerminal, x: u16, y: u16) -> Option<Cow<'v, Cell>> {
+        match *self {
+            Slice::Copy {
+                pane_rows,
+                scroll_offset,
+            } => row_for_view(vt, pane_rows, scroll_offset, y)?
+                .get(usize::from(x))
+                .map(Cow::Borrowed),
+            Slice::Frame(view) => {
+                let (x, y) = (usize::from(x), usize::from(y));
+                (y < view.shown_rows() && x < view.shown_cols()).then(|| {
+                    view.shown_cell(
+                        vt.grid().visible_row(view.row_offset + y),
+                        view.col_offset + x,
+                    )
+                })
+            }
+        }
+    }
+}
+
 trait BoolExt {
     fn then_updated(self) -> CopyKey;
 }
@@ -648,6 +687,31 @@ pub fn extract_selection(
     state: &CopyModeState,
     pane_cols: u16,
     pane_rows: u16,
+) -> String {
+    let slice = Slice::Copy {
+        pane_rows,
+        scroll_offset: state.scroll_offset,
+    };
+    extract_from(vt, state, pane_cols, pane_rows, slice)
+}
+
+/// [`extract_selection`] for a mouse selection made over `view`: the cells
+/// that frame drew, cut glyphs at its edges blank as drawn.
+pub fn extract_frame_selection(
+    vt: &VirtualTerminal,
+    state: &CopyModeState,
+    view: &PaneViewport,
+) -> String {
+    let (cols, rows) = (view.shown_cols() as u16, view.shown_rows() as u16);
+    extract_from(vt, state, cols, rows, Slice::Frame(view))
+}
+
+fn extract_from(
+    vt: &VirtualTerminal,
+    state: &CopyModeState,
+    pane_cols: u16,
+    pane_rows: u16,
+    slice: Slice<'_>,
 ) -> String {
     let cursor = state.cursor;
     let anchor = state.anchor.unwrap_or(cursor);
@@ -688,15 +752,16 @@ pub fn extract_selection(
             (line_start, line_end)
         };
 
-        let Some(row_ref) = row_for_view(vt, pane_rows, state.scroll_offset, row) else {
+        if slice.cell(vt, 0, row).is_none() {
             continue;
-        };
-        let row_len = row_ref.len() as u16;
+        }
         for col in col_lo..=col_hi {
-            if col >= max_col || col >= row_len {
+            if col >= max_col {
                 break;
             }
-            let cell = &row_ref[col as usize];
+            let Some(cell) = slice.cell(vt, col, row) else {
+                break;
+            };
             if cell.is_wide_continuation() {
                 continue;
             }
@@ -837,15 +902,16 @@ pub fn render_copy_overlay_with_vt_into(
 /// Draw only the selected text, without the copy-mode cursor or status hint.
 ///
 /// This is used by the human mouse-selection path: a selected range can remain
-/// visible while normal pane input keeps flowing to the PTY.
+/// visible while normal pane input keeps flowing to the PTY. It reads the
+/// cells `view` showed, as [`extract_frame_selection`] yanks them.
 pub fn render_selection_overlay_with_vt_into(
     buf: &mut Vec<u8>,
-    pane: Rect,
+    view: &PaneViewport,
     vt: &VirtualTerminal,
     state: &CopyModeState,
     theme: &Theme,
 ) {
-    render_selection_overlay_inner(buf, pane, Some(vt), state, theme);
+    render_selection_overlay_inner(buf, view.rect, Some(vt), state, theme, Slice::Frame(view));
 }
 
 /// Variant of [`render_selection_overlay_with_vt_into`] used when the VT has
@@ -856,7 +922,11 @@ pub fn render_selection_overlay_into(
     state: &CopyModeState,
     theme: &Theme,
 ) {
-    render_selection_overlay_inner(buf, pane, None, state, theme);
+    let slice = Slice::Copy {
+        pane_rows: pane.height,
+        scroll_offset: state.scroll_offset,
+    };
+    render_selection_overlay_inner(buf, pane, None, state, theme, slice);
 }
 
 fn render_copy_overlay_inner(
@@ -870,7 +940,11 @@ fn render_copy_overlay_inner(
         return;
     }
 
-    render_selection_overlay_inner(buf, pane, vt, state, theme);
+    let slice = Slice::Copy {
+        pane_rows: pane.height,
+        scroll_offset: state.scroll_offset,
+    };
+    render_selection_overlay_inner(buf, pane, vt, state, theme, slice);
 
     // Status-line hint at the bottom row of the pane: shows current
     // mode and dismiss/yank shortcuts. The text width changes with
@@ -928,6 +1002,7 @@ fn render_selection_overlay_inner(
     vt: Option<&VirtualTerminal>,
     state: &CopyModeState,
     theme: &Theme,
+    slice: Slice<'_>,
 ) {
     if pane.width < 1 || pane.height < 1 {
         return;
@@ -956,7 +1031,7 @@ fn render_selection_overlay_inner(
                 let ctx = SelectionRenderCtx {
                     pane,
                     vt,
-                    state,
+                    slice,
                     theme,
                 };
                 selection_text_run(buf, ctx, col_lo, col_hi, row);
@@ -1037,7 +1112,7 @@ pub fn render_copy_menu_into(
 struct SelectionRenderCtx<'a> {
     pane: Rect,
     vt: &'a VirtualTerminal,
-    state: &'a CopyModeState,
+    slice: Slice<'a>,
     theme: &'a Theme,
 }
 
@@ -1048,7 +1123,7 @@ fn selection_text_run(
     col_hi: u16,
     row: u16,
 ) {
-    let Some(row_ref) = row_for_view(ctx.vt, ctx.pane.height, ctx.state.scroll_offset, row) else {
+    if ctx.slice.cell(ctx.vt, 0, row).is_none() {
         highlight_run(
             buf,
             ctx.pane,
@@ -1059,13 +1134,14 @@ fn selection_text_run(
             ctx.theme.status_accent,
         );
         return;
-    };
+    }
     let col_hi = col_hi.min(ctx.pane.width.saturating_sub(1));
     for col in col_lo..=col_hi {
-        let text = row_ref
-            .get(col as usize)
+        let text = ctx
+            .slice
+            .cell(ctx.vt, col, row)
             .filter(|cell| !cell.is_wide_continuation())
-            .map(shown_text)
+            .map(|cell| shown_text(&cell))
             .unwrap_or_else(|| " ".to_string());
         let _ = write!(
             buf,
@@ -1663,7 +1739,8 @@ mod tests {
             ..Default::default()
         };
         let mut buf = Vec::new();
-        render_selection_overlay_with_vt_into(&mut buf, pane, &vt, &state, &Theme::DEFAULT);
+        let view = PaneViewport::of(pane, &vt, 0);
+        render_selection_overlay_with_vt_into(&mut buf, &view, &vt, &state, &Theme::DEFAULT);
         let rendered = String::from_utf8_lossy(&buf);
         let plain = strip_ansi(&rendered);
         assert!(plain.contains("abc"));
@@ -1758,5 +1835,38 @@ mod tests {
             vt2.process(b"line\r\n");
         }
         assert_eq!(effective_total_lines(&vt2, 24), vt2.grid().total_lines());
+    }
+    /// A mouse selection over a slice cropped on both axes highlights and
+    /// yanks the same cells: those the frame drew, a glyph cut by the left
+    /// edge blank in both.
+    #[test]
+    fn a_frame_selection_highlights_and_yanks_the_slice_it_was_made_over() {
+        let mut vt = VirtualTerminal::new(8, 30);
+        for r in 0..8 {
+            vt.process(format!("\x1b[{};1H{r}abcdefghi界jklmnopqrstuvw", r + 1).as_bytes());
+        }
+        // Rows 3..=5 and columns 11..=16 shown in a 6x3 rect at (2, 1): column
+        // 11 is the right half of 界.
+        let view = PaneViewport {
+            rect: Rect::new(2, 1, 6, 3),
+            grid_rows: 8,
+            grid_cols: 30,
+            row_offset: 3,
+            col_offset: 11,
+        };
+        let state = CopyModeState {
+            anchor: Some((0, 0)),
+            cursor: (3, 1),
+            ..Default::default()
+        };
+        assert_eq!(extract_frame_selection(&vt, &state, &view), " jklmn\n jkl");
+        let mut buf = Vec::new();
+        render_selection_overlay_with_vt_into(&mut buf, &view, &vt, &state, &Theme::DEFAULT);
+        let mut screen = VirtualTerminal::new(5, 10);
+        screen.process(&buf);
+        let line =
+            |y: usize| -> String { (2..8).map(|x| screen.grid().visible_row(y)[x].ch).collect() };
+        assert_eq!(line(1), " jklmn");
+        assert_eq!(&line(2)[..4], " jkl");
     }
 }

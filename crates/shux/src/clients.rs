@@ -30,6 +30,34 @@ pub struct ClientInfo {
     pub last_input: Option<Instant>,
 }
 
+/// A client's part in sizing its session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Driving,
+    /// Votes, but another client drives: its own input would take over.
+    Viewing,
+    ReadOnly,
+}
+
+impl Role {
+    /// The status bar's words for it; a driver needs none.
+    pub fn status(self) -> Option<&'static str> {
+        match self {
+            Role::Driving => None,
+            Role::Viewing => Some("viewing · type to drive"),
+            Role::ReadOnly => Some("read-only"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionView {
+    pub attached: usize,
+    /// `None` for a frame no attached client asked for.
+    pub role: Option<Role>,
+    pub pinned: std::collections::HashSet<PaneId>,
+}
+
 struct Entry {
     info: ClientInfo,
     end: CancellationToken,
@@ -233,6 +261,57 @@ impl ClientRegistry {
         info
     }
 
+    /// What a frame for `client` (none for a snapshot) shows about `session`,
+    /// read under one lock: who is attached, the client's role, and which of
+    /// `panes` are pinned. Decides nothing: the driver is the one
+    /// [`ClientRegistry::driver`] would elect now.
+    pub fn session_view(
+        &self,
+        session: SessionId,
+        client: Option<ClientId>,
+        panes: &[PaneId],
+    ) -> SessionView {
+        let s = self.state();
+        let mut voters: Vec<&Entry> = s
+            .clients
+            .values()
+            .filter(|e| e.info.session_id == session && e.info.votes)
+            .collect();
+        voters.sort_by_key(|e| e.seq);
+        let infos: Vec<&ClientInfo> = voters.iter().map(|e| &e.info).collect();
+        let driver = elect(s.drivers.get(&session).copied(), &infos);
+        let role = client.and_then(|id| s.clients.get(&id)).map(|e| {
+            if !e.info.votes {
+                Role::ReadOnly
+            } else if driver == Some(e.info.id) {
+                Role::Driving
+            } else {
+                Role::Viewing
+            }
+        });
+        SessionView {
+            attached: s
+                .clients
+                .values()
+                .filter(|e| e.info.session_id == session)
+                .count(),
+            role,
+            pinned: panes
+                .iter()
+                .copied()
+                .filter(|p| s.pins.contains_key(p))
+                .collect(),
+        }
+    }
+
+    /// Whether any attached client may size `session` now.
+    pub fn has_voter(&self, session: SessionId) -> bool {
+        self.state()
+            .clients
+            .values()
+            .any(|e| e.info.session_id == session && e.info.votes)
+    }
+
     pub fn is_pinned(&self, pane: PaneId) -> bool {
         self.state().pins.contains_key(&pane)
     }
@@ -412,6 +491,39 @@ mod tests {
         );
         assert!(!reg.remove(a.id), "a gone client can still be removed");
         assert_eq!(reg.count_for(SessionId::new()), 0);
+    }
+
+    /// A frame's view of its session, without electing anyone: before anybody
+    /// types the first voter drives and a later one views, input hands the
+    /// role over, a read-only client is read-only, and a snapshot has none.
+    #[tokio::test(start_paused = true)]
+    async fn the_session_view_names_each_clients_role_and_the_pins() {
+        let reg = ClientRegistry::default();
+        let s = SessionId::new();
+        let (a, b) = (info(s), info(s));
+        let watcher = ClientInfo {
+            votes: false,
+            ..info(s)
+        };
+        let _ga = reg.register(a.clone(), CancellationToken::new());
+        let _gb = reg.register(b.clone(), CancellationToken::new());
+        let _gw = reg.register(watcher.clone(), CancellationToken::new());
+        let (pinned, free) = (PaneId::new(), PaneId::new());
+        reg.pin(pinned);
+        let role = |id| reg.session_view(s, Some(id), &[pinned, free]).role;
+        assert_eq!(role(a.id), Some(Role::Driving), "the first voter, untyped");
+        assert_eq!(role(b.id), Some(Role::Viewing));
+        assert_eq!(role(watcher.id), Some(Role::ReadOnly));
+        assert!(reg.mark_input(b.id, Instant::now()));
+        assert_eq!(role(b.id), Some(Role::Driving));
+        assert_eq!(role(a.id), Some(Role::Viewing));
+        let view = reg.session_view(s, None, &[pinned, free]);
+        assert_eq!(view.role, None);
+        assert_eq!(view.attached, 3);
+        assert_eq!(view.pinned, [pinned].into_iter().collect());
+        assert_eq!(Role::Viewing.status(), Some("viewing · type to drive"));
+        assert_eq!(Role::Driving.status(), None);
+        assert!(reg.has_voter(s) && !reg.has_voter(SessionId::new()));
     }
 
     #[tokio::test(start_paused = true)]

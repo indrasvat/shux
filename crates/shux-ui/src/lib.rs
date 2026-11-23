@@ -30,7 +30,7 @@ pub use borders::{BorderChars, BorderColors, BorderSegment, BorderStyle, compute
 pub use buffer::{DirtyCell, FrameBuffer, RenderAttrs, RenderCell};
 pub use chrome::{PaneChrome, StatusBadge, TitleGlyph, text_cells, title_overlay};
 pub use client::{ClientConfig, ExitReason};
-pub use composed::{ComposeInputs, ComposedFrame, compose};
+pub use composed::{ComposeInputs, ComposedFrame, compose, presented_grids};
 pub use compositor::{
     CompositorConfig, MultiPaneFrame, RenderCompositor, RenderStats, pane_viewport,
 };
@@ -46,4 +46,7 @@ pub use keys::{KeyPress, KeyValue, Modifiers, NamedKey};
 pub use render::RenderBackend;
 pub use statusbar::{StatusBar, StatusSegment};
 pub use terminal::TerminalGuard;
-pub use viewport::pane_view_row_offset;
+pub use viewport::{
+    FrameGeometry, FrameInputs, PaneViewport, PresentedPane, follow_offset, prepare_frame,
+    presented_panes,
+};
