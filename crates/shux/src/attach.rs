@@ -1076,7 +1076,14 @@ async fn run_attach_loop(
     loop {
         tokio::select! {
             _ = conn.cancelled() => {
-                end_reason = if cancel.is_cancelled() { "daemon_stopped" } else { "connection_lost" };
+                // The writer ends `conn` after sending a removal notice too.
+                end_reason = if removed.is_cancelled() {
+                    "removed"
+                } else if cancel.is_cancelled() {
+                    "daemon_stopped"
+                } else {
+                    "connection_lost"
+                };
                 break;
             }
             _ = removed.cancelled() => {
@@ -10133,6 +10140,9 @@ mod tests {
     async fn a_client_removed_while_its_copy_waits_gets_no_backlog() {
         let fixture = attach_fixture().await;
         let _io = seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+        let bus = shux_core::bus::EventBus::new();
+        let mut events = bus.subscribe_filtered(vec!["client.disconnected".into()]);
+        fixture.io_state.lock().await.event_bus = Some(bus);
         let (server_stream, client_stream) = tokio::io::duplex(1024);
         let server = tokio::spawn(handle_attach_connection(
             server_stream,
@@ -10222,6 +10232,14 @@ mod tests {
             "a removed client was sent {screens} queued screens"
         );
         let _ = shux_testkit::Deadline::start().run(server).await;
+        let reason = match events.try_recv() {
+            Some(shux_core::bus::SubscriptionEvent::Event(e)) => match e.data {
+                shux_core::event::EventData::ClientDisconnected { reason, .. } => reason,
+                other => panic!("unexpected event {other:?}"),
+            },
+            other => panic!("no client.disconnected: {other:?}"),
+        };
+        assert_eq!(reason, "removed", "a removal was published as {reason:?}");
         fixture.stop();
     }
 
