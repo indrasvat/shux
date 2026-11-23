@@ -1866,6 +1866,21 @@ pub(crate) fn register_pane_io_methods(
                 async move {
                     let params = params.unwrap_or_default();
                     let pane_id = resolve_pane_id_from_params(&gh, &params)?;
+                    let clients = io.lock().await.clients.clone();
+                    // `unpin`: back to the layout's size, from the next reconcile.
+                    if params.get("unpin").and_then(|v| v.as_bool()) == Some(true) {
+                        if params.get("cols").is_some() || params.get("rows").is_some() {
+                            return Err(shux_rpc::RpcError::invalid_params(
+                                "'unpin' takes no 'cols' or 'rows'",
+                            ));
+                        }
+                        let was = clients.unpin(pane_id);
+                        return Ok(serde_json::json!({
+                            "pane_id": pane_id.to_string(),
+                            "pinned": false,
+                            "was_pinned": was,
+                        }));
+                    }
                     // Validate in u64-space BEFORE narrowing — `as u16` silently
                     // wraps `cols=66536` to 1000 and lets it through (codex
                     // review). Sanity bounds: 4..=1000 cols, 2..=1000 rows.
@@ -1900,18 +1915,32 @@ pub(crate) fn register_pane_io_methods(
                     let resizer = resizer.ok_or_else(|| {
                         shux_rpc::RpcError::not_found("pane resizer", &pane_id.to_string())
                     })?;
-                    resizer
+                    // Pinned before the resize lands, so no client's size can
+                    // slip in between; taken back if the resize fails.
+                    let was_pinned = clients.is_pinned(pane_id);
+                    clients.pin(pane_id);
+                    let sent = resizer
                         .send(ResizeRequest {
                             size: pty_size,
                             ack: Some(ack_tx),
                         })
                         .await
-                        .map_err(|_| shux_rpc::RpcError::internal("pane resize channel closed"))?;
-                    resize_acked(ack_rx).await?;
+                        .map_err(|_| shux_rpc::RpcError::internal("pane resize channel closed"));
+                    let acked = match sent {
+                        Ok(()) => resize_acked(ack_rx).await,
+                        Err(e) => Err(e),
+                    };
+                    if let Err(e) = acked {
+                        if !was_pinned {
+                            clients.unpin(pane_id);
+                        }
+                        return Err(e);
+                    }
                     Ok(serde_json::json!({
                         "pane_id": pane_id.to_string(),
                         "rows": rows,
                         "cols": cols,
+                        "pinned": true,
                     }))
                 }
             },

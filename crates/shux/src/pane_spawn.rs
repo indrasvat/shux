@@ -1256,6 +1256,8 @@ async fn spawn_pane_pty_unshared(
             }
         }
         state.resizers.insert(pane_id, resize_tx);
+        // Now resizable: a pane created from the CLI takes its rect.
+        state.clients.touch();
         state.pty_done.insert(pane_id, done_rx);
         let replaced = state.vts.insert(pane_id, vt).is_some();
         state.status_sealed.remove(&pane_id);

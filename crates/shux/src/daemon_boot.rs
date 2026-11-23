@@ -683,6 +683,15 @@ pub(crate) async fn run_rpc_server(
         }
     });
 
+    // Panes follow the driver of their session, whatever changed: a client,
+    // a pin, a new pane, or a layout change made over RPC.
+    tokio::spawn(attach::run_size_reconciler(
+        graph_handle.clone(),
+        io_state.clone(),
+        config_handle.clone(),
+        cancel.clone(),
+    ));
+
     // Spawn timeout checker (1s interval)
     let timeout_io = io_state.clone();
     let timeout_cancel = cancel.clone();

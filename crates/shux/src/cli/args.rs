@@ -1640,7 +1640,8 @@ pub enum PaneCommand {
         no_row_text: bool,
     },
 
-    /// Resize a pane's PTY + VT grid to absolute (cols, rows).
+    /// Resize a pane's PTY + VT grid to absolute (cols, rows) and pin it
+    /// there: no attached client's size moves it until `--unpin`.
     /// Mirrors `pane.set_size` RPC. Synchronous — the next snapshot
     /// sees the new dims. Use this BEFORE driving keystrokes when
     /// you need the pane wider/taller than the daemon default.
@@ -1657,11 +1658,14 @@ pub enum PaneCommand {
         #[arg(short, long)]
         pane: Option<String>,
         /// New width in cells (4..=1000).
-        #[arg(long)]
-        cols: u16,
+        #[arg(long, required_unless_present = "unpin")]
+        cols: Option<u16>,
         /// New height in cells (2..=1000).
-        #[arg(long)]
-        rows: u16,
+        #[arg(long, required_unless_present = "unpin")]
+        rows: Option<u16>,
+        /// Release a pinned pane: it takes the layout's size again.
+        #[arg(long, conflicts_with_all = ["cols", "rows"])]
+        unpin: bool,
     },
 
     /// Block until a pane's captured text matches (or stops matching)

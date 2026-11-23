@@ -117,6 +117,8 @@ mod tests {
             cols: 100,
             rows: 30,
             attached_at: std::time::SystemTime::now(),
+            votes: true,
+            last_input: None,
         };
         // Two ids sharing a prefix, so a short one is ambiguous.
         let a = uuid::Uuid::parse_str("aaaa1111-0000-4000-8000-000000000000").unwrap();
@@ -218,5 +220,42 @@ mod tests {
         .await;
         assert_eq!(done["detached"], b.to_string());
         assert!(end_b.is_cancelled());
+    }
+
+    /// Issue #190: `pane.set_size` pins the pane only if the resize lands,
+    /// and `unpin` hands it back to the layout.
+    #[tokio::test]
+    async fn a_failed_set_size_leaves_no_pin_and_unpin_releases_one() {
+        let h = RpcHarness::new();
+        let (_session, _window, pane) = h.seed_session("pinned").await;
+        // A resizer nobody reads: the resize can never land.
+        let (dead_tx, dead_rx) = tokio::sync::mpsc::channel(1);
+        drop(dead_rx);
+        h.io.lock().await.resizers.insert(pane, dead_tx);
+        let clients = h.io.lock().await.clients.clone();
+
+        let params = serde_json::json!({ "pane_id": pane.to_string(), "cols": 100, "rows": 30 });
+        let _ = dispatch_err(&h.router, "pane.set_size", params).await;
+        assert!(
+            !clients.is_pinned(pane),
+            "a resize that never landed left a pin"
+        );
+
+        clients.pin(pane);
+        let unpinned = dispatch_ok(
+            &h.router,
+            "pane.set_size",
+            serde_json::json!({ "pane_id": pane.to_string(), "unpin": true }),
+        )
+        .await;
+        assert_eq!(unpinned["was_pinned"], true);
+        assert!(!clients.is_pinned(pane));
+        let both = dispatch_err(
+            &h.router,
+            "pane.set_size",
+            serde_json::json!({ "pane_id": pane.to_string(), "unpin": true, "cols": 80 }),
+        )
+        .await;
+        assert_eq!(both.code, shux_rpc::ErrorCode::InvalidParams.code());
     }
 }

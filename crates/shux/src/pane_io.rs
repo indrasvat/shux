@@ -618,6 +618,7 @@ impl PaneIoState {
             self.forget_command(*pane_id);
             self.sync_gates.remove(pane_id);
             self.resizers.remove(pane_id);
+            self.clients.unpin(*pane_id);
             if let Some(rx) = self.pty_done.remove(pane_id) {
                 done.push(rx);
             }

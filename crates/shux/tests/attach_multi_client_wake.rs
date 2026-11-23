@@ -243,3 +243,89 @@ async fn one_output_chunk_redraws_every_attached_client() {
         "one output chunk redrew only some clients: clients {missed:?} of 3 never drew MARK"
     );
 }
+
+/// Issue #190: a window focused over RPC is drawn by an attached client that
+/// has sent nothing since. With no fallback tick, only a wake can draw it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_idle_client_follows_a_window_focused_over_rpc() {
+    let h = Harness::new();
+    let created = h.rpc(
+        "session.create",
+        serde_json::json!({
+            "name": "follow",
+            "command": ["/bin/sh", "-c", "printf 'FIR%sST\\n' ''; read x"],
+        }),
+    );
+    let session = created["result"]["id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let first_window = created["result"]["window_id"]
+        .as_str()
+        .expect("window id")
+        .to_string();
+    let second = h.rpc(
+        "window.create",
+        serde_json::json!({
+            "session_id": session,
+            "name": "second",
+            "command": ["/bin/sh", "-c", "printf 'SEC%sOND\\n' ''; read x"],
+        }),
+    );
+    let second_window = second["result"]["id"]
+        .as_str()
+        .expect("new window id")
+        .to_string();
+    h.rpc("window.focus", serde_json::json!({ "id": first_window }));
+
+    let mut client = Client::attach(&h, "follow").await;
+    assert!(
+        client.draws("FIRST").await,
+        "the client never drew the first window"
+    );
+    h.rpc("window.focus", serde_json::json!({ "id": second_window }));
+    assert!(
+        client.draws("SECOND").await,
+        "an idle client kept drawing the window it attached to"
+    );
+}
+
+/// Issue #190: a pane split over RPC takes its share of the attached
+/// client's screen, not the 80x24 every new pane is born with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pane_split_over_rpc_takes_its_rect() {
+    let h = Harness::new();
+    let created = h.rpc(
+        "session.create",
+        serde_json::json!({
+            "name": "split",
+            "command": ["/bin/sh", "-c", "printf 'RE%sADY\\n' ''; read x"],
+        }),
+    );
+    let pane = created["result"]["pane_id"]
+        .as_str()
+        .expect("pane id")
+        .to_string();
+    let mut client = Client::attach(&h, "split").await;
+    assert!(client.draws("READY").await);
+
+    let split = h.rpc(
+        "pane.split",
+        serde_json::json!({ "pane_id": pane, "direction": "horizontal" }),
+    );
+    let new_pane = split["result"]["pane"]["id"]
+        .as_str()
+        .expect("new pane id")
+        .to_string();
+    let size = |id: &str| {
+        let snap = h.rpc("pane.snapshot", serde_json::json!({ "pane_id": id }));
+        (
+            snap["result"]["cols"].as_u64(),
+            snap["result"]["rows"].as_u64(),
+        )
+    };
+    shux_testkit::wait_until("the split panes to share the client's screen", || {
+        let (old, new) = (size(&pane), size(&new_pane));
+        new != (Some(80), Some(24)) && new.0 == old.0 && new.0 < Some(u64::from(COLS))
+    });
+}

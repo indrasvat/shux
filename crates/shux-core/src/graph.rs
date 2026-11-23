@@ -1251,6 +1251,13 @@ impl SessionGraph {
 
         self.commit_snapshot(snapshot);
         info!(%id, %session_id, "Window focused");
+        if previous.is_some() {
+            self.fire(EventData::WindowActivated {
+                window_id: id,
+                session_id,
+                previous_window_id: previous,
+            });
+        }
         Ok(previous)
     }
 
