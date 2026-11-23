@@ -152,7 +152,7 @@ impl PaneViewport {
 
 /// A space showing `cell`'s background, inverse video included. Nothing of
 /// the glyph survives: no other attribute, grapheme or hyperlink.
-fn blank_like(cell: &Cell) -> Cell {
+pub(crate) fn blank_like(cell: &Cell) -> Cell {
     let mut flags = CellFlags::default();
     if cell.style.flags.contains(CellFlags::INVERSE) {
         flags.set(CellFlags::INVERSE);

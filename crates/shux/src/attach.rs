@@ -77,6 +77,13 @@ struct MouseSelection {
     /// The slice the frame showed when the selection started; it ends when
     /// the pane shows another.
     view: PaneViewport,
+    /// Tells this selection from a later one over the same slice.
+    generation: u64,
+}
+
+fn next_selection_generation() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -892,13 +899,26 @@ pub(crate) async fn spawn_size(
     let state = io_state.lock().await;
     // The last sizing outlives its driver, for snapshots; only a client
     // still attached sizes a new pane.
-    if state.clients.is_pinned(pane) || !state.clients.has_voter(window.session_id) {
+    if state.clients.is_pinned(pane) {
         return None;
     }
-    let (cols, rows, border) = state.layout_basis.get(&window.session_id)?.clone();
-    window_sizes(&window.layout, BorderStyle::parse(&border), cols, rows)
-        .into_iter()
-        .find_map(|(pid, size)| (pid == pane).then_some(size))
+    // The client that drives now, which may not have sized anything yet: one
+    // that just reconnected must not start a pane at its predecessor's size.
+    let driver = state.clients.driver(window.session_id)?;
+    let border = crate::pane_spawn::daemon_border_style().or_else(|| {
+        state
+            .layout_basis
+            .get(&window.session_id)
+            .map(|b| b.2.clone())
+    })?;
+    window_sizes(
+        &window.layout,
+        BorderStyle::parse(&border),
+        driver.cols,
+        driver.rows,
+    )
+    .into_iter()
+    .find_map(|(pid, size)| (pid == pane).then_some(size))
 }
 
 /// A pane takes the layout's size unless it is pinned or was last asked for
@@ -1597,11 +1617,18 @@ async fn run_attach_loop(
                             // dragging for the rest of its life.
                             release_app_gesture(&io_state, &mut selection_drag).await;
                             selection_drag = SelectionDrag::None;
+                            // That gesture ended unfinished: its press is no
+                            // input to count at some later click.
+                            gesture_input = false;
                             continue;
                         }
                         let unhandled_mouse = |error| {
                             warn!(?kind, %error, "attach: mouse handle failed");
                             false
+                        };
+                        let gesture_pane = match selection_drag {
+                            SelectionDrag::App { pane_id, .. } => Some(pane_id),
+                            _ => None,
                         };
                         match handle_app_mouse(
                             kind,
@@ -1623,18 +1650,32 @@ async fn run_attach_loop(
                         .await
                         {
                             Ok(AppMouse::Consumed { redraw, input }) => {
-                                // A press or wheel the app received is input. A
-                                // press counts once its gesture ends: taking the
-                                // panes resizes them, and a release mapped after
-                                // that names another cell than its press.
-                                gesture_input |= input
-                                    && matches!(kind, MouseKind::Down | MouseKind::ScrollUp | MouseKind::ScrollDown);
-                                if gesture_input
-                                    && !matches!(selection_drag, SelectionDrag::App { .. })
-                                    && std::mem::take(&mut gesture_input)
-                                    && clients.mark_input(registry_id, tokio::time::Instant::now())
-                                {
-                                    reconcile_session(&graph, &io_state, &config, session.session_id).await;
+                                // A press or drag the app received is input. The
+                                // driver's keeps its hold on the panes for the
+                                // gesture; a viewer's takes them only when the
+                                // gesture ends, and only once its release is
+                                // written: taking them resizes the grid, and a
+                                // release mapped or read after that names
+                                // another cell than its press.
+                                let committed = input
+                                    && matches!(kind, MouseKind::Down | MouseKind::Drag | MouseKind::ScrollUp | MouseKind::ScrollDown);
+                                let driving = clients
+                                    .session_view(session.session_id, Some(registry_id), &[])
+                                    .role
+                                    == Some(crate::clients::Role::Driving);
+                                if committed && driving {
+                                    clients.mark_input(registry_id, tokio::time::Instant::now());
+                                } else {
+                                    gesture_input |= committed && kind != MouseKind::Drag;
+                                }
+                                if gesture_input && !matches!(selection_drag, SelectionDrag::App { .. }) {
+                                    gesture_input = false;
+                                    if let Some(pane) = gesture_pane {
+                                        releases_written(&io_state, &[pane]).await;
+                                    }
+                                    if clients.mark_input(registry_id, tokio::time::Instant::now()) {
+                                        reconcile_session(&graph, &io_state, &config, session.session_id).await;
+                                    }
                                 }
                                 if redraw {
                                     let pulse = io_state.lock().await.render_pulse.clone();
@@ -1663,12 +1704,21 @@ async fn run_attach_loop(
                         .await.unwrap_or_else(unhandled_mouse)
                         {
                             // A press that focused another pane is input; a
-                            // selection inside the focused one is not.
+                            // selection inside the focused one is not. It counts
+                            // once the selection ends and is yanked: taking the
+                            // panes resizes them, which ends the selection.
                             if kind == MouseKind::Down
                                 && focused_pane(&graph, session.session_id) != focus_before
-                                && clients.mark_input(registry_id, tokio::time::Instant::now())
                             {
-                                reconcile_session(&graph, &io_state, &config, session.session_id).await;
+                                gesture_input = true;
+                            }
+                            if gesture_input
+                                && !matches!(selection_drag, SelectionDrag::MouseSelection { .. })
+                            {
+                                gesture_input = false;
+                                if clients.mark_input(registry_id, tokio::time::Instant::now()) {
+                                    reconcile_session(&graph, &io_state, &config, session.session_id).await;
+                                }
                             }
                             let pulse = io_state.lock().await.render_pulse.clone();
                             pulse.bump();
@@ -2034,22 +2084,12 @@ async fn run_render_loop(
             Some(w) => w,
             None => continue,
         };
+        // A modal overlay takes its rect from the prepared frame, below.
         let copy_overlay = if let Some(ref cm) = attached.copy_mode {
-            let content = current_content_rect(&client_size).await;
-            let viewport = current_viewport(&client_size, &config).await;
-            let rect = if win.layout.is_zoomed() {
-                Some(content)
-            } else {
-                win.layout
-                    .compute_rects(viewport)
-                    .into_iter()
-                    .find(|(pid, _)| *pid == attached.active_pane_id)
-                    .map(|(_, rect)| rect)
-            };
-            rect.map(|rect| CopyOverlayStamp {
+            Some(CopyOverlayStamp {
                 kind: CopyOverlayKind::Modal,
                 pane_id: attached.active_pane_id,
-                rect,
+                rect: Rect::new(0, 0, 0, 0),
                 state: cm.clone(),
                 theme: live_theme,
             })
@@ -2066,16 +2106,6 @@ async fn run_render_loop(
                 })
         };
         let mut copy_overlay = copy_overlay;
-        let copy_overlay_changed =
-            copy_overlay_needs_base_redraw(last_copy_overlay.as_ref(), copy_overlay.as_ref());
-        let copy_menu_changed = attached.copy_menu != last_copy_menu;
-        if copy_overlay_changed || copy_menu_changed {
-            // The copy cursor/selection is drawn as an overlay after the normal
-            // framebuffer diff, so changes to it are invisible to the
-            // compositor. Redraw the base frame only when that overlay state
-            // changes; doing this every tick makes the pane visibly flicker.
-            compositor.force_redraw();
-        }
 
         // Collect pane VT references while holding the io_state lock.
         // We render under the lock to avoid copying VT grids; the lock
@@ -2108,12 +2138,46 @@ async fn run_render_loop(
         latch_at = geometry.deadline_ns;
         // A selection reads the slice it was made over; once the pane shows
         // another, it would highlight and yank cells no longer drawn there.
-        let stale_selection = copy_overlay.as_ref().is_some_and(|o| {
-            matches!(o.kind, CopyOverlayKind::MouseSelection(view)
-                if geometry.views.get(&o.pane_id) != Some(&view))
-        });
-        if stale_selection {
+        let stale_selection = attached
+            .mouse_selection
+            .as_ref()
+            .filter(|s| geometry.views.get(&s.pane_id) != Some(&s.view))
+            .map(|s| s.generation)
+            .filter(|_| attached.copy_mode.is_none());
+        if stale_selection.is_some() {
             copy_overlay = None;
+            compositor.force_redraw();
+        }
+        // Its menu goes with it, in this frame already.
+        let copy_menu = attached.copy_menu.filter(|_| stale_selection.is_none());
+        // Modal copy mode over the rect the frame drew its pane in, its scroll
+        // kept within what that pane can reach now: a grid that shrank, or a
+        // view that grew, leaves less history above it.
+        let mut copy_scroll = None;
+        if let Some(o) = copy_overlay
+            .as_mut()
+            .filter(|o| matches!(o.kind, CopyOverlayKind::Modal))
+        {
+            match (geometry.views.get(&o.pane_id), vt_refs.get(&o.pane_id)) {
+                (Some(view), Some(vt)) => {
+                    o.rect = view.rect;
+                    let lines = shux_ui::copy_mode::effective_total_lines(vt, o.rect.height);
+                    let max = shux_ui::copy_mode::max_scroll_offset(lines, o.rect.height);
+                    if o.state.scroll_offset > max {
+                        o.state.scroll_offset = max;
+                        copy_scroll = Some(max);
+                    }
+                }
+                _ => copy_overlay = None,
+            }
+        }
+        let copy_overlay_changed =
+            copy_overlay_needs_base_redraw(last_copy_overlay.as_ref(), copy_overlay.as_ref());
+        if copy_overlay_changed || copy_menu != last_copy_menu {
+            // The copy cursor/selection is drawn as an overlay after the normal
+            // framebuffer diff, so changes to it are invisible to the
+            // compositor. Redraw the base frame only when that overlay state
+            // changes; doing this every tick makes the pane visibly flicker.
             compositor.force_redraw();
         }
         let pane_ids = win.layout.tree.pane_ids();
@@ -2300,7 +2364,7 @@ async fn run_render_loop(
             theme: live_theme,
             label,
         };
-        if let Some(menu) = attached.copy_menu {
+        if let Some(menu) = copy_menu {
             // A different menu forced a full redraw above.
             let base_emitted = !compositor.inner().is_empty();
             if sheet_due(&mut menu_sheet, sheet(String::new()), base_emitted) {
@@ -2316,7 +2380,7 @@ async fn run_render_loop(
         } else {
             menu_sheet = None;
         }
-        last_copy_menu = attached.copy_menu;
+        last_copy_menu = copy_menu;
 
         // Help-overlay layer: drawn AFTER the diff'd multipane frame so
         // it covers the cells underneath. Toggling the overlay also
@@ -2395,10 +2459,21 @@ async fn run_render_loop(
         if toast_expired {
             session.lock().await.show_welcome_toast = false;
         }
-        if stale_selection {
+        if let Some(max) = copy_scroll
+            && let Some(cm) = session.lock().await.copy_mode.as_mut()
+        {
+            cm.scroll_offset = cm.scroll_offset.min(max);
+        }
+        // Only the selection found stale: one started since stays.
+        if let Some(stale) = stale_selection {
             let mut s = session.lock().await;
-            s.mouse_selection = None;
-            s.copy_menu = None;
+            if s.mouse_selection
+                .as_ref()
+                .is_some_and(|m| m.generation == stale)
+            {
+                s.mouse_selection = None;
+                s.copy_menu = None;
+            }
         }
 
         // A frame that moved a slice but no cell still goes out, so the
@@ -2781,6 +2856,7 @@ async fn handle_mouse_selection(
                 pane_id,
                 state,
                 view,
+                generation: next_selection_generation(),
             });
             s.copy_menu = None;
             *drag = SelectionDrag::MouseSelection { pane_id };
@@ -2858,7 +2934,15 @@ async fn handle_mouse_selection(
                 session.lock().await.mouse_selection = None;
                 return Ok(true);
             }
-            let at = view_point(&selection.view, col, row, false).zip(selection.state.anchor);
+            // The click names the selection only through the frame it was made
+            // over: a client a frame behind or ahead saw other cells there.
+            let stamped = attached
+                .shown
+                .views(frame)
+                .and_then(|v| v.get(&selection.pane_id));
+            let at = view_point(&selection.view, col, row, false)
+                .filter(|_| stamped == Some(&selection.view))
+                .zip(selection.state.anchor);
             let inside = at.is_some_and(|(point, anchor)| {
                 selection_contains_local_point(
                     anchor,
@@ -2948,7 +3032,7 @@ async fn handle_copy_mode_mouse(
                 state
                     .vts
                     .get(&attached.active_pane_id)
-                    .map(|vt| vt.presented_total_lines())
+                    .map(|vt| shux_ui::copy_mode::effective_total_lines(vt, rect.height))
                     .unwrap_or(rect.height as usize)
             };
             let mut s = session.lock().await;
@@ -3571,6 +3655,30 @@ async fn handle_app_mouse(
         end_gesture_if_released(gesture, action, button);
         return Ok(AppMouse::NotHandled);
     };
+    // The stamped frame can predate a resize. A gesture underway stays on the
+    // grid the app has now; a press off it names no cell the app has.
+    let live = io_state
+        .lock()
+        .await
+        .vts
+        .get(&pane_id)
+        .map(|vt| (vt.grid().cols(), vt.grid().rows()));
+    let (local_col, local_row) = match live {
+        Some((cols, rows)) => {
+            let fit = |v: u16, n: usize| v.min(u16::try_from(n).unwrap_or(u16::MAX));
+            let on_grid = usize::from(local_col) <= cols && usize::from(local_row) <= rows;
+            if !on_grid && !pin {
+                let redraw = action == ButtonAction::Press
+                    && select_pane_on_press(graph, session, attached.active_pane_id, pane_id).await;
+                return Ok(AppMouse::Consumed {
+                    redraw,
+                    input: false,
+                });
+            }
+            (fit(local_col, cols), fit(local_row, rows))
+        }
+        None => (local_col, local_row),
+    };
     let (local_col, local_row) = if pin && !sgr {
         (
             local_col.min(X10_MOUSE_LIMIT),
@@ -3822,19 +3930,44 @@ async fn forward_bytes_to_pane(
     bytes: Vec<u8>,
     lane: Lane,
 ) -> bool {
-    match io_state
-        .lock()
-        .await
-        .try_send_outside_paste(pane_id, bytes, lane)
-    {
-        None => false,
-        Some(Ok(())) => true,
-        Some(Err(e)) => {
+    let mut state = io_state.lock().await;
+    let Some(writer) = state.writers.get(&pane_id) else {
+        return false;
+    };
+    let mut permit = match writer.try_reserve_in(bytes.len(), lane) {
+        Ok(permit) => permit,
+        Err(e) => {
             tracing::warn!(error = %e, "mouse forward dropped (pane backpressured)");
-            false
+            return false;
         }
+    };
+    // Urgent is a release: what a takeover resize must not overtake.
+    if lane == Lane::Urgent {
+        let written = permit.watch();
+        state.mouse_release_written.insert(pane_id, written);
+    }
+    state.send_outside_paste(pane_id, permit, bytes)
+}
+
+/// Waits, a bounded while, for the last mouse release sent to any of `panes`
+/// to be written: the PTY applies a resize ahead of queued input, so a
+/// takeover issued at once could reach the program before the release.
+async fn releases_written(io_state: &Arc<Mutex<PaneIoState>>, panes: &[PaneId]) {
+    let waits: Vec<_> = {
+        let mut state = io_state.lock().await;
+        panes
+            .iter()
+            .filter_map(|p| state.mouse_release_written.remove(p))
+            .collect()
+    };
+    for written in waits {
+        let _ = tokio::time::timeout(RELEASE_WRITE_BOUND, written).await;
     }
 }
+
+/// The longest a takeover waits for a release to reach a program that is
+/// not reading its input.
+const RELEASE_WRITE_BOUND: Duration = Duration::from_millis(100);
 
 /// Handle a scroll-wheel event while copy mode is NOT active. Returns `Ok(true)`
 /// if the event was a wheel event (and thus consumed), `Ok(false)` otherwise so
@@ -3897,7 +4030,9 @@ async fn handle_wheel(
                     vt.is_alternate_screen(),
                     m.alternate_scroll,
                     m.application_cursor_keys,
-                    vt.presented_total_lines(),
+                    // The lines copy mode can reach: what the frame shows of a
+                    // grid taller than its rect, plus history.
+                    shux_ui::copy_mode::effective_total_lines(vt, rect.height),
                 )
             }
             None => (false, false, false, true, false, rect.height as usize),
@@ -4076,13 +4211,14 @@ async fn yank_selection(
     }
     let text = {
         let state = io_state.lock().await;
-        state
-            .vts
-            .get(&selection.pane_id)
-            .map(|vt| {
-                shux_ui::copy_mode::extract_frame_selection(vt, &selection.state, &selection.view)
-            })
-            .unwrap_or_default()
+        // The grid as it is now, not as the last frame drew it: a resize may
+        // have landed since, and the slice the selection was made over is gone.
+        let Some(vt) = state.vts.get(&selection.pane_id).filter(|vt| {
+            PaneViewport::of(selection.view.rect, vt, shux_vt::monotonic_now_ns()) == selection.view
+        }) else {
+            return false;
+        };
+        shux_ui::copy_mode::extract_frame_selection(vt, &selection.state, &selection.view)
     };
     if text.is_empty() {
         return false;
@@ -5912,6 +6048,7 @@ mod tests {
             pane_id: fixture.first_pane,
             state,
             view,
+            generation: 1,
         };
 
         let (out_tx, mut out_rx) = mpsc::channel(2);
@@ -5933,6 +6070,51 @@ mod tests {
             other => panic!("expected render frame, got {other:?}"),
         }
 
+        fixture.stop();
+    }
+
+    /// Review of #190: a resize that lands after the last frame shrinks the
+    /// grid under a selection still stamped with that frame. Yanking it then
+    /// copies nothing rather than reading past the grid, on either axis.
+    #[tokio::test]
+    async fn a_yank_after_the_grid_shrank_copies_nothing() {
+        let fixture = attach_fixture().await;
+        let pane = fixture.first_pane;
+        seed_io_for_pane(&fixture.io_state, pane).await;
+        for (rows, cols) in [(2, 40), (6, 8)] {
+            let view = {
+                let mut io = fixture.io_state.lock().await;
+                let vt = io.vts.get_mut(&pane).expect("pane vt");
+                vt.resize(6, 40);
+                vt.process(b"\x1b[6;40H");
+                PaneViewport::of(Rect::new(4, 3, 20, 4), vt, 0)
+            };
+            assert!(view.row_offset > 0 && view.col_offset > 0, "{view:?}");
+            let mut state = shux_ui::CopyModeState::new();
+            state.anchor = Some((0, 0));
+            state.cursor = (19, 3);
+            let selection = MouseSelection {
+                pane_id: pane,
+                state,
+                view,
+                generation: 1,
+            };
+            let mut shown = ShownFrames::default();
+            shown.push(1, HashMap::from([(pane, view)]));
+            fixture
+                .io_state
+                .lock()
+                .await
+                .vts
+                .get_mut(&pane)
+                .expect("pane vt")
+                .resize(rows, cols);
+            let (out_tx, _out_rx) = mpsc::channel(2);
+            assert!(
+                !yank_selection(&selection, &shown, &fixture.io_state, &out_tx).await,
+                "{rows}x{cols}: a slice no longer on the grid was yanked"
+            );
+        }
         fixture.stop();
     }
 
@@ -7676,6 +7858,291 @@ mod tests {
         fixture.stop();
     }
 
+    /// Review of #190: a right-click opens the copy menu only through the frame
+    /// the selection was made over. Stamped with a frame that shows the pane's
+    /// grid elsewhere, the same screen point is not on the selection.
+    #[tokio::test]
+    async fn a_right_click_from_another_frame_opens_no_menu() {
+        let mut h = AppMouseHarness::new().await;
+        let pane = h.fixture.first_pane;
+        let (_wr, r) = install_app(&h, pane, (60, 40), b"").await;
+        let (out_tx, _out_rx) = mpsc::channel(8);
+        let (from, to) = ((r.x + 1, r.y + 1), (r.x + 6, r.y + 1));
+        for (kind, at) in [
+            (MouseKind::Down, from),
+            (MouseKind::Drag, to),
+            (MouseKind::Up, to),
+        ] {
+            ship_frame(
+                &h.fixture.graph,
+                &h.fixture.io_state,
+                &h.session,
+                &h.client_size,
+            )
+            .await;
+            handle_mouse_selection(
+                kind,
+                ProtoMouseButton::Left,
+                at.0,
+                at.1,
+                &h.fixture.graph,
+                &h.fixture.io_state,
+                &h.session,
+                &h.client_size,
+                &test_config(),
+                &out_tx,
+                &mut h.gesture,
+                None,
+            )
+            .await
+            .expect("selection");
+        }
+        assert!(h.session.lock().await.mouse_selection.is_some());
+        // The cursor goes home: the next frame shows the grid's top instead.
+        h.fixture
+            .io_state
+            .lock()
+            .await
+            .vts
+            .get_mut(&pane)
+            .expect("pane vt")
+            .process(b"\x1b[H");
+        ship_frame(
+            &h.fixture.graph,
+            &h.fixture.io_state,
+            &h.session,
+            &h.client_size,
+        )
+        .await;
+        let newest = h.session.lock().await.shown.0.back().map(|(n, _)| *n);
+        handle_mouse_selection(
+            MouseKind::Down,
+            ProtoMouseButton::Right,
+            from.0 + 2,
+            from.1,
+            &h.fixture.graph,
+            &h.fixture.io_state,
+            &h.session,
+            &h.client_size,
+            &test_config(),
+            &out_tx,
+            &mut h.gesture,
+            newest,
+        )
+        .await
+        .expect("right-click");
+        assert_eq!(
+            h.session.lock().await.copy_menu,
+            None,
+            "a menu opened over cells that frame did not show selected"
+        );
+        h.fixture.stop();
+    }
+
+    /// Review of #190: the wheel enters copy mode only with history above the
+    /// view. A grid taller than its rect, cursor at its top, shows its top
+    /// rows: nothing above them to scroll to.
+    #[tokio::test]
+    async fn the_wheel_finds_no_history_above_a_tall_grid_shown_from_its_top() {
+        let h = AppMouseHarness::new().await;
+        let pane = h.fixture.first_pane;
+        let (_wr, r) = install_app(&h, pane, (60, 40), b"").await;
+        h.fixture
+            .io_state
+            .lock()
+            .await
+            .vts
+            .get_mut(&pane)
+            .expect("pane vt")
+            .process(b"\x1b[H");
+        ship_frame(
+            &h.fixture.graph,
+            &h.fixture.io_state,
+            &h.session,
+            &h.client_size,
+        )
+        .await;
+        handle_wheel(
+            MouseKind::ScrollUp,
+            r.x + 1,
+            r.y + 1,
+            None,
+            &h.fixture.graph,
+            &h.fixture.io_state,
+            &h.session,
+            &h.client_size,
+            &test_config(),
+        )
+        .await
+        .expect("wheel");
+        assert!(
+            h.session.lock().await.copy_mode.is_none(),
+            "the wheel opened a scrollback view with nothing above it"
+        );
+        h.fixture.stop();
+    }
+
+    /// Review of #190: an open copy view scrolled further than its pane can
+    /// now reach is brought back within it, in the frame and in the state
+    /// the next key scrolls from.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_open_copy_view_past_its_history_is_brought_back() {
+        let fixture = attach_fixture().await;
+        seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+        let _ = fixture.graph.focus_pane(fixture.first_pane).await;
+        let mut attached = fixture.attached.clone();
+        attached.active_pane_id = fixture.first_pane;
+        let mut cm = shux_ui::CopyModeState::new();
+        cm.scroll_offset = 10_000;
+        attached.copy_mode = Some(cm);
+        let session = Arc::new(Mutex::new(attached));
+        let onboarding = crate::onboarding::OnboardingHandle::from_state_for_test(
+            crate::onboarding::OnboardingState {
+                prefix_discovered: true,
+                welcome_toast_seen: true,
+            },
+        );
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = fixture.cancel.child_token();
+        let render = tokio::spawn(run_render_loop(
+            fixture.graph.clone(),
+            fixture.io_state.clone(),
+            test_config(),
+            SegmentCache::new(),
+            crate::session_meta::SessionMetaCache::new(),
+            onboarding,
+            std::time::Instant::now(),
+            session.clone(),
+            Arc::new(Mutex::new((100, 30))),
+            tx,
+            cancel.clone(),
+            false,
+            false,
+            Duration::from_secs(3600),
+            WELCOME_TOAST_DWELL,
+            shux_vt::monotonic_now_ns,
+        ));
+        let deadline = shux_testkit::Deadline::start();
+        loop {
+            match deadline.run(rx.recv()).await {
+                Some(Some(AttachServerFrame::Render { frame: Some(_), .. })) => break,
+                Some(Some(_)) => {}
+                Some(None) | None => panic!("no frame"),
+            }
+        }
+        let offset = session
+            .lock()
+            .await
+            .copy_mode
+            .as_ref()
+            .map(|cm| cm.scroll_offset);
+        assert!(
+            offset.is_some_and(|o| o < 10_000),
+            "the copy view stayed past its history: {offset:?}"
+        );
+        cancel.cancel();
+        render.await.expect("render loop");
+        fixture.stop();
+    }
+
+    /// Review of #190: the frame that finds a selection stale ends it and its
+    /// menu, drawing neither; a selection started while that frame was drawn
+    /// is a new one, and stays.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stale_selection_ends_alone_and_takes_its_menu_with_it() {
+        let fixture = attach_fixture().await;
+        let pane = fixture.first_pane;
+        seed_io_for_pane(&fixture.io_state, pane).await;
+        let stale_view = PaneViewport {
+            rect: Rect::new(0, 0, 1, 1),
+            grid_rows: 1,
+            grid_cols: 1,
+            row_offset: 0,
+            col_offset: 0,
+        };
+        let selection = |generation| MouseSelection {
+            pane_id: pane,
+            state: shux_ui::CopyModeState::new(),
+            view: stale_view,
+            generation,
+        };
+        let mut attached = fixture.attached.clone();
+        attached.mouse_selection = Some(selection(1));
+        attached.copy_menu = Some(CopyContextMenu {
+            pane_id: pane,
+            col: 5,
+            row: 5,
+        });
+        let session = Arc::new(Mutex::new(attached));
+        let onboarding = crate::onboarding::OnboardingHandle::from_state_for_test(
+            crate::onboarding::OnboardingState {
+                prefix_discovered: true,
+                welcome_toast_seen: true,
+            },
+        );
+        let held = onboarding.hold_for_test().await;
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = fixture.cancel.child_token();
+        let render = tokio::spawn(run_render_loop(
+            fixture.graph.clone(),
+            fixture.io_state.clone(),
+            test_config(),
+            SegmentCache::new(),
+            crate::session_meta::SessionMetaCache::new(),
+            onboarding.clone(),
+            std::time::Instant::now(),
+            session.clone(),
+            Arc::new(Mutex::new((100, 30))),
+            tx,
+            cancel.clone(),
+            false,
+            false,
+            Duration::from_secs(3600),
+            WELCOME_TOAST_DWELL,
+            shux_vt::monotonic_now_ns,
+        ));
+        // The frame has read the session and holds io_state, waiting on the
+        // hold: a selection made now is after the one it found stale.
+        let io_state = fixture.io_state.clone();
+        shux_testkit::wait_until_async("the frame to hold io_state", || {
+            let io_state = io_state.clone();
+            async move { io_state.try_lock().is_err() }
+        })
+        .await;
+        session.lock().await.mouse_selection = Some(selection(2));
+        drop(held);
+        let deadline = shux_testkit::Deadline::start();
+        let drawn = loop {
+            match deadline.run(rx.recv()).await {
+                Some(Some(AttachServerFrame::Render {
+                    data,
+                    frame: Some(_),
+                })) => {
+                    break String::from_utf8_lossy(&BASE64.decode(data).expect("b64")).into_owned();
+                }
+                Some(Some(_)) => {}
+                Some(None) | None => panic!("no frame"),
+            }
+        };
+        assert!(
+            !drawn.contains(" Copy"),
+            "the stale selection's menu was drawn"
+        );
+        assert_eq!(
+            session
+                .lock()
+                .await
+                .mouse_selection
+                .as_ref()
+                .map(|s| s.generation),
+            Some(2),
+            "the cleanup ended the selection made since"
+        );
+        cancel.cancel();
+        render.await.expect("render loop");
+        fixture.stop();
+    }
+
     /// A press that named no cell was never sent, so its release is not sent
     /// either; it releases what the app does hold instead of stranding it.
     #[tokio::test]
@@ -8420,6 +8887,7 @@ mod tests {
                     row_offset: 0,
                     col_offset: 0,
                 },
+                generation: 1,
             });
         }
         assert_eq!(
@@ -11729,6 +12197,276 @@ mod tests {
                 "tracking {tracking}: the surplus press took the panes"
             );
         }
+        fixture.stop();
+    }
+
+    /// Two clients over the fixture's window: A (200 columns) drives, B (80)
+    /// views, and the first pane runs an SGR mouse app whose cursor sits on
+    /// its grid's last cell. Returns the app's input, the pane's size log, the
+    /// clients and the size A gave the pane.
+    async fn driver_and_viewer_over_an_app(
+        fixture: &AttachFixture,
+    ) -> (
+        crate::pane_input::PaneInputRx,
+        Arc<std::sync::Mutex<Vec<(u16, u16)>>>,
+        Client,
+        Client,
+        (u16, u16),
+    ) {
+        let pane = fixture.first_pane;
+        let (writes, rx, _s) = seed_io_for_pane(&fixture.io_state, pane).await;
+        let (_w2, rx2, _s2) = seed_io_for_pane(&fixture.io_state, fixture.second_pane).await;
+        let log = fake_pty(&fixture.io_state, pane, rx);
+        let _log2 = fake_pty(&fixture.io_state, fixture.second_pane, rx2);
+        let _ = fixture.graph.focus_pane(pane).await;
+        let mut a = Client::attach(fixture, 200).await;
+        idle_for(QUIET).await;
+        a.catch_up().await;
+        let by_a = *log.lock().unwrap().last().expect("A sized the pane");
+        fixture
+            .io_state
+            .lock()
+            .await
+            .vts
+            .get_mut(&pane)
+            .expect("pane vt")
+            .process(format!("\x1b[?1002h\x1b[?1006h\x1b[{};{}H", by_a.1, by_a.0).as_bytes());
+        let mut b = Client::attach(fixture, 80).await;
+        idle_for(QUIET).await;
+        a.catch_up().await;
+        b.catch_up().await;
+        (writes, log, a, b, by_a)
+    }
+
+    /// The cell at `(dx, dy)` inside `pane` as a client `cols` wide lays it out.
+    async fn point_in(
+        fixture: &AttachFixture,
+        pane: PaneId,
+        cols: u16,
+        (dx, dy): (u16, u16),
+    ) -> (u16, u16) {
+        let viewport = current_viewport(&Arc::new(Mutex::new((cols, 24))), &test_config()).await;
+        let rect = fixture.graph.snapshot().windows[&fixture.first_window]
+            .layout
+            .compute_rects(viewport)
+            .into_iter()
+            .find_map(|(p, r)| (p == pane).then_some(r))
+            .expect("the pane's rect");
+        (rect.x + dx, rect.y + dy)
+    }
+
+    /// Review of #190: a viewer's takeover waits for its release to be
+    /// written. The PTY applies a resize ahead of queued input, so a takeover
+    /// sent at once could reach the app before the button came up.
+    #[tokio::test(start_paused = true)]
+    async fn a_takeover_waits_for_its_release_to_be_written() {
+        let fixture = attach_fixture().await;
+        let (mut writes, log, _a, mut b, by_a) = driver_and_viewer_over_an_app(&fixture).await;
+        let last = || *log.lock().unwrap().last().expect("sized");
+        let at = point_in(&fixture, fixture.first_pane, 80, (2, 2)).await;
+        b.send(&left_button(MouseKind::Down, at, b.written_frame))
+            .await;
+        idle_for(QUIET).await;
+        let press = writes.try_recv().expect("the press reached the app");
+        assert!(press.ends_with(b"M"), "{press:?}");
+        b.send(&left_button(MouseKind::Up, at, b.written_frame))
+            .await;
+        idle_for(Duration::from_millis(10)).await;
+        assert_eq!(
+            last(),
+            by_a,
+            "the panes were taken with the release unwritten"
+        );
+        let release = writes.try_recv().expect("the release reached the app");
+        assert!(release.ends_with(b"m"), "{release:?}");
+        idle_for(QUIET).await;
+        assert_ne!(last(), by_a, "the click did not hand the panes over");
+        fixture.stop();
+    }
+
+    /// Review of #190: the driver's own press and drag are input that keeps
+    /// its hold on the panes: another client typing during the gesture, even
+    /// past the settle window from the press, does not take them.
+    #[tokio::test(start_paused = true)]
+    async fn the_drivers_gesture_keeps_the_panes_from_a_typing_viewer() {
+        let fixture = attach_fixture().await;
+        let (_writes, log, mut a, mut b, by_a) = driver_and_viewer_over_an_app(&fixture).await;
+        let last = || *log.lock().unwrap().last().expect("sized");
+        let at = point_in(&fixture, fixture.first_pane, 200, (2, 2)).await;
+        a.send(&left_button(MouseKind::Down, at, a.written_frame))
+            .await;
+        idle_for(QUIET).await;
+        b.key(b"x").await;
+        idle_for(QUIET).await;
+        assert_eq!(
+            last(),
+            by_a,
+            "a key took the panes during the driver's first press"
+        );
+        for step in 1..=4u16 {
+            idle_for(crate::clients::SETTLE / 2).await;
+            a.send(&left_button(
+                MouseKind::Drag,
+                (at.0 + step, at.1),
+                a.written_frame,
+            ))
+            .await;
+        }
+        idle_for(QUIET).await;
+        b.key(b"y").await;
+        idle_for(QUIET).await;
+        assert_eq!(
+            last(),
+            by_a,
+            "a key took the panes mid-drag, past SETTLE from the press"
+        );
+        fixture.stop();
+    }
+
+    /// Review of #190: a gesture held across a resize reports the cells the
+    /// app's grid has now, not cells of the grid it had at the press.
+    #[tokio::test]
+    async fn a_held_gesture_stays_on_a_grid_that_shrank() {
+        let mut h = AppMouseHarness::new().await;
+        let pane = h.fixture.first_pane;
+        let (mut wr, r) = install_app(&h, pane, (60, 300), b"\x1b[?1002h\x1b[?1006h").await;
+        let point = (r.x + r.width - 1, r.y + r.height - 1);
+        h.send(MouseKind::Down, ProtoMouseButton::Left, point.0, point.1)
+            .await;
+        let _press = recv_text(&mut wr).await;
+        h.fixture
+            .io_state
+            .lock()
+            .await
+            .vts
+            .get_mut(&pane)
+            .expect("pane vt")
+            .resize(10, 20);
+        handle_app_mouse(
+            MouseKind::Drag,
+            ProtoMouseButton::Left,
+            point.0,
+            point.1,
+            false,
+            false,
+            false,
+            None,
+            &h.fixture.graph,
+            &h.fixture.io_state,
+            &h.session,
+            &h.client_size,
+            &test_config(),
+            &h.border_drag,
+            &mut h.gesture,
+        )
+        .await
+        .expect("drag");
+        let drag = recv_text(&mut wr).await;
+        let at: Vec<u16> = drag
+            .trim_start_matches("\x1b[<32;")
+            .trim_end_matches('M')
+            .split(';')
+            .map(|n| n.parse().expect("a coordinate"))
+            .collect();
+        assert!(
+            at[0] <= 20 && at[1] <= 10,
+            "reported {drag:?} off a 20x10 grid"
+        );
+        h.fixture.stop();
+    }
+
+    /// Review of #190: a text selection a viewer starts by clicking into
+    /// another pane is not ended by the takeover that click earns: the panes
+    /// change hands once it is released and yanked.
+    #[tokio::test(start_paused = true)]
+    async fn a_selection_that_focuses_a_pane_is_yanked_before_the_takeover() {
+        let fixture = attach_fixture().await;
+        let pane = fixture.first_pane;
+        let (_w, rx, _s) = seed_io_for_pane(&fixture.io_state, pane).await;
+        let (_w2, rx2, _s2) = seed_io_for_pane(&fixture.io_state, fixture.second_pane).await;
+        let log = fake_pty(&fixture.io_state, pane, rx);
+        let _log2 = fake_pty(&fixture.io_state, fixture.second_pane, rx2);
+        let last = || *log.lock().unwrap().last().expect("sized");
+        let _ = fixture.graph.focus_pane(fixture.second_pane).await;
+        let mut a = Client::attach(&fixture, 200).await;
+        idle_for(QUIET).await;
+        a.catch_up().await;
+        let by_a = last();
+        let mut b = Client::attach(&fixture, 80).await;
+        idle_for(QUIET).await;
+        b.catch_up().await;
+        let from = point_in(&fixture, pane, 80, (0, 0)).await;
+        b.send(&left_button(MouseKind::Down, from, b.written_frame))
+            .await;
+        idle_for(QUIET).await;
+        b.catch_up().await;
+        b.send(&left_button(
+            MouseKind::Drag,
+            (from.0 + 4, from.1),
+            b.written_frame,
+        ))
+        .await;
+        idle_for(QUIET).await;
+        b.catch_up().await;
+        b.send(&left_button(
+            MouseKind::Up,
+            (from.0 + 4, from.1),
+            b.written_frame,
+        ))
+        .await;
+        let copied = b
+            .frames_until(|f, _| {
+                matches!(f, AttachServerFrame::Render { data, .. }
+                    if BASE64.decode(data).is_ok_and(|d| d.starts_with(b"\x1b]52;")))
+            })
+            .await;
+        assert!(copied, "the selection was ended before it was yanked");
+        idle_for(QUIET).await;
+        assert_ne!(
+            last(),
+            by_a,
+            "the click into the pane did not take the panes"
+        );
+        fixture.stop();
+    }
+
+    /// Review of #190: a help sheet opened mid-gesture ends that gesture, and
+    /// its press with it: a later click on nothing does not count it.
+    #[tokio::test(start_paused = true)]
+    async fn a_gesture_help_interrupted_is_no_input_later() {
+        let fixture = attach_fixture().await;
+        let (_writes, log, _a, mut b, by_a) = driver_and_viewer_over_an_app(&fixture).await;
+        let last = || *log.lock().unwrap().last().expect("sized");
+        let at = point_in(&fixture, fixture.first_pane, 80, (2, 2)).await;
+        b.send(&left_button(MouseKind::Down, at, b.written_frame))
+            .await;
+        let help = AttachClientFrame::Action {
+            kind: ActionKind::ToggleHelp,
+            args: Default::default(),
+        };
+        b.send(&help).await;
+        idle_for(QUIET).await;
+        b.send(&left_button(MouseKind::Drag, at, b.written_frame))
+            .await;
+        b.send(&help).await;
+        idle_for(QUIET).await;
+        // A press on another pane's surplus: it reaches no app.
+        {
+            let mut io = fixture.io_state.lock().await;
+            io.clients.pin(fixture.second_pane);
+            let vt = io.vts.get_mut(&fixture.second_pane).expect("pane vt");
+            vt.resize(4, 12);
+            vt.process(b"\x1b[?1002h\x1b[?1006h");
+        }
+        idle_for(QUIET).await;
+        b.catch_up().await;
+        let surplus = point_in(&fixture, fixture.second_pane, 80, (1, 10)).await;
+        b.send(&left_button(MouseKind::Down, surplus, b.written_frame))
+            .await;
+        b.send(&left_button(MouseKind::Up, surplus, b.written_frame))
+            .await;
+        idle_for(QUIET).await;
+        assert_eq!(last(), by_a, "a press help ended was counted later");
         fixture.stop();
     }
 

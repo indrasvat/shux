@@ -700,6 +700,7 @@ async fn run_pane_pty_task(
         state.writers.remove(&pane_id);
         state.resizers.remove(&pane_id);
         state.requested_sizes.remove(&pane_id);
+        state.mouse_release_written.remove(&pane_id);
         state.shutdowns.remove(&pane_id);
         state.pty_done.remove(&pane_id);
     }
@@ -738,6 +739,13 @@ pub(crate) fn daemon_shell_config() -> shux_core::config::ShellConfig {
         .get()
         .map(|h| h.current().shell.clone())
         .unwrap_or_default()
+}
+
+/// The live outline style, or `None` outside the daemon.
+pub(crate) fn daemon_border_style() -> Option<String> {
+    DAEMON_CONFIG
+        .get()
+        .map(|h| h.current().appearance.border_style.clone())
 }
 
 /// The configured shell argv, or `None` when `[shell].command` does not name a
@@ -1258,6 +1266,7 @@ async fn spawn_pane_pty_unshared(
         }
         state.resizers.insert(pane_id, resize_tx);
         state.requested_sizes.remove(&pane_id);
+        state.mouse_release_written.remove(&pane_id);
         // Now resizable: a pane created from the CLI takes its rect.
         state.clients.touch();
         state.pty_done.insert(pane_id, done_rx);
@@ -2642,6 +2651,57 @@ mod tests {
         assert!(
             born.0 <= 100 && born.1 < 30,
             "born outside the client: {born:?}"
+        );
+        h.stop().await;
+    }
+
+    /// Review of #190: the last sizing outlives its driver, for snapshots. A
+    /// client that reconnects drives before anything resizes, and a pane split
+    /// then is born at that client's rect, not at its predecessor's.
+    #[tokio::test]
+    async fn a_split_after_a_reconnect_is_born_at_the_new_clients_rect() {
+        let h = crate::rpc::test_harness::RpcHarness::new();
+        let (session, _window, a) = h.seed_session("reborn").await;
+        let border = h.config.current().appearance.border_style.clone();
+        h.io.lock()
+            .await
+            .layout_basis
+            .insert(session, (200, 60, border));
+        let clients = h.io.lock().await.clients.clone();
+        let _back = clients.register(
+            crate::clients::ClientInfo {
+                id: shux_core::event::ClientId::new(),
+                session_id: session,
+                cols: 90,
+                rows: 24,
+                attached_at: std::time::SystemTime::now(),
+                votes: true,
+                last_input: None,
+            },
+            tokio_util::sync::CancellationToken::new(),
+        );
+        let split = crate::rpc::test_harness::dispatch_ok(
+            &h.router,
+            "pane.split",
+            serde_json::json!({
+                "pane_id": a.to_string(),
+                "direction": "horizontal",
+                "command": ["/bin/sh", "-c", "read x"],
+            }),
+        )
+        .await;
+        let new: shux_core::model::PaneId = split["pane"]["id"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .expect("new pane id");
+        let born = {
+            let io = h.io.lock().await;
+            let vt = io.vts.get(&new).expect("the split's terminal");
+            (vt.grid().cols(), vt.grid().rows())
+        };
+        assert!(
+            born.0 <= 90 && born.1 < 24,
+            "born at the departed driver's size: {born:?}"
         );
         h.stop().await;
     }

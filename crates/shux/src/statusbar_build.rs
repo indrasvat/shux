@@ -331,10 +331,14 @@ pub fn append_viewing(
     cols: u16,
     plain: bool,
 ) {
+    let words = role.and_then(Role::words);
+    if words.is_none() && label.is_none() {
+        return;
+    }
     let rgb = |Rgb { r, g, b }: Rgb| Color::Rgb { r, g, b };
     let mark = if plain { "*" } else { "◉" };
     // Each part's forms, longest first, and an empty last one: not drawn.
-    let roles: Vec<Vec<StatusSegment>> = match role.and_then(Role::words) {
+    let roles: Vec<Vec<StatusSegment>> = match words {
         Some(words) => words
             .iter()
             .map(|w| {
@@ -376,6 +380,9 @@ pub fn append_viewing(
     let room = usize::from(cols).saturating_sub(lw + cw + rw + gaps);
     // The label sheds its words, then the role its, then the label goes, then
     // the role.
+    // Measured once, as the bar renders them.
+    let role_w: Vec<usize> = roles.iter().map(Vec::as_slice).map(width).collect();
+    let label_w: Vec<usize> = labels.iter().map(Vec::as_slice).map(width).collect();
     let (rl, ll) = (roles.len() - 1, labels.len() - 1);
     let (mut r, mut l) = (0, 0);
     let mut order = vec![(r, l)];
@@ -390,7 +397,7 @@ pub fn append_viewing(
     order.extend([(r, ll), (rl, ll)]);
     for (r, l) in order {
         let (role, label) = (&roles[r], &labels[l]);
-        if width(role) + width(label) <= room {
+        if role_w[r] + label_w[l] <= room {
             let unit: Vec<StatusSegment> = label.iter().chain(role).cloned().collect();
             bar.right.splice(0..0, unit);
             return;

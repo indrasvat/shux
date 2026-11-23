@@ -20,6 +20,7 @@ struct Case {
     rows: u16,
     cols: u16,
     cursor: u16,
+    cursor_col: u16,
     scrollback: u8,
     style: u8,
     layout: u8,
@@ -39,6 +40,8 @@ fuzz_target!(|case: Case| {
     let rows = usize::from(case.rows % 300) + 1;
     let cols = usize::from(case.cols % 300) + 1;
     let cursor = usize::from(case.cursor) % rows;
+    // A cursor right of a narrower rect crops the grid horizontally too.
+    let cursor_col = usize::from(case.cursor_col) % cols;
     let extra = usize::from(case.scrollback % 8);
     let style = [BorderStyle::Rounded, BorderStyle::None][usize::from(case.style % 2)];
     let (other, pane) = (PaneId::new(), PaneId::new());
@@ -59,7 +62,7 @@ fuzz_target!(|case: Case| {
         .map(|l| (0..cols).map(|c| sym(l, c)).collect())
         .collect();
     vt.process(lines.join("\r\n").as_bytes());
-    vt.process(format!("\x1b[{};1H", cursor + 1).as_bytes());
+    vt.process(format!("\x1b[{};{}H", cursor + 1, cursor_col + 1).as_bytes());
     let filler = VirtualTerminal::new(2, 2);
     let mut vts = HashMap::new();
     vts.insert(pane, &vt);
@@ -77,6 +80,7 @@ fuzz_target!(|case: Case| {
         vts: &vts,
         chrome: None,
         status_bar: None,
+        geometry: None,
     })
     .expect("render to a Vec cannot fail");
     let mut screen = VirtualTerminal::new(h.into(), w.into());
@@ -96,8 +100,7 @@ fuzz_target!(|case: Case| {
             .expect("the pane is in its layout")
     };
     assert_eq!(view.rect, rect, "the recorded view sits where attach hit-tests");
-    let shown_rows = rows.saturating_sub(view.row_offset).min(rect.height.into());
-    let shown_cols = cols.min(rect.width.into());
+    let (shown_rows, shown_cols) = (view.shown_rows(), view.shown_cols());
 
     for y in 0..h {
         for x in 0..w {
@@ -129,7 +132,10 @@ fuzz_target!(|case: Case| {
                 x.clamp(rect.x, rect.x + shown_cols as u16 - 1),
                 y.clamp(rect.y, rect.y + shown_rows as u16 - 1),
             );
-            let at = (rect.x + c - 1, rect.y + (usize::from(r) - 1 - view.row_offset) as u16);
+            let at = (
+                rect.x + (usize::from(c) - 1 - view.col_offset) as u16,
+                rect.y + (usize::from(r) - 1 - view.row_offset) as u16,
+            );
             assert_eq!(at, near, "({x},{y}) pinned to ({c},{r}), not the nearest shown cell");
             assert_eq!(seen(at.0, at.1), sym(extra + usize::from(r) - 1, usize::from(c) - 1));
         }
