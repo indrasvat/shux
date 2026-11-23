@@ -1,3 +1,10 @@
+## [0.58.2](https://github.com/indrasvat/shux/compare/v0.58.1...v0.58.2) (2026-11-23)
+
+
+### Bug Fixes
+
+* **cli:** --format json errors are JSON on stdout; resize --delta has a range ([#293](https://github.com/indrasvat/shux/issues/293)) ([5e3475e](https://github.com/indrasvat/shux/commit/5e3475ee240a2bcf91635d27b8f68e7b9fded0e8))
+
 ## [0.58.1](https://github.com/indrasvat/shux/compare/v0.58.0...v0.58.1) (2026-11-23)
 
 
