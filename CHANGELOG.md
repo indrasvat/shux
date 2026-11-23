@@ -1,3 +1,10 @@
+# [0.59.0](https://github.com/indrasvat/shux/compare/v0.58.2...v0.59.0) (2026-11-23)
+
+
+### Features
+
+* **attach:** each client draws every pane right for its own size ([#190](https://github.com/indrasvat/shux/issues/190) B1) ([#294](https://github.com/indrasvat/shux/issues/294)) ([901c600](https://github.com/indrasvat/shux/commit/901c6009aff1ed8476c8ac72c252e4ec12a09637)), closes [#f5a97f](https://github.com/indrasvat/shux/issues/f5a97f)
+
 ## [0.58.2](https://github.com/indrasvat/shux/compare/v0.58.1...v0.58.2) (2026-11-23)
 
 
