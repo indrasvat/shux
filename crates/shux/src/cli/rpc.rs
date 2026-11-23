@@ -32,7 +32,10 @@ pub fn rpc_display_raw(code: i64, message: &str, data: Option<&serde_json::Value
     match code {
         // not_found
         -32004 => match id_field {
-            Some(id) => format!("{resource} '{id}' not found"),
+            Some(id) => match data.and_then(|d| d.get("hint")).and_then(|v| v.as_str()) {
+                Some(hint) => format!("{resource} '{id}' not found — {hint}"),
+                None => format!("{resource} '{id}' not found"),
+            },
             // No structured data at all means the CLI composed this error
             // itself — `resolve_session_id`, `resolve_window_id` and the
             // pane-membership check all do, and all of them say which name

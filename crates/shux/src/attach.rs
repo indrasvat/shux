@@ -1573,6 +1573,21 @@ async fn run_attach_loop(
         }
     }
 
+    // Gone the moment its loop ends: a socket nobody reads can hold the last
+    // frames for a whole write stall, and the list must not wait for it.
+    drop(registered);
+    if let Some(bus) = &bus {
+        bus.publish(shux_core::event::EventData::ClientDisconnected {
+            client_id: registry_id,
+            reason: end_reason.into(),
+        });
+        bus.publish(shux_core::event::EventData::SessionDetached {
+            session_id: session.session_id,
+            client_id: registry_id,
+        });
+    }
+    io_state.lock().await.render_pulse.clone().bump();
+
     // A gesture forwarded to a pane app outlives the attach: the PTY does not
     // go away when the client does. Detaching mid-drag without this leaves the
     // app believing a button is still held, and it stays that way for the rest
@@ -1588,22 +1603,14 @@ async fn run_attach_loop(
     let _ = renderer.await;
     let _ = pinger.await;
     if let Some(frame) = final_frame {
-        let _ = out_tx.send(frame).await;
+        // A full queue on a stalled writer waits for the stall, not forever.
+        tokio::select! {
+            _ = out_tx.send(frame) => {}
+            _ = conn.cancelled() => {}
+        }
     }
     drop(out_tx);
     let _ = writer.await;
-    drop(registered);
-    if let Some(bus) = &bus {
-        bus.publish(shux_core::event::EventData::ClientDisconnected {
-            client_id: registry_id,
-            reason: end_reason.into(),
-        });
-        bus.publish(shux_core::event::EventData::SessionDetached {
-            session_id: session.session_id,
-            client_id: registry_id,
-        });
-    }
-    io_state.lock().await.render_pulse.clone().bump();
     info!(session = %session.name, "attach session ended");
     Ok(())
 }
@@ -1859,7 +1866,11 @@ async fn run_render_loop(
         let last_action_ref = attached.last_action.as_ref().map(|(s, i)| (s.as_str(), *i));
         let render_ctx = StatusBarCtx {
             session_id: attached.session_id,
-            session_name: &attached.name,
+            // The graph, not the name cached at attach: a rename shows at once.
+            session_name: snap
+                .sessions
+                .get(&attached.session_id)
+                .map_or(attached.name.as_str(), |s| s.name.as_str()),
             active_window_id: attached.active_window_id,
             active_pane_id: attached.active_pane_id,
             session_meta: &session_meta,
@@ -9848,6 +9859,79 @@ mod tests {
         }
     }
 
+    /// A client that has ended is unlisted and reported gone at once, even
+    /// while its last frames are still stuck on a socket nobody reads.
+    #[tokio::test(start_paused = true)]
+    async fn a_detached_client_is_unlisted_before_its_socket_drains() {
+        let fixture = attach_fixture().await;
+        let _io = seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+        let bus = shux_core::bus::EventBus::new();
+        let mut events = bus.subscribe_filtered(vec!["client.disconnected".into()]);
+        fixture.io_state.lock().await.event_bus = Some(bus);
+        let (server_stream, client_stream) = tokio::io::duplex(1024);
+        let server = tokio::spawn(handle_attach_connection(
+            server_stream,
+            fixture.graph.clone(),
+            fixture.io_state.clone(),
+            test_config(),
+            SegmentCache::new(),
+            crate::session_meta::SessionMetaCache::new(),
+            crate::onboarding::OnboardingHandle::from_state_for_test(
+                crate::onboarding::OnboardingState {
+                    prefix_discovered: true,
+                    welcome_toast_seen: true,
+                },
+            ),
+            std::time::Instant::now(),
+            fixture.cancel.child_token(),
+        ));
+        let mut framed = Framed::new(client_stream, create_codec());
+        let hello = AttachHello {
+            protocol: ATTACH_PROTOCOL_VERSION,
+            session_name: Some(fixture.attached.name.clone()),
+            cols: 200,
+            rows: 60,
+            client_version: "detach-then-stop".to_string(),
+            graphics: false,
+        };
+        framed
+            .send(Bytes::from(serde_json::to_vec(&hello).expect("hello json")))
+            .await
+            .expect("send hello");
+        shux_testkit::Deadline::start()
+            .run(framed.next())
+            .await
+            .expect("ready timeout")
+            .expect("ready frame")
+            .expect("ready bytes");
+        // It detaches, then reads nothing more: its render frames stay queued.
+        framed
+            .send(Bytes::from(
+                serde_json::to_vec(&AttachClientFrame::Detach).expect("detach json"),
+            ))
+            .await
+            .expect("send detach");
+
+        let gone = shux_testkit::Deadline::start().run(events.recv()).await;
+        assert!(gone.is_some(), "no client.disconnected");
+        assert!(
+            !server.is_finished(),
+            "the client was reported gone only once its socket gave up"
+        );
+        assert_eq!(
+            fixture
+                .io_state
+                .lock()
+                .await
+                .clients
+                .count_for(fixture.session_id),
+            0,
+            "a detached client is still listed"
+        );
+        drop(framed);
+        fixture.stop();
+    }
+
     /// Issue #287: a client that stops reading is let go, instead of its
     /// writer waiting on the socket for as long as the daemon runs.
     #[tokio::test(start_paused = true)]
@@ -9904,6 +9988,27 @@ mod tests {
         );
         drop(framed);
         fixture.stop();
+    }
+
+    /// A session renamed while a client watches it is shown by its new name.
+    #[tokio::test(start_paused = true)]
+    async fn an_attached_client_follows_a_session_rename() {
+        let mut h = InputHarness::new(8).await;
+        assert!(
+            h.frames_until(|_, text| text.contains("attach-test")).await,
+            "the old name was never shown"
+        );
+        h.fixture
+            .graph
+            .rename_session(h.fixture.session_id, "renamed-live".to_string(), None)
+            .await
+            .expect("rename");
+        assert!(
+            h.frames_until(|_, text| text.contains("renamed-live"))
+                .await,
+            "the bar kept the old name"
+        );
+        h.stop().await;
     }
 
     /// A pane split from an attached client belongs to the session, not to

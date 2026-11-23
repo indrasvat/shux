@@ -100,13 +100,18 @@ bar of a session shows `◉ N attached` once two or more are on it.
                      "cols": 120, "rows": 40, "attached_at": 1778... }] }
 
 // client.detach (shux client detach <id>): ends that one connection; the
-// client is told "removed". A unique id prefix works; an ambiguous one is
-// invalid_params, an unknown one not_found.
+// client is told "removed". A unique id prefix works, in any case; an
+// ambiguous one is invalid_params with `candidates`, an unknown one
+// not_found, an empty or non-string id invalid_params.
 { "id": "3f2a" } → { "detached": "<uuid>" }
 ```
 
-A client that takes no bytes at all for 10–20 s (progress is checked every 10 s) is dropped; a slow one that
-keeps reading stays. Events: `client.connected`, `client.resized`,
+`attached_at` is Unix seconds. `--format plain` prints one tab-separated
+line per client: id, session, `COLSxROWS`, `attached_at`.
+
+A client that takes no bytes at all for 10–20 s (progress is checked every
+10 s) is dropped; a slow one that keeps reading stays. Events:
+`client.connected` (`terminal_cols`, `terminal_rows`), `client.resized`,
 `client.disconnected` (`reason`: `detached`, `closed`, `removed`,
 `connection_lost`, `session_destroyed`, `daemon_stopped`), and
 `session.attached` / `session.detached` with the session id.

@@ -703,12 +703,19 @@ pub fn render_session_list(ctx: &TerminalContext, sessions: &[SessionInfo]) -> P
             let mut total_windows: usize = 0;
             for s in sessions {
                 total_windows += s.window_count;
-                let diamond = if s.is_active { "\u{25C6}" } else { "\u{25C7}" }; // ◆/◇
-                let win_text = format!(
+                let diamond = if s.attached > 0 {
+                    "\u{25C6}"
+                } else {
+                    "\u{25C7}"
+                }; // ◆/◇
+                let mut win_text = format!(
                     "{} window{}",
                     s.window_count,
                     if s.window_count == 1 { "" } else { "s" }
                 );
+                if s.attached > 0 {
+                    win_text.push_str(&format!(" · {} attached", s.attached));
+                }
                 // Visible scratch tag (LENS-R-041 --include-scratch rows).
                 let name_cell = if s.scratch {
                     format!("{} [scratch]", safe_label(&s.name))
@@ -747,7 +754,7 @@ pub fn render_session_list(ctx: &TerminalContext, sessions: &[SessionInfo]) -> P
             writeln!(out, "{}", bx.empty_row())?;
 
             for (i, session) in sessions.iter().enumerate() {
-                let is_active = session.is_active;
+                let is_active = session.attached > 0;
                 let colors = ctx.colors;
                 let (colored, visible_len) = layout.render_row(i, &|col_idx, cell| {
                     match col_idx {
@@ -1236,7 +1243,8 @@ pub struct SessionInfo {
     pub id: String,
     pub window_count: usize,
     pub created: String,
-    pub is_active: bool,
+    /// Clients attached to it; drawn as ◆ and "N attached".
+    pub attached: usize,
     /// Lens scratch session (only ever true under `--include-scratch`,
     /// LENS-R-041). Text mode renders a visible `[scratch]` tag; plain
     /// mode appends a `scratch` column so scripts can tell them apart.
@@ -2300,6 +2308,35 @@ pub fn print_pane_diff(
     }
 }
 
+/// One bare line, for a plain-format answer scripts read.
+pub fn print_plain_line(text: &str) -> Printed {
+    let mut out = io::stdout().lock();
+    writeln!(out, "{}", safe_label(text))?;
+    out.flush()?;
+    Ok(())
+}
+
+/// One attached client per line for scripts: full id, session, size,
+/// attach time in Unix seconds, tab-separated; nothing when none.
+pub fn print_clients_plain(clients: &[serde_json::Value]) -> Printed {
+    let mut out = io::stdout().lock();
+    for c in clients {
+        let s = |k: &str| c.get(k).and_then(|v| v.as_str()).unwrap_or("?");
+        let n = |k: &str| c.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+        writeln!(
+            out,
+            "{}\t{}\t{}x{}\t{}",
+            s("id"),
+            safe_label(s("session")),
+            n("cols"),
+            n("rows"),
+            n("attached_at"),
+        )?;
+    }
+    out.flush()?;
+    Ok(())
+}
+
 /// One attached client per line: short id, session, size, and when it
 /// attached.
 pub fn print_clients(clients: &[serde_json::Value]) -> Printed {
@@ -2741,7 +2778,7 @@ mod tests {
                 id: "12345678-aaaa-bbbb-cccc-000000000000".to_string(),
                 window_count: 1,
                 created: "now".to_string(),
-                is_active: true,
+                attached: 2,
                 scratch: false,
             },
             SessionInfo {
@@ -2749,7 +2786,7 @@ mod tests {
                 id: "87654321-aaaa-bbbb-cccc-000000000000".to_string(),
                 window_count: 2,
                 created: "later".to_string(),
-                is_active: false,
+                attached: 0,
                 scratch: true,
             },
         ];

@@ -1,6 +1,6 @@
 //! `shux client list` / `shux client detach`. Mirrors `client.*` RPC.
 
-use crate::cli::{OutputFormat, rpc_call};
+use crate::cli::{OutputFormat, rpc_call, to_style_format};
 use crate::style;
 
 pub async fn handle_client_list(
@@ -8,19 +8,21 @@ pub async fn handle_client_list(
     format: OutputFormat,
 ) -> anyhow::Result<()> {
     let result = rpc_call(stream, "client.list", serde_json::json!({})).await?;
-    match format {
-        OutputFormat::Json => println!(
+    if matches!(format, OutputFormat::Json) {
+        println!(
             "{}",
             style::json_safe(&serde_json::to_string_pretty(&result)?)
-        ),
-        OutputFormat::Text | OutputFormat::Plain => {
-            let rows = result
-                .get("clients")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default();
-            style::print_clients(&rows)?;
-        }
+        );
+        return Ok(());
+    }
+    let rows = result
+        .get("clients")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    match style::TerminalContext::detect(to_style_format(format)).format {
+        style::OutputFormat::Plain => style::print_clients_plain(&rows)?,
+        _ => style::print_clients(&rows)?,
     }
     Ok(())
 }
@@ -31,18 +33,20 @@ pub async fn handle_client_detach(
     format: OutputFormat,
 ) -> anyhow::Result<()> {
     let result = rpc_call(stream, "client.detach", serde_json::json!({ "id": id })).await?;
-    match format {
-        OutputFormat::Json => println!(
+    if matches!(format, OutputFormat::Json) {
+        println!(
             "{}",
             style::json_safe(&serde_json::to_string_pretty(&result)?)
-        ),
-        OutputFormat::Text | OutputFormat::Plain => {
-            let detached = result
-                .get("detached")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("client.detach answered without the detached id"))?;
-            style::print_success("detached client", style::short_id(detached), None)?;
-        }
+        );
+        return Ok(());
+    }
+    let detached = result
+        .get("detached")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("client.detach answered without the detached id"))?;
+    match style::TerminalContext::detect(to_style_format(format)).format {
+        style::OutputFormat::Plain => style::print_plain_line(detached)?,
+        _ => style::print_success("detached client", style::short_id(detached), None)?,
     }
     Ok(())
 }

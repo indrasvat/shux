@@ -319,15 +319,47 @@ pub fn append_watchers(bar: &mut StatusBar, attached: usize, theme: &Theme, cols
     while width(&bar.left) + width(&bar.center) + width(&bar.right) + gaps(bar) > usize::from(cols)
     {
         if bar.right.len() > 1 {
-            bar.right.pop();
+            pop_unit(&mut bar.right);
         } else if bar.left.len() > 1 {
-            bar.left.pop();
+            pop_unit(&mut bar.left);
         } else if !bar.center.is_empty() {
             bar.center.clear();
         } else {
+            // Only the session name is left: it gives up its tail, not the count.
+            let room = usize::from(cols).saturating_sub(width(&bar.right) + 1);
+            match bar.left.first_mut() {
+                Some(name) if room >= 2 => shorten(name, room),
+                _ => bar.left.clear(),
+            }
             return;
         }
     }
+}
+
+/// Drop the zone's last segment, and with it every other run its script printed.
+fn pop_unit(zone: &mut Vec<StatusSegment>) {
+    if let Some(last) = zone.pop()
+        && last.group != 0
+    {
+        while zone.last().is_some_and(|s| s.group == last.group) {
+            zone.pop();
+        }
+    }
+}
+
+/// Fit `seg` in `max` columns, ending in "…".
+fn shorten(seg: &mut StatusSegment, max: usize) {
+    let mut kept = String::new();
+    let mut used = 0;
+    for (cell, w) in shux_ui::text_cells(&seg.text) {
+        if used + usize::from(w) + 1 > max {
+            break;
+        }
+        used += usize::from(w);
+        kept.push_str(&cell);
+    }
+    kept.push('…');
+    seg.text = kept;
 }
 
 /// Clear segments, innermost first, right zone before left, until a transient
@@ -342,9 +374,16 @@ pub fn make_room_for_notice(bar: &mut StatusBar, cols: u16) {
     while width(&bar.left) + width(&bar.center) + width(&bar.right) + gaps(bar) > usize::from(cols)
     {
         if !bar.right.is_empty() {
-            bar.right.remove(0);
-        } else if bar.left.pop().is_none() {
+            let first = bar.right.remove(0);
+            if first.group != 0 {
+                while bar.right.first().is_some_and(|s| s.group == first.group) {
+                    bar.right.remove(0);
+                }
+            }
+        } else if bar.left.is_empty() {
             return;
+        } else {
+            pop_unit(&mut bar.left);
         }
     }
 }
@@ -422,6 +461,37 @@ mod tests {
         assert!(
             text.starts_with("left"),
             "the session name was cleared: {text:?}"
+        );
+    }
+
+    #[test]
+    fn a_long_session_name_on_a_narrow_bar_still_shows_the_count() {
+        let mut b = bar(&"日本".repeat(14), "", "r");
+        append_watchers(&mut b, 9, &Theme::DEFAULT, 30);
+        let text: String = b.render_row(30).iter().map(|c| c.ch).collect();
+        assert!(text.contains("◉ 9 attached"), "the count was cut: {text:?}");
+        assert!(text.starts_with('日') && text.contains('…'), "{text:?}");
+    }
+
+    #[test]
+    fn a_script_segment_gives_way_whole_not_word_by_word() {
+        let mut b = bar("left", "centre", "");
+        for (text, group) in [("up 3h ", 0), ("via ", 7), ("v1.97.1 ", 7)] {
+            b.right.push(StatusSegment {
+                group,
+                ..StatusSegment::plain(text)
+            });
+        }
+        // Room for the count and "up 3h", not for the script's two runs.
+        append_watchers(&mut b, 2, &Theme::DEFAULT, 35);
+        let text: String = b.render_row(35).iter().map(|c| c.ch).collect();
+        assert!(
+            text.contains("◉ 2 attached") && text.contains("up 3h"),
+            "{text:?}"
+        );
+        assert!(
+            !text.contains("via"),
+            "half a script segment was left: {text:?}"
         );
     }
 

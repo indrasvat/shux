@@ -54,32 +54,61 @@ pub(crate) fn register_client_methods(
                 let io = io_detach.clone();
                 async move {
                     let params = params.unwrap_or_default();
-                    let raw = params
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .filter(|id| !id.is_empty())
-                        .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'id'"))?;
+                    let raw = match params.get("id") {
+                        Some(serde_json::Value::String(s)) if !s.trim().is_empty() => {
+                            s.trim().to_ascii_lowercase()
+                        }
+                        Some(serde_json::Value::String(_)) => {
+                            return Err(shux_rpc::RpcError::invalid_params(
+                                "'id' is empty; `shux client list` shows the ids",
+                            ));
+                        }
+                        Some(_) => {
+                            return Err(shux_rpc::RpcError::invalid_params(
+                                "'id' must be a string",
+                            ));
+                        }
+                        None => return Err(shux_rpc::RpcError::invalid_params("missing 'id'")),
+                    };
+                    let not_found = || {
+                        shux_rpc::RpcError::with_data(
+                            shux_rpc::ErrorCode::NotFound,
+                            serde_json::json!({
+                                "resource": "client",
+                                "id": raw,
+                                "hint": "`shux client list` shows the attached clients",
+                            }),
+                        )
+                    };
                     let clients = io.lock().await.clients.clone();
                     // A unique prefix works, like the short ids `client list` prints.
-                    let matches: Vec<_> = clients
+                    let matches: Vec<String> = clients
                         .list()
                         .into_iter()
-                        .filter(|c| c.id.0.to_string().starts_with(raw))
+                        .map(|c| c.id.0.to_string())
+                        .filter(|id| id.starts_with(&raw))
                         .collect();
                     let [target] = matches.as_slice() else {
                         return Err(if matches.is_empty() {
-                            shux_rpc::RpcError::not_found("client", raw)
+                            not_found()
                         } else {
-                            shux_rpc::RpcError::invalid_params(&format!(
-                                "'{raw}' matches {} clients; give more of the id",
-                                matches.len()
-                            ))
+                            shux_rpc::RpcError::ambiguous_ref(
+                                "client",
+                                &raw,
+                                &matches,
+                                matches.len(),
+                            )
                         });
                     };
-                    if !clients.remove(target.id) {
-                        return Err(shux_rpc::RpcError::not_found("client", raw));
+                    let id = shux_core::event::ClientId::from(
+                        uuid::Uuid::parse_str(target)
+                            .map_err(|e| shux_rpc::RpcError::internal(&e.to_string()))?,
+                    );
+                    if !clients.remove(id) {
+                        return Err(not_found());
                     }
-                    Ok(serde_json::json!({ "detached": target.id.0.to_string() }))
+                    let target = target.clone();
+                    Ok(serde_json::json!({ "detached": target }))
                 }
             },
         )
@@ -130,8 +159,14 @@ mod tests {
                 .data
                 .as_ref()
                 .and_then(|d| d["detail"].as_str())
-                .is_some_and(|s| s.contains("matches 2 clients")),
+                .is_some_and(|s| s.contains("is ambiguous")),
             "{ambiguous:?}"
+        );
+        let wrong_type =
+            dispatch_err(&h.router, "client.detach", serde_json::json!({"id": 5})).await;
+        assert!(
+            format!("{wrong_type:?}").contains("must be a string"),
+            "{wrong_type:?}"
         );
         let missing = dispatch_err(
             &h.router,
@@ -152,10 +187,10 @@ mod tests {
         let done = dispatch_ok(
             &h.router,
             "client.detach",
-            serde_json::json!({"id": "aaaa1"}),
+            serde_json::json!({"id": " AAAA1 "}),
         )
         .await;
-        assert_eq!(done["detached"], a.to_string());
+        assert_eq!(done["detached"], a.to_string(), "ids match case-blind");
         assert!(end_a.is_cancelled());
         assert!(!end_b.is_cancelled(), "detaching one client ended another");
 
