@@ -119,11 +119,13 @@ pub struct PaneIoState {
     pub resizers: HashMap<shux_core::model::PaneId, mpsc::Sender<ResizeRequest>>,
     /// The size last sent to each pane's resizer, queued or applied.
     pub requested_sizes: HashMap<shux_core::model::PaneId, shux_pty::handle::PtySize>,
-    /// Per pane, the last mouse release sent to its program: written once
-    /// this resolves. A takeover resize waits on it, so the program reads the
-    /// release before the size change rather than after.
-    pub mouse_release_written:
-        HashMap<shux_core::model::PaneId, tokio::sync::oneshot::Receiver<()>>,
+    /// Per pane and client, the last mouse release that client sent the
+    /// pane's program: written once this resolves. That client's takeover
+    /// resize waits on it, so the program reads the release first.
+    pub mouse_release_written: HashMap<
+        (shux_core::model::PaneId, shux_core::event::ClientId),
+        tokio::sync::oneshot::Receiver<()>,
+    >,
     /// Each session's last sizing: its driver's cols, rows and border style.
     /// A pane spawned into the session starts at its rect from this.
     pub layout_basis: HashMap<shux_core::model::SessionId, (u16, u16, String)>,
@@ -632,7 +634,7 @@ impl PaneIoState {
             self.sync_gates.remove(pane_id);
             self.resizers.remove(pane_id);
             self.requested_sizes.remove(pane_id);
-            self.mouse_release_written.remove(pane_id);
+            self.mouse_release_written.retain(|(p, _), _| p != pane_id);
             self.clients.unpin(*pane_id);
             if let Some(rx) = self.pty_done.remove(pane_id) {
                 done.push(rx);

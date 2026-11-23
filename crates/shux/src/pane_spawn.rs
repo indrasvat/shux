@@ -700,7 +700,9 @@ async fn run_pane_pty_task(
         state.writers.remove(&pane_id);
         state.resizers.remove(&pane_id);
         state.requested_sizes.remove(&pane_id);
-        state.mouse_release_written.remove(&pane_id);
+        state
+            .mouse_release_written
+            .retain(|(p, _), _| *p != pane_id);
         state.shutdowns.remove(&pane_id);
         state.pty_done.remove(&pane_id);
     }
@@ -1266,7 +1268,9 @@ async fn spawn_pane_pty_unshared(
         }
         state.resizers.insert(pane_id, resize_tx);
         state.requested_sizes.remove(&pane_id);
-        state.mouse_release_written.remove(&pane_id);
+        state
+            .mouse_release_written
+            .retain(|(p, _), _| *p != pane_id);
         // Now resizable: a pane created from the CLI takes its rect.
         state.clients.touch();
         state.pty_done.insert(pane_id, done_rx);

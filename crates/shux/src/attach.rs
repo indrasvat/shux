@@ -1542,6 +1542,11 @@ async fn run_attach_loop(
                             onboarding.mark_welcome_toast_seen().await;
                         }
 
+                        // Modal copy mode takes over any text drag: a credit it
+                        // left pending must not be spent by a later click.
+                        if kind == ActionKind::EnterCopyMode {
+                            gesture_input = false;
+                        }
                         let action_result = handle_action(
                             kind,
                             args.clone(),
@@ -1615,7 +1620,7 @@ async fn run_attach_loop(
                             // An app mid-drag behind the overlay has to be
                             // told the button came up, or it stays stuck
                             // dragging for the rest of its life.
-                            release_app_gesture(&io_state, &mut selection_drag).await;
+                            release_app_gesture(&io_state, &mut selection_drag, None).await;
                             selection_drag = SelectionDrag::None;
                             // That gesture ended unfinished: its press is no
                             // input to count at some later click.
@@ -1657,23 +1662,27 @@ async fn run_attach_loop(
                                 // written: taking them resizes the grid, and a
                                 // release mapped or read after that names
                                 // another cell than its press.
-                                let committed = input
-                                    && matches!(kind, MouseKind::Down | MouseKind::Drag | MouseKind::ScrollUp | MouseKind::ScrollDown);
                                 let driving = clients
                                     .session_view(session.session_id, Some(registry_id), &[])
                                     .role
                                     == Some(crate::clients::Role::Driving);
-                                if committed && driving {
+                                // The driver's release too: the hold it had while
+                                // still lasts a settle window past letting go.
+                                if input && driving && kind != MouseKind::Move {
                                     clients.mark_input(registry_id, tokio::time::Instant::now());
                                 } else {
-                                    gesture_input |= committed && kind != MouseKind::Drag;
+                                    gesture_input |= input
+                                        && matches!(kind, MouseKind::Down | MouseKind::ScrollUp | MouseKind::ScrollDown);
                                 }
                                 if gesture_input && !matches!(selection_drag, SelectionDrag::App { .. }) {
                                     gesture_input = false;
-                                    if let Some(pane) = gesture_pane {
-                                        releases_written(&io_state, &[pane]).await;
-                                    }
-                                    if clients.mark_input(registry_id, tokio::time::Instant::now()) {
+                                    // A release not written in time drops the
+                                    // takeover: the next input can earn it.
+                                    let written = match gesture_pane {
+                                        Some(pane) => release_written(&io_state, pane, registry_id).await,
+                                        None => true,
+                                    };
+                                    if written && clients.mark_input(registry_id, tokio::time::Instant::now()) {
                                         reconcile_session(&graph, &io_state, &config, session.session_id).await;
                                     }
                                 }
@@ -1739,6 +1748,11 @@ async fn run_attach_loop(
                         )
                         .await.unwrap_or_else(unhandled_mouse)
                         {
+                            // Copy mode ended the drag a focusing press began:
+                            // that selection was never yanked, so its credit goes.
+                            if kind == MouseKind::Up {
+                                gesture_input = false;
+                            }
                             let pulse = io_state.lock().await.render_pulse.clone();
                             pulse.bump();
                             continue;
@@ -1857,7 +1871,7 @@ async fn run_attach_loop(
     // app believing a button is still held, and it stays that way for the rest
     // of the pane's life — visible next time anyone attaches.
     close_open_pastes(&io_state, client_id).await;
-    release_app_gesture(&io_state, &mut selection_drag).await;
+    release_app_gesture(&io_state, &mut selection_drag, None).await;
 
     // The writer finishes the frame on the wire, sends the final one and
     // ends; a stalled socket ends it at the write stall.
@@ -2164,8 +2178,8 @@ async fn run_render_loop(
                     let lines = shux_ui::copy_mode::effective_total_lines(vt, o.rect.height);
                     let max = shux_ui::copy_mode::max_scroll_offset(lines, o.rect.height);
                     if o.state.scroll_offset > max {
+                        copy_scroll = Some((o.pane_id, o.state.clone(), max));
                         o.state.scroll_offset = max;
-                        copy_scroll = Some(max);
                     }
                 }
                 _ => copy_overlay = None,
@@ -2459,10 +2473,14 @@ async fn run_render_loop(
         if toast_expired {
             session.lock().await.show_welcome_toast = false;
         }
-        if let Some(max) = copy_scroll
-            && let Some(cm) = session.lock().await.copy_mode.as_mut()
-        {
-            cm.scroll_offset = cm.scroll_offset.min(max);
+        // Only into the view it was worked out for: one scrolled, or opened
+        // over another pane, since has bounds of its own.
+        if let Some((pane, seen, max)) = copy_scroll {
+            let mut s = session.lock().await;
+            let same = s.active_pane_id == pane;
+            if let Some(cm) = s.copy_mode.as_mut().filter(|cm| same && **cm == seen) {
+                cm.scroll_offset = max;
+            }
         }
         // Only the selection found stale: one started since stays.
         if let Some(stale) = stale_selection {
@@ -3372,7 +3390,11 @@ fn button_bit(button: ProtoMouseButton) -> u8 {
 /// a forwarded gesture is abandoned rather than completed — help overlay,
 /// detach, session end, the pane's rect vanishing under a zoom or window switch
 /// — so the app is never left believing a button is down.
-async fn release_app_gesture(io_state: &Arc<Mutex<PaneIoState>>, gesture: &mut SelectionDrag) {
+async fn release_app_gesture(
+    io_state: &Arc<Mutex<PaneIoState>>,
+    gesture: &mut SelectionDrag,
+    client: Option<shux_core::event::ClientId>,
+) {
     let SelectionDrag::App {
         pane_id,
         buttons,
@@ -3410,7 +3432,7 @@ async fn release_app_gesture(io_state: &Arc<Mutex<PaneIoState>>, gesture: &mut S
             continue;
         };
         if let Some(bytes) = encode_mouse_report(cb, true, sgr, last.0, last.1) {
-            forward_bytes_to_pane(io_state, pane_id, bytes, Lane::Urgent).await;
+            forward_bytes_to_pane(io_state, pane_id, bytes, Lane::Urgent, client).await;
         }
     }
 }
@@ -3479,7 +3501,7 @@ async fn handle_app_mouse(
     let Some(views) = attached.shown.views(frame) else {
         if matches!(*gesture, SelectionDrag::App { .. }) {
             if action == ButtonAction::Release {
-                release_app_gesture(io_state, gesture).await;
+                release_app_gesture(io_state, gesture, attached.client).await;
             }
             return Ok(AppMouse::Consumed {
                 redraw: false,
@@ -3571,7 +3593,7 @@ async fn handle_app_mouse(
         // because a stuck button does not recover and a mis-placed release does.
         AppMouseRoute::Swallow => {
             if action == ButtonAction::Release && mode != shux_vt::MouseMode::None {
-                release_app_gesture(io_state, gesture).await;
+                release_app_gesture(io_state, gesture, attached.client).await;
             } else {
                 end_gesture_if_released(gesture, action, button);
             }
@@ -3587,7 +3609,7 @@ async fn handle_app_mouse(
     // it off-screen. Let the app know the button came up rather than letting
     // the gesture evaporate with it still held.
     if !pane_is_shown(graph, &attached, pane_id) {
-        release_app_gesture(io_state, gesture).await;
+        release_app_gesture(io_state, gesture, attached.client).await;
         return Ok(AppMouse::Consumed {
             redraw: false,
             input: false,
@@ -3630,7 +3652,7 @@ async fn handle_app_mouse(
         if let (Some((_, at)), SelectionDrag::App { last, .. }) = (cell, &mut *gesture) {
             *last = at;
         }
-        release_app_gesture(io_state, gesture).await;
+        release_app_gesture(io_state, gesture, attached.client).await;
         return Ok(AppMouse::Consumed {
             redraw: false,
             input: false,
@@ -3711,7 +3733,7 @@ async fn handle_app_mouse(
         ButtonAction::Release => Lane::Urgent,
         ButtonAction::Drag => Lane::Main,
     };
-    if !forward_bytes_to_pane(io_state, pane_id, bytes, lane).await {
+    if !forward_bytes_to_pane(io_state, pane_id, bytes, lane, attached.client).await {
         // Dropped on the floor. Opening a gesture now would hand the app a
         // release with no press behind it.
         return Ok(AppMouse::Consumed {
@@ -3929,6 +3951,7 @@ async fn forward_bytes_to_pane(
     pane_id: PaneId,
     bytes: Vec<u8>,
     lane: Lane,
+    client: Option<shux_core::event::ClientId>,
 ) -> bool {
     let mut state = io_state.lock().await;
     let Some(writer) = state.writers.get(&pane_id) else {
@@ -3942,26 +3965,35 @@ async fn forward_bytes_to_pane(
         }
     };
     // Urgent is a release: what a takeover resize must not overtake.
-    if lane == Lane::Urgent {
+    if lane == Lane::Urgent
+        && let Some(client) = client
+    {
         let written = permit.watch();
-        state.mouse_release_written.insert(pane_id, written);
+        state
+            .mouse_release_written
+            .insert((pane_id, client), written);
     }
     state.send_outside_paste(pane_id, permit, bytes)
 }
 
-/// Waits, a bounded while, for the last mouse release sent to any of `panes`
-/// to be written: the PTY applies a resize ahead of queued input, so a
-/// takeover issued at once could reach the program before the release.
-async fn releases_written(io_state: &Arc<Mutex<PaneIoState>>, panes: &[PaneId]) {
-    let waits: Vec<_> = {
-        let mut state = io_state.lock().await;
-        panes
-            .iter()
-            .filter_map(|p| state.mouse_release_written.remove(p))
-            .collect()
-    };
-    for written in waits {
-        let _ = tokio::time::timeout(RELEASE_WRITE_BOUND, written).await;
+/// Whether the last mouse release `client` sent `pane` was written within a
+/// bounded wait. The PTY applies a resize ahead of queued input, so a takeover
+/// is not issued until it was: one not written by then is dropped.
+async fn release_written(
+    io_state: &Arc<Mutex<PaneIoState>>,
+    pane: PaneId,
+    client: shux_core::event::ClientId,
+) -> bool {
+    let waiting = io_state
+        .lock()
+        .await
+        .mouse_release_written
+        .remove(&(pane, client));
+    match waiting {
+        Some(written) => tokio::time::timeout(RELEASE_WRITE_BOUND, written)
+            .await
+            .is_ok(),
+        None => true,
     }
 }
 
@@ -4050,7 +4082,7 @@ async fn handle_wheel(
             if let Some(bytes) = cell.and_then(|(local_col, local_row)| {
                 encode_mouse_wheel(up, sgr, local_col, local_row)
             }) {
-                forward_bytes_to_pane(io_state, pane_id, bytes, Lane::Main).await;
+                forward_bytes_to_pane(io_state, pane_id, bytes, Lane::Main, None).await;
             }
         }
         WheelRouting::ArrowKeys => {
@@ -4059,7 +4091,7 @@ async fn handle_wheel(
             for _ in 0..3 {
                 bytes.extend_from_slice(seq);
             }
-            forward_bytes_to_pane(io_state, pane_id, bytes, Lane::Main).await;
+            forward_bytes_to_pane(io_state, pane_id, bytes, Lane::Main, None).await;
         }
         WheelRouting::Scrollback => {
             // This tier is only reached while copy mode is INACTIVE (an active
@@ -8403,7 +8435,7 @@ mod tests {
             .get_mut(&pane)
             .expect("vt")
             .resize(20, 40);
-        release_app_gesture(&h.fixture.io_state, &mut h.gesture).await;
+        release_app_gesture(&h.fixture.io_state, &mut h.gesture, None).await;
         assert_eq!(drain(&mut wr), "\x1b[<0;3;20m");
         h.fixture.stop();
     }
@@ -8692,7 +8724,7 @@ mod tests {
         h.send(MouseKind::Drag, ProtoMouseButton::Left, 14, 7).await;
         assert_eq!(recv_text(&mut wr).await, "\x1b[<32;14;7M");
 
-        release_app_gesture(&h.fixture.io_state, &mut h.gesture).await;
+        release_app_gesture(&h.fixture.io_state, &mut h.gesture, None).await;
         assert_eq!(
             recv_text(&mut wr).await,
             "\x1b[<0;14;7m",
@@ -8700,7 +8732,7 @@ mod tests {
         );
         assert_eq!(h.gesture, SelectionDrag::None);
         // Idempotent: nothing left to release.
-        release_app_gesture(&h.fixture.io_state, &mut h.gesture).await;
+        release_app_gesture(&h.fixture.io_state, &mut h.gesture, None).await;
         assert_no_bytes(&mut wr, "a finished gesture releases once").await;
         h.fixture.stop();
     }
@@ -12467,6 +12499,182 @@ mod tests {
             .await;
         idle_for(QUIET).await;
         assert_eq!(last(), by_a, "a press help ended was counted later");
+        fixture.stop();
+    }
+
+    /// Review of #190: a viewer's release the program has not read within the
+    /// bound is still queued behind a resize the PTY would apply first; that
+    /// takeover is dropped, not taken late, and does not come back.
+    #[tokio::test(start_paused = true)]
+    async fn a_takeover_whose_release_is_not_written_in_time_is_dropped() {
+        let fixture = attach_fixture().await;
+        let (mut writes, log, _a, mut b, by_a) = driver_and_viewer_over_an_app(&fixture).await;
+        let last = || *log.lock().unwrap().last().expect("sized");
+        let at = point_in(&fixture, fixture.first_pane, 80, (2, 2)).await;
+        b.send(&left_button(MouseKind::Down, at, b.written_frame))
+            .await;
+        idle_for(QUIET).await;
+        let _press = writes.try_recv().expect("the press reached the app");
+        b.send(&left_button(MouseKind::Up, at, b.written_frame))
+            .await;
+        idle_for(QUIET).await;
+        assert_eq!(last(), by_a, "taken with the release still queued");
+        let _release = writes.try_recv().expect("the release reached the app");
+        idle_for(QUIET).await;
+        assert_eq!(last(), by_a, "the dropped takeover was taken later");
+        fixture.stop();
+    }
+
+    /// Review of #190: the driver's release keeps its hold for a settle window,
+    /// as its keys do, though it held the button still for longer than one.
+    #[tokio::test(start_paused = true)]
+    async fn the_drivers_release_keeps_the_panes_for_a_settle_window() {
+        let fixture = attach_fixture().await;
+        let (_writes, log, mut a, mut b, by_a) = driver_and_viewer_over_an_app(&fixture).await;
+        let last = || *log.lock().unwrap().last().expect("sized");
+        let at = point_in(&fixture, fixture.first_pane, 200, (2, 2)).await;
+        a.send(&left_button(MouseKind::Down, at, a.written_frame))
+            .await;
+        idle_for(crate::clients::SETTLE + QUIET).await;
+        a.send(&left_button(MouseKind::Up, at, a.written_frame))
+            .await;
+        idle_for(QUIET).await;
+        b.key(b"x").await;
+        idle_for(QUIET).await;
+        assert_eq!(
+            last(),
+            by_a,
+            "a key took the panes the moment the driver let go"
+        );
+        fixture.stop();
+    }
+
+    /// Review of #190: a focusing press's pending credit goes with its text
+    /// drag when modal copy mode takes the drag over; a later click on
+    /// another pane's surplus does not spend it.
+    #[tokio::test(start_paused = true)]
+    async fn copy_mode_ends_a_focusing_presss_credit() {
+        let fixture = attach_fixture().await;
+        let (shell, other) = (fixture.first_pane, fixture.second_pane);
+        let (_w, rx, _s) = seed_io_for_pane(&fixture.io_state, shell).await;
+        let (_w2, rx2, _s2) = seed_io_for_pane(&fixture.io_state, other).await;
+        let log = fake_pty(&fixture.io_state, shell, rx);
+        let _log2 = fake_pty(&fixture.io_state, other, rx2);
+        let last = || *log.lock().unwrap().last().expect("sized");
+        let _ = fixture.graph.focus_pane(other).await;
+        let mut a = Client::attach(&fixture, 200).await;
+        idle_for(QUIET).await;
+        a.catch_up().await;
+        let by_a = last();
+        {
+            let mut io = fixture.io_state.lock().await;
+            io.clients.pin(other);
+            let vt = io.vts.get_mut(&other).expect("pane vt");
+            vt.resize(4, 12);
+            vt.process(b"\x1b[?1002h\x1b[?1006h");
+        }
+        let mut b = Client::attach(&fixture, 80).await;
+        idle_for(QUIET).await;
+        b.catch_up().await;
+        let from = point_in(&fixture, shell, 80, (0, 0)).await;
+        b.send(&left_button(MouseKind::Down, from, b.written_frame))
+            .await;
+        b.send(&AttachClientFrame::Action {
+            kind: ActionKind::EnterCopyMode,
+            args: Default::default(),
+        })
+        .await;
+        b.send(&left_button(MouseKind::Up, from, b.written_frame))
+            .await;
+        b.key(b"q").await;
+        idle_for(QUIET).await;
+        b.catch_up().await;
+        let surplus = point_in(&fixture, other, 80, (1, 10)).await;
+        b.send(&left_button(MouseKind::Down, surplus, b.written_frame))
+            .await;
+        b.send(&left_button(MouseKind::Up, surplus, b.written_frame))
+            .await;
+        idle_for(QUIET).await;
+        assert_eq!(last(), by_a, "a click on nothing spent a drag's old credit");
+        fixture.stop();
+    }
+
+    /// Review of #190: a frame clamps the copy view it drew; a different view
+    /// opened over another pane while it was drawn keeps its own scroll.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_copy_view_clamp_lands_only_on_the_view_it_was_for() {
+        let fixture = attach_fixture().await;
+        let (short, long) = (fixture.first_pane, fixture.second_pane);
+        seed_io_for_pane(&fixture.io_state, short).await;
+        let _wr = seed_scrollback_pane(&fixture.io_state, long, b"").await;
+        let mut attached = fixture.attached.clone();
+        attached.active_pane_id = short;
+        let mut past = shux_ui::CopyModeState::new();
+        past.scroll_offset = 10_000;
+        attached.copy_mode = Some(past);
+        let session = Arc::new(Mutex::new(attached));
+        let onboarding = crate::onboarding::OnboardingHandle::from_state_for_test(
+            crate::onboarding::OnboardingState {
+                prefix_discovered: true,
+                welcome_toast_seen: true,
+            },
+        );
+        let held = onboarding.hold_for_test().await;
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = fixture.cancel.child_token();
+        let render = tokio::spawn(run_render_loop(
+            fixture.graph.clone(),
+            fixture.io_state.clone(),
+            test_config(),
+            SegmentCache::new(),
+            crate::session_meta::SessionMetaCache::new(),
+            onboarding.clone(),
+            std::time::Instant::now(),
+            session.clone(),
+            Arc::new(Mutex::new((100, 30))),
+            tx,
+            cancel.clone(),
+            false,
+            false,
+            Duration::from_secs(3600),
+            WELCOME_TOAST_DWELL,
+            shux_vt::monotonic_now_ns,
+        ));
+        let io_state = fixture.io_state.clone();
+        shux_testkit::wait_until_async("the frame to hold io_state", || {
+            let io_state = io_state.clone();
+            async move { io_state.try_lock().is_err() }
+        })
+        .await;
+        {
+            let mut s = session.lock().await;
+            let mut view = shux_ui::CopyModeState::new();
+            view.scroll_offset = 100;
+            s.copy_mode = Some(view);
+            s.active_pane_id = long;
+        }
+        drop(held);
+        let deadline = shux_testkit::Deadline::start();
+        loop {
+            match deadline.run(rx.recv()).await {
+                Some(Some(AttachServerFrame::Render { frame: Some(_), .. })) => break,
+                Some(Some(_)) => {}
+                Some(None) | None => panic!("no frame"),
+            }
+        }
+        let offset = session
+            .lock()
+            .await
+            .copy_mode
+            .as_ref()
+            .map(|cm| cm.scroll_offset);
+        assert_eq!(
+            offset,
+            Some(100),
+            "another pane's copy view was clamped to this one's bounds"
+        );
+        cancel.cancel();
+        render.await.expect("render loop");
         fixture.stop();
     }
 
