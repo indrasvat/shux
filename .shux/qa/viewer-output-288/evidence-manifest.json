@@ -1,6 +1,6 @@
 {
   "solid_qa_report": "SOLID-QA.md",
-  "commit_under_audit": "c9657f219b4262ffd865a53be87a397adde2db1c",
+  "commit_under_audit": "ebbafab8673a1a9ba14aba89e610322e8e619c24",
   "tier": "full",
   "neutrality": "neutrality.json",
   "dootsabha_design": "council-design.md",

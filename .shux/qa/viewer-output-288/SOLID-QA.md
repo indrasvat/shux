@@ -113,3 +113,16 @@ VERDICT: PASS
 - The first attempt's WezTerm mux (7130) and its children were killed by pid.
 - The re-run harness stopped its own mux and daemons.
 - No orphaned probe, attach, `bash --norc` or sleep processes remain.
+
+## Delta: rebase onto main after #289 merged
+
+The branch was rebased from d36b738 onto f61f664 (#289). commit_under_audit
+moves to ebbafab, the rebased copy of c9657f2. `git diff c9657f2 ebbafab`
+over every VT path differs only in crates/shux-ui/src/statusbar.rs, where
+#289's `StatusSegment.group` field arrived from main (trivial tier there,
+neutrality 0/0); no VT code of this change moved. After it, 7bff949 adds
+`plain: false` to #289's test hellos (tests only). `make vt-neutrality
+BASE=f61f664` re-run at 7bff949: 0/0 on every layer. `make check` green at
+7bff949. The pixel metrics and WezTerm A/B above were measured before the
+rebase; #289 changes nothing a single viewer draws ("◉ N attached" appears
+only with two or more).
