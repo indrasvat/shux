@@ -759,3 +759,79 @@ fn a_client_that_started_the_daemon_keeps_no_zombie() {
     assert!(started, "events watch never started the daemon");
     assert!(reaped, "unreaped children: {left:?}");
 }
+
+// ── `--format json` errors are JSON on stdout ───────────────────────────────
+
+/// Under `--format json` a failing command prints `{"error": …}` on stdout
+/// and nothing on stderr, whether the CLI or the daemon raised the error.
+#[test]
+fn a_json_error_is_json_on_stdout() {
+    let mut env = Env::new();
+    let s = env.session("jsonerr");
+    let missing_pane = "00000000-0000-0000-0000-000000000000";
+    for (who, args) in [
+        ("the CLI", vec!["pane", "capture", "-s", "no-such-session"]),
+        (
+            "the daemon",
+            vec!["pane", "capture", "-s", &s, "-p", missing_pane],
+        ),
+    ] {
+        let mut full = vec!["--format", "json"];
+        full.extend_from_slice(&args);
+        let out = env.run(&full);
+        assert!(!out.status.success(), "{who}: {args:?} succeeded");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let v: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+            panic!(
+                "{who}: stdout is not JSON ({e}):\n{stdout}\nstderr:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
+        assert_eq!(v["error"]["code"], -32004, "{who}: {v}");
+        assert!(
+            out.stderr.is_empty(),
+            "{who}: stderr is not empty: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+// ── `pane resize --delta` stays inside its documented range ────────────────
+
+#[test]
+fn resize_rejects_a_delta_outside_the_documented_range() {
+    let mut env = Env::new();
+    let s = env.session("delta-oob");
+    env.ok(&["pane", "split", "-s", &s, "-d", "horizontal"]);
+    let sizes = |env: &Env| {
+        env.json(&["pane", "list", "-s", &s])
+            .as_array()
+            .map(|a| a.iter().map(|p| p["version"].clone()).collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+    let before = sizes(&env);
+    for bad in ["4", "-2", "1.5", "nan", "inf"] {
+        let arg = format!("--delta={bad}");
+        let stderr = env.fails(&["pane", "resize", "-s", &s, "-d", "horizontal", &arg]);
+        assert!(
+            stderr.contains("-1.0") && stderr.contains("1.0"),
+            "--delta {bad} must be refused with the range named:\n{stderr}"
+        );
+    }
+    assert_eq!(
+        sizes(&env),
+        before,
+        "a refused delta still changed the layout"
+    );
+    for good in ["0.2", "-0.2"] {
+        env.ok(&[
+            "pane",
+            "resize",
+            "-s",
+            &s,
+            "-d",
+            "horizontal",
+            &format!("--delta={good}"),
+        ]);
+    }
+}

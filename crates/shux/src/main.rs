@@ -51,7 +51,7 @@ fn main() {
         if let Some(refusal) = shux::client::DaemonInUse::find(&e) {
             cli::exit_daemon_in_use(refusal, format);
         }
-        report_fatal(&e);
+        report_fatal(&e, format);
     }
 }
 
@@ -132,7 +132,7 @@ fn die_of_sigpipe() -> ! {
 /// Exiting here means the `Termination` path is never reached, so the message
 /// an operator sees is the one we chose to write. The backtrace stays
 /// reachable behind the standard opt-in, for whoever is actually debugging.
-fn report_fatal(e: &anyhow::Error) -> ! {
+fn report_fatal(e: &anyhow::Error, format: cli::OutputFormat) -> ! {
     use std::io::Write as _;
 
     let closed = e
@@ -143,9 +143,29 @@ fn report_fatal(e: &anyhow::Error) -> ! {
         die_of_sigpipe();
     }
 
-    // `{:#}` walks the anyhow chain onto one line; `print_error` owns the
-    // marker, the colour and the NO_COLOR check.
-    style::print_error(&format!("{e:#}"));
+    if matches!(format, cli::OutputFormat::Json) {
+        // The documented contract: `{"error": {code, message, data}}` on
+        // stdout, nothing on stderr, whoever raised it.
+        let rpc = e.chain().find_map(|c| match c.downcast_ref() {
+            Some(cli::rpc::RpcClientError::Rpc {
+                code,
+                message,
+                data,
+            }) => Some(serde_json::json!({ "code": code, "message": message, "data": data })),
+            _ => None,
+        });
+        let error = rpc.unwrap_or_else(
+            || serde_json::json!({ "code": -32603, "message": format!("{e:#}"), "data": null }),
+        );
+        match serde_json::to_string_pretty(&serde_json::json!({ "error": error })) {
+            Ok(s) => println!("{}", style::json_safe(&s)),
+            Err(_) => style::print_error(&format!("{e:#}")),
+        }
+    } else {
+        // `{:#}` walks the anyhow chain onto one line; `print_error` owns the
+        // marker, the colour and the NO_COLOR check.
+        style::print_error(&format!("{e:#}"));
+    }
 
     if std::env::var_os("RUST_BACKTRACE").is_some_and(|v| !v.is_empty() && v != "0") {
         // anyhow's Debug is exactly what Termination used to print — chain

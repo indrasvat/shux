@@ -260,7 +260,10 @@ pub(crate) fn register_pane_methods(
                 let delta = params
                     .get("delta")
                     .and_then(|v| v.as_f64())
-                    .unwrap_or(0.1) as f32;
+                    .unwrap_or(0.1);
+                crate::pane_command::check_delta(delta)
+                    .map_err(|e| shux_rpc::RpcError::invalid_params(&format!("delta: {e}")))?;
+                let delta = delta as f32;
 
                 let expected_version = parse_expected_version(&params)?;
 
