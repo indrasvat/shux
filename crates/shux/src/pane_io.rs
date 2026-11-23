@@ -117,6 +117,11 @@ pub struct PaneIoState {
     /// fire-and-forget; `ack: Some(tx)` for synchronous RPCs that must
     /// see the new dimensions on return.
     pub resizers: HashMap<shux_core::model::PaneId, mpsc::Sender<ResizeRequest>>,
+    /// The size last sent to each pane's resizer, queued or applied.
+    pub requested_sizes: HashMap<shux_core::model::PaneId, shux_pty::handle::PtySize>,
+    /// Each session's last sizing: its driver's cols, rows and border style.
+    /// A pane spawned into the session starts at its rect from this.
+    pub layout_basis: HashMap<shux_core::model::SessionId, (u16, u16, String)>,
     /// Per-pane cancellation tokens. These are child tokens of the daemon
     /// shutdown token, so daemon shutdown still cancels every pane, while
     /// explicit pane/window/session kills can target only the affected panes.
@@ -248,6 +253,8 @@ impl PaneIoState {
         Self {
             writers: HashMap::new(),
             resizers: HashMap::new(),
+            requested_sizes: HashMap::new(),
+            layout_basis: HashMap::new(),
             shutdowns: HashMap::new(),
             pty_done: HashMap::new(),
             scratch_ends: HashMap::new(),
@@ -618,6 +625,7 @@ impl PaneIoState {
             self.forget_command(*pane_id);
             self.sync_gates.remove(pane_id);
             self.resizers.remove(pane_id);
+            self.requested_sizes.remove(pane_id);
             self.clients.unpin(*pane_id);
             if let Some(rx) = self.pty_done.remove(pane_id) {
                 done.push(rx);

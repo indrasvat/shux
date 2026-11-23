@@ -306,6 +306,65 @@ mod tests {
         );
     }
 
+    /// `-p` without `-w`: the CLI names the session's active window beside a
+    /// pane of a background window. That pane is in the session, so it is
+    /// accepted.
+    #[tokio::test]
+    async fn a_background_pane_named_with_the_active_window_is_accepted() {
+        let h = RpcHarness::new();
+        let (s, _w, background) = h.seed_session("gamma").await;
+        let active = h
+            .graph
+            .create_window(s, "second".into(), "/tmp".into())
+            .await
+            .expect("second window");
+        h.graph.focus_window(active, None).await.expect("focus it");
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::pane_io::ResizeRequest>(4);
+        h.io.lock().await.resizers.insert(background, tx);
+        tokio::spawn(async move {
+            while let Some(req) = rx.recv().await {
+                if let Some(ack) = req.ack {
+                    let _ = ack.send(());
+                }
+            }
+        });
+        dispatch_ok(
+            &h.router,
+            "pane.set_size",
+            serde_json::json!({ "window_id": active.to_string(), "pane_id": background.to_string(), "cols": 90, "rows": 30 }),
+        )
+        .await;
+    }
+
+    /// A set_size whose caller goes away mid-resize leaves no pin behind.
+    #[tokio::test]
+    async fn a_cancelled_set_size_leaves_no_pin() {
+        let h = RpcHarness::new();
+        let (_s, _w, pane) = h.seed_session("cancelled").await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::pane_io::ResizeRequest>(4);
+        h.io.lock().await.resizers.insert(pane, tx);
+        let router = h.router.clone();
+        let id = pane.to_string();
+        let call = tokio::spawn(async move {
+            router
+                .dispatch(
+                    "pane.set_size",
+                    Some(serde_json::json!({ "pane_id": id, "cols": 90, "rows": 30 })),
+                )
+                .await
+        });
+        // Held, never acked: the call is still waiting when it is dropped.
+        let held = rx.recv().await.expect("the resize request");
+        call.abort();
+        let _ = call.await;
+        drop(held);
+        let clients = h.io.lock().await.clients.clone();
+        assert!(
+            !clients.is_pinned(pane),
+            "a cancelled set_size left its pin"
+        );
+    }
+
     /// Two set_size calls race: one fails after the other succeeded. The
     /// pane stays pinned, as the successful call said.
     #[tokio::test]

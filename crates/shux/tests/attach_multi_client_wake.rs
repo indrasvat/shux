@@ -395,3 +395,59 @@ async fn zoom_resizes_only_the_zoomed_pane() {
     });
     assert_eq!(size(&h, &bottom), hidden, "zoom resized a hidden pane");
 }
+
+/// Renames wake the size reconciler; none of them may resize a pane. The
+/// pane counts the SIGWINCHes it receives and prints the count on demand.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rename_storm_resizes_nothing() {
+    let h = Harness::new();
+    let fifo = h.work.path().join("count");
+    nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).expect("mkfifo");
+    let program = format!(
+        "n=0; r=0; trap 'n=$((n+1))' WINCH; printf 'RE%sADY\\n' ''; \
+         while :; do if read x < '{}'; then r=$((r+1)); printf 'ROUND%s=%s\\n' \"$r\" \"$n\"; fi; done",
+        fifo.display()
+    );
+    let created = h.rpc(
+        "session.create",
+        serde_json::json!({ "name": "storm", "command": ["/bin/sh", "-c", program] }),
+    );
+    let pane = created["result"]["pane_id"]
+        .as_str()
+        .expect("pane id")
+        .to_string();
+    let window = created["result"]["window_id"]
+        .as_str()
+        .expect("window id")
+        .to_string();
+    let mut client = Client::attach(&h, "storm").await;
+    assert!(client.draws("READY").await);
+    shux_testkit::wait_until("the pane to take the client's size", || {
+        size(&h, &pane) != (80, 24)
+    });
+    let count = |round: u32| {
+        release(&fifo);
+        let needle = format!("ROUND{round}=");
+        let mut seen = None;
+        shux_testkit::wait_until("the pane to report its SIGWINCH count", || {
+            let text =
+                h.rpc("pane.capture", serde_json::json!({ "pane_id": pane }))["result"]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+            seen = text
+                .lines()
+                .find_map(|l| l.trim().strip_prefix(&needle).map(str::to_string));
+            seen.is_some()
+        });
+        seen.expect("count")
+    };
+    let before = count(1);
+    for i in 0..30 {
+        h.rpc(
+            "window.rename",
+            serde_json::json!({ "id": window, "name": format!("t{i}") }),
+        );
+    }
+    assert_eq!(count(2), before, "a rename resized the pane");
+}

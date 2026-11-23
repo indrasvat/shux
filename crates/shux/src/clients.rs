@@ -159,7 +159,12 @@ impl ClientRegistry {
     /// on some unrelated change.
     pub fn mark_input(&self, id: ClientId, now: Instant) -> bool {
         let mut s = self.state();
-        let Some(session) = s.clients.get(&id).map(|e| e.info.session_id) else {
+        let Some(session) = s
+            .clients
+            .get(&id)
+            .filter(|e| e.info.votes)
+            .map(|e| e.info.session_id)
+        else {
             return false;
         };
         let driver = s.drivers.get(&session).copied();
@@ -175,9 +180,13 @@ impl ClientRegistry {
         if let Some(e) = s.clients.get_mut(&id) {
             e.info.last_input = Some(now);
         }
-        drop(s);
-        // The driver typing changes nothing about who drives.
+        // The driver typing changes nothing about who drives. A takeover is
+        // recorded here, so the next key is held against this one.
         let takes = driver != Some(id);
+        if takes {
+            s.drivers.insert(session, id);
+        }
+        drop(s);
         if takes {
             self.bump();
         }
@@ -298,6 +307,38 @@ impl Drop for Registered {
     }
 }
 
+/// A `pane.set_size` pin, released on drop unless kept, so a call that fails
+/// or is cancelled leaves no pin it added. A pin that was already there stays.
+pub struct PinGuard {
+    clients: ClientRegistry,
+    pane: PaneId,
+    added: Option<u64>,
+}
+
+impl PinGuard {
+    pub fn take(clients: &ClientRegistry, pane: PaneId) -> Self {
+        let was = clients.is_pinned(pane);
+        let generation = clients.pin(pane);
+        Self {
+            clients: clients.clone(),
+            pane,
+            added: (!was).then_some(generation),
+        }
+    }
+
+    pub fn keep(mut self) {
+        self.added = None;
+    }
+}
+
+impl Drop for PinGuard {
+    fn drop(&mut self) {
+        if let Some(generation) = self.added {
+            self.clients.release(self.pane, generation);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,6 +424,28 @@ mod tests {
 
         drop(gb);
         assert_eq!(driver(&reg), Some(a.id));
+    }
+
+    /// Two clients type back to back with no sizing pass between: the first
+    /// takes the panes and the second is held off by its settle window.
+    #[tokio::test(start_paused = true)]
+    async fn competing_keys_hand_the_panes_over_once() {
+        let reg = ClientRegistry::default();
+        let s = SessionId::new();
+        let (a, b, c) = (info(s), info(s), info(s));
+        let _ga = reg.register(a.clone(), CancellationToken::new());
+        let _gb = reg.register(b.clone(), CancellationToken::new());
+        let _gc = reg.register(c.clone(), CancellationToken::new());
+        reg.mark_input(a.id, Instant::now());
+        assert_eq!(reg.driver(s).map(|d| d.id), Some(a.id));
+        tokio::time::advance(SETTLE).await;
+        assert!(reg.mark_input(b.id, Instant::now()));
+        tokio::time::advance(Duration::from_millis(10)).await;
+        assert!(
+            !reg.mark_input(c.id, Instant::now()),
+            "a second key also took the panes"
+        );
+        assert_eq!(reg.driver(s).map(|d| d.id), Some(b.id));
     }
 
     #[test]

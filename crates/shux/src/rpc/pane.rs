@@ -233,7 +233,7 @@ pub(crate) fn register_pane_methods(
                 }
             },
         )
-        .register_with_policy("pane.resize", Policy::fixed(Sensitivity::OwnedMutation), move |params: Option<serde_json::Value>| {
+        .register_to_completion("pane.resize", Policy::fixed(Sensitivity::OwnedMutation), move |params: Option<serde_json::Value>| {
             let gh = g5.clone();
             let io = io_resize.clone();
             async move {
@@ -291,7 +291,7 @@ pub(crate) fn register_pane_methods(
                 }))
             }
         })
-        .register_with_policy("pane.swap", Policy::fixed(Sensitivity::OwnedMutation), move |params: Option<serde_json::Value>| {
+        .register_to_completion("pane.swap", Policy::fixed(Sensitivity::OwnedMutation), move |params: Option<serde_json::Value>| {
             let gh = g7.clone();
             let io = io_swap.clone();
             async move {

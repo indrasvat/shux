@@ -7,6 +7,7 @@ use std::time::Duration;
 use shux_rpc::{Policy, Sensitivity};
 use tokio::sync::Mutex;
 
+use crate::clients::PinGuard;
 use crate::lens_render::{
     glance_row_text, lens_pixel_budget_check, parse_glance_masks, render_lens_heat_png,
 };
@@ -1930,27 +1931,25 @@ pub(crate) fn register_pane_io_methods(
                     let resizer = resizer.ok_or_else(|| {
                         shux_rpc::RpcError::not_found("pane resizer", &pane_id.to_string())
                     })?;
-                    // Pinned before the resize lands, so no client's size can
-                    // slip in between; taken back if the resize fails.
-                    let was_pinned = clients.is_pinned(pane_id);
-                    let generation = clients.pin(pane_id);
-                    let sent = resizer
-                        .send(ResizeRequest {
+                    // The slot is reserved first, then the pin and the send
+                    // happen in one sizing turn: a layout resize is either
+                    // queued ahead of this one or sees the pin.
+                    let permit = resizer
+                        .reserve()
+                        .await
+                        .map_err(|_| shux_rpc::RpcError::internal("pane resize channel closed"))?;
+                    let pin = {
+                        let _turn = clients.sizing_turn().await;
+                        let pin = PinGuard::take(&clients, pane_id);
+                        permit.send(ResizeRequest {
                             size: pty_size,
                             ack: Some(ack_tx),
-                        })
-                        .await
-                        .map_err(|_| shux_rpc::RpcError::internal("pane resize channel closed"));
-                    let acked = match sent {
-                        Ok(()) => resize_acked(ack_rx).await,
-                        Err(e) => Err(e),
+                        });
+                        io.lock().await.requested_sizes.insert(pane_id, pty_size);
+                        pin
                     };
-                    if let Err(e) = acked {
-                        if !was_pinned {
-                            clients.release(pane_id, generation);
-                        }
-                        return Err(e);
-                    }
+                    resize_acked(ack_rx).await?;
+                    pin.keep();
                     Ok(serde_json::json!({
                         "pane_id": pane_id.to_string(),
                         "rows": rows,
