@@ -342,8 +342,9 @@ pub enum SessionCommand {
         session: Option<String>,
 
         /// Text and colour only: the daemon sends this terminal no
-        /// hyperlinks, cursor shape or colour, or images. For a terminal
-        /// whose owner did not choose to run the panes' programs.
+        /// hyperlinks, cursor shape or colour, images, or invisible
+        /// direction controls. For a terminal whose owner did not choose to
+        /// run the panes' programs.
         #[arg(long)]
         plain: bool,
     },
