@@ -9947,6 +9947,7 @@ mod tests {
             rows: 60,
             client_version: "detach-then-stop".to_string(),
             graphics: false,
+            plain: false,
         };
         framed
             .send(Bytes::from(serde_json::to_vec(&hello).expect("hello json")))
@@ -10043,6 +10044,7 @@ mod tests {
             rows: 60,
             client_version: "slow-then-removed".to_string(),
             graphics: false,
+            plain: false,
         };
         framed
             .send(Bytes::from(serde_json::to_vec(&hello).expect("hello json")))
@@ -10184,6 +10186,7 @@ mod tests {
             rows: 60,
             client_version: "copy-then-removed".to_string(),
             graphics: false,
+            plain: false,
         };
         let send = |f: &AttachClientFrame| Bytes::from(serde_json::to_vec(f).expect("frame json"));
         framed
@@ -10291,6 +10294,7 @@ mod tests {
             rows: 60,
             client_version: "stopped-reader".to_string(),
             graphics: false,
+            plain: false,
         };
         framed
             .send(Bytes::from(serde_json::to_vec(&hello).expect("hello json")))
