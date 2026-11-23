@@ -49,13 +49,19 @@ impl State {
     }
 }
 
+#[derive(Clone, Copy)]
+struct Pin {
+    generation: u64,
+    kept: bool,
+}
+
 #[derive(Default)]
 struct State {
     clients: HashMap<ClientId, Entry>,
     drivers: HashMap<SessionId, ClientId>,
     /// Each pin carries the generation that set it, so a failed resize can
     /// take back only its own.
-    pins: HashMap<PaneId, u64>,
+    pins: HashMap<PaneId, Pin>,
     next_pin: u64,
     next_seq: u64,
 }
@@ -94,6 +100,11 @@ impl ClientRegistry {
     /// Hold for a whole sizing pass.
     pub async fn sizing_turn(&self) -> tokio::sync::OwnedMutexGuard<()> {
         self.sizing.clone().lock_owned().await
+    }
+
+    #[cfg(test)]
+    pub fn sizing_busy(&self) -> bool {
+        self.sizing.try_lock().is_err()
     }
 
     /// Wakes whenever a size decision may have changed.
@@ -227,13 +238,28 @@ impl ClientRegistry {
     }
 
     /// Pin a pane at the size it was set to: no client's size moves it.
-    /// Returns the pin's generation, for [`ClientRegistry::release`].
-    pub fn pin(&self, pane: PaneId) -> u64 {
+    pub fn pin(&self, pane: PaneId) {
+        self.place_pin(pane, true);
+    }
+
+    /// A pin that lasts only if [`ClientRegistry::keep`] confirms it; until
+    /// then [`ClientRegistry::release`] with its generation takes it back.
+    fn pin_provisionally(&self, pane: PaneId) -> u64 {
+        self.place_pin(pane, false)
+    }
+
+    fn place_pin(&self, pane: PaneId, kept: bool) -> u64 {
         let (generation, new) = {
             let mut s = self.state();
             s.next_pin += 1;
             let generation = s.next_pin;
-            (generation, s.pins.insert(pane, generation).is_none())
+            // Replacing a kept pin keeps it kept: a later failure must not
+            // take back a pin an earlier call reported.
+            let kept = kept || s.pins.get(&pane).is_some_and(|p| p.kept);
+            (
+                generation,
+                s.pins.insert(pane, Pin { generation, kept }).is_none(),
+            )
         };
         if new {
             self.bump();
@@ -241,11 +267,22 @@ impl ClientRegistry {
         generation
     }
 
-    /// Take back the pin `generation` set, unless a later pin replaced it.
-    pub fn release(&self, pane: PaneId, generation: u64) {
+    /// Confirm a pane's pin: its set_size reported success.
+    fn keep(&self, pane: PaneId) {
+        if let Some(p) = self.state().pins.get_mut(&pane) {
+            p.kept = true;
+        }
+    }
+
+    /// Take back the provisional pin `generation` placed, unless a later pin
+    /// replaced it or a call confirmed it.
+    fn release(&self, pane: PaneId, generation: u64) {
         let released = {
             let mut s = self.state();
-            let ours = s.pins.get(&pane) == Some(&generation);
+            let ours = s
+                .pins
+                .get(&pane)
+                .is_some_and(|p| p.generation == generation && !p.kept);
             if ours {
                 s.pins.remove(&pane);
             }
@@ -307,33 +344,32 @@ impl Drop for Registered {
     }
 }
 
-/// A `pane.set_size` pin, released on drop unless kept, so a call that fails
-/// or is cancelled leaves no pin it added. A pin that was already there stays.
+/// A `pane.set_size` pin, taken back on drop unless kept, so a call that fails
+/// or is cancelled leaves no pin behind; a pin some call reported stays.
 pub struct PinGuard {
     clients: ClientRegistry,
     pane: PaneId,
-    added: Option<u64>,
+    generation: Option<u64>,
 }
 
 impl PinGuard {
     pub fn take(clients: &ClientRegistry, pane: PaneId) -> Self {
-        let was = clients.is_pinned(pane);
-        let generation = clients.pin(pane);
         Self {
             clients: clients.clone(),
             pane,
-            added: (!was).then_some(generation),
+            generation: Some(clients.pin_provisionally(pane)),
         }
     }
 
     pub fn keep(mut self) {
-        self.added = None;
+        self.clients.keep(self.pane);
+        self.generation = None;
     }
 }
 
 impl Drop for PinGuard {
     fn drop(&mut self) {
-        if let Some(generation) = self.added {
+        if let Some(generation) = self.generation {
             self.clients.release(self.pane, generation);
         }
     }

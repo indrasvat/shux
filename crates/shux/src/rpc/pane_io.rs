@@ -1940,12 +1940,16 @@ pub(crate) fn register_pane_io_methods(
                         .map_err(|_| shux_rpc::RpcError::internal("pane resize channel closed"))?;
                     let pin = {
                         let _turn = clients.sizing_turn().await;
+                        let mut state = io.lock().await;
+                        // No await from here to the send: a cancel cannot
+                        // leave the size recorded but unsent, or sent but
+                        // unrecorded.
                         let pin = PinGuard::take(&clients, pane_id);
+                        state.requested_sizes.insert(pane_id, pty_size);
                         permit.send(ResizeRequest {
                             size: pty_size,
                             ack: Some(ack_tx),
                         });
-                        io.lock().await.requested_sizes.insert(pane_id, pty_size);
                         pin
                     };
                     resize_acked(ack_rx).await?;

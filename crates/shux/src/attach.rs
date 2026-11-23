@@ -916,6 +916,8 @@ pub(crate) async fn reconcile_session(
     let clients = io_state.lock().await.clients.clone();
     let _turn = clients.sizing_turn().await;
     let Some(driver) = clients.driver(session) else {
+        // Nobody sizes it now: a pane spawned later starts at its default.
+        io_state.lock().await.layout_basis.remove(&session);
         return false;
     };
     let Some(window) = graph
@@ -1247,9 +1249,9 @@ async fn run_attach_loop(
                             Ok(b) => b,
                             Err(_) => continue,
                         };
-                        // A key goes to the pane focused now, whoever moved
-                        // it; a paste stays with the pane it started in.
-                        if paste.is_none() {
+                        // A key, or a paste's first piece, goes to the pane
+                        // focused now; a paste stays with the pane it began in.
+                        if paste.is_none() || pasting.is_none() {
                             sync_focus(&graph, &mut session, &render_session).await;
                         }
                         // Help-overlay capture: while the cheat sheet
@@ -10907,6 +10909,37 @@ mod tests {
             sized,
             "the last client leaving resized the panes"
         );
+        fixture.stop();
+    }
+
+    /// A paste from a client that has sent nothing since another window was
+    /// focused over RPC goes to the window the session now shows.
+    #[tokio::test(start_paused = true)]
+    async fn a_paste_after_an_rpc_window_switch_goes_to_the_shown_window() {
+        let fixture = attach_fixture().await;
+        let (mut first, _r1, _s1) = seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+        let (mut shown, _r2, _s2) =
+            seed_io_for_pane(&fixture.io_state, fixture.second_window_pane).await;
+        let mut client = Client::attach(&fixture, 100).await;
+        idle_for(QUIET).await;
+        let window = fixture.graph.snapshot().panes[&fixture.second_window_pane].window_id;
+        fixture
+            .graph
+            .focus_window(window, None)
+            .await
+            .expect("focus the other window");
+        client
+            .send(&AttachClientFrame::Paste {
+                data: BASE64.encode(b"pasted"),
+                more: false,
+            })
+            .await;
+        idle_for(QUIET).await;
+        assert!(
+            first.try_recv().is_err(),
+            "the paste went to the window no longer shown"
+        );
+        assert_eq!(shown.try_recv().ok(), Some(b"pasted".to_vec()));
         fixture.stop();
     }
 

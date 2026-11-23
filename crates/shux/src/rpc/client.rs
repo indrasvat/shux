@@ -336,6 +336,96 @@ mod tests {
         .await;
     }
 
+    /// A set_size cancelled inside its sizing turn leaves the queue and the
+    /// recorded size agreeing, so the sizer never skips a needed correction.
+    #[tokio::test]
+    async fn a_set_size_cancelled_mid_turn_leaves_no_stale_size() {
+        let h = RpcHarness::new();
+        let (_s, _w, pane) = h.seed_session("midturn").await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::pane_io::ResizeRequest>(4);
+        let probe = tx.clone();
+        let clients = {
+            let mut io = h.io.lock().await;
+            io.resizers.insert(pane, tx);
+            io.clients.clone()
+        };
+        // Stop the call at its sizing turn, after its slot is reserved; then
+        // hold the I/O state so the turn stops wherever it next needs it.
+        let turn = clients.sizing_turn().await;
+        let router = h.router.clone();
+        let id = pane.to_string();
+        let call = tokio::spawn(async move {
+            router
+                .dispatch(
+                    "pane.set_size",
+                    Some(serde_json::json!({ "pane_id": id, "cols": 120, "rows": 30 })),
+                )
+                .await
+        });
+        shux_testkit::wait_until_async("the call to reserve its slot", || {
+            let reserved = probe.capacity() < probe.max_capacity();
+            async move { reserved }
+        })
+        .await;
+        let held = h.io.lock().await;
+        drop(turn);
+        shux_testkit::wait_until_async("the call to take its sizing turn", || {
+            let busy = clients.sizing_busy();
+            async move { busy }
+        })
+        .await;
+        // The turn is handed over before the call runs: let it run to its
+        // next await, wherever that is.
+        tokio::task::yield_now().await;
+        call.abort();
+        let _ = call.await;
+        drop(held);
+        let queued = rx.try_recv().ok().map(|r| (r.size.cols, r.size.rows));
+        let recorded =
+            h.io.lock()
+                .await
+                .requested_sizes
+                .get(&pane)
+                .map(|s| (s.cols, s.rows));
+        assert_eq!(
+            queued, recorded,
+            "a size went out that the sizer does not know of"
+        );
+    }
+
+    /// Two set_size calls both fail: neither leaves its pin behind.
+    #[tokio::test]
+    async fn two_failed_set_sizes_leave_no_pin() {
+        let h = RpcHarness::new();
+        let (_s, _w, pane) = h.seed_session("twofail").await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::pane_io::ResizeRequest>(4);
+        h.io.lock().await.resizers.insert(pane, tx);
+        tokio::spawn(async move {
+            let first = rx.recv().await.expect("first resize");
+            let second = rx.recv().await.expect("second resize");
+            drop((first, second));
+        });
+        let set = |cols: u64| {
+            let router = h.router.clone();
+            let id = pane.to_string();
+            tokio::spawn(async move {
+                router
+                    .dispatch(
+                        "pane.set_size",
+                        Some(serde_json::json!({ "pane_id": id, "cols": cols, "rows": 30 })),
+                    )
+                    .await
+            })
+        };
+        let first = set(90);
+        tokio::task::yield_now().await;
+        let second = set(100);
+        let (first, second) = (first.await.unwrap(), second.await.unwrap());
+        assert!(first.is_err() && second.is_err(), "both were meant to fail");
+        let clients = h.io.lock().await.clients.clone();
+        assert!(!clients.is_pinned(pane), "two failed set_sizes left a pin");
+    }
+
     /// A set_size whose caller goes away mid-resize leaves no pin behind.
     #[tokio::test]
     async fn a_cancelled_set_size_leaves_no_pin() {
