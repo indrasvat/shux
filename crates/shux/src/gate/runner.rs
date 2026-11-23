@@ -123,7 +123,11 @@ impl Trace {
             return;
         };
         let written = (|| {
-            if let Some(file) = self.truncate.take() {
+            // Only a regular file is emptied: a FIFO or a device cannot be,
+            // and Linux refuses to try.
+            if let Some(file) = self.truncate.take()
+                && file.metadata()?.is_file()
+            {
                 file.set_len(0)?;
             }
             if self.signals.is_empty() {
