@@ -180,6 +180,8 @@ impl DirtyState {
 struct LogicalLine {
     cells: Vec<Cell>,
     display_width: usize,
+    /// Blanks after the last glyph of a hard line: kept where they fit, never wrapped.
+    trailing: Vec<Cell>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1479,11 +1481,12 @@ impl Grid {
 
         for (abs_row, row) in self.raw.iter().enumerate() {
             let is_tail = !row.wrapped;
-            let row_cells = if is_tail {
-                trim_default_trailing_cells(&row.cells)
+            let content_len = if is_tail {
+                content_len(&row.cells)
             } else {
-                row.cells.as_ref().clone()
+                row.cells.len()
             };
+            let row_cells = &row.cells[..content_len];
 
             if let Some((cursor_row, cursor_col)) = cursor_abs
                 && cursor_row == abs_row
@@ -1495,10 +1498,11 @@ impl Grid {
                 });
             }
 
-            current.display_width += display_width(&row_cells);
-            current.cells.extend(row_cells);
+            current.display_width += display_width(row_cells);
+            current.cells.extend_from_slice(row_cells);
 
             if is_tail {
+                current.trailing = row.cells[content_len..].to_vec();
                 logical_lines.push(std::mem::take(&mut current));
             }
         }
@@ -1512,18 +1516,15 @@ impl Grid {
         if let Some(anchor) = &mut cursor_anchor
             && let Some(line) = logical_lines.get(anchor.logical_line)
         {
-            anchor.display_offset = anchor.display_offset.min(line.display_width);
+            anchor.display_offset = anchor
+                .display_offset
+                .min(line.display_width + line.trailing.len());
         }
 
         let mut reflowed = VecDeque::new();
         let mut line_ranges = Vec::with_capacity(logical_lines.len());
         for line in logical_lines {
-            line_ranges.push(append_reflowed_line(
-                &mut reflowed,
-                line.cells,
-                line.display_width,
-                new_cols,
-            ));
+            line_ranges.push(append_reflowed_line(&mut reflowed, line, new_cols));
         }
 
         while reflowed.len() < new_rows {
@@ -1588,9 +1589,8 @@ impl Grid {
 
 impl ReflowedLineMap {
     fn position_for_offset(&self, offset: usize) -> (usize, usize) {
-        let offset = offset.min(self.display_width);
-        if offset == self.display_width {
-            return (self.end_row, self.end_col);
+        if offset >= self.display_width {
+            return (self.end_row, self.end_col + (offset - self.display_width));
         }
 
         for cell in &self.cells {
@@ -1603,13 +1603,12 @@ impl ReflowedLineMap {
     }
 }
 
-fn trim_default_trailing_cells(cells: &[Cell]) -> Vec<Cell> {
-    let end = cells
+fn content_len(cells: &[Cell]) -> usize {
+    cells
         .iter()
         .rposition(|cell| cell.ch != ' ' || cell.is_wide_continuation())
         .map(|idx| idx + 1)
-        .unwrap_or(0);
-    cells[..end].to_vec()
+        .unwrap_or(0)
 }
 
 fn display_width_until(cells: &[Cell], col: usize) -> usize {
@@ -1626,12 +1625,16 @@ fn display_width(cells: &[Cell]) -> usize {
 
 fn append_reflowed_line(
     rows: &mut VecDeque<Row>,
-    cells: Vec<Cell>,
-    display_width: usize,
+    line: LogicalLine,
     cols: usize,
 ) -> ReflowedLineMap {
     debug_assert!(cols > 0);
 
+    let LogicalLine {
+        cells,
+        display_width,
+        trailing,
+    } = line;
     let start = rows.len();
     let mut row = Row::new(cols);
     let mut col = 0;
@@ -1688,6 +1691,9 @@ fn append_reflowed_line(
 
     let end_row = rows.len();
     let end_col = col.min(cols.saturating_sub(1));
+    for (slot, cell) in row.cells_mut()[col.min(cols)..].iter_mut().zip(trailing) {
+        *slot = cell;
+    }
     rows.push_back(row);
     let end = rows.len();
 

@@ -1541,6 +1541,101 @@ mod tests {
         vt.capture_text(None).replace('\n', "")
     }
 
+    const BLANK_BG_LINES: &[u8] =
+        b"\x1b[44m          \x1b[0m\r\nX\x1b[48;2;10;20;30m      \x1b[0m\r\n\x1b[101m   \x1b[0m";
+
+    fn blank_bg_counts(vt: &VirtualTerminal) -> [usize; 3] {
+        let grid = vt.grid();
+        let mut counts = [0; 3];
+        for r in 0..grid.total_lines() {
+            let row = grid.row(r).expect("row exists");
+            for c in 0..row.len() {
+                let cell = &row[c];
+                if cell.ch != ' ' {
+                    continue;
+                }
+                match cell.style.bg {
+                    Color::Indexed(4) => counts[0] += 1,
+                    Color::Rgb(10, 20, 30) => counts[1] += 1,
+                    Color::Indexed(9) => counts[2] += 1,
+                    _ => {}
+                }
+            }
+        }
+        counts
+    }
+
+    #[test]
+    fn resize_keeps_background_of_blank_cells() {
+        for (rows, cols) in [(33, 54), (30, 100), (10, 40), (12, 80), (24, 20)] {
+            let mut vt = VirtualTerminal::new(24, 80);
+            vt.process(BLANK_BG_LINES);
+            vt.resize(rows, cols);
+            assert_eq!(blank_bg_counts(&vt), [10, 6, 3], "80x24 -> {cols}x{rows}");
+        }
+    }
+
+    #[test]
+    fn resize_keeps_blank_bg_after_wide_combining_and_linked_text() {
+        let mut vt = VirtualTerminal::new(24, 80);
+        vt.process(
+            "界e\u{301}\x1b]8;;https://x.test\x1b\\\x1b[44m   \x1b]8;;\x1b\\\x1b[0m".as_bytes(),
+        );
+        for (rows, cols) in [(24, 7), (24, 120), (10, 40)] {
+            vt.resize(rows, cols);
+            assert_grid_wide_invariants(vt.grid());
+            let row = vt.grid().visible_row(0);
+            assert!(row[0].is_wide() && row[1].is_wide_continuation(), "{cols}");
+            assert_eq!(row[2].grapheme(), Some("e\u{301}"), "{cols}");
+            for col in 3..6 {
+                assert_eq!(row[col].style.bg, Color::Indexed(4), "{cols} col {col}");
+                let link = row[col]
+                    .extended
+                    .as_ref()
+                    .and_then(|e| e.hyperlink.as_deref());
+                assert_eq!(link, Some("https://x.test"), "{cols} col {col}");
+            }
+        }
+    }
+
+    #[test]
+    fn resize_keeps_cursor_column_after_trailing_blanks() {
+        let mut vt = VirtualTerminal::new(24, 80);
+        vt.process(b"$ ");
+        vt.resize(24, 40);
+        assert_eq!((vt.cursor().row, vt.cursor().col), (0, 2), "default blank");
+        vt.process(b"\r\n\x1b[44m    ");
+        vt.resize(24, 30);
+        assert_eq!(
+            (vt.cursor().row, vt.cursor().col),
+            (1, 4),
+            "coloured blanks"
+        );
+    }
+
+    #[test]
+    fn resize_keeps_background_of_blank_cells_in_scrollback() {
+        let mut vt = VirtualTerminal::new(24, 80);
+        vt.process(BLANK_BG_LINES);
+        vt.process(&b"\r\n".repeat(40));
+        assert!(vt.scrollback_len() >= 3);
+        vt.resize(33, 54);
+        assert_eq!(blank_bg_counts(&vt), [10, 6, 3]);
+        let blue = vt.grid().scrollback_row(0).expect("scrollback row");
+        assert_eq!(blue[9].style.bg, Color::Indexed(4));
+    }
+
+    #[test]
+    fn resize_keeps_background_of_blank_cells_across_alt_screen() {
+        let mut vt = VirtualTerminal::new(24, 80);
+        vt.process(BLANK_BG_LINES);
+        vt.process(b"\x1b[?1049h\x1b[H\x1b[44m    \x1b[0m");
+        vt.resize(33, 54);
+        assert_eq!(blank_bg_counts(&vt), [4, 0, 0], "alternate screen");
+        vt.process(b"\x1b[?1049l");
+        assert_eq!(blank_bg_counts(&vt), [10, 6, 3], "primary behind alt");
+    }
+
     fn assert_grid_wide_invariants(grid: &Grid) {
         for row_idx in 0..grid.total_lines() {
             let row = grid.row(row_idx).expect("row exists");
