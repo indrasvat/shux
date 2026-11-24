@@ -3,7 +3,24 @@ VERDICT: PASS
 # copy-images-190: VT + TUI gate (one run, both charters)
 
 - Change: #190 PR B2 (copy mode frozen on the shown slice; pictures cropped to the shown cells; SIGTERM on a stalled client terminal)
-- Branch `feat/190-b2-copy-images`, base `0764a91` (origin/main after the rebase), commit_under_audit `1ae8b433bf837a26998d43bf9d39c5ebfdc243a6` (code identical to `b46d321`; the three commits after it add only QA evidence)
+- Branch `feat/190-b2-copy-images`, base `d4473f1` (origin/main after the second rebase), commit_under_audit `80cbb1b` (see *Delta re-audit*). Before that: `1ae8b43` on `0764a91`, and first `4c2894b` on `6bc9d94`.
+
+## Delta re-audit (old commit_under_audit 1ae8b43 → 80cbb1b, rebased on d4473f1)
+
+- Delta: `f224d5c` (a copy-mode stamp whose top line was evicted opens nothing; a press clears `selection_evicted`), `4d21cf5` (the config watcher is armed before the client draws and before the daemon accepts), `3a3c71f` (fuzz ignores the `hidden_since_ns` clock; adds a seed), `80cbb1b` (neutrality 0/0 vs d4473f1, cited). `make check` (3403 tests) is cited.
+- `make check-vt-qa-pregate` at 80cbb1b: pass. The binary was rebuilt with `make release` at 80cbb1b (`git_sha` 80cbb1b).
+- **Hot reload, attached client and daemon.** The client drew, then `config.toml` was swapped from `prefix = "ctrl-space"`, `border_focused = "#74c7ec"` to `ctrl-a` and `#ff0000`.
+  - Client: ctrl-a `[` opened copy mode, and the client's border pixel went from (106,181,215) to (231,1,2).
+  - Daemon: `window snapshot` shows the same border change.
+  - The first ctrl-a sent within milliseconds of the swap reached the pane as `^A`, because reload applies asynchronously. The edit itself was not missed: it applied with no further write.
+- **Eviction.** The client was SIGSTOPped with prefix `[` queued while it showed L101-L120. The pane then printed 6000 lines, so history (5000) evicted those lines, and the client got SIGCONT.
+  - Entry declined with "action failed: the screen changed before copy mode opened; press it again". No evicted or replacement L-line was shown.
+  - A fresh prefix `[` opened copy mode, and `v` plus 11×`l` then `y` yanked exactly `E05977 evict` (OSC 52 decoded).
+- **vim (90x28, colour probe pane) and btop (140x42), private rc copies:** both correct.
+  - btop's first frame after the client resize keeps its 80x24 startup layout in the top half. Base 6bc9d94 does exactly the same, and by later btop ticks the client view matches the pane, so this is btop, not shux.
+- The delta and the d4473f1 rebase touch no image, raster, composed or VT file. The 8 pixel metrics, regenerated at 1ae8b43, still stand.
+- Old → new SHAs (this rebase, matched by subject): b79f897→1ba95c6 · e8d991e→536ed84 · e07886c→555c5ef · 30ef9a5→ca1c30f · 6dabcf9→612b66c · d3ea02b→c6ff092 · cb7e2f0→acd6b27 · 77f4734→09e6f9e · d8a9e55→e869076 · 60acc31→2d711bd · 137b3e4→fcf54c8 · 2086c32→edc518d · 7a138e0→7047c98 · b4ad528→cee03e9 · b46d321→bda641d · 4a9016c→53c8777 · 620c6dc→1c109e0 · 1ae8b43→0f8a747 · ff8f318→6f3e4ee; new: f224d5c, 3153928, 4d21cf5, 3a3c71f, 80cbb1b.
+- Leaks: none (all sessions killed, `daemon stop` ×3, `ps` scan clean).
 - Tier: full. Full audit ran at pre-rebase `4c2894b` on base `6bc9d94`; re-stamped after a conflict-free rebase onto `0764a91` (see *Re-stamp after rebase*). Base binary from the `make vt-neutrality` cache at 6bc9d94. Binaries copied outside `target/`.
 
 ## Re-stamp after rebase (onto 0764a91, which brings #302's erase and wrap-link changes under copy mode)
