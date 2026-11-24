@@ -41,6 +41,7 @@ pub(crate) fn register_client_methods(
                                 "cols": c.cols,
                                 "rows": c.rows,
                                 "attached_at": attached_at,
+                                "read_only": !c.votes,
                             })
                         })
                         .collect();
@@ -105,6 +106,45 @@ mod tests {
     use crate::rpc::test_harness::{RpcHarness, dispatch_err, dispatch_ok};
     use shux_core::event::ClientId;
     use tokio_util::sync::CancellationToken;
+
+    /// `read_only` is true exactly for a client that does not vote.
+    #[tokio::test]
+    async fn list_says_which_clients_are_read_only() {
+        let h = RpcHarness::new();
+        let (session_id, _, _) = h.seed_session("watched").await;
+        let clients = h.io.lock().await.clients.clone();
+        let info = |votes| ClientInfo {
+            id: ClientId::new(),
+            session_id,
+            cols: 100,
+            rows: 30,
+            attached_at: std::time::SystemTime::now(),
+            votes,
+            last_input: None,
+        };
+        let (writer, viewer) = (info(true), info(false));
+        let _gw = clients.register(writer.clone(), CancellationToken::new());
+        let _gv = clients.register(viewer.clone(), CancellationToken::new());
+        let listed = dispatch_ok(&h.router, "client.list", serde_json::json!({})).await;
+        let read_only = |id: ClientId| {
+            listed["clients"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["id"] == id.0.to_string())
+                .map(|r| r["read_only"].clone())
+        };
+        assert_eq!(
+            read_only(writer.id),
+            Some(serde_json::json!(false)),
+            "{listed}"
+        );
+        assert_eq!(
+            read_only(viewer.id),
+            Some(serde_json::json!(true)),
+            "{listed}"
+        );
+    }
 
     #[tokio::test]
     async fn list_names_each_client_and_detach_takes_a_unique_prefix() {
