@@ -1608,26 +1608,25 @@ async fn run_attach_loop(
                             SelectionDrag::App { pane_id, .. } => Some(pane_id),
                             _ => None,
                         };
-                        match handle_app_mouse(
+                        let focus_before = focused_pane(&graph, session.session_id);
+                        let route = route_mouse(
                             kind,
                             button,
-                            col,
-                            row,
-                            shift,
-                            alt,
-                            ctrl,
+                            (col, row),
+                            (shift, alt, ctrl),
                             frame,
                             &graph,
                             &io_state,
                             &render_session,
                             &client_size,
                             &config,
+                            &out_tx,
                             &mouse_drag,
                             &mut selection_drag,
                         )
-                        .await
-                        {
-                            Ok(AppMouse::Consumed { redraw, input }) => {
+                        .await;
+                        match route {
+                            MouseRoute::App { redraw, input } => {
                                 // A press or drag the app received is input. The
                                 // driver's keeps its hold on the panes for the
                                 // gesture; a viewer's takes them only when the
@@ -1665,71 +1664,39 @@ async fn run_attach_loop(
                                 }
                                 continue;
                             }
-                            Ok(AppMouse::NotHandled) => {}
-                            Err(error) => { unhandled_mouse(error); }
-                        }
-                        let focus_before = focused_pane(&graph, session.session_id);
-                        if handle_mouse_selection(
-                            kind,
-                            button,
-                            col,
-                            row,
-                            &graph,
-                            &io_state,
-                            &render_session,
-                            &client_size,
-                            &config,
-                            &out_tx,
-                            &mut selection_drag,
-                            frame,
-                        )
-                        .await.unwrap_or_else(unhandled_mouse)
-                        {
-                            // A press that focused another pane is input; a
-                            // selection inside the focused one is not. It counts
-                            // once the selection ends and is yanked: taking the
-                            // panes resizes them, which ends the selection.
-                            if kind == MouseKind::Down
-                                && focused_pane(&graph, session.session_id) != focus_before
-                            {
-                                gesture_input = true;
-                            }
-                            if gesture_input
-                                && !matches!(selection_drag, SelectionDrag::MouseSelection { .. })
-                            {
-                                gesture_input = false;
-                                if clients.mark_input(registry_id, tokio::time::Instant::now()) {
-                                    reconcile_session(&graph, &io_state, &config, session.session_id).await;
+                            MouseRoute::Selection => {
+                                // A press that focused another pane is input; a
+                                // selection inside the focused one is not. It counts
+                                // once the selection ends and is yanked: taking the
+                                // panes resizes them, which ends the selection.
+                                if kind == MouseKind::Down
+                                    && focused_pane(&graph, session.session_id) != focus_before
+                                {
+                                    gesture_input = true;
                                 }
+                                if gesture_input
+                                    && !matches!(selection_drag, SelectionDrag::MouseSelection { .. })
+                                {
+                                    gesture_input = false;
+                                    if clients.mark_input(registry_id, tokio::time::Instant::now()) {
+                                        reconcile_session(&graph, &io_state, &config, session.session_id).await;
+                                    }
+                                }
+                                let pulse = io_state.lock().await.render_pulse.clone();
+                                pulse.bump();
+                                continue;
                             }
-                            let pulse = io_state.lock().await.render_pulse.clone();
-                            pulse.bump();
-                            continue;
-                        }
-                        if handle_copy_mode_mouse(
-                            kind,
-                            button,
-                            col,
-                            row,
-                            &graph,
-                            &io_state,
-                            &render_session,
-                            &client_size,
-                            &config,
-                            &out_tx,
-                            &mut selection_drag,
-                            frame,
-                        )
-                        .await.unwrap_or_else(unhandled_mouse)
-                        {
-                            // Copy mode ended the drag a focusing press began:
-                            // that selection was never yanked, so its credit goes.
-                            if kind == MouseKind::Up {
-                                gesture_input = false;
+                            MouseRoute::CopyMode => {
+                                // Copy mode ended the drag a focusing press began:
+                                // that selection was never yanked, so its credit goes.
+                                if kind == MouseKind::Up {
+                                    gesture_input = false;
+                                }
+                                let pulse = io_state.lock().await.render_pulse.clone();
+                                pulse.bump();
+                                continue;
                             }
-                            let pulse = io_state.lock().await.render_pulse.clone();
-                            pulse.bump();
-                            continue;
+                            MouseRoute::Unrouted => {}
                         }
                         // Scroll wheel (copy mode inactive): scroll scrollback,
                         // or forward to a mouse-aware / alt-screen app.
@@ -3221,6 +3188,146 @@ async fn handle_copy_mode_mouse(
     }
 
     Ok(true)
+}
+
+/// Which of the app, a mouse selection or copy mode took a mouse event.
+#[derive(Debug, PartialEq, Eq)]
+enum MouseRoute {
+    App {
+        redraw: bool,
+        input: bool,
+    },
+    Selection,
+    CopyMode,
+    /// None of them: the wheel, focus and border handling come next.
+    Unrouted,
+}
+
+/// Offer a mouse event to the app, a mouse selection and copy mode, in that
+/// order; once more when copy mode turns out to have stopped mapping since
+/// the event was first offered, so it reaches whoever takes it without one.
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
+async fn route_mouse(
+    kind: MouseKind,
+    button: ProtoMouseButton,
+    (col, row): (u16, u16),
+    (shift, alt, ctrl): (bool, bool, bool),
+    frame: Option<u64>,
+    graph: &GraphHandle,
+    io_state: &Arc<Mutex<PaneIoState>>,
+    session: &Arc<Mutex<AttachedSession>>,
+    client_size: &ClientSize,
+    config: &ConfigHandle,
+    out_tx: &mpsc::Sender<AttachServerFrame>,
+    border_drag: &Option<DragState>,
+    gesture: &mut SelectionDrag,
+) -> MouseRoute {
+    for _ in 0..2 {
+        let had_copy_mode = session.lock().await.copy_mode.is_some();
+        let route = route_mouse_once(
+            kind,
+            button,
+            (col, row),
+            (shift, alt, ctrl),
+            frame,
+            graph,
+            io_state,
+            session,
+            client_size,
+            config,
+            out_tx,
+            border_drag,
+            gesture,
+        )
+        .await;
+        let ended = had_copy_mode && session.lock().await.copy_mode.is_none();
+        if route != MouseRoute::Unrouted || !ended {
+            return route;
+        }
+    }
+    MouseRoute::Unrouted
+}
+
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
+async fn route_mouse_once(
+    kind: MouseKind,
+    button: ProtoMouseButton,
+    (col, row): (u16, u16),
+    (shift, alt, ctrl): (bool, bool, bool),
+    frame: Option<u64>,
+    graph: &GraphHandle,
+    io_state: &Arc<Mutex<PaneIoState>>,
+    session: &Arc<Mutex<AttachedSession>>,
+    client_size: &ClientSize,
+    config: &ConfigHandle,
+    out_tx: &mpsc::Sender<AttachServerFrame>,
+    border_drag: &Option<DragState>,
+    gesture: &mut SelectionDrag,
+) -> MouseRoute {
+    let unhandled = |error| {
+        warn!(?kind, %error, "attach: mouse handle failed");
+        false
+    };
+    match handle_app_mouse(
+        kind,
+        button,
+        col,
+        row,
+        shift,
+        alt,
+        ctrl,
+        frame,
+        graph,
+        io_state,
+        session,
+        client_size,
+        config,
+        border_drag,
+        gesture,
+    )
+    .await
+    {
+        Ok(AppMouse::Consumed { redraw, input }) => return MouseRoute::App { redraw, input },
+        Ok(AppMouse::NotHandled) => {}
+        Err(error) => {
+            unhandled(error);
+        }
+    }
+    let selection = handle_mouse_selection(
+        kind,
+        button,
+        col,
+        row,
+        graph,
+        io_state,
+        session,
+        client_size,
+        config,
+        out_tx,
+        gesture,
+        frame,
+    );
+    if selection.await.unwrap_or_else(unhandled) {
+        return MouseRoute::Selection;
+    }
+    let copy_mode = handle_copy_mode_mouse(
+        kind,
+        button,
+        col,
+        row,
+        graph,
+        io_state,
+        session,
+        client_size,
+        config,
+        out_tx,
+        gesture,
+        frame,
+    );
+    if copy_mode.await.unwrap_or_else(unhandled) {
+        return MouseRoute::CopyMode;
+    }
+    MouseRoute::Unrouted
 }
 
 #[expect(clippy::too_many_arguments, reason = "independent inputs")]
@@ -9921,6 +10028,48 @@ mod tests {
                 .expect("vt")
                 .process(b"\x1b[?1049l");
         }
+        fixture.stop();
+    }
+
+    /// A click whose copy mode stops mapping after routing began goes on to
+    /// the app that asked for the mouse, as one arriving after it would.
+    #[tokio::test]
+    async fn a_click_copy_mode_finds_unmapped_is_routed_to_the_app() {
+        let fixture = attach_fixture().await;
+        let _wr = seed_scrollback_pane(&fixture.io_state, fixture.first_pane, b"").await;
+        let session = Arc::new(Mutex::new(fixture.attached.clone()));
+        let client_size: ClientSize = Arc::new(Mutex::new((100, 30)));
+        open_copy_mode(&fixture.graph, &fixture.io_state, &session, &client_size).await;
+        fixture
+            .io_state
+            .lock()
+            .await
+            .vts
+            .get_mut(&fixture.first_pane)
+            .expect("vt")
+            .process(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h");
+        let (out_tx, _out_rx) = mpsc::channel(8);
+        let route = route_mouse(
+            MouseKind::Down,
+            ProtoMouseButton::Left,
+            (3, 3),
+            (false, false, false),
+            None,
+            &fixture.graph,
+            &fixture.io_state,
+            &session,
+            &client_size,
+            &test_config(),
+            &out_tx,
+            &None,
+            &mut SelectionDrag::None,
+        )
+        .await;
+        assert!(
+            matches!(route, MouseRoute::App { input: true, .. }),
+            "the click went to {route:?}, not the app"
+        );
+        assert!(session.lock().await.copy_mode.is_none());
         fixture.stop();
     }
 
