@@ -28,7 +28,7 @@ pub use attach::{
 };
 pub use caller::{current_caller, run_to_completion, with_caller};
 pub use codec::{MAX_FRAME_SIZE, create_codec};
-pub use connection::current_connection;
+pub use connection::{Transport, current_connection, current_transport, with_transport};
 pub use error::{ErrorCode, RpcError};
 pub use policy::{Policy, Sensitivity};
 pub use router::{Handler, Router, RouterBuilder};

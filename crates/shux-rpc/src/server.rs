@@ -243,16 +243,19 @@ async fn handle_uds_connection(
     // needs the real socket fd for write-direction readiness.
     let monitor = PeerDeathMonitor::try_new(&stream);
     let (read_half, write_half) = stream.into_split();
-    serve_connection(
-        read_half,
-        write_half,
-        router,
-        cancel,
-        ConnAuth::Trusted,
-        // Historical UDS behavior: attempt a frame_too_large error response
-        // before closing on a codec error.
-        true,
-        monitor,
+    crate::connection::with_transport(
+        crate::connection::Transport::Uds,
+        serve_connection(
+            read_half,
+            write_half,
+            router,
+            cancel,
+            ConnAuth::Trusted,
+            // Historical UDS behavior: attempt a frame_too_large error response
+            // before closing on a codec error.
+            true,
+            monitor,
+        ),
     )
     .await
 }
@@ -273,7 +276,11 @@ async fn handle_tcp_connection(
         None => ConnAuth::Trusted, // No token configured = no auth needed.
     };
     // Historical TCP behavior: close silently on codec errors.
-    serve_connection(read_half, write_half, router, cancel, auth, false, monitor).await
+    crate::connection::with_transport(
+        crate::connection::Transport::Tcp,
+        serve_connection(read_half, write_half, router, cancel, auth, false, monitor),
+    )
+    .await
 }
 
 /// Hard per-connection cap on frames queued awaiting execution (codex P3
@@ -2159,6 +2166,75 @@ mod tests {
 
         cancel.cancel();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server_handle).await;
+    }
+
+    #[tokio::test]
+    async fn an_owner_local_method_answers_only_the_daemon_socket() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let router = register_builtin_methods(Router::builder())
+            .register_with_policy(
+                "owner.only",
+                crate::Policy::fixed(crate::Sensitivity::PluginsForbidden),
+                |_: Option<serde_json::Value>| async { Ok(serde_json::json!({"ok": true})) },
+            )
+            .owner_local("owner.only")
+            .build();
+        let dir = tempfile::tempdir().unwrap();
+        let config = ServerConfig {
+            socket_path: dir.path().join("test.sock"),
+            tcp_addr: "127.0.0.1:0".to_string(),
+            auth_token: Some("t".to_string()),
+        };
+        let bound = Server::new(config.clone(), router.clone(), cancel.clone())
+            .bind()
+            .await
+            .unwrap();
+        let tcp_addr = bound.tcp_local_addr().expect("TCP listener bound");
+        let server = tokio::spawn(async move { bound.serve().await.unwrap() });
+
+        async fn call<S>(
+            framed: &mut Framed<S, tokio_util::codec::LengthDelimitedCodec>,
+            method: &str,
+        ) -> serde_json::Value
+        where
+            S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+        {
+            let req = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": method,
+                "params": {"token": "t"}});
+            framed
+                .send(Bytes::from(serde_json::to_vec(&req).unwrap()))
+                .await
+                .unwrap();
+            serde_json::from_slice(&framed.next().await.unwrap().unwrap()).unwrap()
+        }
+
+        let uds = UnixStream::connect(&config.socket_path).await.unwrap();
+        let mut uds = Framed::new(uds, create_codec());
+        assert_eq!(call(&mut uds, "owner.only").await["result"]["ok"], true);
+
+        let tcp = tokio::net::TcpStream::connect(tcp_addr).await.unwrap();
+        let mut tcp = Framed::new(tcp, create_codec());
+        assert_eq!(
+            call(&mut tcp, "auth").await["result"]["authenticated"],
+            true
+        );
+        let refused = call(&mut tcp, "owner.only").await;
+        assert_eq!(
+            refused["error"]["message"], "permission_denied",
+            "{refused}"
+        );
+        assert_eq!(refused["error"]["data"]["reason"], "owner_local");
+        assert_eq!(
+            call(&mut tcp, "system.version").await["result"]["name"],
+            "shux",
+            "the same connection still answers every other method"
+        );
+
+        // Plugin dispatch and daemon-internal calls name no transport.
+        let direct = router.dispatch("owner.only", None).await.unwrap_err();
+        assert_eq!(direct.message, "permission_denied");
+        cancel.cancel();
+        server.await.unwrap();
     }
 
     #[tokio::test]

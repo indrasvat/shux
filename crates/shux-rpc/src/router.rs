@@ -3,7 +3,7 @@
 //! The router maintains a HashMap of method names to handler trait objects.
 //! New methods are registered via `router.register("method.name", handler)`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -55,6 +55,7 @@ where
 pub struct Router {
     methods: Arc<HashMap<String, Arc<dyn Handler>>>,
     policies: Arc<HashMap<String, Policy>>,
+    owner_local: Arc<HashSet<String>>,
 }
 
 impl Router {
@@ -63,6 +64,7 @@ impl Router {
         Router {
             methods: Arc::new(HashMap::new()),
             policies: Arc::new(HashMap::new()),
+            owner_local: Arc::default(),
         }
     }
 
@@ -71,13 +73,32 @@ impl Router {
         RouterBuilder {
             methods: HashMap::new(),
             policies: HashMap::new(),
+            owner_local: HashSet::new(),
         }
+    }
+
+    /// Whether `method` answers only a request on the daemon's own socket.
+    pub fn is_owner_local(&self, method: &str) -> bool {
+        self.owner_local.contains(method)
     }
 
     /// Dispatch a JSON-RPC request to the appropriate handler.
     ///
-    /// Returns `Err(RpcError)` if the method is not found.
+    /// Returns `Err(RpcError)` if the method is not found, or is owner-local
+    /// and this request did not come over the daemon's own socket.
     pub async fn dispatch(&self, method: &str, params: Option<Value>) -> HandlerResult {
+        if self.is_owner_local(method) && crate::current_transport() != Some(crate::Transport::Uds)
+        {
+            warn!(method, "owner-local method refused off the daemon socket");
+            return Err(RpcError::with_data(
+                crate::ErrorCode::PermissionDenied,
+                serde_json::json!({
+                    "method": method,
+                    "reason": "owner_local",
+                    "hint": "only the daemon's own socket may call this; run the shux CLI as its user",
+                }),
+            ));
+        }
         match self.methods.get(method) {
             Some(handler) => {
                 debug!(method, "dispatching RPC method");
@@ -149,6 +170,7 @@ impl std::fmt::Debug for Router {
 pub struct RouterBuilder {
     methods: HashMap<String, Arc<dyn Handler>>,
     policies: HashMap<String, Policy>,
+    owner_local: HashSet<String>,
 }
 
 impl RouterBuilder {
@@ -193,11 +215,19 @@ impl RouterBuilder {
         })
     }
 
+    /// Accept `method` only over the daemon's own socket ([`crate::Transport::Uds`]):
+    /// never over TCP, from a plugin, or from a call that names no transport.
+    pub fn owner_local(mut self, method: impl Into<String>) -> Self {
+        self.owner_local.insert(method.into());
+        self
+    }
+
     /// Build the router.
     pub fn build(self) -> Router {
         Router {
             methods: Arc::new(self.methods),
             policies: Arc::new(self.policies),
+            owner_local: Arc::new(self.owner_local),
         }
     }
 }
