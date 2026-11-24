@@ -39,6 +39,10 @@ const PROBE_ATTEMPT: Duration = Duration::from_secs(5);
 const PROBE_PAUSE: Duration = Duration::from_millis(750);
 /// How long a supervisor has to reap cloudflared once told to stop.
 const REAP: Duration = Duration::from_secs(10);
+/// How long cloudflared, asked to stop, may take to finish before it is
+/// killed; its own grace period is shorter.
+const DRAIN: Duration = Duration::from_secs(2);
+const _: () = assert!(DRAIN.as_secs() < REAP.as_secs());
 pub const PROBE_PATH: &str = "/.well-known/shux-probe";
 pub const INSTALL_HINT: &str = "install cloudflared (macOS: `brew install cloudflared`; \
     elsewhere: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/), \
@@ -264,7 +268,15 @@ pub fn supervise(cloudflared: &Path, port: u16) -> anyhow::Result<()> {
     let spawned = std::process::Command::new(cloudflared)
         .args(["tunnel", "--no-autoupdate", "--config"])
         .arg(&config)
-        .args(["--loglevel", "info", "--metrics", "127.0.0.1:0", "--url"])
+        .args([
+            "--loglevel",
+            "info",
+            "--metrics",
+            "127.0.0.1:0",
+            "--grace-period",
+            "1s",
+            "--url",
+        ])
         .arg(format!("http://127.0.0.1:{port}"))
         .env_clear()
         .env("HOME", home.path())
@@ -329,9 +341,21 @@ pub fn supervise(cloudflared: &Path, port: u16) -> anyhow::Result<()> {
             Ok(Msg::Stop) | Err(_) => break Exit::Stopped,
         }
     };
-    // Whatever it left behind in its group goes with it.
+    // Asked to stop, it gets DRAIN to deliver what it carries (the frame
+    // telling a guest why the share ended); then, and whatever it left
+    // behind in its group, it is killed.
+    let mut reaped = false;
+    if why == Exit::Stopped {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(group),
+            nix::sys::signal::Signal::SIGTERM,
+        );
+        reaped = done_rx.recv_timeout(DRAIN).is_ok();
+    }
     kill_group(group);
-    let _ = done_rx.recv();
+    if !reaped {
+        let _ = done_rx.recv();
+    }
     kill_group(group);
     report(Report::Exit(why));
     drop(listener);

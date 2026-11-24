@@ -53,6 +53,11 @@ fn stand_in(dir: &Path, host: &str, needle: &str, mode: &str) -> PathBuf {
         let then = match mode {
             // Stops logging and keeps running: only its pid says it is alive.
             "closes-stderr" => format!("exec 2>&-\nexec /bin/sleep {needle}\n"),
+            // Says, as it goes, whether it was asked to stop before it was killed.
+            "drains" => format!(
+                "trap \"echo term > '{}'; exit 0\" TERM\nwhile :; do /bin/sleep {needle} & wait $!; done\n",
+                dir.join("cloudflared.term").display()
+            ),
             // Leaves a child in its group, then exits.
             "forks-then-exits" => format!(
                 "/bin/sleep {needle}1 &\necho $! > '{}'\nexit 0\n",
@@ -384,6 +389,24 @@ fn stop_ends_every_link_and_a_new_link_needs_a_new_tunnel() {
     assert_ne!(t1.cloudflared, t2.cloudflared, "a fresh connector");
     assert_ne!(first["id"], second["id"]);
     assert_eq!(h.links().len(), 1, "the old links stayed ended");
+}
+
+/// Stop asks cloudflared to finish before killing it, so the frame that tells
+/// a guest why can still leave it.
+#[test]
+fn stop_asks_cloudflared_to_finish_before_killing_it() {
+    let h = Harness::with_mode("drains");
+    h.session("demo");
+    h.json(&["share", "-s", "demo"]);
+    let t = h.tunnel();
+    h.json(&["share", "stop"]);
+    wait_until("the supervisor to exit", || {
+        !running(t.supervisor, &format!("--port {}", t.port))
+    });
+    assert!(
+        h.fake.path().join("cloudflared.term").exists(),
+        "cloudflared was killed without being asked to stop"
+    );
 }
 
 #[test]
