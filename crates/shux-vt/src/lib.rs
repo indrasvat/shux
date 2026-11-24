@@ -1250,6 +1250,13 @@ impl VirtualTerminal {
         }
     }
 
+    /// Lines evicted from the front of the presented history so far: never
+    /// decreases, and presented line `i` names the same line as long as it
+    /// does not change.
+    pub fn presented_evicted(&self) -> u64 {
+        self.presented_history_grid().evicted()
+    }
+
     /// One line of the presented frame by absolute index, counting history
     /// from 0. The companion to [`VirtualTerminal::presented_total_lines`].
     pub fn presented_row(&self, abs: usize) -> Option<&Row> {

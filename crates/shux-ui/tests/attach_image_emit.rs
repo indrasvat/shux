@@ -674,7 +674,7 @@ fn a_clipped_scaled_put_keeps_its_scale_on_the_host() {
 /// it in; once the whole picture is left of the slice it is taken down from
 /// the attached terminal, not shifted onto other cells.
 #[test]
-fn a_picture_moves_with_the_slice_on_both_axes_and_leaves_once_past_it() {
+fn a_picture_moves_with_the_slice_on_both_axes_and_leaves_with_its_origin() {
     let p = pane(1);
     let layout = LayoutNode::leaf(p);
     let mut vt = VirtualTerminal::new(12, 60);

@@ -381,7 +381,7 @@ where
                                 continue;
                             }
                             if let Some(target) = bindings.resolve_prefix(key) {
-                                send_binding_target(&mut sink, target).await?;
+                                send_binding_target(&mut sink, target, event_frame).await?;
                                 continue;
                             }
                             // Unbound prefix-key: fall through and forward
@@ -408,7 +408,7 @@ where
                         }
                         // Bare-key Tier-1 actions (Alt+key etc.).
                         if let Some(target) = bindings.resolve_root(key) {
-                            send_binding_target(&mut sink, target).await?;
+                            send_binding_target(&mut sink, target, event_frame).await?;
                             continue;
                         }
                         // Otherwise forward as PTY input bytes.
@@ -536,7 +536,13 @@ where
     }
 }
 
-async fn send_binding_target<SinkT>(sink: &mut SinkT, target: &BindingTarget) -> Result<()>
+/// `frame` is the last one written when the key was read: copy mode opens over
+/// what that frame showed.
+async fn send_binding_target<SinkT>(
+    sink: &mut SinkT,
+    target: &BindingTarget,
+    frame: Option<u64>,
+) -> Result<()>
 where
     SinkT: futures::Sink<Bytes> + Unpin,
     SinkT::Error: std::fmt::Display,
@@ -544,7 +550,10 @@ where
     let frame = match target {
         BindingTarget::Action(kind, args) => AttachClientFrame::Action {
             kind: *kind,
-            args: args.clone(),
+            args: ActionArgs {
+                frame: frame.filter(|_| *kind == ActionKind::EnterCopyMode),
+                ..args.clone()
+            },
         },
         BindingTarget::Detach => AttachClientFrame::Detach,
     };
@@ -859,10 +868,15 @@ mod tests {
                     ..Default::default()
                 },
             ),
+            Some(9),
         )
         .await
         .expect("send action");
-        send_binding_target(&mut tx, &BindingTarget::Detach)
+        let copy = BindingTarget::Action(ActionKind::EnterCopyMode, ActionArgs::default());
+        send_binding_target(&mut tx, &copy, Some(9))
+            .await
+            .expect("send copy mode");
+        send_binding_target(&mut tx, &BindingTarget::Detach, Some(9))
             .await
             .expect("send detach");
         drop(tx);
@@ -873,6 +887,19 @@ mod tests {
             AttachClientFrame::Action { kind, args } => {
                 assert_eq!(kind, ActionKind::SwitchToWindow);
                 assert_eq!(args.window_index, Some(3));
+                assert_eq!(args.frame, None, "only copy mode is stamped");
+            }
+            other => panic!("expected action frame, got {other:?}"),
+        }
+        let copy = rx.next().await.expect("copy mode frame");
+        match serde_json::from_slice(&copy).expect("copy mode json") {
+            AttachClientFrame::Action { kind, args } => {
+                assert_eq!(kind, ActionKind::EnterCopyMode);
+                assert_eq!(
+                    args.frame,
+                    Some(9),
+                    "copy mode not stamped with the shown frame"
+                );
             }
             other => panic!("expected action frame, got {other:?}"),
         }

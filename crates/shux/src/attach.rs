@@ -58,22 +58,22 @@ type ClientSize = Arc<Mutex<(u16, u16)>>;
 struct CopyOverlayStamp {
     kind: CopyOverlayKind,
     pane_id: PaneId,
-    rect: Rect,
-    state: shux_ui::CopyModeState,
     theme: Theme,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum CopyOverlayKind {
-    Modal,
+    /// Copy mode as of this frame, and whether its view is drawn over the
+    /// pane's own cells.
+    Modal(shux_ui::CopyModeState, bool),
     /// Over the slice the selection was made on.
-    MouseSelection(PaneViewport),
+    MouseSelection(PaneViewport, shux_ui::Selection),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MouseSelection {
     pane_id: PaneId,
-    state: shux_ui::CopyModeState,
+    state: shux_ui::Selection,
     /// The slice the frame showed when the selection started; it ends when
     /// the pane shows another.
     view: PaneViewport,
@@ -663,10 +663,18 @@ struct AttachedSession {
 /// Frames queued to one client before the render loop waits for it.
 const OUTBOUND_FRAMES: usize = 64;
 
-/// Pane views of the latest frames sent to one client, oldest first, each
+/// What one frame showed: each pane's slice, and copy mode's view when it
+/// was drawing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Shown {
+    views: HashMap<PaneId, PaneViewport>,
+    modal: Option<(PaneId, shux_ui::CopyView)>,
+}
+
+/// What the latest frames sent to one client showed, oldest first, each
 /// under the number its `Render { frame }` carried.
 #[derive(Debug, Clone, Default)]
-struct ShownFrames(std::collections::VecDeque<(u64, Arc<HashMap<PaneId, PaneViewport>>)>);
+struct ShownFrames(std::collections::VecDeque<(u64, Arc<Shown>)>);
 
 impl ShownFrames {
     /// Frames a client can trail the daemon by and still be mapped: the
@@ -675,23 +683,27 @@ impl ShownFrames {
     /// shux's own handling at the live layout (`handle_app_mouse`).
     const KEPT: usize = 2 * OUTBOUND_FRAMES;
 
-    fn push(&mut self, frame: u64, views: HashMap<PaneId, PaneViewport>) {
+    fn push(&mut self, frame: u64, shown: Shown) {
         if self.0.len() == Self::KEPT {
             self.0.pop_front();
         }
-        self.0.push_back((frame, Arc::new(views)));
+        self.0.push_back((frame, Arc::new(shown)));
     }
 
-    /// The views the client saw when it had written `frame`: the newest frame
-    /// not after it. `None` (a client that predates frame numbers) is the
-    /// latest frame sent. A stamp older than every frame kept names nothing:
-    /// any kept frame is newer than what that client shows.
-    fn views(&self, frame: Option<u64>) -> Option<&HashMap<PaneId, PaneViewport>> {
+    /// What the client saw when it had written `frame`: the newest frame not
+    /// after it. `None` (a client that predates frame numbers) is the latest
+    /// frame sent. A stamp older than every frame kept names nothing: any
+    /// kept frame is newer than what that client shows.
+    fn shown(&self, frame: Option<u64>) -> Option<&Shown> {
         let entry = match frame {
             None => self.0.back(),
             Some(f) => self.0.iter().rev().find(|(n, _)| *n <= f),
         };
-        entry.map(|(_, views)| views.as_ref())
+        entry.map(|(_, shown)| shown.as_ref())
+    }
+
+    fn views(&self, frame: Option<u64>) -> Option<&HashMap<PaneId, PaneViewport>> {
+        self.shown(frame).map(|s| &s.views)
     }
 }
 
@@ -1352,100 +1364,49 @@ async fn run_attach_loop(
                         // self-contained terminal sequence — most
                         // terminals interpret it before any subsequent
                         // diff bytes overwrite the cursor position.
-                        let copy_action = {
-                            // Snapshot the bits we need under the lock,
-                            // then drop it before computing the pane
-                            // size (which itself takes locks).
-                            let (active_pane, attached_clone, in_copy) = {
-                                let s = render_session.lock().await;
-                                (s.active_pane_id, s.clone(), s.copy_mode.is_some())
-                            };
-                            if in_copy {
-                                let (cols, rows) = focused_pane_size(
-                                    &graph,
-                                    &io_state,
-                                    active_pane,
-                                    &attached_clone,
-                                    &client_size,
-                                    &config,
-                                )
-                                .await;
-                                let action = {
-                                    let state = io_state.lock().await;
-                                    let vt = state.vts.get(&active_pane);
-                                    // #108: anchor copy-mode scrolling to the region the
-                                    // attach frame shows for an oversized pane (identical to
-                                    // grid.total_lines() when the grid fits its rect).
-                                    let total_lines = vt
-                                        .map(|vt| shux_ui::copy_mode::effective_total_lines(vt, rows))
-                                        .unwrap_or(rows as usize);
-                                    let mut s = render_session.lock().await;
-                                    if let Some(ref mut cm) = s.copy_mode {
-                                        shux_ui::copy_mode_key_with_vt(
-                                            &bytes,
-                                            cm,
-                                            cols,
-                                            rows,
-                                            total_lines,
-                                            vt,
-                                        )
-                                    } else {
-                                        shux_ui::CopyKey::Ignored
-                                    }
-                                };
-                                Some((action, active_pane, cols, rows))
-                            } else {
-                                None
-                            }
-                        };
-                        if let Some((action, pane_id, cols, rows)) = copy_action {
-                            match action {
-                                shux_ui::CopyKey::Updated | shux_ui::CopyKey::Ignored => {
-                                    let pulse = io_state.lock().await.render_pulse.clone();
-                                    pulse.bump();
-                                }
-                                shux_ui::CopyKey::Exit => {
-                                    let mut s = render_session.lock().await;
-                                    s.copy_mode = None;
-                                    drop(s);
-                                    let pulse = io_state.lock().await.render_pulse.clone();
-                                    pulse.bump();
-                                }
-                                shux_ui::CopyKey::Yank => {
-                                    let text = {
-                                        let s = render_session.lock().await;
-                                        let cm = s.copy_mode.clone();
-                                        drop(s);
-                                        match cm {
-                                            Some(cm) => {
-                                                let state = io_state.lock().await;
-                                                state
-                                                    .vts
-                                                    .get(&pane_id)
-                                                    .map(|vt| {
-                                                        shux_ui::copy_mode::extract_selection(
-                                                            vt, &cm, cols, rows,
-                                                        )
-                                                    })
-                                                    .unwrap_or_default()
-                                            }
-                                            None => String::new(),
+                        let attached_now = render_session.lock().await.clone();
+                        if let Some(cm) = attached_now.copy_mode.as_ref() {
+                            let rect = pane_rect_for(&graph, &attached_now, &client_size, &config, cm.pane).await;
+                            let yank = {
+                                let state = io_state.lock().await;
+                                let mut s = render_session.lock().await;
+                                let active = s.active_pane_id;
+                                let mut yank = None;
+                                let keep = s.copy_mode.as_mut().is_some_and(|cm| {
+                                    if copy_mode_vt(cm, active, rect, &state).is_none() {
+                                        let live = rect.zip(state.vts.get(&cm.pane)).map(|(r, vt)| {
+                                            PaneViewport::of(r, vt, shux_vt::monotonic_now_ns())
+                                        });
+                                        match reopen_untouched(cm, active, live.as_ref(), &state) {
+                                            Some(fresh) => *cm = fresh,
+                                            None => return false,
                                         }
-                                    };
-                                    if !text.is_empty() {
-                                        let osc = shux_ui::osc52_copy(&text);
-                                        let frame = AttachServerFrame::Render {
-                                            data: BASE64.encode(&osc),
-                                            frame: None,
-                                        };
-                                        let _ = out_tx.send(frame).await;
                                     }
-                                    let mut s = render_session.lock().await;
+                                    let Some(vt) = copy_mode_vt(cm, active, rect, &state) else {
+                                        return false;
+                                    };
+                                    match shux_ui::copy_mode_key(&bytes, cm, vt) {
+                                        shux_ui::CopyKey::Updated | shux_ui::CopyKey::Ignored => true,
+                                        shux_ui::CopyKey::Exit => false,
+                                        shux_ui::CopyKey::Yank => {
+                                            yank = Some(shux_ui::copy_mode::extract_selection(vt, cm));
+                                            false
+                                        }
+                                    }
+                                });
+                                if !keep {
                                     s.copy_mode = None;
-                                    drop(s);
-                                    let pulse = io_state.lock().await.render_pulse.clone();
-                                    pulse.bump();
                                 }
+                                state.render_pulse.bump();
+                                yank
+                            };
+                            if let Some(text) = yank.filter(|t| !t.is_empty()) {
+                                let osc = shux_ui::osc52_copy(&text);
+                                let frame = AttachServerFrame::Render {
+                                    data: BASE64.encode(&osc),
+                                    frame: None,
+                                };
+                                let _ = out_tx.send(frame).await;
                             }
                             continue;
                         }
@@ -1745,6 +1706,7 @@ async fn run_attach_loop(
                             &config,
                             &out_tx,
                             &mut selection_drag,
+                            frame,
                         )
                         .await.unwrap_or_else(unhandled_mouse)
                         {
@@ -1979,7 +1941,7 @@ async fn run_render_loop(
     let mut registry = clients.changed();
     // When a pending hidden-cursor latch will move a pane: a frame then.
     let mut latch_at: Option<u64> = None;
-    let mut last_views: Option<HashMap<PaneId, PaneViewport>> = None;
+    let mut last_shown: Option<Shown> = None;
 
     loop {
         // A bump landed while the last frame was being drawn: output is
@@ -2103,28 +2065,16 @@ async fn run_render_loop(
             Some(w) => w,
             None => continue,
         };
-        // A modal overlay takes its rect from the prepared frame, below.
-        let copy_overlay = if let Some(ref cm) = attached.copy_mode {
-            Some(CopyOverlayStamp {
-                kind: CopyOverlayKind::Modal,
-                pane_id: attached.active_pane_id,
-                rect: Rect::new(0, 0, 0, 0),
-                state: cm.clone(),
+        // Modal copy mode's stamp is made from the prepared frame, below.
+        let mut copy_overlay = attached
+            .mouse_selection
+            .as_ref()
+            .filter(|_| attached.copy_mode.is_none())
+            .map(|selection| CopyOverlayStamp {
+                kind: CopyOverlayKind::MouseSelection(selection.view, selection.state),
+                pane_id: selection.pane_id,
                 theme: live_theme,
-            })
-        } else {
-            attached
-                .mouse_selection
-                .as_ref()
-                .map(|selection| CopyOverlayStamp {
-                    kind: CopyOverlayKind::MouseSelection(selection.view),
-                    pane_id: selection.pane_id,
-                    rect: selection.view.rect,
-                    state: selection.state.clone(),
-                    theme: live_theme,
-                })
-        };
-        let mut copy_overlay = copy_overlay;
+            });
 
         // Collect pane VT references while holding the io_state lock.
         // We render under the lock to avoid copying VT grids; the lock
@@ -2146,13 +2096,33 @@ async fn run_render_loop(
             panes: &shux_ui::PresentedPane::of_vts(&vt_refs),
             now_ns: now(),
         });
-        if attached.copy_mode.is_some()
-            && let (Some(view), Some(vt)) = (
-                geometry.views.get_mut(&attached.active_pane_id),
-                vt_refs.get(&attached.active_pane_id),
-            )
-        {
-            *view = shux_ui::copy_mode::copy_mode_view(*view, vt);
+        // Modal copy mode draws its pane through its own view while that still
+        // maps. Once it does not (focus moved, the pane went, a resize), copy
+        // mode ends and this frame is drawn live, unless nothing was done in
+        // it yet: then it opens again over this frame, losing nothing.
+        let mut modal = None;
+        let mut modal_replaced = None;
+        if let Some(seen) = attached.copy_mode.as_ref() {
+            let (pane, active) = (seen.pane, attached.active_pane_id);
+            let rect = geometry.views.get(&pane).map(|v| v.rect);
+            let current = if copy_mode_vt(seen, active, rect, &state).is_some() {
+                Some(seen.clone())
+            } else {
+                let fresh = reopen_untouched(seen, active, geometry.views.get(&pane), &state);
+                modal_replaced = Some((seen.clone(), fresh.clone()));
+                fresh
+            };
+            if let Some((mut cm, vt)) = current.zip(state.vts.get(&pane)) {
+                cm.rebase(vt);
+                let (view, over) = cm.view.frame_view(vt);
+                geometry.views.insert(pane, view);
+                modal = Some((pane, cm.view));
+                copy_overlay = Some(CopyOverlayStamp {
+                    pane_id: pane,
+                    kind: CopyOverlayKind::Modal(cm, over),
+                    theme: live_theme,
+                });
+            }
         }
         latch_at = geometry.deadline_ns;
         // A selection reads the slice it was made over; once the pane shows
@@ -2169,27 +2139,6 @@ async fn run_render_loop(
         }
         // Its menu goes with it, in this frame already.
         let copy_menu = attached.copy_menu.filter(|_| stale_selection.is_none());
-        // Modal copy mode over the rect the frame drew its pane in, its scroll
-        // kept within what that pane can reach now: a grid that shrank, or a
-        // view that grew, leaves less history above it.
-        let mut copy_scroll = None;
-        if let Some(o) = copy_overlay
-            .as_mut()
-            .filter(|o| matches!(o.kind, CopyOverlayKind::Modal))
-        {
-            match (geometry.views.get(&o.pane_id), vt_refs.get(&o.pane_id)) {
-                (Some(view), Some(vt)) => {
-                    o.rect = view.rect;
-                    let lines = shux_ui::copy_mode::effective_total_lines(vt, o.rect.height);
-                    let max = shux_ui::copy_mode::max_scroll_offset(lines, o.rect.height);
-                    if o.state.scroll_offset > max {
-                        copy_scroll = Some((o.pane_id, o.state.clone(), max));
-                        o.state.scroll_offset = max;
-                    }
-                }
-                _ => copy_overlay = None,
-            }
-        }
         let copy_overlay_changed =
             copy_overlay_needs_base_redraw(last_copy_overlay.as_ref(), copy_overlay.as_ref());
         if copy_overlay_changed || copy_menu != last_copy_menu {
@@ -2306,7 +2255,7 @@ async fn run_render_loop(
             attached.help_visible
                 || copy_overlay
                     .as_ref()
-                    .is_some_and(|o| matches!(o.kind, CopyOverlayKind::Modal)),
+                    .is_some_and(|o| matches!(o.kind, CopyOverlayKind::Modal(..))),
         );
         // Reset the buffer first so we only ship the new frame's bytes.
         compositor.inner_mut().clear();
@@ -2324,53 +2273,25 @@ async fn run_render_loop(
                 copy_overlay.as_ref(),
                 base_emitted,
             ) {
-                if let Some(vt) = state.vts.get(&overlay.pane_id) {
-                    if overlay.state.scroll_offset > 0 {
-                        shux_ui::render_copy_view_into(
-                            compositor.inner_mut(),
-                            overlay.rect,
-                            vt,
-                            &overlay.state,
+                let buf = compositor.inner_mut();
+                let theme = &overlay.theme;
+                match (&overlay.kind, state.vts.get(&overlay.pane_id)) {
+                    (CopyOverlayKind::Modal(cm, over), Some(vt)) => {
+                        if *over {
+                            shux_ui::render_copy_view_into(buf, vt, cm);
+                        }
+                        shux_ui::render_copy_overlay_with_vt_into(buf, vt, cm, theme);
+                    }
+                    (CopyOverlayKind::Modal(cm, _), None) => {
+                        shux_ui::render_copy_overlay_into(buf, cm, theme);
+                    }
+                    (CopyOverlayKind::MouseSelection(view, sel), Some(vt)) => {
+                        shux_ui::copy_mode::render_selection_overlay_with_vt_into(
+                            buf, view, vt, sel, theme,
                         );
                     }
-                    match overlay.kind {
-                        CopyOverlayKind::Modal => {
-                            shux_ui::render_copy_overlay_with_vt_into(
-                                compositor.inner_mut(),
-                                overlay.rect,
-                                vt,
-                                &overlay.state,
-                                &overlay.theme,
-                            );
-                        }
-                        CopyOverlayKind::MouseSelection(view) => {
-                            shux_ui::copy_mode::render_selection_overlay_with_vt_into(
-                                compositor.inner_mut(),
-                                &view,
-                                vt,
-                                &overlay.state,
-                                &overlay.theme,
-                            );
-                        }
-                    }
-                } else {
-                    match overlay.kind {
-                        CopyOverlayKind::Modal => {
-                            shux_ui::render_copy_overlay_into(
-                                compositor.inner_mut(),
-                                overlay.rect,
-                                &overlay.state,
-                                &overlay.theme,
-                            );
-                        }
-                        CopyOverlayKind::MouseSelection(_) => {
-                            shux_ui::copy_mode::render_selection_overlay_into(
-                                compositor.inner_mut(),
-                                overlay.rect,
-                                &overlay.state,
-                                &overlay.theme,
-                            );
-                        }
+                    (CopyOverlayKind::MouseSelection(view, sel), None) => {
+                        shux_ui::copy_mode::render_selection_overlay_into(buf, view, sel, theme);
                     }
                 }
             }
@@ -2478,13 +2399,11 @@ async fn run_render_loop(
         if toast_expired {
             session.lock().await.show_welcome_toast = false;
         }
-        // Only into the view it was worked out for: one scrolled, or opened
-        // over another pane, since has bounds of its own.
-        if let Some((pane, seen, max)) = copy_scroll {
+        // Only the copy mode found unmappable: one opened since stays.
+        if let Some((seen, replacement)) = modal_replaced {
             let mut s = session.lock().await;
-            let same = s.active_pane_id == pane;
-            if let Some(cm) = s.copy_mode.as_mut().filter(|cm| same && **cm == seen) {
-                cm.scroll_offset = max;
+            if s.copy_mode.as_ref() == Some(&seen) {
+                s.copy_mode = replacement;
             }
         }
         // Only the selection found stale: one started since stays.
@@ -2499,13 +2418,16 @@ async fn run_render_loop(
             }
         }
 
-        // A frame that moved a slice but no cell still goes out, so the
-        // client's next event is stamped with the geometry it now shows.
-        let views = compositor.pane_views();
-        if !bytes.is_empty() || last_views.as_ref() != Some(views) {
+        // A frame that moved a slice, or copy mode's view, but no cell still
+        // goes out, so the client's next event is stamped with what it shows.
+        let shown = Shown {
+            views: compositor.pane_views().clone(),
+            modal,
+        };
+        if !bytes.is_empty() || last_shown.as_ref() != Some(&shown) {
             frame_number += 1;
-            last_views = Some(views.clone());
-            if !send_frame(&out_tx, &session, frame_number, views.clone(), &bytes).await {
+            last_shown = Some(shown.clone());
+            if !send_frame(&out_tx, &session, frame_number, shown, &bytes).await {
                 break;
             }
         }
@@ -2526,10 +2448,10 @@ async fn send_frame(
     out_tx: &mpsc::Sender<AttachServerFrame>,
     session: &Arc<Mutex<AttachedSession>>,
     frame: u64,
-    views: HashMap<PaneId, PaneViewport>,
+    shown: Shown,
     bytes: &[u8],
 ) -> bool {
-    session.lock().await.shown.push(frame, views);
+    session.lock().await.shown.push(frame, shown);
     if bytes.is_empty() {
         let render = AttachServerFrame::Render {
             data: String::new(),
@@ -2870,9 +2792,10 @@ async fn handle_mouse_selection(
             if pane_id != attached.active_pane_id {
                 let _ = graph.focus_pane(pane_id).await;
             }
-            let mut state = shux_ui::CopyModeState::new();
-            state.cursor = pos;
-            state.anchor = Some(pos);
+            let state = shux_ui::Selection {
+                cursor: pos,
+                anchor: Some(pos),
+            };
             let mut s = session.lock().await;
             s.active_pane_id = pane_id;
             s.mouse_selection = Some(MouseSelection {
@@ -3001,6 +2924,32 @@ async fn handle_mouse_selection(
     }
 }
 
+/// The pane's VT while copy mode still maps onto it: focus on its pane, which
+/// is drawn in the rect its view began in, with the same grid and screen.
+fn copy_mode_vt<'s>(
+    cm: &shux_ui::CopyModeState,
+    active: PaneId,
+    rect: Option<Rect>,
+    state: &'s PaneIoState,
+) -> Option<&'s shux_vt::VirtualTerminal> {
+    let vt = state.vts.get(&cm.pane).filter(|_| cm.pane == active)?;
+    rect.is_some_and(|r| cm.view.maps(r, vt)).then_some(vt)
+}
+
+/// Copy mode opened again over `view`, for one whose own view no longer maps
+/// but in which nothing was done yet: an action's resize just landed under it.
+fn reopen_untouched(
+    cm: &shux_ui::CopyModeState,
+    active: PaneId,
+    view: Option<&PaneViewport>,
+    state: &PaneIoState,
+) -> Option<shux_ui::CopyModeState> {
+    let view = view.filter(|_| cm.is_untouched() && cm.pane == active)?;
+    let mut fresh = shux_ui::CopyModeState::enter(cm.pane, *view, state.vts.get(&cm.pane)?)?;
+    fresh.wheel_initiated = cm.wheel_initiated;
+    Some(fresh)
+}
+
 #[expect(clippy::too_many_arguments, reason = "independent inputs")]
 async fn handle_copy_mode_mouse(
     kind: MouseKind,
@@ -3014,19 +2963,16 @@ async fn handle_copy_mode_mouse(
     config: &ConfigHandle,
     out_tx: &mpsc::Sender<AttachServerFrame>,
     dragging: &mut SelectionDrag,
+    frame: Option<u64>,
 ) -> anyhow::Result<bool> {
     let attached = session.lock().await.clone();
-    if attached.copy_mode.is_none() {
+    let Some(cm) = attached.copy_mode.as_ref() else {
         if matches!(*dragging, SelectionDrag::CopyMode) {
             *dragging = SelectionDrag::None;
         }
         return Ok(false);
-    }
-
-    let Some(rect) = focused_pane_rect(graph, &attached, client_size, config).await else {
-        *dragging = SelectionDrag::None;
-        return Ok(true);
     };
+    let rect = pane_rect_for(graph, &attached, client_size, config, cm.pane).await;
 
     match kind {
         MouseKind::ScrollUp | MouseKind::ScrollDown => {
@@ -3041,120 +2987,100 @@ async fn handle_copy_mode_mouse(
             // session-global — only one is active at a time).
             let viewport = current_viewport(client_size, config).await;
             let cursor_pane = pane_under_pointer(graph, &attached, viewport, col, row);
-            let transient = attached
-                .copy_mode
-                .as_ref()
-                .is_some_and(|cm| cm.wheel_initiated);
-            if transient && cursor_pane != attached.active_pane_id {
+            if cm.wheel_initiated && cursor_pane != cm.pane {
                 session.lock().await.copy_mode = None;
                 *dragging = SelectionDrag::None;
                 return Ok(false);
             }
-            let total_lines = {
-                let state = io_state.lock().await;
-                state
-                    .vts
-                    .get(&attached.active_pane_id)
-                    .map(|vt| shux_ui::copy_mode::effective_total_lines(vt, rect.height))
-                    .unwrap_or(rect.height as usize)
-            };
+            let state = io_state.lock().await;
             let mut s = session.lock().await;
-            // A wheel-initiated scrollback view hands the keyboard back the
-            // moment the wheel brings it to the live bottom; a manually-entered
-            // copy mode (`Prefix [` / API) stays so an in-progress selection or
-            // search is never lost. `exit` is computed while `cm` is borrowed,
-            // then applied after the borrow ends.
-            let exit = if let Some(ref mut cm) = s.copy_mode {
-                if matches!(kind, MouseKind::ScrollUp) {
-                    shux_ui::copy_mode::scroll_up(cm, 3, total_lines, rect.height);
-                    false
+            let active = s.active_pane_id;
+            // A wheel-opened view hands the keyboard back once the wheel
+            // brings it down to where it began; a deliberate copy mode
+            // (`Prefix [`, or a search since) stays, so an in-progress
+            // selection or search is never lost.
+            let keep = s.copy_mode.as_mut().is_some_and(|cm| {
+                let Some(vt) = copy_mode_vt(cm, active, rect, &state) else {
+                    return false;
+                };
+                cm.rebase(vt);
+                if kind == MouseKind::ScrollUp {
+                    shux_ui::copy_mode::scroll_up(cm, 3);
+                    true
                 } else {
-                    shux_ui::copy_mode::scroll_down(cm, 3, total_lines, rect.height);
-                    cm.wheel_initiated && cm.scroll_offset == 0
+                    shux_ui::copy_mode::scroll_down(cm, vt, 3);
+                    !(cm.wheel_initiated && shux_ui::copy_mode::back_at_entry(cm))
                 }
-            } else {
-                false
-            };
-            if exit {
+            });
+            if !keep {
                 s.copy_mode = None;
             }
             *dragging = SelectionDrag::None;
         }
-        MouseKind::Down => {
-            if button != ProtoMouseButton::Left {
-                return Ok(true);
-            }
-            if !point_in_rect(rect, col, row) {
-                *dragging = SelectionDrag::None;
-                return Ok(true);
-            }
-            let pos = pane_local_point_clamped(rect, col, row);
+        MouseKind::Down | MouseKind::Drag | MouseKind::Up
+            if button == ProtoMouseButton::Left
+                && (kind == MouseKind::Down || matches!(*dragging, SelectionDrag::CopyMode)) =>
+        {
+            // The cell is named through the copy view the stamped frame drew.
+            let drawn = attached
+                .shown
+                .shown(frame)
+                .and_then(|shown| shown.modal)
+                .filter(|(pane, _)| *pane == cm.pane);
+            let state = io_state.lock().await;
             let mut s = session.lock().await;
-            if let Some(ref mut cm) = s.copy_mode {
-                cm.cursor = pos;
-                cm.anchor = Some(pos);
-            }
-            *dragging = SelectionDrag::CopyMode;
-        }
-        MouseKind::Drag if matches!(*dragging, SelectionDrag::CopyMode) => {
-            if button != ProtoMouseButton::Left {
-                return Ok(true);
-            }
-            let pos = pane_local_point_clamped(rect, col, row);
-            let mut s = session.lock().await;
-            if let Some(ref mut cm) = s.copy_mode {
-                cm.cursor = pos;
-            }
-        }
-        MouseKind::Up if matches!(*dragging, SelectionDrag::CopyMode) => {
-            if button != ProtoMouseButton::Left {
-                return Ok(true);
-            }
-            let pos = pane_local_point_clamped(rect, col, row);
-            let cm = {
-                let mut s = session.lock().await;
-                if let Some(ref mut cm) = s.copy_mode {
-                    cm.cursor = pos;
+            let active = s.active_pane_id;
+            let mut yank = None;
+            let keep = s.copy_mode.as_mut().is_some_and(|cm| {
+                let Some(vt) = copy_mode_vt(cm, active, rect, &state) else {
+                    return false;
+                };
+                cm.rebase(vt);
+                let Some((_, view)) = drawn else {
+                    *dragging = SelectionDrag::None;
+                    return true;
+                };
+                let view = view.rebased(vt);
+                let r = view.rect();
+                if kind == MouseKind::Down && !point_in_rect(r, col, row) {
+                    *dragging = SelectionDrag::None;
+                    return true;
                 }
-                s.copy_mode.clone()
-            };
-            if let Some(cm) = cm {
-                let moved = cm.anchor.is_some_and(|anchor| anchor != cm.cursor);
-                if moved {
-                    let text = {
-                        let state = io_state.lock().await;
-                        state
-                            .vts
-                            .get(&attached.active_pane_id)
-                            .map(|vt| {
-                                shux_ui::copy_mode::extract_selection(
-                                    vt,
-                                    &cm,
-                                    rect.width,
-                                    rect.height,
-                                )
-                            })
-                            .unwrap_or_default()
-                    };
-                    if !text.is_empty() {
-                        let osc = shux_ui::osc52_copy(&text);
-                        let frame = AttachServerFrame::Render {
-                            data: BASE64.encode(&osc),
-                            frame: None,
-                        };
-                        let _ = out_tx.send(frame).await;
+                cm.set_cursor(view.source(pane_local_point_clamped(r, col, row)));
+                match kind {
+                    MouseKind::Down => {
+                        cm.anchor = Some(cm.cursor);
+                        *dragging = SelectionDrag::CopyMode;
+                        true
                     }
-                    let mut s = session.lock().await;
-                    s.copy_mode = None;
-                } else {
-                    let mut s = session.lock().await;
-                    if let Some(ref mut cm) = s.copy_mode {
-                        cm.anchor = None;
+                    MouseKind::Up => {
+                        *dragging = SelectionDrag::None;
+                        if cm.anchor.is_some_and(|anchor| anchor != cm.cursor) {
+                            yank = Some(shux_ui::copy_mode::extract_selection(vt, cm));
+                            false
+                        } else {
+                            cm.anchor = None;
+                            true
+                        }
                     }
+                    _ => true,
                 }
+            });
+            if !keep {
+                s.copy_mode = None;
             }
-            *dragging = SelectionDrag::None;
+            drop(s);
+            drop(state);
+            if let Some(text) = yank.filter(|t| !t.is_empty()) {
+                let osc = shux_ui::osc52_copy(&text);
+                let frame = AttachServerFrame::Render {
+                    data: BASE64.encode(&osc),
+                    frame: None,
+                };
+                let _ = out_tx.send(frame).await;
+            }
         }
+        MouseKind::Down | MouseKind::Drag => {}
         MouseKind::Up => {
             *dragging = SelectionDrag::None;
         }
@@ -4049,14 +3975,17 @@ async fn handle_wheel(
         }
     };
     let pane_id = hit.unwrap_or(attached.active_pane_id);
-    let Some(rect) = pane_rect_for(graph, &attached, client_size, config, pane_id).await else {
+    if pane_rect_for(graph, &attached, client_size, config, pane_id)
+        .await
+        .is_none()
+    {
         return Ok(true);
-    };
+    }
 
-    // Snapshot the target pane's live mode state + scrollback depth. A pane shux
-    // cannot encode for is treated as not mouse-aware, so the wheel falls back
-    // to shux's own scrollback. See `coords_are_encodable`.
-    let (mouse_on, sgr, alt, alt_scroll, app_cursor, total_lines) = {
+    // Snapshot the target pane's live mode state. A pane shux cannot encode
+    // for is treated as not mouse-aware, so the wheel falls back to shux's
+    // own scrollback. See `coords_are_encodable`.
+    let (mouse_on, sgr, alt, alt_scroll, app_cursor) = {
         let state = io_state.lock().await;
         match state.vts.get(&pane_id) {
             Some(vt) => {
@@ -4067,12 +3996,9 @@ async fn handle_wheel(
                     vt.is_alternate_screen(),
                     m.alternate_scroll,
                     m.application_cursor_keys,
-                    // The lines copy mode can reach: what the frame shows of a
-                    // grid taller than its rect, plus history.
-                    shux_ui::copy_mode::effective_total_lines(vt, rect.height),
                 )
             }
-            None => (false, false, false, true, false, rect.height as usize),
+            None => (false, false, false, true, false),
         }
     };
 
@@ -4106,23 +4032,29 @@ async fn handle_wheel(
             if !up {
                 return Ok(true);
             }
-            // Nothing above the live view — don't pointlessly enter copy mode.
-            if shux_ui::copy_mode::max_scroll_offset(total_lines, rect.height) == 0 {
+            // Copy mode opens over the slice the pointer was over, taken
+            // before focus moves; with nothing above it, not at all.
+            let entered = {
+                let state = io_state.lock().await;
+                views
+                    .and_then(|views| views.get(&pane_id))
+                    .zip(state.vts.get(&pane_id))
+                    .filter(|(view, vt)| shux_ui::copy_mode::has_history_above(view, vt))
+                    .and_then(|(view, vt)| shux_ui::CopyModeState::enter(pane_id, *view, vt))
+            };
+            let Some(mut cm) = entered else {
                 return Ok(true);
-            }
+            };
+            cm.wheel_initiated = true;
+            shux_ui::copy_mode::scroll_up(&mut cm, 3);
             // Scrolling a background pane focuses it (the overlay renders for the
             // active pane), matching tmux.
             if pane_id != attached.active_pane_id {
                 let _ = graph.focus_pane(pane_id).await;
-                session.lock().await.active_pane_id = pane_id;
             }
             let mut s = session.lock().await;
-            let cm = s.copy_mode.get_or_insert_with(|| {
-                let mut st = shux_ui::CopyModeState::new();
-                st.wheel_initiated = true;
-                st
-            });
-            shux_ui::copy_mode::scroll_up(cm, 3, total_lines, rect.height);
+            s.active_pane_id = pane_id;
+            s.copy_mode = Some(cm);
         }
     }
     Ok(true)
@@ -4143,48 +4075,8 @@ fn pane_local_point_clamped(rect: Rect, col: u16, row: u16) -> (u16, u16) {
     (local_col, local_row)
 }
 
-/// Compute the focused pane's content rect (cols, rows) — the size
-/// copy mode uses to clamp cursor motion. Returns (0, 0) when the
-/// pane is not in the active window's layout, which keeps `handle_key`
-/// safely a no-op rather than panicking.
-///
-/// In a zoomed window the visible pane fills the full viewport, so we
-/// use the viewport's dimensions instead of the saved split-layout
-/// rectangle — otherwise cursor motion would clamp to an unzoomed
-/// rect that no longer matches what's on screen.
-async fn focused_pane_size(
-    graph: &GraphHandle,
-    _io_state: &Arc<Mutex<PaneIoState>>,
-    pane_id: PaneId,
-    attached: &AttachedSession,
-    client_size: &ClientSize,
-    config: &ConfigHandle,
-) -> (u16, u16) {
-    if pane_id != attached.active_pane_id {
-        return (0, 0);
-    }
-    focused_pane_rect(graph, attached, client_size, config)
-        .await
-        .map(|rect| (rect.width, rect.height))
-        .unwrap_or((0, 0))
-}
-
-async fn focused_pane_rect(
-    graph: &GraphHandle,
-    attached: &AttachedSession,
-    client_size: &ClientSize,
-    config: &ConfigHandle,
-) -> Option<Rect> {
-    pane_rect_for(
-        graph,
-        attached,
-        client_size,
-        config,
-        attached.active_pane_id,
-    )
-    .await
-}
-
+/// The rect `pane_id` is drawn in at the client's size now: the whole
+/// content area while it is zoomed, `None` while the window does not draw it.
 async fn pane_rect_for(
     graph: &GraphHandle,
     attached: &AttachedSession,
@@ -4349,13 +4241,50 @@ async fn handle_action(
         return Ok(());
     }
 
-    // EnterCopyMode is also a UI-only flip — start a fresh copy-mode
-    // session on the currently focused pane. If one is already active
-    // (the user pressed prefix+[ twice), reset it back to (0,0)
-    // without an anchor, matching tmux's behavior.
+    // EnterCopyMode is also a UI-only flip: copy mode on the focused pane,
+    // over the slice the frame the client stamped showed. Pressed again
+    // while open, it changes nothing.
     if matches!(kind, ActionKind::EnterCopyMode) {
+        let attached = session.lock().await.clone();
+        let rect = pane_rect_for(
+            graph,
+            &attached,
+            client_size,
+            config,
+            attached.active_pane_id,
+        )
+        .await;
+        let state = io_state.lock().await;
         let mut s = session.lock().await;
-        s.copy_mode = Some(shux_ui::CopyModeState::new());
+        if s.copy_mode.is_some() {
+            return Ok(());
+        }
+        let pane = s.active_pane_id;
+        let vt = state.vts.get(&pane);
+        // The stamped frame's slice. When an action since has moved or
+        // resized the pane, no frame sent shows it yet: then the slice the
+        // next frame draws, which copy mode shows before anything is
+        // selected. A stamp older than every frame kept names nothing.
+        let stamped = match args.frame {
+            Some(_) => s.shown.shown(args.frame).map(Some),
+            None => Some(s.shown.shown(None)),
+        };
+        let enter = |view: Option<&PaneViewport>| shux_ui::CopyModeState::enter(pane, *view?, vt?);
+        let live = rect
+            .zip(vt)
+            .map(|(rect, vt)| PaneViewport::of(rect, vt, shux_vt::monotonic_now_ns()));
+        let entered = stamped.and_then(|stamped| {
+            enter(stamped.and_then(|f| f.views.get(&pane)))
+                .or_else(|| enter(s.shown.views(None).and_then(|v| v.get(&pane))))
+                .or_else(|| enter(live.as_ref()))
+        });
+        // Refused, the notice changes the status bar, so a frame the client
+        // can stamp afresh goes out.
+        let cm = anyhow::Context::context(
+            entered,
+            "the screen changed before copy mode opened; press it again",
+        )?;
+        s.copy_mode = Some(cm);
         tracing::info!("attach: entered copy mode on focused pane");
         return Ok(());
     }
@@ -4934,14 +4863,31 @@ mod tests {
         assert_eq!(wheel_arrow_seq(false, true), b"\x1bOB");
     }
 
+    /// What a frame with no copy mode showed.
+    fn views_only<const N: usize>(views: [(PaneId, PaneViewport); N]) -> Shown {
+        Shown {
+            views: HashMap::from(views),
+            modal: None,
+        }
+    }
+
+    /// Copy mode on `pane` over `vt` as a frame drawing it in `rect` shows it.
+    fn copy_mode_on(
+        pane: PaneId,
+        rect: Rect,
+        vt: &shux_vt::VirtualTerminal,
+    ) -> shux_ui::CopyModeState {
+        shux_ui::CopyModeState::enter(pane, PaneViewport::of(rect, vt, 0), vt).expect("copy mode")
+    }
+
     fn overlay_stamp(cursor: (u16, u16)) -> CopyOverlayStamp {
-        let mut state = shux_ui::CopyModeState::new();
-        state.cursor = cursor;
+        let pane = PaneId::from_uuid(uuid::Uuid::from_u128(7));
+        let vt = shux_vt::VirtualTerminal::new(23, 80);
+        let mut state = copy_mode_on(pane, Rect::new(1, 1, 80, 23), &vt);
+        state.set_cursor(state.view.source(cursor));
         CopyOverlayStamp {
-            kind: CopyOverlayKind::Modal,
-            pane_id: PaneId::new(),
-            rect: Rect::new(1, 1, 80, 23),
-            state,
+            kind: CopyOverlayKind::Modal(state, false),
+            pane_id: pane,
             theme: Theme::DEFAULT,
         }
     }
@@ -5852,6 +5798,8 @@ mod tests {
         )
         .await
         .expect("toggle help off");
+        let _seeded = seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+        ship_frame(&fixture.graph, &fixture.io_state, &session, &client_size).await;
         handle_action(
             ActionKind::EnterCopyMode,
             Default::default(),
@@ -6076,9 +6024,10 @@ mod tests {
             let io = fixture.io_state.lock().await;
             PaneViewport::of(Rect::new(4, 3, 20, 6), &io.vts[&fixture.first_pane], 0)
         };
-        let mut state = shux_ui::CopyModeState::new();
-        state.anchor = Some((0, 0));
-        state.cursor = (4, 0);
+        let state = shux_ui::Selection {
+            anchor: Some((0, 0)),
+            cursor: (4, 0),
+        };
         assert_eq!(view_point(&view, 6, 3, false), Some((2, 0)));
         assert_eq!(view_point(&view, 3, 3, false), None);
         let selection = MouseSelection {
@@ -6094,7 +6043,7 @@ mod tests {
             !yank_selection(&selection, &shown, &fixture.io_state, &out_tx).await,
             "no frame showed this slice"
         );
-        shown.push(1, HashMap::from([(fixture.first_pane, view)]));
+        shown.push(1, views_only([(fixture.first_pane, view)]));
         assert!(yank_selection(&selection, &shown, &fixture.io_state, &out_tx).await);
         let frame = out_rx.recv().await.expect("render frame");
         match frame {
@@ -6127,9 +6076,10 @@ mod tests {
                 PaneViewport::of(Rect::new(4, 3, 20, 4), vt, 0)
             };
             assert!(view.row_offset > 0 && view.col_offset > 0, "{view:?}");
-            let mut state = shux_ui::CopyModeState::new();
-            state.anchor = Some((0, 0));
-            state.cursor = (19, 3);
+            let state = shux_ui::Selection {
+                anchor: Some((0, 0)),
+                cursor: (19, 3),
+            };
             let selection = MouseSelection {
                 pane_id: pane,
                 state,
@@ -6137,7 +6087,7 @@ mod tests {
                 generation: 1,
             };
             let mut shown = ShownFrames::default();
-            shown.push(1, HashMap::from([(pane, view)]));
+            shown.push(1, views_only([(pane, view)]));
             fixture
                 .io_state
                 .lock()
@@ -6277,13 +6227,11 @@ mod tests {
     async fn copy_mode_mouse_scrolls_drags_copies_and_handles_non_left_clicks() {
         let fixture = attach_fixture().await;
         seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
-        let mut attached = fixture.attached.clone();
-        attached.copy_mode = Some(shux_ui::CopyModeState::new());
-        let session = Arc::new(Mutex::new(attached));
+        let session = Arc::new(Mutex::new(fixture.attached.clone()));
         let client_size = Arc::new(Mutex::new((100, 30)));
         let (out_tx, mut out_rx) = mpsc::channel(4);
         let mut drag = SelectionDrag::None;
-        ship_frame(&fixture.graph, &fixture.io_state, &session, &client_size).await;
+        open_copy_mode(&fixture.graph, &fixture.io_state, &session, &client_size).await;
 
         assert!(
             handle_copy_mode_mouse(
@@ -6298,6 +6246,7 @@ mod tests {
                 &test_config(),
                 &out_tx,
                 &mut drag,
+                None,
             )
             .await
             .expect("scroll up")
@@ -6315,6 +6264,7 @@ mod tests {
                 &test_config(),
                 &out_tx,
                 &mut drag,
+                None,
             )
             .await
             .expect("ignore right down")
@@ -6333,6 +6283,7 @@ mod tests {
             &test_config(),
             &out_tx,
             &mut drag,
+            None,
         )
         .await
         .expect("copy mode down");
@@ -6349,6 +6300,7 @@ mod tests {
             &test_config(),
             &out_tx,
             &mut drag,
+            None,
         )
         .await
         .expect("copy mode drag");
@@ -6364,6 +6316,7 @@ mod tests {
             &test_config(),
             &out_tx,
             &mut drag,
+            None,
         )
         .await
         .expect("copy mode up");
@@ -7070,7 +7023,7 @@ mod tests {
         let sender = {
             let session = session.clone();
             tokio::spawn(
-                async move { send_frame(&out_tx, &session, 7, HashMap::new(), b"x").await },
+                async move { send_frame(&out_tx, &session, 7, Shown::default(), b"x").await },
             )
         };
         for _ in 0..8 {
@@ -7097,7 +7050,7 @@ mod tests {
     fn shown_frames_map_a_stamp_to_the_frame_the_client_had_written() {
         let pane = PaneId::new();
         let view = |row_offset| {
-            HashMap::from([(
+            views_only([(
                 pane,
                 PaneViewport {
                     rect: Rect::new(0, 0, 1, 1),
@@ -7213,7 +7166,35 @@ mod tests {
         };
         let mut s = session.lock().await;
         let next = s.shown.0.back().map_or(1, |(n, _)| n + 1);
-        s.shown.push(next, shown);
+        let modal = s.copy_mode.as_ref().map(|cm| (cm.pane, cm.view));
+        s.shown.push(
+            next,
+            Shown {
+                views: shown,
+                modal,
+            },
+        );
+    }
+
+    /// Copy mode on the session's focused pane over the slice a frame just
+    /// shipped shows, and a frame showing it.
+    async fn open_copy_mode(
+        graph: &GraphHandle,
+        io_state: &Arc<Mutex<PaneIoState>>,
+        session: &Arc<Mutex<AttachedSession>>,
+        client_size: &ClientSize,
+    ) {
+        ship_frame(graph, io_state, session, client_size).await;
+        {
+            let state = io_state.lock().await;
+            let mut s = session.lock().await;
+            let pane = s.active_pane_id;
+            let view = s.shown.views(None).expect("a frame")[&pane];
+            s.copy_mode = Some(
+                shux_ui::CopyModeState::enter(pane, view, &state.vts[&pane]).expect("copy mode"),
+            );
+        }
+        ship_frame(graph, io_state, session, client_size).await;
     }
 
     /// A release whose frame is no longer kept still finishes a selection
@@ -8019,20 +8000,38 @@ mod tests {
         h.fixture.stop();
     }
 
-    /// Review of #190: an open copy view scrolled further than its pane can
-    /// now reach is brought back within it, in the frame and in the state
-    /// the next key scrolls from.
+    /// A resize under an open copy view names other cells than it showed: the
+    /// next frame ends a copy mode with a selection and brings the pane back to
+    /// its live view. One nothing was done in yet opens again over the new grid.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_open_copy_view_past_its_history_is_brought_back() {
+        for selecting in [true, false] {
+            copy_mode_across_a_resize(selecting).await;
+        }
+    }
+
+    async fn copy_mode_across_a_resize(selecting: bool) {
         let fixture = attach_fixture().await;
         seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
         let _ = fixture.graph.focus_pane(fixture.first_pane).await;
         let mut attached = fixture.attached.clone();
         attached.active_pane_id = fixture.first_pane;
-        let mut cm = shux_ui::CopyModeState::new();
-        cm.scroll_offset = 10_000;
-        attached.copy_mode = Some(cm);
         let session = Arc::new(Mutex::new(attached));
+        let client_size: ClientSize = Arc::new(Mutex::new((100, 30)));
+        open_copy_mode(&fixture.graph, &fixture.io_state, &session, &client_size).await;
+        if selecting {
+            let mut s = session.lock().await;
+            let cm = s.copy_mode.as_mut().expect("copy mode");
+            cm.anchor = Some(cm.cursor);
+        }
+        fixture
+            .io_state
+            .lock()
+            .await
+            .vts
+            .get_mut(&fixture.first_pane)
+            .expect("vt")
+            .resize(4, 30);
         let onboarding = crate::onboarding::OnboardingHandle::from_state_for_test(
             crate::onboarding::OnboardingState {
                 prefix_discovered: true,
@@ -8067,16 +8066,17 @@ mod tests {
                 Some(None) | None => panic!("no frame"),
             }
         }
-        let offset = session
+        let grid = session
             .lock()
             .await
             .copy_mode
             .as_ref()
-            .map(|cm| cm.scroll_offset);
-        assert!(
-            offset.is_some_and(|o| o < 10_000),
-            "the copy view stayed past its history: {offset:?}"
-        );
+            .map(|cm| (cm.view.entry.grid_rows, cm.view.entry.grid_cols));
+        if selecting {
+            assert_eq!(grid, None, "a selection outlived the grid it was made on");
+        } else {
+            assert_eq!(grid, Some((4, 30)), "an untouched copy mode did not reopen");
+        }
         cancel.cancel();
         render.await.expect("render loop");
         fixture.stop();
@@ -8099,7 +8099,7 @@ mod tests {
         };
         let selection = |generation| MouseSelection {
             pane_id: pane,
-            state: shux_ui::CopyModeState::new(),
+            state: shux_ui::Selection::default(),
             view: stale_view,
             generation,
         };
@@ -8887,7 +8887,10 @@ mod tests {
                         row: 5,
                     });
                 } else {
-                    s.copy_mode = Some(shux_ui::CopyModeState::new());
+                    let state = h.fixture.io_state.lock().await;
+                    let pane = h.fixture.first_pane;
+                    let rect = Rect::new(0, 0, 49, 27);
+                    s.copy_mode = Some(copy_mode_on(pane, rect, &state.vts[&pane]));
                 }
             }
             assert_eq!(
@@ -8916,7 +8919,7 @@ mod tests {
             let mut s = h.session.lock().await;
             s.mouse_selection = Some(MouseSelection {
                 pane_id: h.fixture.first_pane,
-                state: shux_ui::CopyModeState::new(),
+                state: shux_ui::Selection::default(),
                 view: PaneViewport {
                     rect: Rect::new(0, 0, 1, 1),
                     grid_rows: 1,
@@ -9230,7 +9233,203 @@ mod tests {
                 );
             }
         }
+        every_render_path_agrees_on_a_scrolled_slice(&fixture).await;
         fixture.stop();
+    }
+
+    /// The same claim for a slice scrolled on both axes, split and zoomed:
+    /// the live attach bytes, the composed frame, the kitty placement and
+    /// the raster pixels all show the same cells and the same cropped
+    /// picture, and copy mode opened over that frame shows it unchanged.
+    async fn every_render_path_agrees_on_a_scrolled_slice(fixture: &AttachFixture) {
+        use base64::Engine as _;
+        let pane = fixture.first_pane;
+        let snap = fixture.graph.snapshot();
+        let tree = snap.windows[&fixture.first_window].layout.tree.clone();
+        drop(snap);
+        let zoomed = shux_core::layout::ZoomState {
+            zoomed_pane: pane,
+            saved_layout: tree.clone(),
+        };
+        let green = [30u8, 200, 60];
+        for zoom in [None, Some(&zoomed)] {
+            let mut vt = lettered(40, 200);
+            // Colour probes in the shown slice, then a 2x1-cell picture whose
+            // first cell lies left of it.
+            vt.process(b"\x1b[13;48H\x1b[38;2;0;200;90mT\x1b[38;5;208mI\x1b[34mB\x1b[0m");
+            vt.process(b"\x1b[12;45H");
+            let px: Vec<u8> = (0..18 * 19).flat_map(|_| green).collect();
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&px);
+            vt.process(format!("\x1b_Ga=T,f=24,s=18,v=19,C=1;{b64}\x1b\\").as_bytes());
+            let base = {
+                let vts = HashMap::from([(pane, &vt)]);
+                shux_ui::prepare_frame(&shux_ui::FrameInputs {
+                    layout: &tree,
+                    zoom,
+                    cols: 100,
+                    rows: 30,
+                    status_bar_height: STATUS_BAR_ROWS,
+                    border_style: BorderStyle::parse("rounded"),
+                    panes: &shux_ui::PresentedPane::of_vts(&vts),
+                    now_ns: 0,
+                })
+            };
+            let rect = base.views[&pane].rect;
+            vt.process(&follow_to(rect, 10, 45));
+            let vts = HashMap::from([(pane, &vt)]);
+            let geometry = shux_ui::prepare_frame(&shux_ui::FrameInputs {
+                layout: &tree,
+                zoom,
+                cols: 100,
+                rows: 30,
+                status_bar_height: STATUS_BAR_ROWS,
+                border_style: BorderStyle::parse("rounded"),
+                panes: &shux_ui::PresentedPane::of_vts(&vts),
+                now_ns: 0,
+            });
+            let view = geometry.views[&pane];
+            let what = if zoom.is_some() { "zoomed" } else { "split" };
+            assert_eq!((view.row_offset, view.col_offset), (10, 45), "{what}");
+            let expect = |r: usize, c: usize| char::from(b'a' + ((10 + r + 45 + c) % 26) as u8);
+
+            // 1. Live attach bytes, replayed into a terminal.
+            let cfg = CompositorConfig {
+                border_style: BorderStyle::parse("rounded"),
+                status_bar_height: STATUS_BAR_ROWS,
+                ..Default::default()
+            };
+            let mut compositor = RenderCompositor::new(100, 30, Vec::new(), cfg);
+            compositor.set_graphics(true);
+            let frame = MultiPaneFrame {
+                layout: &tree,
+                zoom,
+                focused: pane,
+                vts: &vts,
+                chrome: None,
+                status_bar: None,
+                geometry: Some(&geometry),
+            };
+            compositor.render_multi_pane(frame).expect("render");
+            let live = std::mem::take(compositor.inner_mut());
+            let mut screen = shux_vt::VirtualTerminal::new(30, 100);
+            screen.process(&live);
+
+            // 2. The composed frame snapshots draw.
+            let panes = HashMap::from([(pane, (vt.grid(), vt.cursor()))]);
+            let composed = shux_ui::compose(
+                &shux_ui::ComposeInputs {
+                    layout: &tree,
+                    zoom,
+                    focused: pane,
+                    panes: &panes,
+                    chrome: None,
+                    status_bar: None,
+                    geometry: Some(&geometry),
+                },
+                100,
+                30,
+                BorderStyle::parse("rounded"),
+                shux_ui::BorderColors::default(),
+                STATUS_BAR_ROWS,
+            );
+            let (x0, y0) = (usize::from(rect.x), usize::from(rect.y));
+            for (r, c) in [
+                (0, 0),
+                (0, 1),
+                (4, 7),
+                (usize::from(rect.height) - 1, usize::from(rect.width) - 1),
+            ] {
+                if r == 2 && c < 2 {
+                    continue;
+                }
+                let want = expect(r, c);
+                assert_eq!(
+                    screen.grid().visible_row(y0 + r)[x0 + c].ch,
+                    want,
+                    "{what}: live ({r},{c})"
+                );
+                assert_eq!(
+                    composed.grid.visible_row(y0 + r)[x0 + c].ch,
+                    want,
+                    "{what}: composed ({r},{c})"
+                );
+            }
+            // The probes, coloured on both paths: grid row 12, columns 47..50.
+            for path in [screen.grid(), &composed.grid] {
+                let probe = path.visible_row(y0 + 2);
+                assert_eq!(
+                    [
+                        probe[x0 + 2].style.fg,
+                        probe[x0 + 3].style.fg,
+                        probe[x0 + 4].style.fg
+                    ],
+                    [
+                        shux_vt::Color::Rgb(0, 200, 90),
+                        shux_vt::Color::Indexed(208),
+                        shux_vt::Color::Indexed(4)
+                    ],
+                    "{what}: colour probes"
+                );
+            }
+            assert_eq!(
+                view.cursor_cell(vt.cursor()),
+                Some((rect.x + rect.width - 1, rect.y + rect.height - 1)),
+                "{what}: cursor"
+            );
+
+            // 3. Kitty: the picture's second cell at the slice's first, its
+            //    first nine source columns cropped off.
+            let live = String::from_utf8_lossy(&live);
+            let put = format!("\x1b[{};{}H\x1b_Ga=T", y0 + 2, x0 + 1);
+            assert!(
+                live.contains(&put),
+                "{what}: kitty placement not at {put:?}"
+            );
+            assert!(
+                live.contains("x=9,y=0,w=9,h=19,c=1,r=1"),
+                "{what}: kitty crop"
+            );
+
+            // 4. Raster: that cell green, the border left of it not.
+            let rast = shux_raster::Rasterizer::new(14.0).expect("rasterizer");
+            let (cw, ch) = rast.cell_size();
+            let mut img = rast.render_regions(
+                &composed.grid,
+                &shux_raster::RasterOptions::default(),
+                &composed.regions,
+            );
+            rast.composite_composed(&mut img, &composed.placements);
+            let at = |x: u32, y: u32| {
+                let p = img.get_pixel(x, y).0;
+                [p[0], p[1], p[2]]
+            };
+            let (px0, py) = (x0 as u32 * cw, (y0 as u32 + 1) * ch + ch / 2);
+            assert_eq!(at(px0 + cw / 2, py), green, "{what}: raster crop");
+            assert_ne!(
+                at(px0 + cw + cw / 2, py),
+                green,
+                "{what}: raster ran past the picture"
+            );
+            assert!(
+                (0..px0).all(|x| at(x, py) != green),
+                "{what}: the cropped cell landed left of the pane"
+            );
+
+            // 5. Copy mode over that frame draws the same slice, its picture
+            //    where the frame put it.
+            let cm = shux_ui::CopyModeState::enter(pane, view, &vt).expect("copy mode");
+            assert_eq!(cm.view.frame_view(&vt), (view, false), "{what}: copy view");
+            let mut copy = Vec::new();
+            shux_ui::render_copy_view_into(&mut copy, &vt, &cm);
+            screen.process(&copy);
+            for (r, c) in [(0, 0), (4, 7)] {
+                assert_eq!(
+                    screen.grid().visible_row(y0 + r)[x0 + c].ch,
+                    expect(r, c),
+                    "{what}: copy view"
+                );
+            }
+        }
     }
 
     /// A live `border_style` edit moves every pane's rect, so the PTYs must be
@@ -9411,9 +9610,9 @@ mod tests {
             .as_ref()
             .expect("primary-screen wheel-up must enter scrollback");
         assert!(
-            cm.scroll_offset > 0,
-            "scroll_offset must advance, got {}",
-            cm.scroll_offset
+            cm.view.top < cm.view.entry_top,
+            "the view must scroll up from where it opened: {:?}",
+            cm.view
         );
         drop(s);
         fixture.stop();
@@ -9528,7 +9727,7 @@ mod tests {
             let s = session.lock().await;
             let cm = s.copy_mode.as_ref().expect("wheel-up enters scrollback");
             assert!(cm.wheel_initiated, "must be flagged wheel-initiated");
-            assert!(cm.scroll_offset > 0);
+            assert!(cm.view.top < cm.view.entry_top);
         }
 
         // Copy mode is now active, so wheel-down flows through the OTHER handler.
@@ -9545,6 +9744,7 @@ mod tests {
                 &test_config(),
                 &out_tx,
                 &mut drag,
+                None,
             )
             .await
             .expect("copy-mode wheel down");
@@ -9565,10 +9765,10 @@ mod tests {
         // so a scroll never discards an in-progress selection/search.
         let fixture = attach_fixture().await;
         let _wr = seed_scrollback_pane(&fixture.io_state, fixture.first_pane, b"").await;
-        let mut attached = fixture.attached.clone();
-        attached.copy_mode = Some(shux_ui::CopyModeState::new()); // wheel_initiated = false
-        let session = Arc::new(Mutex::new(attached));
+        let session = Arc::new(Mutex::new(fixture.attached.clone()));
         let client_size = Arc::new(Mutex::new((100, 30)));
+        // wheel_initiated = false
+        open_copy_mode(&fixture.graph, &fixture.io_state, &session, &client_size).await;
         let (out_tx, _out_rx) = mpsc::channel(8);
         let mut drag = SelectionDrag::None;
 
@@ -9584,6 +9784,7 @@ mod tests {
             &test_config(),
             &out_tx,
             &mut drag,
+            None,
         )
         .await
         .expect("copy-mode wheel up");
@@ -9600,6 +9801,7 @@ mod tests {
                 &test_config(),
                 &out_tx,
                 &mut drag,
+                None,
             )
             .await
             .expect("copy-mode wheel down");
@@ -9670,6 +9872,7 @@ mod tests {
             &test_config(),
             &out_tx,
             &mut drag,
+            None,
         )
         .await
         .expect("copy-mode wheel over pane B");
@@ -9704,7 +9907,8 @@ mod tests {
             "the pane under the pointer must scroll and take focus"
         );
         assert!(
-            s.copy_mode.as_ref().is_some_and(|cm| cm.scroll_offset > 0),
+            s.copy_mode.as_ref().is_some_and(|cm| cm.pane == fixture.second_pane
+                && cm.view.top < cm.view.entry_top),
             "B must now be in its own scrollback view"
         );
         drop(s);
@@ -9719,10 +9923,10 @@ mod tests {
         let fixture = attach_fixture().await;
         let _wr_a = seed_scrollback_pane(&fixture.io_state, fixture.first_pane, b"").await;
         let _wr_b = seed_scrollback_pane(&fixture.io_state, fixture.second_pane, b"").await;
-        let mut attached = fixture.attached.clone();
-        attached.copy_mode = Some(shux_ui::CopyModeState::new()); // wheel_initiated = false
-        let session = Arc::new(Mutex::new(attached));
+        let session = Arc::new(Mutex::new(fixture.attached.clone()));
         let client_size = Arc::new(Mutex::new((100, 30)));
+        // wheel_initiated = false
+        open_copy_mode(&fixture.graph, &fixture.io_state, &session, &client_size).await;
         let (out_tx, _out_rx) = mpsc::channel(8);
         let mut drag = SelectionDrag::None;
         let viewport = current_viewport(&client_size, &test_config()).await;
@@ -9741,6 +9945,7 @@ mod tests {
             &test_config(),
             &out_tx,
             &mut drag,
+            None,
         )
         .await
         .expect("copy-mode wheel over pane B");
@@ -12606,19 +12811,24 @@ mod tests {
         fixture.stop();
     }
 
-    /// Review of #190: a frame clamps the copy view it drew; a different view
-    /// opened over another pane while it was drawn keeps its own scroll.
+    /// A frame ends the copy mode it found unmappable, and only that one: a
+    /// copy mode opened over another pane while the frame was drawn stays.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_copy_view_clamp_lands_only_on_the_view_it_was_for() {
         let fixture = attach_fixture().await;
         let (short, long) = (fixture.first_pane, fixture.second_pane);
         seed_io_for_pane(&fixture.io_state, short).await;
         let _wr = seed_scrollback_pane(&fixture.io_state, long, b"").await;
+        let (stale, opened) = {
+            let state = fixture.io_state.lock().await;
+            (
+                copy_mode_on(short, Rect::new(0, 0, 1, 1), &state.vts[&short]),
+                copy_mode_on(long, Rect::new(0, 0, 3, 3), &state.vts[&long]),
+            )
+        };
         let mut attached = fixture.attached.clone();
         attached.active_pane_id = short;
-        let mut past = shux_ui::CopyModeState::new();
-        past.scroll_offset = 10_000;
-        attached.copy_mode = Some(past);
+        attached.copy_mode = Some(stale);
         let session = Arc::new(Mutex::new(attached));
         let onboarding = crate::onboarding::OnboardingHandle::from_state_for_test(
             crate::onboarding::OnboardingState {
@@ -12655,9 +12865,7 @@ mod tests {
         .await;
         {
             let mut s = session.lock().await;
-            let mut view = shux_ui::CopyModeState::new();
-            view.scroll_offset = 100;
-            s.copy_mode = Some(view);
+            s.copy_mode = Some(opened.clone());
             s.active_pane_id = long;
         }
         drop(held);
@@ -12669,16 +12877,10 @@ mod tests {
                 Some(None) | None => panic!("no frame"),
             }
         }
-        let offset = session
-            .lock()
-            .await
-            .copy_mode
-            .as_ref()
-            .map(|cm| cm.scroll_offset);
         assert_eq!(
-            offset,
-            Some(100),
-            "another pane's copy view was clamped to this one's bounds"
+            session.lock().await.copy_mode,
+            Some(opened),
+            "the frame ended a copy mode it never drew"
         );
         cancel.cancel();
         render.await.expect("render loop");
@@ -12745,5 +12947,376 @@ mod tests {
         );
         a.stop().await;
         fixture.stop();
+    }
+
+    // --- #190 B2: modal copy mode reads the frame the client was shown ---
+
+    /// A `rows` x `cols` grid whose cell (r, c) holds letter `(r + c) % 26`,
+    /// so any slice of it reads as a string the test can name.
+    fn lettered(rows: usize, cols: usize) -> shux_vt::VirtualTerminal {
+        let mut vt = shux_vt::VirtualTerminal::new(rows, cols);
+        for r in 0..rows {
+            let line: String = (0..cols)
+                .map(|c| char::from(b'a' + ((r + c) % 26) as u8))
+                .collect();
+            vt.process(format!("\x1b[{};1H{line}", r + 1).as_bytes());
+        }
+        vt
+    }
+
+    /// The cursor position that makes cursor-follow show `rect` from grid row
+    /// `row`, column `col`.
+    fn follow_to(rect: Rect, row: usize, col: usize) -> Vec<u8> {
+        let (h, w) = (usize::from(rect.height), usize::from(rect.width));
+        format!("\x1b[{};{}H", row + h, col + w).into_bytes()
+    }
+
+    impl InputHarness {
+        /// The rect the first pane is drawn in for this harness's client.
+        async fn first_rect(&self) -> Rect {
+            let size: ClientSize = Arc::new(Mutex::new((90, 24)));
+            let pane = self.fixture.first_pane;
+            pane_rect_for(
+                &self.fixture.graph,
+                &self.fixture.attached,
+                &size,
+                &test_config(),
+                pane,
+            )
+            .await
+            .expect("first pane rect")
+        }
+
+        /// Make `vt` the first pane's grid and wake every render loop.
+        async fn show(&self, vt: shux_vt::VirtualTerminal) {
+            let mut state = self.fixture.io_state.lock().await;
+            state.vts.insert(self.fixture.first_pane, vt);
+            state.render_pulse.bump();
+        }
+
+        /// What the first pane's application writes next.
+        async fn app_writes(&self, bytes: &[u8]) {
+            let mut state = self.fixture.io_state.lock().await;
+            let pane = self.fixture.first_pane;
+            state
+                .vts
+                .get_mut(&pane)
+                .expect("first pane vt")
+                .process(bytes);
+            state.render_pulse.bump();
+        }
+    }
+
+    impl Client {
+        /// `prefix [`, stamped with `frame` as the real client stamps it.
+        /// Built from JSON: the stamp is a field an older daemon ignores.
+        async fn enter_copy_mode(&mut self, frame: Option<u64>) {
+            let action = serde_json::json!({
+                "type": "action",
+                "kind": "enter_copy_mode",
+                "args": { "frame": frame },
+            });
+            let action: AttachClientFrame = serde_json::from_value(action).expect("action json");
+            self.send(&action).await;
+        }
+
+        /// A left-button event at screen `(col, row)`, stamped with the
+        /// frame this client last applied.
+        async fn left(&mut self, kind: MouseKind, col: u16, row: u16) {
+            let frame = self.written_frame;
+            self.send(&AttachClientFrame::Mouse {
+                kind,
+                button: ProtoMouseButton::Left,
+                col,
+                row,
+                shift: false,
+                alt: false,
+                ctrl: false,
+                frame,
+            })
+            .await;
+        }
+
+        /// The text of the next OSC 52 clipboard write, if one comes.
+        async fn yanked(&mut self) -> Option<String> {
+            let mut text = None;
+            self.frames_until(|f, _| {
+                let AttachServerFrame::Render { data, .. } = f else {
+                    return false;
+                };
+                let bytes = BASE64.decode(data.as_bytes()).expect("render base64");
+                let Some(rest) = bytes.strip_prefix(b"\x1b]52;c;") else {
+                    return false;
+                };
+                let b64 = rest.strip_suffix(b"\x07").expect("OSC 52 ends in BEL");
+                let raw = BASE64.decode(b64).expect("OSC 52 base64");
+                text = Some(String::from_utf8(raw).expect("utf8 yank"));
+                true
+            })
+            .await;
+            text
+        }
+    }
+
+    /// Copy mode opens over the slice the client was looking at when it
+    /// pressed the key, though a frame with another slice was already on its
+    /// way, and holds it while the application moves and hides its cursor.
+    #[tokio::test(start_paused = true)]
+    async fn copy_mode_yanks_from_the_frame_the_client_was_shown() {
+        let mut h = InputHarness::new(64).await;
+        let rect = h.first_rect().await;
+        let mut vt = lettered(40, 120);
+        vt.process(b"\x1b[40;101HNEWVIEW");
+        vt.process(&follow_to(rect, 10, 40));
+        h.show(vt).await;
+        h.catch_up().await;
+        let shown = h.written_frame;
+
+        // A newer slice reaches the client's socket before its key does.
+        h.app_writes(b"\x1b[40;120H").await;
+        h.receive_unapplied("NEWVIEW").await;
+        h.enter_copy_mode(shown).await;
+        h.catch_up().await;
+        h.app_writes(b"\x1b[?25l\x1b[1;1H").await;
+        idle_for(QUIET).await;
+        for key in [b"v", b"l", b"l", b"l", b"l", b"y"] {
+            h.key(key).await;
+        }
+        // Row 10 from column 40: letters (10 + 40) % 26 onward.
+        assert_eq!(h.yanked().await.as_deref(), Some("yzabc"));
+        h.stop().await;
+    }
+
+    /// A drag in copy mode names cells of the frame the pointer was over, and
+    /// its release copies them.
+    #[tokio::test(start_paused = true)]
+    async fn a_copy_mode_drag_yanks_what_its_frame_showed() {
+        let mut h = InputHarness::new(64).await;
+        let rect = h.first_rect().await;
+        let mut vt = lettered(40, 120);
+        vt.process(&follow_to(rect, 10, 40));
+        h.show(vt).await;
+        h.catch_up().await;
+        let shown = h.written_frame;
+        h.enter_copy_mode(shown).await;
+        h.catch_up().await;
+        h.app_writes(b"\x1b[40;120H").await;
+        idle_for(QUIET).await;
+        let (x, y) = (rect.x + 2, rect.y + 1);
+        h.left(MouseKind::Down, x, y).await;
+        h.left(MouseKind::Drag, x + 4, y).await;
+        h.left(MouseKind::Up, x + 4, y).await;
+        // Row 11 from column 42: letters (11 + 42) % 26 onward.
+        assert_eq!(h.yanked().await.as_deref(), Some("bcdef"));
+        h.stop().await;
+    }
+
+    /// A stamp that names no frame still kept opens nothing: the next key is
+    /// the pane's. One whose frame's grid has been resized since opens over
+    /// the slice the next frame draws, never the stale one.
+    #[tokio::test(start_paused = true)]
+    async fn copy_mode_refuses_an_expired_stamp_and_follows_a_resize() {
+        let mut h = InputHarness::new(64).await;
+        let rect = h.first_rect().await;
+        let mut vt = lettered(40, 120);
+        vt.process(&follow_to(rect, 10, 40));
+        h.show(vt).await;
+        h.catch_up().await;
+
+        h.enter_copy_mode(Some(0)).await;
+        h.key(b"x").await;
+        assert_eq!(
+            h.next_input().await,
+            b"x",
+            "an expired stamp opened copy mode"
+        );
+
+        h.catch_up().await;
+        let shown = h.written_frame;
+        let top_left = {
+            let mut state = h.fixture.io_state.lock().await;
+            let pane = h.fixture.first_pane;
+            let vt = state.vts.get_mut(&pane).expect("vt");
+            vt.resize(30, 100);
+            let view = PaneViewport::of(rect, vt, shux_vt::monotonic_now_ns());
+            vt.grid().visible_row(view.row_offset)[view.col_offset].ch
+        };
+        h.enter_copy_mode(shown).await;
+        h.key(b"y").await;
+        assert_eq!(
+            h.yanked().await,
+            Some(top_left.to_string()),
+            "copy mode opened over the slice the stale frame showed"
+        );
+        h.stop().await;
+    }
+
+    /// Copy mode belongs to the pane it opened on: focus moving off it ends
+    /// copy mode, and the pane's keys are its own again.
+    #[tokio::test(start_paused = true)]
+    async fn copy_mode_ends_when_focus_leaves_its_pane() {
+        let mut h = InputHarness::new(64).await;
+        h.show(lettered(10, 40)).await;
+        h.catch_up().await;
+        let shown = h.written_frame;
+        h.enter_copy_mode(shown).await;
+        assert!(h.frames_until(|_, text| text.contains("COPY")).await);
+        h.fixture
+            .graph
+            .focus_pane(h.fixture.second_pane)
+            .await
+            .expect("focus second");
+        h.fixture.io_state.lock().await.render_pulse.bump();
+        assert!(
+            h.frames_until(|_, text| !text.contains("COPY")).await,
+            "copy mode followed focus to another pane"
+        );
+        h.fixture
+            .graph
+            .focus_pane(h.fixture.first_pane)
+            .await
+            .expect("focus first");
+        h.key(b"q").await;
+        assert_eq!(h.next_input().await, b"q");
+        h.stop().await;
+    }
+
+    /// A selection whose lines scroll out of the pane's history is dropped,
+    /// not stretched over whatever slid into their place.
+    #[tokio::test(start_paused = true)]
+    async fn a_copy_selection_whose_lines_are_evicted_is_dropped() {
+        let mut h = InputHarness::new(64).await;
+        let config = shux_vt::GridConfig {
+            max_scrollback: 4,
+            ..Default::default()
+        };
+        let mut vt = shux_vt::VirtualTerminal::with_config(6, 40, config);
+        for i in 0..10 {
+            vt.process(format!("e{i:02}\r\n").as_bytes());
+        }
+        h.show(vt).await;
+        h.catch_up().await;
+        let shown = h.written_frame;
+        h.enter_copy_mode(shown).await;
+        h.catch_up().await;
+        for key in [b"v", b"l", b"l"] {
+            h.key(key).await;
+        }
+        idle_for(QUIET).await;
+        let flood: String = (10..40).map(|i| format!("e{i:02}\r\n")).collect();
+        h.app_writes(flood.as_bytes()).await;
+        idle_for(QUIET).await;
+        h.key(b"y").await;
+        let text = h.yanked().await.unwrap_or_default();
+        assert_eq!(
+            text.chars().count(),
+            1,
+            "yanked a selection whose lines were evicted: {text:?}"
+        );
+        h.stop().await;
+    }
+
+    /// Enter copy mode over the first pane's `vt` and yank what `keys` select.
+    async fn search_yank(vt: shux_vt::VirtualTerminal, keys: &[&[u8]]) -> Option<String> {
+        let mut h = InputHarness::new(64).await;
+        h.show(vt).await;
+        h.catch_up().await;
+        let shown = h.written_frame;
+        h.enter_copy_mode(shown).await;
+        h.catch_up().await;
+        // One key per frame, as a terminal reports typing.
+        for key in keys
+            .iter()
+            .flat_map(|k| std::str::from_utf8(k).expect("utf8").chars())
+        {
+            h.key(key.to_string().as_bytes()).await;
+        }
+        let text = h.yanked().await;
+        h.stop().await;
+        text
+    }
+
+    const SELECT_SIX: [&[u8]; 7] = [b"v", b"l", b"l", b"l", b"l", b"l", b"y"];
+
+    /// A search finds a match on a row's columns right of the slice and pans
+    /// just far enough to show it; one on grid rows below the slice is
+    /// scrolled to.
+    #[tokio::test(start_paused = true)]
+    async fn a_search_reveals_a_match_right_of_or_below_the_slice() {
+        let mut wide = shux_vt::VirtualTerminal::new(10, 120);
+        wide.process(b"\x1b[6;101Hneedle\x1b[1;1H");
+        let keys = [&[b"/needle\r" as &[u8]][..], &SELECT_SIX].concat();
+        assert_eq!(search_yank(wide, &keys).await.as_deref(), Some("needle"));
+
+        let mut tall = shux_vt::VirtualTerminal::new(60, 40);
+        tall.process(b"\x1b[51;4Hneedle\x1b[1;1H");
+        assert_eq!(search_yank(tall, &keys).await.as_deref(), Some("needle"));
+    }
+
+    /// Match columns are the cells that hold the matched text: a wide glyph
+    /// is two, a combining sequence one.
+    #[tokio::test(start_paused = true)]
+    async fn a_search_maps_matched_text_to_its_cells() {
+        let row = "\x1b[3;1H界界e\u{301}x needle\x1b[1;1H";
+        let mut vt = shux_vt::VirtualTerminal::new(10, 40);
+        vt.process(row.as_bytes());
+        let keys = [&[b"/needle\r" as &[u8]][..], &SELECT_SIX].concat();
+        assert_eq!(search_yank(vt, &keys).await.as_deref(), Some("needle"));
+
+        let mut vt = shux_vt::VirtualTerminal::new(10, 40);
+        vt.process(row.as_bytes());
+        let keys: [&[u8]; 6] = [b"/", "界e".as_bytes(), b"\r", b"v", b"l", b"l"];
+        let keys = [&keys[..], &[b"y" as &[u8]]].concat();
+        assert_eq!(search_yank(vt, &keys).await.as_deref(), Some("界e\u{301}"));
+    }
+
+    /// A backward search finds the match the cursor sits inside, and a
+    /// forward one wraps back to a match left of the cursor on its own row.
+    #[tokio::test(start_paused = true)]
+    async fn a_search_finds_matches_across_and_behind_the_cursor() {
+        let mut vt = shux_vt::VirtualTerminal::new(10, 40);
+        vt.process(b"\x1b[5;1Hxx needle yy\x1b[1;1H");
+        let keys = [&[b"/dle\r" as &[u8], b"?needle\r"][..], &SELECT_SIX].concat();
+        assert_eq!(search_yank(vt, &keys).await.as_deref(), Some("needle"));
+
+        let mut vt = shux_vt::VirtualTerminal::new(10, 40);
+        vt.process(b"\x1b[5;1Hxx needle yy\x1b[1;1H");
+        let keys = [&[b"/yy\r" as &[u8], b"/needle\r"][..], &SELECT_SIX].concat();
+        assert_eq!(search_yank(vt, &keys).await.as_deref(), Some("needle"));
+    }
+
+    /// A grid smaller than its rect pages through history in the rows and
+    /// columns it was shown in; the surplus beside and below keeps its fill.
+    #[tokio::test(start_paused = true)]
+    async fn copy_mode_over_an_undersized_grid_leaves_its_surplus() {
+        let mut h = InputHarness::new(64).await;
+        let rect = h.first_rect().await;
+        let mut vt = shux_vt::VirtualTerminal::new(5, 20);
+        for i in 0..30 {
+            vt.process(format!("\r\nh{i:02}").as_bytes());
+        }
+        h.show(vt).await;
+        h.catch_up().await;
+        let surplus = |c: &Client| {
+            let (x, y) = (usize::from(rect.x) + 25, usize::from(rect.y) + 7);
+            (
+                c.screen.grid().visible_row(usize::from(rect.y))[x].style.bg,
+                c.screen.grid().visible_row(y)[x].style.bg,
+            )
+        };
+        let before = surplus(&h);
+        assert_ne!(before.0, shux_vt::Color::Default, "setup: no surplus fill");
+        let shown = h.written_frame;
+        h.enter_copy_mode(shown).await;
+        h.key(b"\x02").await;
+        idle_for(QUIET).await;
+        h.catch_up().await;
+        assert_eq!(surplus(&h), before, "copy mode painted over the surplus");
+        for key in [b"v", b"l", b"l", b"y"] {
+            h.key(key).await;
+        }
+        // Five rows a page: the slice now starts five lines above h25.
+        assert_eq!(h.yanked().await.as_deref(), Some("h20"));
+        h.stop().await;
     }
 }

@@ -240,6 +240,10 @@ pub struct ActionArgs {
     /// doesn't try to be clever about clamping.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_index: Option<u16>,
+    /// For `ActionKind::EnterCopyMode`: the last `Render { frame }` the
+    /// client wrote, so copy mode opens over the slice the user saw.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame: Option<u64>,
 }
 
 #[cfg(test)]
