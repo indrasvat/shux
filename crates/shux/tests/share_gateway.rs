@@ -644,6 +644,17 @@ fn a_browser_view_sends_nothing_never_sizes_the_host_and_draws_no_status_bar() {
             viewer.draws("RECORDING").await,
             "nothing drawn at the new size"
         );
+        // The registry holds it as a watcher: it can never drive the panes,
+        // even once the host has gone.
+        let listed = rig.rpc("client.list", serde_json::json!({})).await;
+        let watchers: Vec<_> = listed["clients"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["cols"] == 240)
+            .map(|c| c["read_only"].clone())
+            .collect();
+        assert_eq!(watchers, [serde_json::json!(true)], "{listed}");
         // A viewer that tries to type is cut off; its bytes go nowhere.
         viewer
             .send(serde_json::json!({ "t": "input", "data": "rm -rf ~\r" }))
@@ -968,18 +979,34 @@ fn a_stalled_renderer_never_holds_more_than_the_window_and_is_dropped() {
     let _ = dirs();
     runtime().block_on(async {
         let rig = Rig::start("stall").await;
-        let (session, _) = rig.session("flooded", producer()).await;
+        // A wide pane full of coloured scrolling lines: far more than the
+        // window within the ack deadline.
+        let flood = serde_json::json!([
+            "sh",
+            "-c",
+            "i=0; while :; do i=$((i+1)); printf \"\\033[3%dmTICK %s %0200d\\033[0m\\n\" $((i%7+1)) $i 0; done"
+        ]);
+        let (session, _) = rig.session("flooded", flood).await;
+        let mut host = Host::attach(&rig, "flooded", 240, 101).await;
+        host.draws("TICK").await;
         let (id, secret) = rig.link(&session, |_| {});
         let r = rig.redeem(&id, &secret).await;
         let cookie = r.cookie(&id);
-        let mut stalled = Viewer::connect(rig.addr, &id, &cookie, ORIGIN, 80, 24)
+        let mut stalled = Viewer::connect(rig.addr, &id, &cookie, ORIGIN, 240, 100)
             .await
             .unwrap();
         stalled.acks = false;
         assert_eq!(stalled.ends().await.as_deref(), Some("lagging"));
+        let window = shux::share::wire::WINDOW;
         assert!(
-            stalled.received <= shux::share::wire::WINDOW,
+            stalled.received <= window,
             "{} bytes reached a viewer that acknowledged none",
+            stalled.received
+        );
+        // Not vacuous: the stream filled the window before it was dropped.
+        assert!(
+            stalled.received > window - shux::share::wire::CHUNK as u64,
+            "only {} bytes were sent; the window was never reached",
             stalled.received
         );
         // It comes back to a whole screen.
