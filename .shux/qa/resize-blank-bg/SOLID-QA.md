@@ -1,12 +1,72 @@
 VERDICT: PASS
 
-commit_under_audit: fcee6d044b82d6dc4009ea04843b289870a42ba0
-merge-base: f1478e4b1e5dcc163aaeb635069dec0b901790d4
+commit_under_audit: de65edccee1119afe1f323df9f8d1e2ca976db14
+merge-base: 444b6ba50035efe0191904814149d84c39a67b11 (origin/main, 0.59.0, includes #294 / #190 B1)
 scope: resize-blank-bg (issue #295, PR #300, branch fix/resize-keeps-blank-bg), tier full
-audit type: delta re-audit #2 of 72f5044..fcee6d0 (8ed9a6c, fcee6d0), on top of re-audit #1
-(7cff347..7ae17af, PASS at 72f5044), which is kept below
+audit type: delta re-audit #3, the rebase onto 444b6ba (cursor.rs conflict resolution and
+c35cdb1), on top of re-audits #1 and #2. Those are kept below under their pre-rebase SHAs.
 
-## Re-audit #2: 72f5044..fcee6d0
+## Pre-rebase to rebased SHAs
+
+The fix commits' changed lines are identical before and after the rebase (compared `+`/`-`
+lines; only context differs where #294 touched cursor.rs).
+
+| Pre-rebase | Rebased | Commit |
+|---|---|---|
+| 7cff347 | bebbfad | mark the wide-glyph wrap gap on its cell |
+| f25c203 | 9aaa0b9 | cursor intent, reflowed history trim, `Cell::meta` |
+| 7ae17af | 26125f5 | closure-review P0/P1 fixes |
+| 72f5044 | e517ab6 | VT gate PASS (re-audit #1) |
+| 8ed9a6c | 5d41e7a | `after_print` flag, carried by DECSC |
+| fcee6d0 | 8a009a7 | neutrality refresh |
+| new | c35cdb1 | build fix: `meta` in `shux-ui/src/viewport.rs`, `after_print` made `pub` |
+| new | de65edc | neutrality refresh: base 444b6ba, head c35cdb1, 6/6 layers pass (cited) |
+
+## Re-audit #3: the rebase
+
+`make check-vt-qa-pregate` at de65edc passes: "9 VT path(s) touched; evidence conforming in resize-blank-bg".
+
+Review of the rebase:
+- **cursor.rs:** `Cursor` keeps both #294's `hidden_since_ns` (latch stamp, `hidden_for_ns`)
+  and `after_print`. `Cursor::new()` initialises both. `save` and `restore` carry
+  `after_print` and leave the hidden stamp alone, as on main. Resize writes cursor fields in
+  place, so the stamp survives a reflow.
+- **c35cdb1:** `blank_like` in viewport.rs (the B1 crop blank) sets `meta: Default::default()`.
+  That is right: a crop blank is display-only, and a gap mark there would mean nothing.
+  `after_print` became `pub` only so that viewport.rs tests compile `..Cursor::new()` across
+  crates (private fields block functional record update). That widens the public API, which
+  is P3: `hidden_since_ns` is already `pub` on the same struct.
+
+Real binary: h3 = c35cdb1 release build (`git_sha` c35cdb1; de65edc changes no code),
+b2 = 444b6ba (vt-neutrality cache).
+
+| Input | h3 | Expected | Status |
+|---|---|---|---|
+| bot 1: `ABCDE ESC[1;6H`, 10x4 -> 5x4, X | `ABCDX` | `ABCDX` | PASS |
+| bot 2: `ABCDE ?1049h`, shrink to 5 in alt, `?1049l F` | `ABCDE` / `F` | E kept, F on next row | PASS |
+| `ABCDE ESC7 ESC[3;1H zz ESC8`, shrink, X | `ABCDE` / `X` / `zz` | DECRC restores intent | PASS |
+| closure inputs: CUP one past the edge, ICH widen, `ABCDE ` intent, history at the cap, 4-col DCH gap rows | `abc F`, `c   界`, `ABCDE`/`F`, `TOP`/`mid`, no panic | unchanged | PASS |
+| B1: pane pinned 120x40, 80x24 attach client, indexed-bg ED fill, truecolor `ABCDE`, `?25l` | client: crop with "pinned 120×40" label, no cursor drawn | | PASS |
+| then pin narrows to 5x40, X typed | pane and client: `ABCDE` / `X`, cursor (1,1) hidden; 5-col blue column kept; surplus shaded | hidden cursor does not end print intent | PASS |
+| then pin back to 120x40 | `ABCDEX` rejoined, cursor (0,6) still hidden, client label "pinned 120×40" | | PASS |
+
+Pixel: coloured blanks on the main and alt screens over 6 sizes, h3 against the pre-rebase
+build (8ed9a6c): 12/12 at 0/0 (`pixel-r3-rebase-*.json`). The rebase moved nothing on the
+change's own surface. vim across 5 sizes, h3 against base 444b6ba: 5/5 at 0/0
+(`pixel-r3-base-vim-*.json`). Re-audit #1/#2 metrics, whose arms were pre-rebase builds,
+have been removed from the manifest and the tree.
+
+Frames: `.shux/out/resize-blank-bg/delta/h3/b1/{0-pin120x40,1-pin5x40,2-typed,3-pin120x40}-{inner,attach}.png`,
+read at full resolution.
+
+Findings for re-audit #3: no P0, P1 or P2. P3: `after_print` and `SavedCursor::after_print`
+are now `pub` for a test's sake. The P2 alt-screen height-shrink finding from re-audit #1
+stands, unchanged: it was already there before this branch.
+
+Cleanup: daemons in `/tmp/qh3`, `/tmp/qh3i`, `/tmp/qh3o` and `/tmp/qb2` report not running,
+and no processes leaked.
+
+## Re-audit #2: 72f5044..fcee6d0 (pre-rebase SHAs; see the map above)
 
 8ed9a6c fixes two P1s from the PR bots. A new `Cursor::after_print` flag is set by printing
 and cleared by every cursor command. DECSC/DECRC (and SCOSC/SCORC) save it, and reflow
@@ -41,7 +101,7 @@ processes leaked.
 Findings for re-audit #2: no P0/P1. The P2 alt-screen height-shrink finding from re-audit #1
 stands unchanged: it was already there before this branch, and is out of this delta.
 
-## Re-audit #1: 7cff347..7ae17af
+## Re-audit #1: 7cff347..7ae17af (pre-rebase SHAs; see the map above)
 
 commit audited: 7ae17af1cf0d5a3a4231d436a97da0a862c5fb3e
 binaries: new = 7ae17af release build, old = 7cff347 (previous gate), base = f1478e4 (vt-neutrality cache)
