@@ -17,11 +17,32 @@ unset SHUX_NEUTRALITY_CACHE
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 work="$(cd "$(mktemp -d "${TMPDIR:-/tmp}/shux-prune-selftest.XXXXXX")" && pwd -P)"
 : >"${work}/pids"
+# A process this run started that is still listed: a zombie, or one whose args name
+# this run's work dir (a reused pid names neither).
+leftovers() {
+  local pid line
+  while read -r pid; do
+    line="$(ps -o stat=,args= -p "${pid}" 2>/dev/null)" || continue
+    case "${line}" in Z* | *"${work}"*) echo "${pid} ${line}" ;; esac
+  done <"${work}/pids"
+}
+
+# Every fixture process, zombies included, must be gone: under an init that does
+# not reap, as in a container, whatever a fixture leaves unreaped stays for good.
 cleanup() {
-  local pid
+  local pid i left=""
   while read -r pid; do kill "${pid}" 2>/dev/null || true; done <"${work}/pids"
+  for i in $(seq 1 100); do
+    left="$(leftovers)"
+    [[ -n "${left}" ]] || break
+    sleep 0.1
+  done
   chmod -R u+rwx "${work}" 2>/dev/null || true
   find "${work}" -delete
+  if [[ -n "${left}" ]]; then
+    printf '✗ prune self-test: fixture processes outlived cleanup:\n%s\n' "${left}" >&2
+    exit 1
+  fi
 }
 trap cleanup EXIT
 
@@ -60,6 +81,16 @@ if [[ "${never_rc}" -ne 1 || -n "${never_out}" ]]; then
 fi
 dead_pid() { echo "${NEVER_PID}"; }
 
+# The fakes this shell started. A subshell that starts fakes kills and reaps them
+# on its way out (reap_mine): orphaned, they would each be a zombie under an init
+# that does not reap.
+MY_FAKES=()
+reap_mine() {
+  [[ "${#MY_FAKES[@]}" -gt 0 ]] || return 0
+  kill "${MY_FAKES[@]}" 2>/dev/null || :
+  wait "${MY_FAKES[@]}" 2>/dev/null || :
+}
+
 # start_fake <exe> <argv0> <cwd> <script>: perl (or a link to it, which names the
 # process) running a script that sleeps until cleanup kills it; FAKE is its pid,
 # returned once it has exec'd. Perl, not cat or sleep: coreutils built as one
@@ -73,6 +104,7 @@ start_fake() {
   (cd "${cwd}" && exec -a "${argv0}" "${exe}" "${arg}") </dev/null >/dev/null 2>"${script}.err" &
   FAKE=$!
   echo "${FAKE}" >>"${work}/pids"
+  MY_FAKES+=("${FAKE}")
   for i in $(seq 1 300); do
     if [[ -r "/proc/${FAKE}/cmdline" ]]; then
       args="$(tr '\0' ' ' <"/proc/${FAKE}/cmdline" 2>/dev/null || true)"
@@ -85,6 +117,27 @@ start_fake() {
   echo "✗ prune self-test: ${argv0} never started; it shows as '${args}'" >&2
   ps -o pid=,stat=,comm=,args= -p "${FAKE}" >&2 || echo "  (pid ${FAKE} is gone)" >&2
   sed 's/^/  stderr: /' "${script}.err" >&2
+  exit 1
+}
+
+# zombie_cargo <fixture>: a perl parent that forks a `cargo` child and leaves it a
+# zombie until TERM, when it reaps it and exits; returned once the child is a zombie.
+zombie_cargo() {
+  local parent i z
+  perl -e 'my $c = fork(); if (!$c) { exec($ARGV[0], "-e", "exit 0") }
+    $SIG{TERM} = sub { waitpid($c, 0); exit 0 }; sleep 3600' "$1/bin/cargo" </dev/null >/dev/null 2>&1 &
+  parent=$!
+  echo "${parent}" >>"${work}/pids"
+  MY_FAKES+=("${parent}")
+  for i in $(seq 1 300); do
+    z="$(ps -axo pid=,ppid=,stat= | awk -v p="${parent}" '$2 == p && $3 ~ /^Z/ { print $1 }')"
+    if [[ -n "${z}" ]]; then
+      echo "${z}" >>"${work}/pids"
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "✗ prune self-test: the zombie cargo never appeared" >&2
   exit 1
 }
 
@@ -160,6 +213,8 @@ fixture() {
 
   wt_add "${repo}" feat/fuzz "${f}/wt-fuzz"
   git -C "${f}/wt-fuzz" push -q origin feat/fuzz
+  wt_add "${repo}" feat/gone "${f}/wt-gone"
+  git -C "${f}/wt-gone" push -q origin feat/gone
 
   git init -q "${f}/subrepo"
   echo s >"${f}/subrepo/s.txt"
@@ -182,7 +237,8 @@ fixture() {
   git -C "${f}/wt-pushed/.claude/worktrees/busy" push -q origin feat/busy
 
   for wt in "${repo}" "${f}/wt-pushed" "${f}/wt-merged" "${f}/wt-dirty" "${f}/wt-unpushed" "${f}/wt-moved" \
-    "${f}/wt-fuzz" "${f}/wt-sub" "${f}/wt-subdirty" "${f}/victim" "${f}/wt-pushed/.claude/worktrees/busy"; do
+    "${f}/wt-fuzz" "${f}/wt-gone" "${f}/wt-sub" "${f}/wt-subdirty" "${f}/victim" \
+    "${f}/wt-pushed/.claude/worktrees/busy"; do
     blob "${wt}/target/debug/deps/libx.rlib"
     blob "${wt}/.shux/out/stale/run.log"
     backdate "${OLD}" "${wt}/target" "${wt}/.shux/out/stale"
@@ -205,6 +261,16 @@ fixture() {
   start_fake "$(command -v perl)" "${repo}/target/debug/shux" "${f}/daemon" __daemon
   DAEMON="${FAKE}"
   echo "${DAEMON}" >"${f}/daemon.pid"
+  # Builds on the machine that are none of the repo's, as another suite's are: a cargo
+  # whose scratch cwd was deleted, and a zombie cargo (exited, never reaped).
+  mkdir -p "${f}/foreign"
+  start_fake "${f}/bin/cargo" "${f}/bin/cargo" "${f}/foreign" "${f}/foreign.pl"
+  find "${f}/foreign" -delete
+  zombie_cargo "${f}"
+  # The other half: a cargo whose deleted cwd was inside clean, pushed wt-gone still holds it.
+  mkdir -p "${f}/wt-gone/scratch"
+  start_fake "${f}/bin/cargo" "${f}/bin/cargo" "${f}/wt-gone/scratch" "${f}/gone.pl"
+  find "${f}/wt-gone/scratch" -delete
 
   blob "${f}/neutral/bin/oldsha-tc/shux"
   blob "${f}/neutral/bin/newsha-tc/shux"
@@ -309,6 +375,8 @@ planned() {
 
 # late_apply <fixture>: plan, then start a build and a daemon, then apply that plan.
 late_apply() (
+  MY_FAKES=()
+  trap reap_mine EXIT
   prune_env "$1"
   late="$1"
   # shellcheck source=scripts/prune.sh
@@ -329,6 +397,8 @@ snapshot() { find "$1" \( -name .git -o -name origin.git -o -name modules \) -pr
 # suite <dir> <prune.sh to test> — exits non-zero at the first broken promise.
 suite() {
   local f="$1" script="$2" repo rc out args nl
+  MY_FAKES=()
+  trap reap_mine EXIT  # suite always runs in a subshell of its own
   fixture "${f}" "${script}"
   repo="${f}/repo"
   nl="crates"$'\n'"sub"
@@ -371,6 +441,7 @@ suite() {
   kept "${f}/wt-sym/important/test-inventory/keep.txt"
   kept "${f}/wt-moved/target"
   kept "${f}/wt-fuzz/fuzz/target/debug/fresh"
+  kept "${f}/wt-gone/target"
   kept "${f}/wt-sub/target"
   kept "${f}/wt-subdirty/target"
   kept "${f}/victim/target"
@@ -630,6 +701,12 @@ mutant() { M_NAME+=("$1") M_FROM+=("$2") M_TO+=("$3") M_WANT+=("$4"); }
     'if false; then HOLD="$(build_activity_hold' 'mid-apply fuzz/target was removed'
   mutant 'unreadable cwd' '[[ "$(pid_state "${pid}")" == dead ]] || CWD_UNKNOWN="cannot see the cwd' \
     'true || CWD_UNKNOWN="cannot see the cwd' 'an unreadable build cwd was ignored'
+  mutant 'foreign deleted cwd' '    B_PID+=("${pid}") B_NAME+=("${name}") B_CWD+=("${cwd}")' \
+    '    [[ -d "${cwd}" ]] || { CWD_UNKNOWN=gone; continue; }; B_PID+=("${pid}") B_NAME+=("${name}") B_CWD+=("${cwd}")' \
+    'wt-pushed/target was kept'
+  mutant 'deleted cwd skipped' '    B_PID+=("${pid}") B_NAME+=("${name}") B_CWD+=("${cwd}")' \
+    '    [[ -d "${cwd}" ]] || continue; B_PID+=("${pid}") B_NAME+=("${name}") B_CWD+=("${cwd}")' \
+    'wt-gone/target was removed'
 }
 
 # mutate <file> <from> <to> <out>: the first occurrence replaced, literally

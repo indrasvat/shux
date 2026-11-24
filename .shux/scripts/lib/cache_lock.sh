@@ -2,11 +2,15 @@
 # Pid liveness and the vt-neutrality cache lock, shared by scripts/vt-neutrality.sh
 # and scripts/prune.sh. Sourced; defines functions only.
 
-# pid_state <pid>: prints alive, dead, or unknown when ps cannot say.
+# pid_state <pid>: prints alive, dead (a zombie included: it has exited), or
+# unknown when ps cannot say.
 pid_state() {
-  local out rc=0
-  out="$(ps -p "$1" -o pid= 2>&1)" || rc=$?
-  if [[ "${out//[[:space:]]/}" == "$1" ]]; then
+  local out rc=0 pid="" stat=""
+  out="$(ps -p "$1" -o pid=,stat= 2>&1)" || rc=$?
+  read -r pid stat <<<"${out}" || :
+  if [[ "${pid}" == "$1" && "${stat}" == Z* ]]; then
+    echo dead
+  elif [[ "${pid}" == "$1" && -n "${stat}" ]]; then
     echo alive
   elif [[ "${rc}" -eq 1 && -z "${out//[[:space:]]/}" ]]; then
     echo dead
