@@ -460,11 +460,9 @@ pub fn append_sharing(
     let put = |bar: &mut StatusBar, unit: Vec<StatusSegment>| {
         bar.right.splice(0..0, unit);
     };
-    for rung in 0..=badge.core {
-        let unit = badge.unit(rung, theme, mark);
-        if fits(bar, &unit) {
-            return put(bar, unit);
-        }
+    let full = badge.unit(0, theme, mark);
+    if fits(bar, &full) {
+        return put(bar, full);
     }
     let core = badge.unit(badge.core, theme, mark);
     loop {

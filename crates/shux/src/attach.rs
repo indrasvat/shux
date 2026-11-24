@@ -15312,7 +15312,8 @@ mod tests {
         })
         .await;
         drop((writer, viewer));
-        bar_until(&|bar| !bar.contains('◉')).await;
+        // Settled: no toast left whose expiry would draw the next change.
+        bar_until(&|bar| !bar.contains('◉') && !bar.contains("left")).await;
         clients.set_shared(fixture.session_id, true);
         bar_until(&|bar| bar.contains("◉ shared · 0 watching")).await;
         clients.set_shared(fixture.session_id, false);
