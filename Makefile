@@ -403,6 +403,15 @@ test-vt-grapheme: release ## Drive shux grapheme storage visual/pixel automation
 	@.shux/scripts/no_leak_guard.sh .shux/scripts/grapheme_check.sh
 	@echo "$(COLOR_GREEN)✓ VT grapheme storage automation passed$(COLOR_RESET)"
 
+# Not in `make check`: it needs Chrome and a cached Playwright (`uv --offline`,
+# no network). WebKit runs when Playwright has it installed, and says when not.
+.PHONY: test-share-browser
+test-share-browser: ## The share gateway (#297) in headless Chrome behind a local TLS proxy
+	@echo "$(COLOR_BLUE)▶ Building the shux binary and the share rig...$(COLOR_RESET)"
+	@cargo build -p shux --bin shux --example share_rig
+	@.shux/scripts/no_leak_guard.sh uv run --offline --script scripts/share-browser-check.py \
+		target/debug/shux target/debug/examples/share_rig .shux/out/share-gateway-297
+
 # Deliberately NOT in `make check` or `make ci`: this needs an X server and a GUI
 # terminal, and it costs minutes. Image work and emit-path changes invoke it.
 # docs/agents/visual-testing.md says what it can and cannot see.
