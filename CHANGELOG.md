@@ -1,3 +1,10 @@
+## [0.59.3](https://github.com/indrasvat/shux/compare/v0.59.2...v0.59.3) (2026-11-24)
+
+
+### Bug Fixes
+
+* **test:** prune self-test no longer races a closed pipe or the clock ([#307](https://github.com/indrasvat/shux/issues/307)) ([25c68b5](https://github.com/indrasvat/shux/commit/25c68b544929c009b42c7a7401f3ba0fa07505ce)), closes [#304](https://github.com/indrasvat/shux/issues/304)
+
 ## [0.59.2](https://github.com/indrasvat/shux/compare/v0.59.1...v0.59.2) (2026-11-24)
 
 
