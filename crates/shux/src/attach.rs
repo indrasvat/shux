@@ -1373,16 +1373,8 @@ async fn run_attach_loop(
                                 let active = s.active_pane_id;
                                 let mut yank = None;
                                 let keep = s.copy_mode.as_mut().is_some_and(|cm| {
-                                    if copy_mode_vt(cm, active, rect, &state).is_none() {
-                                        let live = rect.zip(state.vts.get(&cm.pane)).map(|(r, vt)| {
-                                            PaneViewport::of(r, vt, shux_vt::monotonic_now_ns())
-                                        });
-                                        match reopen_untouched(cm, active, live.as_ref(), &state) {
-                                            Some(fresh) => *cm = fresh,
-                                            None => return false,
-                                        }
-                                    }
-                                    let Some(vt) = copy_mode_vt(cm, active, rect, &state) else {
+                                    let now = shux_vt::monotonic_now_ns();
+                                    let Some(vt) = resolve_copy_mode(cm, active, rect, now, &state) else {
                                         return false;
                                     };
                                     match shux_ui::copy_mode_key(&bytes, cm, vt) {
@@ -2096,24 +2088,18 @@ async fn run_render_loop(
             panes: &shux_ui::PresentedPane::of_vts(&vt_refs),
             now_ns: now(),
         });
-        // Modal copy mode draws its pane through its own view while that still
-        // maps. Once it does not (focus moved, the pane went, a resize), copy
-        // mode ends and this frame is drawn live, unless nothing was done in
-        // it yet: then it opens again over this frame, losing nothing.
+        // Modal copy mode draws its pane through its own view, as resolved.
         let mut modal = None;
         let mut modal_replaced = None;
         if let Some(seen) = attached.copy_mode.as_ref() {
-            let (pane, active) = (seen.pane, attached.active_pane_id);
+            let pane = seen.pane;
             let rect = geometry.views.get(&pane).map(|v| v.rect);
-            let current = if copy_mode_vt(seen, active, rect, &state).is_some() {
-                Some(seen.clone())
-            } else {
-                let fresh = reopen_untouched(seen, active, geometry.views.get(&pane), &state);
-                modal_replaced = Some((seen.clone(), fresh.clone()));
-                fresh
-            };
-            if let Some((mut cm, vt)) = current.zip(state.vts.get(&pane)) {
-                cm.rebase(vt);
+            let mut cm = seen.clone();
+            let vt = resolve_copy_mode(&mut cm, attached.active_pane_id, rect, now(), &state);
+            if vt.is_none() || cm != *seen {
+                modal_replaced = Some((seen.clone(), vt.map(|_| cm.clone())));
+            }
+            if let Some(vt) = vt {
                 let (view, over) = cm.view.frame_view(vt);
                 geometry.views.insert(pane, view);
                 modal = Some((pane, cm.view));
@@ -2924,30 +2910,48 @@ async fn handle_mouse_selection(
     }
 }
 
-/// The pane's VT while copy mode still maps onto it: focus on its pane, which
-/// is drawn in the rect its view began in, with the same grid and screen.
-fn copy_mode_vt<'s>(
-    cm: &shux_ui::CopyModeState,
+/// Copy mode on `pane` over `shown`, the slice a frame drew; when an action
+/// since has moved or resized the pane, over the slice the next frame draws in
+/// `rect`, which copy mode shows before anything is selected.
+fn copy_mode_over(
+    pane: PaneId,
+    shown: Option<&PaneViewport>,
+    rect: Option<Rect>,
+    state: &PaneIoState,
+) -> Option<shux_ui::CopyModeState> {
+    let vt = state.vts.get(&pane)?;
+    shown
+        .and_then(|view| shux_ui::CopyModeState::enter(pane, *view, vt))
+        .or_else(|| {
+            let live = PaneViewport::of(rect?, vt, shux_vt::monotonic_now_ns());
+            shux_ui::CopyModeState::enter(pane, live, vt)
+        })
+}
+
+/// The pane's VT, with `cm` counted against it, while copy mode maps: focus
+/// on its pane, drawn in `rect`, the grid and screen its view began on. One
+/// nothing was done in yet reopens over the slice `rect` shows now, so an
+/// action's resize landing under it loses nothing. `None` ends copy mode.
+fn resolve_copy_mode<'s>(
+    cm: &mut shux_ui::CopyModeState,
     active: PaneId,
     rect: Option<Rect>,
+    now_ns: u64,
     state: &'s PaneIoState,
 ) -> Option<&'s shux_vt::VirtualTerminal> {
     let vt = state.vts.get(&cm.pane).filter(|_| cm.pane == active)?;
-    rect.is_some_and(|r| cm.view.maps(r, vt)).then_some(vt)
-}
-
-/// Copy mode opened again over `view`, for one whose own view no longer maps
-/// but in which nothing was done yet: an action's resize just landed under it.
-fn reopen_untouched(
-    cm: &shux_ui::CopyModeState,
-    active: PaneId,
-    view: Option<&PaneViewport>,
-    state: &PaneIoState,
-) -> Option<shux_ui::CopyModeState> {
-    let view = view.filter(|_| cm.is_untouched() && cm.pane == active)?;
-    let mut fresh = shux_ui::CopyModeState::enter(cm.pane, *view, state.vts.get(&cm.pane)?)?;
-    fresh.wheel_initiated = cm.wheel_initiated;
-    Some(fresh)
+    let rect = rect?;
+    if !cm.view.maps(rect, vt) {
+        if !cm.is_untouched() {
+            return None;
+        }
+        let view = PaneViewport::of(rect, vt, now_ns);
+        let wheel = cm.wheel_initiated;
+        *cm = shux_ui::CopyModeState::enter(cm.pane, view, vt)?;
+        cm.wheel_initiated = wheel;
+    }
+    cm.rebase(vt);
+    Some(vt)
 }
 
 #[expect(clippy::too_many_arguments, reason = "independent inputs")]
@@ -3000,16 +3004,16 @@ async fn handle_copy_mode_mouse(
             // (`Prefix [`, or a search since) stays, so an in-progress
             // selection or search is never lost.
             let keep = s.copy_mode.as_mut().is_some_and(|cm| {
-                let Some(vt) = copy_mode_vt(cm, active, rect, &state) else {
+                let now = shux_vt::monotonic_now_ns();
+                let Some(vt) = resolve_copy_mode(cm, active, rect, now, &state) else {
                     return false;
                 };
-                cm.rebase(vt);
                 if kind == MouseKind::ScrollUp {
                     shux_ui::copy_mode::scroll_up(cm, 3);
                     true
                 } else {
                     shux_ui::copy_mode::scroll_down(cm, vt, 3);
-                    !(cm.wheel_initiated && shux_ui::copy_mode::back_at_entry(cm))
+                    !(cm.wheel_initiated && cm.view.top >= cm.view.entry_top)
                 }
             });
             if !keep {
@@ -3032,11 +3036,12 @@ async fn handle_copy_mode_mouse(
             let active = s.active_pane_id;
             let mut yank = None;
             let keep = s.copy_mode.as_mut().is_some_and(|cm| {
-                let Some(vt) = copy_mode_vt(cm, active, rect, &state) else {
+                let now = shux_vt::monotonic_now_ns();
+                let Some(vt) = resolve_copy_mode(cm, active, rect, now, &state) else {
                     return false;
                 };
-                cm.rebase(vt);
-                let Some((_, view)) = drawn else {
+                // A frame from before a reopen drew another view.
+                let Some((_, view)) = drawn.filter(|(_, v)| v.entry == cm.view.entry) else {
                     *dragging = SelectionDrag::None;
                     return true;
                 };
@@ -3975,12 +3980,9 @@ async fn handle_wheel(
         }
     };
     let pane_id = hit.unwrap_or(attached.active_pane_id);
-    if pane_rect_for(graph, &attached, client_size, config, pane_id)
-        .await
-        .is_none()
-    {
+    let Some(rect) = pane_rect_for(graph, &attached, client_size, config, pane_id).await else {
         return Ok(true);
-    }
+    };
 
     // Snapshot the target pane's live mode state. A pane shux cannot encode
     // for is treated as not mouse-aware, so the wheel falls back to shux's
@@ -4036,11 +4038,9 @@ async fn handle_wheel(
             // before focus moves; with nothing above it, not at all.
             let entered = {
                 let state = io_state.lock().await;
-                views
-                    .and_then(|views| views.get(&pane_id))
-                    .zip(state.vts.get(&pane_id))
-                    .filter(|(view, vt)| shux_ui::copy_mode::has_history_above(view, vt))
-                    .and_then(|(view, vt)| shux_ui::CopyModeState::enter(pane_id, *view, vt))
+                let shown = views.and_then(|views| views.get(&pane_id));
+                copy_mode_over(pane_id, shown, Some(rect), &state)
+                    .filter(|cm| cm.view.entry_top > 0)
             };
             let Some(mut cm) = entered else {
                 return Ok(true);
@@ -4246,38 +4246,19 @@ async fn handle_action(
     // while open, it changes nothing.
     if matches!(kind, ActionKind::EnterCopyMode) {
         let attached = session.lock().await.clone();
-        let rect = pane_rect_for(
-            graph,
-            &attached,
-            client_size,
-            config,
-            attached.active_pane_id,
-        )
-        .await;
+        let pane = attached.active_pane_id;
+        let rect = pane_rect_for(graph, &attached, client_size, config, pane).await;
         let state = io_state.lock().await;
         let mut s = session.lock().await;
         if s.copy_mode.is_some() {
             return Ok(());
         }
-        let pane = s.active_pane_id;
-        let vt = state.vts.get(&pane);
-        // The stamped frame's slice. When an action since has moved or
-        // resized the pane, no frame sent shows it yet: then the slice the
-        // next frame draws, which copy mode shows before anything is
-        // selected. A stamp older than every frame kept names nothing.
-        let stamped = match args.frame {
-            Some(_) => s.shown.shown(args.frame).map(Some),
-            None => Some(s.shown.shown(None)),
-        };
-        let enter = |view: Option<&PaneViewport>| shux_ui::CopyModeState::enter(pane, *view?, vt?);
-        let live = rect
-            .zip(vt)
-            .map(|(rect, vt)| PaneViewport::of(rect, vt, shux_vt::monotonic_now_ns()));
-        let entered = stamped.and_then(|stamped| {
-            enter(stamped.and_then(|f| f.views.get(&pane)))
-                .or_else(|| enter(s.shown.views(None).and_then(|v| v.get(&pane))))
-                .or_else(|| enter(live.as_ref()))
-        });
+        // A stamp older than every frame kept names nothing.
+        let expired = args.frame.is_some() && s.shown.shown(args.frame).is_none();
+        let shown = s.shown.views(args.frame).and_then(|v| v.get(&pane));
+        let entered = (!expired)
+            .then(|| copy_mode_over(pane, shown, rect, &state))
+            .flatten();
         // Refused, the notice changes the status bar, so a frame the client
         // can stamp afresh goes out.
         let cm = anyhow::Context::context(
@@ -9261,8 +9242,7 @@ mod tests {
             let px: Vec<u8> = (0..18 * 19).flat_map(|_| green).collect();
             let b64 = base64::engine::general_purpose::STANDARD.encode(&px);
             vt.process(format!("\x1b_Ga=T,f=24,s=18,v=19,C=1;{b64}\x1b\\").as_bytes());
-            let base = {
-                let vts = HashMap::from([(pane, &vt)]);
+            let prepare = |vts: &HashMap<PaneId, &shux_vt::VirtualTerminal>| {
                 shux_ui::prepare_frame(&shux_ui::FrameInputs {
                     layout: &tree,
                     zoom,
@@ -9270,23 +9250,14 @@ mod tests {
                     rows: 30,
                     status_bar_height: STATUS_BAR_ROWS,
                     border_style: BorderStyle::parse("rounded"),
-                    panes: &shux_ui::PresentedPane::of_vts(&vts),
+                    panes: &shux_ui::PresentedPane::of_vts(vts),
                     now_ns: 0,
                 })
             };
-            let rect = base.views[&pane].rect;
+            let rect = prepare(&HashMap::from([(pane, &vt)])).views[&pane].rect;
             vt.process(&follow_to(rect, 10, 45));
             let vts = HashMap::from([(pane, &vt)]);
-            let geometry = shux_ui::prepare_frame(&shux_ui::FrameInputs {
-                layout: &tree,
-                zoom,
-                cols: 100,
-                rows: 30,
-                status_bar_height: STATUS_BAR_ROWS,
-                border_style: BorderStyle::parse("rounded"),
-                panes: &shux_ui::PresentedPane::of_vts(&vts),
-                now_ns: 0,
-            });
+            let geometry = prepare(&vts);
             let view = geometry.views[&pane];
             let what = if zoom.is_some() { "zoomed" } else { "split" };
             assert_eq!((view.row_offset, view.col_offset), (10, 45), "{what}");
@@ -9339,9 +9310,6 @@ mod tests {
                 (4, 7),
                 (usize::from(rect.height) - 1, usize::from(rect.width) - 1),
             ] {
-                if r == 2 && c < 2 {
-                    continue;
-                }
                 let want = expect(r, c);
                 assert_eq!(
                     screen.grid().visible_row(y0 + r)[x0 + c].ch,
@@ -9754,6 +9722,132 @@ mod tests {
             session.lock().await.copy_mode.is_none(),
             "wheel-down to the live bottom must exit wheel-initiated scrollback \
              (else the keyboard stays hijacked)"
+        );
+        fixture.stop();
+    }
+
+    /// A resize lands under a copy mode nothing was done in yet: the wheel
+    /// reopens it over the new grid, as a key does, rather than ending it.
+    #[tokio::test]
+    async fn the_wheel_reopens_an_untouched_copy_mode_as_a_key_does() {
+        let fixture = attach_fixture().await;
+        let _wr = seed_scrollback_pane(&fixture.io_state, fixture.first_pane, b"").await;
+        let session = Arc::new(Mutex::new(fixture.attached.clone()));
+        let client_size: ClientSize = Arc::new(Mutex::new((100, 30)));
+        open_copy_mode(&fixture.graph, &fixture.io_state, &session, &client_size).await;
+        resize_vt(&fixture, fixture.first_pane, 20, 49).await;
+        let (out_tx, _out_rx) = mpsc::channel(8);
+        handle_copy_mode_mouse(
+            MouseKind::ScrollUp,
+            ProtoMouseButton::None,
+            3,
+            3,
+            &fixture.graph,
+            &fixture.io_state,
+            &session,
+            &client_size,
+            &test_config(),
+            &out_tx,
+            &mut SelectionDrag::None,
+            None,
+        )
+        .await
+        .expect("copy-mode wheel up");
+        let rows = session
+            .lock()
+            .await
+            .copy_mode
+            .as_ref()
+            .map(|cm| cm.view.entry.grid_rows);
+        assert_eq!(
+            rows,
+            Some(20),
+            "the wheel ended a copy mode a key would reopen"
+        );
+        fixture.stop();
+    }
+
+    /// A wheel-up that lands after a resize no frame has shown yet opens copy
+    /// mode over the slice the next frame draws, as `prefix [` does.
+    #[tokio::test]
+    async fn a_wheel_after_a_resize_opens_copy_mode_over_the_next_frame() {
+        let fixture = attach_fixture().await;
+        let _wr = seed_scrollback_pane(&fixture.io_state, fixture.first_pane, b"").await;
+        let session = Arc::new(Mutex::new(fixture.attached.clone()));
+        let client_size: ClientSize = Arc::new(Mutex::new((100, 30)));
+        ship_frame(&fixture.graph, &fixture.io_state, &session, &client_size).await;
+        resize_vt(&fixture, fixture.first_pane, 20, 49).await;
+        handle_wheel(
+            MouseKind::ScrollUp,
+            3,
+            3,
+            None,
+            &fixture.graph,
+            &fixture.io_state,
+            &session,
+            &client_size,
+            &test_config(),
+        )
+        .await
+        .expect("wheel up");
+        let rows = session
+            .lock()
+            .await
+            .copy_mode
+            .as_ref()
+            .map(|cm| cm.view.entry.grid_rows);
+        assert_eq!(rows, Some(20), "a wheel-up after a resize was swallowed");
+        fixture.stop();
+    }
+
+    async fn resize_vt(fixture: &AttachFixture, pane: PaneId, rows: usize, cols: usize) {
+        let mut state = fixture.io_state.lock().await;
+        state.vts.get_mut(&pane).expect("vt").resize(rows, cols);
+    }
+
+    /// `prefix [` opens copy mode on the pane focused when it was pressed,
+    /// though focus moves while the action waits for the client's size.
+    #[tokio::test]
+    async fn copy_mode_opens_on_the_pane_focused_when_its_key_was_read() {
+        let fixture = attach_fixture().await;
+        let _a = seed_scrollback_pane(&fixture.io_state, fixture.first_pane, b"").await;
+        let _b = seed_scrollback_pane(&fixture.io_state, fixture.second_pane, b"").await;
+        let session = Arc::new(Mutex::new(fixture.attached.clone()));
+        let client_size: ClientSize = Arc::new(Mutex::new((100, 30)));
+        ship_frame(&fixture.graph, &fixture.io_state, &session, &client_size).await;
+        let held = client_size.lock().await;
+        let action = tokio::spawn({
+            let (graph, io, session, size) = (
+                fixture.graph.clone(),
+                fixture.io_state.clone(),
+                session.clone(),
+                client_size.clone(),
+            );
+            let cancel = fixture.cancel.clone();
+            async move {
+                handle_action(
+                    ActionKind::EnterCopyMode,
+                    Default::default(),
+                    &graph,
+                    &io,
+                    &session,
+                    &size,
+                    &test_config(),
+                    &cancel,
+                )
+                .await
+            }
+        });
+        // One thread: the action runs until it waits on the client's size.
+        tokio::task::yield_now().await;
+        session.lock().await.active_pane_id = fixture.second_pane;
+        drop(held);
+        action.await.expect("join").expect("enter copy mode");
+        let pane = session.lock().await.copy_mode.as_ref().map(|cm| cm.pane);
+        assert_eq!(
+            pane,
+            Some(fixture.first_pane),
+            "copy mode opened on a pane focused after its key"
         );
         fixture.stop();
     }
@@ -12949,8 +13043,6 @@ mod tests {
         fixture.stop();
     }
 
-    // --- #190 B2: modal copy mode reads the frame the client was shown ---
-
     /// A `rows` x `cols` grid whose cell (r, c) holds letter `(r + c) % 26`,
     /// so any slice of it reads as a string the test can name.
     fn lettered(rows: usize, cols: usize) -> shux_vt::VirtualTerminal {
@@ -13238,16 +13330,11 @@ mod tests {
 
     const SELECT_SIX: [&[u8]; 7] = [b"v", b"l", b"l", b"l", b"l", b"l", b"y"];
 
-    /// A search finds a match on a row's columns right of the slice and pans
-    /// just far enough to show it; one on grid rows below the slice is
-    /// scrolled to.
+    /// A search finds a match on grid rows below the slice and scrolls to it.
+    /// (Panning right to one is `a_pan_keeps_the_selection_it_started_with`.)
     #[tokio::test(start_paused = true)]
     async fn a_search_reveals_a_match_right_of_or_below_the_slice() {
-        let mut wide = shux_vt::VirtualTerminal::new(10, 120);
-        wide.process(b"\x1b[6;101Hneedle\x1b[1;1H");
         let keys = [&[b"/needle\r" as &[u8]][..], &SELECT_SIX].concat();
-        assert_eq!(search_yank(wide, &keys).await.as_deref(), Some("needle"));
-
         let mut tall = shux_vt::VirtualTerminal::new(60, 40);
         tall.process(b"\x1b[51;4Hneedle\x1b[1;1H");
         assert_eq!(search_yank(tall, &keys).await.as_deref(), Some("needle"));

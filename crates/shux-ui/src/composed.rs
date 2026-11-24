@@ -102,7 +102,8 @@ pub fn compose(
         if let (Some((src_grid, _)), Some(view)) = (inputs.panes.get(pid), geometry.views.get(pid))
         {
             compose_pane(&mut grid, view, src_grid, surplus);
-            placements.extend(resolve_placements(view, src_grid));
+            let resolved = src_grid.placements().iter();
+            placements.extend(resolved.map(|p| resolve_placement(view, src_grid, p)));
         } else {
             compose_placeholder(&mut grid, *rect, "(no output)");
         }
@@ -211,15 +212,8 @@ fn cell_rect(r: Rect) -> CellRect {
     }
 }
 
-/// Rebase one pane's placements into the frame that shows it through `view`,
-/// clipped to the cells it shows on both axes.
-pub(crate) fn resolve_placements(view: &PaneViewport, src: &Grid) -> Vec<ComposedPlacement> {
-    src.placements()
-        .iter()
-        .map(|p| resolve_placement(view, src, p))
-        .collect()
-}
-
+/// Rebase one of a pane's placements into the frame that shows it through
+/// `view`, clipped to the cells it shows on both axes.
 pub(crate) fn resolve_placement(
     view: &PaneViewport,
     src: &Grid,

@@ -707,18 +707,6 @@ fn a_picture_moves_with_the_slice_on_both_axes_and_leaves_with_its_origin() {
     assert!(cmds[0].starts_with("a=d"), "taken down: {cmds:?}");
 }
 
-/// The host id an `a=T` in `cmds` transmitted.
-fn transmitted_id(cmds: &[String]) -> String {
-    let t = cmds
-        .iter()
-        .find(|k| k.starts_with("a=T"))
-        .unwrap_or_else(|| panic!("nothing transmitted: {cmds:?}"));
-    t.split(',')
-        .find_map(|k| k.strip_prefix("i="))
-        .expect("an id")
-        .to_string()
-}
-
 /// A slice scrolled two cells right of and one below a cropped picture's
 /// origin shows its bottom-right part from the pane's top-left cell, under
 /// the host id it already has: a put, no pixels. Scrolling back re-puts it
@@ -743,7 +731,7 @@ fn a_picture_left_of_and_above_the_slice_is_cropped_in_place() {
     let first = graphics(&drain(&mut c));
     assert_eq!(first.len(), 1, "{first:?}");
     assert!(first[0].contains("x=9,y=19,w=36,h=38,c=4,r=2"), "{first:?}");
-    let id = transmitted_id(&first);
+    let id = &ids(&first, "a=T")[0];
 
     // Cursor at row 9, column 31: the slice starts at row 4, column 12.
     vt.process(b"\x1b[10;32H");
@@ -788,7 +776,7 @@ fn a_restored_picture_omits_a_zero_source_x() {
     let mut c = make_compositor(20, 6);
     c.render_multi_pane(frame(&layout, &HashMap::from([(p, &vt)]), p))
         .unwrap();
-    let id = transmitted_id(&graphics(&drain(&mut c)));
+    let id = &ids(&graphics(&drain(&mut c)), "a=T")[0];
 
     vt.process(b"\x1b[1;32H");
     c.render_multi_pane(frame(&layout, &HashMap::from([(p, &vt)]), p))
@@ -873,15 +861,7 @@ fn retiring_one_picture_does_not_re_send_the_next() {
         .unwrap();
     let first = graphics(&drain(&mut c));
     assert_eq!(first.len(), 2, "{first:?}");
-    let ids: Vec<String> = first
-        .iter()
-        .map(|k| {
-            k.split(',')
-                .find_map(|f| f.strip_prefix("i="))
-                .unwrap()
-                .to_string()
-        })
-        .collect();
+    let sent = ids(&first, "a=T");
 
     // The slice starts at column 3: the first picture is gone, the second
     // moves from column 4 to 1.
@@ -891,14 +871,41 @@ fn retiring_one_picture_does_not_re_send_the_next() {
     let out = drain(&mut c);
     let mut cmds = graphics(&out);
     cmds.sort();
-    let put = format!("a=p,i={},p=1,C=1,q=2,z=-1,y=0,w=36,h=19,c=4,r=1", ids[1]);
-    let delete = format!("a=d,d=I,i={},q=2\x1b\\", ids[0]);
+    let put = format!("a=p,i={},p=1,C=1,q=2,z=-1,y=0,w=36,h=19,c=4,r=1", sent[1]);
+    let delete = format!("a=d,d=I,i={},q=2\x1b\\", sent[0]);
     assert_eq!(cmds.len(), 2, "{cmds:?}");
     assert!(
         cmds[0].starts_with(&delete) && cmds[1].starts_with(&put),
         "expected a delete of {} and a put of {}: {cmds:?}",
-        ids[0],
-        ids[1]
+        sent[0],
+        sent[1]
     );
     assert!(out.contains(&format!("\x1b[1;2H\x1b_G{put}")), "{cmds:?}");
+}
+
+/// A placement its application can address, put again elsewhere under the
+/// same ids, moves on the host under the id it has: a put, no pixels.
+#[test]
+fn an_addressable_placement_put_elsewhere_moves_without_a_re_send() {
+    let p = pane(1);
+    let layout = LayoutNode::leaf(p);
+    let mut vt = VirtualTerminal::new(10, 20);
+    vt.process(b"\x1b[2;3H");
+    vt.process(&transmit_then_put(5, 18, 19, "a=p,i=5,p=3,C=1"));
+    let mut c = make_compositor(20, 10);
+    c.render_multi_pane(frame(&layout, &HashMap::from([(p, &vt)]), p))
+        .unwrap();
+    let id = &ids(&graphics(&drain(&mut c)), "a=T")[0];
+
+    vt.process(b"\x1b[5;7H\x1b_Ga=p,i=5,p=3,C=1\x1b\\");
+    c.render_multi_pane(frame(&layout, &HashMap::from([(p, &vt)]), p))
+        .unwrap();
+    let out = drain(&mut c);
+    let put = format!("\x1b[5;7H\x1b_Ga=p,i={id},p=1,C=1,q=2,z=-1,y=0,w=18,h=19,c=2,r=1\x1b\\");
+    assert!(
+        out.contains(&put),
+        "expected {put:?} in {:?}",
+        graphics(&out)
+    );
+    assert_eq!(graphics(&out).len(), 1, "{:?}", graphics(&out));
 }

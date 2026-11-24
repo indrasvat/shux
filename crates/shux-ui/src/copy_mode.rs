@@ -597,16 +597,6 @@ pub fn scroll_down(state: &mut CopyModeState, vt: &VirtualTerminal, lines: usize
     top > state.view.top && state.scroll_to(top)
 }
 
-/// Whether wheel-opened copy mode has scrolled back down to where it began.
-pub fn back_at_entry(state: &CopyModeState) -> bool {
-    state.view.top >= state.view.entry_top
-}
-
-/// Whether a wheel over `entry` has history above it to open copy mode on.
-pub fn has_history_above(entry: &PaneViewport, vt: &VirtualTerminal) -> bool {
-    history_len(vt) + entry.row_offset > 0
-}
-
 /// Which grid cell a pane-local cell names.
 #[derive(Clone, Copy)]
 enum Slice<'a> {
@@ -655,36 +645,19 @@ impl BoolExt for bool {
 /// cursor's cell alone with no anchor. Every line reads the columns the view
 /// shows, as drawn, so the yank is what the highlight covers.
 pub fn extract_selection(vt: &VirtualTerminal, state: &CopyModeState) -> String {
-    let mut out = String::new();
     let v = &state.view;
-    let ((_, start_line), (_, end_line)) = reading_order(state);
-    for line in start_line..=end_line {
-        if vt.presented_row(line).is_none() {
-            continue;
-        }
-        if let Some((lo, hi)) = line_span(state, line) {
-            for x in lo..=hi {
-                let Some(cell) = v.cell(vt, x, line) else {
-                    break;
-                };
-                if !cell.is_wide_continuation() {
-                    cell.push_display_text(&mut out);
-                }
-            }
-        }
-        if line != end_line {
-            // Trim trailing whitespace per line for cleaner copies.
-            out.truncate(out.trim_end_matches(' ').len());
-            out.push('\n');
-        }
-    }
-    out.trim_end_matches(' ').to_string()
+    let ends = ordered(state.anchor.unwrap_or(state.cursor), state.cursor);
+    read(
+        ends,
+        |line| modal_span(v, ends, line),
+        |x, line| v.cell(vt, x, line),
+    )
 }
 
-/// The selection's ends in reading order, as `(column, line)`.
-fn reading_order(state: &CopyModeState) -> ((usize, usize), (usize, usize)) {
-    let cursor = state.cursor;
-    let anchor = state.anchor.unwrap_or(cursor);
+/// A selection's ends, as `(column, line)`, in reading order.
+type Ends = ((usize, usize), (usize, usize));
+
+fn ordered(anchor: (usize, usize), cursor: (usize, usize)) -> Ends {
     if (anchor.1, anchor.0) <= (cursor.1, cursor.0) {
         (anchor, cursor)
     } else {
@@ -692,27 +665,66 @@ fn reading_order(state: &CopyModeState) -> ((usize, usize), (usize, usize)) {
     }
 }
 
-/// The local columns of `line` the selection covers inside the view.
-fn line_span(state: &CopyModeState, line: usize) -> Option<(usize, usize)> {
-    let v = &state.view;
-    let ((start_col, start_line), (end_col, end_line)) = reading_order(state);
-    if line < start_line || line > end_line {
+/// The columns of `line` a selection covers, within `first..=last`.
+fn span(
+    ((start_col, start), (end_col, end)): Ends,
+    line: usize,
+    first: usize,
+    last: usize,
+) -> Option<(usize, usize)> {
+    if line < start || line > end {
         return None;
     }
-    let (first, last) = (v.col, v.col + v.cols().saturating_sub(1));
-    let (lo, hi) = if start_line == end_line {
-        let cursor = state.cursor.0;
-        let anchor = state.anchor.map_or(cursor, |a| a.0);
-        (cursor.min(anchor), cursor.max(anchor))
-    } else if line == start_line {
-        (start_col, last)
-    } else if line == end_line {
-        (first, end_col)
+    let lo = if line == start {
+        start_col.max(first)
     } else {
-        (first, last)
+        first
     };
-    let (lo, hi) = (lo.max(first), hi.min(last));
-    (lo <= hi).then(|| (lo - v.col, hi - v.col))
+    let hi = if line == end { end_col.min(last) } else { last };
+    (lo <= hi).then_some((lo, hi))
+}
+
+/// [`span`] in modal copy mode's view, as columns local to it.
+fn modal_span(v: &CopyView, ends: Ends, line: usize) -> Option<(usize, usize)> {
+    let (lo, hi) = span(ends, line, v.col, v.col + v.cols().saturating_sub(1))?;
+    Some((lo - v.col, hi - v.col))
+}
+
+/// The text a selection covers: each line's span of cells, read through
+/// `cell`, trailing blanks trimmed. A line with no first cell is skipped.
+fn read<'v>(
+    ends: Ends,
+    span: impl Fn(usize) -> Option<(usize, usize)>,
+    cell: impl Fn(usize, usize) -> Option<Cow<'v, Cell>>,
+) -> String {
+    let mut out = String::new();
+    let ((_, start), (_, end)) = ends;
+    for line in start..=end {
+        if cell(0, line).is_none() {
+            continue;
+        }
+        for x in span(line).into_iter().flat_map(|(lo, hi)| lo..=hi) {
+            let Some(cell) = cell(x, line) else {
+                break;
+            };
+            if !cell.is_wide_continuation() {
+                cell.push_display_text(&mut out);
+            }
+        }
+        if line != end {
+            out.truncate(out.trim_end_matches(' ').len());
+            out.push('\n');
+        }
+    }
+    out.trim_end_matches(' ').to_string()
+}
+
+fn frame_ends(selection: &Selection) -> Ends {
+    let local = |(x, y): (u16, u16)| (usize::from(x), usize::from(y));
+    ordered(
+        local(selection.anchor.unwrap_or(selection.cursor)),
+        local(selection.cursor),
+    )
 }
 
 /// [`extract_selection`] for a mouse selection made over `view`: the cells
@@ -722,54 +734,20 @@ pub fn extract_frame_selection(
     selection: &Selection,
     view: &PaneViewport,
 ) -> String {
-    let (cols, rows) = (view.shown_cols() as u16, view.shown_rows() as u16);
     let slice = Slice::Frame(view);
-    let mut out = String::new();
-    let (_, end) = order_endpoints(
-        selection.anchor.unwrap_or(selection.cursor),
-        selection.cursor,
-    );
-    for (row, lo, hi) in frame_runs(selection, cols, rows) {
-        if slice.cell(vt, 0, row).is_none() {
-            continue;
-        }
-        for col in lo..=hi {
-            let Some(cell) = slice.cell(vt, col, row) else {
-                break;
-            };
-            if !cell.is_wide_continuation() {
-                cell.push_display_text(&mut out);
-            }
-        }
-        if row != end.1 {
-            out.truncate(out.trim_end_matches(' ').len());
-            out.push('\n');
-        }
-    }
-    out.trim_end_matches(' ').to_string()
+    let last = view.shown_cols().saturating_sub(1);
+    let cell = |x: usize, y: usize| slice.cell(vt, u16::try_from(x).ok()?, u16::try_from(y).ok()?);
+    let ends = frame_ends(selection);
+    read(ends, |row| span(ends, row, 0, last), cell)
 }
 
-/// A local selection's `(row, first, last)` column runs within `cols` x `rows`.
-fn frame_runs(selection: &Selection, cols: u16, rows: u16) -> Vec<(u16, u16, u16)> {
-    let cursor = selection.cursor;
-    let anchor = selection.anchor.unwrap_or(cursor);
-    let (start, end) = order_endpoints(anchor, cursor);
-    let last = cols.saturating_sub(1);
-    (start.1..=end.1)
-        .take_while(|&row| row < rows)
-        .map(|row| {
-            let (lo, hi) = if start.1 == end.1 {
-                (cursor.0.min(anchor.0), cursor.0.max(anchor.0))
-            } else if row == start.1 {
-                (start.0, last)
-            } else if row == end.1 {
-                (0, end.0)
-            } else {
-                (0, last)
-            };
-            (row, lo, hi.min(last))
+/// A mouse selection's `(row, first, last)` runs in the cells `view` showed.
+fn frame_runs(selection: &Selection, view: &PaneViewport) -> Vec<(u16, u16, u16)> {
+    let (ends, last) = (frame_ends(selection), view.shown_cols().saturating_sub(1));
+    (0..view.shown_rows())
+        .filter_map(|row| {
+            span(ends, row, 0, last).map(|(lo, hi)| (row as u16, lo as u16, hi as u16))
         })
-        .filter(|&(_, lo, hi)| lo <= hi)
         .collect()
 }
 
@@ -846,15 +824,6 @@ fn write_color(buf: &mut Vec<u8>, color: Color, fg: bool) {
     }
 }
 
-/// Order two (col, row) endpoints in reading order (top-left → bottom-right).
-fn order_endpoints(a: (u16, u16), b: (u16, u16)) -> ((u16, u16), (u16, u16)) {
-    if a.1 < b.1 || (a.1 == b.1 && a.0 <= b.0) {
-        (a, b)
-    } else {
-        (b, a)
-    }
-}
-
 /// Append ANSI bytes that draw the copy-mode overlay over its pane. Use
 /// [`render_copy_overlay_with_vt_into`] when a VT is available so selection
 /// can repaint the selected glyphs with a high-contrast palette instead of
@@ -887,8 +856,7 @@ pub fn render_selection_overlay_with_vt_into(
     theme: &Theme,
 ) {
     // Only cells the frame drew: a run is not highlighted across surplus.
-    let (cols, rows) = (view.shown_cols() as u16, view.shown_rows() as u16);
-    let runs = frame_runs(selection, cols, rows);
+    let runs = frame_runs(selection, view);
     paint_runs(buf, view.rect, Some(vt), Slice::Frame(view), theme, &runs);
 }
 
@@ -900,8 +868,7 @@ pub fn render_selection_overlay_into(
     selection: &Selection,
     theme: &Theme,
 ) {
-    let (cols, rows) = (view.shown_cols() as u16, view.shown_rows() as u16);
-    let runs = frame_runs(selection, cols, rows);
+    let runs = frame_runs(selection, view);
     paint_runs(buf, view.rect, None, Slice::Frame(view), theme, &runs);
 }
 
@@ -917,10 +884,11 @@ fn render_copy_overlay_inner(
         return;
     }
 
-    if state.anchor.is_some() {
+    if let Some(anchor) = state.anchor {
+        let ends = ordered(anchor, state.cursor);
         let runs: Vec<(u16, u16, u16)> = (0..v.rows())
             .filter_map(|y| {
-                let (lo, hi) = line_span(state, v.top + y)?;
+                let (lo, hi) = modal_span(v, ends, v.top + y)?;
                 Some((y as u16, lo as u16, hi as u16))
             })
             .collect();
