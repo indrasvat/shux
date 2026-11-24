@@ -124,8 +124,9 @@ impl CopyView {
         }
     }
 
+    /// The last line readable at the bottom, above the hint bar.
     fn max_top(&self, vt: &VirtualTerminal) -> usize {
-        vt.presented_total_lines().saturating_sub(self.rows())
+        vt.presented_total_lines().saturating_sub(self.readable())
     }
 
     /// Lines a page moves: the hint bar covers the last row of a slice as
@@ -250,17 +251,21 @@ impl CopyModeState {
         })
     }
 
-    /// This state counted against `vt`'s history now. A selection that
-    /// started on a line since evicted is dropped.
+    /// This state counted against `vt`'s history now. A selection with
+    /// either end on a line since evicted is dropped.
     pub fn rebase(&mut self, vt: &VirtualTerminal) {
         let gone = self.view.evicted_since(vt);
         if gone == 0 {
             return;
         }
         self.view = self.view.rebased(vt);
+        let cursor_kept = self.cursor.1 >= gone;
         self.cursor.1 = self.cursor.1.saturating_sub(gone);
         if let Some((col, line)) = self.anchor {
-            self.anchor = line.checked_sub(gone).map(|line| (col, line));
+            self.anchor = line
+                .checked_sub(gone)
+                .filter(|_| cursor_kept)
+                .map(|line| (col, line));
             self.selection_evicted = self.anchor.is_none();
         }
         self.keep_cursor_in_view();
@@ -679,15 +684,28 @@ impl BoolExt for bool {
 
 /// The text modal copy mode's selection covers: inclusive at both ends, the
 /// cursor's cell alone with no anchor. Every line reads the columns the view
-/// shows, as drawn, so the yank is what the highlight covers.
+/// shows, as drawn, widened to both ends when a pan has left one outside it.
 pub fn extract_selection(vt: &VirtualTerminal, state: &CopyModeState) -> String {
     let v = &state.view;
     let ends = ordered(state.anchor.unwrap_or(state.cursor), state.cursor);
-    read(
-        ends,
-        |line| modal_span(v, ends, line),
-        |x, line| v.cell(vt, x, line),
-    )
+    let ((a, _), (b, _)) = ends;
+    let (shown_first, shown_last) = (v.col, v.col + v.cols().saturating_sub(1));
+    let (first, last) = (shown_first.min(a).min(b), shown_last.max(a).max(b));
+    let cell = |c: usize, line: usize| -> Option<Cow<'_, Cell>> {
+        let row = vt.presented_row(line)?;
+        let cell = row.get(c).filter(|_| (first..=last).contains(&c))?;
+        // A wide glyph the view's own edge cuts is drawn as its blank half.
+        Some(
+            if c == shown_first && c > 0 && cell.is_wide_continuation() {
+                Cow::Owned(blank_like(&row[c - 1]))
+            } else if c == shown_last && cell.width == 2 {
+                Cow::Owned(blank_like(cell))
+            } else {
+                Cow::Borrowed(cell)
+            },
+        )
+    };
+    read(ends, first, |line| span(ends, line, first, last), cell)
 }
 
 /// A selection's ends, as `(column, line)`, in reading order.
@@ -727,16 +745,18 @@ fn modal_span(v: &CopyView, ends: Ends, line: usize) -> Option<(usize, usize)> {
 }
 
 /// The text a selection covers: each line's span of cells, read through
-/// `cell`, trailing blanks trimmed. A line with no first cell is skipped.
+/// `cell`, trailing blanks trimmed. A line with no cell at column `first`
+/// is skipped.
 fn read<'v>(
     ends: Ends,
+    first: usize,
     span: impl Fn(usize) -> Option<(usize, usize)>,
     cell: impl Fn(usize, usize) -> Option<Cow<'v, Cell>>,
 ) -> String {
     let mut out = String::new();
     let ((_, start), (_, end)) = ends;
     for line in start..=end {
-        if cell(0, line).is_none() {
+        if cell(first, line).is_none() {
             continue;
         }
         for x in span(line).into_iter().flat_map(|(lo, hi)| lo..=hi) {
@@ -774,7 +794,7 @@ pub fn extract_frame_selection(
     let last = view.shown_cols().saturating_sub(1);
     let cell = |x: usize, y: usize| slice.cell(vt, u16::try_from(x).ok()?, u16::try_from(y).ok()?);
     let ends = frame_ends(selection);
-    read(ends, |row| span(ends, row, 0, last), cell)
+    read(ends, 0, |row| span(ends, row, 0, last), cell)
 }
 
 /// A mouse selection's `(row, first, last)` runs in the cells `view` showed.
@@ -1379,7 +1399,8 @@ mod tests {
         assert_eq!(handle_key(b"g", &mut s, &vt), CopyKey::Updated);
         assert_eq!((s.view.top, s.cursor), (0, (0, 0)));
         assert_eq!(handle_key(b"G", &mut s, &vt), CopyKey::Updated);
-        assert_eq!(s.view.top, vt.presented_total_lines() - 5);
+        // Four rows readable: the last line sits just above the hint bar.
+        assert_eq!(s.view.top, vt.presented_total_lines() - 4);
         assert_eq!(
             s.cursor_local(),
             (0, 3),
@@ -1703,6 +1724,111 @@ mod tests {
         s.rebase(&vt);
         assert_eq!(s.anchor, None);
         assert!(s.view.local(s.cursor).is_some(), "the cursor left the view");
+    }
+
+    /// An upward selection whose CURSOR's line is evicted, its anchor still
+    /// in history, is dropped too: `y` says so rather than copy a shorter one.
+    #[test]
+    fn evicting_the_cursors_line_drops_an_upward_selection() {
+        let config = shux_vt::GridConfig {
+            max_scrollback: 6,
+            ..Default::default()
+        };
+        let mut vt = VirtualTerminal::with_config(3, 10, config);
+        for i in 0..9 {
+            vt.process(format!("e{i}\r\n").as_bytes());
+        }
+        let mut s = at_top(&vt);
+        handle_key(b"j", &mut s, &vt);
+        handle_key(b"v", &mut s, &vt);
+        handle_key(b"k", &mut s, &vt);
+        assert_eq!(
+            (s.anchor.map(|a| a.1), s.cursor.1),
+            (Some(1), 0),
+            "setup: an upward selection from line 1 to 0"
+        );
+        let evicted = vt.presented_evicted();
+        vt.process(b"e9\r\n");
+        assert_eq!(
+            vt.presented_evicted(),
+            evicted + 1,
+            "setup: one more line evicted"
+        );
+        assert_eq!(handle_key(b"y", &mut s, &vt), CopyKey::SelectionEvicted);
+        assert_eq!(s.anchor, None);
+    }
+
+    /// A search match on the last line is brought into the readable rows,
+    /// never left under the hint bar; `G` reaches that line too.
+    #[test]
+    fn the_last_line_is_reachable_above_the_hint_bar() {
+        let vt = vt_with_lines_ending(5, 20, 12, "LAST");
+        let readable = 4;
+        let mut s = at_top(&vt);
+        for key in ["/", "L", "A", "S", "T", "\r"] {
+            handle_key(key.as_bytes(), &mut s, &vt);
+        }
+        assert_eq!(
+            vt.presented_row(s.cursor.1).map(|r| r[0].ch),
+            Some('L'),
+            "the search did not find the last line"
+        );
+        assert!(
+            s.cursor_local().1 < readable,
+            "the match is under the hint bar: {:?}",
+            s.cursor_local()
+        );
+        let mut s = at_top(&vt);
+        handle_key(b"G", &mut s, &vt);
+        assert_eq!(
+            vt.presented_row(s.cursor.1).map(|r| r[0].ch),
+            Some('L'),
+            "G stopped short of the last line"
+        );
+        assert!(s.cursor_local().1 < readable);
+        // The frame draws it from the grid; the row past the grid's last is
+        // the hint bar's.
+        let (view, over) = s.view.frame_view(&vt);
+        let y = usize::from(s.cursor_local().1);
+        assert!(!over);
+        assert_eq!(view.row_offset + y, 4, "the frame does not draw LAST there");
+        assert_eq!(view.shown_rows(), usize::from(readable));
+    }
+
+    fn vt_with_lines_ending(rows: u16, cols: u16, count: usize, last: &str) -> VirtualTerminal {
+        let mut vt = vt_with_lines(rows, cols, count);
+        vt.process(last.as_bytes());
+        vt
+    }
+
+    /// A pan by search keeps the whole selection: the yank reads its source
+    /// columns from end to end, wherever the view has moved since, in both
+    /// directions, wide glyphs whole.
+    #[test]
+    fn a_panned_selection_yanks_every_column_it_covers() {
+        let text = "ab中c\x1b[1;30H文de\x1b[1;50Hzz\x1b[1;1H";
+        let vt = vt_with(3, 60, text);
+        // Columns 0-4, blank to 28, 29-32, blank to 48, then the first `z`.
+        let want = format!("ab中c{}文de{}z", " ".repeat(24), " ".repeat(16));
+        // Right: `v` at column 0, then a search pans to `zz`.
+        let mut s = modal(&vt, Rect::new(0, 0, 20, 3));
+        handle_key(b"v", &mut s, &vt);
+        for key in ["/", "z", "z", "\r"] {
+            handle_key(key.as_bytes(), &mut s, &vt);
+        }
+        assert!(s.view.col > 0, "setup: the search did not pan");
+        assert_eq!(extract_selection(&vt, &s), want, "panned right");
+        // Left: `v` on `zz`, then a backward search pans back to `ab`.
+        let mut s = modal(&vt, Rect::new(0, 0, 20, 3));
+        for key in ["/", "z", "z", "\r"] {
+            handle_key(key.as_bytes(), &mut s, &vt);
+        }
+        handle_key(b"v", &mut s, &vt);
+        for key in ["?", "a", "b", "\r"] {
+            handle_key(key.as_bytes(), &mut s, &vt);
+        }
+        assert_eq!(s.view.col, 0, "setup: the search did not pan back");
+        assert_eq!(extract_selection(&vt, &s), want, "panned left");
     }
 
     #[test]
