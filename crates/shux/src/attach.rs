@@ -2912,7 +2912,8 @@ async fn handle_mouse_selection(
 /// Copy mode on `pane` over the lines `shown`, a frame, drew; when an action
 /// since has moved or resized the pane, over the slice the next frame draws in
 /// `rect`, which copy mode shows before anything is selected. None once the
-/// pane shows another screen than that frame did.
+/// pane shows another screen than that frame did, or the line at its top has
+/// been evicted: those name lines no other slice has.
 fn copy_mode_over(
     pane: PaneId,
     shown: Option<&Shown>,
@@ -2921,7 +2922,8 @@ fn copy_mode_over(
 ) -> Option<shux_ui::CopyModeState> {
     let vt = state.vts.get(&pane)?;
     let stamped = shown.and_then(|frame| frame.of(pane));
-    if stamped.is_some_and(|(_, drawn)| !drawn.on_screen_of(vt)) {
+    if stamped.is_some_and(|(view, drawn)| !drawn.on_screen_of(vt) || !drawn.keeps_top_of(view, vt))
+    {
         return None;
     }
     stamped
@@ -3145,7 +3147,7 @@ async fn handle_copy_mode_mouse(
                 cm.set_cursor(view.source(pane_local_point_clamped(r, col, row)));
                 match kind {
                     MouseKind::Down => {
-                        cm.anchor = Some(cm.cursor);
+                        cm.select_from_cursor();
                         *dragging = SelectionDrag::CopyMode;
                         true
                     }
@@ -13757,6 +13759,50 @@ mod tests {
             "yanked after the selection's lines were evicted"
         );
         assert!(told, "the status bar never said the selection is gone");
+
+        // A selection the mouse starts afresh yanks: what was evicted no
+        // longer stands in for it.
+        let rect = h.first_rect().await;
+        h.catch_up().await;
+        let (x, y) = (rect.x, rect.y);
+        h.left(MouseKind::Down, x, y).await;
+        h.left(MouseKind::Drag, x + 2, y).await;
+        h.key(b"y").await;
+        let fresh = h.yanked().await;
+        assert_eq!(
+            fresh.as_ref().map(|t| t.chars().count()),
+            Some(3),
+            "a fresh mouse selection was not yanked: {fresh:?}"
+        );
+        h.stop().await;
+    }
+
+    /// A frame whose top line has been evicted since names lines no longer
+    /// there: `prefix [` stamped with it opens no copy mode, over those lines'
+    /// replacements or the slice shown now.
+    #[tokio::test(start_paused = true)]
+    async fn a_stamp_whose_lines_were_evicted_opens_no_copy_mode() {
+        let mut h = InputHarness::new(64).await;
+        let config = shux_vt::GridConfig {
+            max_scrollback: 4,
+            ..Default::default()
+        };
+        let mut vt = shux_vt::VirtualTerminal::with_config(6, 40, config);
+        for i in 0..10 {
+            vt.process(format!("e{i:02}\r\n").as_bytes());
+        }
+        h.show(vt).await;
+        h.catch_up().await;
+        let shown = h.written_frame;
+        let flood: String = (10..40).map(|i| format!("e{i:02}\r\n")).collect();
+        h.app_writes(flood.as_bytes()).await;
+        h.enter_copy_mode(shown).await;
+        h.key(b"x").await;
+        assert_eq!(
+            h.next_input().await,
+            b"x",
+            "copy mode opened over lines the stamp never showed"
+        );
         h.stop().await;
     }
 

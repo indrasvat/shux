@@ -73,16 +73,24 @@ impl Drawn {
     pub fn on_screen_of(&self, vt: &VirtualTerminal) -> bool {
         self.screen == vt.presented_screen()
     }
+
+    /// Whether the line at the top of `entry`, drawn when lines stood here,
+    /// is still in `vt`'s history.
+    pub fn keeps_top_of(&self, entry: &PaneViewport, vt: &VirtualTerminal) -> bool {
+        let gone = vt.presented_evicted().saturating_sub(self.evicted);
+        usize::try_from(gone).is_ok_and(|gone| gone <= self.history + entry.row_offset)
+    }
 }
 
 impl CopyView {
     /// `entry`, drawn when `vt`'s lines stood at `drawn`, over `vt` as it
     /// presents now; `None` once `vt`'s grid or screen is not the one
-    /// `entry` showed.
+    /// `entry` showed, or its top line has been evicted.
     pub fn new(entry: PaneViewport, drawn: Drawn, vt: &VirtualTerminal) -> Option<Self> {
         let grid = vt.grid();
         if (grid.rows(), grid.cols()) != (entry.grid_rows, entry.grid_cols)
             || !drawn.on_screen_of(vt)
+            || !drawn.keeps_top_of(&entry, vt)
         {
             return None;
         }
@@ -310,6 +318,12 @@ impl CopyModeState {
             && self.cursor == (v.col, v.top)
     }
 
+    /// Start a selection at the cursor: an evicted one no longer stands in.
+    pub fn select_from_cursor(&mut self) {
+        self.selection_evicted = false;
+        self.anchor = Some(self.cursor);
+    }
+
     /// Put the cursor on source `(column, line)`, pinned onto the slice.
     pub fn set_cursor(&mut self, at: (usize, usize)) {
         self.cursor = at;
@@ -455,11 +469,10 @@ pub fn handle_key(bytes: &[u8], state: &mut CopyModeState, vt: &VirtualTerminal)
         }
         b'v' => {
             state.pending_g = false;
-            state.selection_evicted = false;
-            state.anchor = match state.anchor {
-                Some(_) => None,
-                None => Some(state.cursor),
-            };
+            match state.anchor {
+                Some(_) => state.anchor = None,
+                None => state.select_from_cursor(),
+            }
             CopyKey::Updated
         }
         b'y' => {
@@ -1820,6 +1833,30 @@ mod tests {
     }
 
     /// A frame's slice names lines of the screen it was drawn on: once the
+    /// A frame whose top line has since been evicted opens nothing: the
+    /// lines now at its indices are others.
+    #[test]
+    fn a_stamp_whose_top_line_was_evicted_opens_nothing() {
+        let pane = PaneId::from_uuid(uuid::Uuid::from_u128(1));
+        let config = shux_vt::GridConfig {
+            max_scrollback: 4,
+            ..Default::default()
+        };
+        let mut vt = VirtualTerminal::with_config(3, 10, config);
+        for i in 0..8 {
+            vt.process(format!("e{i}\r\n").as_bytes());
+        }
+        let rect = Rect::new(0, 0, 10, 3);
+        let (entry, drawn) = (PaneViewport::of(rect, &vt, 0), Drawn::of(&vt));
+        for i in 8..20 {
+            vt.process(format!("e{i}\r\n").as_bytes());
+        }
+        assert!(
+            CopyModeState::enter(pane, entry, drawn, &vt).is_none(),
+            "opened over lines that replaced the stamped ones"
+        );
+    }
+
     /// pane shows another screen, or went to the other and came back, it
     /// opens nothing and maps nothing.
     #[test]
