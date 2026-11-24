@@ -286,7 +286,7 @@ pub(crate) async fn ask_daemon_version(socket_path: &Path) -> (DaemonAnswer, Opt
 async fn ask_version(socket_path: &Path) -> Result<(UnixStream, Asked), DaemonAnswer> {
     let mut stream = match probe_socket(socket_path).await {
         Ok(stream) => stream,
-        Err(e) if is_connection_refused_or_not_found(&e) => return Err(DaemonAnswer::Absent),
+        Err(e) if nothing_listening(&e) => return Err(DaemonAnswer::Absent),
         Err(e) => return Err(DaemonAnswer::Unreachable(e)),
     };
     let asked = ask(&mut stream, "version-check", "system.version", json!({}));
@@ -710,7 +710,7 @@ async fn wait_for_daemon(
                 info!(attempt, "Connected to daemon");
                 return Ok(stream);
             }
-            Err(e) if is_connection_refused_or_not_found(&e) => {
+            Err(e) if nothing_listening(&e) => {
                 debug!(
                     attempt,
                     backoff_ms = backoff.as_millis(),
@@ -774,16 +774,28 @@ pub async fn try_connect(socket_path: &Path) -> Result<UnixStream, ClientError> 
     probe_socket(socket_path).await.map_err(ClientError::Io)
 }
 
-fn is_connection_refused_or_not_found(e: &io::Error) -> bool {
+/// Whether a failed connect means nothing is listening on the socket. A reset
+/// counts: a listener that closes while our connection waits in its backlog, as
+/// a retiring daemon's does, resets it, and tokio's `connect` reports that.
+fn nothing_listening(e: &io::Error) -> bool {
     matches!(
         e.kind(),
-        io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+        io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound | io::ErrorKind::ConnectionReset
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A connect the listener reset is absent: on Linux a daemon that stops
+    /// listening (as one retiring does) resets the connections still queued on
+    /// it, and tokio reports that from `connect` (#311).
+    #[test]
+    fn a_connection_reset_while_connecting_means_nothing_is_listening() {
+        let reset = io::Error::from(io::ErrorKind::ConnectionReset);
+        assert!(nothing_listening(&reset));
+    }
 
     /// A daemon that stops serving between the version check and the fresh
     /// connection is absent, not an I/O error the user is shown.
