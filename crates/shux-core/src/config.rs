@@ -385,14 +385,19 @@ fn apply_reload(path: &Path, file: ConfigFile, handle: &ConfigHandle) {
     }
 }
 
-/// Spawn a hot-reload watcher. On any modify event for `path` (or its
-/// parent dir), re-parse and store the new config behind the handle.
-/// Runs until `cancel` fires.
-pub async fn run_hot_reload(
+/// A hot-reload watcher armed on a config file: every edit from the moment
+/// [`watch_config`] returns is seen, and [`ConfigWatch::run`] applies it.
+pub struct ConfigWatch {
     path: PathBuf,
     handle: ConfigHandle,
-    cancel: tokio_util::sync::CancellationToken,
-) {
+    rx: tokio::sync::mpsc::Receiver<()>,
+    _watcher: notify::RecommendedWatcher,
+}
+
+/// Arm a hot-reload watcher for `path`, or `None`, logged, when it cannot be.
+/// Armed before returning, so a caller that arms it before it starts serving
+/// misses no edit made once it serves.
+pub fn watch_config(path: PathBuf, handle: ConfigHandle) -> Option<ConfigWatch> {
     use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
     // Watch the parent directory because editors typically write to a
@@ -402,18 +407,18 @@ pub async fn run_hot_reload(
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => {
             tracing::warn!("config hot-reload: no parent dir, skipping watcher");
-            return;
+            return None;
         }
     };
     if !parent.exists()
         && let Err(e) = std::fs::create_dir_all(&parent)
     {
         tracing::warn!(error = %e, "config hot-reload: failed to create parent");
-        return;
+        return None;
     }
 
     // Bridge from notify (sync callback) to a tokio mpsc.
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(8);
+    let (tx, rx) = tokio::sync::mpsc::channel::<()>(8);
     let watch_path = path.clone();
     let mut watcher = match RecommendedWatcher::new(
         move |res: notify::Result<notify::Event>| {
@@ -437,27 +442,39 @@ pub async fn run_hot_reload(
         Ok(w) => w,
         Err(e) => {
             tracing::warn!(error = %e, "config hot-reload: watcher init failed");
-            return;
+            return None;
         }
     };
     if let Err(e) = watcher.watch(&parent, RecursiveMode::NonRecursive) {
         tracing::warn!(error = %e, "config hot-reload: watch attach failed");
-        return;
+        return None;
     }
     tracing::info!(path = %path.display(), "config hot-reload: watching");
+    Some(ConfigWatch {
+        path,
+        handle,
+        rx,
+        _watcher: watcher,
+    })
+}
 
-    // Debounce: editors often emit a flurry of events for a single save.
-    // Coalesce to one reload per ~150ms quiet window.
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => break,
-            ev = rx.recv() => {
-                if ev.is_none() { break; }
-                // Drain any extra events that arrived in the same burst.
-                #[expect(clippy::disallowed_methods, reason = "debounce window for one save's burst of events")]
-                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-                while rx.try_recv().is_ok() {}
-                reload_settled(&path, &handle).await;
+impl ConfigWatch {
+    /// Re-parse the file on each edit and store it behind the handle, until
+    /// `cancel` fires.
+    pub async fn run(mut self, cancel: tokio_util::sync::CancellationToken) {
+        // Debounce: editors often emit a flurry of events for a single save.
+        // Coalesce to one reload per ~150ms quiet window.
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                ev = self.rx.recv() => {
+                    if ev.is_none() { break; }
+                    // Drain any extra events that arrived in the same burst.
+                    #[expect(clippy::disallowed_methods, reason = "debounce window for one save's burst of events")]
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    while self.rx.try_recv().is_ok() {}
+                    reload_settled(&self.path, &self.handle).await;
+                }
             }
         }
     }
@@ -648,18 +665,12 @@ mod tests {
         assert_eq!(h.current().appearance.border_style, "thin");
 
         let cancel = tokio_util::sync::CancellationToken::new();
-        let watcher_handle = h.clone();
-        let watcher_path = path.clone();
-        let cancel_for_watcher = cancel.clone();
-        tokio::spawn(async move {
-            run_hot_reload(watcher_path, watcher_handle, cancel_for_watcher).await;
-        });
+        let watch = watch_config(path.clone(), h.clone()).expect("watcher armed");
+        tokio::spawn(watch.run(cancel.clone()));
 
-        // The watcher attaches asynchronously and says nothing when it has,
-        // so keep re-saving until a save lands: one before the attach is
-        // missed, the first after it is seen.
+        // Armed once `watch_config` returns: the one save after it is seen.
+        std::fs::write(&path, "[appearance]\nborder_style = \"double\"\n").unwrap();
         shux_testkit::wait_until_async("hot reload to pick up the file change", || {
-            std::fs::write(&path, "[appearance]\nborder_style = \"double\"\n").unwrap();
             let landed = h.current().appearance.border_style == "double";
             async move { landed }
         })

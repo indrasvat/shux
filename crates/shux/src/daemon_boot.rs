@@ -623,13 +623,11 @@ pub(crate) async fn run_rpc_server(
         io_state.clone(),
         cancel.clone(),
     ));
-    let cfg_watcher_handle = config_handle.clone();
-    let cfg_watcher_path = config_path.clone();
-    let cfg_watcher_cancel = cancel.clone();
-    tokio::spawn(async move {
-        shux_core::config::run_hot_reload(cfg_watcher_path, cfg_watcher_handle, cfg_watcher_cancel)
-            .await;
-    });
+    // Armed before any server accepts, so an edit made once it serves is seen.
+    if let Some(watch) = shux_core::config::watch_config(config_path.clone(), config_handle.clone())
+    {
+        tokio::spawn(watch.run(cancel.clone()));
+    }
 
     // Status-bar segment cache + runners. One runner task per
     // `[[statusbar.segment]]` in config; restarts when config reloads.
