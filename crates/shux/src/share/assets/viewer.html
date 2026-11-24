@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="referrer" content="no-referrer">
 <meta name="robots" content="noindex, nofollow">
 <title>shux · shared session</title>
@@ -17,14 +17,23 @@
   <span class="sep" hidden>·</span>
   <span id="session"></span>
   <span id="expiry"></span>
+  <span id="watching"></span>
   <span id="state">loading…</span>
   <button id="zoom" type="button" hidden>Zoom</button>
 </header>
 <main id="stage">
   <section id="gate" hidden>
-    <p id="gate-text">Someone shared a read-only view of a terminal session with you.</p>
+    <div id="gate-about">
+      <h1>A live terminal session is being shared with you</h1>
+      <p>You'll watch it as it happens. You can't type into it.</p>
+      <p id="gate-when" hidden></p>
+      <p>The person sharing it can see how many people are watching.</p>
+    </div>
+    <p id="gate-text" hidden></p>
     <button id="watch" type="button">Watch session</button>
+    <p class="made">Shared with shux · <a href="https://shux.pages.dev" rel="noreferrer noopener" target="_blank">shux.pages.dev</a></p>
   </section>
+  <div id="toast" role="status" hidden>View only: your keys aren't sent.</div>
   <div id="sizer"><div id="frame"><div id="term"></div></div></div>
 </main>
 </body>

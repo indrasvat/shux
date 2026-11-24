@@ -62,9 +62,23 @@ session, so no guest can read it back.
 
 ### What a guest sees
 
-The guest opens the link, clicks **Watch session**, and sees the session's
+The guest's first page says what this is before anything is spent: a live
+terminal session they can watch and not type into, until when the link works
+and how many uses it has left, and that you can see how many are watching. It
+does not name the session. They click **Watch session**, and see the session's
 panes as you do, at a size that fits their window, under a bar that reads
-**Read-only · expires at …**. On a phone they get an overview they can zoom.
+**◉ Read-only · demo · until 3:55 PM · 2 watching · live**. The count is the
+one your badge shows, and nothing about who. A key press, a paste or a tap on
+the terminal shows, once, "View only: your keys aren't sent." On a phone the
+session opens at a readable size that pans with a swipe; the **Fit** button
+shows the whole layout at once, and **Zoom** goes back.
+
+Every new link also prints a reminder under it, and `--format json` carries it
+as `notice`:
+
+```text
+Anyone with this link sees everything in demo, live, until 15:55. End it with: shux share stop
+```
 
 They do **not** see your status bar, other sessions, scrollback from before
 they joined, or anything else on your machine. Nothing they do in the browser

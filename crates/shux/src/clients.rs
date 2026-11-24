@@ -249,6 +249,16 @@ impl ClientRegistry {
         }
     }
 
+    /// The read-only clients on `session`: what a host's badge counts as
+    /// watching.
+    pub fn watching(&self, session: SessionId) -> usize {
+        self.state()
+            .clients
+            .values()
+            .filter(|e| e.info.session_id == session && !e.info.votes)
+            .count()
+    }
+
     pub fn list(&self) -> Vec<ClientInfo> {
         let s = self.state();
         let mut all: Vec<&Entry> = s.clients.values().collect();

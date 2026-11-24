@@ -408,6 +408,10 @@ async fn asset(
 #[serde(deny_unknown_fields)]
 struct RedeemBody {
     secret: String,
+    /// Check the secret and say when the link ends and its uses left,
+    /// spending nothing: what the page shows before Watch session.
+    #[serde(default)]
+    peek: bool,
 }
 
 fn refused(why: Refused) -> Response {
@@ -450,7 +454,7 @@ async fn redeem(
             serde_json::json!({"error": "json"}),
         );
     }
-    let Ok(RedeemBody { secret }) = serde_json::from_slice(&body) else {
+    let Ok(RedeemBody { secret, peek }) = serde_json::from_slice(&body) else {
         return json(
             StatusCode::BAD_REQUEST,
             serde_json::json!({"error": "body"}),
@@ -458,6 +462,18 @@ async fn redeem(
     };
     if !claim(conn.as_ref()) {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    if peek {
+        return match gw.peek(client(&headers), generation, &id, &secret) {
+            Ok((expires, uses_left)) => json(
+                StatusCode::OK,
+                serde_json::json!({
+                    "expires_in_ms": expires.remaining_ms(gw.now()),
+                    "uses_left": uses_left,
+                }),
+            ),
+            Err(why) => refused(why),
+        };
     }
     match gw.redeem(client(&headers), generation, &id, &secret) {
         Ok(r) => {

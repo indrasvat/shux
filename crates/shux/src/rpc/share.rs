@@ -258,11 +258,18 @@ pub(crate) fn register_share_methods(
                 };
                 let created = gw.open(opts, hold).await.map_err(|e| share_error(e, ""))?;
                 let snap = graph.snapshot();
+                let name = snap.sessions.get(&session).map(|s| s.name.clone());
+                let until = chrono::DateTime::<chrono::Local>::from(created.expires_wall).format("%H:%M");
+                let notice = format!(
+                    "Anyone with this link sees everything in {}, live, until {until}. End it with: shux share stop",
+                    name.as_deref().unwrap_or("the session"),
+                );
                 Ok(serde_json::json!({
+                    "notice": notice,
                     "id": created.id.as_str(),
                     "url": created.url,
                     "session_id": session.to_string(),
-                    "session": snap.sessions.get(&session).map(|s| s.name.clone()),
+                    "session": name,
                     "expires_at": rfc3339(created.expires_wall),
                     "uses": match uses { Uses::Limited(n) => Some(n.get()), Uses::Unlimited => None },
                     "label": label,

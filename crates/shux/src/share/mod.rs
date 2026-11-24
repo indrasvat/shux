@@ -671,6 +671,16 @@ impl Gateway {
                     Down::Idle
                 };
                 if lost.is_cancelled() || idle {
+                    // A stream that just ended may still be sending the
+                    // frame that says why: let every one close first, within
+                    // TEARDOWN, and admit none meanwhile.
+                    let _closed = if reason == Down::Idle {
+                        let all = u32::try_from(MAX_STREAMS).unwrap_or(u32::MAX);
+                        let streams = self.inner.streams.clone().acquire_many_owned(all);
+                        tokio::time::timeout(TEARDOWN, streams).await.ok()
+                    } else {
+                        None
+                    };
                     if let Some(c) = tunnel.take_if(|c| c.generation == generation)
                         && let Err(e) = self.down(c, reason).await
                     {
@@ -837,6 +847,31 @@ impl Gateway {
         id: &GrantId,
         secret: &str,
     ) -> Result<Redeemed, Refused> {
+        self.guessed(client, generation, |store, now| {
+            store.redeem(id, secret, now)
+        })
+    }
+
+    /// What the holder of link `id`'s secret may know before spending a use:
+    /// when it ends and the uses it has left. A wrong secret costs a guess.
+    fn peek(
+        &self,
+        client: &str,
+        generation: u64,
+        id: &GrantId,
+        secret: &str,
+    ) -> Result<(grants::Expiry, Option<u32>), Refused> {
+        self.guessed(client, generation, |store, now| store.peek(id, secret, now))
+    }
+
+    /// Runs `check` of a presented secret under the generation the request
+    /// was checked in, unless `client` has failed too often of late.
+    fn guessed<T>(
+        &self,
+        client: &str,
+        generation: u64,
+        check: impl FnOnce(&mut Store, Now) -> Result<T, Refused>,
+    ) -> Result<T, Refused> {
         let now = self.now();
         if !lock(&self.inner.failures).allowed(client, now.mono) {
             return Err(Refused::Throttled);
@@ -845,7 +880,7 @@ impl Gateway {
         let redeemed = {
             let mut store = self.store();
             if store.generation() == generation {
-                store.redeem(id, secret, now)
+                check(&mut store, now)
             } else {
                 Err(Refused::NotFound)
             }
@@ -1266,6 +1301,39 @@ mod tests {
             gw.redeem("c", generation, &fresh.id, fresh_secret).is_ok(),
             "asking after an ended link counted as guessing"
         );
+    }
+
+    /// A tunnel gone idle stays up until the streams that just ended have
+    /// closed, so their last frame, which says why, reaches the guest.
+    #[tokio::test]
+    async fn an_idle_tunnel_waits_for_ended_streams_to_close() {
+        let gw = gateway();
+        let session = shared(&gw).await;
+        let lost = CancellationToken::new();
+        *gw.inner.tunnel.lock().await = Some(Connector {
+            generation: 0,
+            supervisor: tunnel::Supervisor::idle(),
+            lost: lost.clone(),
+        });
+        gw.inner.tunnel_state.store(TUNNEL_UP, Ordering::Relaxed);
+        tokio::spawn(gw.clone().keep(0, lost));
+        gw.create(CreateOpts::new(session)).unwrap();
+        // A stream still closing holds its slot until its socket is gone.
+        let closing = gw.inner.streams.clone().try_acquire_owned().unwrap();
+        gw.revoke_all().await.1.unwrap();
+        let streams = gw.inner.streams.clone();
+        shux_testkit::wait_until_async("the keeper to wait for the closing stream", || {
+            let free = streams.available_permits();
+            async move { free == 0 }
+        })
+        .await;
+        assert_eq!(gw.tunnel_state(), "up", "taken down under a closing stream");
+        drop(closing);
+        shux_testkit::wait_until_async("the idle tunnel to go down", || {
+            let state = gw.tunnel_state();
+            async move { state == "down" }
+        })
+        .await;
     }
 
     /// A startup `stop` cancelled mints nothing, even through a tunnel

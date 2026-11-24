@@ -521,14 +521,16 @@ impl Store {
         })
     }
 
-    /// Spends one use of `id` for whoever presents its secret. Atomic: the
-    /// caller holds the store, so two redemptions of a one-use link cannot
-    /// both pass.
-    pub fn redeem(&mut self, id: &GrantId, secret: &str, at: Now) -> Result<Redeemed, Refused> {
+    /// Whether `secret` would redeem `id` now, spending nothing: when the
+    /// link ends and the uses it has left.
+    pub fn peek(
+        &self,
+        id: &GrantId,
+        secret: &str,
+        at: Now,
+    ) -> Result<(Expiry, Option<u32>), Refused> {
         let presented = presented(secret);
-        let viewers = self.viewers.len();
-        let of_link = self.viewers.values().filter(|v| v.grant == *id).count();
-        let Some(grant) = self.grants.get_mut(id) else {
+        let Some(grant) = self.grants.get(id) else {
             return Err(match self.ended.get(id) {
                 Some(&(why, _)) => Refused::Gone(Some(why)),
                 None => Refused::NotFound,
@@ -546,6 +548,19 @@ impl Store {
         if grant.uses_left == Some(0) {
             return Err(Refused::Gone(None));
         }
+        Ok((grant.expires, grant.uses_left))
+    }
+
+    /// Spends one use of `id` for whoever presents its secret. Atomic: the
+    /// caller holds the store, so two redemptions of a one-use link cannot
+    /// both pass.
+    pub fn redeem(&mut self, id: &GrantId, secret: &str, at: Now) -> Result<Redeemed, Refused> {
+        self.peek(id, secret, at)?;
+        let viewers = self.viewers.len();
+        let of_link = self.viewers.values().filter(|v| v.grant == *id).count();
+        let Some(grant) = self.grants.get_mut(id) else {
+            return Err(Refused::NotFound);
+        };
         if viewers >= MAX_VIEWERS || of_link >= MAX_VIEWERS_PER_LINK {
             return Err(Refused::Full);
         }

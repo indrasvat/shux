@@ -54,7 +54,8 @@ TCP and plugins get `permission_denied` with `reason: "owner_local"`) and
 → { "id": "ab12cd34", "url": "https://<words>.trycloudflare.com/v/ab12cd34#<secret>",
     "session_id": "<uuid>", "session": "demo", "expires_at": "2026-11-24T15:00:00Z",
     "uses": 1,                // null when unlimited
-    "label": "review", "deliver": "print" }   // or "clipboard"
+    "label": "review", "deliver": "print",    // or "clipboard"
+    "notice": "Anyone with this link sees everything in demo, live, until 15:00. End it with: shux share stop" }
 
 // share.list (shux share list)
 {} → { "tunnel": "up",        // "starting" or "down"
@@ -84,6 +85,12 @@ unlimited), live viewers.
 
 A guest also shows in `client.list` with `"share": true`; `client.detach`
 of one is a kick (credential invalidated, the guest told `kicked`).
+
+The guest's page (`shux.view.v1`) gets `{"t":"watching","n":2}`: the badge's
+count of read-only clients on the session, on a change and at most once a
+second, never who. Before Watch session it asks the redeem endpoint with
+`"peek": true`, which checks the secret, spends no use, and answers
+`expires_in_ms` and `uses_left`; a wrong secret counts as a failed guess.
 
 ## Errors
 

@@ -2453,14 +2453,7 @@ pub fn print_share_created(r: &serde_json::Value) -> Printed {
     let mut out = io::stdout().lock();
     share_summary(&mut out, "sharing read-only:", r)?;
     writeln!(out, "  {}", accent(safe_label(s("url"))))?;
-    writeln!(
-        out,
-        "  {}",
-        muted(format!(
-            "anyone with this link can watch; send it privately · end it: shux share revoke {} · done: shux share stop",
-            s("id")
-        ))
-    )?;
+    writeln!(out, "  {}", muted(safe_label(s("notice"))))?;
     out.flush()?;
     Ok(())
 }
@@ -2472,8 +2465,10 @@ pub fn print_share_copied(r: &serde_json::Value) -> Printed {
     writeln!(
         out,
         "  {}",
-        muted("not printed: inside shux, a link never is · done: shux share stop")
+        muted("not printed: inside shux, a link never is")
     )?;
+    let notice = r.get("notice").and_then(|v| v.as_str()).unwrap_or("?");
+    writeln!(out, "  {}", muted(safe_label(notice)))?;
     out.flush()?;
     Ok(())
 }

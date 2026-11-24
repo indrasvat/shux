@@ -121,9 +121,9 @@ pub enum Command {
     /// Bare `shux share` makes one link: one use, for one hour. The guest
     /// sees the session live and cannot type into it or resize it. A public
     /// Cloudflare quick tunnel carries it, so cloudflared must be installed;
-    /// Cloudflare sees the stream in plaintext at its edge. Inside any shux
-    /// pane the link goes to the clipboard and is never printed; with no
-    /// clipboard there, nothing is made. Run `shux share stop` when you are
+    /// Cloudflare sees the stream in plaintext at its edge. Wherever
+    /// SHUX_PANE_ID is set (any shux pane) the link goes to the clipboard and
+    /// is not printed; with no clipboard there, nothing is made. Run `shux share stop` when you are
     /// done.
     #[command(args_conflicts_with_subcommands = true)]
     Share {

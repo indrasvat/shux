@@ -247,6 +247,37 @@ fn ok_and_quiet(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// Every new link reminds its owner what it shows and how to end it, in
+/// text and in JSON alike.
+#[test]
+fn a_new_link_says_what_it_exposes_and_how_to_end_it() {
+    let h = Harness::new();
+    let pane = h.session("demo");
+    let made = h.json(&["share", "-s", "demo"]);
+    let notice = made["notice"].as_str().unwrap_or_default();
+    assert!(
+        notice.starts_with("Anyone with this link sees everything in demo, live, until ")
+            && notice.ends_with(". End it with: shux share stop"),
+        "{made}"
+    );
+    // Copied from a pane: the summary prints whatever the output is.
+    let bin = fake_clipboard(h.fake.path());
+    let copied = h
+        .command()
+        .env("SHUX_PANE_ID", &pane)
+        .env("PATH", &bin)
+        .env("DISPLAY", ":99")
+        .args(["share", "-s", "demo"])
+        .output()
+        .expect("run shux");
+    let text = ok_and_quiet(&copied);
+    assert!(
+        text.contains(notice.split(", until").next().unwrap_or("?")),
+        "{text}"
+    );
+    assert!(text.contains("End it with: shux share stop"), "{text}");
+}
+
 #[test]
 fn a_link_runs_its_tunnel_and_the_last_link_ending_reaps_it() {
     let h = Harness::new();
