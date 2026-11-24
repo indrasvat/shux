@@ -386,6 +386,15 @@ impl<'a> VtHandler<'a> {
         self.cursor.extended.clone()
     }
 
+    /// Erase the cursor row from `from` to its end. The row no longer runs
+    /// on into the next one, so its soft wrap ends too (as xterm's ClearRight).
+    fn erase_to_row_end(&mut self, from: usize, bg: Color) {
+        let cols = self.grid.cols();
+        self.grid
+            .erase_chars(self.cursor.row, from, cols.saturating_sub(from), bg);
+        self.grid.visible_row_mut_marked(self.cursor.row).wrapped = false;
+    }
+
     fn save_cursor_state(&mut self) {
         self.cursor.save(self.modes.origin_mode, *self.charsets);
         if let Some(saved) = &mut self.cursor.saved {
@@ -1451,12 +1460,7 @@ impl<'a> vte::Perform for VtHandler<'a> {
                 match p(0, 0) {
                     0 => {
                         // Clear from cursor to end.
-                        self.grid.erase_chars(
-                            self.cursor.row,
-                            self.cursor.col,
-                            cols - self.cursor.col,
-                            bg,
-                        );
+                        self.erase_to_row_end(self.cursor.col, bg);
                         if self.cursor.row + 1 < rows {
                             self.grid.clear_below(self.cursor.row + 1, bg);
                         }
@@ -1485,16 +1489,11 @@ impl<'a> vte::Perform for VtHandler<'a> {
             ('K', []) => {
                 let bg = self.cursor.style.bg;
                 match p(0, 0) {
-                    0 => self.grid.erase_chars(
-                        self.cursor.row,
-                        self.cursor.col,
-                        cols - self.cursor.col,
-                        bg,
-                    ),
+                    0 => self.erase_to_row_end(self.cursor.col, bg),
                     1 => self
                         .grid
                         .erase_chars(self.cursor.row, 0, self.cursor.col + 1, bg),
-                    2 => self.grid.erase_chars(self.cursor.row, 0, cols, bg),
+                    2 => self.erase_to_row_end(0, bg),
                     _ => {}
                 }
             }

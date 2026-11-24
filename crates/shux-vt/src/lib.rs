@@ -2144,6 +2144,80 @@ mod tests {
         assert_eq!(visible_text(&vt, 1), "F");
     }
 
+    /// What `bash --norc` echoes and prints for the #301 smoke: the command
+    /// line soft-wraps at 80 columns, then `clear` is `CSI H CSI J`.
+    fn smoke_301(fill: usize) -> Vec<u8> {
+        let mut bytes = b"\x1b[?2004hbash-5.3$ clear; printf '\\033[48;2;30;60;160m%40s\\033[0m\\n\
+\\033[48;5;130m%40s\\033[0m\\n\\033[42m%40s\\033[0m\\n' '' '' ''; printf 'DONE%s\\n' -mark\r\n\
+\x1b[?2004l\r\x1b[H\x1b[J"
+            .to_vec();
+        for sgr in [&b"\x1b[48;2;30;60;160m"[..], b"\x1b[48;5;130m", b"\x1b[42m"] {
+            bytes.extend_from_slice(sgr);
+            bytes.extend(std::iter::repeat_n(b' ', fill));
+            bytes.extend_from_slice(b"\x1b[0m\r\n");
+        }
+        bytes.extend_from_slice(b"DONE-mark\r\n\x1b[?2004hbash-5.3$ ");
+        bytes
+    }
+
+    fn row_bgs(vt: &VirtualTerminal, rows: usize) -> Vec<(Color, usize)> {
+        (0..rows)
+            .map(|r| {
+                let row = vt.grid().visible_row(r);
+                let coloured = (0..row.len())
+                    .filter(|&c| row[c].style.bg != Color::Default)
+                    .count();
+                (row[0].style.bg, coloured)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_clear_does_not_join_the_next_line_onto_a_wrapped_row() {
+        let blue = Color::Rgb(30, 60, 160);
+        let (brown, green) = (Color::Indexed(130), Color::Indexed(2));
+        for (fill, steps) in [
+            (40, &[(10, 40), (40, 120)][..]),
+            (40, &[(10, 39)][..]),
+            (40, &[(10, 41)][..]),
+            (40, &[(24, 60)][..]),
+            (60, &[(10, 40), (40, 120)][..]),
+        ] {
+            let mut vt = VirtualTerminal::new(24, 80);
+            vt.process(&smoke_301(fill));
+            // Padding clipped by a narrow is not regained by a later widen.
+            let mut kept = fill;
+            for &(rows, cols) in steps {
+                vt.resize(rows, cols);
+                kept = kept.min(cols);
+                assert_eq!(
+                    row_bgs(&vt, 3),
+                    [(blue, kept), (brown, kept), (green, kept)],
+                    "fill {fill} at {cols}x{rows}"
+                );
+                assert_eq!(
+                    visible_text(&vt, 3),
+                    "DONE-mark",
+                    "fill {fill} at {cols}x{rows}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn erasing_to_the_end_of_a_row_ends_its_soft_wrap() {
+        for erase in [&b"\x1b[J"[..], b"\x1b[K", b"\x1b[2K"] {
+            let mut vt = VirtualTerminal::new(4, 5);
+            vt.process(b"ABCDEFG\x1b[H");
+            assert!(vt.grid().visible_row(0).wrapped);
+            vt.process(erase);
+            assert!(!vt.grid().visible_row(0).wrapped, "{erase:?}");
+        }
+        let mut vt = VirtualTerminal::new(4, 5);
+        vt.process(b"ABCDEFG\x1b[1;3H\x1b[1K");
+        assert!(vt.grid().visible_row(0).wrapped, "EL 1 leaves the wrap");
+    }
+
     #[test]
     fn row_shrink_without_a_parked_cursor_lets_erase_fill_yield() {
         let mut vt = VirtualTerminal::new(6, 10);
