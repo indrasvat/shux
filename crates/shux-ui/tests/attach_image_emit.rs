@@ -119,11 +119,16 @@ fn an_image_in_a_pane_reaches_the_attached_terminal() {
     // decoded as keystrokes and typed into the pane.
     assert!(cmd.contains("C=1"), "{cmd}");
     assert!(cmd.contains("q=2"), "{cmd}");
-    // `z=-1` draws the picture UNDER text: the attach client writes copy mode,
-    // the help sheet and the toasts into the frame after the images, and the
-    // protocol's default would cover them.
-    assert!(cmd.contains("z=-1"), "{cmd}");
+    // A negative z draws the picture UNDER text: the attach client writes
+    // copy mode, the help sheet and the toasts into the frame after the
+    // images, and the protocol's default would cover them. Below its floor,
+    // kitty would draw it under cell backgrounds too.
+    assert!(cmd.contains(&format!(",z={Z0},")), "{cmd}");
 }
+
+/// The `z` of the lowest picture: the floor of the band kitty draws under
+/// text but above cell backgrounds. Each picture painted later is one above.
+const Z0: i32 = -(1 << 30);
 
 #[test]
 fn new_pixels_under_the_same_image_id_are_re_transmitted() {
@@ -745,7 +750,7 @@ fn a_picture_left_of_and_above_the_slice_is_cropped_in_place() {
     assert_eq!(c.pane_views()[&p].row_offset, 4);
     assert_eq!(c.pane_views()[&p].col_offset, 12);
     let put =
-        format!("\x1b[1;1H\x1b_Ga=p,i={id},p=1,C=1,q=2,z=-1,x=27,y=38,w=18,h=19,c=2,r=1\x1b\\");
+        format!("\x1b[1;1H\x1b_Ga=p,i={id},p=1,C=1,q=2,z={Z0},x=27,y=38,w=18,h=19,c=2,r=1\x1b\\");
     assert!(
         out.contains(&put),
         "expected {put:?} in {:?}",
@@ -758,7 +763,7 @@ fn a_picture_left_of_and_above_the_slice_is_cropped_in_place() {
         .unwrap();
     let out = drain(&mut c);
     let put =
-        format!("\x1b[4;11H\x1b_Ga=p,i={id},p=1,C=1,q=2,z=-1,x=9,y=19,w=36,h=38,c=4,r=2\x1b\\");
+        format!("\x1b[4;11H\x1b_Ga=p,i={id},p=1,C=1,q=2,z={Z0},x=9,y=19,w=36,h=38,c=4,r=2\x1b\\");
     assert!(
         out.contains(&put),
         "expected {put:?} in {:?}",
@@ -787,7 +792,7 @@ fn a_restored_picture_omits_a_zero_source_x() {
         .unwrap();
     let out = drain(&mut c);
     let put =
-        format!("\x1b[4;1H\x1b_Ga=p,i={id},p=1,C=1,q=2,z=-1,x=18,y=0,w=18,h=38,c=2,r=2\x1b\\");
+        format!("\x1b[4;1H\x1b_Ga=p,i={id},p=1,C=1,q=2,z={Z0},x=18,y=0,w=18,h=38,c=2,r=2\x1b\\");
     assert!(
         out.contains(&put),
         "expected {put:?} in {:?}",
@@ -798,7 +803,7 @@ fn a_restored_picture_omits_a_zero_source_x() {
     c.render_multi_pane(frame(&layout, &HashMap::from([(p, &vt)]), p))
         .unwrap();
     let out = drain(&mut c);
-    let put = format!("\x1b[4;11H\x1b_Ga=p,i={id},p=1,C=1,q=2,z=-1,y=0,w=36,h=38,c=4,r=2\x1b\\");
+    let put = format!("\x1b[4;11H\x1b_Ga=p,i={id},p=1,C=1,q=2,z={Z0},y=0,w=36,h=38,c=4,r=2\x1b\\");
     assert!(
         out.contains(&put),
         "expected {put:?} in {:?}",
@@ -875,7 +880,12 @@ fn retiring_one_picture_does_not_re_send_the_next() {
     let out = drain(&mut c);
     let mut cmds = graphics(&out);
     cmds.sort();
-    let put = format!("a=p,i={},p=1,C=1,q=2,z=-1,y=0,w=36,h=19,c=4,r=1", sent[1]);
+    // The second keeps the `z` above the first it was given.
+    let put = format!(
+        "a=p,i={},p=1,C=1,q=2,z={},y=0,w=36,h=19,c=4,r=1",
+        sent[1],
+        Z0 + 1
+    );
     let delete = format!("a=d,d=I,i={},q=2\x1b\\", sent[0]);
     assert_eq!(cmds.len(), 2, "{cmds:?}");
     assert!(
@@ -905,7 +915,7 @@ fn an_addressable_placement_put_elsewhere_moves_without_a_re_send() {
     c.render_multi_pane(frame(&layout, &HashMap::from([(p, &vt)]), p))
         .unwrap();
     let out = drain(&mut c);
-    let put = format!("\x1b[5;7H\x1b_Ga=p,i={id},p=1,C=1,q=2,z=-1,y=0,w=18,h=19,c=2,r=1\x1b\\");
+    let put = format!("\x1b[5;7H\x1b_Ga=p,i={id},p=1,C=1,q=2,z={Z0},y=0,w=18,h=19,c=2,r=1\x1b\\");
     assert!(
         out.contains(&put),
         "expected {put:?} in {:?}",
@@ -1029,4 +1039,66 @@ fn a_moved_picture_without_a_placement_id_is_put_not_re_sent() {
         graphics(&out)
     );
     assert_eq!(graphics(&out).len(), 1, "{:?}", graphics(&out));
+}
+
+/// The `z=` each host id was last given in `cmds`, oldest first.
+fn last_z(cmds: &[String], z: &mut HashMap<String, i64>) {
+    for k in cmds {
+        let field = |name: &str| k.split(',').find_map(|f| f.strip_prefix(name));
+        if let (Some(id), Some(at)) = (field("i="), field("z=")) {
+            z.insert(id.to_string(), at.parse().expect("z"));
+        }
+    }
+}
+
+/// Two pictures over one cell stack on the host as the raster paints them,
+/// the later one on top, whichever host id is older: a picture put again
+/// goes on top though the host already holds it.
+#[test]
+fn stacked_pictures_keep_the_rasters_order_on_the_host() {
+    let p = pane(1);
+    let layout = LayoutNode::leaf(p);
+    let mut vt = VirtualTerminal::new(10, 20);
+    vt.process(b"\x1b[3;3H");
+    vt.process(&transmit_then_put(72, 9, 19, "a=p,i=72,C=1"));
+    vt.process(&transmit_then_put(73, 9, 19, "a=p,i=73,C=1"));
+    let mut c = make_compositor(20, 10);
+    let mut z = HashMap::new();
+    c.render_multi_pane(frame(&layout, &HashMap::from([(p, &vt)]), p))
+        .unwrap();
+    let first = graphics(&drain(&mut c));
+    let sent = ids(&first, "a=T");
+    assert_eq!(sent.len(), 2, "{first:?}");
+    last_z(&first, &mut z);
+    assert!(
+        z[&sent[0]] < z[&sent[1]],
+        "the first drawn on top: {first:?}"
+    );
+
+    // The first is put again: the raster paints it last, on top.
+    vt.process(b"\x1b_Ga=d,d=i,i=72,q=2\x1b\\\x1b[3;3H\x1b_Ga=p,i=72,C=1,q=2\x1b\\");
+    assert_eq!(
+        vt.grid().placements().last().map(|q| q.image_id),
+        Some(72),
+        "setup: the re-put is not last"
+    );
+    c.render_multi_pane(frame(&layout, &HashMap::from([(p, &vt)]), p))
+        .unwrap();
+    let second = graphics(&drain(&mut c));
+    assert_eq!(
+        ids(&second, "a=T"),
+        Vec::<String>::new(),
+        "re-sent: {second:?}"
+    );
+    last_z(&second, &mut z);
+    assert!(
+        z[&sent[0]] > z[&sent[1]],
+        "the re-put picture is under the other on the host: {first:?} then {second:?}"
+    );
+    for at in z.values() {
+        assert!(
+            (-(1 << 30)..=-1).contains(at),
+            "z={at} leaves the band under text"
+        );
+    }
 }

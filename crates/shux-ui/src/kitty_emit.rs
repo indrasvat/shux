@@ -104,6 +104,34 @@ struct Live {
     image: Arc<StoredImage>,
     host_id: u32,
     placed: Placed,
+    z: i32,
+}
+
+/// The lowest `z` kitty still draws above a cell's background.
+const Z_FLOOR: i32 = -(1 << 30);
+
+/// A `z` per placement in paint order, each above the one before: kitty
+/// stacks equal `z` by host id, which reuse leaves in any order. A survivor
+/// keeps the `z` it `had` where that order allows; when the band under text
+/// runs out, all are renumbered from its floor.
+fn stack(had: &[Option<i32>]) -> Vec<i32> {
+    let mut below = i64::from(Z_FLOOR) - 1;
+    let z: Vec<i64> = had
+        .iter()
+        .map(|had| {
+            let z = had
+                .map(i64::from)
+                .filter(|&z| z > below)
+                .unwrap_or(below + 1);
+            below = z;
+            z
+        })
+        .collect();
+    if below <= -1 {
+        z.into_iter().map(|z| z as i32).collect()
+    } else {
+        (0..had.len()).map(|i| Z_FLOOR + i as i32).collect()
+    }
 }
 
 /// What the user's terminal currently holds, for one attach.
@@ -183,16 +211,23 @@ impl KittyEmitter {
                 *held = Some(was.swap_remove(i));
             }
         }
-        for ((k, placed), held) in want.into_iter().zip(held) {
+        let had: Vec<Option<i32>> = held.iter().map(|h| h.as_ref().map(|l| l.z)).collect();
+        for (((k, placed), held), z) in want.into_iter().zip(held).zip(stack(&had)) {
             match held {
                 Some(mut live) => {
-                    if live.placed != placed || replace_all {
+                    if live.placed != placed || live.z != z || replace_all {
                         // Same pixels, new geometry. Re-putting under the same
                         // image AND placement id replaces the placement in
                         // place, which is the protocol's own answer to flicker.
                         cup(out, &placed)?;
-                        write!(out, "\x1b_Ga=p,i={},{}\x1b\\", live.host_id, keys(&placed))?;
+                        write!(
+                            out,
+                            "\x1b_Ga=p,i={},{}\x1b\\",
+                            live.host_id,
+                            keys(&placed, z)
+                        )?;
                         live.placed = placed;
+                        live.z = z;
                         wrote = true;
                     }
                     live.key = k.key;
@@ -200,12 +235,13 @@ impl KittyEmitter {
                 }
                 None => {
                     let id = self.take_id();
-                    transmit(out, id, &k.placement.image, &placed)?;
+                    transmit(out, id, &k.placement.image, &placed, z)?;
                     self.live.push(Live {
                         key: k.key,
                         image: k.placement.image.clone(),
                         host_id: id,
                         placed,
+                        z,
                     });
                     wrote = true;
                 }
@@ -327,12 +363,12 @@ fn place(
 /// and scrolls the whole screen for an image at the bottom margin. `q=2` so the
 /// host's `OK` never lands in the client's key decoder.
 ///
-/// `z=-1` puts the picture UNDER text: the client writes copy mode, the help
-/// sheet and the welcome toast into the frame after the compositor has emitted
-/// images, and at the default z=0 kitty draws a placement above them. Negative
-/// z still draws above the cell BACKGROUND, so a picture is not hidden by the
-/// blank cells it covers.
-fn keys(p: &Placed) -> String {
+/// A negative `z` puts the picture UNDER text: the client writes copy mode,
+/// the help sheet and the welcome toast into the frame after the compositor
+/// has emitted images, and at the default z=0 kitty draws a placement above
+/// them. From [`Z_FLOOR`] up it still draws above the cell BACKGROUND, so a
+/// picture is not hidden by the blank cells it covers.
+fn keys(p: &Placed, z: i32) -> String {
     let (x, y, w, h) = p.src;
     let (c, r) = p.cells;
     let x = if x == 0 {
@@ -351,14 +387,20 @@ fn keys(p: &Placed) -> String {
     } else {
         format!(",Y={dy}")
     };
-    format!("p=1,C=1,q=2,z=-1,{x}y={y},w={w},h={h},c={c},r={r}{dx}{dy}")
+    format!("p=1,C=1,q=2,z={z},{x}y={y},w={w},h={h},c={c},r={r}{dx}{dy}")
 }
 
 fn cup(out: &mut impl Write, p: &Placed) -> io::Result<()> {
     write!(out, "\x1b[{};{}H", p.row + 1, p.col + 1)
 }
 
-fn transmit(out: &mut impl Write, id: u32, img: &StoredImage, placed: &Placed) -> io::Result<()> {
+fn transmit(
+    out: &mut impl Write,
+    id: u32,
+    img: &StoredImage,
+    placed: &Placed,
+    z: i32,
+) -> io::Result<()> {
     let fmt = match img.format {
         ImageFormat::Rgba32 => 32,
         ImageFormat::Rgb24 => 24,
@@ -377,7 +419,7 @@ fn transmit(out: &mut impl Write, id: u32, img: &StoredImage, placed: &Placed) -
                 "\x1b_Ga=T,f={fmt}{zlib},t=d,i={id},s={},v={},{},m={more};",
                 img.width,
                 img.height,
-                keys(placed)
+                keys(placed, z)
             )?;
         } else {
             write!(out, "\x1b_Gq=2,m={more};")?;
