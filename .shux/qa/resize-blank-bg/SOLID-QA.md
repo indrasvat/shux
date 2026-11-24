@@ -1,9 +1,49 @@
 VERDICT: PASS
 
-commit_under_audit: 7ae17af1cf0d5a3a4231d436a97da0a862c5fb3e
+commit_under_audit: fcee6d044b82d6dc4009ea04843b289870a42ba0
 merge-base: f1478e4b1e5dcc163aaeb635069dec0b901790d4
-scope: resize-blank-bg (issue #295, branch fix/resize-keeps-blank-bg), tier full
-audit type: delta re-audit of 7cff347..7ae17af (f25c203, 7ae17af) plus the previous gate's findings
+scope: resize-blank-bg (issue #295, PR #300, branch fix/resize-keeps-blank-bg), tier full
+audit type: delta re-audit #2 of 72f5044..fcee6d0 (8ed9a6c, fcee6d0), on top of re-audit #1
+(7cff347..7ae17af, PASS at 72f5044), which is kept below
+
+## Re-audit #2: 72f5044..fcee6d0
+
+8ed9a6c fixes two P1s from the PR bots. A new `Cursor::after_print` flag is set by printing
+and cleared by every cursor command. DECSC/DECRC (and SCOSC/SCORC) save it, and reflow
+carries it. fcee6d0 refreshes `neutrality.json`: head 8ed9a6c, 6/6 layers pass (cited).
+`make check-vt-qa-pregate` at HEAD passes ("8 VT path(s) touched; evidence conforming").
+
+Binaries: h2 = 8ed9a6c release build (`git_sha` 8ed9a6c; fcee6d0 changes no code),
+p1 = 7ae17af. Same scripts as re-audit #1 (`.shux/out/resize-blank-bg/delta/`), output
+under `h2/` and `p1/`. Each case starts at 10x4, shrinks to 5x4, then types X:
+
+| Input | h2 (HEAD) | p1 (7ae17af) | Expected | Status |
+|---|---|---|---|---|
+| bot 1: `ABCDE ESC[1;6H` | `ABCDX` | `ABCDE` / `X` | `ABCDX` | PASS (red on p1) |
+| `ABCDE ESC[C ESC[D` | `ABCDX` | `ABCDE` / `X` | addressed, so overwrite | PASS |
+| `ABCDE CR ESC[5C` | `ABCDX` | `ABCDE` / `X` | addressed | PASS |
+| bot 2: `ABCDE ?1049h`, shrink in alt, `?1049l F` | `ABCDE` / `F` | `ABCDF` | F on next row, E kept | PASS (red on p1) |
+| `ABCDE ESC[31m` (SGR, no move) | `ABCDE` / `X` | same | intent kept | PASS |
+| `ABCDE ESC[K` (EL, no move) | `ABCDE` / `X` | same | intent kept | PASS |
+| `ABCDE ESC7 ESC[3;1H zz ESC8` | `ABCDE` / `X` / `zz` | `ABCDX` / `` / `zz` | DECRC restores intent | PASS (red on p1) |
+| `ABCDE CSI s ESC[3;1H zz CSI u` | `ABCDE` / `X` / `zz` | `ABCDX` / `` / `zz` | SCORC restores intent | PASS (red on p1) |
+
+Regressions from re-audit #1, all unchanged on h2: CUP one past the edge (`abc F`), ICH widen
+(`c   界`), `ABCDE ` intent (`ABCDE` / `F`), history at the 5000-line cap (`TOP` / `mid`).
+The 4-column DCH gap-only rows run through 8x2, 4x2, 12x3 and 5x2 with no panic, and Q
+prints. Coloured blanks on the main and alt screens over 6 sizes: h2 against p1, 12/12 at
+0/0 (`pixel-r2-delta-*.json`). vim across 80x24, 120x40, 200x60, 50x15 and 80x24: h2 against
+p1, 5/5 at 0/0 (`pixel-r2-vim-*.json`). htop across the same sizes, inspected at full
+resolution (`h2/tui/htop-*.png`): no artifacts. The TUIs used private config copies, and the
+real htoprc is unchanged. Daemons in `/tmp/qh2` and `/tmp/qp1` report not running, and no
+processes leaked.
+
+Findings for re-audit #2: no P0/P1. The P2 alt-screen height-shrink finding from re-audit #1
+stands unchanged: it was already there before this branch, and is out of this delta.
+
+## Re-audit #1: 7cff347..7ae17af
+
+commit audited: 7ae17af1cf0d5a3a4231d436a97da0a862c5fb3e
 binaries: new = 7ae17af release build, old = 7cff347 (previous gate), base = f1478e4 (vt-neutrality cache)
 
 ## Previous finding
