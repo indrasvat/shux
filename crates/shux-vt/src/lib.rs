@@ -26,7 +26,8 @@ pub use capture::{
 };
 pub use cast::{CastWriter, cast_complete_prefix};
 pub use cell::{
-    Cell, CellFlags, CellStyle, Color, ExtendedAttrs, Rgb, TerminalDefaultColors, UnderlineStyle,
+    Cell, CellFlags, CellMeta, CellStyle, Color, ExtendedAttrs, Rgb, TerminalDefaultColors,
+    UnderlineStyle,
 };
 pub use charset::{CharsetSlot, TerminalCharset, TerminalCharsets};
 pub use commands::{
@@ -40,6 +41,7 @@ pub use diff::{
 };
 pub use graphics::image::StoredImage;
 pub use graphics::kitty::Format as ImageFormat;
+use grid::ResizePoint;
 pub use grid::{
     CellRect, ComposedPlacement, DirtyRegion, Grid, GridConfig, ImageGeometry, PixelRect, Row,
 };
@@ -1376,8 +1378,12 @@ impl VirtualTerminal {
         if dims_changed {
             self.alt_spare = None;
         }
+        let auto_wrap = self.modes.auto_wrap;
         if self.modes.alternate_screen {
             self.grid.resize_canvas(rows, cols);
+            let carried = self.cursor.saved.take();
+            self.cursor.clamp(rows, cols);
+            self.cursor.saved = carried;
             // The stashed primary grid is resized whether or not a saved
             // cursor came with it. DECSET 1047 enters the alternate screen
             // WITHOUT saving a cursor, so gating the whole branch on
@@ -1387,31 +1393,18 @@ impl VirtualTerminal {
             // longer there (issue #107 adversarial review). 1049 was never
             // affected, which is why this survived.
             if let Some(primary) = &mut self.alt_grid {
-                match &mut self.alt_cursor {
-                    Some(primary_cursor) => {
-                        if let Some((row, col)) = primary.resize_with_cursor(
-                            rows,
-                            cols,
-                            Some((primary_cursor.row, primary_cursor.col)),
-                        ) {
-                            primary_cursor.row = row;
-                            primary_cursor.col = col;
-                        }
-                        primary_cursor.clamp(rows, cols);
-                    }
-                    None => {
-                        primary.resize_with_cursor(rows, cols, None);
-                    }
-                }
+                resize_primary(
+                    primary,
+                    rows,
+                    cols,
+                    auto_wrap,
+                    self.alt_cursor.as_mut(),
+                    self.cursor.saved.as_mut(),
+                );
             }
         } else {
-            if let Some((row, col)) =
-                self.grid
-                    .resize_with_cursor(rows, cols, Some((self.cursor.row, self.cursor.col)))
-            {
-                self.cursor.row = row;
-                self.cursor.col = col;
-            }
+            let cursor = Some(&mut self.cursor);
+            resize_primary(&mut self.grid, rows, cols, auto_wrap, cursor, None);
             if let Some(ref mut alt) = self.alt_grid {
                 alt.resize_canvas(rows, cols);
             }
@@ -1428,10 +1421,6 @@ impl VirtualTerminal {
             top: 0,
             bottom: rows.saturating_sub(1),
         };
-        self.cursor.clamp(rows, cols);
-        if let Some(ref mut saved_cursor) = self.alt_cursor {
-            saved_cursor.clamp(rows, cols);
-        }
         if let Some(ref mut frozen_cursor) = self.frozen_cursor {
             frozen_cursor.clamp(rows, cols);
         }
@@ -1532,6 +1521,80 @@ impl VirtualTerminal {
     }
 }
 
+/// Resize the primary `grid`, carrying through it `cursor` (the primary
+/// cursor, live or parked) and every DECSC slot saved on the primary screen;
+/// `carried` is a slot the alternate screen's cursor holds. A deferred wrap
+/// survives only under DECAWM. Only the cursor holds its row on screen;
+/// slots saved on the alternate screen are clamped.
+fn resize_primary(
+    grid: &mut Grid,
+    rows: usize,
+    cols: usize,
+    auto_wrap: bool,
+    cursor: Option<&mut Cursor>,
+    carried: Option<&mut SavedCursor>,
+) {
+    let point = |row, col, pending: bool, holds_row, after_print: bool| ResizePoint {
+        row,
+        col,
+        past_glyph: pending && auto_wrap,
+        holds_row,
+        after_print: pending || after_print,
+    };
+    let slot_point =
+        |s: &SavedCursor| point(s.row, s.col, s.auto_wrap_pending, false, s.after_print);
+    let primary_slot = |slot: &&SavedCursor| !slot.on_alternate;
+    let mut points = Vec::with_capacity(3);
+    if let Some(cursor) = &cursor {
+        points.push(point(
+            cursor.row,
+            cursor.col,
+            cursor.auto_wrap_pending,
+            true,
+            cursor.after_print,
+        ));
+        points.extend(cursor.saved.as_ref().filter(primary_slot).map(slot_point));
+    }
+    points.extend(carried.as_deref().filter(primary_slot).map(slot_point));
+    grid.resize_with_points(rows, cols, &mut points);
+
+    let mut points = points.into_iter().map(|mut p| {
+        p.past_glyph &= auto_wrap;
+        p
+    });
+    if let Some(cursor) = cursor
+        && let Some(p) = points.next()
+    {
+        cursor.row = p.row.min(rows.saturating_sub(1));
+        cursor.col = p.col.min(cols.saturating_sub(1));
+        cursor.auto_wrap_pending = p.past_glyph;
+        if let Some(slot) = &mut cursor.saved {
+            place_slot(slot, &mut points, rows, cols);
+        }
+    }
+    if let Some(slot) = carried {
+        place_slot(slot, &mut points, rows, cols);
+    }
+}
+
+fn place_slot(
+    slot: &mut SavedCursor,
+    points: &mut impl Iterator<Item = ResizePoint>,
+    rows: usize,
+    cols: usize,
+) {
+    if !slot.on_alternate
+        && let Some(p) = points.next()
+    {
+        (slot.row, slot.col, slot.auto_wrap_pending) = (p.row, p.col, p.past_glyph);
+    } else {
+        slot.after_print = false;
+        slot.row = slot.row.min(rows.saturating_sub(1));
+        slot.col = slot.col.min(cols.saturating_sub(1));
+        slot.auto_wrap_pending = false;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1539,6 +1602,569 @@ mod tests {
 
     fn compact_capture(vt: &VirtualTerminal) -> String {
         vt.capture_text(None).replace('\n', "")
+    }
+
+    const BLANK_BG_LINES: &[u8] =
+        b"\x1b[44m          \x1b[0m\r\nX\x1b[48;2;10;20;30m      \x1b[0m\r\n\x1b[101m   \x1b[0m";
+
+    fn blank_bg_counts(vt: &VirtualTerminal) -> [usize; 3] {
+        let grid = vt.grid();
+        let mut counts = [0; 3];
+        for r in 0..grid.total_lines() {
+            let row = grid.row(r).expect("row exists");
+            for c in 0..row.len() {
+                let cell = &row[c];
+                if cell.ch != ' ' {
+                    continue;
+                }
+                match cell.style.bg {
+                    Color::Indexed(4) => counts[0] += 1,
+                    Color::Rgb(10, 20, 30) => counts[1] += 1,
+                    Color::Indexed(9) => counts[2] += 1,
+                    _ => {}
+                }
+            }
+        }
+        counts
+    }
+
+    #[test]
+    fn resize_keeps_background_of_blank_cells() {
+        for (rows, cols) in [(33, 54), (30, 100), (10, 40), (12, 80), (24, 20)] {
+            let mut vt = VirtualTerminal::new(24, 80);
+            vt.process(BLANK_BG_LINES);
+            vt.resize(rows, cols);
+            assert_eq!(blank_bg_counts(&vt), [10, 6, 3], "80x24 -> {cols}x{rows}");
+        }
+    }
+
+    #[test]
+    fn resize_keeps_blank_bg_after_wide_combining_and_linked_text() {
+        let mut vt = VirtualTerminal::new(24, 80);
+        vt.process(
+            "界e\u{301}\x1b]8;;https://x.test\x1b\\\x1b[44m   \x1b]8;;\x1b\\\x1b[0m".as_bytes(),
+        );
+        for (rows, cols) in [(24, 7), (24, 120), (10, 40)] {
+            vt.resize(rows, cols);
+            assert_grid_wide_invariants(vt.grid());
+            let row = vt.grid().visible_row(0);
+            assert!(row[0].is_wide() && row[1].is_wide_continuation(), "{cols}");
+            assert_eq!(row[2].grapheme(), Some("e\u{301}"), "{cols}");
+            for col in 3..6 {
+                assert_eq!(row[col].style.bg, Color::Indexed(4), "{cols} col {col}");
+                let link = row[col]
+                    .extended
+                    .as_ref()
+                    .and_then(|e| e.hyperlink.as_deref());
+                assert_eq!(link, Some("https://x.test"), "{cols} col {col}");
+            }
+        }
+    }
+
+    #[test]
+    fn resize_keeps_cursor_column_after_trailing_blanks() {
+        let mut vt = VirtualTerminal::new(24, 80);
+        vt.process(b"$ ");
+        vt.resize(24, 40);
+        assert_eq!((vt.cursor().row, vt.cursor().col), (0, 2), "default blank");
+        vt.process(b"\r\n\x1b[44m    ");
+        vt.resize(24, 30);
+        assert_eq!(
+            (vt.cursor().row, vt.cursor().col),
+            (1, 4),
+            "coloured blanks"
+        );
+    }
+
+    #[test]
+    fn resize_keeps_background_of_blank_cells_in_scrollback() {
+        let mut vt = VirtualTerminal::new(24, 80);
+        vt.process(BLANK_BG_LINES);
+        vt.process(&b"\r\n".repeat(40));
+        assert!(vt.scrollback_len() >= 3);
+        vt.resize(33, 54);
+        assert_eq!(blank_bg_counts(&vt), [10, 6, 3]);
+        let blue = vt.grid().scrollback_row(0).expect("scrollback row");
+        assert_eq!(blue[9].style.bg, Color::Indexed(4));
+    }
+
+    #[test]
+    fn resize_keeps_background_of_blank_cells_across_alt_screen() {
+        let mut vt = VirtualTerminal::new(24, 80);
+        vt.process(BLANK_BG_LINES);
+        vt.process(b"\x1b[?1049h\x1b[H\x1b[44m    \x1b[0m");
+        vt.resize(33, 54);
+        assert_eq!(blank_bg_counts(&vt), [4, 0, 0], "alternate screen");
+        vt.process(b"\x1b[?1049l");
+        assert_eq!(blank_bg_counts(&vt), [10, 6, 3], "primary behind alt");
+    }
+
+    fn visible_text(vt: &VirtualTerminal, row: usize) -> String {
+        row_text(vt, vt.scrollback_len() + row)
+    }
+
+    #[test]
+    fn column_shrink_lets_erase_fill_below_the_cursor_yield() {
+        let ed: &[u8] = b"\x1b[44m\x1b[2J\x1b[H\x1b[0mABCDEFGH";
+        let el: &[u8] =
+            b"\x1b[H\x1b[44m\x1b[K\n\x1b[K\n\x1b[K\n\x1b[K\n\x1b[K\n\x1b[K\x1b[H\x1b[0mABCDEFGH";
+        for max_scrollback in [0, 100] {
+            for (name, erase) in [("ED", ed), ("EL", el)] {
+                let config = GridConfig {
+                    max_scrollback,
+                    ..GridConfig::default()
+                };
+                let mut vt = VirtualTerminal::with_config(6, 10, config);
+                if max_scrollback > 0 {
+                    vt.process(b"old1\r\nold2\r\nold3\r\nold4\r\nold5\r\nold6\r\nold7\r\n");
+                }
+                vt.process(erase);
+                let sb = vt.scrollback_len();
+                vt.resize(6, 4);
+                let ctx = format!("{name} max_scrollback={max_scrollback}");
+                assert_eq!(visible_text(&vt, 0), "ABCD", "{ctx}");
+                assert_eq!(visible_text(&vt, 1), "EFGH", "{ctx}");
+                assert_eq!(vt.scrollback_len(), sb, "{ctx}");
+                assert_eq!(vt.cursor().row, 1, "{ctx}");
+                for row in 2..6 {
+                    let cell = &vt.grid().visible_row(row)[0];
+                    assert_eq!(cell.style.bg, Color::Indexed(4), "{ctx} row {row}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hard_line_padding_keeps_what_fits_and_never_regains() {
+        let mut vt = VirtualTerminal::new(4, 10);
+        vt.process(b"ABCDEFG\x1b[44m   \x1b[0m");
+        for (cols, blue) in [(12, 3), (8, 1), (12, 1), (10, 1)] {
+            vt.resize(4, cols);
+            assert_eq!(blank_bg_counts(&vt)[0], blue, "{cols} cols");
+            assert_eq!(visible_text(&vt, 0), "ABCDEFG", "{cols} cols");
+            assert_eq!(visible_text(&vt, 1), "", "{cols} cols");
+        }
+    }
+
+    #[test]
+    fn padding_is_counted_across_soft_wraps() {
+        // ABC + 12 blue blanks: the blanks soft-wrap onto a second row.
+        let mut vt = VirtualTerminal::new(4, 10);
+        vt.process(b"ABC\x1b[44m            \x1b[0m");
+        assert!(vt.grid().visible_row(0).wrapped);
+        for (cols, blue) in [(9, 6), (10, 6), (11, 6), (20, 6)] {
+            vt.resize(4, cols);
+            assert_eq!(blank_bg_counts(&vt)[0], blue, "{cols} cols");
+            assert!(!vt.grid().visible_row(0).wrapped, "{cols} cols");
+        }
+        let mut wide = VirtualTerminal::new(4, 10);
+        wide.process(b"ABC\x1b[44m            \x1b[0m");
+        wide.resize(4, 11);
+        assert_eq!(blank_bg_counts(&wide)[0], 8);
+    }
+
+    #[test]
+    fn linked_and_attributed_blanks_are_content() {
+        let mut vt = VirtualTerminal::new(4, 10);
+        vt.process(b"X\x1b]8;;https://x.test\x1b\\     \x1b]8;;\x1b\\\x1b[7m  \x1b[0m");
+        vt.resize(4, 3);
+        let grid = vt.grid();
+        let mut linked = 0;
+        let mut inverse = 0;
+        for r in 0..grid.rows() {
+            let row = grid.visible_row(r);
+            for c in 0..row.len() {
+                if row[c]
+                    .extended
+                    .as_ref()
+                    .and_then(|e| e.hyperlink.as_deref())
+                    .is_some()
+                {
+                    linked += 1;
+                }
+                if row[c].style.flags.contains(CellFlags::INVERSE) {
+                    inverse += 1;
+                }
+            }
+        }
+        assert_eq!((linked, inverse), (5, 2));
+        assert!(vt.grid().visible_row(1).wrapped);
+    }
+
+    #[test]
+    fn resize_keeps_cursor_column_inside_untouched_padding() {
+        let mut vt = VirtualTerminal::new(4, 80);
+        vt.process(b"abc\x1b[1;21H");
+        vt.resize(4, 40);
+        assert_eq!((vt.cursor().row, vt.cursor().col), (0, 20));
+        vt.resize(4, 10);
+        assert_eq!((vt.cursor().row, vt.cursor().col), (0, 9));
+    }
+
+    #[test]
+    fn exact_width_shrink_then_typing_wraps() {
+        let mut vt = VirtualTerminal::new(4, 10);
+        vt.process(b"ABCDE");
+        vt.resize(4, 5);
+        vt.process(b"F");
+        assert_eq!(
+            (visible_text(&vt, 0), visible_text(&vt, 1)),
+            ("ABCDE".into(), "F".into())
+        );
+    }
+
+    #[test]
+    fn pending_wrap_survives_a_widen() {
+        let mut vt = VirtualTerminal::new(4, 5);
+        vt.process(b"ABCDE");
+        assert!(vt.cursor().auto_wrap_pending);
+        vt.resize(4, 10);
+        vt.process(b"F");
+        assert_eq!(visible_text(&vt, 0), "ABCDEF");
+    }
+
+    #[test]
+    fn pending_wrap_without_decawm_is_not_an_offset() {
+        let mut vt = VirtualTerminal::new(4, 5);
+        vt.process(b"\x1b[?7lABCDEFG");
+        vt.resize(4, 10);
+        vt.process(b"Z");
+        assert_eq!(visible_text(&vt, 0), "ABCDZ");
+    }
+
+    #[test]
+    fn saved_cursor_is_remapped_by_reflow() {
+        let mut vt = VirtualTerminal::new(4, 10);
+        vt.process(b"ABCDEFGHIJKL\x1b7\x1b[4;1H");
+        vt.resize(4, 20);
+        vt.process(b"\x1b8");
+        assert_eq!((vt.cursor().row, vt.cursor().col), (0, 12), "ESC 8");
+
+        let mut alt = VirtualTerminal::new(4, 10);
+        alt.process(b"ABCDEFGHIJKL\x1b[?1049h\x1b[3;3H");
+        alt.resize(4, 20);
+        alt.process(b"\x1b[?1049l");
+        assert_eq!((alt.cursor().row, alt.cursor().col), (0, 12), "?1049l");
+    }
+
+    #[test]
+    fn saved_cursor_is_remapped_on_the_screen_it_was_saved_on() {
+        // Saved on the primary, carried into ?1047, restored after leaving.
+        let mut vt = VirtualTerminal::new(4, 10);
+        vt.process(b"ABCDEFGHIJKL\x1b7\x1b[?1047h\x1b[H");
+        vt.resize(4, 20);
+        vt.process(b"\x1b[?1047l\x1b8");
+        assert_eq!((vt.cursor().row, vt.cursor().col), (0, 12), "primary slot");
+        // Saved on the alternate screen: no primary reflow moves it.
+        let mut alt = VirtualTerminal::new(4, 10);
+        alt.process(b"ABCDEFGHIJKL\x1b[?1047h\x1b[2;3H\x1b7\x1b[H");
+        alt.resize(4, 20);
+        alt.process(b"\x1b8");
+        assert_eq!(
+            (alt.cursor().row, alt.cursor().col),
+            (1, 2),
+            "alternate slot"
+        );
+    }
+
+    #[test]
+    fn wide_glyph_wrap_gap_is_not_a_printed_space() {
+        let mut reflowed = VirtualTerminal::new(4, 8);
+        reflowed.process("ab界".as_bytes());
+        reflowed.resize(4, 3);
+        reflowed.resize(4, 8);
+        assert_eq!(visible_text(&reflowed, 0), "ab界", "reflow gap");
+
+        let mut printed = VirtualTerminal::new(4, 3);
+        printed.process("ab界".as_bytes());
+        printed.resize(4, 8);
+        assert_eq!(visible_text(&printed, 0), "ab界", "print gap");
+
+        // A printed space in the last cell of a wrapped row, with no gap.
+        let mut space = VirtualTerminal::new(4, 3);
+        space.process("ab 界".as_bytes());
+        space.resize(4, 8);
+        assert_eq!(visible_text(&space, 0), "ab 界", "printed space");
+    }
+
+    #[test]
+    fn a_space_moved_into_a_wide_gap_is_kept() {
+        // Printed into the gap.
+        let mut printed = VirtualTerminal::new(4, 3);
+        printed.process("ab界\x1b[1;3H ".as_bytes());
+        printed.resize(4, 8);
+        assert_eq!(visible_text(&printed, 0), "ab 界", "print");
+        // Shifted into the gap by ICH.
+        let mut inserted = VirtualTerminal::new(4, 3);
+        inserted.process("a 界\x1b[1;1H\x1b[@".as_bytes());
+        inserted.resize(4, 8);
+        assert_eq!(visible_text(&inserted, 0), " a 界", "ICH");
+    }
+
+    #[test]
+    fn row_shrink_keeps_the_cursor_on_its_row() {
+        let mut vt = VirtualTerminal::new(6, 10);
+        vt.process(b"a\r\nb\r\nc\r\nd\r\ne\r\n");
+        vt.resize(3, 10);
+        assert_eq!(vt.cursor().row, 2);
+        assert_eq!(visible_text(&vt, 1), "e");
+        assert_eq!(visible_text(&vt, 2), "");
+    }
+
+    fn no_scrollback(rows: usize, cols: usize) -> VirtualTerminal {
+        let config = GridConfig {
+            max_scrollback: 0,
+            ..GridConfig::default()
+        };
+        VirtualTerminal::with_config(rows, cols, config)
+    }
+
+    #[test]
+    fn a_saved_cursor_does_not_pin_blank_rows() {
+        for fill in [&b""[..], b"\x1b[44m\x1b[2J\x1b[0m"] {
+            let mut vt = no_scrollback(6, 10);
+            vt.process(fill);
+            vt.process(b"\x1b[6;1H\x1b7\x1b[HABCDEFGH");
+            vt.resize(6, 4);
+            assert_eq!(visible_text(&vt, 0), "ABCD", "fill {fill:?}");
+            assert_eq!(visible_text(&vt, 1), "EFGH", "fill {fill:?}");
+        }
+    }
+
+    #[test]
+    fn reflow_creates_no_pending_wrap_without_decawm() {
+        let mut vt = VirtualTerminal::new(4, 10);
+        vt.process(b"\x1b[?7lABCDE");
+        vt.resize(4, 5);
+        vt.process(b"\x1b[?7hF");
+        assert_eq!(visible_text(&vt, 0), "ABCDF");
+        assert_eq!(visible_text(&vt, 1), "");
+    }
+
+    #[test]
+    fn an_evicted_saved_cursor_keeps_no_pending_wrap() {
+        let mut vt = no_scrollback(2, 10);
+        vt.process(b"ABCDE\x1b7\r\nFGHIJKLM");
+        vt.resize(2, 5);
+        vt.process(b"\x1b8Z");
+        assert_eq!(visible_text(&vt, 0), "FGHIZ");
+        assert_eq!(visible_text(&vt, 1), "KLM");
+    }
+
+    #[test]
+    fn a_styled_space_printed_into_a_wide_gap_is_kept() {
+        let mut vt = VirtualTerminal::new(4, 3);
+        vt.process("ab界\x1b[1;3H\x1b[7m \x1b[m".as_bytes());
+        vt.resize(4, 8);
+        assert_eq!(visible_text(&vt, 0), "ab 界");
+        let row = vt.grid().visible_row(0);
+        assert!(row[2].style.flags.contains(CellFlags::INVERSE));
+    }
+
+    #[test]
+    fn a_blank_written_for_an_unwrapped_wide_glyph_is_not_a_gap() {
+        let mut vt = VirtualTerminal::new(4, 3);
+        vt.process("ab界\x1b[1;3H\x1b[?7l\x1b[7m界\x1b[m".as_bytes());
+        vt.resize(4, 8);
+        assert_eq!(visible_text(&vt, 0), "ab 界");
+        let row = vt.grid().visible_row(0);
+        assert!(row[2].style.flags.contains(CellFlags::INVERSE));
+    }
+
+    #[test]
+    fn deleting_the_wide_gap_leaves_a_gap() {
+        let mut vt = no_scrollback(2, 3);
+        vt.process("ab界c\x1b[1;3H\x1b[1P".as_bytes());
+        vt.resize(1, 5);
+        assert_eq!(visible_text(&vt, 0), "ab界c");
+    }
+
+    #[test]
+    fn a_blank_shifted_into_the_last_column_is_not_a_gap() {
+        let mut vt = VirtualTerminal::new(2, 3);
+        vt.process("ab界c\x1b[1;2H🇺🇸\x1b[1;1H\x1b[1P\x1b[1;3H".as_bytes());
+        vt.resize(2, 8);
+        vt.process(b"Z");
+        let row = vt.grid().visible_row(0);
+        let text: String = (2..row.len()).map(|c| row[c].ch).collect();
+        assert_eq!(text.trim_end(), "Z界 c");
+    }
+
+    #[test]
+    fn the_wide_gap_mark_is_invisible_to_equality_and_capture() {
+        let mut gap = VirtualTerminal::new(2, 3);
+        gap.process("ab界".as_bytes());
+        let mut plain = VirtualTerminal::new(2, 3);
+        plain.process("ab \r\n界".as_bytes());
+        let (g, p) = (
+            &gap.grid().visible_row(0)[2],
+            &plain.grid().visible_row(0)[2],
+        );
+        assert_eq!(g, p);
+        assert_eq!(gap.capture_text(None), plain.capture_text(None));
+    }
+
+    #[test]
+    fn the_wide_gap_mark_is_not_an_extended_attribute() {
+        let mut vt = VirtualTerminal::new(4, 3);
+        vt.process("ab界".as_bytes());
+        assert!(vt.grid().visible_row(0)[2].extended.is_none());
+        vt.grid.visible_row_mut(0)[2].prune_default_extended();
+        vt.resize(4, 8);
+        assert_eq!(visible_text(&vt, 0), "ab界");
+    }
+
+    #[test]
+    fn the_wide_gap_mark_costs_no_cell_space() {
+        assert_eq!(std::mem::size_of::<Cell>(), 24);
+    }
+
+    #[test]
+    fn deleting_before_a_wide_gap_adds_no_space() {
+        let mut vt = VirtualTerminal::new(4, 3);
+        vt.process("ab界\x1b[1;1H\x1b[1P".as_bytes());
+        vt.resize(4, 8);
+        assert_eq!(visible_text(&vt, 0), "b界");
+    }
+
+    #[test]
+    fn a_cursor_after_a_printed_separator_keeps_its_insertion_point() {
+        for text in ["ABCDE ", "ABCD ", "AB   "] {
+            let mut vt = VirtualTerminal::new(4, 10);
+            vt.process(text.as_bytes());
+            vt.resize(4, 5);
+            vt.process(b"X");
+            assert_eq!(visible_text(&vt, 0), text.trim_end(), "{text:?}");
+            assert_eq!(visible_text(&vt, 1), "X", "{text:?}");
+        }
+        let mut vt = VirtualTerminal::new(4, 10);
+        vt.process(b"ABCDE ");
+        vt.resize(4, 5);
+        vt.resize(4, 10);
+        vt.process(b"X");
+        assert_eq!(visible_text(&vt, 0), "ABCDEX", "widened again");
+    }
+
+    #[test]
+    fn a_cup_into_trailing_padding_stays_on_coordinates() {
+        let mut vt = VirtualTerminal::new(4, 80);
+        vt.process(b"abc\x1b[1;21H");
+        vt.resize(4, 10);
+        vt.process(b"X");
+        assert_eq!(visible_text(&vt, 0), "abc      X");
+        assert_eq!(visible_text(&vt, 1), "");
+    }
+
+    #[test]
+    fn the_trim_floor_is_the_reflowed_history_boundary() {
+        // Widen while shrinking: the history line unwraps to one row.
+        let mut vt = VirtualTerminal::new(3, 5);
+        vt.process(b"HHHHHHHHHH\r\nTOP\r\nmid\r\n\x1b[2;4H");
+        assert_eq!(vt.scrollback_len(), 2);
+        vt.resize(2, 10);
+        assert_eq!(visible_text(&vt, 0), "TOP", "widen");
+        assert_eq!(visible_text(&vt, 1), "mid", "widen");
+    }
+
+    #[test]
+    fn the_trim_floor_follows_history_that_grows_on_a_narrow() {
+        let mut vt = VirtualTerminal::new(3, 10);
+        vt.process(b"HHHHHHHHHH\r\nTOP\r\nmid\r\n\x1b[2;4H");
+        assert_eq!(vt.scrollback_len(), 1);
+        vt.resize(3, 5);
+        assert_eq!(visible_text(&vt, 0), "TOP", "narrow");
+        assert_eq!(visible_text(&vt, 1), "mid", "narrow");
+    }
+
+    #[test]
+    fn capped_history_is_evicted_not_pulled_into_view() {
+        let config = GridConfig {
+            max_scrollback: 1,
+            ..GridConfig::default()
+        };
+        let mut vt = VirtualTerminal::with_config(3, 10, config);
+        vt.process(b"HHHHHHHHHH\r\nTOP\r\nmid\r\n\x1b[2;4H");
+        vt.resize(3, 5);
+        assert_eq!(visible_text(&vt, 0), "TOP");
+        assert_eq!(visible_text(&vt, 1), "mid");
+    }
+
+    #[test]
+    fn a_line_left_with_only_gap_cells_survives_a_resize() {
+        let mut vt = VirtualTerminal::new(2, 3);
+        vt.process("ab界\x1b[T\x1b[2;1H\x1b[3P".as_bytes());
+        vt.resize(2, 8);
+        assert_eq!((vt.cursor().row, vt.cursor().col), (1, 0));
+    }
+
+    #[test]
+    fn a_cup_one_past_the_new_edge_sets_no_deferred_wrap() {
+        let mut vt = VirtualTerminal::new(4, 10);
+        vt.process(b"abc\x1b[1;6H");
+        vt.resize(4, 5);
+        vt.process(b"F");
+        assert_eq!(visible_text(&vt, 0), "abc F");
+        assert_eq!(visible_text(&vt, 1), "");
+    }
+
+    #[test]
+    fn ich_does_not_carry_stale_gap_marks_into_the_trailing_run() {
+        let mut vt = VirtualTerminal::new(4, 4);
+        vt.process("abc界\x1b[1;1H\x1b[2P\x1b[1;4HZ\x1b[1;2H\x1b[@".as_bytes());
+        vt.resize(4, 8);
+        assert_eq!(visible_text(&vt, 0), "c   界");
+    }
+
+    #[test]
+    fn a_cursor_command_ends_print_intent_even_in_place() {
+        for moves in [
+            "\x1b[1;6H",
+            "\x1b[C\x1b[D",
+            "\x1b[6G",
+            "\r\x1b[5C",
+            "\x1b[1;6f",
+        ] {
+            let mut vt = VirtualTerminal::new(4, 10);
+            vt.process(format!("ABCDE{moves}").as_bytes());
+            assert_eq!(vt.cursor().col, 5, "{moves:?}");
+            vt.resize(4, 5);
+            vt.process(b"X");
+            assert_eq!(visible_text(&vt, 0), "ABCDX", "{moves:?}");
+            assert_eq!(visible_text(&vt, 1), "", "{moves:?}");
+        }
+    }
+
+    #[test]
+    fn a_saved_cursor_keeps_print_intent_across_reflow() {
+        let mut vt = VirtualTerminal::new(4, 10);
+        vt.process(b"ABCDE\x1b[?1049h");
+        vt.resize(4, 5);
+        vt.process(b"\x1b[?1049lF");
+        assert_eq!(visible_text(&vt, 0), "ABCDE");
+        assert_eq!(visible_text(&vt, 1), "F");
+    }
+
+    #[test]
+    fn row_shrink_without_a_parked_cursor_lets_erase_fill_yield() {
+        let mut vt = VirtualTerminal::new(6, 10);
+        vt.process(b"\x1b[44m\x1b[2J\x1b[0mAB\x1b7\x1b[?1047h");
+        vt.resize(3, 10);
+        vt.process(b"\x1b[?1047l");
+        assert_eq!(visible_text(&vt, 0), "AB");
+        assert_eq!(vt.scrollback_len(), 0);
+    }
+
+    #[test]
+    fn row_shrink_without_a_parked_cursor_keeps_linked_blanks() {
+        let mut vt = VirtualTerminal::new(2, 10);
+        vt.process(b"A\x1b7\r\n\x1b]8;;https://x.test\x1b\\ \x1b]8;;\x1b\\\x1b[?1047h");
+        vt.resize(1, 10);
+        vt.process(b"\x1b[?1047l");
+        let grid = vt.grid();
+        let linked = (0..grid.total_lines())
+            .filter_map(|r| grid.row(r))
+            .any(|row| (0..row.len()).any(|c| row[c].extended.is_some()));
+        assert!(linked, "the linked blank was dropped");
     }
 
     fn assert_grid_wide_invariants(grid: &Grid) {
@@ -2503,6 +3129,7 @@ mod tests {
         vt.presented_row(abs)
             .map(|row| {
                 (0..row.len())
+                    .filter(|&c| !row[c].is_wide_continuation())
                     .map(|c| row[c].ch)
                     .collect::<String>()
                     .trim_end()

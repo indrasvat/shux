@@ -378,6 +378,7 @@ impl<'a> VtHandler<'a> {
             width: 1,
             style: self.cursor.style,
             extended: None,
+            meta: Default::default(),
         }
     }
 
@@ -387,6 +388,9 @@ impl<'a> VtHandler<'a> {
 
     fn save_cursor_state(&mut self) {
         self.cursor.save(self.modes.origin_mode, *self.charsets);
+        if let Some(saved) = &mut self.cursor.saved {
+            saved.on_alternate = self.modes.alternate_screen;
+        }
     }
 
     fn restore_cursor_state(&mut self) {
@@ -652,7 +656,12 @@ impl<'a> VtHandler<'a> {
             {
                 let row = self.grid.visible_row_mut_marked(self.cursor.row);
                 row.clear_wide_pair_around(col, self.cursor.style.bg);
-                row[col] = blank;
+                // A gap only when the wrap below happens.
+                row[col] = if self.modes.auto_wrap {
+                    Cell::wide_gap(blank)
+                } else {
+                    blank
+                };
             }
             if self.modes.auto_wrap {
                 self.wrap_to_next_line();
@@ -685,6 +694,7 @@ impl<'a> VtHandler<'a> {
                 width: width as u8,
                 style: self.cursor.style,
                 extended,
+                meta: Default::default(),
             };
 
             // For wide characters, write a continuation cell.
@@ -700,6 +710,7 @@ impl<'a> VtHandler<'a> {
             self.cursor.col = cols.saturating_sub(1);
             self.cursor.auto_wrap_pending = true;
         }
+        self.cursor.after_print = true;
     }
 
     fn append_zero_width_scalar(&mut self, ch: char) {
@@ -1060,6 +1071,7 @@ impl<'a> VtHandler<'a> {
             6 => {
                 self.modes.origin_mode = enable;
                 self.home_cursor_to_origin();
+                self.cursor.after_print = false;
             }
             // DECAWM -- Auto-wrap mode.
             7 => self.modes.auto_wrap = enable,
@@ -1276,6 +1288,9 @@ impl<'a> vte::Perform for VtHandler<'a> {
 
     fn execute(&mut self, byte: u8) {
         self.clear_active_grapheme_cell();
+        if matches!(byte, 0x08..=0x0D) {
+            self.cursor.after_print = false;
+        }
         match byte {
             // BEL -- bell.
             0x07 => { /* emit bell event in the future */ }
@@ -1331,6 +1346,11 @@ impl<'a> vte::Perform for VtHandler<'a> {
         if ignore {
             trace!(action = %action, "overflowed CSI sequence discarded");
             return;
+        }
+        // A cursor command, even one that lands where the cursor already is,
+        // makes the position an addressed one. SCOSC/SCORC carry the intent.
+        if intermediates.is_empty() && "ABCDEFGHIZ`adefrLMST".contains(action) {
+            self.cursor.after_print = false;
         }
         let params_groups: Vec<Vec<u16>> =
             params.iter().map(|subparam| subparam.to_vec()).collect();
@@ -1768,6 +1788,13 @@ impl<'a> vte::Perform for VtHandler<'a> {
         if ignore {
             trace!(byte, "overflowed ESC sequence discarded");
             return;
+        }
+        // IND, NEL, RI and DECALN move the cursor; DECRC restores the intent.
+        if matches!(
+            (byte, intermediates),
+            (b'D' | b'E' | b'M', []) | (b'8', [b'#'])
+        ) {
+            self.cursor.after_print = false;
         }
         match (byte, intermediates) {
             // DECSC -- Save Cursor (ESC 7).

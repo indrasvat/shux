@@ -310,6 +310,7 @@ fn put_cell(grid: &mut Grid, x: u16, y: u16, ch: char, fg: Color, bg: Color, fla
         width: 1,
         style: CellStyle { fg, bg, flags },
         extended: None,
+        meta: Default::default(),
     };
 }
 
