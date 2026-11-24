@@ -333,8 +333,13 @@ impl AttachedClient {
 impl Drop for AttachedClient {
     fn drop(&mut self) {
         let _ = self.child.kill();
-        let _ = self.child.wait();
         self.stop_reading();
+        // A client exiting with output its terminal never read waits in the
+        // kernel for that output to drain: closing the master discards it.
+        if let Ok(null) = File::open("/dev/null") {
+            self.master = null;
+        }
+        let _ = self.child.wait();
     }
 }
 
@@ -591,11 +596,19 @@ async fn a_client_whose_session_ends_is_hung_up_on() {
     .await;
 }
 
+/// Whether output the terminal has not read is queued behind the PTY.
+#[cfg(not(target_os = "linux"))]
+fn blocked_writing_to_terminal(slave: &OwnedFd) -> bool {
+    let mut queued: nix::libc::c_int = 0;
+    // SAFETY: TIOCOUTQ writes one int through a pointer to a live local.
+    let ok = unsafe { nix::libc::ioctl(slave.as_raw_fd(), nix::libc::TIOCOUTQ, &mut queued) };
+    ok == 0 && queued > 0
+}
+
 /// A terminal that stops reading (a stalled ssh, a hung emulator) leaves the
 /// client blocked mid-write. A signal must still end it and restore the modes:
-/// that is exactly when someone reaches for `kill`. Linux only: proving the
-/// client really is blocked reads `/proc`.
-#[cfg(target_os = "linux")]
+/// that is exactly when someone reaches for `kill`. On macOS the exit itself
+/// then waits for the unread output to drain, which never comes.
 #[test]
 fn a_signal_ends_a_client_whose_terminal_stopped_reading() {
     let h = Harness::new();
@@ -606,8 +619,12 @@ fn a_signal_ends_a_client_whose_terminal_stopped_reading() {
 
     // Stop reading and let the client's output back up behind the PTY.
     client.stop_reading();
+    #[cfg(target_os = "linux")]
+    let backed_up = || blocked_writing_to_terminal(client.child.id());
+    #[cfg(not(target_os = "linux"))]
+    let backed_up = || blocked_writing_to_terminal(&client._slave);
     assert!(
-        poll_until(BUDGET, || blocked_writing_to_terminal(client.child.id())),
+        poll_until(BUDGET, backed_up),
         "the client never blocked on its terminal; this test proves nothing"
     );
     kill(Pid::from_raw(client.child.id() as i32), Signal::SIGTERM).expect("signal attach");
