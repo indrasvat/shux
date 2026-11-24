@@ -169,12 +169,16 @@ impl TerminalGuard {
 /// Point stdout and stderr at `/dev/null`, so nothing more reaches the
 /// terminal, discarding what it holds unread meanwhile, for at most `budget`.
 /// Repointing waits for a write still blocked on the terminal, and that write
-/// moves only as its output is discarded: so the two run side by side.
-fn discard_unread_output(budget: Duration) {
+/// moves only as its output is discarded: so the two run side by side. The
+/// terminal is `/dev/tty`, or stdout itself when there is no controlling one.
+pub(crate) fn discard_unread_output(budget: Duration) {
     use nix::sys::termios::{FlushArg, tcflush};
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+    let tty = std::fs::File::open("/dev/tty")
+        .map(OwnedFd::from)
+        .or_else(|_| io::stdout().as_fd().try_clone_to_owned());
     let (Ok(tty), Ok(null)) = (
-        std::fs::File::open("/dev/tty"),
+        tty,
         std::fs::OpenOptions::new().write(true).open("/dev/null"),
     ) else {
         return;

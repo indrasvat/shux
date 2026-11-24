@@ -178,6 +178,7 @@ pub async fn run_attach(socket_path: &Path, config: ClientConfig) -> Result<Exit
         _ = leaving => result,
         signo = signals.recv() => {
             let _ = crossterm::terminal::disable_raw_mode();
+            terminal::discard_unread_output(SIGNAL_RESTORE_BUDGET);
             Ok(ExitReason::Signal(signo))
         }
     }
