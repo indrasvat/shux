@@ -1,3 +1,10 @@
+## [0.61.2](https://github.com/indrasvat/shux/compare/v0.61.1...v0.61.2) (2026-11-24)
+
+
+### Bug Fixes
+
+* **client:** a connection reset while connecting means nothing is listening ([#312](https://github.com/indrasvat/shux/issues/312)) ([3bdb2f2](https://github.com/indrasvat/shux/commit/3bdb2f2288aff029f597568a43a6a7fa58362d88)), closes [#311](https://github.com/indrasvat/shux/issues/311)
+
 ## [0.61.1](https://github.com/indrasvat/shux/compare/v0.61.0...v0.61.1) (2026-11-24)
 
 
