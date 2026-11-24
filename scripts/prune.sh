@@ -6,13 +6,14 @@
 #   scripts/prune.sh --apply    the same plan; each entry is re-checked, then removed
 #
 # Paths are carried literally: NUL-delimited lists, no word splitting, trailing
-# newlines kept. Anything uncertain (a symlink on the way, git or a pidfile that
-# cannot answer) is kept. It never stops a daemon. Sourcing this file defines
-# the functions without running anything.
+# newlines kept. Anything uncertain (a symlink on the way, git, ps or a pidfile
+# that cannot answer) is kept. It never stops a daemon. Sourcing this file
+# defines the functions without running anything.
 set -euo pipefail
 
 BUSY_MIN=30
 BASE_REF=origin/main
+LIST_FAILED="its build dirs could not be listed (check-target-hygiene.sh --list failed, above)"
 
 prune_settings() {
   CACHE_MIB="${PRUNE_CACHE_MIB:-5120}"
@@ -102,12 +103,19 @@ below() {
   done
 }
 
-# True when anything under $1 was modified within $3 units of find test $2
-# (-mmin/-mtime). A tree find cannot fully read counts as recent.
+# ref_file <path> <seconds ago>: a file whose mtime is exactly that long ago, so
+# "newer than" means the same second on every platform (find -mmin rounds differently).
+ref_file() {
+  : >"$1"
+  python3 -c 'import os, sys, time; t = time.time() - int(sys.argv[2]); os.utime(sys.argv[1], (t, t))' "$1" "$2"
+}
+
+# True when anything under $1 was modified after reference file $2. A tree find
+# cannot fully read counts as recent.
 touched_within() {
   local hit
   [[ -e "$1" || -L "$1" ]] || return 1
-  if ! hit="$(find "$1" "$2" "-$3" -print -quit 2>/dev/null)"; then
+  if ! hit="$(find "$1" -newer "$2" -print -quit 2>/dev/null)"; then
     warn "find could not read all of $1; treating it as in use"
     return 0
   fi
@@ -147,20 +155,32 @@ tmpf() { TMPF="$(mktemp "${SCRATCH}/l.XXXXXX")"; }
 # entries <dir>: TMPF lists every entry of dir, dotfiles and `..x` included.
 entries() { tmpf; find "$1" -mindepth 1 -maxdepth 1 -print0 >"${TMPF}"; }
 
-# The first line of file $1, whitespace removed, in LINE; fails if unreadable.
-first_line() {
-  LINE=""
-  [[ -f "$1" && -r "$1" ]] || return 1
-  IFS= read -r LINE <"$1" || :  # a last line without a newline still lands in LINE
-  LINE="${LINE//[[:space:]]/}"
+# Why pidfile $1 keeps what holds it, or nothing: unreadable, not exactly one
+# line of digits, or a pid that is running or that ps cannot rule out.
+pid_hold() {
+  local f="$1" rc=0
+  pidfile_pid "${f}" || rc=$?
+  case "${rc}" in
+    0) ;;
+    2) echo "${f##*/} cannot be read"; return ;;
+    *) echo "${f##*/} is not one pid"; return ;;
+  esac
+  if [[ -z "${PIDFILE_PID}" ]]; then
+    [[ "${f}" == *.lock ]] || echo "${f##*/} is empty"  # start locks are empty
+    return
+  fi
+  case "$(pid_state "${PIDFILE_PID}")" in
+    alive) echo "pid ${PIDFILE_PID} (${f##*/}) is running" ;;
+    unknown) echo "ps cannot say whether pid ${PIDFILE_PID} (${f##*/}) is running" ;;
+  esac
 }
 
 # ── The plan ───────────────────────────────────────────────────────────────
-P_KIND=() P_PATH=() P_ROOT=() P_KIB=() P_WHY=() P_CTX=() P_FLAG=()
+P_KIND=() P_PATH=() P_ROOT=() P_KIB=() P_WHY=() P_CTX=()
 KEPT=0
 
 plan_remove() {
-  P_KIND+=("$1") P_ROOT+=("$2") P_PATH+=("$3") P_KIB+=("$4") P_WHY+=("$5") P_CTX+=("$6") P_FLAG+=("${7:-}")
+  P_KIND+=("$1") P_ROOT+=("$2") P_PATH+=("$3") P_KIB+=("$4") P_WHY+=("$5") P_CTX+=("$6")
   printf '  %s- remove%s %10s  %s %s(%s)%s\n' "${C_RED}" "${C_OFF}" "$(human_kib "$4")" \
     "$3" "${C_DIM}" "$5" "${C_OFF}"
 }
@@ -221,11 +241,33 @@ list_builds() {
   bash "${ROOT}/scripts/check-target-hygiene.sh" --list "$1" >"${TMPF}"
 }
 
+# The flag git reports for worktree $1 now: locked, prunable, missing or empty.
+wt_flag() {
+  local field mine=0 flag=missing
+  tmpf
+  if ! git -C "${ROOT}" worktree list --porcelain -z >"${TMPF}"; then echo unknown; return; fi
+  while IFS= read -r -d '' field <&3; do
+    case "${field}" in
+      "worktree "*)
+        [[ "${mine}" -eq 0 ]] || break
+        if canon "${field#worktree }" && [[ "${CANON}" == "$1" ]]; then mine=1 flag=""; fi
+        ;;
+      locked | "locked "*) if [[ "${mine}" -eq 1 ]]; then flag=locked; fi ;;
+      prunable | "prunable "*) if [[ "${mine}" -eq 1 ]]; then flag=prunable; fi ;;
+    esac
+  done 3<"${TMPF}"
+  echo "${flag}"
+}
+
 # Why worktree $1 must be kept whole, or nothing. Uses the last scan_builds.
 worktree_hold() {
   local wt="$1" flag="$2" st n tree i d
-  if [[ "${flag}" == prunable || ! -d "${wt}" ]]; then echo "missing on disk"; return; fi
-  if [[ "${flag}" == locked ]]; then echo "locked (git worktree lock)"; return; fi
+  case "${flag}" in
+    prunable | missing) echo "missing on disk"; return ;;
+    locked) echo "locked (git worktree lock)"; return ;;
+    unknown) echo "git worktree list failed"; return ;;
+  esac
+  [[ -d "${wt}" ]] || { echo "missing on disk"; return; }
   if ! st="$(git -C "${wt}" status --porcelain --ignore-submodules=none --untracked-files=normal 2>&1)"; then
     echo "git status failed: ${st}"
     return
@@ -247,9 +289,9 @@ worktree_hold() {
       return
     fi
   done
-  if ! list_builds "${wt}"; then echo "its build dirs could not be listed"; return; fi
+  if ! list_builds "${wt}"; then echo "${LIST_FAILED}"; return; fi
   while IFS= read -r -d '' d <&3; do
-    if touched_within "${d}" -mmin "${BUSY_MIN}"; then echo "${d} written in the last ${BUSY_MIN} min"; return; fi
+    if touched_within "${d}" "${BUSY_REF}"; then echo "${d} written in the last ${BUSY_MIN} min"; return; fi
   done 3<"${TMPF}"
 }
 
@@ -270,6 +312,21 @@ tracked_hold() {
   fi
 }
 
+# Why $1, a cache or runtime path, must stay because a checkout tracks it, or nothing.
+checkout_hold() {
+  local top
+  if ! top="$(LC_ALL=C git -C "${1%/*}" rev-parse --show-toplevel 2>&1)"; then
+    [[ "${top}" == *"not a git repository"* ]] ||
+      echo "git cannot say whether it is in a checkout: ${top//$'\n'/ }"
+    return
+  fi
+  if ! below "${top}" "$1"; then
+    echo "inside checkout ${top} through a symlink"
+    return
+  fi
+  tracked_hold "${top}" "$1"
+}
+
 # Why a planned per-worktree path must stay, beyond worktree_hold.
 item_hold() {
   local kind="$1" wt="$2" path="$3" h
@@ -278,16 +335,16 @@ item_hold() {
   if [[ -n "${h}" ]]; then echo "${h}"; return; fi
   case "${kind}" in
     build) daemon_hold "${wt}" ;;
-    inventory) if touched_within "${path}" -mmin "${BUSY_MIN}"; then echo "written in the last ${BUSY_MIN} min"; fi ;;
-    scratch) if touched_within "${path}" -mtime "${SCRATCH_DAYS}"; then echo "used in the last ${SCRATCH_DAYS} days"; fi ;;
+    inventory) if touched_within "${path}" "${BUSY_REF}"; then echo "written in the last ${BUSY_MIN} min"; fi ;;
+    scratch) if touched_within "${path}" "${SCRATCH_REF}"; then echo "used in the last ${SCRATCH_DAYS} days"; fi ;;
   esac
 }
 
 plan_worktree() {
-  local wt="$1" flag="$2" d h kib e out inv recent=0 builds
+  local wt="$1" d h kib e out inv recent=0 builds
   inv="${wt}/.shux/out/test-inventory"
   if ! list_builds "${wt}"; then
-    plan_keep "${wt}" "check-target-hygiene.sh --list failed (above); its build dirs are left alone"
+    plan_keep "${wt}" "${LIST_FAILED}"
     HYGIENE_FAILED=$((HYGIENE_FAILED + 1))
   else
     builds="${TMPF}"
@@ -300,7 +357,7 @@ plan_worktree() {
         h="$(item_hold build "${wt}" "${d}")"
         if [[ -n "${h}" ]]; then plan_keep "${d}" "${h}"; continue; fi
         kib="$(size_kib "${d}")"
-        if [[ "${kib}" -gt 0 ]]; then plan_remove build "${wt}" "${d}" "${kib}" "build output" "${wt}" "${flag}"; fi
+        if [[ "${kib}" -gt 0 ]]; then plan_remove build "${wt}" "${d}" "${kib}" "build output" "${wt}"; fi
       done 3<"${builds}"
     fi
   fi
@@ -315,10 +372,9 @@ plan_worktree() {
       kib="$(size_kib "${inv}")"
       if [[ "${kib}" -gt $((CACHE_MIB * 1024)) ]]; then
         plan_remove inventory "${wt}" "${inv}" "${kib}" \
-          "test-inventory cache over $(human_kib $((CACHE_MIB * 1024)))" "${wt}" "${flag}"
-      elif ! touched_within "${inv}" -mtime "${CACHE_DAYS}"; then
-        plan_remove inventory "${wt}" "${inv}" "${kib}" "test-inventory cache unused for ${CACHE_DAYS} days" \
-          "${wt}" "${flag}"
+          "test-inventory cache over $(human_kib $((CACHE_MIB * 1024)))" "${wt}"
+      elif ! touched_within "${inv}" "${CACHE_REF}"; then
+        plan_remove inventory "${wt}" "${inv}" "${kib}" "test-inventory cache unused for ${CACHE_DAYS} days" "${wt}"
       else
         plan_keep "${inv}" "test-inventory cache within limits" "$(human_kib "${kib}")"
       fi
@@ -333,7 +389,7 @@ plan_worktree() {
     elif [[ -n "${h}" ]]; then
       plan_keep "${e}" "${h}"
     else
-      plan_remove scratch "${wt}" "${e}" "$(size_kib "${e}")" "scratch unused for ${SCRATCH_DAYS} days" "${wt}" "${flag}"
+      plan_remove scratch "${wt}" "${e}" "$(size_kib "${e}")" "scratch unused for ${SCRATCH_DAYS} days" "${wt}"
     fi
   done 3<"${TMPF}"
   [[ "${recent}" -eq 0 ]] || plan_keep "${out}" "${recent} scratch entr(ies) used in the last ${SCRATCH_DAYS} days"
@@ -368,9 +424,10 @@ plan_worktrees() {
     hold="$(worktree_hold "${WTS[${i}]}" "${flags[${i}]}")"
     if [[ -n "${hold}" ]]; then
       plan_keep "${WTS[${i}]}" "${hold}"
+      [[ "${hold}" != "${LIST_FAILED}" ]] || HYGIENE_FAILED=$((HYGIENE_FAILED + 1))
     else
       printf '  %s%s%s %s(clean, pushed or merged, idle)%s\n' "${C_B}" "${WTS[${i}]}" "${C_OFF}" "${C_DIM}" "${C_OFF}"
-      plan_worktree "${WTS[${i}]}" "${flags[${i}]}"
+      plan_worktree "${WTS[${i}]}"
     fi
   done
 }
@@ -379,20 +436,23 @@ plan_worktrees() {
 NEUTRAL_LOCKED=""
 
 # Why cache $1 must be left alone, or nothing. vt-neutrality.sh registers a
-# reader marker under the lock; prune holds the same lock while it removes.
+# reader marker under the lock; prune holds the same lock while it removes. A
+# lock whose recorded pid is dead was left by a killed run and is stale.
 neutral_hold() {
-  local cr="$1" f
+  local cr="$1" f h
   if [[ "${NEUTRAL_LOCKED}" != "${cr}" ]] && [[ -e "${cr}/lock" || -L "${cr}/lock" ]]; then
-    echo "a vt-neutrality run (or another prune) holds ${cr}/lock"
-    return
+    if ! pidfile_pid "${cr}/lock/pid" || [[ -z "${PIDFILE_PID}" ]] ||
+      [[ "$(pid_state "${PIDFILE_PID}")" != dead ]]; then
+      echo "a vt-neutrality run (or another prune) holds ${cr}/lock"
+      return
+    fi
   fi
   if [[ -L "${cr}/bin" || -L "${cr}/readers" ]]; then echo "a symlink on the way"; return; fi
   [[ -d "${cr}/readers" ]] || return 0
   entries "${cr}/readers"
   while IFS= read -r -d '' f <&3; do
-    if ! first_line "${f}"; then echo "reader marker ${f##*/} cannot be read"; return; fi
-    if ! [[ "${LINE}" =~ ^[0-9]+$ ]]; then echo "reader marker ${f##*/} names no pid"; return; fi
-    if ps -p "${LINE}" >/dev/null 2>&1; then echo "a vt-neutrality run is reading it (pid ${LINE})"; return; fi
+    h="$(pid_hold "${f}")"
+    if [[ -n "${h}" ]]; then echo "reader marker: ${h}"; return; fi
   done 3<"${TMPF}"
 }
 
@@ -416,7 +476,7 @@ plan_neutrality() {
   done
   [[ "${#units[@]}" -gt 0 ]] || { echo "  (empty)"; return; }
   for u in "${units[@]}"; do
-    if touched_within "${u}" -mmin "${BUSY_MIN}"; then hot="${u}"; fi
+    if touched_within "${u}" "${BUSY_REF}"; then hot="${u}"; fi
     kib="$(size_kib "${u}")"
     kibs+=("${kib}")
     total=$((total + kib))
@@ -424,12 +484,15 @@ plan_neutrality() {
   if [[ -n "${hot}" ]]; then plan_keep "${cr}" "in use: ${hot} written in the last ${BUSY_MIN} min"; return; fi
   for i in "${!units[@]}"; do
     u="${units[${i}]}"
-    if ! below "${cr}" "${u}"; then
-      plan_keep "${u}" "a symlink; left alone"
+    h=""
+    below "${cr}" "${u}" || h="a symlink; left alone"
+    [[ -n "${h}" ]] || h="$(checkout_hold "${u}")"
+    if [[ -n "${h}" ]]; then
+      plan_keep "${u}" "${h}"
     elif [[ "${total}" -gt $((CACHE_MIB * 1024)) ]]; then
       plan_remove neutral "${cr}" "${u}" "${kibs[${i}]}" \
         "cache is $(human_kib "${total}"), over $(human_kib $((CACHE_MIB * 1024)))" "${cr}"
-    elif ! touched_within "${u}" -mtime "${CACHE_DAYS}"; then
+    elif ! touched_within "${u}" "${CACHE_REF}"; then
       plan_remove neutral "${cr}" "${u}" "${kibs[${i}]}" "unused for ${CACHE_DAYS} days" "${cr}"
     else
       plan_keep "${u}" "used in the last ${CACHE_DAYS} days" "$(human_kib "${kibs[${i}]}")"
@@ -439,7 +502,7 @@ plan_neutrality() {
 
 neutral_release() {
   [[ -n "${NEUTRAL_LOCKED}" ]] || return 0
-  rmdir "${NEUTRAL_LOCKED}/lock" 2>/dev/null || warn "could not release ${NEUTRAL_LOCKED}/lock; remove it"
+  cache_lock_release "${NEUTRAL_LOCKED}/lock" || warn "could not release ${NEUTRAL_LOCKED}/lock; the next run replaces it"
   NEUTRAL_LOCKED=""
 }
 
@@ -469,23 +532,19 @@ only_runtime_files() {
 # Why runtime dir $2 (inside candidate $1) must be kept, or nothing. A pid that
 # is alive keeps it, whoever owns that pid now.
 runtime_hold() {
-  local e="$1" rd="$2" f
+  local e="$1" rd="$2" f h
   if [[ -L "${e}" || ! -d "${e}" || ! -O "${e}" ]]; then echo "no longer a runtime dir of ours"; return; fi
   if [[ "${rd}" != "${e}" ]] && ! only_runtime_parent "${e}"; then echo "holds other files"; return; fi
   if ! only_runtime_files "${rd}"; then echo "holds other files"; return; fi
+  h="$(checkout_hold "${e}")"
+  if [[ -n "${h}" ]]; then echo "${h}"; return; fi
   entries "${rd}"
   while IFS= read -r -d '' f <&3; do
     case "${f##*/}" in *.pid | *.lock) ;; *) continue ;; esac
-    if ! first_line "${f}"; then echo "unreadable ${f##*/}"; return; fi
-    if [[ -z "${LINE}" ]]; then
-      [[ "${f}" == *.lock ]] && continue  # start locks are empty
-      echo "empty ${f##*/}"
-      return
-    fi
-    if ! [[ "${LINE}" =~ ^[0-9]+$ ]]; then echo "${f##*/} names no pid"; return; fi
-    if ps -p "${LINE}" >/dev/null 2>&1; then echo "live process (pid ${LINE}, ${f##*/})"; return; fi
+    h="$(pid_hold "${f}")"
+    if [[ -n "${h}" ]]; then echo "${h}"; return; fi
   done 3<"${TMPF}"
-  if touched_within "${e}" -mmin "${BUSY_MIN}"; then echo "written in the last ${BUSY_MIN} min"; fi
+  if touched_within "${e}" "${BUSY_REF}"; then echo "written in the last ${BUSY_MIN} min"; fi
 }
 
 plan_runtime() {
@@ -534,7 +593,8 @@ recheck() {
       # A worktree's entries are contiguous: it is re-checked as a whole once, as its turn starts.
       if [[ "${i}" -eq 0 || "${P_CTX[$((i - 1))]}" != "${ctx}" ]]; then
         scan_builds
-        WT_HOLD="$(worktree_hold "${ctx}" "${P_FLAG[${i}]}")"
+        WT_HOLD="$(worktree_hold "${ctx}" "$(wt_flag "${ctx}")")"
+        [[ "${WT_HOLD}" != "${LIST_FAILED}" ]] || HYGIENE_FAILED=$((HYGIENE_FAILED + 1))
       fi
       HOLD="${WT_HOLD}"
       [[ -n "${HOLD}" ]] || HOLD="$(item_hold "${kind}" "${ctx}" "${path}")"
@@ -542,11 +602,12 @@ recheck() {
     neutral)
       if [[ "${NEUTRAL_LOCKED}" != "${ctx}" ]]; then
         neutral_release
-        if ! mkdir "${ctx}/lock" 2>/dev/null; then HOLD="${ctx}/lock is held"; return; fi
+        if ! cache_lock_take "${ctx}/lock" 1; then HOLD="${ctx}/lock is held"; return; fi
         NEUTRAL_LOCKED="${ctx}"
       fi
       HOLD="$(neutral_hold "${ctx}")"
-      if [[ -z "${HOLD}" ]] && touched_within "${path}" -mmin "${BUSY_MIN}"; then
+      [[ -n "${HOLD}" ]] || HOLD="$(checkout_hold "${path}")"
+      if [[ -z "${HOLD}" ]] && touched_within "${path}" "${BUSY_REF}"; then
         HOLD="written in the last ${BUSY_MIN} min"
       fi
       ;;
@@ -586,7 +647,13 @@ prune_setup() {
   REPO_ROOT="${ROOT}"
   # shellcheck source=.shux/scripts/lib/proc_scope.sh disable=SC1091
   . "${ROOT}/.shux/scripts/lib/proc_scope.sh"
+  # shellcheck source=.shux/scripts/lib/cache_lock.sh disable=SC1091
+  . "${ROOT}/.shux/scripts/lib/cache_lock.sh"
   SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/shux-prune.XXXXXX")"
+  BUSY_REF="${SCRATCH}/busy.ref" CACHE_REF="${SCRATCH}/cache.ref" SCRATCH_REF="${SCRATCH}/scratch.ref"
+  ref_file "${BUSY_REF}" $((BUSY_MIN * 60))
+  ref_file "${CACHE_REF}" $((CACHE_DAYS * 86400))
+  ref_file "${SCRATCH_REF}" $((SCRATCH_DAYS * 86400))
   if ! BASE_TREE="$(git -C "${ROOT}" rev-parse -q --verify "${BASE_REF}^{tree}")"; then
     BASE_TREE=""
     warn "${BASE_REF} is not a known ref, so no worktree counts as merged"

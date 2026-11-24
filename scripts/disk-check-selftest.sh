@@ -83,9 +83,17 @@ hook_cmd() {
 }
 STOP_CMD="$(hook_cmd Stop)" || die "no disk-check Stop hook in .claude/settings.json"
 SESSION_CMD="$(hook_cmd SessionStart)" || die "no disk-check SessionStart hook in .claude/settings.json"
-mkdir -p "${work}/broken" "${work}/old"
+# Project dirs whose make misbehaves; each has the hook script, as a real checkout would.
+for d in broken old info noisy; do
+  mkdir -p "${work}/${d}/scripts"
+  cp "${SRC}/scripts/disk-check-hook.sh" "${work}/${d}/scripts/"
+done
 printf '<<<<<<< a merge conflict\noops\n' >"${work}/broken/Makefile"
 printf 'all:\n\t@true\n' >"${work}/old/Makefile"
+# shellcheck disable=SC2016  # make syntax, written literally
+printf '$(info loading)\ndisk-check:\n\t@echo half; false\n' >"${work}/info/Makefile"
+# shellcheck disable=SC2016  # make syntax, written literally
+printf '$(info noise)\ndisk-check:\n\t@echo '"'"'{"systemMessage": "from make"}'"'"'\n' >"${work}/noisy/Makefile"
 # run_hook <cmd> <project dir> [env…]
 run_hook() {
   local cmd="$1" dir="$2" rc=0
@@ -93,16 +101,33 @@ run_hook() {
   LAST="$(env PATH="${work}/bin:${PATH}" CLAUDE_PROJECT_DIR="${dir}" "$@" bash -c "${cmd}" 2>/dev/null)" || rc=$?
   [[ "${rc}" -eq 0 ]] || die "hook '${cmd}' in ${dir} exited ${rc}"
 }
+# Stop stdout is nothing, or exactly one line that is one JSON document.
+one_json() {
+  [[ -n "${LAST}" ]] || return 0
+  [[ "${LAST}" != *$'\n'* ]] || die "Stop hook in $1 printed more than one line: ${LAST}"
+  json '.systemMessage | type == "string"'
+}
 stub_df "${LOW}" 0
-for dir in "${SRC}" "${work}/broken" "${work}/old" "${work}/missing"; do
+for dir in "${SRC}" "${work}/broken" "${work}/old" "${work}/info" "${work}/noisy" "${work}/missing"; do
   for env in SHUX_DISK_MIN_GIB=40 SHUX_DISK_MIN_GIB=08 $'SHUX_DISK_MIN_GIB=x\ny\t"z'; do
     run_hook "${STOP_CMD}" "${dir}" "${env}"
-    json '.systemMessage | type == "string"'
+    one_json "${dir}"
+    [[ "${dir}" == "${SRC}" ]] || [[ -n "${LAST}" ]] || die "Stop hook in ${dir} printed nothing"
     run_hook "${SESSION_CMD}" "${dir}" "${env}"
-    [[ -n "${LAST}" ]] || die "SessionStart hook in ${dir} with ${env} printed nothing"
+    [[ "${dir}" == "${work}/noisy" || -n "${LAST}" ]] || die "SessionStart hook in ${dir} with ${env} printed nothing"
   done
 done
 run_hook "${STOP_CMD}" "${SRC}" SHUX_DISK_MIN_GIB=40
 json '.systemMessage | contains("make prune")'
+run_hook "${STOP_CMD}" "${work}/noisy"
+json '.systemMessage == "from make"'
+
+# The first df's own error is the one reported.
+cat >"${work}/bin/df" <<EOF
+#!/bin/sh
+if [ -e "${work}/df.once" ]; then printf '%b' "${HIGH}"; exit 0; fi
+: >"${work}/df.once"; echo "df: first failure" >&2; exit 1
+EOF
+expect 1 "df -Pk failed: df: first failure" --
 
 echo "✓ disk-check self-test: warns below the threshold, reads any df -Pk, loud on bad input, hooks always exit 0"

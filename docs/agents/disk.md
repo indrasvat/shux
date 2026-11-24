@@ -68,14 +68,15 @@ Machine-wide:
   itself), or any of whose build dirs was written in the last 30 minutes; a locked or
   missing worktree, or one git lists at a path that is a symlink;
 - a worktree's build dirs while a live shux daemon runs a binary built there;
-- `.shux/qa`, anything git tracks, or anything git cannot say it does not track;
+- `.shux/qa`, anything git tracks, or anything git cannot say it does not track, in a
+  worktree or in any checkout a cache or runtime root sits inside;
 - anything reached through a symlink (`.shux`, `.shux/out`, a cache, a worktree, any
   directory on the way);
-- the vt-neutrality cache while its `lock` exists or a marker in its `readers/` names a
-  running pid (or cannot be read), and its `src` checkout;
-- a runtime dir with a running pid in it (even one a new process reused), an unreadable
-  or malformed pidfile, anything else in it, written recently, a symlink, or owned by
-  another user.
+- the vt-neutrality cache while its `lock` names a pid that is running (or names none),
+  or a marker in its `readers/` does, and its `src` checkout;
+- a runtime dir with a running pid in it (even one a new process reused), a pid `ps`
+  cannot rule out, a pidfile that is unreadable or not exactly one line of digits,
+  anything else in it, written recently, a symlink, or owned by another user.
 
 ## Internals
 
@@ -87,20 +88,26 @@ worktrees come from `git worktree list --porcelain -z`, build dirs from
 `check-target-hygiene.sh --list` (NUL-terminated), entries from `find -print0`, and path
 resolution keeps trailing newlines. A build's cwd comes from `/proc` on Linux and `lsof`
 on macOS (`.shux/scripts/lib/proc_scope.sh`); if one cannot be seen, every worktree is
-kept. Sizes are `du -sk`, ages `find -mmin`/`-mtime`, free space `df -Pk`: the same flags
-on macOS and Linux, Bash 3.2 compatible.
+kept. At apply, a worktree's git state, lock and builds are read again as its turn comes;
+a worktree whose build dirs cannot be listed makes the run exit non-zero. Ages compare
+against reference files stamped exactly 30 minutes or N days ago (`find -newer`), sizes
+are `du -sk`, free space `df -Pk`: the same answer to the second on macOS and Linux,
+Bash 3.2 compatible.
 
-vt-neutrality and prune share the cache's `lock` directory. `scripts/vt-neutrality.sh`
-takes it to write its `readers/<pid>` marker (and keeps it while it builds the base);
-prune takes it before removing anything there and leaves the cache alone while a marker
-names a running pid. A vt-neutrality run that finds the lock held waits up to 30 s.
+vt-neutrality and prune share the cache's `lock` directory, which holds its holder's pid
+(`.shux/scripts/lib/cache_lock.sh`). `scripts/vt-neutrality.sh` takes it to write its
+`readers/<pid>` marker (and keeps it while it builds the base), and releases both from
+its exit trap; prune takes it before removing anything there and leaves the cache alone
+while a marker names a running pid. A lock whose pid is dead (a killed run) is replaced;
+one held by a running pid is waited on for up to 30 s.
 
 `scripts/disk-check.sh --hook session` prints plain stdout, which Claude Code adds to the
 agent's context; `--hook stop` prints `{"systemMessage": ...}`, shown to the user without
 continuing the turn, with control characters replaced. Under `--hook` it always exits 0;
-a df it cannot read or a malformed threshold becomes the message. The hook commands in
-`.claude/settings.json` end in `|| echo …`, so a missing target or a broken Makefile
-(make exits 2, which would block a Stop) still exits 0 with a message.
+a df it cannot read (with df's own error) or a malformed threshold becomes the message.
+The hooks call `scripts/disk-check-hook.sh`, which runs `make disk-check`, keeps only the
+one line a hook may print (so `$(info …)` noise never reaches stdout), prints a fallback
+when make fails (make exits 2, which would block a Stop), and always exits 0.
 
 `make check-prune` (in `make check` and in CI on Linux and on macOS Bash 3.2) runs
 `scripts/disk-check-selftest.sh` against a stub `df` and the exact hook commands, and

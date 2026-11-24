@@ -43,8 +43,10 @@ min="${SHUX_DISK_MIN_GIB:-40}"
 
 # -P: one line per filesystem, 1024-byte blocks, same columns on macOS and Linux.
 # stdout only: a warning on stderr must not shift the lines read below.
-if ! df_out="$(df -Pk -- "${ROOT}" 2>/dev/null)"; then
-  broken "df -Pk failed: $(df -Pk -- "${ROOT}" 2>&1 >/dev/null | tr '\n' ' ')"
+df_err="$(mktemp "${TMPDIR:-/tmp}/shux-disk-check.XXXXXX")" || broken "mktemp failed"
+trap 'rm -f "${df_err}"' EXIT
+if ! df_out="$(df -Pk -- "${ROOT}" 2>"${df_err}")"; then
+  broken "df -Pk failed: $(tr '\n' ' ' <"${df_err}")"
 fi
 # The data line's Capacity is the first N% field after three numbers; Available is
 # just before it, the mount point after it. Filesystem names may hold spaces.

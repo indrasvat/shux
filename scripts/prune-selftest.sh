@@ -36,6 +36,12 @@ DAYS=800
 AS_ROOT=0
 [[ "$(id -u)" -ne 0 ]] || AS_ROOT=1  # mode bits stop nobody as root
 backdate() { local stamp="$1"; shift; find "$@" -exec touch -t "${stamp}" {} +; }
+# ago <path> <seconds>: everything under path modified exactly that long ago.
+ago() {
+  find "$1" -exec python3 -c 'import os, sys, time
+t = time.time() - int(sys.argv[1])
+for p in sys.argv[2:]: os.utime(p, (t, t))' "$2" {} +
+}
 blob() { mkdir -p "$(dirname "$1")"; head -c "${2:-65536}" /dev/zero >"$1"; }
 
 dead_pid() {
@@ -83,7 +89,7 @@ fixture() {
   cp "${script}" "${repo}/scripts/prune.sh"
   cp "${SRC}/scripts/check-target-hygiene.sh" "${repo}/scripts/"
   cp "${SRC}/.shux/scripts/reap_daemons.sh" "${repo}/.shux/scripts/"
-  cp "${SRC}/.shux/scripts/lib/proc_scope.sh" "${repo}/.shux/scripts/lib/"
+  cp "${SRC}/.shux/scripts/lib/proc_scope.sh" "${SRC}/.shux/scripts/lib/cache_lock.sh" "${repo}/.shux/scripts/lib/"
   printf '[workspace]\n' >"${repo}/Cargo.toml"
   printf '[workspace]\n' >"${repo}/fuzz/Cargo.toml"
   nl="${repo}/crates"$'\n'"sub"
@@ -94,9 +100,14 @@ fixture() {
   echo base >"${repo}/file.txt"
   echo evidence >"${repo}/.shux/qa/kept/SOLID-QA.md"
   blob "${repo}/.shux/out/tracked/keep.txt" 16
+  # A configured cache and a runtime root inside the checkout, with committed contents.
+  dead="$(dead_pid)"
+  blob "${repo}/ncache/target/release/shux"
+  rt "${repo}/rtroot/shuxtracked/shux/shux.pid" "${dead}"
   git -C "${repo}" add -- Cargo.toml fuzz crates "crates"$'\n'"sub" .gitignore file.txt scripts .shux/qa .shux/scripts
-  git -C "${repo}" add -f -- .shux/out/tracked/keep.txt
+  git -C "${repo}" add -f -- .shux/out/tracked/keep.txt ncache rtroot
   git -C "${repo}" commit -qm base
+  backdate "${OLD}" "${repo}/ncache" "${repo}/rtroot"
   git -C "${repo}" remote add origin "${f}/origin.git"
   git -C "${repo}" push -q origin main
 
@@ -194,6 +205,11 @@ fixture() {
   ln -s "${f}/neutral-real" "${f}/neutral-link"
   blob "${f}/neutral-binlink/src/precious/file.rs"
   ln -s src "${f}/neutral-binlink/bin"
+  # A lock and reader marker left by a SIGKILLed run.
+  blob "${f}/neutral-stale/target/release/shux"
+  mkdir -p "${f}/neutral-stale/lock" "${f}/neutral-stale/readers"
+  dead_pid >"${f}/neutral-stale/lock/pid"
+  dead_pid >"${f}/neutral-stale/readers/1"
   backdate "${OLD}" "${f}"/neutral*
   backdate "${RECENT}" "${f}/neutral/bin/newsha-tc" "${f}/neutral-big/target"
 
@@ -213,6 +229,9 @@ fixture() {
   rt "${f}/tmp1/shuxdotdot2/shux/shux.pid" "${dead}"
   rt "${f}/tmp1/shuxdotdot2/shux/..secret" data
   rt "${f}/tmp1/shuxclone/shux/Cargo.toml" "[package]"
+  mkdir -p "${f}/tmp1/shuxmulti/shux"
+  printf '%s\n%s\n' "${dead}" "${DAEMON}" >"${f}/tmp1/shuxmulti/shux/shux.pid"
+  rt "${f}/tmp1/shuxspace/shux/shux.pid" "${dead:0:1} ${dead:1}"
   rt "${f}/outside/shuxtarget/shux/shux.pid" "${dead}"
   ln -s "${f}/outside/shuxtarget" "${f}/tmp1/shuxlink"
   if [[ "${AS_ROOT}" -eq 0 ]]; then
@@ -233,7 +252,7 @@ kept() { [[ -e "$1" || -L "$1" ]] || fail "$1 was removed"; }
 
 prune_env() {
   local f="$1"
-  export PRUNE_TMP_ROOTS="${f}/tmp1:${f}/tmp2:${f}/tmp 3 [x]*" PRUNE_SCRATCH_DAYS="${DAYS}" \
+  export PRUNE_TMP_ROOTS="${f}/tmp1:${f}/tmp2:${f}/tmp 3 [x]*:${f}/repo/rtroot" PRUNE_SCRATCH_DAYS="${DAYS}" \
     PRUNE_CACHE_DAYS="${DAYS}" PRUNE_CACHE_MIB="${CACHE_MIB:-5120}" SHUX_NEUTRALITY_CACHE="${NEUTRAL:-${f}/neutral}"
 }
 
@@ -272,8 +291,10 @@ late_apply() (
   prune_setup
   prune_plan >/dev/null
   printf '%s\n' "${P_PATH[@]}" | grep -qxF "${late}/wt-pushed/target" || { echo "late target not planned"; exit 3; }
+  printf '%s\n' "${P_PATH[@]}" | grep -qxF "${late}/wt-merged/target" || { echo "late lock target not planned"; exit 3; }
   start_fake "${late}/bin/cargo" "${late}/bin/cargo" "${late}/wt-pushed" "${late}/late.fifo"
   cat "${late}/daemon.pid" >"${late}/tmp1/shuxlate/shux/shux.pid"
+  git -C "${late}/repo" worktree lock "${late}/wt-merged"
   prune_apply
   prune_cleanup
 )
@@ -287,6 +308,10 @@ suite() {
   repo="${f}/repo"
   nl="crates"$'\n'"sub"
 
+  # Either side of the 30-minute line, set just before the runs: BSD find -mmin
+  # rounds the age up and GNU truncates, so macOS and Linux disagreed here.
+  ago "${f}/wt-fuzz/fuzz/target" $((29 * 60 + 10))
+  ago "${f}/wt-merged/target" $((30 * 60 + 30))
   snapshot "${f}" >"${f}.before"
   rc=0
   prune "${f}" || rc=$?
@@ -336,31 +361,53 @@ suite() {
   kept "${f}/tmp1/shuxdotdot/..precious/data.txt"
   kept "${f}/tmp1/shuxdotdot2/shux/..secret"
   kept "${f}/tmp1/shuxclone/shux/Cargo.toml"
+  kept "${f}/tmp1/shuxmulti"
+  kept "${f}/tmp1/shuxspace"
+  kept "${repo}/rtroot/shuxtracked/shux/shux.pid"
   kept "${f}/tmp1/shuxlink"
   kept "${f}/outside/shuxtarget/shux/shux.pid"
   [[ "${AS_ROOT}" -eq 1 ]] || kept "${f}/tmp1/shuxunread/shux"
 
-  for n in big locked reading link binlink; do
+  for n in big locked reading link binlink stale; do
     rc=0
     OUT="$(NEUTRAL="${f}/neutral-${n}" CACHE_MIB=1 neutral_apply "${f}" 2>&1)" || rc=$?
     [[ "${rc}" -eq 0 ]] || fail "neutral-${n} apply exited ${rc}"
   done
+  rc=0
+  OUT="$(NEUTRAL="${repo}/ncache" CACHE_MIB=1 neutral_apply "${f}" 2>&1)" || rc=$?
+  [[ "${rc}" -eq 0 ]] || fail "in-checkout cache apply exited ${rc}"
+  kept "${repo}/ncache/target/release/shux"
   gone "${f}/neutral-big/target"
+  gone "${f}/neutral-stale/target"
+  gone "${f}/neutral-stale/lock"
   kept "${f}/neutral-locked/target"
   kept "${f}/neutral-reading/target"
   kept "${f}/neutral-real/target"
   kept "${f}/neutral-binlink/src/precious/file.rs"
 
   # A plan gone stale: a build starts and a daemon comes alive after planning.
+  # A plan gone stale: a build starts, a daemon comes alive and a worktree is locked after planning.
   blob "${f}/wt-pushed/target/debug/late"
+  blob "${f}/wt-merged/target/debug/late"
   rt "${f}/tmp1/shuxlate/shux/shux.pid" "$(dead_pid)"
-  backdate "${OLD}" "${f}/wt-pushed/target" "${f}/tmp1/shuxlate"
+  backdate "${OLD}" "${f}/wt-pushed/target" "${f}/wt-merged/target" "${f}/tmp1/shuxlate"
   rc=0
   out="$(late_apply "${f}")" || rc=$?
   OUT="${out}"
   [[ "${rc}" -eq 0 ]] || fail "the stale-plan apply exited ${rc}"
   kept "${f}/wt-pushed/target"
   kept "${f}/tmp1/shuxlate"
+  [[ -e "${f}/wt-merged/target" ]] || fail "late-locked wt-merged/target was removed"
+
+  # ps that cannot answer: the pid might be running, so the runtime dir stays.
+  rt "${f}/tmp1/shuxpsfail/shux/shux.pid" "$(dead_pid)"
+  OUT="$(ps_fails_hold "${f}" "${f}/tmp1/shuxpsfail" 2>&1)" || :
+  [[ "${OUT}" == *"ps cannot say"* ]] || fail "a ps failure was not held"
+
+  # A lock left by a dead pid is replaced; one held by a live pid is not.
+  rc=0
+  OUT="$(lock_cases "${f}" 2>&1)" || rc=$?
+  [[ "${rc}" -eq 0 ]] || fail "cache lock: ${OUT}"
 
   # safe_rm itself: empty, `/`, relative, outside the root, `..`, a symlink on the way, newlines.
   mkdir -p "${f}/root/inside" "${f}/root/real/victim" "${f}/elsewhere" "${f}/root/dir"$'\n'
@@ -384,7 +431,40 @@ suite() {
   rc=0
   OUT="$(PRUNE_TMP_ROOTS=relative "${BASH}" "${repo}/scripts/prune.sh" 2>&1)" || rc=$?
   [[ "${rc}" -eq 2 && "${OUT}" == *"not absolute"* ]] || fail "a relative runtime root was not refused (exit ${rc})"
+
+  # A worktree whose build dirs cannot be listed fails the run.
+  wt_add "${repo}" feat/bad "${f}/wt-bad"
+  printf '[workspace\n' >"${f}/wt-bad/Cargo.toml"
+  commit_push "${f}/wt-bad" bad Cargo.toml
+  rc=0
+  prune "${f}" || rc=$?
+  [[ "${rc}" -ne 0 && "${OUT}" == *"could not list"* ]] || fail "a bad manifest did not fail the run (exit ${rc})"
 }
+
+# ps_fails_hold <fixture> <runtime dir>: runtime_hold's verdict when ps errors.
+ps_fails_hold() (
+  prune_env "$1"
+  # shellcheck source=scripts/prune.sh
+  . "$1/repo/scripts/prune.sh"
+  prune_setup
+  # shellcheck disable=SC2329  # shadows ps for pid_state, which calls it by name
+  ps() { echo "ps: cannot read the process table" >&2; return 1; }
+  runtime_hold "$2" "$2/shux"
+  prune_cleanup
+)
+
+# lock_cases <fixture>: cache_lock_take replaces a dead holder's lock, not a live one's.
+lock_cases() (
+  # shellcheck source=.shux/scripts/lib/cache_lock.sh
+  . "$1/repo/.shux/scripts/lib/cache_lock.sh"
+  mkdir -p "$1/locks/stale" "$1/locks/live"
+  dead_pid >"$1/locks/stale/pid"
+  cat "$1/daemon.pid" >"$1/locks/live/pid"
+  cache_lock_take "$1/locks/stale" 1 || { echo "a dead holder's lock was not replaced"; exit 1; }
+  [[ "$(cat "$1/locks/stale/pid")" == "$$" ]] || { echo "the replaced lock does not name its new holder"; exit 1; }
+  cache_lock_release "$1/locks/stale" || { echo "release failed"; exit 1; }
+  if cache_lock_take "$1/locks/live" 1; then echo "a live holder's lock was taken"; exit 1; fi
+)
 rt() { mkdir -p "$(dirname "$1")"; printf '%s\n' "$2" >"$1"; }
 
 # ── Run: the real script passes; each mutant fails for its own reason ──────
@@ -404,10 +484,18 @@ mutant() { M_NAME+=("$1") M_FROM+=("$2") M_TO+=("$3") M_WANT+=("$4"); }
   mutant dirty 'if [[ -n "${st}" ]]; then' 'if false; then' 'wt-dirty/target was removed'
   mutant unpushed 'if [[ "${n}" -gt 0 ]]; then' 'if false; then' 'wt-unpushed/target was removed'
   mutant busy 'if [[ "$(owner_of "${B_CWD[${i}]}")" == "${wt}" ]]; then' 'if false; then' 'busy/target was removed'
-  mutant 'fresh build dir' 'if touched_within "${d}" -mmin "${BUSY_MIN}"; then echo "${d} written' \
+  mutant 'fresh build dir' 'if touched_within "${d}" "${BUSY_REF}"; then echo "${d} written' \
     'if false; then echo "${d} written' 'fresh was removed'
-  mutant 'live daemon pid' 'if ps -p "${LINE}" >/dev/null 2>&1; then echo "live process' \
-    'if false; then echo "live process' 'shuxlive was removed'
+  mutant 'live daemon pid' 'alive) echo "pid ${PIDFILE_PID}' 'alive) : "pid ${PIDFILE_PID}' 'shuxlive was removed'
+  mutant 'ps failure' 'unknown) echo "ps cannot say' 'unknown) : "ps cannot say' 'a ps failure was not held'
+  mutant 'lock at apply' 'WT_HOLD="$(worktree_hold "${ctx}" "$(wt_flag "${ctx}")")"' \
+    'WT_HOLD="$(worktree_hold "${ctx}" "")"' 'late-locked wt-merged/target was removed'
+  mutant 'tracked in a checkout' '  tracked_hold "${top}" "$1"' '  :' \
+    $'shuxtracked/shux/shux.pid was removed\nncache/target/release/shux was removed'
+  mutant 'tracked runtime' '  h="$(checkout_hold "${e}")"' '  h=""' 'shuxtracked/shux/shux.pid was removed'
+  mutant 'list failure' '[[ "${hold}" != "${LIST_FAILED}" ]] || HYGIENE_FAILED' \
+    'true || HYGIENE_FAILED' 'a bad manifest did not fail the run'
+  mutant 'stale lock' '[[ "$(pid_state "${PIDFILE_PID}")" != dead ]]; then' 'true; then' 'neutral-stale/target was kept'
   mutant 'daemon build' '[[ -z "${pids// /}" ]] || echo "a live shux daemon' 'true || echo "a live shux daemon' \
     'repo/target was removed'
   mutant 'reaps daemons' '"${ROOT}/.shux/scripts/reap_daemons.sh" --dry-run 2>&1' \
@@ -416,11 +504,11 @@ mutant() { M_NAME+=("$1") M_FROM+=("$2") M_TO+=("$3") M_WANT+=("$4"); }
   mutant tracked 'elif [[ -n "${out}" ]]; then' 'elif false; then' 'baseline.txt was removed'
   mutant 'dry run applies' 'if [[ "${apply}" -eq 1 ]]; then' 'if true; then' 'dry run changed the tree'
   mutant 'root containment' 'if ! below "${root}" "${path}"; then' 'if false; then' 'was not refused'
-  mutant 'neutrality reader' 'if ps -p "${LINE}" >/dev/null 2>&1; then echo "a vt-neutrality run is reading' \
-    'if false; then echo "a vt-neutrality run is reading' 'neutral-reading/target was removed'
-  mutant 'stale plan' '    recheck "${i}"' '    HOLD=""' 'wt-pushed/target was removed'
+  mutant 'neutrality reader' 'if [[ -n "${h}" ]]; then echo "reader marker: ${h}"' \
+    'if false; then echo "reader marker: ${h}"' 'neutral-reading/target was removed'
+  mutant 'stale plan' '    recheck "${i}"' '    HOLD=""' $'wt-pushed/target was removed\nneutral-stale/lock was kept'
   mutant 'squash merge' '== "${BASE_TREE}" ]]; }; then' '== "never" ]]; }; then' 'wt-merged/target was kept'
-  mutant inert '      plan_worktree "${WTS[${i}]}" "${flags[${i}]}"' '      :' 'wt-pushed/target was kept'
+  mutant inert '      plan_worktree "${WTS[${i}]}"' '      :' 'wt-pushed/target was kept'
 }
 
 # Each mutant in its own fixture, all at once; then each verdict is read.

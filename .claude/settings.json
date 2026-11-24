@@ -46,7 +46,7 @@
           },
           {
             "type": "command",
-            "command": "make -s --no-print-directory -C \"$CLAUDE_PROJECT_DIR\" disk-check HOOK=session || echo '⚠ make disk-check failed; run it in the repo to see why'",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/scripts/disk-check-hook.sh\" session || echo '⚠ scripts/disk-check-hook.sh could not run'",
             "timeout": 15
           }
         ]
@@ -57,7 +57,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "make -s --no-print-directory -C \"$CLAUDE_PROJECT_DIR\" disk-check HOOK=stop || echo '{\"systemMessage\": \"⚠ make disk-check failed; run it in the repo to see why\"}'",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/scripts/disk-check-hook.sh\" stop || echo '{\"systemMessage\": \"⚠ scripts/disk-check-hook.sh could not run\"}'",
             "timeout": 15
           }
         ]
