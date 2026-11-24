@@ -1,3 +1,10 @@
+# [0.60.0](https://github.com/indrasvat/shux/compare/v0.59.3...v0.60.0) (2026-11-24)
+
+
+### Features
+
+* **attach:** copy mode keeps the slice you saw; pictures crop instead of vanishing ([#190](https://github.com/indrasvat/shux/issues/190) B2) ([#303](https://github.com/indrasvat/shux/issues/303)) ([d697fa9](https://github.com/indrasvat/shux/commit/d697fa9885da17507a7987245d60d8d0e69a52fb)), closes [#302](https://github.com/indrasvat/shux/issues/302)
+
 ## [0.59.3](https://github.com/indrasvat/shux/compare/v0.59.2...v0.59.3) (2026-11-24)
 
 
