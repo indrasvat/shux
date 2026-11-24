@@ -135,6 +135,8 @@ impl Client {
             client_version: "multi-client-wake-test".to_string(),
             graphics: false,
             plain: false,
+            read_only: false,
+            no_color: false,
         };
         framed
             .send(Bytes::from(serde_json::to_vec(&hello).expect("hello json")))

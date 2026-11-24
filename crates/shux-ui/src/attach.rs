@@ -83,10 +83,33 @@ fn terminal_can_draw_images() -> bool {
         .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()))
 }
 
-/// A mode the client asked for that the daemon's reply does not confirm. A
-/// daemon that predates `plain` ignores it, so its echo is the only proof.
-fn unmet_mode(asked_plain: bool, granted_plain: bool) -> Option<String> {
-    (asked_plain && !granted_plain).then(|| {
+/// What the daemon's reply fails to confirm of what the client asked for:
+/// its protocol, `plain` or `read_only`. A daemon that predates a mode ignores
+/// it, so its echo is the only proof; checked before the terminal is touched.
+fn unmet_mode(
+    config: &ClientConfig,
+    protocol: u32,
+    plain: bool,
+    read_only: bool,
+) -> Option<String> {
+    if protocol != ATTACH_PROTOCOL_VERSION {
+        return Some(format!(
+            "the running daemon speaks attach protocol {protocol}, this shux \
+             {ATTACH_PROTOCOL_VERSION}"
+        ));
+    }
+    if config.read_only != read_only {
+        return Some(
+            if config.read_only {
+                "the running daemon did not confirm --read-only, so this attach \
+             could type into the session; refusing"
+            } else {
+                "the running daemon attached read-only, though writable was asked for"
+            }
+            .to_string(),
+        );
+    }
+    (config.plain && !plain).then(|| {
         "the running daemon cannot strip terminal effects, so --plain would not \
          hold; it is older than this shux"
             .to_string()
@@ -120,6 +143,8 @@ pub async fn run_attach(socket_path: &Path, config: ClientConfig) -> Result<Exit
         client_version: env!("CARGO_PKG_VERSION").to_string(),
         graphics,
         plain: config.plain,
+        read_only: config.read_only,
+        no_color: std::env::var_os("NO_COLOR").is_some(),
     };
     framed
         .send(Bytes::from(serde_json::to_vec(&hello)?))
@@ -137,10 +162,12 @@ pub async fn run_attach(socket_path: &Path, config: ClientConfig) -> Result<Exit
         AttachReady::Ok {
             session_id,
             session_name,
+            protocol,
             plain,
+            read_only,
             ..
         } => {
-            if let Some(why) = unmet_mode(config.plain, plain) {
+            if let Some(why) = unmet_mode(&config, protocol, plain, read_only) {
                 return Ok(ExitReason::Error(why));
             }
             (session_id, session_name)
@@ -714,19 +741,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn plain_unconfirmed_by_the_daemon_refuses_to_attach() {
-        assert!(unmet_mode(true, false).is_some());
-        assert!(unmet_mode(true, true).is_none());
-        assert!(unmet_mode(false, false).is_none());
-        // An old daemon's reply has no `plain`; serde reads it as false.
+    fn a_mode_unconfirmed_by_the_daemon_refuses_to_attach() {
+        let v = ATTACH_PROTOCOL_VERSION;
+        let asked = |plain, read_only| ClientConfig {
+            plain,
+            read_only,
+            ..ClientConfig::default()
+        };
+        assert!(unmet_mode(&asked(true, false), v, false, false).is_some());
+        assert!(unmet_mode(&asked(true, false), v, true, false).is_none());
+        assert!(unmet_mode(&asked(false, false), v, false, false).is_none());
+        assert!(unmet_mode(&asked(false, true), v, false, true).is_none());
+        let absent =
+            unmet_mode(&asked(false, true), v, false, false).expect("read-only unconfirmed");
+        assert!(absent.contains("--read-only"), "{absent}");
+        assert!(
+            unmet_mode(&asked(false, false), v, false, true).is_some(),
+            "read-only unasked"
+        );
+        // An old daemon's reply has neither mode and an older protocol.
         let old: AttachReady = serde_json::from_str(
             r#"{"kind":"ok","session_id":"s","session_name":"n","active_window_id":"w","active_pane_id":"p","protocol":1}"#,
         )
         .unwrap();
-        let AttachReady::Ok { plain, .. } = old else {
+        let AttachReady::Ok {
+            protocol,
+            plain,
+            read_only,
+            ..
+        } = old
+        else {
             panic!("ok reply");
         };
-        assert!(unmet_mode(true, plain).is_some());
+        let why = unmet_mode(&asked(false, true), protocol, plain, read_only).expect("old daemon");
+        assert!(why.contains("protocol 1"), "{why}");
+        assert!(unmet_mode(&asked(true, false), v, plain, read_only).is_some());
     }
 
     #[test]

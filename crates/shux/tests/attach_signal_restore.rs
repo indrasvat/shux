@@ -513,6 +513,8 @@ async fn headless_attach(
         client_version: "attach-teardown-test".to_string(),
         graphics: false,
         plain: false,
+        read_only: false,
+        no_color: false,
     };
     framed
         .send(Bytes::from(serde_json::to_vec(&hello).unwrap()))
@@ -788,6 +790,7 @@ async fn a_resize_during_the_handshake_reaches_the_daemon() {
         active_pane_id: "stand-in".into(),
         protocol: ATTACH_PROTOCOL_VERSION,
         plain: false,
+        read_only: false,
     };
     framed
         .send(Bytes::from(serde_json::to_vec(&ready).unwrap()))
@@ -863,6 +866,7 @@ async fn a_connection_cut_mid_frame_is_reported_as_lost() {
         active_pane_id: "stand-in".into(),
         protocol: ATTACH_PROTOCOL_VERSION,
         plain: false,
+        read_only: false,
     };
     framed
         .send(Bytes::from(serde_json::to_vec(&ready).unwrap()))
@@ -915,6 +919,7 @@ async fn plain_unconfirmed_by_the_daemon_fails_without_touching_the_terminal() {
         active_pane_id: "stand-in".into(),
         protocol: ATTACH_PROTOCOL_VERSION,
         plain: false,
+        read_only: false,
     };
     framed
         .send(Bytes::from(serde_json::to_vec(&ready).unwrap()))
