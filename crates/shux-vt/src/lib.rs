@@ -26,7 +26,8 @@ pub use capture::{
 };
 pub use cast::{CastWriter, cast_complete_prefix};
 pub use cell::{
-    Cell, CellFlags, CellStyle, Color, ExtendedAttrs, Rgb, TerminalDefaultColors, UnderlineStyle,
+    Cell, CellFlags, CellMeta, CellStyle, Color, ExtendedAttrs, Rgb, TerminalDefaultColors,
+    UnderlineStyle,
 };
 pub use charset::{CharsetSlot, TerminalCharset, TerminalCharsets};
 pub use commands::{
@@ -1997,6 +1998,78 @@ mod tests {
         );
         assert_eq!(g, p);
         assert_eq!(gap.capture_text(None), plain.capture_text(None));
+    }
+
+    #[test]
+    fn the_wide_gap_mark_is_not_an_extended_attribute() {
+        let mut vt = VirtualTerminal::new(4, 3);
+        vt.process("ab界".as_bytes());
+        assert!(vt.grid().visible_row(0)[2].extended.is_none());
+        vt.grid.visible_row_mut(0)[2].prune_default_extended();
+        vt.resize(4, 8);
+        assert_eq!(visible_text(&vt, 0), "ab界");
+    }
+
+    #[test]
+    fn the_wide_gap_mark_costs_no_cell_space() {
+        assert_eq!(std::mem::size_of::<Cell>(), 24);
+    }
+
+    #[test]
+    fn deleting_before_a_wide_gap_adds_no_space() {
+        let mut vt = VirtualTerminal::new(4, 3);
+        vt.process("ab界\x1b[1;1H\x1b[1P".as_bytes());
+        vt.resize(4, 8);
+        assert_eq!(visible_text(&vt, 0), "b界");
+    }
+
+    #[test]
+    fn a_cursor_after_a_printed_separator_keeps_its_insertion_point() {
+        for text in ["ABCDE ", "ABCD ", "AB   "] {
+            let mut vt = VirtualTerminal::new(4, 10);
+            vt.process(text.as_bytes());
+            vt.resize(4, 5);
+            vt.process(b"X");
+            assert_eq!(visible_text(&vt, 0), text.trim_end(), "{text:?}");
+            assert_eq!(visible_text(&vt, 1), "X", "{text:?}");
+        }
+        let mut vt = VirtualTerminal::new(4, 10);
+        vt.process(b"ABCDE ");
+        vt.resize(4, 5);
+        vt.resize(4, 10);
+        vt.process(b"X");
+        assert_eq!(visible_text(&vt, 0), "ABCDEX", "widened again");
+    }
+
+    #[test]
+    fn a_cup_into_trailing_padding_stays_on_coordinates() {
+        let mut vt = VirtualTerminal::new(4, 80);
+        vt.process(b"abc\x1b[1;21H");
+        vt.resize(4, 10);
+        vt.process(b"X");
+        assert_eq!(visible_text(&vt, 0), "abc      X");
+        assert_eq!(visible_text(&vt, 1), "");
+    }
+
+    #[test]
+    fn the_trim_floor_is_the_reflowed_history_boundary() {
+        // Widen while shrinking: the history line unwraps to one row.
+        let mut vt = VirtualTerminal::new(3, 5);
+        vt.process(b"HHHHHHHHHH\r\nTOP\r\nmid\r\n\x1b[2;4H");
+        assert_eq!(vt.scrollback_len(), 2);
+        vt.resize(2, 10);
+        assert_eq!(visible_text(&vt, 0), "TOP", "widen");
+        assert_eq!(visible_text(&vt, 1), "mid", "widen");
+    }
+
+    #[test]
+    fn the_trim_floor_follows_history_that_grows_on_a_narrow() {
+        let mut vt = VirtualTerminal::new(3, 10);
+        vt.process(b"HHHHHHHHHH\r\nTOP\r\nmid\r\n\x1b[2;4H");
+        assert_eq!(vt.scrollback_len(), 1);
+        vt.resize(3, 5);
+        assert_eq!(visible_text(&vt, 0), "TOP", "narrow");
+        assert_eq!(visible_text(&vt, 1), "mid", "narrow");
     }
 
     #[test]

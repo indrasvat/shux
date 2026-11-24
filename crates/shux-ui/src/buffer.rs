@@ -124,7 +124,7 @@ impl RenderCell {
                 hidden: flags.contains(shux_vt::CellFlags::HIDDEN),
                 strikethrough: flags.contains(shux_vt::CellFlags::STRIKETHROUGH),
             },
-            extended: cell.visible_extended().cloned(),
+            extended: cell.extended.clone(),
             wide_continuation: cell.is_wide_continuation(),
         }
     }
@@ -473,6 +473,7 @@ mod tests {
                 flags: shux_vt::CellFlags::default(),
             },
             extended: None,
+            meta: Default::default(),
         };
         let render_cell = RenderCell::from(&vt_cell);
         assert_eq!(render_cell.ch, 'X');
@@ -525,6 +526,7 @@ mod tests {
                 flags,
             },
             extended: None,
+            meta: Default::default(),
         };
         let render_cell = RenderCell::from(&vt_cell);
         assert!(render_cell.attrs.bold);
@@ -554,6 +556,7 @@ mod tests {
             width: 1,
             style: shux_vt::CellStyle::default(),
             extended: Some(extended.clone()),
+            meta: Default::default(),
         };
 
         let render_cell = RenderCell::from(&vt_cell);

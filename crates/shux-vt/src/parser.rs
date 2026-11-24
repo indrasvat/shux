@@ -378,6 +378,7 @@ impl<'a> VtHandler<'a> {
             width: 1,
             style: self.cursor.style,
             extended: None,
+            meta: Default::default(),
         }
     }
 
@@ -693,6 +694,7 @@ impl<'a> VtHandler<'a> {
                 width: width as u8,
                 style: self.cursor.style,
                 extended,
+                meta: Default::default(),
             };
 
             // For wide characters, write a continuation cell.

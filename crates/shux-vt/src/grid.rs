@@ -214,7 +214,7 @@ fn is_padding(cell: &Cell) -> bool {
         && cell.width == 1
         && cell.style.fg == Color::Default
         && cell.style.flags == Default::default()
-        && cell.visible_extended().is_none()
+        && cell.extended.is_none()
 }
 
 fn is_default_blank(cell: &Cell) -> bool {
@@ -1558,9 +1558,14 @@ impl Grid {
         let mut anchors = Vec::with_capacity(points.len());
         let mut logical_lines = Vec::new();
         let mut current = LogicalLine::default();
+        // Where the old viewport began, to find where history ends after reflow.
+        let mut viewport_top = (0, 0);
 
         for (abs_row, row) in self.raw.iter().enumerate() {
             let cells = row.reflow_cells();
+            if abs_row == old_scrollback_len {
+                viewport_top = (logical_lines.len(), current.read_width);
+            }
             for (point, p) in points.iter().enumerate() {
                 if old_scrollback_len + p.row == abs_row {
                     let col = p.col + usize::from(p.past_glyph);
@@ -1605,7 +1610,9 @@ impl Grid {
         while reflowed.len() < new_rows {
             reflowed.push_back(Row::new(new_cols));
         }
-        let min_total_to_keep = old_scrollback_len.min(self.config.max_scrollback) + new_rows;
+        let (top_line, top_offset) = viewport_top;
+        let history = line_ranges[top_line].position_for_offset(top_offset).0;
+        let min_total_to_keep = history.min(self.config.max_scrollback) + new_rows;
         while reflowed.len() > min_total_to_keep
             && floor.is_none_or(|floor| reflowed.len() - 1 > floor)
             && reflowed.back().is_some_and(|row| !row_has_content(row))
@@ -1661,15 +1668,19 @@ impl Grid {
 
 impl ReflowedLineMap {
     /// `(abs_row, col, past_glyph)` for a display offset into the logical
-    /// line. Past the content, the offset counts on along the final row.
+    /// line. Past the content, the offset counts on along the final row. A
+    /// position at the edge, or one the edge would clamp onto content,
+    /// becomes a deferred wrap at the last column; one further out in blank
+    /// columns clamps to them.
     fn position_for_offset(&self, offset: usize) -> (usize, usize, bool) {
         let last_col = self.cols.saturating_sub(1);
         if offset >= self.display_width {
-            let extra = offset - self.display_width;
-            if extra == 0 && self.end_col >= self.cols && self.display_width > 0 {
-                return (self.end_row, last_col, true);
+            let target = self.end_col + (offset - self.display_width);
+            if target < self.cols {
+                return (self.end_row, target, false);
             }
-            return (self.end_row, (self.end_col + extra).min(last_col), false);
+            let past = target == self.cols || self.end_col >= self.cols;
+            return (self.end_row, last_col, past);
         }
 
         for cell in &self.cells {
@@ -1683,11 +1694,19 @@ impl ReflowedLineMap {
 }
 
 impl Row {
-    /// The cells a reflow reads: all of them, less a wide-gap blank that
-    /// still ends a soft-wrapped row.
+    /// The cells a reflow reads: all of them, less the wide-gap blanks that
+    /// still end a soft-wrapped row.
     fn reflow_cells(&self) -> &[Cell] {
-        let gap = self.wrapped && self.cells.last().is_some_and(Cell::is_wide_gap);
-        &self.cells[..self.cells.len() - usize::from(gap)]
+        let gaps = if self.wrapped {
+            self.cells
+                .iter()
+                .rev()
+                .take_while(|c| c.is_wide_gap())
+                .count()
+        } else {
+            0
+        };
+        &self.cells[..self.cells.len() - gaps]
     }
 }
 
@@ -1854,21 +1873,19 @@ impl Grid {
         if actual == 0 {
             return;
         }
-        // Shift left. A wide gap belongs to the edge, so it stays there.
+        // Shift left. Blanks filling in after a wide gap at the edge are gap too.
         let cells = r.cells_mut();
-        let edge_gap = cells[len - 1].is_wide_gap();
+        let fill = if cells[len - 1].is_wide_gap() {
+            Cell::wide_gap(Cell::default())
+        } else {
+            Cell::default()
+        };
         for i in col..(len - actual) {
             cells[i] = cells[i + actual].clone();
-            if cells[i].is_wide_gap() {
-                cells[i].extended = None;
-            }
         }
         // Fill right edge with blanks.
         for cell in cells.iter_mut().skip(len - actual) {
-            *cell = Cell::default();
-        }
-        if edge_gap {
-            cells[len - 1] = Cell::wide_gap(Cell::default());
+            *cell = fill.clone();
         }
         r.sanitize_wide_pairs(Color::Default);
         self.dirty
@@ -1905,6 +1922,7 @@ mod tests {
             width: 2,
             style: CellStyle::default(),
             extended: None,
+            meta: Default::default(),
         };
         row[col + 1] = Cell::wide_continuation();
     }
@@ -2124,6 +2142,7 @@ mod tests {
                 flags,
             },
             extended: Some(ext.clone()),
+            meta: Default::default(),
         };
 
         grid.resize(4, 2);
@@ -2146,6 +2165,7 @@ mod tests {
             width: 2,
             style: CellStyle::default(),
             extended: None,
+            meta: Default::default(),
         };
         grid.visible_row_mut(0)[2] = Cell::wide_continuation();
         grid.visible_row_mut(0).wrapped = true;

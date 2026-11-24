@@ -846,7 +846,7 @@ fn cell_is_blank_default(cell: &Cell) -> bool {
     cell.ch == ' '
         && cell.width == 1
         && cell.style == CellStyle::default()
-        && cell.visible_extended().is_none()
+        && cell.extended.is_none()
 }
 
 struct RunBuilder {
@@ -1090,6 +1090,7 @@ fn make_cell(
         width,
         style: *cell_style,
         extended: style.to_extended(grapheme).map(std::sync::Arc::new),
+        meta: Default::default(),
     }
 }
 
@@ -1102,6 +1103,7 @@ fn mask_placeholder() -> Cell {
         width: 1,
         style: CellStyle::default(),
         extended: None,
+        meta: Default::default(),
     }
 }
 

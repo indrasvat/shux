@@ -91,27 +91,32 @@ pub struct Cell {
     pub width: u8,
     /// Style attributes.
     pub style: CellStyle,
-    /// Extended attributes (hyperlink, underline color, etc.). Read it through
-    /// [`Cell::visible_extended`]: it may hold the wide-gap mark.
+    /// Extended attributes (hyperlink, underline color, etc.).
     pub extended: Option<Arc<ExtendedAttrs>>,
+    /// Grid bookkeeping. Never drawn or captured, and ignored by equality.
+    pub meta: CellMeta,
 }
 
-/// Equality ignores the wide-gap mark: it never changes what a cell shows.
+/// Equality ignores `meta`: it never changes what a cell shows.
 impl PartialEq for Cell {
     fn eq(&self, other: &Self) -> bool {
         self.ch == other.ch
             && self.width == other.width
             && self.style == other.style
-            && self.visible_extended() == other.visible_extended()
+            && self.extended == other.extended
     }
 }
 
 impl Eq for Cell {}
 
-/// The mark on the blank a wrap leaves where a wide glyph did not fit: all
-/// default attributes, told apart by identity.
-static WIDE_GAP: std::sync::LazyLock<Arc<ExtendedAttrs>> =
-    std::sync::LazyLock::new(|| Arc::new(ExtendedAttrs::default()));
+/// A cell's grid bookkeeping. It sits in `Cell`'s padding, so costs no space.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CellMeta(u8);
+
+impl CellMeta {
+    /// The blank a wrap left where a wide glyph did not fit.
+    const WIDE_GAP: u8 = 0b0000_0001;
+}
 
 /// Extended attributes that are rare enough to be heap-allocated.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,6 +168,7 @@ impl Cell {
             flags: CellFlags(0),
         },
         extended: None,
+        meta: CellMeta(0),
     };
 
     /// One cell of the DECALN screen-alignment pattern (`ESC # 8`, issue #117).
@@ -180,6 +186,7 @@ impl Cell {
             flags: CellFlags(0),
         },
         extended: None,
+        meta: CellMeta(0),
     };
 
     /// A wide-character continuation cell (placeholder for the second column).
@@ -189,6 +196,7 @@ impl Cell {
             width: 0,
             style: CellStyle::default(),
             extended: None,
+            meta: CellMeta::default(),
         }
     }
 
@@ -201,23 +209,13 @@ impl Cell {
     /// drops it; every reader sees `blank`.
     pub(crate) fn wide_gap(blank: Cell) -> Cell {
         Cell {
-            extended: Some(WIDE_GAP.clone()),
+            meta: CellMeta(blank.meta.0 | CellMeta::WIDE_GAP),
             ..blank
         }
     }
 
     pub(crate) fn is_wide_gap(&self) -> bool {
-        self.extended
-            .as_ref()
-            .is_some_and(|ext| Arc::ptr_eq(ext, &WIDE_GAP))
-    }
-
-    /// The extended attributes this cell shows: `extended` less the wide-gap
-    /// mark.
-    pub fn visible_extended(&self) -> Option<&Arc<ExtendedAttrs>> {
-        self.extended
-            .as_ref()
-            .filter(|ext| !Arc::ptr_eq(ext, &WIDE_GAP))
+        self.meta.0 & CellMeta::WIDE_GAP != 0
     }
 
     /// Whether this cell is a wide character (width 2).
@@ -327,6 +325,7 @@ impl Cell {
             flags: CellFlags(0),
         };
         self.extended = None;
+        self.meta = CellMeta::default();
     }
 }
 
@@ -363,6 +362,7 @@ mod tests {
                 flags: CellFlags(CellFlags::BOLD),
             },
             extended: None,
+            meta: Default::default(),
         };
         cell.reset(Color::Rgb(10, 20, 30));
         assert_eq!(cell.ch, ' ');
@@ -427,6 +427,7 @@ mod tests {
             width: 1,
             style: CellStyle::default(),
             extended: Some(Arc::new(ext)),
+            meta: Default::default(),
         };
         let ext = cell.extended.as_ref().unwrap();
         assert_eq!(ext.hyperlink.as_deref(), Some("https://example.com"));
