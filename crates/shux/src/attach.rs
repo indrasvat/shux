@@ -461,6 +461,29 @@ trait AttachStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin 
 
 impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static> AttachStream for S {}
 
+/// What an attach reads the daemon through. No PTY writer is among it: a
+/// connection holds one only once its hello is writable.
+#[derive(Clone)]
+pub struct AttachDeps {
+    pub graph: GraphHandle,
+    pub io_state: Arc<Mutex<PaneIoState>>,
+    pub config: ConfigHandle,
+    pub segments: SegmentCache,
+    pub meta_cache: crate::session_meta::SessionMetaCache,
+    pub onboarding: crate::onboarding::OnboardingHandle,
+    pub daemon_start: std::time::Instant,
+}
+
+/// Who decides what a connection may do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    /// Its hello: any session by name or id, writable or read-only.
+    Hello,
+    /// An in-process browser viewer: read-only, plain, to exactly this
+    /// session, drawn without the status bar.
+    Browser(SessionId),
+}
+
 /// Handle one attach connection: handshake, then run the streaming loop.
 #[expect(clippy::too_many_arguments, reason = "independent inputs")]
 async fn handle_attach_connection(
@@ -474,6 +497,46 @@ async fn handle_attach_connection(
     daemon_start: std::time::Instant,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
+    let deps = AttachDeps {
+        graph,
+        io_state,
+        config,
+        segments,
+        meta_cache,
+        onboarding,
+        daemon_start,
+    };
+    serve_connection(stream, deps, cancel, Scope::Hello).await
+}
+
+/// The share gateway's attach (#297): read-only and plain to exactly
+/// `session` whatever its hello names, without a status bar, and with no way
+/// to write to a pane: this connection never holds a [`PtyWrite`]. It reports
+/// each size it draws at with [`AttachServerFrame::Resized`] before the frame.
+pub async fn serve_read_only(
+    stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+    deps: AttachDeps,
+    session: SessionId,
+    cancel: CancellationToken,
+) -> anyhow::Result<()> {
+    serve_connection(stream, deps, cancel, Scope::Browser(session)).await
+}
+
+async fn serve_connection(
+    stream: impl AttachStream,
+    deps: AttachDeps,
+    cancel: CancellationToken,
+    scope: Scope,
+) -> anyhow::Result<()> {
+    let AttachDeps {
+        graph,
+        io_state,
+        config,
+        segments,
+        meta_cache,
+        onboarding,
+        daemon_start,
+    } = deps;
     let (stream, taken) = crate::write_progress::Metered::new(stream);
     let mut framed = Framed::new(stream, create_codec());
 
@@ -517,11 +580,32 @@ async fn handle_attach_connection(
         return Ok(());
     }
 
+    if let Scope::Browser(_) = scope
+        && !(hello.read_only && hello.plain)
+    {
+        send_ready_error(
+            &mut framed,
+            "read_only_required",
+            "this connection only attaches read-only and plain",
+        )
+        .await?;
+        return Ok(());
+    }
     let read_only = hello.read_only;
 
     // Step 2: Resolve the target session. A watcher only finds one.
-    let resolved =
-        resolve_or_create_session(&graph, &hello.session_name, &meta_cache, !read_only).await;
+    let resolved = match scope {
+        Scope::Browser(id) => {
+            let snap = graph.snapshot();
+            match snap.sessions.get(&id) {
+                Some(sess) => attached_to(&snap, sess),
+                None => Err(anyhow::anyhow!("session {id} not found")),
+            }
+        }
+        Scope::Hello => {
+            resolve_or_create_session(&graph, &hello.session_name, &meta_cache, !read_only).await
+        }
+    };
     let mut session = match resolved {
         Ok(s) => s,
         Err(e) => {
@@ -530,6 +614,7 @@ async fn handle_attach_connection(
         }
     };
     session.read_only = read_only;
+    session.browser = matches!(scope, Scope::Browser(_));
     // A watcher writes nothing to disk: no toast to dismiss for good.
     session.show_welcome_toast = !read_only;
 
@@ -699,6 +784,9 @@ struct AttachedSession {
     redraw: Arc<tokio::sync::Notify>,
     /// `Prefix r`: the next frame repaints every cell, changed or not.
     repaint: bool,
+    /// The share gateway's guest: no status bar, its row given to the panes,
+    /// and each new size announced before the frame drawn at it.
+    browser: bool,
 }
 
 impl AttachedSession {
@@ -800,6 +888,7 @@ fn attached_to(
         read_only: false,
         redraw: Arc::default(),
         repaint: false,
+        browser: false,
     })
 }
 
@@ -1955,11 +2044,13 @@ async fn run_render_loop(
         (io.render_pulse.subscribe(), io.clients.clone())
     };
     let (mut cols, mut rows) = *client_size.lock().await;
+    let browser = session.lock().await.browser;
+    let bar_rows = if browser { 0 } else { STATUS_BAR_ROWS };
     let initial = config.current();
     let initial_theme = shux_core::theme::Theme::resolve(&initial.theme);
     let cfg = CompositorConfig {
         show_border: false,
-        status_bar_height: STATUS_BAR_ROWS,
+        status_bar_height: bar_rows,
         border_style: BorderStyle::parse(&initial.appearance.border_style),
         border_colors: shux_ui::BorderColors::from_theme(&initial_theme),
     };
@@ -2094,6 +2185,15 @@ async fn run_render_loop(
             cols = new_cols;
             rows = new_rows;
             compositor.resize(cols, rows);
+            // Every byte after this is drawn for the new grid.
+            if browser
+                && out_tx
+                    .send(AttachServerFrame::Resized { cols, rows })
+                    .await
+                    .is_err()
+            {
+                break;
+            }
         }
 
         // Apply any config-driven appearance changes to the compositor.
@@ -2180,7 +2280,7 @@ async fn run_render_loop(
             zoom: win.layout.zoom.as_ref(),
             cols,
             rows,
-            status_bar_height: STATUS_BAR_ROWS,
+            status_bar_height: bar_rows,
             border_style: BorderStyle::parse(&last_border_style),
             panes: &shux_ui::PresentedPane::of_vts(&vt_refs),
             now_ns: now(),
@@ -2363,7 +2463,7 @@ async fn run_render_loop(
             focused: attached.active_pane_id,
             vts: &vt_refs,
             chrome: Some(&pane_chrome),
-            status_bar: Some(&bar),
+            status_bar: (!browser).then_some(&bar),
             geometry: Some(&geometry),
         };
         compositor.set_cursor_hidden(
@@ -5941,6 +6041,7 @@ mod tests {
             read_only: false,
             redraw: Arc::default(),
             repaint: false,
+            browser: false,
         };
 
         AttachFixture {
