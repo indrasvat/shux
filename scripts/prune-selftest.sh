@@ -54,15 +54,17 @@ dead_pid() {
   done
 }
 
-# start_fake <exe> <argv0> <cwd> <fifo>: a process blocked opening a fifo until
-# cleanup kills it; FAKE is its pid, returned once it has exec'd.
+# start_fake <exe> <argv0> <cwd> <script>: perl (or a link to it, which names the
+# process) running a script that sleeps until cleanup kills it; FAKE is its pid,
+# returned once it has exec'd. Perl, not cat or sleep: coreutils built as one
+# multicall binary (uutils, on ubuntu-latest) refuses to run under another name.
 start_fake() {
-  local exe="$1" argv0="$2" cwd="$3" arg="$4" fifo i args
-  fifo="${arg}"
-  [[ "${fifo}" == /* ]] || fifo="${cwd}/${arg}"
-  [[ -p "${fifo}" ]] || mkfifo "${fifo}"
+  local exe="$1" argv0="$2" cwd="$3" arg="$4" script i args
+  script="${arg}"
+  [[ "${script}" == /* ]] || script="${cwd}/${arg}"
+  [[ -e "${script}" ]] || echo 'sleep 3600 while 1;' >"${script}"
   # Its stdout detached, or a command substitution around the caller waits for it.
-  (cd "${cwd}" && exec -a "${argv0}" "${exe}" "${arg}") </dev/null >/dev/null 2>"${fifo}.err" &
+  (cd "${cwd}" && exec -a "${argv0}" "${exe}" "${arg}") </dev/null >/dev/null 2>"${script}.err" &
   FAKE=$!
   echo "${FAKE}" >>"${work}/pids"
   for i in $(seq 1 300); do
@@ -76,7 +78,7 @@ start_fake() {
   done
   echo "✗ prune self-test: ${argv0} never started; it shows as '${args}'" >&2
   ps -o pid=,stat=,comm=,args= -p "${FAKE}" >&2 || echo "  (pid ${FAKE} is gone)" >&2
-  sed 's/^/  stderr: /' "${fifo}.err" >&2
+  sed 's/^/  stderr: /' "${script}.err" >&2
   exit 1
 }
 
@@ -88,7 +90,7 @@ fixture() {
   local f="$1" script="$2" repo dead wt nl
   repo="${f}/repo"
   mkdir -p "${f}/bin"
-  ln -s "$(command -v cat)" "${f}/bin/cargo"
+  ln -s "$(command -v perl)" "${f}/bin/cargo"
   git init -q --bare "${f}/origin.git"
   git init -q "${repo}"
   mkdir -p "${repo}/scripts" "${repo}/.shux/scripts/lib" "${repo}/.shux/qa/kept" "${repo}/fuzz" "${repo}/crates"
@@ -190,11 +192,11 @@ fixture() {
   backdate "${OLD}" "${repo}/.shux/out/test-inventory" "${repo}/.shux/out/tracked"
 
   # Running "cargo"s: in a worktree nested in wt-pushed, and in wt-sub's submodule.
-  start_fake "${f}/bin/cargo" "${f}/bin/cargo" "${f}/wt-pushed/.claude/worktrees/busy" "${f}/busy.fifo"
-  start_fake "${f}/bin/cargo" "${f}/bin/cargo" "${f}/wt-sub/vendor/sub" "${f}/sub.fifo"
-  # A live shux daemon (a session) running repo's own build.
+  start_fake "${f}/bin/cargo" "${f}/bin/cargo" "${f}/wt-pushed/.claude/worktrees/busy" "${f}/busy.pl"
+  start_fake "${f}/bin/cargo" "${f}/bin/cargo" "${f}/wt-sub/vendor/sub" "${f}/sub.pl"
+  # A live shux daemon (a session) running repo's own build: args `<repo>/target/debug/shux __daemon`.
   mkdir -p "${f}/daemon"
-  start_fake "$(command -v cat)" "${repo}/target/debug/shux" "${f}/daemon" __daemon
+  start_fake "$(command -v perl)" "${repo}/target/debug/shux" "${f}/daemon" __daemon
   DAEMON="${FAKE}"
   echo "${DAEMON}" >"${f}/daemon.pid"
 
@@ -298,7 +300,7 @@ late_apply() (
   prune_plan >/dev/null
   printf '%s\n' "${P_PATH[@]}" | grep -qxF "${late}/wt-pushed/target" || { echo "late target not planned"; exit 3; }
   printf '%s\n' "${P_PATH[@]}" | grep -qxF "${late}/wt-merged/target" || { echo "late lock target not planned"; exit 3; }
-  start_fake "${late}/bin/cargo" "${late}/bin/cargo" "${late}/wt-pushed" "${late}/late.fifo"
+  start_fake "${late}/bin/cargo" "${late}/bin/cargo" "${late}/wt-pushed" "${late}/late.pl"
   cat "${late}/daemon.pid" >"${late}/tmp1/shuxlate/shux/shux.pid"
   git -C "${late}/repo" worktree lock "${late}/wt-merged"
   prune_apply
