@@ -129,6 +129,26 @@ vertical separator, which gives per-pane rects, and asserts:
 It was proven able to fail by building it with the size label turned off: the
 viewer's border then held no more than the driver's, and `label` went red.
 
+### Pictures cropped by a horizontal scroll
+
+`.shux/scripts/gui_terminal_image_crop.sh` pins one pane wider than its rect
+and has it draw two pictures of vertical colour bands: A at its own size, one
+band per cell, and B fitted to five cells, so its four bands are 1.25 cells
+wide and the crop cuts one of them mid-cell. The pane then moves its cursor
+right, so the slice starts eleven columns in (one cell into A, three into B),
+and back home. `lib/kitty_image_crop_verdict.py` reads the band runs along a
+row through each picture and asserts:
+
+| Assertion | What a failure means |
+|---|---|
+| `whole` | a picture's bands are not drawn in order, at their widths, from its cell |
+| `cropped` | after the scroll, a picture does not start at the pane's left edge with the band that edge cuts, at the part of its width left (B: three quarters of a cell) |
+| `contained` | a band colour is painted outside the pane in any frame: on the border, the status bar or past the window |
+| `restored` | the pane does not draw exactly as it did before the scroll |
+
+It was proven able to fail against `444b6ba`, which took a picture down once
+its origin left the slice: `cropped` went red with neither picture drawn.
+
 ### Tools
 
 `kitty`, `Xvfb`, `xdotool`, ImageMagick's `import`, `python3`, `uv`. The rig
