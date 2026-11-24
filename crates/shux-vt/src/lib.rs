@@ -2374,6 +2374,27 @@ mod tests {
     }
 
     #[test]
+    fn an_erase_widened_over_a_wide_glyph_to_the_whole_row_cuts_the_history_link() {
+        let mut wrong = Vec::new();
+        for bytes in [
+            // EL 0 from the glyph's second cell widens to column 0.
+            "ABCDE界\r\n\x1b[1;2H\x1b[K\x1b[HXYZ",
+            // EL 1 and ECH ending on the glyph's first cell widen to the edge.
+            "ABCDEabc界\r\n\x1b[1;4H\x1b[1K\x1b[HXYZ",
+            "ABCDEabc界\r\n\x1b[H\x1b[4XXYZ",
+        ] {
+            let mut vt = VirtualTerminal::new(2, 5);
+            vt.process(bytes.as_bytes());
+            vt.resize(2, 10);
+            let got = (row_text(&vt, 0), visible_text(&vt, 0));
+            if got != ("ABCDE".to_string(), "XYZ".to_string()) {
+                wrong.push((bytes, got));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:?}");
+    }
+
+    #[test]
     fn row_shrink_without_a_parked_cursor_lets_erase_fill_yield() {
         let mut vt = VirtualTerminal::new(6, 10);
         vt.process(b"\x1b[44m\x1b[2J\x1b[0mAB\x1b7\x1b[?1047h");

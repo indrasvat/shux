@@ -1853,16 +1853,23 @@ impl Grid {
     /// Clearing the whole first visible row ends history's link into it.
     pub fn erase_chars(&mut self, row: usize, col: usize, count: usize, bg: Color) {
         self.bump_mutations();
-        let dirty = {
+        let erased = {
             let r = self.visible_row_mut_untracked(row);
             r.erase_chars_expanding_wide_pairs(col, count, bg)
         };
-        if let Some(range) = dirty {
-            self.dirty.mark_range(row, range, self.rows, self.cols);
-        }
-        if row == 0 && col == 0 && count >= self.cols {
+        self.after_erase(row, erased);
+    }
+
+    /// Mark what an erase actually cleared (wide pairs included) dirty. If
+    /// that is the whole first visible row, history's link into it ends.
+    fn after_erase(&mut self, row: usize, erased: Option<Range<usize>>) {
+        let Some(range) = erased else {
+            return;
+        };
+        if row == 0 && range.start == 0 && range.end >= self.cols {
             self.cut_history_link();
         }
+        self.dirty.mark_range(row, range, self.rows, self.cols);
     }
 
     /// Erase `row` from `col` to its end (ED 0, EL 0, EL 2). The row no
@@ -1871,17 +1878,12 @@ impl Grid {
     pub fn erase_to_row_end(&mut self, row: usize, col: usize, bg: Color) {
         self.bump_mutations();
         let count = self.cols.saturating_sub(col);
-        let dirty = {
+        let erased = {
             let r = self.visible_row_mut_untracked(row);
             r.wrapped = false;
             r.erase_chars_expanding_wide_pairs(col, count, bg)
         };
-        if let Some(range) = dirty {
-            self.dirty.mark_range(row, range, self.rows, self.cols);
-        }
-        if row == 0 && col == 0 {
-            self.cut_history_link();
-        }
+        self.after_erase(row, erased);
     }
 
     /// History's last row no longer continues into the first visible row.
