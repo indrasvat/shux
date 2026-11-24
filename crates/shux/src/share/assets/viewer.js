@@ -132,7 +132,8 @@ function onText(m) {
   switch (m.t) {
     case "ready":
       max = m.max;
-      expiresAt = new Date(m.expires_at);
+      // Counted down from the server's remaining time: this clock may be off.
+      expiresAt = new Date(Date.now() + m.expires_in_ms);
       applyPalette(m.palette);
       $("#session").textContent = m.session;
       showExpiry();

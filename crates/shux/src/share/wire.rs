@@ -47,10 +47,8 @@ pub enum Inbound {
 }
 
 impl Inbound {
+    /// The socket refuses a message over [`MAX_INBOUND`] before this sees it.
     pub fn parse(text: &str) -> Option<Self> {
-        if text.len() > MAX_INBOUND {
-            return None;
-        }
         serde_json::from_str(text).ok()
     }
 }
@@ -103,9 +101,8 @@ pub enum Outbound {
         palette: Palette,
         /// RFC 3339, UTC.
         expires_at: String,
+        /// The page counts down from this, whatever its own clock says.
         expires_in_ms: u64,
-        chunk: usize,
-        window: u64,
         max: Size,
     },
     /// The bytes from `at` on are drawn for this grid.
@@ -146,35 +143,25 @@ pub struct Credit {
     acked: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Lag {
-    /// More than [`BACKLOG`] waits for credit.
-    Backlog,
-    /// An acknowledgement past what was sent, or before the last one.
-    BadAck,
-}
-
 impl Credit {
-    pub fn sent(&self) -> u64 {
-        self.sent
-    }
     pub fn in_flight(&self) -> u64 {
         self.sent - self.acked
     }
 
-    pub fn push_bytes(&mut self, bytes: &[u8]) -> Result<(), Lag> {
+    /// Queues composed output; false once more than [`BACKLOG`] waits.
+    pub fn push_bytes(&mut self, bytes: &[u8]) -> bool {
         if bytes.is_empty() {
-            return Ok(());
+            return true;
         }
         self.queued_bytes += bytes.len();
         if self.queued_bytes > BACKLOG {
-            return Err(Lag::Backlog);
+            return false;
         }
         match self.queue.back_mut() {
             Some(Queued::Bytes(tail)) if tail.len() < CHUNK => tail.extend_from_slice(bytes),
             _ => self.queue.push_back(Queued::Bytes(bytes.to_vec())),
         }
-        Ok(())
+        true
     }
 
     pub fn push_text(&mut self, message: &Outbound) {
@@ -215,14 +202,15 @@ impl Credit {
         }
     }
 
-    /// Records an acknowledgement; true when it moved.
-    pub fn ack(&mut self, offset: u64) -> Result<bool, Lag> {
+    /// Records an acknowledgement: whether it moved, or `None` for one past
+    /// what was sent or before the last.
+    pub fn ack(&mut self, offset: u64) -> Option<bool> {
         if offset > self.sent || offset < self.acked {
-            return Err(Lag::BadAck);
+            return None;
         }
         let moved = offset > self.acked;
         self.acked = offset;
-        Ok(moved)
+        Some(moved)
     }
 }
 
@@ -257,8 +245,6 @@ mod tests {
         ] {
             assert_eq!(Inbound::parse(refused), None, "{refused}");
         }
-        let long = format!(r#"{{"t":"ack","offset":1{}}}"#, " ".repeat(MAX_INBOUND));
-        assert_eq!(Inbound::parse(&long), None);
     }
 
     #[test]
@@ -271,7 +257,7 @@ mod tests {
     #[test]
     fn no_more_than_the_window_is_ever_in_flight() {
         let mut credit = Credit::default();
-        credit.push_bytes(&vec![b'x'; 3 * WINDOW as usize]).unwrap();
+        assert!(credit.push_bytes(&vec![b'x'; 3 * WINDOW as usize]));
         let sent = drain(&mut credit);
         assert_eq!(credit.in_flight(), WINDOW);
         assert_eq!(sent.len(), WINDOW as usize / CHUNK);
@@ -280,7 +266,7 @@ mod tests {
             assert!(b.len() - 8 <= CHUNK);
         }
         assert!(credit.pop().is_none(), "sent past the window");
-        assert!(credit.ack(CHUNK as u64).unwrap());
+        assert_eq!(credit.ack(CHUNK as u64), Some(true));
         let Some(Queued::Bytes(next)) = credit.pop() else {
             panic!("an ack opened no credit");
         };
@@ -291,13 +277,13 @@ mod tests {
     #[test]
     fn a_resize_keeps_its_place_between_the_bytes() {
         let mut credit = Credit::default();
-        credit.push_bytes(b"old").unwrap();
+        assert!(credit.push_bytes(b"old"));
         credit.push_text(&Outbound::Resize {
             cols: 10,
             rows: 5,
             at: credit.position(),
         });
-        credit.push_bytes(b"new").unwrap();
+        assert!(credit.push_bytes(b"new"));
         let got = drain(&mut credit);
         assert!(matches!(&got[0], Queued::Bytes(b) if &b[8..] == b"old"));
         assert!(matches!(&got[1], Queued::Text(t) if t.contains(r#""at":3"#)));
@@ -307,15 +293,15 @@ mod tests {
     #[test]
     fn a_lagging_viewer_and_a_lying_ack_are_caught() {
         let mut credit = Credit::default();
-        credit.push_bytes(&vec![0; BACKLOG]).unwrap();
-        assert_eq!(credit.push_bytes(b"x"), Err(Lag::Backlog));
+        assert!(credit.push_bytes(&vec![0; BACKLOG]));
+        assert!(!credit.push_bytes(b"x"));
         let mut credit = Credit::default();
-        credit.push_bytes(b"abc").unwrap();
+        assert!(credit.push_bytes(b"abc"));
         drain(&mut credit);
-        assert_eq!(credit.ack(4), Err(Lag::BadAck));
-        assert_eq!(credit.ack(2), Ok(true));
-        assert_eq!(credit.ack(1), Err(Lag::BadAck));
-        assert_eq!(credit.ack(2), Ok(false));
+        assert_eq!(credit.ack(4), None);
+        assert_eq!(credit.ack(2), Some(true));
+        assert_eq!(credit.ack(1), None);
+        assert_eq!(credit.ack(2), Some(false));
     }
 
     proptest! {
@@ -324,8 +310,9 @@ mod tests {
         /// UTF-8 and escapes split across chunks are the parser's to join.
         #[test]
         fn chunks_reassemble_the_stream(
-            pushes in proptest::collection::vec(proptest::collection::vec(any::<u8>(), 0..70_000), 1..12),
-            ack_every in 1usize..5,
+            pushes in proptest::collection::vec(proptest::collection::vec(any::<u8>(), 0..400_000), 1..8),
+            // Past the window's 8 chunks, the window is what stops a drain.
+            ack_every in 1usize..20,
         ) {
             let mut credit = Credit::default();
             let mut want = Vec::new();
@@ -333,7 +320,7 @@ mod tests {
             let mut n = 0;
             for p in &pushes {
                 want.extend_from_slice(p);
-                credit.push_bytes(p).unwrap();
+                prop_assert!(credit.push_bytes(p));
                 while let Some(q) = credit.pop() {
                     let Queued::Bytes(b) = q else { unreachable!() };
                     prop_assert_eq!(offset_of(&b), got.len() as u64);
@@ -342,13 +329,14 @@ mod tests {
                     prop_assert!(credit.in_flight() <= WINDOW);
                     n += 1;
                     if n % ack_every == 0 {
-                        credit.ack(got.len() as u64).unwrap();
+                        prop_assert_eq!(credit.ack(got.len() as u64).map(|_| ()), Some(()));
                     }
                 }
-                credit.ack(got.len() as u64).unwrap();
+                prop_assert_eq!(credit.ack(got.len() as u64).map(|_| ()), Some(()));
             }
             while let Some(Queued::Bytes(b)) = credit.pop() {
                 got.extend_from_slice(&b[8..]);
+                prop_assert_eq!(credit.ack(got.len() as u64).map(|_| ()), Some(()));
             }
             prop_assert_eq!(got, want);
         }

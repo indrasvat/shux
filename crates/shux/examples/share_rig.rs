@@ -4,14 +4,12 @@
 //!
 //! Serves `$SHUX_SOCKET`, prints `{"addr": "127.0.0.1:N"}`, then answers one
 //! JSON line per request line:
-//! `{"op":"origin","origin":"https://…"}`, `{"op":"create","session":ID,"uses":N,"ttl_s":S}`
-//! (`uses` 0 is unlimited), `{"op":"revoke","id":ID}`, `{"op":"kick","viewer":ID}`,
-//! `{"op":"list"}`, `{"op":"sent"}`, `{"op":"stop"}`, `{"op":"quit"}`.
-
-use std::time::Duration;
+//! `{"op":"origin","origin":"https://…"}`, `{"op":"create","session":ID,"uses":N}`
+//! (`uses` 0 is unlimited), `{"op":"revoke","id":ID}`, `{"op":"list"}`,
+//! `{"op":"stop"}`, `{"op":"quit"}`.
 
 use serde_json::{Value, json};
-use shux::share::{CreateOpts, GrantId, Origin, Uses, ViewerId};
+use shux::share::{CreateOpts, GrantId, Origin, Uses};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 #[tokio::main]
@@ -40,9 +38,6 @@ async fn main() -> anyhow::Result<()> {
                 if let Some(n) = req["uses"].as_u64() {
                     opts.uses = std::num::NonZeroU32::new(u32::try_from(n)?).map_or(Uses::Unlimited, Uses::Limited);
                 }
-                if let Some(s) = req["ttl_s"].as_u64() {
-                    opts.ttl = Duration::from_secs(s);
-                }
                 match gw.create(opts) {
                     Ok(c) => json!({ "id": c.id.as_str(), "url": c.url }),
                     Err(e) => json!({ "error": e.to_string() }),
@@ -51,10 +46,6 @@ async fn main() -> anyhow::Result<()> {
             Some("revoke") => match GrantId::parse(&field("id")) {
                 Some(id) => json!({ "ok": gw.revoke(&id).await.is_ok() }),
                 None => json!({ "error": "bad id" }),
-            },
-            Some("kick") => match ViewerId::parse(&field("viewer")) {
-                Some(v) => json!({ "ok": gw.kick(&v).await.is_ok() }),
-                None => json!({ "error": "bad viewer" }),
             },
             Some("list") => json!(gw
                 .list()
@@ -66,7 +57,6 @@ async fn main() -> anyhow::Result<()> {
                     "viewers": g.viewers.iter().map(|v| json!({ "id": v.id.as_str(), "connected": v.connected })).collect::<Vec<_>>(),
                 }))
                 .collect::<Vec<_>>()),
-            Some("sent") => json!({ "sent": gw.bytes_sent() }),
             Some("stop") => {
                 gw.stop().await;
                 json!({ "ok": true })

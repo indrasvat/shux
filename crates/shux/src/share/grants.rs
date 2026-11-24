@@ -6,8 +6,13 @@
 //! cookie), so one viewer can be dropped without ending the link. Every
 //! operation takes the clock as an argument: the store decides nothing by
 //! reading time itself.
+//!
+//! No link takes the daemon: each holds at most [`MAX_VIEWERS_PER_LINK`]
+//! credentials and [`MAX_STREAMS_PER_LINK`] streams, a credential offline for
+//! [`OFFLINE_GRACE`] gives its place back, and one credential reconnects at
+//! most [`ADMIT_BURST`] times in [`ADMIT_WINDOW`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
@@ -26,6 +31,15 @@ pub const MAX_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 pub const MAX_GRANTS: usize = 64;
 /// Viewer credentials held at once, across the daemon.
 pub const MAX_VIEWERS: usize = 256;
+/// Credentials one link may hold: an eighth of the daemon's.
+pub const MAX_VIEWERS_PER_LINK: usize = 32;
+/// Streams one link may have open: a quarter of the daemon's.
+pub const MAX_STREAMS_PER_LINK: usize = 4;
+/// A credential with no stream for this long is dropped, and its place freed.
+pub const OFFLINE_GRACE: Duration = Duration::from_secs(10 * 60);
+/// Streams one credential may open within [`ADMIT_WINDOW`].
+pub const ADMIT_BURST: usize = 5;
+pub const ADMIT_WINDOW: Duration = Duration::from_secs(10);
 pub const MAX_LABEL: usize = 64;
 
 const ID_ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
@@ -66,6 +80,36 @@ fn presented(text: &str) -> Option<[u8; 32]> {
 
 fn same(a: &[u8; 32], b: &[u8; 32]) -> bool {
     bool::from(a.ct_eq(b))
+}
+
+/// A moment on both clocks. The monotonic one stops while a laptop sleeps
+/// and the wall one does not, so an expiry passes on whichever reaches it.
+#[derive(Debug, Clone, Copy)]
+pub struct Now {
+    pub mono: Instant,
+    pub wall: SystemTime,
+}
+
+impl Now {
+    pub fn current() -> Self {
+        Self {
+            mono: Instant::now(),
+            wall: SystemTime::now(),
+        }
+    }
+}
+
+/// When a link ends, on both clocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Expiry {
+    pub mono: Instant,
+    pub wall: SystemTime,
+}
+
+impl Expiry {
+    pub fn passed(&self, at: Now) -> bool {
+        at.mono >= self.mono || at.wall >= self.wall
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -208,8 +252,7 @@ impl Live {
 struct Grant {
     session: SessionId,
     digest: [u8; 32],
-    expires: Instant,
-    expires_wall: SystemTime,
+    expires: Expiry,
     /// `None` is unlimited.
     uses_left: Option<u32>,
     redeemed: u32,
@@ -221,23 +264,45 @@ struct Viewer {
     grant: GrantId,
     digest: [u8; 32],
     live: Option<Live>,
+    /// Since when it has had no stream; `None` while it streams.
+    offline_since: Option<Instant>,
+    /// When its recent streams were admitted, within [`ADMIT_WINDOW`].
+    admitted: VecDeque<Instant>,
 }
 
-/// A link just minted. `secret` exists only here.
-#[derive(Debug, Clone)]
+/// A link just minted. `secret` exists only here, and no debug print shows it.
+#[derive(Clone)]
 pub struct Minted {
     pub id: GrantId,
     pub secret: String,
     pub expires_wall: SystemTime,
 }
 
-/// A redemption that succeeded: the cookie value to set, once.
-#[derive(Debug, Clone)]
+impl std::fmt::Debug for Minted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Minted")
+            .field("id", &self.id)
+            .field("expires_wall", &self.expires_wall)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A redemption that succeeded: the cookie value to set, once, and never
+/// printed.
+#[derive(Clone)]
 pub struct Redeemed {
     pub viewer: ViewerId,
     pub cookie: String,
-    pub expires: Instant,
-    pub expires_wall: SystemTime,
+    pub expires: Expiry,
+}
+
+impl std::fmt::Debug for Redeemed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Redeemed")
+            .field("viewer", &self.viewer)
+            .field("expires", &self.expires)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -246,18 +311,19 @@ pub enum Refused {
     NotFound,
     /// The right secret for a link that has ended or has no uses left.
     Gone,
-    /// The daemon holds as many viewers as it will, or cannot mint one.
+    /// The daemon or the link holds as many viewers or streams as it will,
+    /// or a viewer cannot be minted.
     Full,
+    /// The credential reconnected too often of late.
+    Throttled,
 }
 
 /// A credential admitted to stream.
 #[derive(Debug, Clone)]
 pub struct Admitted {
     pub viewer: ViewerId,
-    pub grant: GrantId,
     pub session: SessionId,
-    pub expires: Instant,
-    pub expires_wall: SystemTime,
+    pub expires: Expiry,
     pub live: Live,
 }
 
@@ -295,12 +361,7 @@ pub struct Store {
 }
 
 impl Store {
-    pub fn create(
-        &mut self,
-        opts: CreateOpts,
-        now: Instant,
-        wall: SystemTime,
-    ) -> Result<Minted, CreateError> {
+    pub fn create(&mut self, opts: CreateOpts, at: Now) -> Result<Minted, CreateError> {
         if opts.ttl.is_zero() || opts.ttl > MAX_TTL {
             return Err(CreateError::Ttl);
         }
@@ -309,7 +370,7 @@ impl Store {
         {
             return Err(CreateError::Label);
         }
-        self.sweep(now);
+        let _ = self.end_grants(at, |_| false);
         if self.grants.len() >= MAX_GRANTS {
             return Err(CreateError::Full);
         }
@@ -320,14 +381,16 @@ impl Store {
             }
         };
         let (secret, digest) = fresh_secret().map_err(CreateError::Random)?;
-        let expires_wall = wall + opts.ttl;
+        let expires = Expiry {
+            mono: at.mono + opts.ttl,
+            wall: at.wall + opts.ttl,
+        };
         self.grants.insert(
             id.clone(),
             Grant {
                 session: opts.session,
                 digest,
-                expires: now + opts.ttl,
-                expires_wall,
+                expires,
                 uses_left: match opts.uses {
                     Uses::Limited(n) => Some(n.get()),
                     Uses::Unlimited => None,
@@ -339,21 +402,17 @@ impl Store {
         Ok(Minted {
             id,
             secret,
-            expires_wall,
+            expires_wall: expires.wall,
         })
     }
 
     /// Spends one use of `id` for whoever presents its secret. Atomic: the
     /// caller holds the store, so two redemptions of a one-use link cannot
     /// both pass.
-    pub fn redeem(
-        &mut self,
-        id: &GrantId,
-        secret: &str,
-        now: Instant,
-    ) -> Result<Redeemed, Refused> {
+    pub fn redeem(&mut self, id: &GrantId, secret: &str, at: Now) -> Result<Redeemed, Refused> {
         let presented = presented(secret);
         let viewers = self.viewers.len();
+        let of_link = self.viewers.values().filter(|v| v.grant == *id).count();
         let grant = self.grants.get_mut(id).ok_or(Refused::NotFound)?;
         // Compared whatever was presented, so a malformed secret costs what a
         // wrong one does.
@@ -361,10 +420,10 @@ impl Store {
         if !matched {
             return Err(Refused::NotFound);
         }
-        if grant.expires <= now || grant.uses_left == Some(0) {
+        if grant.expires.passed(at) || grant.uses_left == Some(0) {
             return Err(Refused::Gone);
         }
-        if viewers >= MAX_VIEWERS {
+        if viewers >= MAX_VIEWERS || of_link >= MAX_VIEWERS_PER_LINK {
             return Err(Refused::Full);
         }
         // Minted before the use is spent: a failure spends nothing.
@@ -379,20 +438,21 @@ impl Store {
             *left -= 1;
         }
         grant.redeemed += 1;
-        let (expires, expires_wall) = (grant.expires, grant.expires_wall);
+        let expires = grant.expires;
         self.viewers.insert(
             viewer.clone(),
             Viewer {
                 grant: id.clone(),
                 digest,
                 live: None,
+                offline_since: Some(at.mono),
+                admitted: VecDeque::new(),
             },
         );
         Ok(Redeemed {
             cookie: format!("{}.{secret}", viewer.0),
             viewer,
             expires,
-            expires_wall,
         })
     }
 
@@ -405,27 +465,27 @@ impl Store {
         (same(&presented, &held.digest) && held.grant == *grant).then_some(viewer)
     }
 
-    /// Whether `cookie` may stream `grant` now, without admitting it.
-    pub fn status(
-        &self,
-        grant: &GrantId,
-        cookie: &str,
-        now: Instant,
-    ) -> Option<(SessionId, SystemTime)> {
+    /// When `cookie`'s link ends, if it may stream `grant` now.
+    pub fn status(&self, grant: &GrantId, cookie: &str, at: Now) -> Option<SystemTime> {
         self.credential(grant, cookie)?;
-        let g = self.grants.get(grant).filter(|g| g.expires > now)?;
-        Some((g.session, g.expires_wall))
+        let g = self.grants.get(grant).filter(|g| !g.expires.passed(at))?;
+        Some(g.expires.wall)
     }
 
     /// Admits `cookie` to stream `grant`: one live stream per credential.
-    pub fn admit(&mut self, grant: &GrantId, cookie: &str, now: Instant) -> Admit {
+    pub fn admit(&mut self, grant: &GrantId, cookie: &str, at: Now) -> Admit {
         let Some(viewer) = self.credential(grant, cookie) else {
             return Admit::Refused(Refused::NotFound);
         };
-        let Some(g) = self.grants.get(grant).filter(|g| g.expires > now) else {
+        let Some(g) = self.grants.get(grant).filter(|g| !g.expires.passed(at)) else {
             return Admit::Refused(Refused::Gone);
         };
-        let (session, expires, expires_wall) = (g.session, g.expires, g.expires_wall);
+        let (session, expires) = (g.session, g.expires);
+        let streaming = self
+            .viewers
+            .iter()
+            .filter(|(id, v)| v.grant == *grant && v.live.is_some() && **id != viewer)
+            .count();
         let stream = self.next_stream;
         let Some(held) = self.viewers.get_mut(&viewer) else {
             return Admit::Refused(Refused::NotFound);
@@ -433,25 +493,39 @@ impl Store {
         if let Some(live) = &held.live {
             return Admit::Busy(live.clone());
         }
+        while held
+            .admitted
+            .front()
+            .is_some_and(|&t| t + ADMIT_WINDOW <= at.mono)
+        {
+            held.admitted.pop_front();
+        }
+        if held.admitted.len() >= ADMIT_BURST {
+            return Admit::Refused(Refused::Throttled);
+        }
+        if streaming >= MAX_STREAMS_PER_LINK {
+            return Admit::Refused(Refused::Full);
+        }
+        held.admitted.push_back(at.mono);
+        held.offline_since = None;
         self.next_stream += 1;
         let live = Live::new(stream);
         held.live = Some(live.clone());
         Admit::Ready(Admitted {
             viewer,
-            grant: grant.clone(),
             session,
             expires,
-            expires_wall,
             live,
         })
     }
 
     /// A stream has ended: its credential may stream again.
-    pub fn stream_ended(&mut self, viewer: &ViewerId, stream: u64) {
+    pub fn stream_ended(&mut self, viewer: &ViewerId, stream: u64, at: Instant) {
         if let Some(held) = self.viewers.get_mut(viewer)
             && held.live.as_ref().is_some_and(|l| l.stream == stream)
         {
             held.live = None;
+            held.offline_since = Some(at);
         }
     }
 
@@ -473,31 +547,31 @@ impl Store {
         self.drop_viewers(|_| true, EndReason::Stopped)
     }
 
-    /// Ends every link to `session` and every viewer they admitted.
-    pub fn end_session(&mut self, session: SessionId) -> Vec<Live> {
-        let gone: Vec<GrantId> = self
-            .grants
-            .iter()
-            .filter(|(_, g)| g.session == session)
-            .map(|(id, _)| id.clone())
-            .collect();
-        self.grants.retain(|_, g| g.session != session);
-        self.drop_viewers(|v| gone.contains(&v.grant), EndReason::SessionEnded)
-    }
-
-    /// Drops every link past its expiry, with its viewers.
-    pub fn sweep(&mut self, now: Instant) -> Vec<Live> {
-        let gone: Vec<GrantId> = self
-            .grants
-            .iter()
-            .filter(|(_, g)| g.expires <= now)
-            .map(|(id, _)| id.clone())
-            .collect();
-        if gone.is_empty() {
-            return Vec::new();
+    /// Ends every link past its expiry, and every link to a session `gone`
+    /// names, with all their viewers; drops credentials offline past
+    /// [`OFFLINE_GRACE`].
+    pub fn end_grants(&mut self, at: Now, gone: impl Fn(SessionId) -> bool) -> Vec<Live> {
+        let mut ended: Vec<(GrantId, EndReason)> = Vec::new();
+        self.grants.retain(|id, g| {
+            let why = if g.expires.passed(at) {
+                EndReason::Expired
+            } else if gone(g.session) {
+                EndReason::SessionEnded
+            } else {
+                return true;
+            };
+            ended.push((id.clone(), why));
+            false
+        });
+        let mut lives = Vec::new();
+        for (id, why) in ended {
+            lives.extend(self.drop_viewers(|v| v.grant == id, why));
         }
-        self.grants.retain(|id, _| !gone.contains(id));
-        self.drop_viewers(|v| gone.contains(&v.grant), EndReason::Expired)
+        self.viewers.retain(|_, v| {
+            v.offline_since
+                .is_none_or(|since| since + OFFLINE_GRACE > at.mono)
+        });
+        lives
     }
 
     fn drop_viewers(&mut self, which: impl Fn(&Viewer) -> bool, why: EndReason) -> Vec<Live> {
@@ -513,14 +587,6 @@ impl Store {
             false
         });
         ended
-    }
-
-    /// Sessions some link still points at.
-    pub fn sessions(&self) -> Vec<SessionId> {
-        let mut s: Vec<SessionId> = self.grants.values().map(|g| g.session).collect();
-        s.sort_unstable_by_key(ToString::to_string);
-        s.dedup();
-        s
     }
 
     pub fn list(&self) -> Vec<GrantInfo> {
@@ -542,7 +608,7 @@ impl Store {
                     id: id.clone(),
                     session: g.session,
                     label: g.label.clone(),
-                    expires_wall: g.expires_wall,
+                    expires_wall: g.expires.wall,
                     uses_left: g.uses_left,
                     redeemed: g.redeemed,
                     viewers,
@@ -563,10 +629,16 @@ mod tests {
         SessionId::new()
     }
 
-    fn mint(store: &mut Store, opts: CreateOpts, now: Instant) -> Minted {
-        store
-            .create(opts, now, SystemTime::UNIX_EPOCH)
-            .expect("mint")
+    /// `mono` on the monotonic clock, and a wall clock that holds still.
+    fn at(mono: Instant) -> Now {
+        Now {
+            mono,
+            wall: SystemTime::UNIX_EPOCH + Duration::from_secs(1 << 30),
+        }
+    }
+
+    fn mint(store: &mut Store, opts: CreateOpts, now: Now) -> Minted {
+        store.create(opts, now).expect("mint")
     }
 
     #[test]
@@ -586,7 +658,7 @@ mod tests {
 
     #[test]
     fn the_store_keeps_no_secret_it_hands_out() {
-        let now = Instant::now();
+        let now = at(Instant::now());
         let mut store = Store::default();
         let minted = mint(&mut store, CreateOpts::new(session()), now);
         let redeemed = store
@@ -596,11 +668,20 @@ mod tests {
         let cookie_secret = redeemed.cookie.split_once('.').unwrap().1;
         assert!(!dump.contains(&minted.secret), "the link secret is held");
         assert!(!dump.contains(cookie_secret), "the cookie secret is held");
+        // Nor does a debug print of what carries them.
+        assert!(
+            !format!("{minted:?}").contains(&minted.secret),
+            "{minted:?}"
+        );
+        assert!(
+            !format!("{redeemed:?}").contains(cookie_secret),
+            "{redeemed:?}"
+        );
     }
 
     #[test]
     fn a_link_is_one_use_unless_asked_and_its_secret_only_its_own() {
-        let now = Instant::now();
+        let now = at(Instant::now());
         let mut store = Store::default();
         let a = mint(&mut store, CreateOpts::new(session()), now);
         let b = mint(&mut store, CreateOpts::new(session()), now);
@@ -630,9 +711,9 @@ mod tests {
             ttl: Duration::from_secs(60),
             ..CreateOpts::new(session())
         };
-        let g = mint(&mut store, opts, now);
-        let r = store.redeem(&g.id, &g.secret, now).unwrap();
-        let later = now + Duration::from_secs(60);
+        let g = mint(&mut store, opts, at(now));
+        let r = store.redeem(&g.id, &g.secret, at(now)).unwrap();
+        let later = at(now + Duration::from_secs(60));
         assert_eq!(
             store.redeem(&g.id, &g.secret, later).unwrap_err(),
             Refused::Gone
@@ -641,13 +722,39 @@ mod tests {
             store.admit(&g.id, &r.cookie, later),
             Admit::Refused(Refused::Gone)
         ));
-        assert!(store.sweep(later).is_empty(), "nothing was streaming");
+        assert!(
+            store.end_grants(later, |_| false).is_empty(),
+            "nothing was streaming"
+        );
+        assert!(store.list().is_empty());
+    }
+
+    /// The monotonic clock stops while a laptop sleeps: an hour's link must
+    /// not outlive eight hours of it.
+    #[test]
+    fn a_link_expires_by_the_wall_clock_through_a_sleep() {
+        let mono = Instant::now();
+        let before = at(mono);
+        let mut store = Store::default();
+        let g = mint(&mut store, CreateOpts::new(session()), before);
+        let r = store.redeem(&g.id, &g.secret, before).unwrap();
+        let Admit::Ready(a) = store.admit(&g.id, &r.cookie, before) else {
+            panic!("not admitted");
+        };
+        let woke = Now {
+            mono,
+            wall: before.wall + Duration::from_secs(8 * 3600),
+        };
+        assert!(a.expires.passed(woke), "a stream would outlive its link");
+        assert_eq!(store.status(&g.id, &r.cookie, woke), None);
+        let ended = store.end_grants(woke, |_| false);
+        assert_eq!(ended[0].reason(), Some(EndReason::Expired));
         assert!(store.list().is_empty());
     }
 
     #[test]
     fn ttl_and_label_are_bounded() {
-        let now = Instant::now();
+        let now = at(Instant::now());
         let mut store = Store::default();
         let s = session();
         for (ttl, label, want) in [
@@ -670,7 +777,7 @@ mod tests {
                 label,
                 ..CreateOpts::new(s)
             };
-            let got = store.create(opts, now, SystemTime::UNIX_EPOCH).map(|_| ());
+            let got = store.create(opts, now).map(|_| ());
             assert_eq!(got, want);
         }
     }
@@ -682,22 +789,86 @@ mod tests {
         let now = Instant::now();
         let mut store = Store::default();
         for _ in 0..MAX_GRANTS {
-            mint(&mut store, CreateOpts::new(session()), now);
+            mint(&mut store, CreateOpts::new(session()), at(now));
         }
-        let over = store.create(CreateOpts::new(session()), now, SystemTime::UNIX_EPOCH);
+        let over = store.create(CreateOpts::new(session()), at(now));
         assert_eq!(over.unwrap_err(), CreateError::Full);
         // Expired links make room.
-        let later = now + DEFAULT_TTL;
-        assert!(
-            store
-                .create(CreateOpts::new(session()), later, SystemTime::UNIX_EPOCH)
-                .is_ok()
+        let later = at(now + DEFAULT_TTL);
+        assert!(store.create(CreateOpts::new(session()), later).is_ok());
+    }
+
+    /// An unlimited link takes at most its share of credentials and
+    /// streams, and an idle credential gives its place back.
+    #[test]
+    fn one_link_holds_a_share_of_the_daemon_and_idle_credentials_leave() {
+        // why: an origin handed to the store, which reads no clock; later instants are data
+        // ast-grep-ignore: test-wall-clock-unit
+        let now = Instant::now();
+        let mut store = Store::default();
+        let opts = CreateOpts {
+            uses: Uses::Unlimited,
+            ..CreateOpts::new(session())
+        };
+        let g = mint(&mut store, opts, at(now));
+        let cookies: Vec<String> = (0..MAX_VIEWERS_PER_LINK)
+            .map(|_| store.redeem(&g.id, &g.secret, at(now)).unwrap().cookie)
+            .collect();
+        assert_eq!(
+            store.redeem(&g.id, &g.secret, at(now)).unwrap_err(),
+            Refused::Full
         );
+        let other = mint(&mut store, CreateOpts::new(session()), at(now));
+        assert!(store.redeem(&other.id, &other.secret, at(now)).is_ok());
+        let admitted: Vec<_> = cookies
+            .iter()
+            .map(|c| store.admit(&g.id, c, at(now)))
+            .collect();
+        let ready = admitted
+            .iter()
+            .filter(|a| matches!(a, Admit::Ready(_)))
+            .count();
+        assert_eq!(ready, MAX_STREAMS_PER_LINK);
+        assert!(matches!(
+            admitted[MAX_STREAMS_PER_LINK],
+            Admit::Refused(Refused::Full)
+        ));
+        // Credentials with no stream leave after the grace period.
+        let later = at(now + OFFLINE_GRACE);
+        let _ = store.end_grants(later, |_| false);
+        let held: usize = store.list().iter().map(|g| g.viewers.len()).sum();
+        assert_eq!(held, MAX_STREAMS_PER_LINK, "only the streaming ones stay");
+        assert!(store.redeem(&g.id, &g.secret, later).is_ok());
+    }
+
+    #[test]
+    fn a_credential_reconnects_only_so_often() {
+        // why: an origin handed to the store, which reads no clock; later instants are data
+        // ast-grep-ignore: test-wall-clock-unit
+        let now = Instant::now();
+        let mut store = Store::default();
+        let g = mint(&mut store, CreateOpts::new(session()), at(now));
+        let r = store.redeem(&g.id, &g.secret, at(now)).unwrap();
+        for _ in 0..ADMIT_BURST {
+            let Admit::Ready(a) = store.admit(&g.id, &r.cookie, at(now)) else {
+                panic!("not admitted");
+            };
+            store.stream_ended(&a.viewer, a.live.stream(), now);
+        }
+        assert!(matches!(
+            store.admit(&g.id, &r.cookie, at(now)),
+            Admit::Refused(Refused::Throttled)
+        ));
+        assert!(matches!(
+            store.admit(&g.id, &r.cookie, at(now + ADMIT_WINDOW)),
+            Admit::Ready(_)
+        ));
     }
 
     #[test]
     fn a_cookie_streams_once_at_a_time_and_only_its_own_link() {
-        let now = Instant::now();
+        let mono = Instant::now();
+        let now = at(mono);
         let mut store = Store::default();
         let s = session();
         let a = mint(&mut store, CreateOpts::new(s), now);
@@ -715,12 +886,12 @@ mod tests {
         };
         assert_eq!(live.stream(), first.live.stream());
         // A stale end of an older stream does not free a newer one.
-        store.stream_ended(&first.viewer, first.live.stream() + 1);
+        store.stream_ended(&first.viewer, first.live.stream() + 1, mono);
         assert!(matches!(
             store.admit(&a.id, &ra.cookie, now),
             Admit::Busy(_)
         ));
-        store.stream_ended(&first.viewer, first.live.stream());
+        store.stream_ended(&first.viewer, first.live.stream(), mono);
         assert!(matches!(
             store.admit(&a.id, &ra.cookie, now),
             Admit::Ready(_)
@@ -735,7 +906,7 @@ mod tests {
 
     #[test]
     fn revoke_and_session_end_take_offline_viewers_too() {
-        let now = Instant::now();
+        let now = at(Instant::now());
         let mut store = Store::default();
         let (s1, s2) = (session(), session());
         let unlimited = |s| CreateOpts {
@@ -764,14 +935,14 @@ mod tests {
             store.admit(&b.id, &other.cookie, now),
             Admit::Ready(_)
         ));
-        let ended = store.end_session(s2);
+        let ended = store.end_grants(now, |s| s == s2);
         assert_eq!(ended[0].reason(), Some(EndReason::SessionEnded));
         assert!(store.list().is_empty());
     }
 
     #[test]
     fn kick_drops_one_viewer_and_keeps_the_link() {
-        let now = Instant::now();
+        let now = at(Instant::now());
         let mut store = Store::default();
         let opts = CreateOpts {
             uses: Uses::Limited(2.try_into().unwrap()),
@@ -796,13 +967,34 @@ mod tests {
 
     #[derive(Debug, Clone)]
     enum Op {
-        Create { uses: u8, ttl_s: u16 },
-        Redeem { grant: usize, right: bool },
-        Admit { viewer: usize },
-        End { viewer: usize },
-        Revoke { grant: usize },
-        Kick { viewer: usize },
-        Advance { s: u16 },
+        Create {
+            uses: u8,
+            ttl_s: u16,
+        },
+        Redeem {
+            grant: usize,
+            right: bool,
+        },
+        Admit {
+            viewer: usize,
+        },
+        End {
+            viewer: usize,
+        },
+        Revoke {
+            grant: usize,
+        },
+        Kick {
+            viewer: usize,
+        },
+        /// Both clocks run.
+        Advance {
+            s: u16,
+        },
+        /// Only the wall clock runs: the machine slept.
+        Sleep {
+            s: u16,
+        },
         Stop,
     }
 
@@ -815,24 +1007,56 @@ mod tests {
             (0usize..8).prop_map(|grant| Op::Revoke { grant }),
             (0usize..16).prop_map(|viewer| Op::Kick { viewer }),
             (0u16..300).prop_map(|s| Op::Advance { s }),
+            (0u16..300).prop_map(|s| Op::Sleep { s }),
             Just(Op::Stop),
         ]
     }
 
+    /// What the model holds of one link.
+    struct MGrant {
+        minted: Minted,
+        allowed: Option<u32>,
+        expires: Expiry,
+        ended: bool,
+    }
+
+    /// What the model holds of one credential.
+    struct MViewer {
+        grant: usize,
+        redeemed: Redeemed,
+        live: Option<Live>,
+        gone: bool,
+        offline_since: Instant,
+        admits: Vec<Instant>,
+    }
+
+    /// The store's sweep, in the model.
+    fn sweep(grants: &mut [MGrant], viewers: &mut [MViewer], now: Now) {
+        for g in grants.iter_mut() {
+            g.ended |= g.expires.passed(now);
+        }
+        for v in viewers.iter_mut() {
+            let idle = v.live.is_none() && v.offline_since + OFFLINE_GRACE <= now.mono;
+            if grants[v.grant].ended || idle {
+                v.gone = true;
+                v.live = None;
+            }
+        }
+    }
+
     proptest! {
-        /// Against a model of what each link allows: a link never admits
-        /// more redemptions than its uses, an ended link or a kicked viewer
-        /// never streams again, and no credential streams twice at once.
+        /// Against a model of what each link allows: a link never admits more
+        /// redemptions than its uses or its share of the daemon, an ended link
+        /// or a dropped credential never streams again, no credential streams
+        /// twice at once or reconnects past its rate, and expiry passes on
+        /// either clock.
         #[test]
         fn the_store_never_admits_what_its_links_forbid(ops in proptest::collection::vec(op(), 1..80)) {
-            let t0 = Instant::now();
-            let mut now = t0;
+            let mut now = at(Instant::now());
             let mut store = Store::default();
             let s = session();
-            // (minted, uses allowed, expiry, ended)
-            let mut grants: Vec<(Minted, Option<u32>, Instant, bool)> = Vec::new();
-            // (grant index, redeemed, live stream, kicked)
-            let mut viewers: Vec<(usize, Redeemed, Option<Live>, bool)> = Vec::new();
+            let mut grants: Vec<MGrant> = Vec::new();
+            let mut viewers: Vec<MViewer> = Vec::new();
             for op in ops {
                 match op {
                     Op::Create { uses, ttl_s } => {
@@ -842,101 +1066,114 @@ mod tests {
                             uses: std::num::NonZeroU32::new(u32::from(uses)).map_or(Uses::Unlimited, Uses::Limited),
                             ..CreateOpts::new(s)
                         };
-                        let m = store.create(opts, now, SystemTime::UNIX_EPOCH).expect("under the cap");
-                        let allowed = (uses > 0).then_some(u32::from(uses));
-                        grants.push((m, allowed, now + ttl, false));
+                        let m = store.create(opts, now).expect("under the cap");
+                        sweep(&mut grants, &mut viewers, now);
+                        let expires = Expiry { mono: now.mono + ttl, wall: now.wall + ttl };
+                        grants.push(MGrant { minted: m, allowed: (uses > 0).then_some(u32::from(uses)), expires, ended: false });
                     }
                     Op::Redeem { grant, right } => {
                         let Some(i) = (!grants.is_empty()).then(|| grant % grants.len()) else { continue };
-                        let (m, allowed, expires, ended) = &grants[i];
-                        let secret = if right { m.secret.clone() } else { fresh_secret().unwrap().0 };
-                        let spent = viewers.iter().filter(|v| v.0 == i).count() as u32;
-                        let open = !ended && *expires > now && allowed.is_none_or(|n| spent < n);
-                        match store.redeem(&m.id, &secret, now) {
+                        let g = &grants[i];
+                        let secret = if right { g.minted.secret.clone() } else { fresh_secret().unwrap().0 };
+                        let spent = viewers.iter().filter(|v| v.grant == i).count() as u32;
+                        let held = viewers.iter().filter(|v| v.grant == i && !v.gone).count();
+                        let open = !g.ended && !g.expires.passed(now) && g.allowed.is_none_or(|n| spent < n);
+                        match store.redeem(&g.minted.id, &secret, now) {
                             Ok(r) => {
-                                prop_assert!(right && open, "redeemed a link that forbids it");
-                                viewers.push((i, r, None, false));
+                                prop_assert!(right && open && held < MAX_VIEWERS_PER_LINK, "redeemed a link that forbids it");
+                                viewers.push(MViewer { grant: i, redeemed: r, live: None, gone: false, offline_since: now.mono, admits: Vec::new() });
                             }
-                            Err(Refused::NotFound) => prop_assert!(!right || *ended || *expires <= now),
-                            Err(Refused::Gone) => prop_assert!(right && !open),
-                            Err(Refused::Full) => prop_assert!(false, "no cap is near"),
+                            Err(Refused::NotFound) => prop_assert!(!right || g.ended),
+                            Err(Refused::Gone) => prop_assert!(right && !g.ended && !open),
+                            Err(Refused::Full) => prop_assert!(open && held >= MAX_VIEWERS_PER_LINK),
+                            Err(Refused::Throttled) => prop_assert!(false, "a redeem is never throttled"),
                         }
                     }
                     Op::Admit { viewer } => {
                         let Some(i) = (!viewers.is_empty()).then(|| viewer % viewers.len()) else { continue };
-                        let (g, r, live, kicked) = &viewers[i];
-                        let (m, _, expires, ended) = &grants[*g];
-                        let may = !kicked && !ended && *expires > now;
-                        match store.admit(&m.id, &r.cookie, now) {
+                        let g = viewers[i].grant;
+                        let others = viewers.iter().enumerate()
+                            .filter(|(j, v)| *j != i && v.grant == g && v.live.is_some())
+                            .count();
+                        let v = &mut viewers[i];
+                        let may = !v.gone && !grants[g].ended && !grants[g].expires.passed(now);
+                        v.admits.retain(|&t| t + ADMIT_WINDOW > now.mono);
+                        match store.admit(&grants[g].minted.id, &v.redeemed.cookie, now) {
                             Admit::Ready(a) => {
-                                prop_assert!(may && live.is_none(), "admitted a credential that may not stream");
-                                viewers[i].2 = Some(a.live);
+                                prop_assert!(may && v.live.is_none(), "admitted a credential that may not stream");
+                                prop_assert!(v.admits.len() < ADMIT_BURST && others < MAX_STREAMS_PER_LINK);
+                                v.admits.push(now.mono);
+                                v.live = Some(a.live);
                             }
                             Admit::Busy(l) => {
                                 prop_assert!(may);
-                                prop_assert_eq!(live.as_ref().map(Live::stream), Some(l.stream()));
+                                prop_assert_eq!(v.live.as_ref().map(Live::stream), Some(l.stream()));
                             }
+                            Admit::Refused(Refused::Throttled) => prop_assert!(may && v.admits.len() >= ADMIT_BURST),
+                            Admit::Refused(Refused::Full) => prop_assert!(may && others >= MAX_STREAMS_PER_LINK),
                             Admit::Refused(_) => prop_assert!(!may),
                         }
                     }
                     Op::End { viewer } => {
                         let Some(i) = (!viewers.is_empty()).then(|| viewer % viewers.len()) else { continue };
-                        if let Some(l) = viewers[i].2.take() {
-                            store.stream_ended(&viewers[i].1.viewer, l.stream());
+                        if let Some(l) = viewers[i].live.take() {
+                            store.stream_ended(&viewers[i].redeemed.viewer, l.stream(), now.mono);
+                            viewers[i].offline_since = now.mono;
                         }
                     }
                     Op::Revoke { grant } => {
                         let Some(i) = (!grants.is_empty()).then(|| grant % grants.len()) else { continue };
-                        let was_live = !grants[i].3 && grants[i].2 > now;
-                        let got = store.revoke(&grants[i].0.id);
-                        // A link past expiry may already be swept away.
-                        prop_assert!(got.is_some() || !was_live);
-                        grants[i].3 = true;
-                        for v in viewers.iter_mut().filter(|v| v.0 == i) {
-                            if let Some(l) = v.2.take() {
+                        let got = store.revoke(&grants[i].minted.id);
+                        prop_assert_eq!(got.is_some(), !grants[i].ended);
+                        grants[i].ended = true;
+                        for v in viewers.iter_mut().filter(|v| v.grant == i) {
+                            v.gone = true;
+                            if let Some(l) = v.live.take() {
                                 prop_assert!(l.stop().is_cancelled(), "a revoked viewer kept streaming");
                             }
                         }
                     }
                     Op::Kick { viewer } => {
                         let Some(i) = (!viewers.is_empty()).then(|| viewer % viewers.len()) else { continue };
-                        let _ = store.kick(&viewers[i].1.viewer);
-                        viewers[i].3 = true;
-                        if let Some(l) = viewers[i].2.take() {
+                        let _ = store.kick(&viewers[i].redeemed.viewer);
+                        viewers[i].gone = true;
+                        if let Some(l) = viewers[i].live.take() {
                             prop_assert!(l.stop().is_cancelled());
                         }
                     }
-                    Op::Advance { s } => {
-                        now += Duration::from_secs(u64::from(s));
-                        for l in store.sweep(now) {
+                    Op::Advance { s } | Op::Sleep { s } => {
+                        let d = Duration::from_secs(u64::from(s));
+                        if matches!(op, Op::Advance { .. }) {
+                            now.mono += d;
+                        }
+                        now.wall += d;
+                        for l in store.end_grants(now, |_| false) {
                             prop_assert_eq!(l.reason(), Some(EndReason::Expired));
                         }
-                        for v in viewers.iter_mut() {
-                            if grants[v.0].2 <= now {
-                                v.2 = None;
-                            }
-                        }
+                        sweep(&mut grants, &mut viewers, now);
                     }
                     Op::Stop => {
                         for l in store.stop() {
                             prop_assert!(l.stop().is_cancelled());
                         }
                         for g in grants.iter_mut() {
-                            g.3 = true;
+                            g.ended = true;
                         }
                         for v in viewers.iter_mut() {
-                            v.2 = None;
+                            v.gone = true;
+                            v.live = None;
                         }
                     }
                 }
-                // No credential has two streams; listed counts match.
+                // The listing agrees with the model.
                 for info in store.list() {
-                    let live = info.viewers.iter().filter(|v| v.connected).count();
-                    prop_assert!(live <= info.viewers.len());
+                    let (i, g) = grants.iter().enumerate().find(|(_, g)| g.minted.id == info.id).expect("modelled");
+                    prop_assert!(!g.ended);
                     if let Some(left) = info.uses_left {
-                        let (_, allowed, _, _) = grants.iter().find(|g| g.0.id == info.id).expect("modelled");
-                        prop_assert_eq!(left + info.redeemed, allowed.expect("limited"));
+                        prop_assert_eq!(left + info.redeemed, g.allowed.expect("limited"));
                     }
+                    let held = viewers.iter().filter(|v| v.grant == i && !v.gone).count();
+                    prop_assert_eq!(info.viewers.len(), held);
                 }
             }
         }

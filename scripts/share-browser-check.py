@@ -162,7 +162,7 @@ async def open_link(ctx, url: str, violations: list[str]):
     return page
 
 
-async def run_browser(kind: str, browser, rig: Rig, origin: str, env: dict, bin_: str, work: Path, out: Path, proxy: Proxy):
+async def run_browser(kind: str, browser, rig: Rig, env: dict, bin_: str, work: Path, out: Path, proxy: Proxy):
     violations: list[str] = []
     ctx = await browser.new_context(ignore_https_errors=True, viewport={"width": 1400, "height": 900})
     await ctx.add_init_script(
@@ -206,10 +206,9 @@ async def run_browser(kind: str, browser, rig: Rig, origin: str, env: dict, bin_
     check((before["cols"], before["rows"]) == (after["cols"], after["rows"]), "the guest never sized the pane")
 
     step(f"{kind}: refresh draws the screen again")
-    connects = await page.evaluate("window.__shux.connects")
     await page.reload(wait_until="load")
     await live(page, "RECORDING")
-    check(await page.evaluate("window.__shux.connects") == 1, f"a reload resumes on its cookie (was {connects})")
+    check(not await page.is_visible("#watch"), "a reload resumes on its cookie, spending no use")
 
     step(f"{kind}: a one-use link, raced by two browsers")
     raced = rig.call(op="create", session=s["id"], uses=1)
@@ -239,8 +238,8 @@ async def run_browser(kind: str, browser, rig: Rig, origin: str, env: dict, bin_
     await proxy.start()
     msg = await ended(other)
     check("ended" in msg, f"a revoked link stays ended through a reconnect ({msg!r})")
-    await live(page)
-    check(True, "the first link reconnected after the outage")
+    await live(page, "RECORDING")
+    check(await page.evaluate("window.__shux.connects") > 1, "the first link reconnected after the outage")
 
     step(f"{kind}: a stalled renderer is dropped, and comes back whole")
     third = rig.call(op="create", session=p_sess["id"], uses=1)
@@ -297,14 +296,14 @@ async def main() -> int:
         print(f"{CYAN}gateway {rig.addr[0]}:{rig.addr[1]} behind {origin}{OFF}")
         async with async_playwright() as pw:
             chrome = await pw.chromium.launch(channel="chrome", headless=True)
-            await run_browser("chromium", chrome, rig, origin, env, bin_, work, out, proxy)
+            await run_browser("chromium", chrome, rig, env, bin_, work, out, proxy)
             await chrome.close()
             try:
                 webkit = await pw.webkit.launch(headless=True)
             except Exception as e:  # noqa: BLE001 - reported, never skipped silently
                 print(f"{YELLOW}⚠ WebKit not run: {str(e).splitlines()[0]}{OFF}")
             else:
-                await run_browser("webkit", webkit, rig, origin, env, bin_, work, out, proxy)
+                await run_browser("webkit", webkit, rig, env, bin_, work, out, proxy)
                 await webkit.close()
         step("stop ends everything and closes the listener")
         rig.call(op="stop")

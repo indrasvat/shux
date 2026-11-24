@@ -626,20 +626,15 @@ fn a_browser_view_sends_nothing_never_sizes_the_host_and_draws_no_status_bar() {
             rows.join("\n")
         );
 
-        // Resizes reach this viewer's own grid, held to the browser's bound.
-        for (cols, rows) in [(50, 15), (61, 17), (300, 300)] {
+        // Resizes reach this viewer's own grid, never past the host's layout.
+        for (ask, got) in [((50, 15), (50, 15)), ((300, 300), (100, 29))] {
             viewer
-                .send(serde_json::json!({ "t": "resize", "cols": cols, "rows": rows }))
+                .send(serde_json::json!({ "t": "resize", "cols": ask.0, "rows": ask.1 }))
                 .await;
+            while viewer.resizes.last() != Some(&got) {
+                assert!(viewer.step().await);
+            }
         }
-        while viewer.resizes.last() != Some(&(240, 100)) {
-            assert!(viewer.step().await);
-        }
-        assert!(
-            viewer.resizes.iter().all(|&(c, r)| c <= 240 && r <= 100),
-            "{:?}",
-            viewer.resizes
-        );
         assert!(
             viewer.draws("RECORDING").await,
             "nothing drawn at the new size"
@@ -647,14 +642,13 @@ fn a_browser_view_sends_nothing_never_sizes_the_host_and_draws_no_status_bar() {
         // The registry holds it as a watcher: it can never drive the panes,
         // even once the host has gone.
         let listed = rig.rpc("client.list", serde_json::json!({})).await;
-        let watchers: Vec<_> = listed["clients"]
+        let watchers = listed["clients"]
             .as_array()
             .unwrap()
             .iter()
-            .filter(|c| c["cols"] == 240)
-            .map(|c| c["read_only"].clone())
-            .collect();
-        assert_eq!(watchers, [serde_json::json!(true)], "{listed}");
+            .filter(|c| c["read_only"] == true)
+            .count();
+        assert_eq!(watchers, 1, "{listed}");
         // A viewer that tries to type is cut off; its bytes go nowhere.
         viewer
             .send(serde_json::json!({ "t": "input", "data": "rm -rf ~\r" }))
@@ -930,22 +924,20 @@ fn revoke_ends_the_live_stream_at_the_origin_and_its_reconnect() {
             "the origin kept sending after revoke"
         );
         assert_eq!(live.ends().await.as_deref(), Some("revoked"));
-        // Neither the live viewer nor the offline one gets back in.
-        for cookie in [&offline] {
-            assert_eq!(
-                upgrade(rig.addr, &id, cookie, ORIGIN).await.err(),
-                Some(403)
-            );
-            let status = http(
-                rig.addr,
-                "GET",
-                &format!("/v/{}/status", id.as_str()),
-                &[("Host", HOST), ("Cookie", cookie)],
-                "",
-            )
-            .await;
-            assert_eq!(status.status, 410);
-        }
+        // The offline credential does not get back in.
+        assert_eq!(
+            upgrade(rig.addr, &id, &offline, ORIGIN).await.err(),
+            Some(403)
+        );
+        let status = http(
+            rig.addr,
+            "GET",
+            &format!("/v/{}/status", id.as_str()),
+            &[("Host", HOST), ("Cookie", &offline)],
+            "",
+        )
+        .await;
+        assert_eq!(status.status, 410);
         assert_eq!(rig.redeem(&id, &secret).await.status, 404);
         assert!(rig.gw.list().is_empty());
         rig.stop().await;
@@ -1032,10 +1024,27 @@ fn kick_stop_and_expiry_end_live_viewers() {
         assert_eq!(kicked.ends().await.as_deref(), Some("kicked"));
         assert_eq!(rig.gw.list()[0].viewers.len(), 0);
 
-        let (short, short_secret) =
-            rig.link(&session, |o| o.ttl = std::time::Duration::from_secs(1));
-        let mut expiring = rig.viewer(&short, &short_secret, 80, 24).await;
-        assert_eq!(expiring.ends().await.as_deref(), Some("expired"));
+        // A short link expires under its live viewer. On a loaded machine it
+        // may expire before the viewer is in: then a longer one is tried, so
+        // the clock bounds how long this takes, never whether it passes.
+        let mut ttl = std::time::Duration::from_secs(1);
+        let ended = loop {
+            assert!(
+                ttl <= std::time::Duration::from_secs(32),
+                "no viewer outlived its redeem"
+            );
+            let (short, secret) = rig.link(&session, |o| o.ttl = ttl);
+            ttl *= 2;
+            let r = rig.redeem(&short, &secret).await;
+            if r.status != 200 {
+                continue;
+            }
+            match Viewer::connect(rig.addr, &short, &r.cookie(&short), ORIGIN, 80, 24).await {
+                Ok(mut v) => break v.ends().await,
+                Err(_) => continue,
+            }
+        };
+        assert_eq!(ended.as_deref(), Some("expired"));
 
         let mut stopped = rig.viewer(&id, &secret, 80, 24).await;
         assert!(stopped.draws("TICK").await);
@@ -1047,6 +1056,386 @@ fn kick_stop_and_expiry_end_live_viewers() {
             "the listener outlived stop"
         );
         rig.gw.stop().await;
+        rig.stop().await;
+    });
+}
+
+/// One client frame, masked with a zero key: legal, and the payload stays as is.
+fn frame(op: u8, payload: &[u8]) -> Vec<u8> {
+    assert!(payload.len() < 126, "a short frame");
+    let mut f = vec![0x80 | op, 0x80 | payload.len() as u8, 0, 0, 0, 0];
+    f.extend_from_slice(payload);
+    f
+}
+
+/// A WebSocket upgrade by hand, so a test can write frames no browser would.
+async fn raw_upgrade(addr: SocketAddr, id: &GrantId, cookie: &str) -> TcpStream {
+    let mut tcp = TcpStream::connect(addr).await.expect("connect");
+    let req = format!(
+        "GET /v/{}/ws HTTP/1.1\r\nHost: {HOST}\r\nOrigin: {ORIGIN}\r\nCookie: {cookie}\r\n\
+         Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+        id.as_str()
+    );
+    tcp.write_all(req.as_bytes())
+        .await
+        .expect("upgrade request");
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        let mut b = [0u8; 1];
+        tcp.read_exact(&mut b).await.expect("the upgrade reply");
+        head.push(b[0]);
+    }
+    assert!(
+        head.starts_with(b"HTTP/1.1 101"),
+        "{}",
+        String::from_utf8_lossy(&head)
+    );
+    tcp
+}
+
+#[test]
+fn a_viewer_that_never_reads_its_pongs_is_dropped_not_buffered() {
+    let d = dirs();
+    runtime().block_on(async {
+        let rig = Rig::start("pongs").await;
+        let log = d.work.path().join("pongs.log");
+        let (session, _) = rig.session("pinged", recorder(&log)).await;
+        let (id, secret) = rig.link(&session, |_| {});
+        let mut v = rig.viewer(&id, &secret, 80, 24).await;
+        // All it was sent is acknowledged: no ack deadline runs for it.
+        assert!(v.draws("RECORDING").await);
+        let tcp = v.ws.get_mut();
+        let pings: Vec<u8> = (0..512).flat_map(|_| frame(0x9, &[b'p'; 125])).collect();
+        // Far past any honest buffer: 64 MiB of pongs owed to one viewer.
+        let cap: u64 = 64 << 20;
+        let mut written = 0u64;
+        let dropped = loop {
+            match shux_testkit::Deadline::start()
+                .run(tcp.write_all(&pings))
+                .await
+            {
+                Some(Ok(())) => written += pings.len() as u64,
+                Some(Err(_)) => break true,
+                None => panic!("the gateway stopped reading but kept the viewer connected"),
+            }
+            if written > cap {
+                break false;
+            }
+        };
+        assert!(
+            dropped,
+            "the gateway took {} MiB of pings from a viewer that read none of its pongs",
+            written >> 20
+        );
+        rig.stop().await;
+    });
+}
+
+/// A viewer on its own thread and runtime. It reads and acknowledges all it
+/// is sent, so neither a stalled write nor the ack deadline ever drops it,
+/// and once `go` opens it floods valid acks until it is cut off or stopped.
+fn ack_flooder(
+    addr: SocketAddr,
+    id: GrantId,
+    cookie: String,
+    go: std::sync::Arc<tokio::sync::Barrier>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    cut: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> std::thread::JoinHandle<()> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("flooder runtime");
+        rt.block_on(async move {
+            let tcp = raw_upgrade(addr, &id, &cookie).await;
+            let (mut rd, mut wr) = tcp.into_split();
+            wr.write_all(&frame(0x1, br#"{"t":"hello","cols":80,"rows":24}"#))
+                .await
+                .expect("hello");
+            let received = Arc::new(AtomicU64::new(0));
+            let seen = received.clone();
+            tokio::spawn(async move {
+                loop {
+                    let mut h = [0u8; 2];
+                    if rd.read_exact(&mut h).await.is_err() {
+                        return;
+                    }
+                    let len = match h[1] & 0x7f {
+                        126 => {
+                            let mut l = [0u8; 2];
+                            if rd.read_exact(&mut l).await.is_err() {
+                                return;
+                            }
+                            u64::from(u16::from_be_bytes(l))
+                        }
+                        127 => {
+                            let mut l = [0u8; 8];
+                            if rd.read_exact(&mut l).await.is_err() {
+                                return;
+                            }
+                            u64::from_be_bytes(l)
+                        }
+                        n => u64::from(n),
+                    };
+                    let mut body = vec![0u8; usize::try_from(len).unwrap()];
+                    if rd.read_exact(&mut body).await.is_err() {
+                        return;
+                    }
+                    if h[0] & 0x0f == 0x2 {
+                        let offset = u64::from_be_bytes(body[..8].try_into().unwrap());
+                        seen.store(offset + len - 8, Ordering::SeqCst);
+                    }
+                }
+            });
+            go.wait().await;
+            while !stop.load(Ordering::SeqCst) {
+                let ack = format!(
+                    r#"{{"t":"ack","offset":{}}}"#,
+                    received.load(Ordering::SeqCst)
+                );
+                let burst: Vec<u8> = (0..256).flat_map(|_| frame(0x1, ack.as_bytes())).collect();
+                if wr.write_all(&burst).await.is_err() {
+                    cut.fetch_add(1, Ordering::SeqCst);
+                    return;
+                }
+            }
+        });
+    })
+}
+
+#[test]
+fn a_flood_of_viewer_messages_is_cut_off_and_never_starves_the_hosts_keys() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let d = dirs();
+    runtime().block_on(async {
+        let rig = Rig::start("ackflood").await;
+        let log = d.work.path().join("ackflood.log");
+        let (session, _) = rig.session("acked", recorder(&log)).await;
+        let mut host = Host::attach(&rig, "acked", 100, 30).await;
+        host.draws("RECORDING").await;
+        let opened = log.clone();
+        shux_testkit::wait_until_async("the recorder opens its log", || {
+            let log = opened.clone();
+            async move { log.exists() }
+        })
+        .await;
+        // Every stream the daemon allows, one per link.
+        let n = shux::share::MAX_STREAMS;
+        let go = Arc::new(tokio::sync::Barrier::new(n + 1));
+        let stop = Arc::new(AtomicBool::new(false));
+        let cut = Arc::new(AtomicUsize::new(0));
+        let mut threads = Vec::new();
+        for _ in 0..n {
+            let (id, secret) = rig.link(&session, |_| {});
+            let cookie = rig.redeem(&id, &secret).await.cookie(&id);
+            threads.push(ack_flooder(
+                rig.addr,
+                id,
+                cookie,
+                go.clone(),
+                stop.clone(),
+                cut.clone(),
+            ));
+        }
+        go.wait().await;
+        host.key(b"MARK").await;
+        let landed = log.clone();
+        shux_testkit::wait_until_async("the host's key reaches its pane", || {
+            let log = landed.clone();
+            async move { std::fs::read(&log).is_ok_and(|b| b == b"MARK") }
+        })
+        .await;
+        let gone = cut.clone();
+        shux_testkit::wait_until_async("every flooder is cut off", || {
+            let gone = gone.clone();
+            async move { gone.load(Ordering::SeqCst) == n }
+        })
+        .await;
+        stop.store(true, Ordering::SeqCst);
+        for t in threads {
+            t.join().expect("flooder");
+        }
+        rig.stop().await;
+    });
+}
+
+/// The status a GET answers with; None when the connection is closed unread.
+async fn try_status(addr: SocketAddr, path: &str) -> Option<u16> {
+    let mut tcp = TcpStream::connect(addr).await.ok()?;
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {HOST}\r\nConnection: close\r\n\r\n");
+    tcp.write_all(req.as_bytes()).await.ok()?;
+    let mut raw = Vec::new();
+    tcp.read_to_end(&mut raw).await.ok()?;
+    std::str::from_utf8(raw.get(9..12)?).ok()?.parse().ok()
+}
+
+#[test]
+fn requests_that_never_finish_their_body_cannot_hold_every_connection() {
+    let _ = dirs();
+    runtime().block_on(async {
+        let rig = Rig::start("bodies").await;
+        let mut held = Vec::new();
+        for _ in 0..64 {
+            let mut tcp = TcpStream::connect(rig.addr).await.expect("connect");
+            tcp.write_all(
+                b"POST /v/abcdefgh/redeem HTTP/1.1\r\nHost: elsewhere\r\nContent-Length: 500\r\n\r\n{",
+            )
+            .await
+            .expect("headers");
+            held.push(tcp);
+        }
+        let addr = rig.addr;
+        shux_testkit::wait_until_async("the gateway answers while 64 bodies stall", move || async move {
+            try_status(addr, "/v/abcdefgh").await == Some(200)
+        })
+        .await;
+        drop(held);
+        rig.stop().await;
+    });
+}
+
+#[test]
+fn browser_viewers_publish_no_client_events() {
+    let _ = dirs();
+    runtime().block_on(async {
+        let rig = Rig::start("events").await;
+        let (session, _) = rig.session("evented", producer()).await;
+        let (id, secret) = rig.link(&session, |_| {});
+        let cookie = rig.redeem(&id, &secret).await.cookie(&id);
+        for _ in 0..3 {
+            let mut v = Viewer::connect(rig.addr, &id, &cookie, ORIGIN, 80, 24)
+                .await
+                .unwrap();
+            assert!(v.draws("TICK").await);
+        }
+        let history = rig
+            .rpc("events.history", serde_json::json!({ "count": 1000 }))
+            .await;
+        let text = history.to_string();
+        for kind in [
+            "client.connected",
+            "client.disconnected",
+            "session.attached",
+            "session.detached",
+        ] {
+            assert!(!text.contains(kind), "a browser viewer published {kind}");
+        }
+        rig.stop().await;
+    });
+}
+
+#[test]
+fn a_viewer_draws_at_the_hosts_layout_and_never_larger() {
+    let d = dirs();
+    runtime().block_on(async {
+        let rig = Rig::start("clamp").await;
+        let log = d.work.path().join("clamp.log");
+        let (session, _) = rig.session("clamped", recorder(&log)).await;
+        let mut host = Host::attach(&rig, "clamped", 80, 24).await;
+        host.draws("RECORDING").await;
+        let (id, secret) = rig.link(&session, |_| {});
+        let mut v = rig.viewer(&id, &secret, 200, 60).await;
+        assert_eq!(
+            v.ready["host"],
+            serde_json::json!({ "cols": 80, "rows": 23 })
+        );
+        assert_eq!(
+            v.ready["size"],
+            serde_json::json!({ "cols": 80, "rows": 23 }),
+            "a grid larger than the host's"
+        );
+        v.send(serde_json::json!({ "t": "resize", "cols": 240, "rows": 100 }))
+            .await;
+        v.send(serde_json::json!({ "t": "resize", "cols": 40, "rows": 10 }))
+            .await;
+        while v.resizes.last() != Some(&(40, 10)) {
+            assert!(v.step().await);
+        }
+        assert!(
+            v.resizes.iter().all(|&(c, r)| c <= 80 && r <= 23),
+            "{:?}",
+            v.resizes
+        );
+        rig.stop().await;
+    });
+}
+
+#[test]
+fn with_no_host_a_viewer_is_told_the_size_that_shows_its_panes_whole() {
+    let d = dirs();
+    runtime().block_on(async {
+        let rig = Rig::start("nohost").await;
+        let log = d.work.path().join("nohost.log");
+        let (session, _) = rig.session("hostless", recorder(&log)).await;
+        let (id, secret) = rig.link(&session, |_| {});
+        let mut v = rig.viewer(&id, &secret, 60, 12).await;
+        let host = &v.ready["host"];
+        assert!(
+            host.is_object(),
+            "no layout size for a hostless session: {}",
+            v.ready
+        );
+        let (c, r) = (
+            host["cols"].as_u64().unwrap(),
+            host["rows"].as_u64().unwrap(),
+        );
+        v.send(serde_json::json!({ "t": "resize", "cols": c, "rows": r }))
+            .await;
+        // The pane's first row is shown, not cut off by its border.
+        assert!(v.draws("TRUECOLOR").await && v.draws("RECORDING").await);
+        rig.stop().await;
+    });
+}
+
+#[test]
+fn one_link_cannot_take_every_viewer_or_stream() {
+    let _ = dirs();
+    runtime().block_on(async {
+        let rig = Rig::start("caps").await;
+        let (session, _) = rig.session("capped", producer()).await;
+        let (id, secret) = rig.link(&session, |o| o.uses = Uses::Unlimited);
+        let mut codes = Vec::new();
+        for _ in 0..40 {
+            codes.push(rig.redeem(&id, &secret).await.status);
+        }
+        let ok = codes.iter().filter(|&&c| c == 200).count();
+        assert!(ok < 40, "one link redeemed {ok} viewers");
+        let (other, other_secret) = rig.link(&session, |_| {});
+        assert_eq!(rig.redeem(&other, &other_secret).await.status, 200);
+        // Its streams are capped too, below the daemon's.
+        let (busy, busy_secret) = rig.link(&session, |o| o.uses = Uses::Unlimited);
+        let mut live = Vec::new();
+        let mut refused = 0;
+        for _ in 0..shux::share::MAX_STREAMS {
+            let cookie = rig.redeem(&busy, &busy_secret).await.cookie(&busy);
+            match Viewer::connect(rig.addr, &busy, &cookie, ORIGIN, 80, 24).await {
+                Ok(v) => live.push(v),
+                Err(code) => {
+                    assert_eq!(code, 503);
+                    refused += 1;
+                }
+            }
+        }
+        assert!(refused > 0, "one link held all {} streams", live.len());
+        rig.stop().await;
+    });
+}
+
+#[test]
+fn an_absolute_form_request_for_another_authority_is_not_served() {
+    let _ = dirs();
+    runtime().block_on(async {
+        let rig = Rig::start("absolute").await;
+        let (session, _) = rig.session("absolute", producer()).await;
+        let (id, _) = rig.link(&session, |_| {});
+        let path = format!("http://evil.test/v/{}", id.as_str());
+        let r = http(rig.addr, "GET", &path, &[("Host", HOST)], "").await;
+        assert_eq!(r.status, 404, "served a request for evil.test");
         rig.stop().await;
     });
 }

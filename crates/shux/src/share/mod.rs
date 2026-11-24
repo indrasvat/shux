@@ -72,12 +72,22 @@ impl Origin {
     }
 }
 
-/// A link just made. `url` carries its secret and is returned only here.
-#[derive(Debug, Clone)]
+/// A link just made. `url` carries its secret and is returned only here;
+/// no debug print shows it.
+#[derive(Clone)]
 pub struct Created {
     pub id: GrantId,
     pub url: String,
     pub expires_wall: SystemTime,
+}
+
+impl std::fmt::Debug for Created {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Created")
+            .field("id", &self.id)
+            .field("expires_wall", &self.expires_wall)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -115,12 +125,6 @@ pub(crate) struct Inner {
     sent: AtomicU64,
 }
 
-impl Inner {
-    fn count_sent(&self, n: u64) {
-        self.sent.fetch_add(n, Ordering::Relaxed);
-    }
-}
-
 /// The daemon's share gateway. Cheap to clone.
 #[derive(Clone)]
 pub struct Gateway {
@@ -128,19 +132,21 @@ pub struct Gateway {
 }
 
 /// Held by one stream from admission until its socket is gone: frees its
-/// credential and fires its `done`, even when the upgrade never happened.
+/// slot and credential, then fires its `done`, even when the upgrade never
+/// happened. In that order, so whoever `done` wakes finds them free.
 pub(crate) struct StreamGuard {
     gw: Gateway,
     viewer: ViewerId,
     live: Live,
-    _permit: tokio::sync::OwnedSemaphorePermit,
+    slot: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl Drop for StreamGuard {
     fn drop(&mut self) {
+        drop(self.slot.take());
         self.gw
             .store()
-            .stream_ended(&self.viewer, self.live.stream());
+            .stream_ended(&self.viewer, self.live.stream(), Instant::now());
         self.live.done().cancel();
     }
 }
@@ -231,9 +237,7 @@ impl Gateway {
             return Err(ShareError::NoSession(opts.session));
         }
         self.prune();
-        let minted = self
-            .store()
-            .create(opts, Instant::now(), SystemTime::now())?;
+        let minted = self.store().create(opts, grants::Now::current())?;
         Ok(Created {
             url: format!(
                 "{}/v/{}#{}",
@@ -284,18 +288,10 @@ impl Gateway {
     /// Ends the links to sessions that no longer exist, and expired ones.
     fn prune(&self) {
         let live = self.inner.deps.graph.snapshot();
-        let mut store = self.store();
         // Each ended stream has been told; none is waited for here.
-        let _ = store.sweep(Instant::now());
-        for s in store.sessions() {
-            if !live.sessions.contains_key(&s) {
-                let _ = store.end_session(s);
-            }
-        }
-    }
-
-    fn sweep(&self) {
-        let _ = self.store().sweep(Instant::now());
+        let _ = self
+            .store()
+            .end_grants(grants::Now::current(), |s| !live.sessions.contains_key(&s));
     }
 }
 
@@ -308,5 +304,96 @@ async fn settle(ended: Vec<Live>) {
         {
             tracing::warn!("share: a viewer stream outlived its cutoff");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gateway() -> Gateway {
+        let (graph, state) = shux_core::graph::SessionGraph::new();
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        tokio::spawn(shux_core::graph::run_graph_loop(graph, rx, cancel.clone()));
+        let deps = AttachDeps {
+            graph: shux_core::graph::GraphHandle::new(tx, state),
+            io_state: Arc::new(Mutex::new(crate::pane_io::PaneIoState::new())),
+            config: shux_core::config::ConfigHandle::load_or_default(std::path::Path::new(
+                "/nonexistent/shux-share-tests/config.toml",
+            )),
+            segments: crate::statusbar_runner::SegmentCache::new(),
+            meta_cache: crate::session_meta::SessionMetaCache::new(),
+            onboarding: crate::onboarding::OnboardingHandle::from_state_for_test(Default::default()),
+            daemon_start: std::time::Instant::now(),
+        };
+        Gateway::new(deps, cancel)
+    }
+
+    /// A stream's slot is free by the time it says it is done: a reload at
+    /// the daemon's cap, admitted the moment the old stream is done, must
+    /// find its slot.
+    #[tokio::test]
+    async fn a_stream_frees_its_slot_before_it_says_it_is_done() {
+        use std::task::{Context, Poll, Wake, Waker};
+        struct Check(
+            Arc<tokio::sync::Semaphore>,
+            Arc<std::sync::atomic::AtomicUsize>,
+        );
+        impl Wake for Check {
+            fn wake(self: Arc<Self>) {
+                self.1.store(self.0.available_permits(), Ordering::SeqCst);
+            }
+        }
+        let gw = gateway();
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+        let mut store = Store::default();
+        let opts = CreateOpts::new(shux_core::model::SessionId::new());
+        let now = grants::Now::current();
+        let minted = store.create(opts, now).unwrap();
+        let cookie = store
+            .redeem(&minted.id, &minted.secret, now)
+            .unwrap()
+            .cookie;
+        let grants::Admit::Ready(admitted) = store.admit(&minted.id, &cookie, now) else {
+            panic!("not admitted");
+        };
+        let live = admitted.live;
+        let guard = StreamGuard {
+            gw,
+            viewer: ViewerId::parse("abcdefgh").unwrap(),
+            live: live.clone(),
+            slot: Some(slots.clone().try_acquire_owned().unwrap()),
+        };
+        let done = live.done().cancelled();
+        let mut done = std::pin::pin!(done);
+        // The waker runs inside `cancel`, while the guard is mid-drop.
+        let waker = Waker::from(Arc::new(Check(slots.clone(), seen.clone())));
+        assert!(
+            done.as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        drop(guard);
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            1,
+            "done fired while the slot was still held"
+        );
+        assert!(matches!(
+            done.poll(&mut Context::from_waker(&waker)),
+            Poll::Ready(())
+        ));
+    }
+
+    #[test]
+    fn a_created_link_prints_without_its_secret() {
+        let created = Created {
+            id: GrantId::parse("abcdefgh").unwrap(),
+            url: "https://x.test/v/abcdefgh#SECRETSECRET".into(),
+            expires_wall: SystemTime::UNIX_EPOCH,
+        };
+        assert!(!format!("{created:?}").contains("SECRET"), "{created:?}");
     }
 }
