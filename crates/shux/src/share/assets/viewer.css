@@ -1,0 +1,73 @@
+:root {
+  --bg: #24273a;
+  --fg: #cad3f5;
+  --bar: #1e2030;
+  --bar-text: #cad3f5;
+  --muted: #6e738d;
+  --shared: #f5a97f;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); }
+body {
+  display: flex;
+  flex-direction: column;
+  font: 13px/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+#bar {
+  flex: none;
+  display: flex;
+  gap: 0.5em;
+  align-items: center;
+  padding: 6px 12px;
+  background: var(--bar);
+  color: var(--bar-text);
+  white-space: nowrap;
+  overflow: hidden;
+}
+#bar .mark, #bar .ro { color: var(--shared); font-weight: 600; }
+#bar .sep, #expiry { color: var(--muted); }
+#session { font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
+#state { margin-left: auto; color: var(--muted); }
+#state.bad { color: var(--shared); }
+#stage {
+  flex: 1;
+  overflow: auto;
+  position: relative;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+}
+/* Takes the scaled frame's size, so the stage scrolls (pans) over exactly it. */
+#sizer { overflow: hidden; }
+#frame { transform-origin: 0 0; width: max-content; }
+#stage, #stage * { touch-action: pan-x pan-y; }
+#bar .sep[hidden] { display: none; }
+#zoom {
+  font: inherit;
+  font-weight: 600;
+  padding: 2px 10px;
+  border: 1px solid var(--muted);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--bar-text);
+  cursor: pointer;
+}
+#zoom[hidden] { display: none; }
+#gate {
+  max-width: 28em;
+  margin: 15vh auto 0;
+  padding: 0 16px;
+  text-align: center;
+}
+#gate[hidden] { display: none; }
+#watch {
+  font: inherit;
+  font-weight: 600;
+  padding: 0.7em 1.6em;
+  border: 0;
+  border-radius: 6px;
+  background: var(--shared);
+  color: var(--bar);
+  cursor: pointer;
+}
+#watch:disabled { opacity: 0.5; cursor: default; }

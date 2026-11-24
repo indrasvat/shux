@@ -166,17 +166,11 @@ pub(crate) fn parse_snapshot_dims(
 /// the fitted tree to compose at it. A frame any bigger draws the outline around space no pane has.
 ///
 /// [`LayoutNode::fitted`]: shux_core::layout::LayoutNode::fitted
-fn natural_frame(
+pub(crate) fn natural_frame(
     layout: &shux_core::layout::WindowLayout,
-    pane_data: &[PaneSnapshotData],
+    size_of: &dyn Fn(shux_core::model::PaneId) -> Option<(u16, u16)>,
     border_style: shux_ui::BorderStyle,
 ) -> Option<(shux_core::layout::LayoutNode, (u16, u16))> {
-    let size_of = |pane| {
-        pane_data
-            .iter()
-            .find(|(pid, ..)| *pid == pane)
-            .map(|(_, grid, ..)| (grid.cols() as u16, grid.rows() as u16))
-    };
     let (tree, (cols, rows)) = match &layout.zoom {
         Some(zoom) => (layout.tree.clone(), size_of(zoom.zoomed_pane)?),
         None => {
@@ -195,6 +189,32 @@ fn natural_frame(
         tree,
         (cols.max(4), rows.saturating_add(STATUS_BAR_ROWS).max(2)),
     ))
+}
+
+/// The frame a browser draws a session nothing has sized at: the tree and
+/// grid that show its active window's panes whole, without the status bar
+/// row. None once a client has driven it.
+pub(crate) fn hostless_frame(
+    snap: &shux_core::graph::SessionGraphSnapshot,
+    state: &crate::pane_io::PaneIoState,
+    session: shux_core::model::SessionId,
+    border_style: shux_ui::BorderStyle,
+) -> Option<(shux_core::layout::LayoutNode, (u16, u16))> {
+    if state.clients.driver(session).is_some() || state.layout_basis.contains_key(&session) {
+        return None;
+    }
+    let window = snap
+        .windows
+        .get(&snap.sessions.get(&session)?.active_window)?;
+    let size_of = |pane| {
+        let grid = state.vts.get(&pane)?.grid();
+        Some((
+            u16::try_from(grid.cols()).ok()?,
+            u16::try_from(grid.rows()).ok()?,
+        ))
+    };
+    let (tree, (cols, rows)) = natural_frame(&window.layout, &size_of, border_style)?;
+    Some((tree, (cols, rows.saturating_sub(STATUS_BAR_ROWS))))
 }
 
 /// One pane's render-clone payload, captured under the pane-IO lock:
@@ -298,8 +318,17 @@ pub(crate) async fn snapshot_window(
     // driven has no such size: the frame that fits its panes whole.
     let (default_tree, natural) = match driven {
         Some(size) => (window.layout.tree.clone(), size),
-        None => natural_frame(&window.layout, &pane_data, border_style)
-            .unwrap_or_else(|| (window.layout.tree.clone(), FALLBACK_DIMS)),
+        None => natural_frame(
+            &window.layout,
+            &|pane| {
+                pane_data
+                    .iter()
+                    .find(|(pid, ..)| *pid == pane)
+                    .map(|(_, grid, ..)| (grid.cols() as u16, grid.rows() as u16))
+            },
+            border_style,
+        )
+        .unwrap_or_else(|| (window.layout.tree.clone(), FALLBACK_DIMS)),
     };
     let defaulted = cols.is_none() || rows.is_none();
     let (cols, rows) = (cols.unwrap_or(natural.0), rows.unwrap_or(natural.1));

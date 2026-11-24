@@ -66,6 +66,8 @@ pub struct SessionView {
 struct Entry {
     info: ClientInfo,
     end: CancellationToken,
+    /// Run when an administrator removes it, before its connection hears.
+    on_remove: Option<Box<dyn FnOnce() + Send>>,
     /// Registration order: before anyone types, the first voter drives.
     seq: u64,
 }
@@ -196,12 +198,29 @@ impl ClientRegistry {
     /// Record a client until the returned guard drops; cancelling `end`
     /// ends that client's connection.
     pub fn register(&self, info: ClientInfo, end: CancellationToken) -> Registered {
+        self.register_with_removal(info, end, None)
+    }
+
+    /// [`Self::register`], with `on_remove` run if [`Self::remove`] ends it:
+    /// for a client whose leaving by force must revoke more than its socket.
+    pub fn register_with_removal(
+        &self,
+        info: ClientInfo,
+        end: CancellationToken,
+        on_remove: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Registered {
         let (id, votes) = (info.id, info.votes);
         {
             let mut s = self.state();
             let seq = s.next_seq;
             s.next_seq += 1;
-            s.clients.insert(id, Entry { info, end, seq });
+            let entry = Entry {
+                info,
+                end,
+                on_remove,
+                seq,
+            };
+            s.clients.insert(id, entry);
         }
         self.bump_for(votes);
         Registered {
@@ -279,7 +298,11 @@ impl ClientRegistry {
 
     /// Unlist a client and end its connection. False when none is attached.
     pub fn remove(&self, id: ClientId) -> bool {
-        let gone = self.state().unlist(id).map(|e| {
+        let entry = self.state().unlist(id);
+        let gone = entry.map(|e| {
+            if let Some(on_remove) = e.on_remove {
+                on_remove();
+            }
             e.end.cancel();
             e.info.votes
         });

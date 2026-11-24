@@ -372,7 +372,7 @@ where
                     AttachServerFrame::Bell => {
                         stdout.write_all(b"\x07").await.ok();
                     }
-                    AttachServerFrame::Notice { text: _ } => {}
+                    AttachServerFrame::Notice { text: _ } | AttachServerFrame::Resized { .. } => {}
                     AttachServerFrame::DetachAck => return Ok(ExitReason::Detached),
                     AttachServerFrame::SessionEnded { reason } if reason == "removed" => {
                         return Ok(ExitReason::Removed);

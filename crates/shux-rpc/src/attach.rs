@@ -108,6 +108,10 @@ pub enum AttachServerFrame {
     /// Heartbeat (no-op) — keeps the connection alive in case the user is
     /// idle and we want to detect a dead client.
     Ping,
+    /// The renders that follow are drawn for a `cols`x`rows` grid. Sent only
+    /// to the share gateway's in-process viewer, between the last byte drawn
+    /// for the old size and the first drawn for the new one.
+    Resized { cols: u16, rows: u16 },
 }
 
 /// Frames sent from client to daemon.

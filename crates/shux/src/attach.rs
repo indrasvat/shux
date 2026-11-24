@@ -461,6 +461,29 @@ trait AttachStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin 
 
 impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static> AttachStream for S {}
 
+/// What an attach reads the daemon through. No PTY writer is among it: a
+/// connection holds one only once its hello is writable.
+#[derive(Clone)]
+pub struct AttachDeps {
+    pub graph: GraphHandle,
+    pub io_state: Arc<Mutex<PaneIoState>>,
+    pub config: ConfigHandle,
+    pub segments: SegmentCache,
+    pub meta_cache: crate::session_meta::SessionMetaCache,
+    pub onboarding: crate::onboarding::OnboardingHandle,
+    pub daemon_start: std::time::Instant,
+}
+
+/// Who decides what a connection may do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    /// Its hello: any session by name or id, writable or read-only.
+    Hello,
+    /// An in-process browser viewer: read-only, plain, to exactly this
+    /// session, drawn without the status bar.
+    Browser(SessionId),
+}
+
 /// Handle one attach connection: handshake, then run the streaming loop.
 #[expect(clippy::too_many_arguments, reason = "independent inputs")]
 async fn handle_attach_connection(
@@ -474,6 +497,56 @@ async fn handle_attach_connection(
     daemon_start: std::time::Instant,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
+    let deps = AttachDeps {
+        graph,
+        io_state,
+        config,
+        segments,
+        meta_cache,
+        onboarding,
+        daemon_start,
+    };
+    serve_connection(stream, deps, cancel, Scope::Hello, None).await
+}
+
+/// The share gateway's attach (#297): read-only and plain to exactly
+/// `session` whatever its hello names, without a status bar, and with no way
+/// to write to a pane: this connection never holds a [`PtyWrite`]. It reports
+/// each size it draws at with [`AttachServerFrame::Resized`] before the frame.
+/// `on_remove` runs if `client detach` removes it, before it hears.
+pub async fn serve_read_only(
+    stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+    deps: AttachDeps,
+    session: SessionId,
+    cancel: CancellationToken,
+    on_remove: Box<dyn FnOnce() + Send>,
+) -> anyhow::Result<()> {
+    serve_connection(
+        stream,
+        deps,
+        cancel,
+        Scope::Browser(session),
+        Some(on_remove),
+    )
+    .await
+}
+
+async fn serve_connection(
+    stream: impl AttachStream,
+    deps: AttachDeps,
+    cancel: CancellationToken,
+    scope: Scope,
+    on_remove: Option<Box<dyn FnOnce() + Send>>,
+) -> anyhow::Result<()> {
+    let AttachDeps {
+        graph,
+        io_state,
+        config,
+        segments,
+        meta_cache,
+        onboarding,
+        daemon_start,
+    } = deps;
     let (stream, taken) = crate::write_progress::Metered::new(stream);
     let mut framed = Framed::new(stream, create_codec());
 
@@ -495,7 +568,7 @@ async fn handle_attach_connection(
             return Ok(());
         }
     };
-    let hello: AttachHello = match serde_json::from_slice(&first) {
+    let mut hello: AttachHello = match serde_json::from_slice(&first) {
         Ok(h) => h,
         Err(e) => {
             warn!(error = %e, "attach: hello parse failed");
@@ -517,11 +590,25 @@ async fn handle_attach_connection(
         return Ok(());
     }
 
+    // The gateway's attach is read-only and plain whatever its hello says.
+    if let Scope::Browser(_) = scope {
+        (hello.read_only, hello.plain) = (true, true);
+    }
     let read_only = hello.read_only;
 
     // Step 2: Resolve the target session. A watcher only finds one.
-    let resolved =
-        resolve_or_create_session(&graph, &hello.session_name, &meta_cache, !read_only).await;
+    let resolved = match scope {
+        Scope::Browser(id) => {
+            let snap = graph.snapshot();
+            match snap.sessions.get(&id) {
+                Some(sess) => attached_to(&snap, sess),
+                None => Err(anyhow::anyhow!("session {id} not found")),
+            }
+        }
+        Scope::Hello => {
+            resolve_or_create_session(&graph, &hello.session_name, &meta_cache, !read_only).await
+        }
+    };
     let mut session = match resolved {
         Ok(s) => s,
         Err(e) => {
@@ -530,6 +617,7 @@ async fn handle_attach_connection(
         }
     };
     session.read_only = read_only;
+    session.browser = matches!(scope, Scope::Browser(_));
     // A watcher writes nothing to disk: no toast to dismiss for good.
     session.show_welcome_toast = !read_only;
 
@@ -590,7 +678,7 @@ async fn handle_attach_connection(
     let removed = CancellationToken::new();
     let (cols, rows) = clamp_client_dims(hello.cols, hello.rows);
     let clients = io_state.lock().await.clients.clone();
-    let registered = clients.register(
+    let registered = clients.register_with_removal(
         crate::clients::ClientInfo {
             id: shux_core::event::ClientId::new(),
             session_id: session.session_id,
@@ -601,6 +689,7 @@ async fn handle_attach_connection(
             last_input: None,
         },
         removed.clone(),
+        on_remove,
     );
     // Panes take the driver's size: this client's only if it is the first.
     // A watcher never sizes, so it never starts a sizing pass either.
@@ -699,6 +788,9 @@ struct AttachedSession {
     redraw: Arc<tokio::sync::Notify>,
     /// `Prefix r`: the next frame repaints every cell, changed or not.
     repaint: bool,
+    /// The share gateway's guest: no status bar, its row given to the panes,
+    /// and each new size announced before the frame drawn at it.
+    browser: bool,
 }
 
 impl AttachedSession {
@@ -800,6 +892,7 @@ fn attached_to(
         read_only: false,
         redraw: Arc::default(),
         repaint: false,
+        browser: false,
     })
 }
 
@@ -1221,9 +1314,14 @@ async fn run_attach_loop(
     let read_only = hello.read_only;
     let pty_write = PtyWrite::grant(read_only);
     let registry_id = registered.id();
+    // A browser viewer publishes no client events: the gateway reports its
+    // viewers, and a reconnecting one would flood the history.
     let (clients, bus) = {
         let io = io_state.lock().await;
-        (io.clients.clone(), io.event_bus.clone())
+        (
+            io.clients.clone(),
+            io.event_bus.clone().filter(|_| !session.browser),
+        )
     };
     let (cols0, rows0) = *client_size.lock().await;
     if let Some(bus) = &bus {
@@ -1955,11 +2053,16 @@ async fn run_render_loop(
         (io.render_pulse.subscribe(), io.clients.clone())
     };
     let (mut cols, mut rows) = *client_size.lock().await;
+    let (browser, session_id) = {
+        let s = session.lock().await;
+        (s.browser, s.session_id)
+    };
+    let bar_rows = if browser { 0 } else { STATUS_BAR_ROWS };
     let initial = config.current();
     let initial_theme = shux_core::theme::Theme::resolve(&initial.theme);
     let cfg = CompositorConfig {
         show_border: false,
-        status_bar_height: STATUS_BAR_ROWS,
+        status_bar_height: bar_rows,
         border_style: BorderStyle::parse(&initial.appearance.border_style),
         border_colors: shux_ui::BorderColors::from_theme(&initial_theme),
     };
@@ -2007,6 +2110,7 @@ async fn run_render_loop(
     // A driver handoff at the same size moves no pane, but changes this
     // client's status bar.
     let mut registry = clients.presence();
+    let mut presence_due: Option<tokio::time::Instant> = None;
     let mut peers: Option<Vec<(shux_core::event::ClientId, bool)>> = None;
     let own_redraw = session.lock().await.redraw.clone();
     let mut peer_toast: Option<PeerToast> = None;
@@ -2034,11 +2138,27 @@ async fn run_render_loop(
         tokio::select! {
             _ = cancel.cancelled() => break,
             () = latch => {}
-            changed = registry.changed() => {
+            // Peers coming and going redraw this client at most so often, a
+            // viewer reconnecting in a loop included; the wait is a deadline,
+            // so output and keys draw meanwhile. A browser shows no peers.
+            changed = registry.changed(), if !browser => {
                 if changed.is_err() {
                     break;
                 }
+                if let Some(next) = last_frame.map(|at| at + PRESENCE_REDRAW)
+                    && next > tokio::time::Instant::now()
+                {
+                    presence_due.get_or_insert(next);
+                    continue;
+                }
             }
+            () = async {
+                match presence_due {
+                    #[expect(clippy::disallowed_methods, reason = "paces frames; never synchronises a test")]
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            } => {}
             changed = pulse.changed() => {
                 // Unreachable while `PaneIoState` lives; never spin on it.
                 if changed.is_err() {
@@ -2085,15 +2205,42 @@ async fn run_render_loop(
         // For the wait after the frame that finds it: a frame not drawn (its
         // window gone) must not leave a past deadline waking this at once.
         latch_at = None;
+        presence_due = None;
         last_frame = Some(tokio::time::Instant::now());
 
+        // A browser watching a session nothing sizes draws its panes whole,
+        // with the tree and grid that fit them as they are now.
+        // One graph snapshot for the whole frame: the tree fitted below and
+        // the window drawn through it are the same window.
+        let snap = graph.snapshot();
+        let hostless = if browser {
+            let state = io_state.lock().await;
+            let border = BorderStyle::parse(&last_border_style);
+            // Never past the grid the gateway promised the browser.
+            crate::snapshot::hostless_frame(&snap, &state, session_id, border)
+                .map(|(tree, (c, r))| (tree, crate::share::wire::clamp(c, r)))
+        } else {
+            None
+        };
         // Resize from authoritative client_size, NOT from VT grid (which
         // would create a self-feeding shrink loop in split mode).
-        let (new_cols, new_rows) = *client_size.lock().await;
+        let (new_cols, new_rows) = match &hostless {
+            Some((_, size)) => *size,
+            None => *client_size.lock().await,
+        };
         if (new_cols, new_rows) != (cols, rows) {
             cols = new_cols;
             rows = new_rows;
             compositor.resize(cols, rows);
+            // Every byte after this is drawn for the new grid.
+            if browser
+                && out_tx
+                    .send(AttachServerFrame::Resized { cols, rows })
+                    .await
+                    .is_err()
+            {
+                break;
+            }
         }
 
         // Apply any config-driven appearance changes to the compositor.
@@ -2110,8 +2257,6 @@ async fn run_render_loop(
             last_copy_overlay = None;
         }
 
-        // Build a multi-pane frame snapshot.
-        let snap = graph.snapshot();
         // Show the window and pane the session shows, though another client
         // or an RPC moved them and this one has sent nothing since.
         // Drawn from this snapshot only: the input loop owns the cached
@@ -2175,12 +2320,13 @@ async fn run_render_loop(
                 vt_refs.insert(pid, vt);
             }
         }
+        let tree = hostless.as_ref().map_or(&win.layout.tree, |(tree, _)| tree);
         let mut geometry = shux_ui::prepare_frame(&shux_ui::FrameInputs {
-            layout: &win.layout.tree,
+            layout: tree,
             zoom: win.layout.zoom.as_ref(),
             cols,
             rows,
-            status_bar_height: STATUS_BAR_ROWS,
+            status_bar_height: bar_rows,
             border_style: BorderStyle::parse(&last_border_style),
             panes: &shux_ui::PresentedPane::of_vts(&vt_refs),
             now_ns: now(),
@@ -2276,80 +2422,103 @@ async fn run_render_loop(
                 .as_deref()
                 .unwrap_or(&live_cfg.keys.prefix),
         );
-        let session_meta = meta_cache.get(attached.session_id).await;
-        let onboarding_state = onboarding.current().await;
-        let toast_up = !onboarding_state.welcome_toast_seen && attached.show_welcome_toast;
+        // A browser draws no bar: nothing that fills one is read for it.
+        let onboarding_state = if browser {
+            None
+        } else {
+            Some(onboarding.current().await)
+        };
+        let toast_up = attached.show_welcome_toast
+            && onboarding_state
+                .as_ref()
+                .is_some_and(|o| !o.welcome_toast_seen);
         // A key ends the toast between frames, here or on another client;
         // its cells changed in no VT grid, so only a full redraw clears them.
         if toast_drawn && !toast_up {
             compositor.force_redraw();
             toast_drawn = false;
         }
-        let daemon_uptime = daemon_start.elapsed();
-        let last_action_ref = attached.last_action.as_ref().map(|(s, i)| (s.as_str(), *i));
-        let render_ctx = StatusBarCtx {
-            session_id: attached.session_id,
-            // The graph, not the name cached at attach: a rename shows at once.
-            session_name: snap
-                .sessions
-                .get(&attached.session_id)
-                .map_or(attached.name.as_str(), |s| s.name.as_str()),
-            active_window_id: attached.active_window_id,
-            active_pane_id: attached.active_pane_id,
-            session_meta: &session_meta,
-            onboarding: &onboarding_state,
-            daemon_uptime,
-            nerd_fonts,
-            prefix_label: &prefix_label,
-            client_cols: cols,
-            // As resolved for this frame: the one that ends it drops the flag.
-            copy_mode_active: modal.is_some(),
-            last_action: last_action_ref,
-            action_error: attached.action_error.as_deref(),
+        let bar = match &onboarding_state {
+            None => None,
+            Some(onboarding_state) => {
+                let session_meta = meta_cache.get(attached.session_id).await;
+                let daemon_uptime = daemon_start.elapsed();
+                let last_action_ref = attached.last_action.as_ref().map(|(s, i)| (s.as_str(), *i));
+                let render_ctx = StatusBarCtx {
+                    session_id: attached.session_id,
+                    // The graph, not the name cached at attach: a rename shows at once.
+                    session_name: snap
+                        .sessions
+                        .get(&attached.session_id)
+                        .map_or(attached.name.as_str(), |s| s.name.as_str()),
+                    active_window_id: attached.active_window_id,
+                    active_pane_id: attached.active_pane_id,
+                    session_meta: &session_meta,
+                    onboarding: onboarding_state,
+                    daemon_uptime,
+                    nerd_fonts,
+                    prefix_label: &prefix_label,
+                    client_cols: cols,
+                    // As resolved for this frame: the one that ends it drops the flag.
+                    copy_mode_active: modal.is_some(),
+                    last_action: last_action_ref,
+                    action_error: attached.action_error.as_deref(),
+                };
+                let has_notice = attached.action_error.is_some()
+                    || last_action_ref.is_some_and(|(_, at)| {
+                        at.elapsed() < crate::statusbar_build::ACTION_FEEDBACK_DWELL
+                    });
+                let mut bar = build_status_bar_shared(&snap, &live_theme, &render_ctx);
+                populate_bar(&mut bar, &live_cfg, &segments).await;
+                crate::statusbar_build::append_waiting(
+                    &mut bar,
+                    crate::pane_chrome::waiting_count(
+                        &snap,
+                        attached.session_id,
+                        &live_cfg.program_status,
+                    ),
+                    &live_theme,
+                    nerd_fonts,
+                    cols,
+                );
+                if let Some(toast) = peer_toast
+                    .as_ref()
+                    .filter(|t| !has_notice && t.until > tokio::time::Instant::now())
+                {
+                    let shux_core::theme::Rgb { r, g, b } = if toast.warn {
+                        live_theme.status_error
+                    } else {
+                        live_theme.status_shared
+                    };
+                    bar.center = vec![shux_ui::StatusSegment::styled(
+                        format!(" {} ", toast.text),
+                        crossterm::style::Color::Rgb { r, g, b },
+                        toast.warn,
+                    )];
+                }
+                crate::statusbar_build::append_viewing(
+                    &mut bar,
+                    bar_label.as_ref(),
+                    &live_theme,
+                    cols,
+                );
+                crate::statusbar_build::append_sharing(
+                    &mut bar,
+                    sizing.sharing,
+                    &live_theme,
+                    cols,
+                    if plain { "*" } else { "◉" },
+                    has_notice,
+                );
+                if has_notice {
+                    crate::statusbar_build::make_room_for_notice(&mut bar, cols);
+                }
+                if no_color {
+                    crate::statusbar_build::monochrome(&mut bar);
+                }
+                Some(bar)
+            }
         };
-        let has_notice = attached.action_error.is_some()
-            || last_action_ref.is_some_and(|(_, at)| {
-                at.elapsed() < crate::statusbar_build::ACTION_FEEDBACK_DWELL
-            });
-        let mut bar = build_status_bar_shared(&snap, &live_theme, &render_ctx);
-        populate_bar(&mut bar, &live_cfg, &segments).await;
-        crate::statusbar_build::append_waiting(
-            &mut bar,
-            crate::pane_chrome::waiting_count(&snap, attached.session_id, &live_cfg.program_status),
-            &live_theme,
-            nerd_fonts,
-            cols,
-        );
-        if let Some(toast) = peer_toast
-            .as_ref()
-            .filter(|t| !has_notice && t.until > tokio::time::Instant::now())
-        {
-            let shux_core::theme::Rgb { r, g, b } = if toast.warn {
-                live_theme.status_error
-            } else {
-                live_theme.status_shared
-            };
-            bar.center = vec![shux_ui::StatusSegment::styled(
-                format!(" {} ", toast.text),
-                crossterm::style::Color::Rgb { r, g, b },
-                toast.warn,
-            )];
-        }
-        crate::statusbar_build::append_viewing(&mut bar, bar_label.as_ref(), &live_theme, cols);
-        crate::statusbar_build::append_sharing(
-            &mut bar,
-            sizing.sharing,
-            &live_theme,
-            cols,
-            if plain { "*" } else { "◉" },
-            has_notice,
-        );
-        if has_notice {
-            crate::statusbar_build::make_room_for_notice(&mut bar, cols);
-        }
-        if no_color {
-            crate::statusbar_build::monochrome(&mut bar);
-        }
 
         // Welcome-toast lifecycle: if it's still showing and the
         // first-render-tick has passed, mark seen on the daemon side.
@@ -2358,12 +2527,12 @@ async fn run_render_loop(
         // toast layer below.
 
         let frame = MultiPaneFrame {
-            layout: &win.layout.tree,
+            layout: tree,
             zoom: win.layout.zoom.as_ref(),
             focused: attached.active_pane_id,
             vts: &vt_refs,
             chrome: Some(&pane_chrome),
-            status_bar: Some(&bar),
+            status_bar: bar.as_ref(),
             geometry: Some(&geometry),
         };
         compositor.set_cursor_hidden(
@@ -2606,6 +2775,9 @@ const RENDER_PART_BYTES: usize = 8 * 1024 * 1024;
 /// The shortest gap between two frames of one client while output arrives
 /// faster than it renders. Output after an idle wait draws at once.
 const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+
+/// The shortest gap between a frame and one drawn for a change of peers.
+const PRESENCE_REDRAW: Duration = Duration::from_millis(100);
 
 /// How long the first-attach welcome toast stays on screen before
 /// auto-dismissing. Tuned for "long enough to read, short enough to
@@ -5941,6 +6113,7 @@ mod tests {
             read_only: false,
             redraw: Arc::default(),
             repaint: false,
+            browser: false,
         };
 
         AttachFixture {

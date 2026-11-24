@@ -50,6 +50,16 @@ sha2 = { workspace = true }
 libc = "0.2"
 # Per-scenario sandbox dirs for the lens gate runner (task 081 D4 deny-by-default env).
 tempfile.workspace = true
+# `shux share` (#297). Routes and the WebSocket upgrade; hyper serves each
+# connection itself, so the gateway caps connections, bounds header reads and
+# drops a socket by dropping its task.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws"] }
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+# The link and viewer secrets: 256 bits from the OS. Already in-tree.
+getrandom = "0.4"
+# Constant-time comparison of a presented secret's digest.
+subtle = "2.6"
 
 [dev-dependencies]
 flate2 = "1"
@@ -58,6 +68,8 @@ tempfile.workspace = true
 base64 = "0.22"
 tokio = { workspace = true, features = ["test-util"] }
 proptest = "1"
+# A WebSocket client for the share gateway's tests; axum's own transport.
+tokio-tungstenite = "0.29"
 
 [lints]
 workspace = true
