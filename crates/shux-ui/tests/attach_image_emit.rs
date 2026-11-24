@@ -974,19 +974,40 @@ fn a_left_cropped_upscaled_put_keeps_its_band_edges() {
 }
 
 /// A client that never said how big its cells are in pixels cannot be told
-/// where inside a cell a picture begins: a picture that would begin there is
-/// taken down rather than drawn at the wrong place.
+/// where inside a cell a picture begins. Its first whole pixel is drawn from
+/// the next cell edge, no `X=`: the picture stays, no more than a cell short.
 #[test]
-fn a_mid_cell_crop_is_not_placed_for_a_client_of_unknown_cell_size() {
+fn a_mid_cell_crop_starts_at_the_next_cell_for_a_client_of_unknown_cell_size() {
+    // 4x1 px fitted to 5 columns, one cell cut off: pixel 1 begins a
+    // quarter cell into the slice, and no pixel on a cell edge follows.
     let mut vt = VirtualTerminal::new(12, 60);
     vt.process(b"\x1b[1;4H");
     vt.process(&transmit_then_put(5, 4, 1, "a=p,i=5,c=5,r=1,C=1"));
     vt.process(b"\x1b[1;1H");
-    let cmds = graphics(&after_scroll_in(&mut vt, b"\x1b[1;24H", None));
-    assert_eq!(cmds.len(), 1, "{cmds:?}");
+    let out = after_scroll_in(&mut vt, b"\x1b[1;24H", None);
     assert!(
-        cmds[0].starts_with("a=d"),
-        "placed mid cell blind: {cmds:?}"
+        out.contains("\x1b[1;2H\x1b_Ga=p,") && out.contains(",x=1,y=0,w=3,h=1,c=3,r=1\x1b\\"),
+        "{:?}",
+        graphics(&out)
+    );
+}
+
+/// The same down the rows, where the next pixel on a cell edge is two rows
+/// further: it starts one row in, not two.
+#[test]
+fn a_mid_row_crop_loses_no_more_than_a_row_for_a_client_of_unknown_cell_size() {
+    // 12x16 px fitted to 19 columns: 14.25 declared px a pixel, a pixel on a
+    // row edge every four. One row cut off: pixel 2 begins half a row in;
+    // pixel 4 is the next on an edge, two rows in.
+    let mut vt = VirtualTerminal::new(12, 20);
+    vt.process(b"\x1b[3;1H");
+    vt.process(&transmit_then_put(5, 12, 16, "a=p,i=5,c=19,C=1"));
+    vt.process(b"\x1b[1;1H");
+    let out = after_scroll_in(&mut vt, b"\x1b[9;1H", None);
+    assert!(
+        out.contains("\x1b[2;1H\x1b_Ga=p,") && out.contains(",y=2,w=12,") && !out.contains(",Y="),
+        "{:?}",
+        graphics(&out)
     );
 }
 

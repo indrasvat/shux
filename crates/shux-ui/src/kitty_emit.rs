@@ -330,8 +330,8 @@ fn resolve(p: &ComposedPlacement, cell_px: Option<(u32, u32)>) -> Option<Placed>
 /// One axis of [`resolve`]: the source pixels `first..end` shown, and where
 /// the first begins, in whole declared cells and then pixels of the client's
 /// own `real` cell, as the host applies `X=`/`Y=`. Not knowing the client's
-/// cell, a pixel that begins partway into one cannot be placed truly: the
-/// first later pixel that begins on a cell edge is used, or none.
+/// cell, a pixel that begins partway into one cannot be placed truly: a pixel
+/// on the next cell edge is used, else the first drawn from that edge.
 fn place(
     extent: u32,
     dest: u64,
@@ -352,9 +352,18 @@ fn place(
             Some((j, end, cells, (lead(j) % whole) * u64::from(real) / whole))
         }
         None => {
-            let j = (first..end).find(|&j| lead(j) % whole == 0)?;
-            let (j, end, cells) = at(j);
-            Some((j, end, cells, 0))
+            let next = lead(first).div_ceil(whole);
+            // A pixel on that next edge, or `first` itself on one, is exact.
+            let exact = (first..end).find(|&j| lead(j) % whole == 0 && lead(j) / whole <= next);
+            let cells = (v1 - v0) / cell;
+            Some(match exact {
+                Some(j) => at(j),
+                // Drawn from the next edge, at most a cell late; with no cell
+                // after it, from its own.
+                None if next < cells => (first, end, next),
+                None => (first, end, next.saturating_sub(1)),
+            })
+            .map(|(j, end, cells)| (j, end, cells, 0))
         }
     }
 }
