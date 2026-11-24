@@ -250,6 +250,7 @@ fixture() {
   rt "${f}/tmp 3 [x]*/shuxdead3/shux/shux.pid" "${dead}"
   backdate "${OLD}" "${f}/tmp1" "${f}/tmp2" "${f}/tmp 3 [x]*" "${f}/outside"
   rt "${f}/tmp1/shuxfresh/shux/shux.pid" "${dead}"
+  ago "${f}/tmp1/shuxfresh" -86400  # recent however long the runs take
 }
 
 # ── Assertions ─────────────────────────────────────────────────────────────
@@ -290,6 +291,16 @@ neutral_apply() (
   prune_cleanup
 )
 
+# planned <path>: the plan holds exactly that path. A loop, not `printf | grep -q`:
+# grep exits at its match, printf can still be writing, and pipefail turns its
+# EPIPE into "not planned".
+planned() {
+  local p
+  # shellcheck disable=SC2031  # called inside the same subshell that sourced prune.sh and planned
+  for p in "${P_PATH[@]}"; do [[ "${p}" != "$1" ]] || return 0; done
+  return 1
+}
+
 # late_apply <fixture>: plan, then start a build and a daemon, then apply that plan.
 late_apply() (
   prune_env "$1"
@@ -298,8 +309,8 @@ late_apply() (
   . "${late}/repo/scripts/prune.sh"
   prune_setup
   prune_plan >/dev/null
-  printf '%s\n' "${P_PATH[@]}" | grep -qxF "${late}/wt-pushed/target" || { echo "late target not planned"; exit 3; }
-  printf '%s\n' "${P_PATH[@]}" | grep -qxF "${late}/wt-merged/target" || { echo "late lock target not planned"; exit 3; }
+  planned "${late}/wt-pushed/target" || { echo "late target not planned"; exit 3; }
+  planned "${late}/wt-merged/target" || { echo "late lock target not planned"; exit 3; }
   start_fake "${late}/bin/cargo" "${late}/bin/cargo" "${late}/wt-pushed" "${late}/late.pl"
   cat "${late}/daemon.pid" >"${late}/tmp1/shuxlate/shux/shux.pid"
   git -C "${late}/repo" worktree lock "${late}/wt-merged"
@@ -316,17 +327,16 @@ suite() {
   repo="${f}/repo"
   nl="crates"$'\n'"sub"
 
-  # Either side of the 30-minute line, set just before the runs: BSD find -mmin
-  # rounds the age up and GNU truncates, so macOS and Linux disagreed here.
-  ago "${f}/wt-fuzz/fuzz/target" $((29 * 60 + 10))
-  ago "${f}/wt-merged/target" $((30 * 60 + 30))
+  # Written "in the future": newer than prune's 30-minute reference however long the
+  # runs take. The line itself is checked by busy_boundary, against that reference.
+  ago "${f}/wt-fuzz/fuzz/target" -86400
   snapshot "${f}" >"${f}.before"
   rc=0
   prune "${f}" || rc=$?
   ps -p "$(cat "${f}/daemon.pid")" >/dev/null 2>&1 || fail "the live daemon (a shux session) was stopped"
   [[ "${rc}" -eq 0 ]] || fail "dry run exited ${rc}"
   snapshot "${f}" >"${f}.after"
-  cmp -s "${f}.before" "${f}.after" || fail "dry run changed the tree: $(diff "${f}.before" "${f}.after" | head -5)"
+  cmp -s "${f}.before" "${f}.after" || fail "dry run changed the tree: $(diff "${f}.before" "${f}.after" | sed -n '1,5p')"
   [[ "${OUT}" == *"make prune APPLY=1"* ]] || fail "dry run did not name the command to apply"
 
   prune "${f}" --apply || fail "apply exited non-zero"
@@ -417,6 +427,9 @@ suite() {
   rc=0
   OUT="$(lock_cases "${f}" "${repo}/.shux/scripts/lib/cache_lock.sh" 2>&1)" || rc=$?
   [[ "${rc}" -eq 0 ]] || fail "cache lock: ${OUT}"
+
+  # The 30-minute line, to the second, on either side of prune's own reference file.
+  OUT="$(busy_boundary "${f}" 2>&1)" || fail "busy boundary: ${OUT}"
 
   # A build whose cwd cannot be read (another user's, under sudo) holds every worktree.
   OUT="$(unreadable_cwd "${f}" 2>&1)" || :
@@ -513,6 +526,24 @@ lock_cases() (
   [[ "$(cat "${race}/pid" 2>/dev/null)" == "${live}" ]] || { echo "a stale-lock race moved the live lock away"; exit 1; }
 )
 
+# busy_boundary <fixture>: fresh_build against prune's reference, 5 s either side of it.
+busy_boundary() (
+  prune_env "$1"
+  # shellcheck source=scripts/prune.sh
+  . "$1/repo/scripts/prune.sh"
+  prune_setup
+  mkdir -p "$1/edge"
+  : >"$1/edge/inside"
+  : >"$1/edge/outside"
+  python3 -c 'import os, sys
+ref = os.stat(sys.argv[1]).st_mtime
+os.utime(sys.argv[2], (ref + 5, ref + 5))
+os.utime(sys.argv[3], (ref - 5, ref - 5))' "${BUSY_REF}" "$1/edge/inside" "$1/edge/outside"
+  [[ -n "$(fresh_build "$1/edge/inside")" ]] || { echo "a build dir 5 s inside the line was not in use"; exit 1; }
+  [[ -z "$(fresh_build "$1/edge/outside")" ]] || { echo "a build dir 5 s outside the line was in use"; exit 1; }
+  prune_cleanup
+)
+
 # unreadable_cwd <fixture>: CWD_UNKNOWN after scan_builds when no build's cwd can be read.
 unreadable_cwd() (
   prune_env "$1"
@@ -535,7 +566,7 @@ mid_apply() (
   . "${mid}/repo/scripts/prune.sh"
   prune_setup
   plan_worktrees >/dev/null
-  printf '%s\n' "${P_PATH[@]}" | grep -qxF "${mid}/wt-two/fuzz/target" || { echo "wt-two/fuzz/target not planned"; exit 3; }
+  planned "${mid}/wt-two/fuzz/target" || { echo "wt-two/fuzz/target not planned"; exit 3; }
   eval "real_$(declare -f safe_rm)"
   # shellcheck disable=SC2329  # shadows safe_rm for prune_apply, which calls it by name
   safe_rm() {
