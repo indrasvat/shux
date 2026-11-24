@@ -485,7 +485,9 @@ pub fn append_sharing(
     }
     // Only the name is left: it gives up its tail, then itself.
     let unit = badge.unit(badge.rungs.len() - 1, theme, mark);
-    let room = cols.saturating_sub(width(&unit) + 1 + width(&bar.center));
+    // A gap after the name, and one after a centre notice too.
+    let cw = width(&bar.center);
+    let room = cols.saturating_sub(width(&unit) + 1 + cw + usize::from(cw > 0));
     if let Some(name) = bar.left.first_mut()
         && let Some(text) = shortened(&name.text, room)
     {
@@ -883,7 +885,46 @@ mod tests {
         let viewer = sharing(Seat::Viewer, 1, 0);
         append_sharing(&mut b, Some(viewer), &Theme::DEFAULT, 2, "*", false);
         let row: String = b.render_row(2).iter().map(|c| c.ch).collect();
-        assert_eq!(row, "*r", "NO_COLOR");
+        assert_eq!(row, "*r", "--plain");
+    }
+
+    /// Council of #191: a passing notice, the badge and the shortened session
+    /// name all fit, with a gap either side of the notice: the name is not
+    /// left one column too long for the row to hold the notice whole.
+    #[test]
+    fn a_notice_and_the_badge_fit_beside_a_shortened_name() {
+        let notice = " [pane split] ";
+        for cols in 20..70u16 {
+            let mut b = bar(" ◆ a-very-long-session-name ", notice, " up 3h ");
+            append_sharing(
+                &mut b,
+                Some(sharing(Seat::Viewer, 1, 0)),
+                &Theme::DEFAULT,
+                cols,
+                "◉",
+                true,
+            );
+            make_room_for_notice(&mut b, cols);
+            let row: String = b.render_row(cols).iter().map(|c| c.ch).collect();
+            let width = StatusBar::segments_width;
+            let used = width(&b.left)
+                + width(&b.center)
+                + width(&b.right)
+                + usize::from(width(&b.left) > 0)
+                + usize::from(width(&b.right) > 0);
+            assert!(
+                used <= usize::from(cols),
+                "{cols}: {used} columns of segments: {row:?}"
+            );
+            assert!(
+                row.contains(notice.trim()),
+                "{cols}: the notice was cut: {row:?}"
+            );
+            // Room for the shortest name (` ◆…`) beside both gaps: it is kept.
+            if usize::from(cols) >= width(&b.center) + width(&b.right) + 2 + 3 {
+                assert!(!b.left.is_empty(), "{cols}: the name went: {row:?}");
+            }
+        }
     }
 
     /// The counts give way before any other segment does.

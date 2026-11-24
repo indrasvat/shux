@@ -111,9 +111,10 @@ Every terminal attached with `shux session attach` is a client. Each one's
 status bar carries a badge while it shares the session: the first writer
 (host) sees `◉ shared · N watching`, or red `◉ shared · N can type` when
 another client can type; another writer sees red `◉ writable · your keys go
-to this session`; a read-only client sees `◉ viewing · read-only`. Under
-`NO_COLOR` the row is monochrome, `*` replaces `◉`, and a warning ends on
-`!` when the badge is shortest. A snapshot, which has no viewer, shows
+to this session`; a read-only client sees `◉ viewing · read-only`. At its
+narrowest the badge keeps a letter: `◉!` someone else can type, `◉r`
+read-only. Under `NO_COLOR` the row is monochrome with the same glyphs;
+`--plain` draws `*` for `◉`. A snapshot, which has no viewer, shows
 `◉ N attached` once two or more are on the session.
 
 ```json

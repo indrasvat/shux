@@ -91,7 +91,9 @@ pub(crate) fn register_client_methods(
                             _ => super::params::ref_error_to_rpc(e, "id"),
                         })?,
                     };
-                    if !clients.remove(target.into()) {
+                    // Under the io lock: a key the client sends meets its removal
+                    // there, so none is written once the list no longer shows it.
+                    if !io.lock().await.clients.remove(target.into()) {
                         return Err(not_found());
                     }
                     Ok(serde_json::json!({ "detached": target.to_string() }))

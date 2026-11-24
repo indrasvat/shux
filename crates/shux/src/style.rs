@@ -2406,15 +2406,16 @@ mod tests {
     /// A watcher is marked in `client list`, a writer is not.
     #[test]
     fn a_read_only_client_is_marked_in_the_list() {
+        // As the terminal shows it: colour on (FORCE_COLOR) or off.
         let row = |read_only| {
-            client_line(&serde_json::json!({
+            shux_pty::strip_ansi(&client_line(&serde_json::json!({
                 "id": "aaaa1111-0000-4000-8000-000000000000",
                 "session": "s",
                 "cols": 80,
                 "rows": 24,
                 "attached_at": 0,
                 "read_only": read_only,
-            }))
+            })))
         };
         assert!(row(true).ends_with("read-only"), "{}", row(true));
         assert!(!row(false).contains("read-only"), "{}", row(false));
