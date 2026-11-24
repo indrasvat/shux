@@ -83,6 +83,11 @@ fn terminal_can_draw_images() -> bool {
         .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()))
 }
 
+/// Whether `NO_COLOR` asks for no colour: set and not empty, per no-color.org.
+fn no_color_asked(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| !v.is_empty())
+}
+
 /// What the daemon's reply fails to confirm of what the client asked for:
 /// its protocol, `plain` or `read_only`. A daemon that predates a mode ignores
 /// it, so its echo is the only proof; checked before the terminal is touched.
@@ -144,7 +149,7 @@ pub async fn run_attach(socket_path: &Path, config: ClientConfig) -> Result<Exit
         graphics,
         plain: config.plain,
         read_only: config.read_only,
-        no_color: std::env::var_os("NO_COLOR").is_some(),
+        no_color: no_color_asked(std::env::var_os("NO_COLOR").as_deref()),
     };
     framed
         .send(Bytes::from(serde_json::to_vec(&hello)?))
@@ -741,16 +746,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_mode_unconfirmed_by_the_daemon_refuses_to_attach() {
+    fn an_empty_no_color_asks_for_colour() {
+        use std::ffi::OsStr;
+        assert!(no_color_asked(Some(OsStr::new("1"))));
+        assert!(!no_color_asked(Some(OsStr::new(""))), "empty NO_COLOR");
+        assert!(!no_color_asked(None));
+    }
+
+    #[test]
+    fn plain_unconfirmed_by_the_daemon_refuses_to_attach() {
+        let v = ATTACH_PROTOCOL_VERSION;
+        let asked = |plain| ClientConfig {
+            plain,
+            ..ClientConfig::default()
+        };
+        assert!(unmet_mode(&asked(true), v, false, false).is_some());
+        assert!(unmet_mode(&asked(true), v, true, false).is_none());
+        assert!(unmet_mode(&asked(false), v, false, false).is_none());
+    }
+
+    #[test]
+    fn read_only_or_protocol_unconfirmed_refuses_to_attach() {
         let v = ATTACH_PROTOCOL_VERSION;
         let asked = |plain, read_only| ClientConfig {
             plain,
             read_only,
             ..ClientConfig::default()
         };
-        assert!(unmet_mode(&asked(true, false), v, false, false).is_some());
-        assert!(unmet_mode(&asked(true, false), v, true, false).is_none());
-        assert!(unmet_mode(&asked(false, false), v, false, false).is_none());
         assert!(unmet_mode(&asked(false, true), v, false, true).is_none());
         let absent =
             unmet_mode(&asked(false, true), v, false, false).expect("read-only unconfirmed");

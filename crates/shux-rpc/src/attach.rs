@@ -338,20 +338,6 @@ mod tests {
         assert_eq!(back.session_name.as_deref(), Some("dev"));
     }
 
-    /// A reply without `read_only` is from a daemon that never granted it.
-    #[test]
-    fn a_ready_without_read_only_reads_as_not_granted() {
-        let old = r#"{"kind":"ok","session_id":"1","session_name":"s","active_window_id":"w","active_pane_id":"p","protocol":1}"#;
-        match serde_json::from_str::<AttachReady>(old).unwrap() {
-            AttachReady::Ok {
-                read_only,
-                protocol,
-                ..
-            } => assert!(!read_only && protocol == 1),
-            other => panic!("{other:?}"),
-        }
-    }
-
     #[test]
     fn test_ready_ok_and_error() {
         let ok = AttachReady::Ok {

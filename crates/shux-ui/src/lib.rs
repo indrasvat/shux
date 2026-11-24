@@ -38,7 +38,7 @@ pub use copy_mode::{
     CopyKey, CopyModeState, CopyView, Drawn, Selection, handle_key as copy_mode_key, osc52_copy,
     render_copy_overlay_into, render_copy_overlay_with_vt_into, render_copy_view_into,
 };
-pub use help_overlay::render_help_overlay_into;
+pub use help_overlay::{render_help_overlay_into, render_viewer_help_overlay_into};
 pub use input::{InputEvent, KeyboardProtocol, MouseAction, MouseButton, MouseEvent};
 pub use keybinding::{BindingTarget, KeybindingError, KeybindingRegistry};
 pub use keys::{KeyPress, KeyValue, Modifiers, NamedKey};

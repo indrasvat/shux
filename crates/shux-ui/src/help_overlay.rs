@@ -148,6 +148,69 @@ const SECTIONS: &[Section] = &[
     },
 ];
 
+/// What a read-only client can do: watch, scroll, select, copy, leave.
+const VIEWER_SECTIONS: &[Section] = &[
+    Section {
+        title: "Read-only: your keys do not reach the session",
+        entries: &[
+            Entry {
+                key: "Scroll wheel",
+                desc: "Scroll the focused pane's scrollback",
+            },
+            Entry {
+                key: "Click / drag",
+                desc: "Select in the focused pane; right-click: menu",
+            },
+        ],
+    },
+    Section {
+        title: "Copy mode",
+        entries: &[
+            Entry {
+                key: "Prefix [",
+                desc: "Enter copy mode on focused pane",
+            },
+            Entry {
+                key: "hjkl / arrows",
+                desc: "Move cursor (in copy mode)",
+            },
+            Entry {
+                key: "/ or ?  n / N",
+                desc: "search forward / back, next / previous",
+            },
+            Entry {
+                key: "v",
+                desc: "Begin / clear selection",
+            },
+            Entry {
+                key: "y",
+                desc: "Yank to clipboard (OSC 52) and exit",
+            },
+        ],
+    },
+    Section {
+        title: "Session & misc",
+        entries: &[
+            Entry {
+                key: "Prefix d",
+                desc: "Detach client",
+            },
+            Entry {
+                key: "Prefix r",
+                desc: "Force full redraw",
+            },
+            Entry {
+                key: "Prefix ?",
+                desc: "Toggle this help overlay",
+            },
+            Entry {
+                key: "Esc or q",
+                desc: "Dismiss overlay / exit copy mode",
+            },
+        ],
+    },
+];
+
 /// Append ANSI bytes that draw a centered rounded box with the cheat
 /// sheet over `cols × rows`, naming `prefix_label` as the prefix. Caller
 /// is responsible for forcing a full redraw on the next frame so the cells
@@ -163,6 +226,40 @@ pub fn render_help_overlay_into(
     theme: &Theme,
     prefix_label: &str,
 ) {
+    let title = format!(" shux — keybindings (prefix = {prefix_label}) ");
+    render_sheet(buf, cols, rows, theme, prefix_label, &title, SECTIONS);
+}
+
+/// The sheet a read-only client sees: it says so, and lists only what works
+/// for it. Splits, kills, resizes, windows and focus are another client's.
+pub fn render_viewer_help_overlay_into(
+    buf: &mut Vec<u8>,
+    cols: u16,
+    rows: u16,
+    theme: &Theme,
+    prefix_label: &str,
+) {
+    let title = format!(" shux — read-only (prefix = {prefix_label}) ");
+    render_sheet(
+        buf,
+        cols,
+        rows,
+        theme,
+        prefix_label,
+        &title,
+        VIEWER_SECTIONS,
+    );
+}
+
+fn render_sheet(
+    buf: &mut Vec<u8>,
+    cols: u16,
+    rows: u16,
+    theme: &Theme,
+    prefix_label: &str,
+    title: &str,
+    sections: &[Section],
+) {
     let cols = cols as usize;
     let rows = rows as usize;
     if cols < 8 || rows < 4 {
@@ -170,14 +267,13 @@ pub fn render_help_overlay_into(
     }
 
     // Lay out the body lines once so we know the box dimensions.
-    let body_lines = build_body_lines();
+    let body_lines = build_body_lines(sections);
     let inner_w = body_lines
         .iter()
         .map(|s| display_width(s))
         .max()
         .unwrap_or(0);
-    let title = format!(" shux — keybindings (prefix = {prefix_label}) ");
-    let title_w = display_width(&title);
+    let title_w = display_width(title);
     let inner_w = inner_w.max(title_w).max(40);
 
     // 2-cell horizontal padding inside the border, plus 1 cell each
@@ -223,7 +319,7 @@ pub fn render_help_overlay_into(
         let left = title_pad / 2;
         let right = title_pad - left;
         line.push_str(&"─".repeat(left));
-        line.push_str(&title);
+        line.push_str(title);
         line.push_str(&"─".repeat(right));
         line.push('╮');
         line.push_str(&String::from_utf8_lossy(reset));
@@ -286,9 +382,9 @@ pub fn render_help_overlay_into(
     }
 }
 
-fn build_body_lines() -> Vec<String> {
+fn build_body_lines(sections: &[Section]) -> Vec<String> {
     // Two-column layout: key column padded to a fixed width, then desc.
-    let key_col_w = SECTIONS
+    let key_col_w = sections
         .iter()
         .flat_map(|s| s.entries.iter())
         .map(|e| display_width(e.key))
@@ -296,7 +392,7 @@ fn build_body_lines() -> Vec<String> {
         .unwrap_or(20);
 
     let mut out = Vec::new();
-    for (i, section) in SECTIONS.iter().enumerate() {
+    for (i, section) in sections.iter().enumerate() {
         if i > 0 {
             out.push(String::new()); // blank line between sections
         }
@@ -425,7 +521,7 @@ mod tests {
 
     #[test]
     fn body_lines_has_all_sections() {
-        let lines = build_body_lines();
+        let lines = build_body_lines(SECTIONS);
         let joined = lines.join("\n");
         for s in SECTIONS {
             assert!(joined.contains(s.title), "missing section: {}", s.title);
