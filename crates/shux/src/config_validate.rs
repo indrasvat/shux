@@ -654,6 +654,7 @@ status_branch    = "#c6a0f6"
 status_ok        = "#a6da95"
 status_error     = "#ed8796"
 status_attention = "#eed49f"
+status_shared    = "#f5a97f"
 "##,
         );
         let diags = validate(f.path()).unwrap();

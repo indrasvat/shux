@@ -77,6 +77,7 @@ pub(crate) async fn run_attach(
     jsonrpc_socket: &std::path::Path,
     session_name: String,
     plain: bool,
+    read_only: bool,
 ) -> anyhow::Result<()> {
     let attach_path = daemon::attach_socket_path_for(jsonrpc_socket)?;
     let cfg_path = shux_core::config::default_config_path();
@@ -103,6 +104,7 @@ pub(crate) async fn run_attach(
         keybindings: cfg_snapshot.keybindings.clone(),
         live_config: Some(live_config),
         plain,
+        read_only,
     };
     match shux_ui::attach::run_attach(&attach_path, cfg).await {
         Ok(reason) => {
@@ -201,7 +203,7 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
             }
             let _ = client::ensure_daemon_running_at(&socket_path).await?;
             let session_name = pick_attach_target(&socket_path).await;
-            run_attach(&socket_path, session_name, false).await
+            run_attach(&socket_path, session_name, false, false).await
         }
 
         // `shux session <verb>` — canonical session lifecycle.
@@ -260,7 +262,7 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
                 cli::or_wait_failed(created, waiting, "session create", args.format)?;
                 drop(stream);
                 if !detached {
-                    run_attach(&socket_path, session_name, false).await
+                    run_attach(&socket_path, session_name, false, false).await
                 } else {
                     Ok(())
                 }
@@ -295,6 +297,7 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
                 name_pos,
                 session,
                 plain,
+                read_only,
             } => {
                 // Refuse before touching the terminal. `run_attach` drives
                 // crossterm raw mode, and crossterm opens `/dev/tty` DIRECTLY —
@@ -318,11 +321,23 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
                          non-interactively."
                     );
                 }
-                let _ = client::ensure_daemon_running_at(&socket_path).await?;
+                // A watcher starts no daemon and replaces none: it attaches
+                // to what is running, or says nothing is.
+                if read_only {
+                    if client::try_connect(&socket_path).await.is_err() {
+                        anyhow::bail!(
+                            "no shux daemon is running at {}: `session attach --read-only` \
+                             watches a session that exists, so it starts none",
+                            socket_path.display()
+                        );
+                    }
+                } else {
+                    let _ = client::ensure_daemon_running_at(&socket_path).await?;
+                }
                 let session_name = name_pos
                     .or(session)
                     .unwrap_or_else(|| "default".to_string());
-                run_attach(&socket_path, session_name, plain).await
+                run_attach(&socket_path, session_name, plain, read_only).await
             }
             cli::SessionCommand::Snapshot {
                 session,

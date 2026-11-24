@@ -30,32 +30,36 @@ pub struct ClientInfo {
     pub last_input: Option<Instant>,
 }
 
-/// A client's part in sizing its session.
+/// Where a client sits among the session's other clients.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Role {
-    Driving,
-    /// Votes, but another client drives: its own input would take over.
-    Viewing,
-    ReadOnly,
+pub enum Seat {
+    /// The earliest attached writer: it keeps the seat through sizing
+    /// handoffs, and the next writer takes it when it leaves.
+    Host,
+    /// Any other writable client.
+    Writer,
+    Viewer,
 }
 
-impl Role {
-    /// The status bar's words beside its mark, longest first down to none;
-    /// a driver shows nothing.
-    pub fn words(self) -> Option<&'static [&'static str]> {
-        match self {
-            Role::Driving => None,
-            Role::Viewing => Some(&["viewing · type to drive", "viewing", ""]),
-            Role::ReadOnly => Some(&["read-only", ""]),
-        }
-    }
+/// Who else is on a client's session, for its sharing badge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sharing {
+    pub seat: Seat,
+    /// Other clients that can type.
+    pub writers: usize,
+    /// Other read-only clients.
+    pub viewers: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionView {
     pub attached: usize,
+    /// The asking client is the one that sizes the panes now.
+    pub driving: bool,
     /// `None` for a frame no attached client asked for.
-    pub role: Option<Role>,
+    pub sharing: Option<Sharing>,
+    /// The session's other clients, and whether each can type.
+    pub peers: Vec<(ClientId, bool)>,
     pub pinned: std::collections::HashSet<PaneId>,
 }
 
@@ -114,11 +118,15 @@ struct State {
 }
 
 /// Every attached client, plus the sizing decisions made from them. A change
-/// to anything that decides a pane's size bumps [`ClientRegistry::changed`].
+/// to anything that decides a pane's size bumps [`ClientRegistry::changed`];
+/// any change a status bar shows, sizing included, bumps
+/// [`ClientRegistry::presence`]. A read-only client's comings, goings and
+/// resizes bump only the latter: they never wake the sizing reconciler.
 #[derive(Clone)]
 pub struct ClientRegistry {
     state: Arc<Mutex<State>>,
     changed: Arc<watch::Sender<u64>>,
+    presence: Arc<watch::Sender<u64>>,
     /// One sizing pass at a time: deciding the driver and writing its sizes
     /// is one step, so two passes cannot interleave stale sizes.
     sizing: Arc<tokio::sync::Mutex<()>>,
@@ -129,6 +137,7 @@ impl Default for ClientRegistry {
         Self {
             state: Arc::default(),
             changed: Arc::new(watch::channel(0).0),
+            presence: Arc::new(watch::channel(0).0),
             sizing: Arc::default(),
         }
     }
@@ -142,6 +151,20 @@ impl ClientRegistry {
 
     fn bump(&self) {
         self.changed.send_modify(|n| *n = n.wrapping_add(1));
+        self.bump_presence();
+    }
+
+    fn bump_presence(&self) {
+        self.presence.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// A change to a client that sizes (`votes`) is a sizing change.
+    fn bump_for(&self, votes: bool) {
+        if votes {
+            self.bump();
+        } else {
+            self.bump_presence();
+        }
     }
 
     /// Hold for a whole sizing pass.
@@ -159,6 +182,12 @@ impl ClientRegistry {
         self.changed.subscribe()
     }
 
+    /// Wakes whenever what a status bar shows of the clients may have
+    /// changed: who is attached, or a size decision.
+    pub fn presence(&self) -> watch::Receiver<u64> {
+        self.presence.subscribe()
+    }
+
     /// Ask for the sizes to be worked out again: a pane gained its resizer.
     pub fn touch(&self) {
         self.bump();
@@ -167,14 +196,14 @@ impl ClientRegistry {
     /// Record a client until the returned guard drops; cancelling `end`
     /// ends that client's connection.
     pub fn register(&self, info: ClientInfo, end: CancellationToken) -> Registered {
-        let id = info.id;
+        let (id, votes) = (info.id, info.votes);
         {
             let mut s = self.state();
             let seq = s.next_seq;
             s.next_seq += 1;
             s.clients.insert(id, Entry { info, end, seq });
         }
-        self.bump();
+        self.bump_for(votes);
         Registered {
             registry: self.clone(),
             id,
@@ -197,11 +226,12 @@ impl ClientRegistry {
             Some(e) if (e.info.cols, e.info.rows) != (cols, rows) => {
                 e.info.cols = cols;
                 e.info.rows = rows;
-                true
+                Some(e.info.votes)
             }
-            _ => false,
+            _ => None,
         };
-        if changed {
+        // Only a voter's size shows anywhere but its own screen and the list.
+        if changed == Some(true) {
             self.bump();
         }
     }
@@ -249,11 +279,14 @@ impl ClientRegistry {
 
     /// Unlist a client and end its connection. False when none is attached.
     pub fn remove(&self, id: ClientId) -> bool {
-        let gone = self.state().unlist(id).map(|e| e.end.cancel()).is_some();
-        if gone {
-            self.bump();
+        let gone = self.state().unlist(id).map(|e| {
+            e.end.cancel();
+            e.info.votes
+        });
+        if let Some(votes) = gone {
+            self.bump_for(votes);
         }
-        gone
+        gone.is_some()
     }
 
     /// The client whose size the session's panes take, decided now. None
@@ -270,8 +303,8 @@ impl ClientRegistry {
     }
 
     /// What a frame for `client` (none for a snapshot) shows about `session`,
-    /// read under one lock: who is attached, the client's role, and which of
-    /// `panes` are pinned. Decides nothing: the driver is the one
+    /// read under one lock: who is attached, whether the client drives, who
+    /// else is there, and which of `panes` are pinned. Decides nothing: the driver is the one
     /// [`ClientRegistry::driver`] would elect now.
     pub fn session_view(
         &self,
@@ -280,19 +313,36 @@ impl ClientRegistry {
         panes: &[PaneId],
     ) -> SessionView {
         let s = self.state();
-        let (_, driver) = s.voters_and_elected(session);
-        let role = client.and_then(|id| s.clients.get(&id)).map(|e| {
-            if !e.info.votes {
-                Role::ReadOnly
-            } else if driver == Some(e.info.id) {
-                Role::Driving
+        let (voters, driver) = s.voters_and_elected(session);
+        let me = client.and_then(|id| s.clients.get(&id));
+        let attached = s.count(session);
+        let sharing = me.map(|e| {
+            let seat = if !e.info.votes {
+                Seat::Viewer
+            } else if voters.first().map(|c| c.id) == Some(e.info.id) {
+                Seat::Host
             } else {
-                Role::Viewing
+                Seat::Writer
+            };
+            let writers = voters.len() - usize::from(e.info.votes);
+            Sharing {
+                seat,
+                writers,
+                viewers: attached - voters.len() - usize::from(!e.info.votes),
             }
         });
+        let mut peers: Vec<(ClientId, bool)> = s
+            .clients
+            .values()
+            .filter(|e| e.info.session_id == session && Some(e.info.id) != client)
+            .map(|e| (e.info.id, e.info.votes))
+            .collect();
+        peers.sort_by_key(|(id, _)| id.0);
         SessionView {
-            attached: s.count(session),
-            role,
+            attached,
+            driving: client.is_some() && driver == client,
+            sharing,
+            peers,
             pinned: panes
                 .iter()
                 .copied()
@@ -412,9 +462,9 @@ impl Registered {
 
 impl Drop for Registered {
     fn drop(&mut self) {
-        let gone = self.registry.state().unlist(self.id).is_some();
-        if gone {
-            self.registry.bump();
+        let gone = self.registry.state().unlist(self.id).map(|e| e.info.votes);
+        if let Some(votes) = gone {
+            self.registry.bump_for(votes);
         }
     }
 }
@@ -507,19 +557,97 @@ mod tests {
         let _gw = reg.register(watcher.clone(), CancellationToken::new());
         let (pinned, free) = (PaneId::new(), PaneId::new());
         reg.pin(pinned);
-        let role = |id| reg.session_view(s, Some(id), &[pinned, free]).role;
-        assert_eq!(role(a.id), Some(Role::Driving), "the first voter, untyped");
-        assert_eq!(role(b.id), Some(Role::Viewing));
-        assert_eq!(role(watcher.id), Some(Role::ReadOnly));
+        let driving = |id| reg.session_view(s, Some(id), &[pinned, free]).driving;
+        assert!(driving(a.id), "the first voter, untyped");
+        assert!(!driving(b.id) && !driving(watcher.id));
         assert!(reg.mark_input(b.id, Instant::now()));
-        assert_eq!(role(b.id), Some(Role::Driving));
-        assert_eq!(role(a.id), Some(Role::Viewing));
+        assert!(driving(b.id) && !driving(a.id));
+        let peers = reg.session_view(s, Some(a.id), &[]).peers;
+        let mut want = vec![(b.id, true), (watcher.id, false)];
+        want.sort_by_key(|(id, _)| id.0);
+        assert_eq!(
+            peers, want,
+            "a client's peers are the others, with their votes"
+        );
         let view = reg.session_view(s, None, &[pinned, free]);
-        assert_eq!(view.role, None);
+        assert!(!view.driving);
         assert_eq!(view.attached, 3);
         assert_eq!(view.pinned, [pinned].into_iter().collect());
-        assert_eq!(Role::Driving.words(), None);
+        assert_eq!(view.sharing, None);
         assert!(reg.has_voter(s) && !reg.has_voter(SessionId::new()));
+    }
+
+    /// A viewer's whole life, removal by `client detach` included, wakes the
+    /// status bars and never the sizing reconciler; a voter's wakes both.
+    #[test]
+    fn a_viewer_never_moves_the_sizing_generation() {
+        let reg = ClientRegistry::default();
+        let s = SessionId::new();
+        let (mut sizing, mut presence) = (reg.changed(), reg.presence());
+        let mut settle = || {
+            let moved = (
+                sizing.has_changed().unwrap(),
+                presence.has_changed().unwrap(),
+            );
+            sizing.borrow_and_update();
+            presence.borrow_and_update();
+            moved
+        };
+        let viewer = ClientInfo {
+            votes: false,
+            ..info(s)
+        };
+        let guard = reg.register(viewer.clone(), CancellationToken::new());
+        assert_eq!(settle(), (false, true), "register");
+        reg.set_size(viewer.id, 200, 60);
+        assert_eq!(settle(), (false, false), "resize");
+        assert!(!reg.mark_input(viewer.id, Instant::now()));
+        assert_eq!(settle(), (false, false), "input");
+        drop(guard);
+        assert_eq!(settle(), (false, true), "drop");
+        let removed = ClientInfo {
+            votes: false,
+            ..info(s)
+        };
+        let _g = reg.register(removed.clone(), CancellationToken::new());
+        settle();
+        assert!(reg.remove(removed.id));
+        assert_eq!(settle(), (false, true), "client detach");
+
+        let _w = reg.register(info(s), CancellationToken::new());
+        assert_eq!(settle(), (true, true), "a voter");
+    }
+
+    /// The host is the earliest writer, through a sizing handoff; the next
+    /// writer takes the seat when it leaves. Counts are of the others.
+    #[tokio::test(start_paused = true)]
+    async fn the_host_is_the_earliest_writer_and_counts_exclude_the_client() {
+        let reg = ClientRegistry::default();
+        let s = SessionId::new();
+        let viewer = ClientInfo {
+            votes: false,
+            ..info(s)
+        };
+        let _gv = reg.register(viewer.clone(), CancellationToken::new());
+        let (a, b) = (info(s), info(s));
+        let ga = reg.register(a.clone(), CancellationToken::new());
+        let _gb = reg.register(b.clone(), CancellationToken::new());
+        let sharing = |id| reg.session_view(s, Some(id), &[]).sharing.unwrap();
+        let seat = |id| sharing(id).seat;
+        assert_eq!(seat(a.id), Seat::Host);
+        assert_eq!(seat(b.id), Seat::Writer);
+        assert_eq!(seat(viewer.id), Seat::Viewer);
+        assert_eq!((sharing(a.id).writers, sharing(a.id).viewers), (1, 1));
+        assert_eq!(
+            (sharing(viewer.id).writers, sharing(viewer.id).viewers),
+            (2, 0)
+        );
+        assert!(reg.mark_input(b.id, Instant::now()));
+        assert!(reg.session_view(s, Some(b.id), &[]).driving);
+        assert_eq!(seat(a.id), Seat::Host, "a handoff moved the host");
+        drop(ga);
+        assert_eq!(seat(b.id), Seat::Host, "the next writer took the seat");
+        assert_eq!((sharing(b.id).writers, sharing(b.id).viewers), (0, 1));
     }
 
     #[tokio::test(start_paused = true)]

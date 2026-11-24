@@ -41,6 +41,7 @@ pub(crate) fn register_client_methods(
                                 "cols": c.cols,
                                 "rows": c.rows,
                                 "attached_at": attached_at,
+                                "read_only": !c.votes,
                             })
                         })
                         .collect();
@@ -90,7 +91,9 @@ pub(crate) fn register_client_methods(
                             _ => super::params::ref_error_to_rpc(e, "id"),
                         })?,
                     };
-                    if !clients.remove(target.into()) {
+                    // Under the io lock: a key the client sends meets its removal
+                    // there, so none is written once the list no longer shows it.
+                    if !io.lock().await.clients.remove(target.into()) {
                         return Err(not_found());
                     }
                     Ok(serde_json::json!({ "detached": target.to_string() }))
@@ -111,25 +114,40 @@ mod tests {
         let h = RpcHarness::new();
         let (session_id, _, _) = h.seed_session("watched").await;
         let clients = h.io.lock().await.clients.clone();
-        let info = |id: uuid::Uuid| ClientInfo {
+        let info = |id: uuid::Uuid, votes| ClientInfo {
             id: ClientId::from(id),
             session_id,
             cols: 100,
             rows: 30,
             attached_at: std::time::SystemTime::now(),
-            votes: true,
+            votes,
             last_input: None,
         };
         // Two ids sharing a prefix, so a short one is ambiguous.
         let a = uuid::Uuid::parse_str("aaaa1111-0000-4000-8000-000000000000").unwrap();
         let b = uuid::Uuid::parse_str("aaaa2222-0000-4000-8000-000000000000").unwrap();
         let (end_a, end_b) = (CancellationToken::new(), CancellationToken::new());
-        let _ga = clients.register(info(a), end_a.clone());
-        let _gb = clients.register(info(b), end_b.clone());
+        // `b` watches read-only.
+        let _ga = clients.register(info(a, true), end_a.clone());
+        let _gb = clients.register(info(b, false), end_b.clone());
 
         let listed = dispatch_ok(&h.router, "client.list", serde_json::json!({})).await;
         let rows = listed["clients"].as_array().expect("clients array");
         assert_eq!(rows.len(), 2, "{listed}");
+        let read_only: Vec<(String, bool)> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r["id"].as_str().unwrap().to_string(),
+                    r["read_only"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            read_only,
+            [(a.to_string(), false), (b.to_string(), true)],
+            "{listed}"
+        );
         assert!(
             rows.iter()
                 .all(|r| r["session"] == "watched" && r["cols"] == 100)

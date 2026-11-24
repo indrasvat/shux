@@ -513,6 +513,8 @@ async fn headless_attach(
         client_version: "attach-teardown-test".to_string(),
         graphics: false,
         plain: false,
+        read_only: false,
+        no_color: false,
     };
     framed
         .send(Bytes::from(serde_json::to_vec(&hello).unwrap()))
@@ -688,6 +690,7 @@ async fn a_signal_during_the_restore_ends_a_client_whose_terminal_stopped_readin
         active_pane_id: "stand-in".into(),
         protocol: ATTACH_PROTOCOL_VERSION,
         plain: false,
+        read_only: false,
     };
     framed
         .send(Bytes::from(serde_json::to_vec(&ready).unwrap()))
@@ -788,6 +791,7 @@ async fn a_resize_during_the_handshake_reaches_the_daemon() {
         active_pane_id: "stand-in".into(),
         protocol: ATTACH_PROTOCOL_VERSION,
         plain: false,
+        read_only: false,
     };
     framed
         .send(Bytes::from(serde_json::to_vec(&ready).unwrap()))
@@ -863,6 +867,7 @@ async fn a_connection_cut_mid_frame_is_reported_as_lost() {
         active_pane_id: "stand-in".into(),
         protocol: ATTACH_PROTOCOL_VERSION,
         plain: false,
+        read_only: false,
     };
     framed
         .send(Bytes::from(serde_json::to_vec(&ready).unwrap()))
@@ -915,6 +920,7 @@ async fn plain_unconfirmed_by_the_daemon_fails_without_touching_the_terminal() {
         active_pane_id: "stand-in".into(),
         protocol: ATTACH_PROTOCOL_VERSION,
         plain: false,
+        read_only: false,
     };
     framed
         .send(Bytes::from(serde_json::to_vec(&ready).unwrap()))
@@ -932,4 +938,82 @@ async fn plain_unconfirmed_by_the_daemon_fails_without_touching_the_terminal() {
         !find(&seen, b"\x1b[?1049h"),
         "the terminal was taken over before the refusal"
     );
+}
+
+/// Issue #191: `--read-only` against a daemon that cannot promise it (a v1
+/// daemon's refusal, or a v2 ready that omits `read_only` or says false)
+/// fails before the terminal is touched, and sends the daemon nothing after
+/// its hello: no key could have reached a pane.
+#[tokio::test]
+async fn read_only_unconfirmed_by_the_daemon_fails_without_touching_the_terminal() {
+    let ok = |read_only: Option<bool>| {
+        let mut ready = serde_json::json!({
+            "kind": "ok", "session_id": "stand-in", "session_name": "ro-refused",
+            "active_window_id": "stand-in", "active_pane_id": "stand-in",
+            "protocol": ATTACH_PROTOCOL_VERSION,
+        });
+        if let Some(read_only) = read_only {
+            ready["read_only"] = read_only.into();
+        }
+        ready
+    };
+    for (case, reply) in [
+        (
+            "a v1 daemon",
+            serde_json::json!({ "kind": "error", "code": "protocol_mismatch",
+                                "message": "client protocol 2 != server 1" }),
+        ),
+        ("read_only omitted", ok(None)),
+        ("read_only false", ok(Some(false))),
+    ] {
+        let h = Harness::new();
+        h.create_session("ro-refused");
+        let sock = h.runtime_dir().join("shux").join("attach.sock");
+        std::fs::rename(&sock, sock.with_extension("real")).expect("move the real attach socket");
+        let listener = tokio::net::UnixListener::bind(&sock).expect("bind stand-in");
+
+        let mut client =
+            AttachedClient::spawn_args(&h, &["session", "attach", "--read-only", "ro-refused"]);
+        let (stream, _) = tokio::time::timeout(BUDGET, listener.accept())
+            .await
+            .expect("the client never connected")
+            .expect("accept");
+        let mut framed = Framed::new(stream, shux_rpc::create_codec());
+        let hello = tokio::time::timeout(BUDGET, framed.next())
+            .await
+            .expect("no hello")
+            .expect("closed before the hello")
+            .expect("read hello");
+        let hello: AttachHello = serde_json::from_slice(&hello).expect("parse hello");
+        assert!(hello.read_only, "{case}: --read-only was not asked for");
+        framed
+            .send(Bytes::from(reply.to_string()))
+            .await
+            .expect("send ready");
+        // Nothing more from the client: it hangs up.
+        let after = tokio::time::timeout(BUDGET, framed.next())
+            .await
+            .expect("the client neither spoke nor hung up");
+        assert!(
+            after.as_ref().is_none_or(|f| f.is_err()),
+            "{case}: the client sent a frame after the refusal: {after:?}"
+        );
+
+        let status = client.wait_for_exit();
+        let seen = client.seen();
+        assert!(
+            !status.success(),
+            "{case}: a refused --read-only attach exited {status:?}: {:?}",
+            String::from_utf8_lossy(&seen)
+        );
+        assert!(
+            !find(&seen, b"\x1b[?1049h") && !find(&seen, b"\x1b[?1000h"),
+            "{case}: the terminal was taken over before the refusal"
+        );
+        assert!(
+            String::from_utf8_lossy(&seen).contains("attach"),
+            "{case}: no reason was given: {:?}",
+            String::from_utf8_lossy(&seen)
+        );
+    }
 }

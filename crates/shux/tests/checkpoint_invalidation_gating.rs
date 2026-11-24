@@ -184,6 +184,8 @@ impl AttachClient {
                     client_version: "p4-gating-test".into(),
                     graphics: false,
                     plain: false,
+                    read_only: false,
+                    no_color: false,
                 };
                 let payload = serde_json::to_vec(&hello).expect("serialize hello");
                 if let Err(e) = framed.send(bytes::Bytes::from(payload)).await {

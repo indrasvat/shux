@@ -80,6 +80,8 @@ pub struct ClientConfig {
     pub live_config: Option<shux_core::config::ConfigHandle>,
     /// Ask the daemon for text and colour only (`session attach --plain`).
     pub plain: bool,
+    /// Watch only (`session attach --read-only`).
+    pub read_only: bool,
 }
 
 impl Default for ClientConfig {
@@ -92,6 +94,7 @@ impl Default for ClientConfig {
             keybindings: std::collections::HashMap::new(),
             live_config: None,
             plain: false,
+            read_only: false,
         }
     }
 }

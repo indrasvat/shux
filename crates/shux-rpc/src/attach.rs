@@ -24,7 +24,10 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const ATTACH_PROTOCOL_VERSION: u32 = 1;
+/// 2 added `read_only`. A daemon rejects any other version before it looks a
+/// session up, spawns, registers or resizes anything, so a mode an older
+/// daemon would ignore fails closed instead of attaching writable.
+pub const ATTACH_PROTOCOL_VERSION: u32 = 2;
 
 /// Initial handshake from client. Sent as a single framed JSON object on
 /// connection open.
@@ -45,6 +48,14 @@ pub struct AttachHello {
     /// owner did not choose to run the pane's program.
     #[serde(default)]
     pub plain: bool,
+    /// Watch only: no byte from this client reaches a pane, and it never
+    /// sizes, focuses or lays out anything. Attaches to an existing session
+    /// only.
+    #[serde(default)]
+    pub read_only: bool,
+    /// The client's `NO_COLOR` is set: its status row is drawn without colour.
+    #[serde(default)]
+    pub no_color: bool,
 }
 
 /// Daemon's reply to the hello.
@@ -61,6 +72,10 @@ pub enum AttachReady {
         /// asked for `plain` and does not see it here must not run.
         #[serde(default)]
         plain: bool,
+        /// The daemon enforces read-only for this client. A client that asked
+        /// for it and does not see it here must not run.
+        #[serde(default)]
+        read_only: bool,
     },
     Error {
         code: String,
@@ -311,12 +326,15 @@ mod tests {
             client_version: "0.1.0".into(),
             graphics: true,
             plain: false,
+            read_only: true,
+            no_color: false,
         };
         let s = serde_json::to_string(&hello).unwrap();
         let back: AttachHello = serde_json::from_str(&s).unwrap();
         assert_eq!(back.cols, 120);
         assert_eq!(back.rows, 30);
         assert!(back.graphics);
+        assert!(back.read_only);
         assert_eq!(back.session_name.as_deref(), Some("dev"));
     }
 
@@ -329,6 +347,7 @@ mod tests {
             active_pane_id: "p".into(),
             protocol: ATTACH_PROTOCOL_VERSION,
             plain: false,
+            read_only: false,
         };
         let s = serde_json::to_string(&ok).unwrap();
         assert!(s.contains("\"kind\":\"ok\""));

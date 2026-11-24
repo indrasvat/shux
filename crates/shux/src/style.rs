@@ -2363,31 +2363,38 @@ pub fn print_clients_plain(clients: &[serde_json::Value]) -> Printed {
     Ok(())
 }
 
-/// One attached client per line: short id, session, size, and when it
-/// attached.
+/// One attached client per line: short id, session, size, when it attached,
+/// and `read-only` for a watcher.
 pub fn print_clients(clients: &[serde_json::Value]) -> Printed {
     let mut out = io::stdout().lock();
     if clients.is_empty() {
         writeln!(out, "{}", muted("no clients attached"))?;
     }
     for c in clients {
-        let s = |k: &str| c.get(k).and_then(|v| v.as_str()).unwrap_or("?");
-        let n = |k: &str| c.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
-        let since = crate::cli::session::format_created_at(
-            c.get("attached_at").unwrap_or(&serde_json::Value::Null),
-        );
-        writeln!(
-            out,
-            "{}  {}  {}x{}  {}",
-            accent(short_id(s("id"))),
-            bold(safe_label(s("session"))),
-            n("cols"),
-            n("rows"),
-            muted(format!("attached {since}")),
-        )?;
+        writeln!(out, "{}", client_line(c))?;
     }
     out.flush()?;
     Ok(())
+}
+
+fn client_line(c: &serde_json::Value) -> String {
+    let s = |k: &str| c.get(k).and_then(|v| v.as_str()).unwrap_or("?");
+    let n = |k: &str| c.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+    let since = crate::cli::session::format_created_at(
+        c.get("attached_at").unwrap_or(&serde_json::Value::Null),
+    );
+    let mut line = format!(
+        "{}  {}  {}x{}  {}",
+        accent(short_id(s("id"))),
+        bold(safe_label(s("session"))),
+        n("cols"),
+        n("rows"),
+        muted(format!("attached {since}")),
+    );
+    if c.get("read_only").and_then(serde_json::Value::as_bool) == Some(true) {
+        line.push_str(&format!("  {}", warning("read-only")));
+    }
+    line
 }
 
 // ── Tests ──────────────────────────────────────────────────────
@@ -2395,6 +2402,24 @@ pub fn print_clients(clients: &[serde_json::Value]) -> Printed {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A watcher is marked in `client list`, a writer is not.
+    #[test]
+    fn a_read_only_client_is_marked_in_the_list() {
+        // As the terminal shows it: colour on (FORCE_COLOR) or off.
+        let row = |read_only| {
+            shux_pty::strip_ansi(&client_line(&serde_json::json!({
+                "id": "aaaa1111-0000-4000-8000-000000000000",
+                "session": "s",
+                "cols": 80,
+                "rows": 24,
+                "attached_at": 0,
+                "read_only": read_only,
+            })))
+        };
+        assert!(row(true).ends_with("read-only"), "{}", row(true));
+        assert!(!row(false).contains("read-only"), "{}", row(false));
+    }
 
     /// A reader that closed the pipe ends the stream; any other write error
     /// is still an error.
