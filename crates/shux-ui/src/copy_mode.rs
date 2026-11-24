@@ -141,6 +141,12 @@ impl CopyView {
         }
     }
 
+    /// [`Self::rebased`], or `None` once the line at its top has been evicted:
+    /// what it showed is no longer there to name.
+    pub fn rebased_intact(self, vt: &VirtualTerminal) -> Option<Self> {
+        (self.evicted_since(vt) <= self.top).then(|| self.rebased(vt))
+    }
+
     /// The last line readable at the bottom, above the hint bar.
     fn max_top(&self, vt: &VirtualTerminal) -> usize {
         vt.presented_total_lines().saturating_sub(self.readable())
@@ -706,21 +712,22 @@ pub fn extract_selection(vt: &VirtualTerminal, state: &CopyModeState) -> String 
     let v = &state.view;
     let ends = ordered(state.anchor.unwrap_or(state.cursor), state.cursor);
     let ((a, _), (b, _)) = ends;
-    let (shown_first, shown_last) = (v.col, v.col + v.cols().saturating_sub(1));
-    let (first, last) = (shown_first.min(a).min(b), shown_last.max(a).max(b));
+    let (first, last) = (
+        v.col.min(a).min(b),
+        (v.col + v.cols().saturating_sub(1)).max(a).max(b),
+    );
     let cell = |c: usize, line: usize| -> Option<Cow<'_, Cell>> {
         let row = vt.presented_row(line)?;
         let cell = row.get(c).filter(|_| (first..=last).contains(&c))?;
-        // A wide glyph the view's own edge cuts is drawn as its blank half.
-        Some(
-            if c == shown_first && c > 0 && cell.is_wide_continuation() {
-                Cow::Owned(blank_like(&row[c - 1]))
-            } else if c == shown_last && cell.width == 2 {
-                Cow::Owned(blank_like(cell))
-            } else {
-                Cow::Borrowed(cell)
-            },
-        )
+        // A wide glyph the columns read cut is its blank half, as the view
+        // draws one its edge cuts.
+        Some(if c == first && c > 0 && cell.is_wide_continuation() {
+            Cow::Owned(blank_like(&row[c - 1]))
+        } else if c == last && cell.width == 2 {
+            Cow::Owned(blank_like(cell))
+        } else {
+            Cow::Borrowed(cell)
+        })
     };
     read(ends, first, |line| span(ends, line, first, last), cell)
 }
@@ -1849,6 +1856,23 @@ mod tests {
         let mut vt = vt_with_lines(rows, cols, count);
         vt.process(last.as_bytes());
         vt
+    }
+
+    /// A wide glyph the view's edge cuts, wholly inside a selection a pan
+    /// widened past that edge, is yanked whole.
+    #[test]
+    fn a_wide_glyph_at_the_views_edge_inside_a_panned_selection_is_yanked() {
+        let vt = vt_with(3, 20, "abc中dzz\x1b[1;1H");
+        let mut s = modal(&vt, Rect::new(0, 0, 4, 3));
+        for key in ["/", "z", "z", "\r"] {
+            handle_key(key.as_bytes(), &mut s, &vt);
+        }
+        handle_key(b"v", &mut s, &vt);
+        for key in ["?", "a", "b", "\r"] {
+            handle_key(key.as_bytes(), &mut s, &vt);
+        }
+        assert_eq!(s.view.col, 0, "setup: the search did not pan back");
+        assert_eq!(extract_selection(&vt, &s), "abc中dz");
     }
 
     /// A pan by search keeps the whole selection: the yank reads its source

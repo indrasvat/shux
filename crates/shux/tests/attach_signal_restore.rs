@@ -643,7 +643,9 @@ fn a_signal_ends_a_client_whose_terminal_stopped_reading() {
     );
 }
 
-/// Output queued behind the PTY that the terminal has not read.
+/// Output queued behind the PTY that the terminal has not read. macOS only:
+/// Linux reports 0 for a PTY slave whatever is queued.
+#[cfg(target_os = "macos")]
 fn unread_output(slave: &OwnedFd) -> usize {
     let mut queued: nix::libc::c_int = 0;
     // SAFETY: TIOCOUTQ writes one int through a pointer to a live local.
@@ -655,6 +657,9 @@ fn unread_output(slave: &OwnedFd) -> usize {
 /// A signal that lands while the client is already restoring the terminal,
 /// after its session ended, with the terminal no longer reading: the restore
 /// is stuck waiting on the terminal, and the signal must still end the client.
+/// macOS only: there a process exiting with unread output on its controlling
+/// terminal waits for it to drain; Linux exits regardless.
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn a_signal_during_the_restore_ends_a_client_whose_terminal_stopped_reading() {
     let h = Harness::new();

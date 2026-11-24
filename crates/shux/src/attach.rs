@@ -3112,11 +3112,13 @@ async fn handle_copy_mode_mouse(
             // brings it down to where it began; a deliberate copy mode
             // (`Prefix [`, or a search since) stays, so an in-progress
             // selection or search is never lost.
+            let mut mapped = false;
             let keep = s.copy_mode.as_mut().is_some_and(|cm| {
                 let now = shux_vt::monotonic_now_ns();
                 let Some(vt) = resolve_copy_mode(cm, active, rect, now, &state) else {
                     return false;
                 };
+                mapped = true;
                 if kind == MouseKind::ScrollUp {
                     shux_ui::copy_mode::scroll_up(cm, 3);
                     true
@@ -3129,6 +3131,10 @@ async fn handle_copy_mode_mouse(
                 s.copy_mode = None;
             }
             *dragging = SelectionDrag::None;
+            // Found gone since routing began: the tick is the app's.
+            if !mapped {
+                return Ok(false);
+            }
         }
         MouseKind::Down | MouseKind::Drag | MouseKind::Up
             if button == ProtoMouseButton::Left
@@ -3144,14 +3150,20 @@ async fn handle_copy_mode_mouse(
             let mut s = session.lock().await;
             let active = s.active_pane_id;
             let mut yank = None;
+            let mut mapped = false;
             let keep = s.copy_mode.as_mut().is_some_and(|cm| {
                 let now = shux_vt::monotonic_now_ns();
                 let Some(vt) = resolve_copy_mode(cm, active, rect, now, &state) else {
                     return false;
                 };
-                // A frame from before a reopen, a page or a pan drew another
-                // view: the gesture it names is dropped.
-                let Some(view) = drawn.map(|(_, v)| v.rebased(vt)).filter(|v| *v == cm.view) else {
+                mapped = true;
+                // A frame from before a reopen, a page, a pan or the eviction
+                // of its lines drew another view: the gesture it names is
+                // dropped.
+                let Some(view) = drawn
+                    .and_then(|(_, v)| v.rebased_intact(vt))
+                    .filter(|v| *v == cm.view)
+                else {
                     if matches!(*dragging, SelectionDrag::CopyMode) {
                         cm.anchor = None;
                     }
@@ -3188,6 +3200,10 @@ async fn handle_copy_mode_mouse(
             }
             drop(s);
             drop(state);
+            if !mapped {
+                *dragging = SelectionDrag::None;
+                return Ok(false);
+            }
             if let Some(text) = yank.filter(|t| !t.is_empty()) {
                 let osc = shux_ui::osc52_copy(&text);
                 let frame = AttachServerFrame::Render {
@@ -9854,6 +9870,60 @@ mod tests {
         fixture.stop();
     }
 
+    /// A wheel tick that reaches the copy-mode handler after its pane changed
+    /// screen (past the settle that routing starts with) ends copy mode and
+    /// is left for the routing that follows, not swallowed.
+    #[tokio::test]
+    async fn a_wheel_the_copy_mode_handler_finds_unmapped_is_routed_on() {
+        let fixture = attach_fixture().await;
+        let _wr = seed_scrollback_pane(&fixture.io_state, fixture.first_pane, b"").await;
+        let session = Arc::new(Mutex::new(fixture.attached.clone()));
+        let client_size: ClientSize = Arc::new(Mutex::new((100, 30)));
+        open_copy_mode(&fixture.graph, &fixture.io_state, &session, &client_size).await;
+        fixture
+            .io_state
+            .lock()
+            .await
+            .vts
+            .get_mut(&fixture.first_pane)
+            .expect("vt")
+            .process(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h");
+        let (out_tx, _out_rx) = mpsc::channel(8);
+        for kind in [MouseKind::ScrollUp, MouseKind::Down] {
+            let handled = handle_copy_mode_mouse(
+                kind,
+                ProtoMouseButton::Left,
+                3,
+                3,
+                &fixture.graph,
+                &fixture.io_state,
+                &session,
+                &client_size,
+                &test_config(),
+                &out_tx,
+                &mut SelectionDrag::None,
+                None,
+            )
+            .await
+            .expect("copy-mode mouse");
+            assert!(
+                !handled,
+                "{kind:?} swallowed by a copy mode that no longer maps"
+            );
+            assert!(session.lock().await.copy_mode.is_none());
+            open_copy_mode(&fixture.graph, &fixture.io_state, &session, &client_size).await;
+            fixture
+                .io_state
+                .lock()
+                .await
+                .vts
+                .get_mut(&fixture.first_pane)
+                .expect("vt")
+                .process(b"\x1b[?1049l");
+        }
+        fixture.stop();
+    }
+
     /// A resize lands under a copy mode nothing was done in yet: the wheel
     /// reopens it over the new grid, as a key does, rather than ending it.
     #[tokio::test]
@@ -13822,6 +13892,48 @@ mod tests {
             "the click that found copy mode gone was not the app's: {:?}",
             String::from_utf8_lossy(&input)
         );
+        h.stop().await;
+    }
+
+    /// A drag stamped with a frame whose top line has since been evicted names
+    /// a line no longer there, though the view, pinned at the oldest line,
+    /// has not moved: it is dropped, not yanked from the line that replaced it.
+    #[tokio::test(start_paused = true)]
+    async fn a_copy_mode_drag_over_evicted_lines_is_dropped() {
+        let mut h = InputHarness::new(64).await;
+        let rect = h.first_rect().await;
+        let config = shux_vt::GridConfig {
+            max_scrollback: 4,
+            ..Default::default()
+        };
+        let mut vt = shux_vt::VirtualTerminal::with_config(6, 40, config);
+        for i in 0..10 {
+            vt.process(format!("e{i:02}\r\n").as_bytes());
+        }
+        h.show(vt).await;
+        h.catch_up().await;
+        let shown = h.written_frame;
+        h.enter_copy_mode(shown).await;
+        h.key(b"g").await;
+        h.key(b"g").await;
+        let oldest = |c: &Client| {
+            let grid = c.screen.grid();
+            let row = grid.visible_row(usize::from(rect.y));
+            let x = usize::from(rect.x);
+            (x..x + 3).map(|c| row[c].ch).collect::<String>()
+        };
+        assert!(h.frames_until(|_, text| text.contains("e01")).await);
+        h.catch_up().await;
+        assert_eq!(oldest(&h), "e01", "setup: not at the oldest line");
+        // One more line evicts that one; the client has not drawn since.
+        h.app_writes(b"e10\r\n").await;
+        let (x, y) = (rect.x, rect.y);
+        h.left(MouseKind::Down, x, y).await;
+        h.left(MouseKind::Drag, x + 2, y).await;
+        h.left(MouseKind::Up, x + 2, y).await;
+        h.key(b"y").await;
+        // The cursor's cell alone: nothing was selected.
+        assert_eq!(h.yanked().await.as_deref(), Some("e"));
         h.stop().await;
     }
 
