@@ -16,7 +16,7 @@ use shux_core::model::{PaneId, SessionId, WindowId};
 use shux_core::theme::{Rgb, Theme};
 use shux_ui::{StatusBar, StatusSegment};
 
-use crate::clients::Role;
+use crate::clients::{Seat, Sharing};
 use crate::onboarding::OnboardingState;
 use crate::session_meta::SessionMeta;
 
@@ -316,92 +316,201 @@ pub fn append_watchers(
     insert_at_head(bar, segment, cols, has_notice);
 }
 
-/// What this client sees of the panes' sizing, at the head of the right zone:
-/// the focused pane's size label when no border shows it, and the client's
-/// role when it does not drive. Each sheds words to fit the room the bar
-/// leaves, the label first, and is dropped whole rather than cut: the role
-/// `◉ viewing · type to drive` → `◉ viewing` → `◉`, the label `pinned W×H` →
-/// `W×H`, `⤡ W×H` → `⤡`. A plain client gets `*` for `◉`, which has no colour
-/// there to carry it.
+/// The focused pane's size label at the head of the right zone, when no
+/// border shows it. It sheds words to fit the room the bar leaves and is
+/// dropped whole rather than cut: `pinned W×H` → `W×H`, `⤡ W×H` → `⤡`.
 pub fn append_viewing(
     bar: &mut StatusBar,
     label: Option<&shux_ui::viewport::SizeLabel>,
-    role: Option<Role>,
     theme: &Theme,
     cols: u16,
-    plain: bool,
 ) {
-    let words = role.and_then(Role::words);
-    if words.is_none() && label.is_none() {
+    let Some(size) = label else {
         return;
-    }
-    let rgb = |Rgb { r, g, b }: Rgb| Color::Rgb { r, g, b };
-    let mark = if plain { "*" } else { "◉" };
-    // Each part's forms, longest first, and an empty last one: not drawn.
-    let roles: Vec<Vec<StatusSegment>> = match words {
-        Some(words) => words
-            .iter()
-            .map(|w| {
-                vec![
-                    StatusSegment::styled(mark, rgb(theme.status_shared), false),
-                    StatusSegment::styled(
-                        if w.is_empty() {
-                            " ".to_string()
-                        } else {
-                            format!(" {w} ")
-                        },
-                        rgb(theme.status_fg),
-                        false,
-                    ),
-                ]
-            })
-            .chain([Vec::new()])
-            .collect(),
-        None => vec![Vec::new()],
     };
-    let labels: Vec<Vec<StatusSegment>> = match label {
-        Some(size) => size
-            .ladder()
-            .into_iter()
-            .map(|t| {
-                vec![StatusSegment::styled(
-                    format!("{t} "),
-                    rgb(theme.status_attention),
-                    false,
-                )]
-            })
-            .chain([Vec::new()])
-            .collect(),
-        None => vec![Vec::new()],
-    };
+    let Rgb { r, g, b } = theme.status_attention;
     let width = StatusBar::segments_width;
     let (lw, cw, rw) = (width(&bar.left), width(&bar.center), width(&bar.right));
     let gaps = if cw > 0 { 2 } else { 1 };
     let room = usize::from(cols).saturating_sub(lw + cw + rw + gaps);
-    // The label sheds its words, then the role its, then the label goes, then
-    // the role.
-    // Measured once, as the bar renders them.
-    let role_w: Vec<usize> = roles.iter().map(Vec::as_slice).map(width).collect();
-    let label_w: Vec<usize> = labels.iter().map(Vec::as_slice).map(width).collect();
-    let (rl, ll) = (roles.len() - 1, labels.len() - 1);
-    let (mut r, mut l) = (0, 0);
-    let mut order = vec![(r, l)];
-    while l + 1 < ll {
-        l += 1;
-        order.push((r, l));
+    let fits = size
+        .ladder()
+        .into_iter()
+        .map(|t| StatusSegment::styled(format!("{t} "), Color::Rgb { r, g, b }, false))
+        .find(|s| width(std::slice::from_ref(s)) <= room);
+    if let Some(segment) = fits {
+        bar.right.insert(0, segment);
     }
-    while r + 1 < rl {
-        r += 1;
-        order.push((r, l));
+}
+
+/// Marks the segments of a sharing badge: no fitting pass drops one.
+const BADGE: usize = usize::MAX;
+
+/// A live client's sharing badge: its words longest first, down to none, the
+/// colour and whether it warns that another client's keys reach the session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Badge {
+    rungs: Vec<String>,
+    /// The first rung without the optional peer counts.
+    core: usize,
+    warn: bool,
+}
+
+impl Badge {
+    /// None for a writer alone with its session and no share link.
+    pub fn of(sharing: Sharing) -> Option<Self> {
+        let Sharing {
+            seat,
+            writers,
+            viewers,
+            link,
+        } = sharing;
+        let watching = (viewers > 0).then(|| format!(" · {viewers} watching"));
+        let typing = format!("{writers} can type");
+        let (rungs, core, warn): (Vec<String>, usize, bool) = match seat {
+            Seat::Viewer => (
+                vec![
+                    "viewing · read-only".into(),
+                    "read-only".into(),
+                    String::new(),
+                ],
+                0,
+                false,
+            ),
+            Seat::Host if writers > 0 => {
+                let core = format!("shared · {typing}");
+                let mut rungs: Vec<String> =
+                    watching.iter().map(|w| format!("{core}{w}")).collect();
+                let counted = rungs.len();
+                rungs.extend([core, typing, "!".into()]);
+                (rungs, counted, true)
+            }
+            Seat::Host if viewers > 0 || link => (
+                vec![
+                    format!("shared · {viewers} watching"),
+                    "shared".into(),
+                    String::new(),
+                ],
+                1,
+                false,
+            ),
+            Seat::Host => return None,
+            Seat::Writer => {
+                let core = "writable · your keys go to this session".to_string();
+                let counts = format!(" · {typing}{}", watching.unwrap_or_default());
+                (
+                    vec![
+                        format!("{core}{counts}"),
+                        core,
+                        "writable".into(),
+                        "!".into(),
+                    ],
+                    1,
+                    true,
+                )
+            }
+        };
+        Some(Self { rungs, core, warn })
     }
-    order.extend([(r, ll), (rl, ll)]);
-    for (r, l) in order {
-        let (role, label) = (&roles[r], &labels[l]);
-        if role_w[r] + label_w[l] <= room {
-            let unit: Vec<StatusSegment> = label.iter().chain(role).cloned().collect();
-            bar.right.splice(0..0, unit);
-            return;
+
+    fn unit(&self, rung: usize, theme: &Theme, mark: &str) -> Vec<StatusSegment> {
+        let Rgb { r, g, b } = if self.warn {
+            theme.status_error
+        } else {
+            theme.status_shared
+        };
+        let color = Color::Rgb { r, g, b };
+        let words = match self.rungs[rung].as_str() {
+            "" => " ".to_string(),
+            "!" => "! ".to_string(),
+            w => format!(" {w} "),
+        };
+        [mark.to_string(), words]
+            .into_iter()
+            .map(|text| StatusSegment {
+                group: BADGE,
+                ..StatusSegment::styled(text, color, self.warn)
+            })
+            .collect()
+    }
+}
+
+/// The sharing badge at the head of the right zone. It is never cut: its peer
+/// counts go first, then the bar's other segments, then its words down to the
+/// mark alone (`◉!` for a warning), then the session name. `mark` is `◉`, or
+/// `*` where colour cannot carry it.
+pub fn append_sharing(
+    bar: &mut StatusBar,
+    badge: Option<&Badge>,
+    theme: &Theme,
+    cols: u16,
+    mark: &str,
+    has_notice: bool,
+) {
+    let Some(badge) = badge else {
+        return;
+    };
+    let width = StatusBar::segments_width;
+    let cols = usize::from(cols);
+    let fits = |bar: &StatusBar, unit: &[StatusSegment]| {
+        let (lw, cw) = (width(&bar.left), width(&bar.center));
+        lw + cw + width(&bar.right) + width(unit) + usize::from(lw > 0) + usize::from(cw > 0)
+            <= cols
+    };
+    let put = |bar: &mut StatusBar, unit: Vec<StatusSegment>| {
+        bar.right.splice(0..0, unit);
+    };
+    for rung in 0..=badge.core {
+        let unit = badge.unit(rung, theme, mark);
+        if fits(bar, &unit) {
+            return put(bar, unit);
         }
+    }
+    let core = badge.unit(badge.core, theme, mark);
+    loop {
+        if fits(bar, &core) {
+            return put(bar, core);
+        }
+        if !bar.right.is_empty() {
+            pop_unit(&mut bar.right);
+        } else if bar.left.len() > 1 {
+            pop_unit(&mut bar.left);
+        } else if !bar.center.is_empty() && !has_notice {
+            bar.center.clear();
+        } else {
+            break;
+        }
+    }
+    for rung in badge.core + 1..badge.rungs.len() {
+        let unit = badge.unit(rung, theme, mark);
+        if fits(bar, &unit) {
+            return put(bar, unit);
+        }
+    }
+    // Only the name is left: it gives up its tail, then itself.
+    let unit = badge.unit(badge.rungs.len() - 1, theme, mark);
+    let room = cols.saturating_sub(width(&unit) + 1 + width(&bar.center));
+    if let Some(name) = bar.left.first_mut()
+        && let Some(text) = shortened(&name.text, room)
+    {
+        name.text = text;
+    } else {
+        bar.left.clear();
+    }
+    put(bar, unit);
+}
+
+/// The status row without colour, for a client whose `NO_COLOR` is set.
+pub fn monochrome(bar: &mut StatusBar) {
+    bar.bg = None;
+    for s in bar
+        .left
+        .iter_mut()
+        .chain(&mut bar.center)
+        .chain(&mut bar.right)
+    {
+        s.fg = None;
+        s.bg = None;
     }
 }
 
@@ -477,11 +586,13 @@ pub fn make_room_for_notice(bar: &mut StatusBar, cols: u16) {
         |bar: &StatusBar| usize::from(width(&bar.left) > 0) + usize::from(width(&bar.right) > 0);
     while width(&bar.left) + width(&bar.center) + width(&bar.right) + gaps(bar) > usize::from(cols)
     {
-        if !bar.right.is_empty() {
-            let first = bar.right.remove(0);
+        // The sharing badge leads the right zone and stays: the notice is cut
+        // before it is.
+        if let Some(at) = bar.right.iter().position(|s| s.group != BADGE) {
+            let first = bar.right.remove(at);
             if first.group != 0 {
-                while bar.right.first().is_some_and(|s| s.group == first.group) {
-                    bar.right.remove(0);
+                while bar.right.get(at).is_some_and(|s| s.group == first.group) {
+                    bar.right.remove(at);
                 }
             }
         } else if bar.left.is_empty() {
@@ -621,12 +732,10 @@ mod tests {
 
     use super::*;
 
-    /// Review of #190: a viewer's role and the focused pane's size label shed
-    /// words to fit the room the bar leaves, whole units only, the role kept
-    /// longest; nothing is cut mid-word. The mark is the theme's shared colour,
-    /// the words the bar's text colour, and a plain client gets `*`.
+    /// The focused pane's size label sheds words to fit, and is dropped whole
+    /// rather than cut mid-word.
     #[test]
-    fn the_viewing_segments_follow_a_width_ladder() {
+    fn the_size_label_follows_a_width_ladder() {
         use shux_ui::viewport::SizeLabel;
         let pinned = SizeLabel {
             cols: 60,
@@ -638,62 +747,239 @@ mod tests {
             rows: 37,
             pinned: false,
         };
-        let right = |label: Option<&SizeLabel>, cols: u16, plain: bool| {
+        let right = |label: &SizeLabel, cols: u16| {
             let mut b = StatusBar::new();
             b.left.push(StatusSegment::plain("s "));
-            append_viewing(
-                &mut b,
-                label,
-                Some(Role::Viewing),
-                &Theme::DEFAULT,
-                cols,
-                plain,
-            );
-            let text: String = b.right.iter().map(|s| s.text.as_str()).collect();
-            let row: String = b.render_row(cols).iter().map(|c| c.ch).collect();
-            assert!(
-                row.contains(text.trim_end()),
-                "{cols} cols: {row:?} cut {text:?}"
-            );
-            (text, b)
+            append_viewing(&mut b, Some(label), &Theme::DEFAULT, cols);
+            b.right.iter().map(|s| s.text.as_str()).collect::<String>()
         };
-        for (cols, want) in [
-            (120, "pinned 60×8 ◉ viewing · type to drive "),
-            (80, "pinned 60×8 ◉ viewing · type to drive "),
-            (50, "pinned 60×8 ◉ viewing · type to drive "),
-            (40, "60×8 ◉ viewing · type to drive "),
-            (30, "60×8 ◉ viewing "),
-            (12, "60×8 ◉ "),
-            (8, "◉ "),
-            (4, ""),
+        for (label, cols, want) in [
+            (&pinned, 40, "pinned 60×8 "),
+            (&pinned, 12, "60×8 "),
+            (&pinned, 4, ""),
+            (&cropped, 40, "⤡ 118×37 "),
+            (&cropped, 8, "⤡ "),
         ] {
-            assert_eq!(right(Some(&pinned), cols, false).0, want, "{cols} cols");
+            assert_eq!(right(label, cols), want, "{cols} cols");
         }
-        for (cols, want) in [
-            (80, "⤡ 118×37 ◉ viewing · type to drive "),
-            (30, "⤡ ◉ viewing "),
-            (8, "⤡ ◉ "),
-        ] {
-            assert_eq!(right(Some(&cropped), cols, false).0, want, "{cols} cols");
-        }
-        assert_eq!(right(None, 30, false).0, "◉ viewing · type to drive ");
+    }
 
-        let (_, b) = right(None, 80, false);
-        let rgb = |Rgb { r, g, b }: Rgb| Some(Color::Rgb { r, g, b });
-        assert_eq!(b.right[0].fg, rgb(Theme::DEFAULT.status_shared));
-        assert_eq!(Theme::DEFAULT.status_shared, Rgb::new(0xf5, 0xa9, 0x7f));
-        assert_eq!(b.right[1].fg, rgb(Theme::DEFAULT.status_fg));
-        assert_eq!(right(Some(&pinned), 30, true).0, "60×8 * viewing ", "plain");
-        let mut driver = StatusBar::new();
-        append_viewing(
-            &mut driver,
-            None,
-            Some(Role::Driving),
+    fn sharing(seat: Seat, writers: usize, viewers: usize, link: bool) -> Sharing {
+        Sharing {
+            seat,
+            writers,
+            viewers,
+            link,
+        }
+    }
+
+    /// The design's table, at full width: what each seat says, and whether
+    /// it warns that another client's keys reach the session.
+    #[test]
+    fn each_seat_gets_its_badge() {
+        let full = |s: Sharing| {
+            let badge = Badge::of(s)?;
+            Some((badge.rungs[0].clone(), badge.warn))
+        };
+        assert_eq!(full(sharing(Seat::Host, 0, 0, false)), None, "solo");
+        for (s, words, warn) in [
+            (
+                sharing(Seat::Host, 0, 2, false),
+                "shared · 2 watching",
+                false,
+            ),
+            (
+                sharing(Seat::Host, 0, 0, true),
+                "shared · 0 watching",
+                false,
+            ),
+            (
+                sharing(Seat::Host, 1, 0, false),
+                "shared · 1 can type",
+                true,
+            ),
+            (
+                sharing(Seat::Host, 1, 2, false),
+                "shared · 1 can type · 2 watching",
+                true,
+            ),
+            (
+                sharing(Seat::Viewer, 1, 0, false),
+                "viewing · read-only",
+                false,
+            ),
+            (
+                sharing(Seat::Viewer, 0, 0, false),
+                "viewing · read-only",
+                false,
+            ),
+            (
+                sharing(Seat::Writer, 1, 0, false),
+                "writable · your keys go to this session · 1 can type",
+                true,
+            ),
+            (
+                sharing(Seat::Writer, 1, 3, false),
+                "writable · your keys go to this session · 1 can type · 3 watching",
+                true,
+            ),
+        ] {
+            assert_eq!(full(s), Some((words.to_string(), warn)), "{s:?}");
+        }
+    }
+
+    /// A bar as a live client builds it, with every kind of segment the badge
+    /// competes with.
+    fn busy_bar() -> StatusBar {
+        let mut b = bar("◆ my-session ", " #1/2 shell ", " up 3h ");
+        b.left.push(StatusSegment::plain("main "));
+        let label = shux_ui::viewport::SizeLabel {
+            cols: 60,
+            rows: 8,
+            pinned: true,
+        };
+        append_viewing(&mut b, Some(&label), &Theme::DEFAULT, 200);
+        b
+    }
+
+    fn badged(s: Sharing, cols: u16, notice: bool) -> (String, String, StatusBar) {
+        let mut b = busy_bar();
+        if notice {
+            b.center = vec![StatusSegment::plain(" [pane split] ")];
+        }
+        append_sharing(
+            &mut b,
+            Badge::of(s).as_ref(),
             &Theme::DEFAULT,
-            80,
+            cols,
+            "◉",
+            notice,
+        );
+        if notice {
+            make_room_for_notice(&mut b, cols);
+        }
+        let badge: String = b
+            .right
+            .iter()
+            .filter(|s| s.group == BADGE)
+            .map(|s| s.text.as_str())
+            .collect();
+        let row: String = b.render_row(cols).iter().map(|c| c.ch).collect();
+        (badge, row, b)
+    }
+
+    /// Down to two columns the badge is drawn whole: counts go first, then
+    /// the other segments, then its words, then the session name; a warning
+    /// ends on `!`, which survives monochrome.
+    #[test]
+    fn the_badge_is_never_cut_down_to_two_columns() {
+        for s in [
+            sharing(Seat::Host, 1, 2, false),
+            sharing(Seat::Host, 0, 2, false),
+            sharing(Seat::Viewer, 2, 0, false),
+            sharing(Seat::Writer, 1, 1, false),
+        ] {
+            let rungs = Badge::of(s).unwrap().rungs;
+            let mut last = 0;
+            for cols in (2..=140u16).rev() {
+                for notice in [false, true] {
+                    let (badge, row, _) = badged(s, cols, notice);
+                    assert!(
+                        row.contains(badge.trim_end()),
+                        "{s:?} at {cols}: {row:?} cut {badge:?}"
+                    );
+                    assert!(badge.starts_with('◉'), "{s:?} at {cols}: {badge:?}");
+                    let rung = rungs
+                        .iter()
+                        .position(|w| {
+                            badge.trim_end() == format!("◉ {w}").trim_end()
+                                || (w == "!" && badge.trim_end() == "◉!")
+                        })
+                        .unwrap_or_else(|| panic!("{s:?} at {cols}: {badge:?} is no rung"));
+                    if !notice {
+                        assert!(rung >= last, "{s:?} at {cols}: longer badge in less room");
+                        last = rung;
+                    }
+                }
+            }
+            let (badge, row, _) = badged(s, 2, false);
+            let warns = Badge::of(s).unwrap().warn;
+            assert_eq!(row, if warns { "◉!" } else { "◉ " }, "{s:?}: {badge:?}");
+        }
+    }
+
+    /// The counts give way before any other segment does.
+    #[test]
+    fn counts_go_before_other_segments() {
+        let s = sharing(Seat::Host, 0, 2, false);
+        let full = badged(s, 200, false);
+        assert_eq!(full.0, "◉ shared · 2 watching ");
+        let others = |b: &StatusBar| {
+            let mut all: Vec<String> = b
+                .left
+                .iter()
+                .chain(&b.center)
+                .chain(&b.right)
+                .filter(|s| s.group != BADGE)
+                .map(|s| s.text.clone())
+                .collect();
+            all.sort();
+            all
+        };
+        let width = StatusBar::segments_width;
+        let need = |b: &StatusBar| width(&b.left) + width(&b.center) + width(&b.right) + 2;
+        let tight = u16::try_from(need(&full.2) - 1).unwrap();
+        let (badge, _, b) = badged(s, tight, false);
+        assert_eq!(badge, "◉ shared ");
+        assert_eq!(
+            others(&b),
+            others(&full.2),
+            "a segment went before the count"
+        );
+    }
+
+    /// The badge's own colours: amber for a host who is only watched, red and
+    /// bold for a warning; monochrome strips every colour off the row.
+    #[test]
+    fn the_badge_takes_the_theme_and_monochrome_strips_it() {
+        let rgb = |Rgb { r, g, b }: Rgb| Some(Color::Rgb { r, g, b });
+        let (_, _, watched) = badged(sharing(Seat::Host, 0, 1, false), 120, false);
+        assert!(
+            watched
+                .right
+                .iter()
+                .filter(|s| s.group == BADGE)
+                .all(|s| s.fg == rgb(Theme::DEFAULT.status_shared) && !s.bold)
+        );
+        let (_, _, mut warned) = badged(sharing(Seat::Writer, 1, 0, false), 120, false);
+        assert!(
+            warned
+                .right
+                .iter()
+                .filter(|s| s.group == BADGE)
+                .all(|s| s.fg == rgb(Theme::DEFAULT.status_error) && s.bold)
+        );
+        warned.bg = Some(Color::Black);
+        monochrome(&mut warned);
+        assert!(warned.bg.is_none());
+        assert!(
+            warned
+                .left
+                .iter()
+                .chain(&warned.center)
+                .chain(&warned.right)
+                .all(|s| s.fg.is_none() && s.bg.is_none())
+        );
+        let mut star = busy_bar();
+        append_sharing(
+            &mut star,
+            Badge::of(sharing(Seat::Viewer, 1, 0, false)).as_ref(),
+            &Theme::DEFAULT,
+            120,
+            "*",
             false,
         );
-        assert!(driver.right.is_empty(), "a driver has no role to show");
+        assert_eq!(star.right[0].text, "*");
     }
 
     #[test]

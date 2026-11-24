@@ -105,7 +105,7 @@ pub(crate) async fn build_snapshot_status_bar(
         cols,
     );
     statusbar_build::append_watchers(&mut bar, attached, &theme, cols, false);
-    statusbar_build::append_viewing(&mut bar, size_label, None, &theme, cols, false);
+    statusbar_build::append_viewing(&mut bar, size_label, &theme, cols);
     bar
 }
 
