@@ -54,7 +54,9 @@ run there (wherever `SHUX_PANE_ID` is set) never prints the link:
   it, the link is revoked.
 
 `--format json` follows the same rule: `url` is `null` and `deliver` is
-`"clipboard"`. `shux rpc call share.create` from a pane is held to it too.
+`"clipboard"`. `shux rpc call share.create` from a pane is refused before
+anything is minted. A link `shux share` minted but did not get to print or
+copy (the CLI was killed, say) is revoked when its connection closes.
 Outside shux the link is printed; anything printed there is not in a shux
 session, so no guest can read it back.
 

@@ -403,6 +403,10 @@ fn a_stand_in_that_exits_at_once_is_an_error_and_mints_nothing() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("exited"), "{err}");
     assert!(h.links().is_empty());
+    let t = h.tunnel();
+    wait_until("the failed startup to stop listening", || {
+        std::net::TcpListener::bind(("127.0.0.1", t.port)).is_ok()
+    });
 }
 
 #[test]
@@ -451,6 +455,9 @@ fn a_caller_gone_mid_startup_leaves_no_connector() {
     });
     wait_until("the supervisor to exit", || {
         !running(t.supervisor, &format!("--port {}", t.port))
+    });
+    wait_until("the abandoned startup to stop listening", || {
+        std::net::TcpListener::bind(("127.0.0.1", t.port)).is_ok()
     });
     assert_eq!(h.json(&["share", "list"])["tunnel"], "down");
 }
@@ -659,6 +666,42 @@ fn raw_rpc_from_a_pane_cannot_print_a_link() {
 }
 
 #[test]
+fn raw_rpc_from_a_pane_cannot_talk_its_way_into_printing_a_link() {
+    let h = Harness::new();
+    let pane = h.session("demo");
+    let bin = fake_clipboard(h.fake.path());
+    for params in [
+        r#"{"session":"demo","from_pane":null}"#,
+        r#"{"session":"demo","can_copy":true}"#,
+        r#"{"session":"demo","from_pane":null,"can_copy":true}"#,
+    ] {
+        let out = h
+            .command()
+            .env("SHUX_PANE_ID", &pane)
+            .env("PATH", &bin)
+            .env("DISPLAY", ":99")
+            .args([
+                "--format",
+                "json",
+                "rpc",
+                "call",
+                "share.create",
+                "--params",
+            ])
+            .arg(params)
+            .output()
+            .expect("run shux");
+        let reply = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!reply.contains("https://"), "{params}: {reply}");
+    }
+    assert!(h.links().is_empty());
+}
+
+#[test]
 fn from_pane_is_required_and_null_means_outside_shux() {
     let h = Harness::new();
     h.session("demo");
@@ -834,6 +877,35 @@ fn a_copy_interrupted_by_ctrl_c_revokes_its_link() {
         h.links().is_empty(),
         "the link outlived its interrupted copy"
     );
+}
+
+#[test]
+fn a_share_killed_before_it_delivers_leaves_no_link() {
+    let h = Harness::new();
+    let pane = h.session("demo");
+    let bin = hanging_clipboard(h.fake.path());
+    let mut copying = h
+        .command()
+        .env("SHUX_PANE_ID", &pane)
+        .env("PATH", &bin)
+        .env("DISPLAY", ":99")
+        .args(["share", "-s", "demo"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("start sharing");
+    let clipboard: i32 = wait_for("the clipboard to start", || {
+        std::fs::read_to_string(h.fake.path().join("pbcopy.pid"))
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+    });
+    copying.kill().expect("SIGKILL the CLI");
+    copying.wait().expect("reap the CLI");
+    // Nothing of the CLI's survives SIGKILL to end its clipboard.
+    assert!(shux_testkit::terminate(clipboard));
+    wait_until("the undelivered link to be revoked", || {
+        h.links().is_empty()
+    });
 }
 
 #[test]

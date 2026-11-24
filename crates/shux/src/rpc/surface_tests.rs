@@ -72,6 +72,7 @@ const EXPECTED_SURFACE: &[&str] = &[
     "session.list => Public",
     "session.rename => OwnedMutation",
     "session.snapshot => ContentRead",
+    "share.confirm => PluginsForbidden, owner-local",
     "share.create => PluginsForbidden, owner-local",
     "share.kick => PluginsForbidden, owner-local",
     "share.list => PluginsForbidden, owner-local",

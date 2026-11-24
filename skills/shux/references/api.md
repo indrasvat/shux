@@ -153,7 +153,7 @@ told `kicked`. A host whose session has a live share link reads `◉ shared ·
 
 ## Share links
 
-`share.create` · `share.list` · `share.revoke` · `share.kick` · `share.stop`:
+`share.create` · `share.confirm` · `share.list` · `share.revoke` · `share.kick` · `share.stop`:
 owner-local, closed to plugins. Shapes, delivery rules, events and errors:
 [share.md](share.md).
 

@@ -233,6 +233,8 @@ pub(crate) struct Inner {
     probe: StdMutex<Option<(String, String)>>,
     /// One per `open` in progress: `stop` cancels them all.
     starting: StdMutex<Vec<(u64, CancellationToken)>>,
+    /// Links minted for a caller that has not yet said it delivered them.
+    pending: StdMutex<HashSet<GrantId>>,
     /// [`TUNNEL_DOWN`], [`TUNNEL_STARTING`] or [`TUNNEL_UP`].
     tunnel_state: AtomicU8,
     /// Numbers tunnel generations and startups.
@@ -281,8 +283,8 @@ impl Drop for StreamGuard {
     }
 }
 
-/// Removes its startup token from the list `stop` cancels, however `open`
-/// ends.
+/// Removes its startup token from the list `stop` cancels, and cancels it,
+/// however `open` ends: a caller that hangs up ends its startup.
 struct Starting<'a> {
     gw: &'a Gateway,
     id: u64,
@@ -292,21 +294,7 @@ struct Starting<'a> {
 impl Drop for Starting<'_> {
     fn drop(&mut self) {
         lock(&self.gw.inner.starting).retain(|(id, _)| *id != self.id);
-    }
-}
-
-/// Puts a tunnel still `starting` back to `down` when dropped: forgotten
-/// once the startup has an answer.
-struct DownOnDrop<'a>(&'a AtomicU8);
-
-impl Drop for DownOnDrop<'_> {
-    fn drop(&mut self) {
-        let _ = self.0.compare_exchange(
-            TUNNEL_STARTING,
-            TUNNEL_DOWN,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
+        self.token.cancel();
     }
 }
 
@@ -343,6 +331,7 @@ impl Gateway {
                 tunnel: Mutex::default(),
                 probe: StdMutex::default(),
                 starting: StdMutex::default(),
+                pending: StdMutex::default(),
                 tunnel_state: AtomicU8::new(TUNNEL_DOWN),
                 tunnels: AtomicU64::new(0),
                 events: StdMutex::default(),
@@ -441,9 +430,14 @@ impl Gateway {
     }
 
     /// Brings the tunnel up if it is not, then mints a link to
-    /// `opts.session` through it. Dropped part way, it leaves no connector
-    /// running.
-    pub async fn open(&self, opts: CreateOpts) -> Result<Created, ShareError> {
+    /// `opts.session` through it. With `hold`, the link is revoked if that
+    /// token fires before [`Self::confirm`] says the link was delivered.
+    /// Dropped part way, it ends its startup, which cleans up after itself.
+    pub async fn open(
+        &self,
+        opts: CreateOpts,
+        hold: Option<CancellationToken>,
+    ) -> Result<Created, ShareError> {
         opts.check()?;
         self.session_exists(opts.session)?;
         // Registered before anything is awaited, so a `stop` from here on
@@ -454,23 +448,36 @@ impl Gateway {
             token: self.inner.shutdown.child_token(),
         };
         lock(&self.inner.starting).push((starting.id, starting.token.clone()));
+        // On its own task, so a caller hanging up cancels the startup
+        // instead of cutting its teardown short.
+        let (gw, token) = (self.clone(), starting.token.clone());
+        tokio::spawn(async move { gw.open_now(opts, &token, hold).await })
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "share: a startup task failed");
+                Err(TunnelError::Cancelled.into())
+            })
+    }
+
+    async fn open_now(
+        &self,
+        opts: CreateOpts,
+        token: &CancellationToken,
+        hold: Option<CancellationToken>,
+    ) -> Result<Created, ShareError> {
         let mut tunnel = self.inner.tunnel.lock().await;
         if let Some(old) = tunnel.take_if(|c| c.lost.is_cancelled()) {
             // The links it carried end either way; the next tunnel is new.
             let _ = self.down(old, Down::Lost).await;
         }
         if tunnel.is_none() {
-            // Reads `starting` until this settles it, or is dropped: a
-            // caller that hangs up mid-startup leaves no tunnel behind.
             let state = &self.inner.tunnel_state;
             state.store(TUNNEL_STARTING, Ordering::Relaxed);
-            let settled = DownOnDrop(state);
-            let up = if starting.token.is_cancelled() {
+            let up = if token.is_cancelled() {
                 Err(TunnelError::Cancelled.into())
             } else {
-                self.up(&starting.token).await
+                self.up(token).await
             };
-            std::mem::forget(settled);
             state.store(
                 if up.is_ok() { TUNNEL_UP } else { TUNNEL_DOWN },
                 Ordering::Relaxed,
@@ -490,17 +497,70 @@ impl Gateway {
                 }
             }
         }
-        let created = self.create(opts);
+        // Under the lock `stop` takes next: a startup it cancelled mints
+        // nothing, whether it brought the tunnel up or found it up.
+        let created = if token.is_cancelled() {
+            Err(TunnelError::Cancelled.into())
+        } else {
+            self.create(opts)
+        };
+        if let (Ok(c), Some(life)) = (&created, hold) {
+            self.hold(c.id.clone(), life);
+        }
         drop(tunnel);
         self.inner.changed.notify_one();
         self.flush().await;
         created
     }
 
+    /// Revokes `id` once `life` fires, unless [`Self::confirm`] came first.
+    fn hold(&self, id: GrantId, life: CancellationToken) {
+        lock(&self.inner.pending).insert(id.clone());
+        let gw = self.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                () = life.cancelled() => {}
+                () = gw.inner.shutdown.cancelled() => return,
+            }
+            if lock(&gw.inner.pending).remove(&id) {
+                match gw.revoke(&id).await {
+                    Ok(()) | Err(ShareError::NoGrant) => {}
+                    Err(e) => tracing::warn!(error = %e, "share: revoking an undelivered link"),
+                }
+            }
+        });
+    }
+
+    /// The caller of a held `open` has delivered link `id`: it stays.
+    pub fn confirm(&self, id: &GrantId) -> Result<(), ShareError> {
+        lock(&self.inner.pending)
+            .remove(id)
+            .then_some(())
+            .ok_or(ShareError::NoGrant)
+    }
+
     /// Starts a supervised quick tunnel to the gateway and proves it reaches
-    /// this generation's marker.
+    /// this generation's marker. Failing, it stops what it started first.
     async fn up(&self, cancel: &CancellationToken) -> Result<Connector, ShareError> {
         let cloudflared = tunnel::find_cloudflared()?;
+        let mut supervisor = None;
+        let started = self.start(&cloudflared, &mut supervisor, cancel).await;
+        if started.is_err() {
+            *lock(&self.inner.probe) = None;
+            if let Some(s) = supervisor {
+                s.stop().await;
+            }
+            self.stop_serving(Instant::now() + TEARDOWN).await;
+        }
+        started
+    }
+
+    async fn start(
+        &self,
+        cloudflared: &std::path::Path,
+        held: &mut Option<tunnel::Supervisor>,
+        cancel: &CancellationToken,
+    ) -> Result<Connector, ShareError> {
         let addr = self
             .listen(SocketAddr::from(([127, 0, 0, 1], 0)))
             .await
@@ -512,7 +572,12 @@ impl Gateway {
         };
         let shux = std::env::current_exe().map_err(|_| TunnelError::SpawnFailed)?;
         let probe = default_probe(addr);
-        let mut supervisor = tunnel::Supervisor::spawn(&shux, &cloudflared, &fd, addr.port())?;
+        let supervisor = held.insert(tunnel::Supervisor::spawn(
+            &shux,
+            cloudflared,
+            &fd,
+            addr.port(),
+        )?);
         drop(fd);
         let origin = supervisor.origin(cancel).await?;
         let marker = tunnel::marker().map_err(|_| TunnelError::SpawnFailed)?;
@@ -524,8 +589,7 @@ impl Gateway {
         let ended = {
             let mut store = self.store();
             let links = store.links();
-            let mut ended = store.end_all(EndReason::Stopped);
-            ended.extend(store.set_origin(origin));
+            let ended = store.end_all(EndReason::Stopped);
             drop(store);
             for (id, session) in links {
                 self.note_ended(id, session, EndReason::Stopped);
@@ -533,7 +597,10 @@ impl Gateway {
             ended
         };
         settle(ended).await?;
+        // Published only now; `end_all` left nothing at the old origin.
+        drop(self.store().set_origin(origin));
         let generation = self.inner.tunnels.fetch_add(1, Ordering::Relaxed);
+        let mut supervisor = held.take().ok_or(TunnelError::SpawnFailed)?;
         let lost = supervisor.watch();
         tokio::spawn(self.clone().keep(generation, lost.clone()));
         self.note(EventData::ShareTunnel {
@@ -550,9 +617,6 @@ impl Gateway {
     /// Takes a generation down: ends what it carried, stops serving, then
     /// stops and reaps the connector, whatever the teardown reports.
     async fn down(&self, c: Connector, why: Down) -> Result<(), ShareError> {
-        self.inner
-            .tunnel_state
-            .store(TUNNEL_DOWN, Ordering::Relaxed);
         let ended = {
             let mut store = self.store();
             let links = store.links();
@@ -564,12 +628,13 @@ impl Gateway {
             }
             ended
         };
-        let settled = settle(ended).await;
-        if let Some(server) = self.inner.server.lock().await.take() {
-            server.cancel.cancel();
-            let _ = tokio::time::timeout(TEARDOWN, server.task).await;
-        }
+        let deadline = Instant::now() + TEARDOWN;
+        let settled = settle_by(ended, deadline).await;
+        self.stop_serving(deadline).await;
         c.supervisor.stop().await;
+        self.inner
+            .tunnel_state
+            .store(TUNNEL_DOWN, Ordering::Relaxed);
         self.note(EventData::ShareTunnel {
             state: "down".into(),
             reason: Some(why.code().into()),
@@ -647,6 +712,29 @@ impl Gateway {
         settled
     }
 
+    /// Ends every link in one step, then waits for their viewers' sockets
+    /// together: returns the links it ended and how that teardown went.
+    pub async fn revoke_all(&self) -> (Vec<GrantId>, Result<(), ShareError>) {
+        self.prune();
+        let at = self.now().mono;
+        let (revoked, ended) = {
+            let mut store = self.store();
+            let links = store.links();
+            let ended: Vec<Live> = links
+                .keys()
+                .filter_map(|id| store.revoke(id, at))
+                .flatten()
+                .collect();
+            (links, ended)
+        };
+        for (id, session) in &revoked {
+            self.note_ended(id.clone(), *session, EndReason::Revoked);
+        }
+        let settled = settle(ended).await;
+        self.flush().await;
+        (revoked.into_keys().collect(), settled)
+    }
+
     /// Drops one viewer and its credential; its link stays.
     pub async fn kick(&self, viewer: &ViewerId) -> Result<(), ShareError> {
         let ended = self.store().kick(viewer).ok_or(ShareError::NoViewer)?;
@@ -663,12 +751,12 @@ impl Gateway {
         for (_, starting) in lock(&self.inner.starting).drain(..) {
             starting.cancel();
         }
+        // Held to the end: an opener after this starts on what stop left.
         let mut tunnel = self.inner.tunnel.lock().await;
         let down = match tunnel.take() {
             Some(c) => self.down(c, Down::Stopped).await,
             None => Ok(()),
         };
-        drop(tunnel);
         let ended = {
             let mut store = self.store();
             let links = store.links();
@@ -682,6 +770,13 @@ impl Gateway {
         // One deadline for the streams and the listener together.
         let deadline = Instant::now() + TEARDOWN;
         let settled = settle_by(ended, deadline).await;
+        self.stop_serving(deadline).await;
+        drop(tunnel);
+        self.flush().await;
+        down.and(settled)
+    }
+
+    async fn stop_serving(&self, deadline: Instant) {
         if let Some(server) = self.inner.server.lock().await.take() {
             server.cancel.cancel();
             if tokio::time::timeout_at(deadline, server.task)
@@ -691,8 +786,6 @@ impl Gateway {
                 tracing::warn!("share: the listener outlived stop's deadline");
             }
         }
-        self.flush().await;
-        down.and(settled)
     }
 
     /// Terminal bytes written to viewers' sockets, over the gateway's life.
@@ -1037,6 +1130,7 @@ mod tests {
         };
         *gw.inner.server.lock().await = Some(Server {
             addr: "127.0.0.1:1".parse().unwrap(),
+            fd: std::fs::File::open("/dev/null").unwrap().into(),
             cancel: CancellationToken::new(),
             task: tokio::spawn(std::future::pending()),
         });
@@ -1098,5 +1192,150 @@ mod tests {
         assert!(matches!(settle(ended).await, Err(ShareError::Teardown(1))));
         stuck.live.done().cancel();
         assert!(settle(vec![stuck.live]).await.is_ok());
+    }
+
+    /// A session with an origin to mint for.
+    async fn shared(gw: &Gateway) -> SessionId {
+        let session = gw
+            .inner
+            .deps
+            .graph
+            .create_session("s".into(), std::env::temp_dir())
+            .await
+            .unwrap();
+        gw.set_origin(Origin::parse("https://a.test").unwrap())
+            .await
+            .unwrap();
+        session
+    }
+
+    /// A link with one viewer whose socket never closes.
+    fn stuck(gw: &Gateway, session: SessionId) -> Live {
+        let created = gw.create(CreateOpts::new(session)).unwrap();
+        let secret = created.url.split_once('#').unwrap().1;
+        let (_, generation) = gw.origin().unwrap();
+        let cookie = gw
+            .redeem("c", generation, &created.id, secret)
+            .unwrap()
+            .cookie;
+        let Admit::Ready(admitted) = gw.admit(generation, &created.id, &cookie) else {
+            panic!("not admitted");
+        };
+        admitted.live
+    }
+
+    /// One link's teardown failing leaves no other link valid.
+    #[tokio::test(start_paused = true)]
+    async fn revoking_all_ends_every_link_though_a_teardown_fails() {
+        let gw = gateway();
+        let session = shared(&gw).await;
+        let held = [stuck(&gw, session), stuck(&gw, session)];
+        let (revoked, settled) = gw.revoke_all().await;
+        assert!(gw.list().is_empty(), "a link outlived revoke all");
+        assert_eq!(revoked.len(), 2);
+        assert!(
+            matches!(settled, Err(ShareError::Teardown(2))),
+            "{settled:?}"
+        );
+        drop(held);
+    }
+
+    /// Revoke all leaves each link's tombstone, as one revoke does: it
+    /// answers "ended", whatever the secret, and costs no guess.
+    #[tokio::test]
+    async fn revoking_all_leaves_each_link_saying_it_ended() {
+        let gw = gateway();
+        let session = shared(&gw).await;
+        let created = gw.create(CreateOpts::new(session)).unwrap();
+        let secret = created.url.split_once('#').unwrap().1.to_string();
+        gw.revoke_all().await.1.unwrap();
+        let (_, generation) = gw.origin().unwrap();
+        for s in [secret.as_str(), "wrong"]
+            .iter()
+            .cycle()
+            .take(CLIENT_FAILURES + 2)
+        {
+            assert_eq!(
+                gw.redeem("c", generation, &created.id, s).unwrap_err(),
+                Refused::Gone(Some(EndReason::Revoked))
+            );
+        }
+        let fresh = gw.create(CreateOpts::new(session)).unwrap();
+        let fresh_secret = fresh.url.split_once('#').unwrap().1;
+        assert!(
+            gw.redeem("c", generation, &fresh.id, fresh_secret).is_ok(),
+            "asking after an ended link counted as guessing"
+        );
+    }
+
+    /// A startup `stop` cancelled mints nothing, even through a tunnel
+    /// already up, whichever of the two gets the tunnel first.
+    #[tokio::test]
+    async fn a_startup_cancelled_by_stop_mints_nothing() {
+        let gw = gateway();
+        let session = shared(&gw).await;
+        let mut tunnel = gw.inner.tunnel.lock().await;
+        *tunnel = Some(Connector {
+            generation: 0,
+            supervisor: tunnel::Supervisor::idle(),
+            lost: CancellationToken::new(),
+        });
+        let opening = tokio::spawn({
+            let gw = gw.clone();
+            async move { gw.open(CreateOpts::new(session), None).await }
+        });
+        shux_testkit::wait_until_async("the startup to register", || {
+            let n = lock(&gw.inner.starting).len();
+            async move { n == 1 }
+        })
+        .await;
+        let stopping = tokio::spawn({
+            let gw = gw.clone();
+            async move { gw.stop().await }
+        });
+        shux_testkit::wait_until_async("stop to cancel the startup", || {
+            let n = lock(&gw.inner.starting).len();
+            async move { n == 0 }
+        })
+        .await;
+        drop(tunnel);
+        let opened = opening.await.unwrap();
+        stopping.await.unwrap().unwrap();
+        assert!(opened.is_err(), "a cancelled startup minted {opened:?}");
+        assert!(gw.list().is_empty());
+    }
+
+    /// An opener that comes in while `stop` tears down waits for it, so the
+    /// listener it finds is not then stopped under it.
+    #[tokio::test(start_paused = true)]
+    async fn an_opener_during_stop_keeps_the_listener_it_finds() {
+        let gw = gateway();
+        let session = shared(&gw).await;
+        gw.listen(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let held = stuck(&gw, session);
+        let stopping = tokio::spawn({
+            let gw = gw.clone();
+            async move { gw.stop().await }
+        });
+        shux_testkit::wait_until_async("stop to end the links", || {
+            let empty = gw.list().is_empty();
+            async move { empty }
+        })
+        .await;
+        // What `open` does: the tunnel, then a listener for it.
+        let tunnel = gw.inner.tunnel.lock().await;
+        gw.listen(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        drop(tunnel);
+        let _ = stopping.await.unwrap();
+        let server = gw.inner.server.lock().await;
+        assert!(
+            server.as_ref().is_some_and(|s| !s.task.is_finished()),
+            "stop stopped the listener an opener had found"
+        );
+        drop(held);
     }
 }

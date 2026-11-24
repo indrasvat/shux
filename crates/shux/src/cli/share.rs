@@ -133,10 +133,11 @@ pub async fn handle_share_create(
             "label": args.label,
             "can_copy": clip.is_some(),
             "qr": args.qr,
+            "hold": true,
         }),
     );
-    // Interrupted before the link exists, the call is dropped: the daemon
-    // ends a tunnel startup whose caller has gone.
+    // Interrupted, the call is dropped: the daemon ends a startup whose
+    // caller has gone, and revokes a held link this never confirmed.
     let result = match signals.as_mut() {
         Some((interrupt, terminate)) => tokio::select! {
             r = create => r?,
@@ -170,6 +171,7 @@ pub async fn handle_share_create(
                 )),
             });
         }
+        confirm(stream, &id).await?;
         let mut shown = result.clone();
         shown["url"] = serde_json::Value::Null;
         if matches!(format, OutputFormat::Json) {
@@ -178,16 +180,25 @@ pub async fn handle_share_create(
         return Ok(style::print_share_copied(&shown)?);
     }
     if matches!(format, OutputFormat::Json) {
-        return print_json(&result);
+        print_json(&result)?;
+    } else {
+        match style::TerminalContext::detect(to_style_format(format)).format {
+            style::OutputFormat::Plain => style::print_plain_line(&url)?,
+            _ => style::print_share_created(&result)?,
+        }
+        if args.qr {
+            style::print_share_qr(&url)?;
+        }
     }
-    match style::TerminalContext::detect(to_style_format(format)).format {
-        style::OutputFormat::Plain => style::print_plain_line(&url)?,
-        _ => style::print_share_created(&result)?,
-    }
-    if args.qr {
-        style::print_share_qr(&url)?;
-    }
-    Ok(())
+    confirm(stream, &id).await
+}
+
+/// Keeps the held link `id`, now that it has been delivered.
+async fn confirm(stream: &mut tokio::net::UnixStream, id: &str) -> anyhow::Result<()> {
+    rpc_call(stream, "share.confirm", serde_json::json!({ "id": id }))
+        .await
+        .map(drop)
+        .map_err(|e| anyhow::Error::from(e).context(format!("keeping link {id}")))
 }
 
 pub async fn handle_share_list(

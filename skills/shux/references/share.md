@@ -25,14 +25,18 @@ A caller in a shux pane never gets the link on screen.
 - The RPC requires `from_pane`. `null` asserts the caller is outside shux
   (`deliver: "print"`). Any other value means clipboard (`can_copy: true`)
   or refuse, whatever pane it names.
-- `shux rpc call share.create` fills in `from_pane` from `SHUX_PANE_ID`
-  when the params leave it out.
+- `shux rpc call share.create` inside a pane is refused (`in_pane`) before
+  anything is minted, whatever the params say: it prints its answer.
+- With `hold: true` the link is revoked if the connection closes before
+  `share.confirm` names it. `shux share` holds every link it makes and
+  confirms it only once printed or copied, so a CLI killed mid-delivery
+  leaves no live link.
 - `--qr` with `--format json` is refused (`qr_json`): the QR is only drawn
   as text.
 
 ## RPCs
 
-All five are **owner-local** (answered only on the daemon's Unix socket;
+All six are **owner-local** (answered only on the daemon's Unix socket;
 TCP and plugins get `permission_denied` with `reason: "owner_local"`) and
 `PluginsForbidden`. Unknown fields are refused.
 
@@ -45,7 +49,8 @@ TCP and plugins get `permission_denied` with `reason: "owner_local"`) and
   "uses": 1,                  // default 1, max 32; 0 = up to 32 (needs ttl_secs)
   "label": "review",          // ≤64 printable chars, for list only
   "can_copy": false,          // the caller can put the link on a clipboard
-  "qr": false }
+  "qr": false,
+  "hold": false }             // revoke unless share.confirm comes before the connection closes
 → { "id": "ab12cd34", "url": "https://<words>.trycloudflare.com/v/ab12cd34#<secret>",
     "session_id": "<uuid>", "session": "demo", "expires_at": "2026-11-24T15:00:00Z",
     "uses": 1,                // null when unlimited
@@ -58,7 +63,11 @@ TCP and plugins get `permission_denied` with `reason: "owner_local"`) and
                    "redeemed": 1,
                    "viewers": [{ "id": "v9x8y7w6", "connected": true }] }] }
 
-// share.revoke (shux share revoke <id|all>): ends the link and its viewers
+// share.confirm: a held link was delivered; it stays
+{ "id": "ab12cd34" } → { "confirmed": "ab12cd34" }
+
+// share.revoke (shux share revoke <id|all>): ends the link and its viewers;
+// "all" ends every link first, then reports any teardown that failed
 { "id": "ab12cd34" } → { "revoked": ["ab12cd34"] }
 
 // share.kick (shux share kick <viewer>): drops one viewer, keeps the link

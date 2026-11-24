@@ -479,6 +479,27 @@ impl Supervisor {
         lost
     }
 
+    /// A stand-in that reports nothing and exits once told to stop.
+    #[cfg(test)]
+    pub fn idle() -> Self {
+        let mut child = tokio::process::Command::new("/bin/cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn cat");
+        let liveness = child.stdin.take();
+        let reports = child
+            .stdout
+            .take()
+            .map(|o| tokio::io::BufReader::new(o).lines());
+        Self {
+            child,
+            liveness,
+            reports,
+            group: None,
+        }
+    }
+
     /// Tells it to stop and waits for it, which it does once cloudflared's
     /// group is gone; past [`REAP`] the daemon kills the group and it.
     pub async fn stop(mut self) {

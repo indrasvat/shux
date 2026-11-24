@@ -17,8 +17,9 @@ use crate::share::{
     CreateError, CreateOpts, Gateway, GrantId, ShareError, TunnelError, Uses, ViewerId,
 };
 
-pub(crate) const METHODS: [&str; 5] = [
+pub(crate) const METHODS: [&str; 6] = [
     "share.create",
+    "share.confirm",
     "share.list",
     "share.revoke",
     "share.kick",
@@ -101,6 +102,9 @@ struct CreateParams {
     can_copy: bool,
     #[serde(default)]
     qr: bool,
+    /// Revoke the link if this connection closes before `share.confirm`.
+    #[serde(default)]
+    hold: bool,
 }
 
 /// A field that was given, `null` included: missing stays `None`.
@@ -171,8 +175,14 @@ pub(crate) fn register_share_methods(
     gw: Gateway,
 ) -> shux_rpc::RouterBuilder {
     let forbidden = || Policy::fixed(Sensitivity::PluginsForbidden);
-    let (g_create, g_list, g_revoke, g_kick, g_stop) =
-        (gw.clone(), gw.clone(), gw.clone(), gw.clone(), gw);
+    let (g_create, g_list, g_revoke, g_kick, g_confirm, g_stop) = (
+        gw.clone(),
+        gw.clone(),
+        gw.clone(),
+        gw.clone(),
+        gw.clone(),
+        gw,
+    );
     let (graph_create, graph_list) = (graph.clone(), graph);
     let builder = builder
         .register_with_policy("share.create", forbidden(), move |p: Option<serde_json::Value>| {
@@ -236,7 +246,17 @@ pub(crate) fn register_share_methods(
                 opts.uses = uses;
                 opts.label = p.label;
                 let label = opts.label.clone();
-                let created = gw.open(opts).await.map_err(|e| share_error(e, ""))?;
+                let hold = match p.hold {
+                    false => None,
+                    true => Some(shux_rpc::current_connection().ok_or_else(|| {
+                        refusal(
+                            ErrorCode::InvalidParams,
+                            "hold",
+                            "hold needs a connection to the daemon's socket",
+                        )
+                    })?),
+                };
+                let created = gw.open(opts, hold).await.map_err(|e| share_error(e, ""))?;
                 let snap = graph.snapshot();
                 Ok(serde_json::json!({
                     "id": created.id.as_str(),
@@ -286,24 +306,33 @@ pub(crate) fn register_share_methods(
                     id: String,
                 }
                 let P { id } = params(p)?;
-                let ids: Vec<GrantId> = if id == "all" {
-                    gw.list().into_iter().map(|g| g.id).collect()
+                let revoked = if id == "all" {
+                    let (revoked, settled) = gw.revoke_all().await;
+                    settled.map_err(|e| share_error(e, &id))?;
+                    revoked
                 } else {
-                    vec![
-                        GrantId::parse(id.trim())
-                            .ok_or_else(|| share_error(ShareError::NoGrant, &id))?,
-                    ]
+                    let g = GrantId::parse(id.trim())
+                        .ok_or_else(|| share_error(ShareError::NoGrant, &id))?;
+                    gw.revoke(&g).await.map_err(|e| share_error(e, &id))?;
+                    vec![g]
                 };
-                let mut revoked = Vec::new();
-                for g in ids {
-                    match gw.revoke(&g).await {
-                        Ok(()) => revoked.push(g.as_str().to_string()),
-                        // Ended meanwhile: one fewer to end.
-                        Err(ShareError::NoGrant) if id == "all" => {}
-                        Err(e) => return Err(share_error(e, &id)),
-                    }
-                }
+                let revoked: Vec<&str> = revoked.iter().map(GrantId::as_str).collect();
                 Ok(serde_json::json!({ "revoked": revoked }))
+            }
+        })
+        .register_with_policy("share.confirm", forbidden(), move |p: Option<serde_json::Value>| {
+            let gw = g_confirm.clone();
+            async move {
+                #[derive(serde::Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct P {
+                    id: String,
+                }
+                let P { id } = params(p)?;
+                let g = GrantId::parse(id.trim())
+                    .ok_or_else(|| share_error(ShareError::NoGrant, &id))?;
+                gw.confirm(&g).map_err(|e| share_error(e, &id))?;
+                Ok(serde_json::json!({ "confirmed": g.as_str() }))
             }
         })
         .register_with_policy("share.kick", forbidden(), move |p: Option<serde_json::Value>| {
