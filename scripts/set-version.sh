@@ -41,3 +41,6 @@ echo "Updated $CARGO_TOML to version $VERSION"
 
 # Verify the change landed in the workspace.package block.
 grep -E '^version = "' "$CARGO_TOML" | head -1
+
+# The fuzz crate's own lockfile records the workspace crates too.
+"$(dirname "$0")/sync-fuzz-lock.sh"

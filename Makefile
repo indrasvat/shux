@@ -759,6 +759,10 @@ test-gauntlet-all: ## Run the whole task-084 gauntlet SERIALLY (6 cells; long). 
 	@.shux/scripts/laghudarshi_gate_all.sh $(if $(CELLS),$(CELLS),codex:cr-b codex:cr-a claude:cr-b claude:cr-a agy:cr-b agy:cr-a)
 
 .PHONY: check-lens-frozen
+.PHONY: check-fuzz-lock
+check-fuzz-lock: ## fuzz/Cargo.lock records the workspace crates at the workspace version
+	@bash scripts/sync-fuzz-lock.sh --check
+
 check-lens-frozen: ## Enforce the lens frozen-path test-integrity trailer (§16.2)
 	@bash scripts/check-lens-frozen.sh "$(MSG)"
 
@@ -796,7 +800,7 @@ fmt: ## Format all code
 	@echo "$(COLOR_GREEN)✓ Formatting complete$(COLOR_RESET)"
 
 .PHONY: check-after-hygiene
-check-after-hygiene: lint shellcheck check-test-sleeps check-test-timing check-test-ignores check-darwin test check-build-rerun check-test-groups check-test-opt-out check-test-inventory check-ci-parity test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-lens-frozen check-no-bin-mods check-action-pins check-vt-corpus-scratch check-prune
+check-after-hygiene: lint shellcheck check-test-sleeps check-test-timing check-test-ignores check-darwin test check-build-rerun check-test-groups check-test-opt-out check-test-inventory check-ci-parity test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-lens-frozen check-no-bin-mods check-action-pins check-vt-corpus-scratch check-fuzz-lock check-prune
 
 .PHONY: check
 check: hooks-check check-target-hygiene ## Run lint + test + process/QA guards (what pre-commit runs)
@@ -808,7 +812,7 @@ check: hooks-check check-target-hygiene ## Run lint + test + process/QA guards (
 	@echo ""
 
 .PHONY: ci
-ci: lint shellcheck check-test-sleeps check-test-timing check-test-ignores check-darwin test check-test-groups check-test-inventory check-ci-parity test-doc test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-no-bin-mods check-action-pins check-vt-corpus-scratch check-prune ## Run the CI pipeline locally (lint + full test + doc tests + process/QA guards)
+ci: lint shellcheck check-test-sleeps check-test-timing check-test-ignores check-darwin test check-test-groups check-test-inventory check-ci-parity test-doc test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-no-bin-mods check-action-pins check-vt-corpus-scratch check-fuzz-lock check-prune ## Run the CI pipeline locally (lint + full test + doc tests + process/QA guards)
 	@echo ""
 	@echo "$(COLOR_GREEN)$(COLOR_BOLD)✓ CI pipeline passed!$(COLOR_RESET)"
 	@echo ""
