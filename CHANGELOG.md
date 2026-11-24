@@ -1,3 +1,10 @@
+## [0.61.1](https://github.com/indrasvat/shux/compare/v0.61.0...v0.61.1) (2026-11-24)
+
+
+### Bug Fixes
+
+* **test:** prune self-test's "dead" pids can never belong to a process ([#310](https://github.com/indrasvat/shux/issues/310)) ([4418bb0](https://github.com/indrasvat/shux/commit/4418bb09f1e58d2e152e6cf6c15d6851821fb87c)), closes [#308](https://github.com/indrasvat/shux/issues/308)
+
 # [0.61.0](https://github.com/indrasvat/shux/compare/v0.60.0...v0.61.0) (2026-11-24)
 
 
