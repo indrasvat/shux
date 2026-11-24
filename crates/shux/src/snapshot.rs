@@ -191,6 +191,32 @@ pub(crate) fn natural_frame(
     ))
 }
 
+/// The frame a browser draws a session nothing has sized at: the tree and
+/// grid that show its active window's panes whole, without the status bar
+/// row. None once a client has driven it.
+pub(crate) fn hostless_frame(
+    snap: &shux_core::graph::SessionGraphSnapshot,
+    state: &crate::pane_io::PaneIoState,
+    session: shux_core::model::SessionId,
+    border_style: shux_ui::BorderStyle,
+) -> Option<(shux_core::layout::LayoutNode, (u16, u16))> {
+    if state.clients.driver(session).is_some() || state.layout_basis.contains_key(&session) {
+        return None;
+    }
+    let window = snap
+        .windows
+        .get(&snap.sessions.get(&session)?.active_window)?;
+    let size_of = |pane| {
+        let grid = state.vts.get(&pane)?.grid();
+        Some((
+            u16::try_from(grid.cols()).ok()?,
+            u16::try_from(grid.rows()).ok()?,
+        ))
+    };
+    let (tree, (cols, rows)) = natural_frame(&window.layout, &size_of, border_style)?;
+    Some((tree, (cols, rows.saturating_sub(STATUS_BAR_ROWS))))
+}
+
 /// One pane's render-clone payload, captured under the pane-IO lock:
 /// (id, grid clone with resolved defaults, cursor, dynamic default colors).
 pub(crate) type PaneSnapshotData = (

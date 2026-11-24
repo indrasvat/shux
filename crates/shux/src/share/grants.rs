@@ -110,6 +110,27 @@ impl Expiry {
     pub fn passed(&self, at: Now) -> bool {
         at.mono >= self.mono || at.wall >= self.wall
     }
+
+    /// Time left by whichever clock is nearer its end.
+    pub fn remaining(&self, at: Now) -> Duration {
+        self.mono
+            .saturating_duration_since(at.mono)
+            .min(self.wall.duration_since(at.wall).unwrap_or_default())
+    }
+
+    pub fn remaining_ms(&self, at: Now) -> u64 {
+        self.remaining(at)
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX)
+    }
+
+    /// Whole seconds, rounded up: a cookie with under a second left is
+    /// still a live one, and `Max-Age=0` would delete it.
+    pub fn cookie_max_age(&self, at: Now) -> u64 {
+        let left = self.remaining(at);
+        left.as_secs() + u64::from(left.subsec_nanos() > 0)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -358,9 +379,34 @@ pub struct Store {
     grants: HashMap<GrantId, Grant>,
     viewers: HashMap<ViewerId, Viewer>,
     next_stream: u64,
+    origin: Option<super::Origin>,
+    /// Moves on with every stop and origin change: a request checked under
+    /// an older one is admitted to nothing.
+    generation: u64,
 }
 
 impl Store {
+    /// The origin requests must name, and the generation they are checked
+    /// under.
+    pub fn origin(&self) -> Option<(super::Origin, u64)> {
+        Some((self.origin.clone()?, self.generation))
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// A different origin ends every link made for the old one, in the same
+    /// step that names the new one.
+    pub fn set_origin(&mut self, origin: super::Origin) -> Vec<Live> {
+        let ended = match &self.origin {
+            Some(old) if *old != origin => self.stop(),
+            _ => Vec::new(),
+        };
+        self.origin = Some(origin);
+        ended
+    }
+
     pub fn create(&mut self, opts: CreateOpts, at: Now) -> Result<Minted, CreateError> {
         if opts.ttl.is_zero() || opts.ttl > MAX_TTL {
             return Err(CreateError::Ttl);
@@ -466,10 +512,10 @@ impl Store {
     }
 
     /// When `cookie`'s link ends, if it may stream `grant` now.
-    pub fn status(&self, grant: &GrantId, cookie: &str, at: Now) -> Option<SystemTime> {
+    pub fn status(&self, grant: &GrantId, cookie: &str, at: Now) -> Option<Expiry> {
         self.credential(grant, cookie)?;
         let g = self.grants.get(grant).filter(|g| !g.expires.passed(at))?;
-        Some(g.expires.wall)
+        Some(g.expires)
     }
 
     /// Admits `cookie` to stream `grant`: one live stream per credential.
@@ -490,9 +536,8 @@ impl Store {
         let Some(held) = self.viewers.get_mut(&viewer) else {
             return Admit::Refused(Refused::NotFound);
         };
-        if let Some(live) = &held.live {
-            return Admit::Busy(live.clone());
-        }
+        // Throttled before anything else: a credential past its rate cannot
+        // end its own live stream by asking for another.
         while held
             .admitted
             .front()
@@ -502,6 +547,9 @@ impl Store {
         }
         if held.admitted.len() >= ADMIT_BURST {
             return Admit::Refused(Refused::Throttled);
+        }
+        if let Some(live) = &held.live {
+            return Admit::Busy(live.clone());
         }
         if streaming >= MAX_STREAMS_PER_LINK {
             return Admit::Refused(Refused::Full);
@@ -517,6 +565,18 @@ impl Store {
             expires,
             live,
         })
+    }
+
+    /// Takes back an admission whose stream never started: it costs the
+    /// credential none of its reconnect budget.
+    pub fn refund(&mut self, viewer: &ViewerId, stream: u64, at: Instant) {
+        if let Some(held) = self.viewers.get_mut(viewer)
+            && held.live.as_ref().is_some_and(|l| l.stream == stream)
+        {
+            held.live = None;
+            held.offline_since = Some(at);
+            held.admitted.pop_back();
+        }
     }
 
     /// A stream has ended: its credential may stream again.
@@ -543,6 +603,7 @@ impl Store {
 
     /// Ends every link and viewer.
     pub fn stop(&mut self) -> Vec<Live> {
+        self.generation += 1;
         self.grants.clear();
         self.drop_viewers(|_| true, EndReason::Stopped)
     }
@@ -567,9 +628,18 @@ impl Store {
         for (id, why) in ended {
             lives.extend(self.drop_viewers(|v| v.grant == id, why));
         }
+        // Only an unlimited link's credentials leave for idling: a limited
+        // link's are its viewers' only way back in, and its uses bound them.
+        let unlimited: Vec<GrantId> = self
+            .grants
+            .iter()
+            .filter(|(_, g)| g.uses_left.is_none())
+            .map(|(id, _)| id.clone())
+            .collect();
         self.viewers.retain(|_, v| {
-            v.offline_since
-                .is_none_or(|since| since + OFFLINE_GRACE > at.mono)
+            !unlimited.contains(&v.grant)
+                || v.offline_since
+                    .is_none_or(|since| since + OFFLINE_GRACE > at.mono)
         });
         lives
     }
@@ -836,7 +906,13 @@ mod tests {
         // Credentials with no stream leave after the grace period.
         let later = at(now + OFFLINE_GRACE);
         let _ = store.end_grants(later, |_| false);
-        let held: usize = store.list().iter().map(|g| g.viewers.len()).sum();
+        let listed = store.list();
+        let held = listed
+            .iter()
+            .find(|i| i.id == g.id)
+            .expect("listed")
+            .viewers
+            .len();
         assert_eq!(held, MAX_STREAMS_PER_LINK, "only the streaming ones stay");
         assert!(store.redeem(&g.id, &g.secret, later).is_ok());
     }
@@ -862,6 +938,86 @@ mod tests {
         assert!(matches!(
             store.admit(&g.id, &r.cookie, at(now + ADMIT_WINDOW)),
             Admit::Ready(_)
+        ));
+    }
+
+    /// Time left is the nearer clock's, and a cookie with under a second
+    /// of it left still lives: `Max-Age=0` would delete it.
+    #[test]
+    fn time_left_is_the_nearer_clocks_and_a_cookie_rounds_it_up() {
+        // why: an origin handed to the store, which reads no clock; later instants are data
+        // ast-grep-ignore: test-wall-clock-unit
+        let before = at(Instant::now());
+        let ttl = Duration::from_secs(1);
+        let expires = Expiry {
+            mono: before.mono + ttl,
+            wall: before.wall + ttl,
+        };
+        let shift = Duration::from_millis(875);
+        for now in [
+            Now {
+                mono: before.mono + shift,
+                ..before
+            },
+            Now {
+                wall: before.wall + shift,
+                ..before
+            },
+        ] {
+            assert_eq!(expires.remaining_ms(now), 125);
+            assert_eq!(expires.cookie_max_age(now), 1);
+        }
+    }
+
+    /// A throttled credential cannot end its own live stream by asking for
+    /// another: the throttle answers before replacement does.
+    #[test]
+    fn a_throttled_reconnect_leaves_the_live_stream_alone() {
+        let now = Instant::now();
+        let mut store = Store::default();
+        let g = mint(&mut store, CreateOpts::new(session()), at(now));
+        let r = store.redeem(&g.id, &g.secret, at(now)).unwrap();
+        for _ in 1..ADMIT_BURST {
+            let Admit::Ready(a) = store.admit(&g.id, &r.cookie, at(now)) else {
+                panic!("not admitted");
+            };
+            store.stream_ended(&a.viewer, a.live.stream(), now);
+        }
+        let Admit::Ready(live) = store.admit(&g.id, &r.cookie, at(now)) else {
+            panic!("not admitted");
+        };
+        assert!(matches!(
+            store.admit(&g.id, &r.cookie, at(now)),
+            Admit::Refused(Refused::Throttled)
+        ));
+        assert!(!live.live.stop().is_cancelled());
+    }
+
+    /// A credential from a limited link is the viewer's only way back in:
+    /// it is never dropped for idling. An unlimited link's are.
+    #[test]
+    fn a_limited_links_credential_outlives_an_idle_spell() {
+        // why: an origin handed to the store, which reads no clock; later instants are data
+        // ast-grep-ignore: test-wall-clock-unit
+        let now = Instant::now();
+        let mut store = Store::default();
+        let limited = mint(&mut store, CreateOpts::new(session()), at(now));
+        let kept = store.redeem(&limited.id, &limited.secret, at(now)).unwrap();
+        let unlimited = CreateOpts {
+            uses: Uses::Unlimited,
+            ..CreateOpts::new(session())
+        };
+        let open = mint(&mut store, unlimited, at(now));
+        let dropped = store.redeem(&open.id, &open.secret, at(now)).unwrap();
+        let later = at(now + OFFLINE_GRACE);
+        let _ = store.end_grants(later, |_| false);
+        assert!(matches!(
+            store.admit(&limited.id, &kept.cookie, later),
+            Admit::Ready(_)
+        ));
+        assert!(matches!(
+            store.admit(&open.id, &dropped.cookie, later),
+            Admit::Refused(Refused::NotFound)
         ));
     }
 
@@ -1036,7 +1192,9 @@ mod tests {
             g.ended |= g.expires.passed(now);
         }
         for v in viewers.iter_mut() {
-            let idle = v.live.is_none() && v.offline_since + OFFLINE_GRACE <= now.mono;
+            let idle = grants[v.grant].allowed.is_none()
+                && v.live.is_none()
+                && v.offline_since + OFFLINE_GRACE <= now.mono;
             if grants[v.grant].ended || idle {
                 v.gone = true;
                 v.live = None;
@@ -1106,7 +1264,7 @@ mod tests {
                                 v.live = Some(a.live);
                             }
                             Admit::Busy(l) => {
-                                prop_assert!(may);
+                                prop_assert!(may && v.admits.len() < ADMIT_BURST);
                                 prop_assert_eq!(v.live.as_ref().map(Live::stream), Some(l.stream()));
                             }
                             Admit::Refused(Refused::Throttled) => prop_assert!(may && v.admits.len() >= ADMIT_BURST),

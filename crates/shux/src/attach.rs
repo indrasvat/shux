@@ -506,20 +506,29 @@ async fn handle_attach_connection(
         onboarding,
         daemon_start,
     };
-    serve_connection(stream, deps, cancel, Scope::Hello).await
+    serve_connection(stream, deps, cancel, Scope::Hello, None).await
 }
 
 /// The share gateway's attach (#297): read-only and plain to exactly
 /// `session` whatever its hello names, without a status bar, and with no way
 /// to write to a pane: this connection never holds a [`PtyWrite`]. It reports
 /// each size it draws at with [`AttachServerFrame::Resized`] before the frame.
+/// `on_remove` runs if `client detach` removes it, before it hears.
 pub async fn serve_read_only(
     stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
     deps: AttachDeps,
     session: SessionId,
     cancel: CancellationToken,
+    on_remove: Box<dyn FnOnce() + Send>,
 ) -> anyhow::Result<()> {
-    serve_connection(stream, deps, cancel, Scope::Browser(session)).await
+    serve_connection(
+        stream,
+        deps,
+        cancel,
+        Scope::Browser(session),
+        Some(on_remove),
+    )
+    .await
 }
 
 async fn serve_connection(
@@ -527,6 +536,7 @@ async fn serve_connection(
     deps: AttachDeps,
     cancel: CancellationToken,
     scope: Scope,
+    on_remove: Option<Box<dyn FnOnce() + Send>>,
 ) -> anyhow::Result<()> {
     let AttachDeps {
         graph,
@@ -668,7 +678,7 @@ async fn serve_connection(
     let removed = CancellationToken::new();
     let (cols, rows) = clamp_client_dims(hello.cols, hello.rows);
     let clients = io_state.lock().await.clients.clone();
-    let registered = clients.register(
+    let registered = clients.register_with_removal(
         crate::clients::ClientInfo {
             id: shux_core::event::ClientId::new(),
             session_id: session.session_id,
@@ -679,6 +689,7 @@ async fn serve_connection(
             last_input: None,
         },
         removed.clone(),
+        on_remove,
     );
     // Panes take the driver's size: this client's only if it is the first.
     // A watcher never sizes, so it never starts a sizing pass either.
@@ -2042,7 +2053,10 @@ async fn run_render_loop(
         (io.render_pulse.subscribe(), io.clients.clone())
     };
     let (mut cols, mut rows) = *client_size.lock().await;
-    let browser = session.lock().await.browser;
+    let (browser, session_id) = {
+        let s = session.lock().await;
+        (s.browser, s.session_id)
+    };
     let bar_rows = if browser { 0 } else { STATUS_BAR_ROWS };
     let initial = config.current();
     let initial_theme = shux_core::theme::Theme::resolve(&initial.theme);
@@ -2096,6 +2110,7 @@ async fn run_render_loop(
     // A driver handoff at the same size moves no pane, but changes this
     // client's status bar.
     let mut registry = clients.presence();
+    let mut presence_due: Option<tokio::time::Instant> = None;
     let mut peers: Option<Vec<(shux_core::event::ClientId, bool)>> = None;
     let own_redraw = session.lock().await.redraw.clone();
     let mut peer_toast: Option<PeerToast> = None;
@@ -2123,23 +2138,27 @@ async fn run_render_loop(
         tokio::select! {
             _ = cancel.cancelled() => break,
             () = latch => {}
-            changed = registry.changed() => {
+            // Peers coming and going redraw this client at most so often, a
+            // viewer reconnecting in a loop included; the wait is a deadline,
+            // so output and keys draw meanwhile. A browser shows no peers.
+            changed = registry.changed(), if !browser => {
                 if changed.is_err() {
                     break;
                 }
-                // Peers coming and going redraw this client at most so often:
-                // a viewer reconnecting in a loop must not repaint the host.
                 if let Some(next) = last_frame.map(|at| at + PRESENCE_REDRAW)
                     && next > tokio::time::Instant::now()
                 {
-                    #[expect(clippy::disallowed_methods, reason = "paces frames; never synchronises a test")]
-                    let pace = tokio::time::sleep_until(next);
-                    tokio::select! {
-                        _ = cancel.cancelled() => break,
-                        _ = pace => {}
-                    }
+                    presence_due.get_or_insert(next);
+                    continue;
                 }
             }
+            () = async {
+                match presence_due {
+                    #[expect(clippy::disallowed_methods, reason = "paces frames; never synchronises a test")]
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            } => {}
             changed = pulse.changed() => {
                 // Unreachable while `PaneIoState` lives; never spin on it.
                 if changed.is_err() {
@@ -2186,11 +2205,25 @@ async fn run_render_loop(
         // For the wait after the frame that finds it: a frame not drawn (its
         // window gone) must not leave a past deadline waking this at once.
         latch_at = None;
+        presence_due = None;
         last_frame = Some(tokio::time::Instant::now());
 
+        // A browser watching a session nothing sizes draws its panes whole,
+        // with the tree and grid that fit them as they are now.
+        let hostless = if browser {
+            let snap = graph.snapshot();
+            let state = io_state.lock().await;
+            let border = BorderStyle::parse(&last_border_style);
+            crate::snapshot::hostless_frame(&snap, &state, session_id, border)
+        } else {
+            None
+        };
         // Resize from authoritative client_size, NOT from VT grid (which
         // would create a self-feeding shrink loop in split mode).
-        let (new_cols, new_rows) = *client_size.lock().await;
+        let (new_cols, new_rows) = match &hostless {
+            Some((_, size)) => *size,
+            None => *client_size.lock().await,
+        };
         if (new_cols, new_rows) != (cols, rows) {
             cols = new_cols;
             rows = new_rows;
@@ -2285,8 +2318,9 @@ async fn run_render_loop(
                 vt_refs.insert(pid, vt);
             }
         }
+        let tree = hostless.as_ref().map_or(&win.layout.tree, |(tree, _)| tree);
         let mut geometry = shux_ui::prepare_frame(&shux_ui::FrameInputs {
-            layout: &win.layout.tree,
+            layout: tree,
             zoom: win.layout.zoom.as_ref(),
             cols,
             rows,
@@ -2491,7 +2525,7 @@ async fn run_render_loop(
         // toast layer below.
 
         let frame = MultiPaneFrame {
-            layout: &win.layout.tree,
+            layout: tree,
             zoom: win.layout.zoom.as_ref(),
             focused: attached.active_pane_id,
             vts: &vt_refs,

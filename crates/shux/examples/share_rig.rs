@@ -30,7 +30,7 @@ async fn main() -> anyhow::Result<()> {
         let field = |k: &str| req[k].as_str().unwrap_or_default().to_string();
         let reply = match req["op"].as_str() {
             Some("origin") => {
-                gw.set_origin(Origin::parse(&field("origin"))?).await;
+                gw.set_origin(Origin::parse(&field("origin"))?).await?;
                 json!({ "ok": true })
             }
             Some("create") => {
@@ -57,10 +57,7 @@ async fn main() -> anyhow::Result<()> {
                     "viewers": g.viewers.iter().map(|v| json!({ "id": v.id.as_str(), "connected": v.connected })).collect::<Vec<_>>(),
                 }))
                 .collect::<Vec<_>>()),
-            Some("stop") => {
-                gw.stop().await;
-                json!({ "ok": true })
-            }
+            Some("stop") => json!({ "ok": gw.stop().await.is_ok() }),
             Some("quit") => break,
             _ => json!({ "error": "unknown op" }),
         };

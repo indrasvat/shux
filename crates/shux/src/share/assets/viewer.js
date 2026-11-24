@@ -37,7 +37,16 @@ let term = null;
 let ws = null;
 let max = { cols: 240, rows: 100 };
 let expiresAt = null;
+// The same moment on this page's monotonic clock, which a changed system
+// clock cannot move.
+let deadline = null;
 let retries = 0;
+
+// Counted down from the server's remaining time: this clock may be off.
+function setExpiry(remainingMs) {
+  expiresAt = new Date(Date.now() + remainingMs);
+  deadline = performance.now() + remainingMs;
+}
 
 function setState(text, bad = false) {
   const el = $("#state");
@@ -132,8 +141,7 @@ function onText(m) {
   switch (m.t) {
     case "ready":
       max = m.max;
-      // Counted down from the server's remaining time: this clock may be off.
-      expiresAt = new Date(Date.now() + m.expires_in_ms);
+      setExpiry(m.expires_in_ms);
       applyPalette(m.palette);
       $("#session").textContent = m.session;
       showExpiry();
@@ -177,7 +185,7 @@ async function status() {
   try {
     const r = await fetch(`/v/${id}/status`, { cache: "no-store", credentials: "same-origin" });
     if (!r.ok) return false;
-    expiresAt = new Date((await r.json()).expires_at);
+    setExpiry((await r.json()).expires_in_ms);
     return true;
   } catch {
     return null;
@@ -209,30 +217,45 @@ async function connect() {
 
 async function reconnectOrEnd(reason) {
   if (FINAL[reason]) return end(FINAL[reason]);
-  if (expiresAt && expiresAt <= new Date()) return end(FINAL.expired);
+  if (deadline !== null && deadline <= performance.now()) return end(FINAL.expired);
   if (retries >= MAX_RETRIES) return end("The connection to the session was lost.");
   retries += 1;
   view.phase = "waiting";
   setState("reconnecting…", true);
   await new Promise((ok) => setTimeout(ok, 250 * 2 ** (retries - 1)));
-  // The socket cannot say why it failed; the status can.
+  // The socket cannot say why it failed; the status can. An unreachable
+  // server is one more retry, not an ending.
   const ok = await status();
   if (ok === false) return end("This link has ended.");
+  if (ok === null) return reconnectOrEnd("");
   connect();
+}
+
+// The button comes back, the secret kept, after a failure that spent no use.
+function retryWatch(message) {
+  setState(message, true);
+  $("#watch").disabled = false;
+  $("#watch").addEventListener("click", redeem, { once: true });
 }
 
 async function redeem() {
   $("#watch").disabled = true;
-  const r = await fetch(`/v/${id}/redeem`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ secret }),
-    credentials: "same-origin",
-    cache: "no-store",
-  });
+  let r;
+  try {
+    r = await fetch(`/v/${id}/redeem`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ secret }),
+      credentials: "same-origin",
+      cache: "no-store",
+    });
+  } catch {
+    return retryWatch("could not reach the session; try again");
+  }
+  if (r.status === 429 || r.status === 503) return retryWatch("busy; try again shortly");
   secret = null;
   if (r.ok) {
-    expiresAt = new Date((await r.json()).expires_at);
+    setExpiry((await r.json()).expires_in_ms);
     connect();
   } else {
     end(r.status === 410 ? "This link has already been used, or has ended." : "This link is not valid.");
@@ -248,8 +271,11 @@ async function boot() {
     $("#gate").hidden = false;
     return;
   }
-  // A reload: this browser's credential, if it still has one.
-  if (await status()) connect();
+  // A reload: this browser's credential, if it still has one. An
+  // unreachable server is retried like any lost connection.
+  const ok = await status();
+  if (ok) connect();
+  else if (ok === null) reconnectOrEnd("");
   else end("This link has ended, or was opened in another browser.");
 }
 

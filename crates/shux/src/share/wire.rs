@@ -138,9 +138,23 @@ pub enum Queued {
 #[derive(Debug, Default)]
 pub struct Credit {
     queue: VecDeque<Queued>,
+    /// Where each sent, unacknowledged chunk ends.
+    chunk_ends: VecDeque<u64>,
     queued_bytes: usize,
     sent: u64,
     acked: u64,
+}
+
+/// What an acknowledgement did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ack {
+    /// Nothing new.
+    Duplicate,
+    /// Moved, within a chunk.
+    Partial,
+    /// Completed at least one sent chunk: the one ack per chunk a browser
+    /// owes, which no rate limit counts.
+    Chunk,
 }
 
 impl Credit {
@@ -196,21 +210,29 @@ impl Credit {
                 out.extend_from_slice(&self.sent.to_be_bytes());
                 out.extend_from_slice(&chunk);
                 self.sent += chunk.len() as u64;
+                self.chunk_ends.push_back(self.sent);
                 self.queued_bytes -= chunk.len();
                 Some(Queued::Bytes(out))
             }
         }
     }
 
-    /// Records an acknowledgement: whether it moved, or `None` for one past
-    /// what was sent or before the last.
-    pub fn ack(&mut self, offset: u64) -> Option<bool> {
+    /// Records an acknowledgement, or `None` for one past what was sent or
+    /// before the last.
+    pub fn ack(&mut self, offset: u64) -> Option<Ack> {
         if offset > self.sent || offset < self.acked {
             return None;
         }
-        let moved = offset > self.acked;
+        if offset == self.acked {
+            return Some(Ack::Duplicate);
+        }
         self.acked = offset;
-        Some(moved)
+        let mut ack = Ack::Partial;
+        while self.chunk_ends.front().is_some_and(|&end| end <= offset) {
+            self.chunk_ends.pop_front();
+            ack = Ack::Chunk;
+        }
+        Some(ack)
     }
 }
 
@@ -266,7 +288,7 @@ mod tests {
             assert!(b.len() - 8 <= CHUNK);
         }
         assert!(credit.pop().is_none(), "sent past the window");
-        assert_eq!(credit.ack(CHUNK as u64), Some(true));
+        assert_eq!(credit.ack(CHUNK as u64), Some(Ack::Chunk));
         let Some(Queued::Bytes(next)) = credit.pop() else {
             panic!("an ack opened no credit");
         };
@@ -299,9 +321,10 @@ mod tests {
         assert!(credit.push_bytes(b"abc"));
         drain(&mut credit);
         assert_eq!(credit.ack(4), None);
-        assert_eq!(credit.ack(2), Some(true));
+        assert_eq!(credit.ack(2), Some(Ack::Partial));
         assert_eq!(credit.ack(1), None);
-        assert_eq!(credit.ack(2), Some(false));
+        assert_eq!(credit.ack(2), Some(Ack::Duplicate));
+        assert_eq!(credit.ack(3), Some(Ack::Chunk));
     }
 
     proptest! {

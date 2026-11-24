@@ -541,7 +541,9 @@ impl Teardown {
     /// End every share viewer, then reap every pane and every plugin, side
     /// by side.
     pub(crate) async fn drain(self) {
-        self.share.stop().await;
+        if let Err(e) = self.share.stop().await {
+            tracing::warn!(error = %e, "share gateway stop");
+        }
         tokio::join!(shutdown_all_pane_io(self.io_state), self.plugins.shutdown());
     }
 }

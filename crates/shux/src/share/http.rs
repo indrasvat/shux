@@ -5,6 +5,8 @@
 //! request it cannot parse itself, with a bare 400 or 431 that bypasses them.)
 
 use std::collections::VecDeque;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use axum::Router;
@@ -18,16 +20,18 @@ use axum::routing::{get, post};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio_util::sync::CancellationToken;
 
-use super::grants::{Admit, GrantId, Now, Refused};
+use super::grants::{Admit, GrantId, Refused};
 use super::{Gateway, Origin, StreamGuard, TEARDOWN, rfc3339};
 
-/// HTTP connections open at once. At the cap, the oldest is closed for the
-/// newest: silent sockets age out first, and a request that is answered at
-/// once is never the oldest for long.
+/// HTTP connections open at once. At the cap, the oldest whose request has
+/// no answer yet is closed for the newest; one being answered (a response
+/// on its way, an upgrade) never is. Each connection serves one request.
 const MAX_CONNECTIONS: usize = 64;
 const HEADER_READ: Duration = Duration::from_secs(10);
-/// A connection's whole life before it upgrades, a slow body included.
+/// A connection's life until its request is answered, a slow body
+/// included; and its whole life once it is, a slow download included.
 const CONN_DEADLINE: Duration = Duration::from_secs(10);
+const ANSWERED_DEADLINE: Duration = Duration::from_secs(60);
 /// The pause after an accept fails for want of a resource, not a peer.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 const MAX_BODY: usize = 512;
@@ -90,6 +94,35 @@ fn one_peer(e: &std::io::Error) -> bool {
     )
 }
 
+/// Set once a connection's request has an answer: from then on it is never
+/// evicted, and has [`ANSWERED_DEADLINE`] to take it.
+#[derive(Clone, Default)]
+struct Answered(Arc<AtomicBool>);
+
+struct Conn {
+    handle: tokio::task::AbortHandle,
+    answered: Answered,
+}
+
+/// Room for one more connection at the cap: the oldest still waiting on its
+/// own request makes way. False when every one is being answered.
+fn make_room(open: &mut VecDeque<Conn>) -> bool {
+    open.retain(|c| !c.handle.is_finished());
+    if open.len() < MAX_CONNECTIONS {
+        return true;
+    }
+    let Some(i) = open
+        .iter()
+        .position(|c| !c.answered.0.load(Ordering::Relaxed))
+    else {
+        return false;
+    };
+    if let Some(c) = open.remove(i) {
+        c.handle.abort();
+    }
+    true
+}
+
 pub(super) async fn serve(
     listener: tokio::net::TcpListener,
     gw: Gateway,
@@ -97,7 +130,7 @@ pub(super) async fn serve(
 ) {
     let app = router(gw);
     let mut conns = tokio::task::JoinSet::new();
-    let mut open: VecDeque<tokio::task::AbortHandle> = VecDeque::new();
+    let mut open: VecDeque<Conn> = VecDeque::new();
     loop {
         let accepted = tokio::select! {
             () = cancel.cancelled() => break,
@@ -120,26 +153,40 @@ pub(super) async fn serve(
                 }
             }
         };
-        open.retain(|h| !h.is_finished());
-        if open.len() >= MAX_CONNECTIONS
-            && let Some(oldest) = open.pop_front()
-        {
-            oldest.abort();
+        if !make_room(&mut open) {
+            // Every connection is being answered: this one is refused.
+            continue;
         }
-        let service = hyper_util::service::TowerToHyperService::new(app.clone());
+        let answered = Answered::default();
+        let service = hyper_util::service::TowerToHyperService::new(
+            app.clone().layer(axum::Extension(answered.clone())),
+        );
         let cancel = cancel.clone();
+        let flag = answered.clone();
         let handle = conns.spawn(async move {
             let conn = hyper::server::conn::http1::Builder::new()
+                .keep_alive(false)
                 .timer(TokioTimer::new())
                 .header_read_timeout(HEADER_READ)
                 .serve_connection(TokioIo::new(tcp), service)
                 .with_upgrades();
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "a connection's own deadline; never synchronises a test"
+            )]
+            let deadline = async {
+                tokio::time::sleep(CONN_DEADLINE).await;
+                if flag.0.load(Ordering::Relaxed) {
+                    tokio::time::sleep(ANSWERED_DEADLINE - CONN_DEADLINE).await;
+                }
+            };
             tokio::select! {
                 () = cancel.cancelled() => {}
-                _ = tokio::time::timeout(CONN_DEADLINE, conn) => {}
+                _ = conn => {}
+                () = deadline => {}
             }
         });
-        open.push_back(handle);
+        open.push_back(Conn { handle, answered });
     }
     conns.shutdown().await;
 }
@@ -155,7 +202,18 @@ fn router(gw: Gateway) -> Router {
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .layer(axum::middleware::from_fn_with_state(gw.clone(), authority))
         .layer(axum::middleware::map_response(harden))
+        .layer(axum::middleware::from_fn(answer))
         .with_state(gw)
+}
+
+/// Marks the connection answered once its request has a response.
+async fn answer(req: Request, next: Next) -> Response {
+    let answered = req.extensions().get::<Answered>().cloned();
+    let res = next.run(req).await;
+    if let Some(a) = answered {
+        a.0.store(true, Ordering::Relaxed);
+    }
+    res
 }
 
 /// An absolute-form request names its own authority: only the origin's.
@@ -163,7 +221,7 @@ async fn authority(State(gw): State<Gateway>, req: Request, next: Next) -> Respo
     if let Some(named) = req.uri().authority()
         && gw
             .origin()
-            .is_none_or(|o| !named.as_str().eq_ignore_ascii_case(o.host()))
+            .is_none_or(|(o, _)| !named.as_str().eq_ignore_ascii_case(o.host()))
     {
         return not_found();
     }
@@ -215,15 +273,23 @@ fn one(headers: &HeaderMap, name: header::HeaderName) -> Option<&str> {
     all.next().is_none().then(|| first.to_str().ok()).flatten()
 }
 
-/// The public origin, when the request names it exactly as its `Host`.
-fn host_ok(gw: &Gateway, headers: &HeaderMap) -> Option<Origin> {
-    let origin = gw.origin()?;
+/// The public origin and its generation, when the request names that origin
+/// exactly as its `Host`.
+fn host_ok(gw: &Gateway, headers: &HeaderMap) -> Option<(Origin, u64)> {
+    let (origin, generation) = gw.origin()?;
     let host = one(headers, header::HOST)?;
-    host.eq_ignore_ascii_case(origin.host()).then_some(origin)
+    host.eq_ignore_ascii_case(origin.host())
+        .then_some((origin, generation))
 }
 
 fn origin_ok(origin: &Origin, headers: &HeaderMap) -> bool {
     one(headers, header::ORIGIN).is_some_and(|o| o == origin.as_str())
+}
+
+/// Who is asking, for the failed-redemption limit: the address the tunnel
+/// saw, or the loopback peer when no tunnel says.
+fn client(headers: &HeaderMap) -> &str {
+    one(headers, header::HeaderName::from_static("cf-connecting-ip")).unwrap_or("direct")
 }
 
 /// The value of this link's viewer cookie, if the request carries exactly one.
@@ -284,7 +350,7 @@ async fn redeem(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let Some(origin) = host_ok(&gw, &headers) else {
+    let Some((origin, generation)) = host_ok(&gw, &headers) else {
         return not_found();
     };
     let Some(id) = GrantId::parse(&id) else {
@@ -308,20 +374,22 @@ async fn redeem(
             serde_json::json!({"error": "body"}),
         );
     };
-    gw.prune();
-    let now = Now::current();
-    let redeemed = gw.store().redeem(&id, &secret, now);
-    match redeemed {
+    match gw.redeem(client(&headers), generation, &id, &secret) {
         Ok(r) => {
-            let max_age = r.expires.mono.saturating_duration_since(now.mono).as_secs();
+            let now = gw.now();
             let set = format!(
-                "{}={}; Max-Age={max_age}; Path=/; Secure; HttpOnly; SameSite=Strict",
+                "{}={}; Max-Age={}; Path=/; Secure; HttpOnly; SameSite=Strict",
                 id.cookie_name(),
-                r.cookie
+                r.cookie,
+                r.expires.cookie_max_age(now),
             );
             let mut res = json(
                 StatusCode::OK,
-                serde_json::json!({"viewer": r.viewer.as_str(), "expires_at": rfc3339(r.expires.wall)}),
+                serde_json::json!({
+                    "viewer": r.viewer.as_str(),
+                    "expires_at": rfc3339(r.expires.wall),
+                    "expires_in_ms": r.expires.remaining_ms(now),
+                }),
             );
             // Base32, base64url, digits and ASCII punctuation: always a valid
             // header value.
@@ -343,11 +411,16 @@ async fn status(State(gw): State<Gateway>, Path(id): Path<String>, headers: Head
         return not_found();
     };
     gw.prune();
-    let ok = cookie(&headers, &id).and_then(|c| gw.store().status(&id, &c, Now::current()));
+    let now = gw.now();
+    let ok = cookie(&headers, &id).and_then(|c| gw.store().status(&id, &c, now));
     match ok {
         Some(expires) => json(
             StatusCode::OK,
-            serde_json::json!({"state": "ok", "expires_at": rfc3339(expires)}),
+            serde_json::json!({
+                "state": "ok",
+                "expires_at": rfc3339(expires.wall),
+                "expires_in_ms": expires.remaining_ms(now),
+            }),
         ),
         None => json(StatusCode::GONE, serde_json::json!({"state": "ended"})),
     }
@@ -359,7 +432,7 @@ async fn stream(
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    let Some(origin) = host_ok(&gw, &headers) else {
+    let Some((origin, generation)) = host_ok(&gw, &headers) else {
         return not_found();
     };
     let Some(id) = GrantId::parse(&id) else {
@@ -373,10 +446,10 @@ async fn stream(
     };
     gw.prune();
     // One stream per credential: a reconnect replaces the old stream once
-    // its socket is gone, so the two never overlap.
+    // its socket is gone, so the two never overlap, and takes over its slot.
+    let mut carried = None;
     let admitted = loop {
-        let admit = gw.store().admit(&id, &cookie, Now::current());
-        match admit {
+        match gw.admit(generation, &id, &cookie) {
             Admit::Ready(a) => break a,
             Admit::Busy(old) => {
                 old.end(super::EndReason::Replaced);
@@ -386,6 +459,8 @@ async fn stream(
                 {
                     return StatusCode::SERVICE_UNAVAILABLE.into_response();
                 }
+                let viewer = old_viewer(&cookie);
+                carried = viewer.and_then(|v| super::lock(&gw.inner.handoff).remove(&v));
             }
             Admit::Refused(Refused::Full) => {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -396,17 +471,19 @@ async fn stream(
             Admit::Refused(_) => return StatusCode::FORBIDDEN.into_response(),
         }
     };
-    // From here the guard frees what admission took, whatever happens.
-    let mut guard = StreamGuard {
+    let Some(slot) = carried.or_else(|| gw.inner.streams.clone().try_acquire_owned().ok()) else {
+        // Admitted but never started: that costs the credential nothing.
+        gw.store()
+            .refund(&admitted.viewer, admitted.live.stream(), gw.now().mono);
+        admitted.live.done().cancel();
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let guard = StreamGuard {
         gw: gw.clone(),
         viewer: admitted.viewer.clone(),
         live: admitted.live.clone(),
-        slot: None,
+        slot: Some(slot),
     };
-    let Ok(slot) = gw.inner.streams.clone().try_acquire_owned() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    guard.slot = Some(slot);
     upgrade
         .max_message_size(super::wire::MAX_INBOUND)
         .max_frame_size(super::wire::MAX_INBOUND)
@@ -415,9 +492,38 @@ async fn stream(
         .on_upgrade(move |ws| super::stream::run(ws, gw, admitted, guard))
 }
 
+/// The viewer a cookie names; whether it is that viewer's is the store's to
+/// say.
+fn old_viewer(cookie: &str) -> Option<super::ViewerId> {
+    super::ViewerId::parse(cookie.split_once('.')?.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// At the cap the oldest connection still waiting on its own request
+    /// makes way; one being answered never does, and with every one being
+    /// answered the newcomer is refused.
+    #[tokio::test]
+    async fn only_an_unanswered_connection_makes_way() {
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut conn = |answered: bool| {
+            let a = Answered::default();
+            a.0.store(answered, Ordering::Relaxed);
+            Conn {
+                handle: tasks.spawn(std::future::pending::<()>()),
+                answered: a,
+            }
+        };
+        let mut open: VecDeque<Conn> = (0..MAX_CONNECTIONS).map(|i| conn(i != 3)).collect();
+        assert!(make_room(&mut open));
+        assert_eq!(open.len(), MAX_CONNECTIONS - 1);
+        assert!(open.iter().all(|c| c.answered.0.load(Ordering::Relaxed)));
+        open.push_back(conn(true));
+        assert!(!make_room(&mut open), "an answered connection was evicted");
+        assert_eq!(open.len(), MAX_CONNECTIONS);
+    }
 
     #[test]
     fn the_vendored_viewer_matches_its_checksums() {

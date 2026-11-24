@@ -100,7 +100,9 @@ impl Rig {
             .listen("127.0.0.1:0".parse().unwrap())
             .await
             .expect("listen");
-        gw.set_origin(Origin::parse(ORIGIN).unwrap()).await;
+        gw.set_origin(Origin::parse(ORIGIN).unwrap())
+            .await
+            .expect("origin");
         Self {
             daemon: Some(daemon),
             gw,
@@ -1012,50 +1014,52 @@ fn a_stalled_renderer_never_holds_more_than_the_window_and_is_dropped() {
 
 #[test]
 fn kick_stop_and_expiry_end_live_viewers() {
-    let _ = dirs();
-    runtime().block_on(async {
+    let d = dirs();
+    // One thread, so the test can drive the gateway's clock.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
         let rig = Rig::start("ends").await;
-        let (session, _) = rig.session("ended", producer()).await;
+        let log = d.work.path().join("ends.log");
+        let (session, _) = rig.session("ended", recorder(&log)).await;
         let (id, secret) = rig.link(&session, |o| o.uses = Uses::Unlimited);
         let mut kicked = rig.viewer(&id, &secret, 80, 24).await;
-        assert!(kicked.draws("TICK").await);
+        assert!(kicked.draws("RECORDING").await);
         let viewer = rig.gw.list()[0].viewers[0].id.clone();
         rig.gw.kick(&viewer).await.expect("kick");
         assert_eq!(kicked.ends().await.as_deref(), Some("kicked"));
         assert_eq!(rig.gw.list()[0].viewers.len(), 0);
 
-        // A short link expires under its live viewer. On a loaded machine it
-        // may expire before the viewer is in: then a longer one is tried, so
-        // the clock bounds how long this takes, never whether it passes.
-        let mut ttl = std::time::Duration::from_secs(1);
-        let ended = loop {
-            assert!(
-                ttl <= std::time::Duration::from_secs(32),
-                "no viewer outlived its redeem"
-            );
-            let (short, secret) = rig.link(&session, |o| o.ttl = ttl);
-            ttl *= 2;
-            let r = rig.redeem(&short, &secret).await;
-            if r.status != 200 {
-                continue;
-            }
-            match Viewer::connect(rig.addr, &short, &r.cookie(&short), ORIGIN, 80, 24).await {
-                Ok(mut v) => break v.ends().await,
-                Err(_) => continue,
-            }
-        };
-        assert_eq!(ended.as_deref(), Some("expired"));
+        // A live viewer, then its link's lifetime passes on the gateway's
+        // clock: no race with real time.
+        let ttl = shux::share::grants::DEFAULT_TTL / 2;
+        let (short, short_secret) = rig.link(&session, |o| o.ttl = ttl);
+        let cookie = rig.redeem(&short, &short_secret).await.cookie(&short);
+        let mut expiring = Viewer::connect(rig.addr, &short, &cookie, ORIGIN, 80, 24)
+            .await
+            .unwrap();
+        assert!(expiring.draws("RECORDING").await);
+        tokio::time::pause();
+        tokio::time::advance(ttl).await;
+        tokio::time::resume();
+        assert_eq!(expiring.ends().await.as_deref(), Some("expired"));
+        assert_eq!(
+            upgrade(rig.addr, &short, &cookie, ORIGIN).await.err(),
+            Some(403)
+        );
 
         let mut stopped = rig.viewer(&id, &secret, 80, 24).await;
-        assert!(stopped.draws("TICK").await);
-        rig.gw.stop().await;
+        assert!(stopped.draws("RECORDING").await);
+        rig.gw.stop().await.expect("stop");
         assert_eq!(stopped.ends().await.as_deref(), Some("stopped"));
         assert!(rig.gw.list().is_empty());
         assert!(
             TcpStream::connect(rig.addr).await.is_err(),
             "the listener outlived stop"
         );
-        rig.gw.stop().await;
+        rig.gw.stop().await.expect("stop");
         rig.stop().await;
     });
 }
@@ -1070,7 +1074,10 @@ fn frame(op: u8, payload: &[u8]) -> Vec<u8> {
 
 /// A WebSocket upgrade by hand, so a test can write frames no browser would.
 async fn raw_upgrade(addr: SocketAddr, id: &GrantId, cookie: &str) -> TcpStream {
-    let mut tcp = TcpStream::connect(addr).await.expect("connect");
+    raw_upgrade_on(TcpStream::connect(addr).await.expect("connect"), id, cookie).await
+}
+
+async fn raw_upgrade_on(mut tcp: TcpStream, id: &GrantId, cookie: &str) -> TcpStream {
     let req = format!(
         "GET /v/{}/ws HTTP/1.1\r\nHost: {HOST}\r\nOrigin: {ORIGIN}\r\nCookie: {cookie}\r\n\
          Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\
@@ -1095,7 +1102,7 @@ async fn raw_upgrade(addr: SocketAddr, id: &GrantId, cookie: &str) -> TcpStream 
 }
 
 #[test]
-fn a_viewer_that_never_reads_its_pongs_is_dropped_not_buffered() {
+fn an_excessive_ping_sender_is_disconnected() {
     let d = dirs();
     runtime().block_on(async {
         let rig = Rig::start("pongs").await;
@@ -1294,6 +1301,14 @@ fn requests_that_never_finish_their_body_cannot_hold_every_connection() {
             try_status(addr, "/v/abcdefgh").await == Some(200)
         })
         .await;
+        // Answered while the stalled requests still hold their places: one
+        // was closed to make room, not all of them by their deadline.
+        let mut buf = [0u8; 1];
+        let open = held
+            .iter()
+            .filter(|t| matches!(t.try_read(&mut buf), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock))
+            .count();
+        assert!(open >= 60, "only {open} of 64 stalled requests were still open");
         drop(held);
         rig.stop().await;
     });
@@ -1436,6 +1451,231 @@ fn an_absolute_form_request_for_another_authority_is_not_served() {
         let path = format!("http://evil.test/v/{}", id.as_str());
         let r = http(rig.addr, "GET", &path, &[("Host", HOST)], "").await;
         assert_eq!(r.status, 404, "served a request for evil.test");
+        rig.stop().await;
+    });
+}
+
+/// What a server's frames carried: the binary payload of every complete
+/// frame (offset prefix excluded), and its text frames.
+fn parse_frames(raw: &[u8]) -> (u64, Vec<String>) {
+    let (mut at, mut payload, mut texts) = (0usize, 0u64, Vec::new());
+    while let Some(&[b0, b1]) = raw.get(at..at + 2) {
+        let (mut len, mut head) = (u64::from(b1 & 0x7f), 2usize);
+        if len == 126 {
+            let Some(l) = raw.get(at + 2..at + 4) else {
+                break;
+            };
+            len = u64::from(u16::from_be_bytes(l.try_into().unwrap()));
+            head = 4;
+        } else if len == 127 {
+            let Some(l) = raw.get(at + 2..at + 10) else {
+                break;
+            };
+            len = u64::from_be_bytes(l.try_into().unwrap());
+            head = 10;
+        }
+        let end = at + head + usize::try_from(len).unwrap();
+        let Some(body) = raw.get(at + head..end) else {
+            break;
+        };
+        match b0 & 0x0f {
+            0x2 => payload += len - 8,
+            0x1 => texts.push(String::from_utf8_lossy(body).to_string()),
+            _ => {}
+        }
+        at = end;
+    }
+    (payload, texts)
+}
+
+#[test]
+fn a_revoked_viewer_gets_no_terminal_bytes_past_the_cutoff() {
+    let _ = dirs();
+    runtime().block_on(async {
+        let rig = Rig::start("cutoff").await;
+        let flood = serde_json::json!([
+            "sh",
+            "-c",
+            "i=0; while :; do i=$((i+1)); printf \"\\033[3%dmTICK %s %0200d\\033[0m\\n\" $((i%7+1)) $i 0; done"
+        ]);
+        let (session, _) = rig.session("cutoff", flood).await;
+        let mut host = Host::attach(&rig, "cutoff", 240, 101).await;
+        host.draws("TICK").await;
+        let (id, secret) = rig.link(&session, |_| {});
+        let cookie = rig.redeem(&id, &secret).await.cookie(&id);
+        // A viewer whose socket holds almost nothing and which reads nothing:
+        // the origin's write blocks partway through a chunk.
+        let sock = tokio::net::TcpSocket::new_v4().expect("socket");
+        sock.set_recv_buffer_size(4096).expect("rcvbuf");
+        let tcp = sock.connect(rig.addr).await.expect("connect");
+        let mut tcp = raw_upgrade_on(tcp, &id, &cookie).await;
+        tcp.write_all(&frame(0x1, br#"{"t":"hello","cols":240,"rows":100}"#))
+            .await
+            .expect("hello");
+        // Stuck: what the origin has fully sent holds still while the pane
+        // keeps printing and the host keeps drawing it. A full window held
+        // back is credit, not a blocked write: acknowledge it (unread) until
+        // the origin stops short of the window, its write blocked on the
+        // socket.
+        let mut acked = 0;
+        let cut = loop {
+            let before = rig.gw.bytes_sent();
+            let seen = host.frames();
+            host.frames_past(seen + 10).await;
+            let now = rig.gw.bytes_sent();
+            if now != before || now == 0 {
+                continue;
+            }
+            if now - acked < shux::share::wire::WINDOW {
+                break now;
+            }
+            acked = now;
+            let ack = format!(r#"{{"t":"ack","offset":{acked}}}"#);
+            tcp.write_all(&frame(0x1, ack.as_bytes())).await.expect("ack");
+        };
+        // Read alongside the revoke, so anything the origin still writes
+        // gets through.
+        let reader = tokio::spawn(async move {
+            let mut raw = Vec::new();
+            let _ = tokio::time::timeout(BUDGET, tcp.read_to_end(&mut raw)).await;
+            raw
+        });
+        rig.gw.revoke(&id).await.expect("revoke");
+        let raw = reader.await.expect("reader");
+        let (payload, _) = parse_frames(&raw);
+        assert!(
+            payload <= cut,
+            "{payload} terminal bytes reached the viewer; the origin had sent {cut} before the cutoff"
+        );
+        rig.stop().await;
+    });
+}
+
+#[test]
+fn administrative_detach_invalidates_the_browser_credential() {
+    let _ = dirs();
+    runtime().block_on(async {
+        let rig = Rig::start("adm-detach").await;
+        let (session, _) = rig.session("adm-detach", producer()).await;
+        let (id, secret) = rig.link(&session, |_| {});
+        let cookie = rig.redeem(&id, &secret).await.cookie(&id);
+        let mut viewer = Viewer::connect(rig.addr, &id, &cookie, ORIGIN, 80, 24)
+            .await
+            .unwrap();
+        assert!(viewer.draws("TICK").await);
+        let listed = rig.rpc("client.list", serde_json::json!({})).await;
+        let clients = listed["clients"].as_array().unwrap();
+        assert_eq!(clients.len(), 1);
+        assert_eq!(clients[0]["read_only"], true);
+        rig.rpc(
+            "client.detach",
+            serde_json::json!({ "id": clients[0]["id"] }),
+        )
+        .await;
+        // Refused the moment the registry lets it go.
+        assert_eq!(
+            upgrade(rig.addr, &id, &cookie, ORIGIN).await.err(),
+            Some(403)
+        );
+        let status = http(
+            rig.addr,
+            "GET",
+            &format!("/v/{}/status", id.as_str()),
+            &[("Host", HOST), ("Cookie", &cookie)],
+            "",
+        )
+        .await;
+        assert_eq!(status.status, 410);
+        assert_eq!(viewer.ends().await.as_deref(), Some("kicked"));
+        rig.stop().await;
+    });
+}
+
+#[test]
+fn a_hostless_split_shows_each_pane_whole() {
+    let _ = dirs();
+    runtime().block_on(async {
+        let rig = Rig::start("hostless-split").await;
+        let wide = serde_json::json!(["sh", "-c", "printf '%090dEDGE%sA\\n' 0 ''; exec cat"]);
+        let (session, left) = rig.session("split", wide).await;
+        let split = rig
+            .rpc(
+                "pane.split",
+                serde_json::json!({ "pane_id": left, "direction": "vertical", "command": ["sh", "-c", "printf 'NAR%sROW\\n' ''; exec cat"] }),
+            )
+            .await;
+        let right = split["pane"]["id"].as_str().expect("the new pane").to_string();
+        // Panes of very different widths, with nothing attached to size them.
+        for (pane, cols, rows) in [(&left, 100, 30), (&right, 30, 10)] {
+            rig.rpc(
+                "pane.set_size",
+                serde_json::json!({ "pane_id": pane, "cols": cols, "rows": rows }),
+            )
+            .await;
+        }
+        let (id, secret) = rig.link(&session, |_| {});
+        let mut v = rig.viewer(&id, &secret, 60, 20).await;
+        let host = v.ready["host"].clone();
+        v.send(serde_json::json!({ "t": "resize", "cols": host["cols"], "rows": host["rows"] }))
+            .await;
+        assert!(v.draws("NARROW").await, "the narrow pane never drew");
+        assert!(v.draws("EDGEA").await, "the wide pane was cropped");
+        rig.stop().await;
+    });
+}
+
+#[test]
+fn failed_redemptions_are_rate_limited_per_client_and_overall() {
+    let _ = dirs();
+    runtime().block_on(async {
+        let rig = Rig::start("guesses").await;
+        let (session, _) = rig.session("guessed", producer()).await;
+        let (id, secret) = rig.link(&session, |o| o.uses = Uses::Unlimited);
+        let attempt = |client: String, secret: String| {
+            let (addr, id) = (rig.addr, id.clone());
+            async move {
+                let body = serde_json::json!({ "secret": secret }).to_string();
+                http(
+                    addr,
+                    "POST",
+                    &format!("/v/{}/redeem", id.as_str()),
+                    &[
+                        ("Host", HOST),
+                        ("Origin", ORIGIN),
+                        ("Content-Type", "application/json"),
+                        ("CF-Connecting-IP", &client),
+                    ],
+                    &body,
+                )
+                .await
+                .status
+            }
+        };
+        let wrong = "A".repeat(43);
+        let mut codes = Vec::new();
+        for _ in 0..20 {
+            codes.push(attempt("192.0.2.1".into(), wrong.clone()).await);
+        }
+        assert!(codes.contains(&429), "one client guessed freely: {codes:?}");
+        assert_eq!(
+            attempt("192.0.2.1".into(), secret.clone()).await,
+            429,
+            "a client over its budget is answered without the secret being tried"
+        );
+        assert_eq!(
+            attempt("192.0.2.2".into(), secret.clone()).await,
+            200,
+            "another client is not held back"
+        );
+        // Many clients, each under its own budget, exhaust the global one.
+        let mut overall = Vec::new();
+        for n in 0..400u32 {
+            overall.push(attempt(format!("198.51.{}.{}", n / 250, n % 250), wrong.clone()).await);
+        }
+        assert!(
+            overall.contains(&429),
+            "guesses spread over clients were never limited"
+        );
         rig.stop().await;
     });
 }
