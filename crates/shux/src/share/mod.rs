@@ -173,9 +173,6 @@ pub(crate) struct Inner {
     deps: AttachDeps,
     store: StdMutex<Store>,
     streams: Arc<tokio::sync::Semaphore>,
-    /// The slot of a stream ended for its replacement, kept for that
-    /// replacement so no one else takes it meanwhile.
-    handoff: StdMutex<HashMap<ViewerId, tokio::sync::OwnedSemaphorePermit>>,
     failures: StdMutex<Failures>,
     server: Mutex<Option<Server>>,
     /// The daemon's own shutdown.
@@ -205,10 +202,10 @@ pub(crate) struct StreamGuard {
 
 impl Drop for StreamGuard {
     fn drop(&mut self) {
-        if let Some(slot) = self.slot.take()
-            && self.live.reason() == Some(EndReason::Replaced)
-        {
-            lock(&self.gw.inner.handoff).insert(self.viewer.clone(), slot);
+        // To a replacement still waiting for it; otherwise (none, or one cut
+        // off meanwhile) the slot is freed here.
+        if let (Some(slot), Some(to)) = (self.slot.take(), self.live.slot_to()) {
+            let _ = to.send(slot);
         }
         let now = self.gw.now().mono;
         self.gw
@@ -238,7 +235,6 @@ impl Gateway {
                 deps,
                 store: StdMutex::default(),
                 streams: Arc::new(tokio::sync::Semaphore::new(MAX_STREAMS)),
-                handoff: StdMutex::default(),
                 failures: StdMutex::default(),
                 server: Mutex::default(),
                 shutdown,
@@ -331,11 +327,18 @@ impl Gateway {
     /// Ends every link and viewer, refuses whatever was in flight under them,
     /// and stops serving. Idempotent.
     pub async fn stop(&self) -> Result<(), ShareError> {
+        // One deadline for the streams and the listener together.
+        let deadline = Instant::now() + TEARDOWN;
         let ended = self.store().stop();
-        let settled = settle(ended).await;
+        let settled = settle_by(ended, deadline).await;
         if let Some(server) = self.inner.server.lock().await.take() {
             server.cancel.cancel();
-            let _ = tokio::time::timeout(TEARDOWN, server.task).await;
+            if tokio::time::timeout_at(deadline, server.task)
+                .await
+                .is_err()
+            {
+                tracing::warn!("share: the listener outlived stop's deadline");
+            }
         }
         settled
     }
@@ -397,8 +400,13 @@ impl Gateway {
 /// Waits, all together and within one deadline, for each ended stream to
 /// close its socket.
 async fn settle(ended: Vec<Live>) -> Result<(), ShareError> {
+    settle_by(ended, Instant::now() + TEARDOWN).await
+}
+
+/// [`settle`], by an absolute `deadline` a caller shares with other work.
+async fn settle_by(ended: Vec<Live>, deadline: Instant) -> Result<(), ShareError> {
     let all = futures::future::join_all(ended.iter().map(|l| l.done().cancelled()));
-    if tokio::time::timeout(TEARDOWN, all).await.is_ok() {
+    if tokio::time::timeout_at(deadline, all).await.is_ok() {
         return Ok(());
     }
     let open = ended.iter().filter(|l| !l.done().is_cancelled()).count();
@@ -520,7 +528,8 @@ mod tests {
         let grants::Admit::Ready(admitted) = store.admit(&minted.id, &cookie, now) else {
             panic!("not admitted");
         };
-        admitted.live.end(EndReason::Replaced);
+        let (to, mut from) = tokio::sync::oneshot::channel();
+        admitted.live.replace(to);
         drop(StreamGuard {
             gw: gw.clone(),
             viewer: admitted.viewer.clone(),
@@ -531,7 +540,86 @@ mod tests {
             slots.clone().try_acquire_owned().is_err(),
             "the slot went to anyone"
         );
-        assert!(lock(&gw.inner.handoff).remove(&admitted.viewer).is_some());
+        assert!(from.try_recv().is_ok(), "the replacement never got it");
+    }
+
+    /// A stream ended for a replacement that never comes (its request was
+    /// cut off while it waited) gives its slot back: nothing holds it.
+    #[tokio::test]
+    async fn a_slot_kept_for_a_replacement_that_never_comes_is_freed() {
+        let gw = gateway();
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let mut store = Store::default();
+        let now = grants::Now::current();
+        let minted = store
+            .create(CreateOpts::new(shux_core::model::SessionId::new()), now)
+            .unwrap();
+        let cookie = store
+            .redeem(&minted.id, &minted.secret, now)
+            .unwrap()
+            .cookie;
+        let grants::Admit::Ready(admitted) = store.admit(&minted.id, &cookie, now) else {
+            panic!("not admitted");
+        };
+        admitted.live.end(EndReason::Replaced);
+        drop(StreamGuard {
+            gw: gw.clone(),
+            viewer: admitted.viewer.clone(),
+            live: admitted.live.clone(),
+            slot: Some(slots.clone().try_acquire_owned().unwrap()),
+        });
+        assert_eq!(slots.available_permits(), 1, "the slot outlived its stream");
+        // Nor when the replacement asked for it, then was cut off waiting.
+        store.stream_ended(&admitted.viewer, admitted.live.stream(), now.mono);
+        let grants::Admit::Ready(again) = store.admit(&minted.id, &cookie, now) else {
+            panic!("not admitted");
+        };
+        let (to, from) = tokio::sync::oneshot::channel();
+        again.live.replace(to);
+        drop(from);
+        drop(StreamGuard {
+            gw: gw.clone(),
+            viewer: again.viewer.clone(),
+            live: again.live.clone(),
+            slot: Some(slots.clone().try_acquire_owned().unwrap()),
+        });
+        assert_eq!(
+            slots.available_permits(),
+            1,
+            "the slot outlived its replacement"
+        );
+        drop(gw);
+    }
+
+    /// A stop that finds a stream which never closes and a listener which
+    /// never stops still ends at one deadline, not one each.
+    #[tokio::test(start_paused = true)]
+    async fn stop_keeps_to_one_deadline_for_streams_and_listener() {
+        let gw = gateway();
+        let now = gw.now();
+        let stuck = {
+            let mut store = gw.store();
+            let minted = store
+                .create(CreateOpts::new(shux_core::model::SessionId::new()), now)
+                .unwrap();
+            let cookie = store
+                .redeem(&minted.id, &minted.secret, now)
+                .unwrap()
+                .cookie;
+            let grants::Admit::Ready(stuck) = store.admit(&minted.id, &cookie, now) else {
+                panic!("not admitted");
+            };
+            stuck
+        };
+        *gw.inner.server.lock().await = Some(Server {
+            addr: "127.0.0.1:1".parse().unwrap(),
+            cancel: CancellationToken::new(),
+            task: tokio::spawn(std::future::pending()),
+        });
+        let started = Instant::now();
+        assert!(matches!(gw.stop().await, Err(ShareError::Teardown(1))));
+        assert_eq!(started.elapsed(), TEARDOWN);
+        drop(stuck);
     }
 
     /// A request checked before a stop is admitted to nothing after it.

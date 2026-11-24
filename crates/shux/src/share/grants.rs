@@ -230,6 +230,10 @@ impl EndReason {
     }
 }
 
+/// Where a replaced stream's slot goes: to the request replacing it, while
+/// that request still waits for it.
+pub type SlotTo = tokio::sync::oneshot::Sender<tokio::sync::OwnedSemaphorePermit>;
+
 /// One live stream of one viewer: ended through `stop`, and `done` once its
 /// socket is gone.
 #[derive(Debug, Clone)]
@@ -238,6 +242,7 @@ pub struct Live {
     stop: CancellationToken,
     reason: Arc<OnceLock<EndReason>>,
     done: CancellationToken,
+    slot_to: Arc<std::sync::Mutex<Option<SlotTo>>>,
 }
 
 impl Live {
@@ -247,7 +252,24 @@ impl Live {
             stop: CancellationToken::new(),
             reason: Arc::default(),
             done: CancellationToken::new(),
+            slot_to: Arc::default(),
         }
+    }
+    /// Ends the stream for its replacement, which takes its slot through
+    /// `to` if it is still waiting by then; if not, the slot is freed.
+    pub fn replace(&self, to: SlotTo) {
+        *self
+            .slot_to
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(to);
+        self.end(EndReason::Replaced);
+    }
+    /// The replacement waiting for this stream's slot, if any.
+    pub fn slot_to(&self) -> Option<SlotTo> {
+        self.slot_to
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
     /// Ends the stream for `why`; the first reason given stands.
     pub fn end(&self, why: EndReason) {

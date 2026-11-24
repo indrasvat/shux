@@ -2210,11 +2210,15 @@ async fn run_render_loop(
 
         // A browser watching a session nothing sizes draws its panes whole,
         // with the tree and grid that fit them as they are now.
+        // One graph snapshot for the whole frame: the tree fitted below and
+        // the window drawn through it are the same window.
+        let snap = graph.snapshot();
         let hostless = if browser {
-            let snap = graph.snapshot();
             let state = io_state.lock().await;
             let border = BorderStyle::parse(&last_border_style);
+            // Never past the grid the gateway promised the browser.
             crate::snapshot::hostless_frame(&snap, &state, session_id, border)
+                .map(|(tree, (c, r))| (tree, crate::share::wire::clamp(c, r)))
         } else {
             None
         };
@@ -2253,8 +2257,6 @@ async fn run_render_loop(
             last_copy_overlay = None;
         }
 
-        // Build a multi-pane frame snapshot.
-        let snap = graph.snapshot();
         // Show the window and pane the session shows, though another client
         // or an RPC moved them and this one has sent nothing since.
         // Drawn from this snapshot only: the input loop owns the cached

@@ -6,7 +6,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use axum::Router;
@@ -38,7 +38,18 @@ const MAX_BODY: usize = 512;
 /// What a viewer's socket may hold unsent: a little over the window's worth of
 /// chunks. A viewer whose pongs or frames pile up past it is dropped.
 const WRITE_BUFFER: usize = 64 * 1024;
-const MAX_WRITE_BUFFER: usize = super::wire::WINDOW as usize + WRITE_BUFFER;
+pub(super) const MAX_WRITE_BUFFER: usize = super::wire::WINDOW as usize + WRITE_BUFFER;
+
+/// The socket settings `stream` gives axum, for tests that drive
+/// tungstenite directly.
+#[cfg(test)]
+pub(super) fn ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(super::wire::MAX_INBOUND))
+        .max_frame_size(Some(super::wire::MAX_INBOUND))
+        .write_buffer_size(WRITE_BUFFER)
+        .max_write_buffer_size(MAX_WRITE_BUFFER)
+}
 
 const CSP: &str = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; \
     style-src 'self'; connect-src 'self'; img-src 'self'; font-src 'self'; \
@@ -94,10 +105,65 @@ fn one_peer(e: &std::io::Error) -> bool {
     )
 }
 
-/// Set once a connection's request has an answer: from then on it is never
-/// evicted, and has [`ANSWERED_DEADLINE`] to take it.
+/// Whether a connection may still be evicted. A request claims its
+/// connection before it commits anything (a redeem, an admission) and when
+/// it has an answer; eviction claims it first or not at all, so no request
+/// commits on a connection being closed. A kept connection has
+/// [`ANSWERED_DEADLINE`] to finish.
 #[derive(Clone, Default)]
-struct Answered(Arc<AtomicBool>);
+struct Answered(Arc<AtomicU8>);
+
+const OPEN: u8 = 0;
+const KEPT: u8 = 1;
+const EVICTED: u8 = 2;
+
+impl Answered {
+    /// Claims the connection; false once it has been evicted.
+    fn keep(&self) -> bool {
+        matches!(
+            self.0
+                .compare_exchange(OPEN, KEPT, Ordering::SeqCst, Ordering::SeqCst),
+            Ok(_) | Err(KEPT)
+        )
+    }
+    /// Claims it for eviction; false once a request has kept it.
+    fn evict(&self) -> bool {
+        self.0
+            .compare_exchange(OPEN, EVICTED, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+    fn kept(&self) -> bool {
+        self.0.load(Ordering::SeqCst) == KEPT
+    }
+}
+
+/// Closes a connection from outside its task: how a stream cut off before
+/// its upgrade completes takes the socket HTTP still holds.
+#[derive(Clone, Default)]
+struct Cut(CancellationToken);
+
+/// Until the stream admitted on this connection is done, its cutoff closes
+/// the connection: a revoke, kick, stop, replacement or expiry that lands
+/// while the upgrade is still pending ends it there, and no stream starts.
+fn cut_on_stop(live: &super::grants::Live, cut: Option<&axum::Extension<Cut>>) {
+    let Some(axum::Extension(Cut(cut))) = cut else {
+        return;
+    };
+    let (stop, done, cut) = (live.stop().clone(), live.done().clone(), cut.clone());
+    tokio::spawn(async move {
+        tokio::select! {
+            biased;
+            () = done.cancelled() => {}
+            () = stop.cancelled() => cut.cancel(),
+        }
+    });
+}
+
+/// A request's claim on its connection before it commits; a request with
+/// no connection behind it (none in tests) has nothing to claim.
+fn claim(conn: Option<&axum::Extension<Answered>>) -> bool {
+    conn.is_none_or(|c| c.0.keep())
+}
 
 struct Conn {
     handle: tokio::task::AbortHandle,
@@ -111,10 +177,7 @@ fn make_room(open: &mut VecDeque<Conn>) -> bool {
     if open.len() < MAX_CONNECTIONS {
         return true;
     }
-    let Some(i) = open
-        .iter()
-        .position(|c| !c.answered.0.load(Ordering::Relaxed))
-    else {
+    let Some(i) = open.iter().position(|c| c.answered.evict()) else {
         return false;
     };
     if let Some(c) = open.remove(i) {
@@ -157,9 +220,11 @@ pub(super) async fn serve(
             // Every connection is being answered: this one is refused.
             continue;
         }
-        let answered = Answered::default();
+        let (answered, cut) = (Answered::default(), Cut::default());
         let service = hyper_util::service::TowerToHyperService::new(
-            app.clone().layer(axum::Extension(answered.clone())),
+            app.clone()
+                .layer(axum::Extension(answered.clone()))
+                .layer(axum::Extension(cut.clone())),
         );
         let cancel = cancel.clone();
         let flag = answered.clone();
@@ -176,12 +241,13 @@ pub(super) async fn serve(
             )]
             let deadline = async {
                 tokio::time::sleep(CONN_DEADLINE).await;
-                if flag.0.load(Ordering::Relaxed) {
+                if flag.kept() {
                     tokio::time::sleep(ANSWERED_DEADLINE - CONN_DEADLINE).await;
                 }
             };
             tokio::select! {
                 () = cancel.cancelled() => {}
+                () = cut.0.cancelled() => {}
                 _ = conn => {}
                 () = deadline => {}
             }
@@ -211,7 +277,7 @@ async fn answer(req: Request, next: Next) -> Response {
     let answered = req.extensions().get::<Answered>().cloned();
     let res = next.run(req).await;
     if let Some(a) = answered {
-        a.0.store(true, Ordering::Relaxed);
+        a.keep();
     }
     res
 }
@@ -348,6 +414,7 @@ async fn redeem(
     State(gw): State<Gateway>,
     Path(id): Path<String>,
     headers: HeaderMap,
+    conn: Option<axum::Extension<Answered>>,
     body: Bytes,
 ) -> Response {
     let Some((origin, generation)) = host_ok(&gw, &headers) else {
@@ -374,6 +441,9 @@ async fn redeem(
             serde_json::json!({"error": "body"}),
         );
     };
+    if !claim(conn.as_ref()) {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
     match gw.redeem(client(&headers), generation, &id, &secret) {
         Ok(r) => {
             let now = gw.now();
@@ -430,6 +500,8 @@ async fn stream(
     State(gw): State<Gateway>,
     Path(id): Path<String>,
     headers: HeaderMap,
+    conn: Option<axum::Extension<Answered>>,
+    cut: Option<axum::Extension<Cut>>,
     upgrade: WebSocketUpgrade,
 ) -> Response {
     let Some((origin, generation)) = host_ok(&gw, &headers) else {
@@ -444,6 +516,9 @@ async fn stream(
     let Some(cookie) = cookie(&headers, &id) else {
         return StatusCode::FORBIDDEN.into_response();
     };
+    if !claim(conn.as_ref()) {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
     gw.prune();
     // One stream per credential: a reconnect replaces the old stream once
     // its socket is gone, so the two never overlap, and takes over its slot.
@@ -452,15 +527,17 @@ async fn stream(
         match gw.admit(generation, &id, &cookie) {
             Admit::Ready(a) => break a,
             Admit::Busy(old) => {
-                old.end(super::EndReason::Replaced);
+                // The slot comes to this request only while it waits: cut off
+                // meanwhile, it drops `from`, and the slot is freed.
+                let (to, mut from) = tokio::sync::oneshot::channel();
+                old.replace(to);
                 if tokio::time::timeout(TEARDOWN, old.done().cancelled())
                     .await
                     .is_err()
                 {
                     return StatusCode::SERVICE_UNAVAILABLE.into_response();
                 }
-                let viewer = old_viewer(&cookie);
-                carried = viewer.and_then(|v| super::lock(&gw.inner.handoff).remove(&v));
+                carried = from.try_recv().ok();
             }
             Admit::Refused(Refused::Full) => {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -484,18 +561,17 @@ async fn stream(
         live: admitted.live.clone(),
         slot: Some(slot),
     };
+    // Cut off already: no upgrade, no byte.
+    if admitted.live.stop().is_cancelled() {
+        return StatusCode::GONE.into_response();
+    }
+    cut_on_stop(&admitted.live, cut.as_ref());
     upgrade
         .max_message_size(super::wire::MAX_INBOUND)
         .max_frame_size(super::wire::MAX_INBOUND)
         .write_buffer_size(WRITE_BUFFER)
         .max_write_buffer_size(MAX_WRITE_BUFFER)
         .on_upgrade(move |ws| super::stream::run(ws, gw, admitted, guard))
-}
-
-/// The viewer a cookie names; whether it is that viewer's is the store's to
-/// say.
-fn old_viewer(cookie: &str) -> Option<super::ViewerId> {
-    super::ViewerId::parse(cookie.split_once('.')?.0)
 }
 
 #[cfg(test)]
@@ -510,7 +586,9 @@ mod tests {
         let mut tasks = tokio::task::JoinSet::new();
         let mut conn = |answered: bool| {
             let a = Answered::default();
-            a.0.store(answered, Ordering::Relaxed);
+            if answered {
+                assert!(a.keep());
+            }
             Conn {
                 handle: tasks.spawn(std::future::pending::<()>()),
                 answered: a,
@@ -519,10 +597,68 @@ mod tests {
         let mut open: VecDeque<Conn> = (0..MAX_CONNECTIONS).map(|i| conn(i != 3)).collect();
         assert!(make_room(&mut open));
         assert_eq!(open.len(), MAX_CONNECTIONS - 1);
-        assert!(open.iter().all(|c| c.answered.0.load(Ordering::Relaxed)));
+        assert!(open.iter().all(|c| c.answered.kept()));
         open.push_back(conn(true));
         assert!(!make_room(&mut open), "an answered connection was evicted");
         assert_eq!(open.len(), MAX_CONNECTIONS);
+    }
+
+    /// A request and the eviction of its connection race for one claim:
+    /// whichever takes it first wins, so a request never commits on a
+    /// connection being closed.
+    #[test]
+    fn a_request_and_its_eviction_cannot_both_win() {
+        let kept = Answered::default();
+        assert!(kept.keep());
+        assert!(!kept.evict(), "evicted a connection a request had claimed");
+        let evicted = Answered::default();
+        assert!(evicted.evict());
+        assert!(
+            !evicted.keep(),
+            "a request committed on an evicted connection"
+        );
+    }
+
+    /// A stream cut off before its upgrade completes closes the connection
+    /// HTTP still holds; one that finished first leaves it alone.
+    #[tokio::test]
+    async fn a_cutoff_before_the_upgrade_closes_its_connection() {
+        let mut store = super::super::grants::Store::default();
+        let now = super::super::grants::Now::current();
+        let minted = store
+            .create(
+                super::super::CreateOpts::new(shux_core::model::SessionId::new()),
+                now,
+            )
+            .unwrap();
+        let cookie = store
+            .redeem(&minted.id, &minted.secret, now)
+            .unwrap()
+            .cookie;
+        let Admit::Ready(cut_off) = store.admit(&minted.id, &cookie, now) else {
+            panic!("not admitted");
+        };
+        let cut = axum::Extension(Cut::default());
+        cut_on_stop(&cut_off.live, Some(&cut));
+        cut_off.live.end(super::super::EndReason::Revoked);
+        shux_testkit::wait_until_async("the connection is cut", || {
+            let c = cut.0.0.clone();
+            async move { c.is_cancelled() }
+        })
+        .await;
+        store.stream_ended(&cut_off.viewer, cut_off.live.stream(), now.mono);
+        let Admit::Ready(finished) = store.admit(&minted.id, &cookie, now) else {
+            panic!("not admitted");
+        };
+        let kept = axum::Extension(Cut::default());
+        cut_on_stop(&finished.live, Some(&kept));
+        finished.live.done().cancel();
+        finished.live.end(super::super::EndReason::Revoked);
+        tokio::task::yield_now().await;
+        assert!(
+            !kept.0.0.is_cancelled(),
+            "a finished stream cut a connection"
+        );
     }
 
     #[test]

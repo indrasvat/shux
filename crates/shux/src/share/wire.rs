@@ -328,6 +328,8 @@ mod tests {
     }
 
     proptest! {
+        // Each case moves megabytes; fewer cases keep it to seconds.
+        #![proptest_config(ProptestConfig::with_cases(32))]
         /// Whatever the pushes and acks, the chunks reassemble to exactly
         /// the bytes pushed, at contiguous offsets, never past the window.
         /// UTF-8 and escapes split across chunks are the parser's to join.

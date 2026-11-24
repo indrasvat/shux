@@ -503,17 +503,21 @@ mod tests {
         ));
     }
 
-    /// A viewer that pings and never reads: tungstenite keeps one pong
-    /// owed, not one per ping, and the idle check's flush of it ends the
-    /// viewer as lagging. Neither waits on the inbound limit.
+    /// A viewer that pings and never reads: what it is owed stops growing at
+    /// the socket's write-buffer bound (tungstenite drops pongs past it),
+    /// and the idle check's flush of it ends the viewer as lagging. Neither
+    /// waits on the inbound limit.
     #[tokio::test(start_paused = true)]
-    async fn owed_pongs_stay_one_and_a_stuck_flush_ends_the_viewer() {
+    async fn owed_pongs_stay_within_the_write_buffer_and_a_stuck_flush_ends_the_viewer() {
         use tokio::io::AsyncWriteExt as _;
         use tokio_tungstenite::tungstenite::protocol::Role;
         let (server_io, mut client_io) = tokio::io::duplex(256);
-        let mut server =
-            tokio_tungstenite::WebSocketStream::from_raw_socket(server_io, Role::Server, None)
-                .await;
+        let mut server = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            server_io,
+            Role::Server,
+            Some(super::super::http::ws_config()),
+        )
+        .await;
         let mut ping = vec![0x89, 0x80 | 125, 0, 0, 0, 0];
         ping.extend_from_slice(&[b'p'; 125]);
         // Far more pings than the pipe holds pongs: none of them read.
@@ -534,11 +538,30 @@ mod tests {
                 "owed pongs grew until reading failed"
             );
         }
-        let _held = pinger.await.expect("pinger");
+        let mut client_io = pinger.await.expect("pinger");
         assert!(matches!(
             socket_write(server.flush()).await,
             Err(Exit::Ended(EndReason::Lagging))
         ));
+        // The viewer reads at last: everything owed reaches it, and it is
+        // the pipe's worth and one more, not a pong per ping.
+        use tokio::io::AsyncReadExt as _;
+        let reader = tokio::spawn(async move {
+            let mut owed = Vec::new();
+            let _ = client_io.read_to_end(&mut owed).await;
+            owed
+        });
+        server.flush().await.expect("the owed pong drains");
+        drop(server);
+        let owed = reader.await.expect("reader");
+        let pongs = owed.chunks(127).filter(|f| f[0] == 0x8a).count();
+        assert_eq!(owed.len() % 127, 0, "pongs of 125 bytes, unmasked");
+        let bound = super::super::http::MAX_WRITE_BUFFER + 256 + 127;
+        assert!(
+            owed.len() <= bound,
+            "{pongs} pongs ({} bytes) were owed for 10000 pings; the bound is {bound}",
+            owed.len()
+        );
     }
 
     /// A write blocked on the socket yields to the cutoff at once.

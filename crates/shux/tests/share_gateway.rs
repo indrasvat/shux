@@ -1679,3 +1679,41 @@ fn failed_redemptions_are_rate_limited_per_client_and_overall() {
         rig.stop().await;
     });
 }
+
+#[test]
+fn a_hostless_view_never_outgrows_the_size_ready_promised() {
+    let _ = dirs();
+    runtime().block_on(async {
+        let rig = Rig::start("hostless-cap").await;
+        let (session, pane) = rig
+            .session(
+                "wide",
+                serde_json::json!(["sh", "-c", "printf 'WI%sDE\\n' ''; exec cat"]),
+            )
+            .await;
+        rig.rpc(
+            "pane.set_size",
+            serde_json::json!({ "pane_id": pane, "cols": 300, "rows": 120 }),
+        )
+        .await;
+        let (id, secret) = rig.link(&session, |_| {});
+        let mut v = rig.viewer(&id, &secret, 80, 24).await;
+        let max = v.ready["max"].clone();
+        let (mc, mr) = (
+            max["cols"].as_u64().unwrap() as u16,
+            max["rows"].as_u64().unwrap() as u16,
+        );
+        assert!(v.draws("WIDE").await);
+        let size = (
+            v.ready["size"]["cols"].as_u64().unwrap() as u16,
+            v.ready["size"]["rows"].as_u64().unwrap() as u16,
+        );
+        for (c, r) in std::iter::once(size).chain(v.resizes.iter().copied()) {
+            assert!(
+                c <= mc && r <= mr,
+                "a {c}x{r} grid past the promised {mc}x{mr}"
+            );
+        }
+        rig.stop().await;
+    });
+}
