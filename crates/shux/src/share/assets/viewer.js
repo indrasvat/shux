@@ -110,6 +110,9 @@ function end(message) {
   $("#watch").hidden = true;
   $("#gate").hidden = false;
   $("#sizer").hidden = true;
+  // Nothing to fit and nobody to count once it has ended.
+  $("#zoom").hidden = true;
+  $("#watching").textContent = "";
 }
 
 function screenText() {
@@ -155,7 +158,7 @@ function layout() {
   sizer.style.width = `${Math.ceil(w * scale)}px`;
   sizer.style.height = `${Math.ceil(h * scale)}px`;
   const button = $("#zoom");
-  button.hidden = readable === fit;
+  button.hidden = readable === fit || view.phase === "ended";
   button.textContent = mode === "readable" ? "Fit" : "Zoom";
   view.mode = mode;
   view.glyph = FONT.size * scale;
@@ -256,7 +259,9 @@ function onBytes(data) {
 async function status() {
   try {
     const r = await fetch(`/v/${id}/status`, { cache: "no-store", credentials: "same-origin" });
-    if (!r.ok) return false;
+    // Only the gateway's own answer says the link ended; anything else (a
+    // tunnel's 530) is the server out of reach.
+    if (!r.ok) return null;
     const j = await r.json();
     if (j.state !== "ok") {
       endedWhy = j.reason;

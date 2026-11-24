@@ -8,19 +8,33 @@
   color-scheme: dark;
 }
 * { box-sizing: border-box; }
-/* Only the stage scrolls: a page that scrolls carries the bar off-screen. */
-html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); color: var(--fg); }
+/* The page is pinned to the screen and only the stage scrolls: a document
+   that scrolls or widens takes the bar under the status bar and off-screen. */
+html, body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--fg);
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
 body {
+  position: fixed;
+  inset: 0;
   display: flex;
   flex-direction: column;
   font: 13px/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
 }
+/* iOS zooms the page in on focusing a field under 16px: the terminal's input
+   elements are focused, never typed into, and must not zoom. */
+#term, #term textarea { font-size: 16px; }
 #bar {
   flex: none;
   display: flex;
   gap: 0.5em;
   align-items: center;
-  padding: max(6px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right)) 6px
+  padding: max(8px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right)) 8px
     max(12px, env(safe-area-inset-left));
   background: var(--bar);
   color: var(--bar-text);
@@ -31,12 +45,12 @@ body {
 #bar > * { flex: none; }
 #bar .mark, #bar .ro { color: var(--shared); font-weight: 600; }
 #bar .sep, #expiry { color: var(--muted); }
-#session, #expiry { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-#session { font-weight: 600; }
-#expiry { flex-shrink: 8; }
+#session { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; font-weight: 600; }
 #bar #watching { color: var(--muted); }
-#watching:empty { display: none; }
-/* The count goes before the Fit button ever would. */
+#expiry:empty, #watching:empty { display: none; }
+/* Narrow, the expiry goes (the first page said it), then the count: never
+   the state or the Fit button. */
+@media (max-width: 480px) { #expiry { display: none; } }
 @media (max-width: 360px) { #watching { display: none; } }
 #state { margin-left: auto; color: var(--muted); }
 #state.bad { color: var(--shared); }
@@ -95,6 +109,7 @@ body {
   color: var(--bar-text);
   border: 1px solid var(--muted);
   pointer-events: none;
+  z-index: 1;
 }
 #toast[hidden] { display: none; }
 #watch {

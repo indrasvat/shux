@@ -49,6 +49,9 @@ const CLIENT_FAILURES: usize = 10;
 const ALL_FAILURES: usize = 300;
 const FAILURE_WINDOW: Duration = Duration::from_secs(60);
 const MAX_TRACKED_CLIENTS: usize = 4096;
+/// How long a tunnel no guest can reach stays up: long enough for the last
+/// frames to leave cloudflared, and for a guest's page to ask why it ended.
+const LINGER: Duration = Duration::from_secs(5);
 /// How often a live share looks for sessions that were deleted under it.
 const SESSION_CHECK: Duration = Duration::from_secs(2);
 /// The most `share.*` events held for announcing; past it the oldest go.
@@ -646,13 +649,18 @@ impl Gateway {
     /// Keeps generation `generation` until no guest can reach it, it is
     /// lost, or another call took it down.
     async fn keep(self, generation: u64, lost: CancellationToken) {
+        // Since when no guest can reach it: it stays up LINGER more.
+        let mut idle_since: Option<Instant> = None;
         loop {
-            let next = self
+            let mut next = self
                 .store()
                 .next_expiry()
                 .map_or(Instant::now() + SESSION_CHECK, |e| {
                     e.min(Instant::now() + SESSION_CHECK)
                 });
+            if let Some(since) = idle_since {
+                next = next.min(since + LINGER);
+            }
             let lost_now = tokio::select! {
                 () = self.inner.shutdown.cancelled() => return,
                 () = lost.cancelled() => true,
@@ -660,7 +668,13 @@ impl Gateway {
                 () = until(next) => false,
             };
             self.prune();
-            if lost_now || self.store().reachable().is_empty() {
+            let now = Instant::now();
+            idle_since = if self.store().reachable().is_empty() {
+                Some(idle_since.unwrap_or(now))
+            } else {
+                None
+            };
+            if lost_now || idle_since.is_some_and(|since| now >= since + LINGER) {
                 // Decided again under the lock a new link is minted under.
                 let mut tunnel = self.inner.tunnel.lock().await;
                 self.prune();
@@ -1303,9 +1317,10 @@ mod tests {
         );
     }
 
-    /// A tunnel gone idle stays up until the streams that just ended have
-    /// closed, so their last frame, which says why, reaches the guest.
-    #[tokio::test]
+    /// A tunnel gone idle stays up for LINGER, and then until the streams that
+    /// just ended have closed, so their last frame, which says why, and the
+    /// page's question after it reach the daemon.
+    #[tokio::test(start_paused = true)]
     async fn an_idle_tunnel_waits_for_ended_streams_to_close() {
         let gw = gateway();
         let session = shared(&gw).await;
@@ -1320,6 +1335,9 @@ mod tests {
         gw.create(CreateOpts::new(session)).unwrap();
         // A stream still closing holds its slot until its socket is gone.
         let closing = gw.inner.streams.clone().try_acquire_owned().unwrap();
+        // why: the paused clock, which moves only as the runtime idles
+        // ast-grep-ignore: test-wall-clock-unit
+        let revoked = Instant::now();
         gw.revoke_all().await.1.unwrap();
         let streams = gw.inner.streams.clone();
         shux_testkit::wait_until_async("the keeper to wait for the closing stream", || {
@@ -1327,6 +1345,7 @@ mod tests {
             async move { free == 0 }
         })
         .await;
+        assert!(revoked.elapsed() >= LINGER, "it did not linger");
         assert_eq!(gw.tunnel_state(), "up", "taken down under a closing stream");
         drop(closing);
         shux_testkit::wait_until_async("the idle tunnel to go down", || {
