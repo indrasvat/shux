@@ -44,15 +44,21 @@ for p in sys.argv[2:]: os.utime(p, (t, t))' "$2" {} +
 }
 blob() { mkdir -p "$(dirname "$1")"; head -c "${2:-65536}" /dev/zero >"$1"; }
 
-dead_pid() {
-  local pid
-  while :; do
-    (exit 0) &
-    pid=$!
-    wait "${pid}"
-    ps -p "${pid}" >/dev/null 2>&1 || { echo "${pid}"; return; }
-  done
-}
+# dead_pid: a pid the OS never assigns, so it names no process however long the
+# run takes. A reaped child's pid does not do: on a busy machine the counter
+# wraps and a live process gets it. Linux allocates below pid_max; XNU wraps
+# before its PID_MAX, 99999.
+if [[ -r /proc/sys/kernel/pid_max ]]; then
+  NEVER_PID="$(cat /proc/sys/kernel/pid_max)"
+else
+  NEVER_PID=99999
+fi
+never_out="$(ps -p "${NEVER_PID}" -o pid= 2>&1)" && never_rc=0 || never_rc=$?
+if [[ "${never_rc}" -ne 1 || -n "${never_out}" ]]; then
+  echo "✗ prune self-test: ps does not report pid ${NEVER_PID} as no such process (exit ${never_rc}: ${never_out})" >&2
+  exit 1
+fi
+dead_pid() { echo "${NEVER_PID}"; }
 
 # start_fake <exe> <argv0> <cwd> <script>: perl (or a link to it, which names the
 # process) running a script that sleeps until cleanup kills it; FAKE is its pid,
