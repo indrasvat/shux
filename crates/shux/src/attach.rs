@@ -1256,6 +1256,8 @@ async fn run_attach_loop(
     // The paste whose pieces are arriving with its pane, and how many this
     // client has sent.
     let (mut pasting, mut pastes): (Option<(u64, PaneId)>, u64) = (None, 0);
+    // Whether the paste arriving began in copy mode, which takes all of it.
+    let mut paste_in_copy_mode: Option<bool> = None;
     loop {
         tokio::select! {
             _ = conn.cancelled() => {
@@ -1349,9 +1351,25 @@ async fn run_attach_loop(
                                 }
                                 continue;
                             }
-                            if paste.is_some() && s.copy_mode.is_some() {
-                                continue;
+                        }
+                        // A paste is text, not keys: one that begins in a copy
+                        // mode that still maps is swallowed whole, and one
+                        // that does not is the pane's to the end.
+                        match paste {
+                            Some(more) => {
+                                let swallow = match paste_in_copy_mode {
+                                    Some(swallow) => swallow,
+                                    None => {
+                                        settle_copy_mode(&graph, &io_state, &render_session, &client_size, &config)
+                                            .await
+                                    }
+                                };
+                                paste_in_copy_mode = more.then_some(swallow);
+                                if swallow {
+                                    continue;
+                                }
                             }
+                            None => paste_in_copy_mode = None,
                         }
                         let cleared_mouse_selection = {
                             let mut s = render_session.lock().await;
@@ -1378,54 +1396,25 @@ async fn run_attach_loop(
                         // terminals interpret it before any subsequent
                         // diff bytes overwrite the cursor position.
                         let attached_now = render_session.lock().await.clone();
-                        if let Some(cm) = attached_now.copy_mode.as_ref() {
+                        if paste.is_none()
+                            && let Some(cm) = attached_now.copy_mode.as_ref()
+                        {
                             let rect = pane_rect_for(&graph, &attached_now, &client_size, &config, cm.pane).await;
-                            let (yank, mapped) = {
+                            let routed = {
                                 let state = io_state.lock().await;
                                 let mut s = render_session.lock().await;
-                                let active = s.active_pane_id;
-                                let (mut yank, mut mapped, mut evicted) = (None, true, false);
-                                let keep = s.copy_mode.as_mut().is_some_and(|cm| {
-                                    let now = shux_vt::monotonic_now_ns();
-                                    let Some(vt) = resolve_copy_mode(cm, active, rect, now, &state) else {
-                                        mapped = false;
-                                        return false;
-                                    };
-                                    match shux_ui::copy_mode_key(&bytes, cm, vt) {
-                                        shux_ui::CopyKey::Updated | shux_ui::CopyKey::Ignored => true,
-                                        shux_ui::CopyKey::SelectionEvicted => {
-                                            evicted = true;
-                                            true
-                                        }
-                                        shux_ui::CopyKey::Exit => false,
-                                        shux_ui::CopyKey::Yank => {
-                                            yank = Some(shux_ui::copy_mode::extract_selection(vt, cm));
-                                            false
-                                        }
-                                    }
-                                });
-                                if !keep {
-                                    s.copy_mode = None;
-                                }
-                                if evicted {
-                                    s.last_action = Some((
-                                        "selection left history: nothing copied".into(),
-                                        std::time::Instant::now(),
-                                    ));
-                                }
-                                state.render_pulse.bump();
-                                (yank, mapped)
+                                copy_mode_key_input(&bytes, &mut s, rect, &state)
                             };
-                            if let Some(text) = yank.filter(|t| !t.is_empty()) {
-                                let osc = shux_ui::osc52_copy(&text);
-                                let frame = AttachServerFrame::Render {
-                                    data: BASE64.encode(&osc),
-                                    frame: None,
-                                };
-                                let _ = out_tx.send(frame).await;
-                            }
                             // A key that found copy mode gone is the pane's.
-                            if mapped {
+                            if let Some(yank) = routed {
+                                if let Some(text) = yank.filter(|t| !t.is_empty()) {
+                                    let osc = shux_ui::osc52_copy(&text);
+                                    let frame = AttachServerFrame::Render {
+                                        data: BASE64.encode(&osc),
+                                        frame: None,
+                                    };
+                                    let _ = out_tx.send(frame).await;
+                                }
                                 continue;
                             }
                         }
@@ -1607,6 +1596,10 @@ async fn run_attach_loop(
                             gesture_input = false;
                             continue;
                         }
+                        // A copy mode that no longer maps is gone before the
+                        // event is routed: it is the app's or a selection's.
+                        settle_copy_mode(&graph, &io_state, &render_session, &client_size, &config)
+                            .await;
                         let unhandled_mouse = |error| {
                             warn!(?kind, %error, "attach: mouse handle failed");
                             false
@@ -2218,7 +2211,8 @@ async fn run_render_loop(
             nerd_fonts,
             prefix_label: &prefix_label,
             client_cols: cols,
-            copy_mode_active: attached.copy_mode.is_some(),
+            // As resolved for this frame: the one that ends it drops the flag.
+            copy_mode_active: modal.is_some(),
             last_action: last_action_ref,
             action_error: attached.action_error.as_deref(),
         };
@@ -2998,6 +2992,77 @@ fn resolve_copy_mode<'s>(
     Some(vt)
 }
 
+/// A key for the client's copy mode, if it has one that still maps: what it
+/// yanked, if anything. `None` when the key is the pane's.
+fn copy_mode_key_input(
+    bytes: &[u8],
+    s: &mut AttachedSession,
+    rect: Option<Rect>,
+    state: &PaneIoState,
+) -> Option<Option<String>> {
+    let active = s.active_pane_id;
+    let (mut yank, mut mapped, mut evicted) = (None, false, false);
+    let keep = s.copy_mode.as_mut().is_some_and(|cm| {
+        let now = shux_vt::monotonic_now_ns();
+        let Some(vt) = resolve_copy_mode(cm, active, rect, now, state) else {
+            return false;
+        };
+        mapped = true;
+        match shux_ui::copy_mode_key(bytes, cm, vt) {
+            shux_ui::CopyKey::Updated | shux_ui::CopyKey::Ignored => true,
+            shux_ui::CopyKey::SelectionEvicted => {
+                evicted = true;
+                true
+            }
+            shux_ui::CopyKey::Exit => false,
+            shux_ui::CopyKey::Yank => {
+                yank = Some(shux_ui::copy_mode::extract_selection(vt, cm));
+                false
+            }
+        }
+    });
+    if !keep {
+        s.copy_mode = None;
+    }
+    if evicted {
+        s.last_action = Some((
+            "selection left history: nothing copied".into(),
+            std::time::Instant::now(),
+        ));
+    }
+    state.render_pulse.bump();
+    mapped.then_some(yank)
+}
+
+/// Whether the client's copy mode still maps, ending it when it does not:
+/// what decides whether the input in hand is copy mode's or the pane's.
+async fn settle_copy_mode(
+    graph: &GraphHandle,
+    io_state: &Arc<Mutex<PaneIoState>>,
+    session: &Arc<Mutex<AttachedSession>>,
+    client_size: &ClientSize,
+    config: &ConfigHandle,
+) -> bool {
+    let attached = session.lock().await.clone();
+    let Some(pane) = attached.copy_mode.as_ref().map(|cm| cm.pane) else {
+        return false;
+    };
+    let rect = pane_rect_for(graph, &attached, client_size, config, pane).await;
+    let state = io_state.lock().await;
+    let mut s = session.lock().await;
+    let active = s.active_pane_id;
+    let Some(cm) = s.copy_mode.as_mut() else {
+        return false;
+    };
+    let now = shux_vt::monotonic_now_ns();
+    if resolve_copy_mode(cm, active, rect, now, &state).is_some() {
+        return true;
+    }
+    s.copy_mode = None;
+    state.render_pulse.bump();
+    false
+}
+
 #[expect(clippy::too_many_arguments, reason = "independent inputs")]
 async fn handle_copy_mode_mouse(
     kind: MouseKind,
@@ -3084,12 +3149,15 @@ async fn handle_copy_mode_mouse(
                 let Some(vt) = resolve_copy_mode(cm, active, rect, now, &state) else {
                     return false;
                 };
-                // A frame from before a reopen drew another view.
-                let Some((_, view)) = drawn.filter(|(_, v)| v.entry == cm.view.entry) else {
+                // A frame from before a reopen, a page or a pan drew another
+                // view: the gesture it names is dropped.
+                let Some(view) = drawn.map(|(_, v)| v.rebased(vt)).filter(|v| *v == cm.view) else {
+                    if matches!(*dragging, SelectionDrag::CopyMode) {
+                        cm.anchor = None;
+                    }
                     *dragging = SelectionDrag::None;
                     return true;
                 };
-                let view = view.rebased(vt);
                 let r = view.rect();
                 if kind == MouseKind::Down && !point_in_rect(r, col, row) {
                     *dragging = SelectionDrag::None;
@@ -13561,6 +13629,228 @@ mod tests {
             b"x",
             "the key that found copy mode gone was swallowed"
         );
+        h.stop().await;
+    }
+
+    /// Copy mode with a selection, its pane then changed under it with no
+    /// frame drawn since: what reaches the daemon next finds it gone.
+    async fn copy_mode_gone_unseen(
+        h: &mut InputHarness,
+        change: impl FnOnce(&mut shux_vt::VirtualTerminal),
+    ) {
+        h.show(lettered(10, 40)).await;
+        h.catch_up().await;
+        let shown = h.written_frame;
+        h.enter_copy_mode(shown).await;
+        h.key(b"v").await;
+        let selecting = h
+            .frames_until(|_, text| text.contains("COPY") && !text.contains("PgUp"))
+            .await;
+        assert!(selecting, "the selection never started");
+        h.catch_up().await;
+        let mut state = h.fixture.io_state.lock().await;
+        let pane = h.fixture.first_pane;
+        change(state.vts.get_mut(&pane).expect("vt"));
+    }
+
+    /// A key whose copy mode the renderer ended between the input task
+    /// seeing it and taking the lock is the pane's, not swallowed.
+    #[tokio::test]
+    async fn a_key_that_finds_copy_mode_ended_is_the_panes() {
+        let fixture = attach_fixture().await;
+        let mut s = fixture.attached.clone();
+        s.copy_mode = None;
+        let routed = {
+            let state = fixture.io_state.lock().await;
+            copy_mode_key_input(b"x", &mut s, None, &state)
+        };
+        assert_eq!(routed, None, "the key went to a copy mode already gone");
+        fixture.stop();
+    }
+
+    /// A paste that finds copy mode gone is the pane's, all of it.
+    #[tokio::test(start_paused = true)]
+    async fn a_paste_after_copy_mode_stops_mapping_reaches_the_pane() {
+        let mut h = InputHarness::new(64).await;
+        copy_mode_gone_unseen(&mut h, |vt| vt.resize(8, 30)).await;
+        h.paste(b"pasted", false).await;
+        assert_eq!(
+            h.next_input().await,
+            b"pasted",
+            "the paste that found copy mode gone was swallowed"
+        );
+        h.stop().await;
+    }
+
+    /// A paste that began in copy mode stays there to its last piece, though
+    /// copy mode ends meanwhile: none of it reaches the pane.
+    #[tokio::test(start_paused = true)]
+    async fn a_paste_that_began_in_copy_mode_is_swallowed_to_its_end() {
+        let mut h = InputHarness::new(64).await;
+        h.show(lettered(10, 40)).await;
+        h.catch_up().await;
+        let shown = h.written_frame;
+        h.enter_copy_mode(shown).await;
+        h.key(b"v").await;
+        let selecting = h
+            .frames_until(|_, text| text.contains("COPY") && !text.contains("PgUp"))
+            .await;
+        assert!(selecting, "the selection never started");
+        h.paste(b"head", true).await;
+        // Handled after the piece: a new size moves the pane out from under
+        // the selection.
+        h.send(&AttachClientFrame::Resize { cols: 80, rows: 24 })
+            .await;
+        assert!(
+            h.frames_until(|_, text| !text.contains("COPY")).await,
+            "copy mode never ended"
+        );
+        h.paste(b"tail", false).await;
+        h.key(b"k").await;
+        assert_eq!(
+            h.next_input().await,
+            b"k",
+            "part of the paste reached the pane"
+        );
+        h.stop().await;
+    }
+
+    /// A wheel stamped with an older frame the client was shown opens copy
+    /// mode over that frame's lines, though a newer one has been drawn since.
+    #[tokio::test(start_paused = true)]
+    async fn the_wheel_opens_copy_mode_over_its_older_stamped_frame() {
+        let mut h = InputHarness::new(64).await;
+        let rect = h.first_rect().await;
+        let mut vt = shux_vt::VirtualTerminal::new(10, 40);
+        for i in 0..40 {
+            vt.process(format!("W{i:02}\r\n").as_bytes());
+        }
+        h.show(vt).await;
+        h.catch_up().await;
+        let older = h.written_frame;
+        h.app_writes(b"X00\r\nX01\r\nX02\r\nX03\r\nX04\r\n").await;
+        assert!(h.frames_until(|_, text| text.contains("X04")).await);
+        h.catch_up().await;
+        assert_ne!(h.written_frame, older, "setup: no newer frame drawn");
+        h.send(&AttachClientFrame::Mouse {
+            kind: MouseKind::ScrollUp,
+            button: ProtoMouseButton::None,
+            col: rect.x + 1,
+            row: rect.y + 1,
+            shift: false,
+            alt: false,
+            ctrl: false,
+            frame: older,
+        })
+        .await;
+        for key in [b"v", b"l", b"l", b"y"] {
+            h.key(key).await;
+        }
+        // The older frame's top line was W31; the wheel scrolls three up.
+        assert_eq!(h.yanked().await.as_deref(), Some("W28"));
+        h.stop().await;
+    }
+
+    /// The frame that ends copy mode, because it no longer maps, drops its
+    /// status bar flag with it.
+    #[tokio::test(start_paused = true)]
+    async fn the_frame_that_ends_copy_mode_drops_its_flag() {
+        let mut h = InputHarness::new(64).await;
+        let bar = |c: &Client| {
+            let grid = c.screen.grid();
+            let row = grid.visible_row(grid.rows() - 1);
+            (0..row.len()).map(|c| row[c].ch).collect::<String>()
+        };
+        let rect = h.first_rect().await;
+        let mut vt = shux_vt::VirtualTerminal::new(10, 40);
+        for i in 0..30 {
+            vt.process(format!("W{i:02}\r\n").as_bytes());
+        }
+        h.show(vt).await;
+        h.catch_up().await;
+        // The wheel, not `prefix [`: its notice would cover the flag.
+        let frame = h.written_frame;
+        h.send(&AttachClientFrame::Mouse {
+            kind: MouseKind::ScrollUp,
+            button: ProtoMouseButton::None,
+            col: rect.x + 1,
+            row: rect.y + 1,
+            shift: false,
+            alt: false,
+            ctrl: false,
+            frame,
+        })
+        .await;
+        h.key(b"v").await;
+        let flagged = h
+            .frames_until(|_, text| text.lines().last().is_some_and(|l| l.contains(" Y ")))
+            .await;
+        assert!(
+            flagged,
+            "setup: no copy-mode flag in the status bar: {:?}",
+            bar(&h)
+        );
+        {
+            let mut state = h.fixture.io_state.lock().await;
+            let pane = h.fixture.first_pane;
+            state.vts.get_mut(&pane).expect("vt").resize(8, 30);
+            state.render_pulse.bump();
+        }
+        let cleared = h.frames_until(|_, text| !text.contains("COPY")).await;
+        assert!(cleared, "copy mode never ended");
+        assert!(
+            !bar(&h).contains(" Y "),
+            "the flag outlived copy mode: {:?}",
+            bar(&h)
+        );
+        h.stop().await;
+    }
+
+    /// A click that finds copy mode gone is the application's.
+    #[tokio::test(start_paused = true)]
+    async fn a_click_after_copy_mode_stops_mapping_reaches_the_app() {
+        let mut h = InputHarness::new(64).await;
+        let rect = h.first_rect().await;
+        copy_mode_gone_unseen(&mut h, |vt| {
+            vt.process(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h");
+        })
+        .await;
+        h.left(MouseKind::Down, rect.x + 2, rect.y + 1).await;
+        let input = h.next_input().await;
+        assert!(
+            input.starts_with(b"\x1b[<0;3;2M"),
+            "the click that found copy mode gone was not the app's: {:?}",
+            String::from_utf8_lossy(&input)
+        );
+        h.stop().await;
+    }
+
+    /// A drag stamped with a frame from before the copy view moved names cells
+    /// that view showed, not the ones under the pointer now: it is dropped,
+    /// and leaves copy mode as it was.
+    #[tokio::test(start_paused = true)]
+    async fn a_copy_mode_drag_over_a_page_since_turned_is_dropped() {
+        let mut h = InputHarness::new(64).await;
+        let rect = h.first_rect().await;
+        let mut vt = shux_vt::VirtualTerminal::new(10, 40);
+        for i in 0..40 {
+            vt.process(format!("S{i:02}\r\n").as_bytes());
+        }
+        h.show(vt).await;
+        h.catch_up().await;
+        let shown = h.written_frame;
+        h.enter_copy_mode(shown).await;
+        assert!(h.frames_until(|_, text| text.contains("COPY")).await);
+        h.catch_up().await;
+        // A page up the client has not drawn yet.
+        h.key(b"\x1b[5~").await;
+        let (x, y) = (rect.x, rect.y + 1);
+        h.left(MouseKind::Down, x, y).await;
+        h.left(MouseKind::Drag, x + 2, y).await;
+        h.left(MouseKind::Up, x + 2, y).await;
+        h.key(b"y").await;
+        // The cursor where the page left it, nothing selected.
+        assert_eq!(h.yanked().await.as_deref(), Some("S"));
         h.stop().await;
     }
 
