@@ -1,8 +1,8 @@
 {
   "scope": "copy-images-190",
   "tier": "full",
-  "base": "6bc9d94ce1b5daa451f153bb6a28321f171460ce",
-  "commit_under_audit": "4c2894b25aa39a4cdfb33df1082fbec9bcc4fd3a",
+  "base": "0764a9150a71e633e34b811aab2025d7e9dba704",
+  "commit_under_audit": "1ae8b433bf837a26998d43bf9d39c5ebfdc243a6",
   "verdict": "PASS",
   "solid_qa_report": "SOLID-QA.md",
   "dootsabha_design": "council-design.md",
@@ -20,5 +20,14 @@
     "pixel-head-img120-3-home-attach-vs-window.json",
     "pixel-head-img120-restore-vs-live.json"
   ],
-  "pixel_metrics_note": "Live attach output (the client's bytes, kitty a=p crops included, drawn by an outer shux) vs window.snapshot of the same pane, body rows only (the status row's uptime clock differs by path), at 90x28 and 120x40 client sizes, before/after a left crop by 3 cells and after restore; plus restore vs the first live frame. All 0/0."
+  "pixel_metrics_note": "Live attach output (the client's bytes, kitty a=p crops included, drawn by an outer shux) vs window.snapshot of the same pane, body rows only (the status row's uptime clock differs by path), at 90x28 and 120x40 client sizes, before/after a left crop by 3 cells and after restore; plus restore vs the first live frame. All 0/0. Regenerated at 1ae8b43 after the rebase; byte-identical to the pre-rebase run.",
+  "previously_audited_heads": [
+    "4c2894b25aa39a4cdfb33df1082fbec9bcc4fd3a"
+  ],
+  "sha_map": {
+    "6bc9d94": "0764a91",
+    "a39fbf6": "b46d321",
+    "4c2894b": "4a9016c",
+    "62304ff": "620c6dc"
+  }
 }

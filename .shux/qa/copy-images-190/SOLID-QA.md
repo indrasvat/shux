@@ -3,15 +3,27 @@ VERDICT: PASS
 # copy-images-190: VT + TUI gate (one run, both charters)
 
 - Change: #190 PR B2 (copy mode frozen on the shown slice; pictures cropped to the shown cells; SIGTERM on a stalled client terminal)
-- Branch `feat/190-b2-copy-images`, base `6bc9d94`, commit_under_audit `4c2894b25aa39a4cdfb33df1082fbec9bcc4fd3a` (code identical to `a39fbf6`; 4c2894b adds only the neutrality report)
-- Tier: full. Binaries: head rebuilt with `make release` at 4c2894b; base from the `make vt-neutrality` cache at 6bc9d94. Both copied outside `target/`.
+- Branch `feat/190-b2-copy-images`, base `0764a91` (origin/main after the rebase), commit_under_audit `1ae8b433bf837a26998d43bf9d39c5ebfdc243a6` (code identical to `b46d321`; the three commits after it add only QA evidence)
+- Tier: full. Full audit ran at pre-rebase `4c2894b` on base `6bc9d94`; re-stamped after a conflict-free rebase onto `0764a91` (see *Re-stamp after rebase*). Base binary from the `make vt-neutrality` cache at 6bc9d94. Binaries copied outside `target/`.
+
+## Re-stamp after rebase (onto 0764a91, which brings #302's erase and wrap-link changes under copy mode)
+
+- `make check-vt-qa-pregate` at 1ae8b43: pass. `make vt-neutrality` vs 0764a91: 0/0, refreshed in 1ae8b43 (cited).
+- Sanity on a binary rebuilt with `make release` at 1ae8b43 (`git_sha` 1ae8b43):
+  - **Copy mode:** entered over the 200x60 pinned pane while output streamed, under a 90x28 client. It opened on the slice the client was showing (`L108`), and that view stayed byte-identical after ten more streamed lines.
+  - **Search:** `/R100` panned to column 150. `/漢字050` panned back to the match's first cell.
+  - **Yank:** the OSC 52 decoded to `😀x040 end`.
+  - **Left-cropped picture:** the bytes are unchanged (`CUP 6;2 a=p,…,x=27,w=81,c=9,r=2`, then the restore at `CUP 6;72` with no `x=`).
+  - **Pixels:** all 8 committed metrics were regenerated at 1ae8b43 at 90x28 and 120x40, all 0/0. They are byte-identical to the pre-rebase ones. Base vs head crop still FAILs (3078 px).
+- Old → new SHAs (same 18 commits, same order): base 6bc9d94→0764a91 · fbd4da5→b79f897 · e83b6a9→e8d991e · 080ab08→e07886c · e3d0c62→30ef9a5 · 68b1f13→6dabcf9 · 9567497→d3ea02b · a330fbb→cb7e2f0 · 91e99bb→77f4734 · 976a100→d8a9e55 · 03de873→60acc31 · 85b2d27→137b3e4 · 4495b3b→2086c32 · cb5626a→7a138e0 · 3e296b1→b4ad528 · a39fbf6→b46d321 · 4c2894b→4a9016c (neutrality) · 62304ff→620c6dc (this PASS) · new 1ae8b43 (neutrality refresh).
+- Pre-rebase SHAs below are kept as they were audited; read them through this map.
 - Isolation: inner daemons `/tmp/q190h` (head) and `/tmp/q190a` (base); attach clients hosted as pane programs in an outer daemon `/tmp/q190o`. Private `XDG_STATE_HOME`/`XDG_CONFIG_HOME`/`HOME`/`HTOPRC` under `/tmp/q190b`; lazygit ran in a scratch repo.
 
 ## Scripted half (cited, not re-run)
 
 | Item | Result | Evidence |
 |---|---|---|
-| `make vt-neutrality` | 0/0 on all six layers, 54 metrics, head a39fbf6 | `neutrality.json`, `neutrality/` |
+| `make vt-neutrality` | 0/0 on all six layers, against 0764a91, refreshed in 1ae8b43 | `neutrality.json`, `neutrality/` |
 | `make check` | pass (implementer) | cited |
 | `make test-gui-terminal` | pass: real kitty under Xvfb, crop, restore, mid-pixel `X=` at font 20, containment | cited; `docs/agents/visual-testing.md` |
 | `make check-vt-qa-pregate` | first run exit 2 (no manifest yet, expected); re-run with this scope staged before commit | this commit |
