@@ -19,7 +19,7 @@
     "",
     "PostToolUse also runs scripts/check-test-timing.sh on every edited Rust file: the ast-grep rules in lint/ast-grep/ ban timing in disguise in test code (wall-clock deadlines and bounds, timed waits, absence by timeout, fixtures that sleep then act). An escape is `// why: …` directly above `// ast-grep-ignore: <rule>`. `make check-test-timing` is the gate.",
     "",
-    "SessionStart and Stop run `make disk-check` (docs/agents/disk.md): silent while the disk holding the repo has SHUX_DISK_MIN_GIB (default 40) free, one line naming `make prune` below it. At SessionStart the line is plain stdout, which Claude Code adds to the agent's context; at Stop it is {\"systemMessage\": ...}, shown to the user, so a low disk never keeps a finished turn going. Under HOOK= the script always exits 0: exit 2 from a Stop hook would block the stop."
+    "SessionStart and Stop run `make disk-check`, never failing the session: docs/agents/disk.md."
   ],
   "hooks": {
     "PreToolUse": [
@@ -46,7 +46,7 @@
           },
           {
             "type": "command",
-            "command": "make -s --no-print-directory -C \"$CLAUDE_PROJECT_DIR\" disk-check HOOK=session",
+            "command": "make -s --no-print-directory -C \"$CLAUDE_PROJECT_DIR\" disk-check HOOK=session || echo '⚠ make disk-check failed; run it in the repo to see why'",
             "timeout": 15
           }
         ]
@@ -57,7 +57,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "make -s --no-print-directory -C \"$CLAUDE_PROJECT_DIR\" disk-check HOOK=stop",
+            "command": "make -s --no-print-directory -C \"$CLAUDE_PROJECT_DIR\" disk-check HOOK=stop || echo '{\"systemMessage\": \"⚠ make disk-check failed; run it in the repo to see why\"}'",
             "timeout": 15
           }
         ]

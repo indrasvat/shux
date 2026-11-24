@@ -71,6 +71,7 @@ runtimes=()
 cache_root="${SHUX_NEUTRALITY_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/shux/vt-neutrality}"
 lock="$cache_root/lock"
 holding_lock=false
+reader="$cache_root/readers/$$"
 cleanup() {
     local rt
     for rt in "${runtimes[@]:-}"; do
@@ -78,6 +79,7 @@ cleanup() {
         shux_harness_stop_daemon "$rt"
         rm -rf "$rt"
     done
+    rm -f "$reader"
     if [[ "$holding_lock" == true ]]; then
         git worktree remove --force "$cache_root/src" >/dev/null 2>&1 || true  # absent on a cache hit
         rmdir "$lock" 2>/dev/null || true  # already gone if never taken
@@ -110,15 +112,29 @@ bin_dir="$cache_root/bin/${base}-${toolchain_key}"
 base_bin="$bin_dir/shux"
 base_harness="$bin_dir/vt_corpus_harness"
 
+# make prune leaves the cache alone while a marker in readers/ names a live pid; the
+# marker is written under the lock prune holds while it removes anything.
+mkdir -p "$cache_root/readers"
+tries=0
+until mkdir "$lock" 2>/dev/null; do
+    tries=$((tries + 1))
+    if [[ "$tries" -ge 30 ]]; then
+        echo "✗ $lock held for 30s by another vt-neutrality run or make prune; remove it if neither is running" >&2
+        exit 1
+    fi
+    sleep 1
+done
+holding_lock=true
+echo "$$" >"$reader"
+
 if [[ -x "$base_bin" && -x "$base_harness" && -f "$bin_dir/stamp" ]]; then
     step "base build cached: ${bin_dir/#$HOME/~}"
     cache_hit=true
+    rmdir "$lock"
+    holding_lock=false
 else
     cache_hit=false
     step "build base (${base:0:10}) into the cache (toolchain ${toolchain_key})"
-    mkdir "$lock" 2>/dev/null ||
-        { echo "✗ another vt-neutrality run holds $lock; remove it if none is running" >&2; exit 1; }
-    holding_lock=true
     git worktree remove --force "$cache_root/src" >/dev/null 2>&1 || true  # leftover from a killed run, if any
     rm -rf "$cache_root/src"
     git worktree add --detach --force "$cache_root/src" "$base" >/dev/null

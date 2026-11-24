@@ -11,23 +11,20 @@
 set -euo pipefail
 
 hook=""
-case "$#" in
-  0) ;;
-  2) [[ "$1" == --hook && ( "$2" == session || "$2" == stop ) ]] || set -- usage ;;
-  *) set -- usage ;;
+case "$*" in
+  "") ;;
+  "--hook session" | "--hook stop") hook="$2" ;;
+  *) echo "usage: scripts/disk-check.sh [--hook session|stop]" >&2; exit 2 ;;
 esac
-if [[ "${1:-}" == usage ]]; then
-  echo "usage: scripts/disk-check.sh [--hook session|stop]" >&2
-  exit 2
-fi
-[[ "$#" -eq 0 ]] || hook="$2"
 
+# One line of text; for Stop, a JSON string with control characters replaced.
 say() {
+  local m="${1//[[:cntrl:]]/?}"
   if [[ "${hook}" == stop ]]; then
-    local m="${1//\\/\\\\}"
+    m="${m//\\/\\\\}"
     printf '{"systemMessage": "%s"}\n' "${m//\"/\\\"}"
   else
-    printf '%s\n' "$1"
+    printf '%s\n' "${m}"
   fi
 }
 
@@ -40,15 +37,26 @@ broken() {
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 min="${SHUX_DISK_MIN_GIB:-40}"
-[[ "${min}" =~ ^[0-9]+$ ]] || broken "SHUX_DISK_MIN_GIB='${min}' is not a whole number of GiB"
+# No leading zeros (bash reads them as octal), and small enough not to overflow.
+[[ "${min}" =~ ^(0|[1-9][0-9]{0,5})$ ]] ||
+  broken "SHUX_DISK_MIN_GIB='${min}' is not a whole number of GiB from 0 to 999999"
 
 # -P: one line per filesystem, 1024-byte blocks, same columns on macOS and Linux.
-if ! df_out="$(df -Pk -- "${ROOT}" 2>&1)"; then
-  broken "df -Pk failed: ${df_out//$'\n'/ }"
+# stdout only: a warning on stderr must not shift the lines read below.
+if ! df_out="$(df -Pk -- "${ROOT}" 2>/dev/null)"; then
+  broken "df -Pk failed: $(df -Pk -- "${ROOT}" 2>&1 >/dev/null | tr '\n' ' ')"
 fi
-avail="$(printf '%s\n' "${df_out}" | awk 'NR == 2 { print $4 }')"
-mount="$(printf '%s\n' "${df_out}" | awk 'NR == 2 { for (i = 6; i <= NF; i++) printf "%s%s", (i > 6 ? " " : ""), $i }')"
-[[ "${avail}" =~ ^[0-9]+$ ]] || broken "could not read free space from: ${df_out//$'\n'/ | }"
+# The data line's Capacity is the first N% field after three numbers; Available is
+# just before it, the mount point after it. Filesystem names may hold spaces.
+read -r avail mount < <(printf '%s\n' "${df_out}" | awk 'NR > 1 {
+  for (i = 5; i <= NF; i++)
+    if ($i ~ /^[0-9]+%$/ && $(i-1) ~ /^[0-9]+$/ && $(i-2) ~ /^[0-9]+$/ && $(i-3) ~ /^[0-9]+$/) {
+      m = $(i+1); for (j = i + 2; j <= NF; j++) m = m " " $j
+      line = $(i-1) " " m
+      break
+    }
+} END { print line }') || :
+[[ "${avail:-}" =~ ^[0-9]+$ ]] || broken "could not read free space from: ${df_out//$'\n'/ | }"
 
 if [[ "${avail}" -lt $((min * 1048576)) ]]; then
   free="$(awk -v k="${avail}" 'BEGIN { printf "%.1f", k / 1048576 }')"

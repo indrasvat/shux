@@ -8,7 +8,7 @@
 #
 #   check-target-hygiene.sh [repo-root]           check (read-only)
 #   check-target-hygiene.sh --clean [repo-root]   empty the repo's build dirs
-#   check-target-hygiene.sh --list [repo-root]    print the dirs --clean would empty
+#   check-target-hygiene.sh --list [repo-root]    the dirs --clean would empty, NUL-terminated
 #
 # check, for every Cargo workspace root in the repo:
 #   1. the manifest pins split-debuginfo = "packed" for every profile that
@@ -395,7 +395,7 @@ if mode == "list":
             print(f"✗ target hygiene: {f}", file=sys.stderr)
         sys.exit(1)
     for t in owned_dirs:
-        print(t)
+        sys.stdout.write(t + "\0")
     sys.exit(0)
 
 if mode == "clean":
