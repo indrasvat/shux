@@ -1,9 +1,52 @@
 VERDICT: PASS
 
-commit_under_audit: efb3dc8 (code at 81b3c8d; efb3dc8 adds only QA evidence)
+commit_under_audit: 7758370 (code at 2e153c4; 7758370 refreshes neutrality only)
 merge-base: 974f3b2e4837dab61486b28b6f1fb6415937867e
-scope: resize-blank-row-301 (issue #301, branch fix/301-resize-drops-blank-row), tier full
-audit type: full audit of 974f3b2..efb3dc8
+scope: resize-blank-row-301 (issue #301, PR #302, branch fix/301-resize-drops-blank-row), tier full
+audit type: delta re-audit of 02572d5..7758370, on top of the full audit of 974f3b2..efb3dc8 (kept below)
+
+## Delta re-audit: 02572d5..7758370
+
+2e153c4 fixes a bot P1. An erase that a wide glyph widens to cover the whole first visible
+row now cuts history's link. EL/ED and ECH both go through `after_erase`, which judges the
+range that was actually cleared. Before, they judged the range that was asked for. 7758370
+refreshes neutrality: head 2e153c4, status pass (cited). `make check-vt-qa-pregate` at
+HEAD passes: "3 VT path(s) touched; evidence conforming in resize-blank-row-301".
+
+Real binary: fix = 2e153c4 release build. Each case starts at 2x5, is widened to 10x2,
+then grown to 10x4 so history shows.
+
+| Input | fix 10x4 | v0.59.1 10x4 |
+|---|---|---|
+| bot: `ABCDE界\r\n ESC[1;2H ESC[K ESC[H XYZ` (EL 0 on the wide tail) | `ABCDE` / `XYZ` | `ABCDEXYZ` |
+| EL 1 on a wide head at the row end: `ABCDEabc界\r\n ESC[1;4H ESC[1K ESC[H XYZ` | `ABCDE` / `XYZ` | `ABCDEXYZ` |
+| ECH from the wide tail to the edge: `ABCDE界\r\n ESC[1;2H ESC[4X ESC[H XYZ` | `ABCDE` / `XYZ` | `ABCDEXYZ` |
+| control, a partial ECH that widens over the glyph only: `ABCDE界ZZ\r\n ESC[1;2H ESC[1X ESC[H XY` | `ABCDEXYZZ` (link kept) | `ABCDEXYZZ` |
+
+- **Issue repro, re-run** (80x24 `bash --norc`, shrink to 40x10, grow to 120x40): all
+  three fills survive. The frames are pixel-identical to the 81b3c8d audit frames
+  (`pixel-302-prev-repro-*.json`, 3/3 at 0/0).
+- **CJK-heavy coloured `cat`** (Japanese, Chinese, Korean; truecolor fg, indexed bg, basic
+  fg) across 80x24, 37x24, 120x24 and back to 80x24:
+  - Text captures are identical to v0.59.1 at every size.
+  - Pixels are identical too (`pixel-302-v0591-cjk-*.json`, 4/4 at 0/0).
+  - Wide glyphs wrap at the boundary and rejoin at 120 columns.
+  - The raster draws CJK as tofu on both builds. That is the existing font-chain limit, so
+    CJK is judged from the text captures.
+- **vim** across 5 sizes against base 974f3b2: 5/5 at 0/0 (`pixel-302-base-vim-*.json`).
+- **Readline across a wrap, re-run:** 6/6 frames at 0/0 against v0.59.1
+  (`pixel-302-v0591-rl-*.json`). The issue repro's pre-resize frames also match v0.59.1,
+  2/2 at 0/0.
+- **Metrics:** the full audit's metric files were produced by the 81b3c8d build, so they are
+  replaced by the `pixel-302-*` set (20 files) produced by 2e153c4.
+- **Cleanup:** runtime dirs `/tmp/qn302`, `/tmp/qo0591b`, `/tmp/qn302v` and `/tmp/qb301v`
+  have no daemon running and no leaked processes.
+
+Findings for the delta: none.
+
+## Full audit: 974f3b2..efb3dc8
+
+audit commit: efb3dc8 (code at 81b3c8d)
 binaries: fix = 81b3c8d release build; v0.59.1 = /tmp/smoke-0591 (git_sha 6bc9d94);
 base = 974f3b2 (vt-neutrality cache)
 
