@@ -17,6 +17,7 @@ shux session list             # list sessions
 shux session kill work        # destroy a session
 shux session rename -s work -n staging
 shux session attach work      # attach to existing
+shux session attach work --read-only   # watch it: no keys reach it
 ```
 
 ## Keybindings

@@ -94,17 +94,33 @@ controls (bidi overrides, zero-width spaces). The viewer's own copy
 (OSC 52) still works. A daemon too old to promise this is refused, and
 `attach` exits non-zero.
 
+`shux session attach --read-only` watches: it scrolls, selects, copies and
+resizes its own view, and nothing else. No key, paste or click reaches a
+pane, it never focuses, splits or sizes anything, and it writes no
+onboarding state. It attaches only to a session that exists, on a daemon
+that is running. It composes with `--plain`. Read-only is enforced by the
+daemon, and needs attach protocol 2: an older daemon refuses the hello
+before it touches anything, and a reply that does not confirm read-only is
+refused before the terminal is touched.
+
 ## Attached clients
 
 ### `client.list` / `client.detach`
 
-Every terminal attached with `shux session attach` is a client. The status
-bar of a session shows `◉ N attached` once two or more are on it.
+Every terminal attached with `shux session attach` is a client. Each one's
+status bar carries a badge while it shares the session: the first writer
+(host) sees `◉ shared · N watching`, or red `◉ shared · N can type` when
+another client can type; another writer sees red `◉ writable · your keys go
+to this session`; a read-only client sees `◉ viewing · read-only`. Under
+`NO_COLOR` the row is monochrome, `*` replaces `◉`, and a warning ends on
+`!` when the badge is shortest. A snapshot, which has no viewer, shows
+`◉ N attached` once two or more are on the session.
 
 ```json
 // client.list (shux client list)
 {} → { "clients": [{ "id": "<uuid>", "session_id": "<uuid>", "session": "demo",
-                     "cols": 120, "rows": 40, "attached_at": 1778... }] }
+                     "cols": 120, "rows": 40, "attached_at": 1778...,
+                     "read_only": false }] }
 
 // client.detach (shux client detach <id>): ends that one connection; the
 // client is told "removed". A unique id prefix works, in any case; an
@@ -113,8 +129,9 @@ bar of a session shows `◉ N attached` once two or more are on it.
 { "id": "3f2a" } → { "detached": "<uuid>" }
 ```
 
-`attached_at` is Unix seconds. `--format plain` prints one tab-separated
-line per client: id, session, `COLSxROWS`, `attached_at`.
+`attached_at` is Unix seconds; `read_only` is true for a `--read-only`
+client, which the text output marks `read-only`. `--format plain` prints one
+tab-separated line per client: id, session, `COLSxROWS`, `attached_at`.
 
 A client is dropped when a frame it is sent makes no progress for 10–20 s
 (checked every 10 s), or when, after 15 s with nothing to send, it does not

@@ -690,6 +690,7 @@ async fn a_signal_during_the_restore_ends_a_client_whose_terminal_stopped_readin
         active_pane_id: "stand-in".into(),
         protocol: ATTACH_PROTOCOL_VERSION,
         plain: false,
+        read_only: false,
     };
     framed
         .send(Bytes::from(serde_json::to_vec(&ready).unwrap()))

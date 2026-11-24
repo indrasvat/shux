@@ -221,10 +221,25 @@ fn frame_input(
     (out, more)
 }
 
+mod pty_write {
+    /// Leave for an attach connection to write to a pane's PTY. Every write
+    /// an attach makes takes one, and only a writable connection is granted
+    /// one: a read-only connection cannot reach a writer at all.
+    pub(super) struct PtyWrite(());
+
+    impl PtyWrite {
+        pub(super) fn grant(read_only: bool) -> Option<Self> {
+            (!read_only).then_some(Self(()))
+        }
+    }
+}
+use pty_write::PtyWrite;
+
 /// Frames `bytes` against the pane's paste state as it stands under this
 /// lock, sends them through `permit` and records the paste they leave open.
 /// `paste` names the paste a piece belongs to.
 fn send_input(
+    _write: &PtyWrite,
     state: &mut PaneIoState,
     pane: PaneId,
     permit: InputPermit,
@@ -267,7 +282,7 @@ fn send_input(
 
 /// Ends every paste this client left open, as a held button is released: no
 /// later key from this client will.
-async fn close_open_pastes(io_state: &Arc<Mutex<PaneIoState>>, client: u64) {
+async fn close_open_pastes(_write: &PtyWrite, io_state: &Arc<Mutex<PaneIoState>>, client: u64) {
     let mut state = io_state.lock().await;
     let mine: Vec<PaneId> = state
         .open_pastes
@@ -440,6 +455,15 @@ trait AttachStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin 
 
 impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static> AttachStream for S {}
 
+/// Who decides what a connection may do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    /// Its hello: any session by name or id, writable or read-only.
+    Hello,
+    /// An in-process caller: read-only, to exactly this session.
+    ReadOnly(SessionId),
+}
+
 /// Handle one attach connection: handshake, then run the streaming loop.
 #[expect(clippy::too_many_arguments, reason = "independent inputs")]
 async fn handle_attach_connection(
@@ -452,6 +476,60 @@ async fn handle_attach_connection(
     onboarding: crate::onboarding::OnboardingHandle,
     daemon_start: std::time::Instant,
     cancel: CancellationToken,
+) -> anyhow::Result<()> {
+    serve_connection(
+        stream,
+        (graph, io_state, config, segments, meta_cache, onboarding),
+        daemon_start,
+        cancel,
+        Scope::Hello,
+    )
+    .await
+}
+
+/// A read-only attach to `session` over an in-process stream, for a caller
+/// that is not the attach socket (the share gateway, #297). The peer speaks
+/// the ordinary protocol and must ask for `read_only`; it gets no other
+/// session whatever its hello names, and no way to write to a pane: this
+/// connection never holds a [`PtyWrite`].
+#[expect(clippy::too_many_arguments, reason = "independent inputs")]
+pub async fn serve_read_only(
+    stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+    graph: GraphHandle,
+    io_state: Arc<Mutex<PaneIoState>>,
+    config: ConfigHandle,
+    segments: SegmentCache,
+    meta_cache: crate::session_meta::SessionMetaCache,
+    onboarding: crate::onboarding::OnboardingHandle,
+    daemon_start: std::time::Instant,
+    cancel: CancellationToken,
+    session: SessionId,
+) -> anyhow::Result<()> {
+    serve_connection(
+        stream,
+        (graph, io_state, config, segments, meta_cache, onboarding),
+        daemon_start,
+        cancel,
+        Scope::ReadOnly(session),
+    )
+    .await
+}
+
+type Shared = (
+    GraphHandle,
+    Arc<Mutex<PaneIoState>>,
+    ConfigHandle,
+    SegmentCache,
+    crate::session_meta::SessionMetaCache,
+    crate::onboarding::OnboardingHandle,
+);
+
+async fn serve_connection(
+    stream: impl AttachStream,
+    (graph, io_state, config, segments, meta_cache, onboarding): Shared,
+    daemon_start: std::time::Instant,
+    cancel: CancellationToken,
+    scope: Scope,
 ) -> anyhow::Result<()> {
     let (stream, taken) = crate::write_progress::Metered::new(stream);
     let mut framed = Framed::new(stream, create_codec());
@@ -496,15 +574,42 @@ async fn handle_attach_connection(
         return Ok(());
     }
 
-    // Step 2: Resolve the target session.
-    let resolved = resolve_or_create_session(&graph, &hello.session_name, &meta_cache).await;
-    let session = match resolved {
+    if let Scope::ReadOnly(_) = scope
+        && !hello.read_only
+    {
+        send_ready_error(
+            &mut framed,
+            "read_only_required",
+            "this connection only attaches read-only",
+        )
+        .await?;
+        return Ok(());
+    }
+    let read_only = hello.read_only;
+
+    // Step 2: Resolve the target session. A watcher only finds one.
+    let resolved = match scope {
+        Scope::ReadOnly(id) => {
+            let snap = graph.snapshot();
+            match snap.sessions.get(&id) {
+                Some(sess) => attached_to(&snap, sess),
+                None => Err(anyhow::anyhow!("session {id} not found")),
+            }
+        }
+        Scope::Hello => {
+            resolve_or_create_session(&graph, &hello.session_name, &meta_cache, !read_only).await
+        }
+    };
+    let mut session = match resolved {
         Ok(s) => s,
         Err(e) => {
             send_ready_error(&mut framed, "session_resolve", &e.to_string()).await?;
             return Ok(());
         }
     };
+    session.read_only = read_only;
+    // A watcher writes nothing to disk: no toast to dismiss for good.
+    session.show_welcome_toast = !read_only;
 
     // Spawn a PTY for the initial pane if it doesn't exist yet (newly
     // created sessions can race with the attach if the client hits us
@@ -518,7 +623,9 @@ async fn handle_attach_connection(
     // it does spawn, it must use the pane's OWN command and cwd rather than
     // an empty argv and the daemon's working directory, or the race it exists
     // to close is closed with the wrong process in the wrong place.
-    {
+    //
+    // A watcher starts nothing: it shows what is there.
+    if !read_only {
         let writer_present = {
             let state = io_state.lock().await;
             state.writers.contains_key(&session.active_pane_id)
@@ -568,13 +675,16 @@ async fn handle_attach_connection(
             cols,
             rows,
             attached_at: std::time::SystemTime::now(),
-            votes: true,
+            votes: !read_only,
             last_input: None,
         },
         removed.clone(),
     );
     // Panes take the driver's size: this client's only if it is the first.
-    reconcile_session(&graph, &io_state, &config, session.session_id).await;
+    // A watcher never sizes, so it never starts a sizing pass either.
+    if !read_only {
+        reconcile_session(&graph, &io_state, &config, session.session_id).await;
+    }
 
     // Step 3: Send AttachReady::Ok.
     let ready = AttachReady::Ok {
@@ -584,6 +694,7 @@ async fn handle_attach_connection(
         active_pane_id: session.active_pane_id.to_string(),
         protocol: ATTACH_PROTOCOL_VERSION,
         plain: hello.plain,
+        read_only,
     };
     framed
         .send(Bytes::from(serde_json::to_vec(&ready)?))
@@ -660,6 +771,8 @@ struct AttachedSession {
     client: Option<shux_core::event::ClientId>,
     /// One of the client's cells in pixels, once it has said.
     cell_pixels: Option<(u16, u16)>,
+    /// A watcher: it moves nothing shared, focus included.
+    read_only: bool,
 }
 
 /// Frames queued to one client before the render loop waits for it.
@@ -718,6 +831,38 @@ impl ShownFrames {
     }
 }
 
+/// A fresh attach's view of `sess`, as the snapshot shows it now.
+fn attached_to(
+    snap: &shux_core::graph::SessionGraphSnapshot,
+    sess: &shux_core::model::Session,
+) -> anyhow::Result<AttachedSession> {
+    let win = snap
+        .windows
+        .get(&sess.active_window)
+        .ok_or_else(|| anyhow::anyhow!("active window missing from snapshot"))?;
+    Ok(AttachedSession {
+        session_id: sess.id,
+        name: sess.name.clone(),
+        active_window_id: win.id,
+        active_pane_id: win.active_pane,
+        help_visible: false,
+        copy_mode: None,
+        mouse_selection: None,
+        copy_menu: None,
+        last_action: None,
+        client_prefix: None,
+        action_error: None,
+        // Whether the toast actually renders is decided at attach
+        // time by reading the onboarding state file; this stays
+        // true here so the render loop can flip it off after dwell.
+        show_welcome_toast: true,
+        shown: ShownFrames::default(),
+        client: None,
+        cell_pixels: None,
+        read_only: false,
+    })
+}
+
 /// Find a session by name, or create it (with one window + one pane) if
 /// missing. Mirrors `shux new -s <name>` semantics. When a new session
 /// is created here, kicks off the `SessionMetaCache` population that
@@ -729,36 +874,11 @@ async fn resolve_or_create_session(
     graph: &GraphHandle,
     name: &Option<String>,
     meta_cache: &crate::session_meta::SessionMetaCache,
+    create: bool,
 ) -> anyhow::Result<AttachedSession> {
     let snap = graph.snapshot();
     let target_name = name.clone().unwrap_or_else(|| "default".to_string());
-
-    let attached = |sess: &shux_core::model::Session| -> anyhow::Result<AttachedSession> {
-        let win = snap
-            .windows
-            .get(&sess.active_window)
-            .ok_or_else(|| anyhow::anyhow!("active window missing from snapshot"))?;
-        Ok(AttachedSession {
-            session_id: sess.id,
-            name: sess.name.clone(),
-            active_window_id: win.id,
-            active_pane_id: win.active_pane,
-            help_visible: false,
-            copy_mode: None,
-            mouse_selection: None,
-            copy_menu: None,
-            last_action: None,
-            client_prefix: None,
-            action_error: None,
-            // Whether the toast actually renders is decided at attach
-            // time by reading the onboarding state file; this stays
-            // true here so the render loop can flip it off after dwell.
-            show_welcome_toast: true,
-            shown: ShownFrames::default(),
-            client: None,
-            cell_pixels: None,
-        })
-    };
+    let attached = |sess| attached_to(&snap, sess);
 
     // An exact NAME first — unchanged, and it still beats a partial id.
     if let Some(sess) = snap.find_session_by_name(&target_name) {
@@ -785,6 +905,12 @@ async fn resolve_or_create_session(
         // Malformed or unmatched prefix: it is just a name. Fall through and
         // create it, which is what `attach` has always done.
         Err(_) => {}
+    }
+    if !create {
+        anyhow::bail!(
+            "session '{}' not found: a read-only attach never creates one",
+            target_name.escape_debug()
+        );
     }
 
     drop(snap);
@@ -815,27 +941,7 @@ async fn resolve_or_create_session(
         .sessions
         .get(&session_id)
         .ok_or_else(|| anyhow::anyhow!("session vanished after create"))?;
-    let win = snap
-        .windows
-        .get(&sess.active_window)
-        .ok_or_else(|| anyhow::anyhow!("active window missing after create"))?;
-    Ok(AttachedSession {
-        session_id: sess.id,
-        name: sess.name.clone(),
-        active_window_id: win.id,
-        active_pane_id: win.active_pane,
-        help_visible: false,
-        copy_mode: None,
-        mouse_selection: None,
-        copy_menu: None,
-        last_action: None,
-        client_prefix: None,
-        action_error: None,
-        show_welcome_toast: true,
-        shown: ShownFrames::default(),
-        client: None,
-        cell_pixels: None,
-    })
+    attached_to(&snap, sess)
 }
 
 /// Compute per-pane rects given the client size and dispatch each PTY its real
@@ -1170,6 +1276,8 @@ async fn run_attach_loop(
     // Authoritative client screen size. Updated only by Resize frames;
     // the renderer reads but never writes it.
     let client_size: ClientSize = Arc::new(Mutex::new(clamp_client_dims(hello.cols, hello.rows)));
+    let read_only = hello.read_only;
+    let pty_write = PtyWrite::grant(read_only);
     let registry_id = registered.id();
     let (clients, bus) = {
         let io = io_state.lock().await;
@@ -1220,6 +1328,7 @@ async fn run_attach_loop(
             render_cancel,
             hello.graphics,
             hello.plain,
+            hello.no_color,
             fallback_tick(),
             WELCOME_TOAST_DWELL,
             shux_vt::monotonic_now_ns,
@@ -1282,7 +1391,9 @@ async fn run_attach_loop(
                 let live = config.current().appearance.border_style.clone();
                 if live != last_border_style {
                     last_border_style = live;
-                    reconcile_session(&graph, &io_state, &config, session.session_id).await;
+                    if !read_only {
+                        reconcile_session(&graph, &io_state, &config, session.session_id).await;
+                    }
                     let pulse = io_state.lock().await.render_pulse.clone();
                     pulse.bump();
                 }
@@ -1310,6 +1421,8 @@ async fn run_attach_loop(
                 };
                 client_activity.send_replace(());
                 match parsed {
+                    // A watcher's paste is dropped whole, before it is read.
+                    AttachClientFrame::Paste { .. } if read_only => {}
                     frame @ (AttachClientFrame::Input { .. } | AttachClientFrame::Paste { .. }) => {
                         let (data, paste) = match frame {
                             AttachClientFrame::Paste { data, more } => (data, Some(more)),
@@ -1418,6 +1531,13 @@ async fn run_attach_loop(
                                 continue;
                             }
                         }
+                        // A key no overlay took reaches a pane only from a writer.
+                        let Some(write) = &pty_write else {
+                            render_session.lock().await.last_action =
+                                Some((READ_ONLY_NOTICE.into(), std::time::Instant::now()));
+                            io_state.lock().await.render_pulse.bump();
+                            continue;
+                        };
                         let active = render_session.lock().await.active_pane_id;
                         // Pieces of one paste share an id and go to the pane
                         // the paste began in, wherever focus has moved since.
@@ -1452,7 +1572,7 @@ async fn run_attach_loop(
                                     };
                                     {
                                         let mut state = io_state.lock().await;
-                                        send_input(&mut state, target, permit, bytes, paste, client_id);
+                                        send_input(write, &mut state, target, permit, bytes, paste, client_id);
                                     }
                                     // Typing is what makes a client the driver.
                                     if clients.mark_input(registry_id, tokio::time::Instant::now()) {
@@ -1496,17 +1616,28 @@ async fn run_attach_loop(
                                 new_rows: rows,
                             });
                         }
-                        // Only the driver's size reaches the panes.
-                        reconcile_session(&graph, &io_state, &config, session.session_id).await;
+                        // Only the driver's size reaches the panes, and a watcher
+                        // never drives.
+                        if !read_only {
+                            reconcile_session(&graph, &io_state, &config, session.session_id).await;
+                        }
                         let pulse = io_state.lock().await.render_pulse.clone();
                         pulse.bump();
+                    }
+                    AttachClientFrame::Action { kind, .. } if read_only && !viewer_action(kind) => {
+                        render_session.lock().await.last_action =
+                            Some((READ_ONLY_NOTICE.into(), std::time::Instant::now()));
+                        io_state.lock().await.render_pulse.bump();
                     }
                     AttachClientFrame::Action { kind, args } => {
                         sync_focus(&graph, &mut session, &render_session).await;
                         // The user pressed prefix + key — onboarding hint
                         // can dismiss. Cheap idempotent write; first call
-                        // persists, subsequent ones short-circuit.
-                        onboarding.mark_prefix_discovered().await;
+                        // persists, subsequent ones short-circuit. A watcher
+                        // persists nothing.
+                        if !read_only {
+                            onboarding.mark_prefix_discovered().await;
+                        }
                         if std::mem::take(&mut render_session.lock().await.show_welcome_toast) {
                             onboarding.mark_welcome_toast_seen().await;
                         }
@@ -1589,7 +1720,7 @@ async fn run_attach_loop(
                             // An app mid-drag behind the overlay has to be
                             // told the button came up, or it stays stuck
                             // dragging for the rest of its life.
-                            release_app_gesture(&io_state, &mut selection_drag, None).await;
+                            release_app_gesture(pty_write.as_ref(), &io_state, &mut selection_drag, None).await;
                             selection_drag = SelectionDrag::None;
                             // That gesture ended unfinished: its press is no
                             // input to count at some later click.
@@ -1610,6 +1741,7 @@ async fn run_attach_loop(
                         };
                         let focus_before = focused_pane(&graph, session.session_id);
                         let route = route_mouse(
+                            pty_write.as_ref(),
                             kind,
                             button,
                             (col, row),
@@ -1700,7 +1832,7 @@ async fn run_attach_loop(
                         }
                         // Scroll wheel (copy mode inactive): scroll scrollback,
                         // or forward to a mouse-aware / alt-screen app.
-                        if handle_wheel(
+                        if handle_wheel(pty_write.as_ref(),
                             kind,
                             col,
                             row,
@@ -1715,6 +1847,10 @@ async fn run_attach_loop(
                         {
                             let pulse = io_state.lock().await.render_pulse.clone();
                             pulse.bump();
+                            continue;
+                        }
+                        // Focus and border drags are shared: never a watcher's.
+                        if read_only {
                             continue;
                         }
                         let acted = match handle_mouse(
@@ -1749,7 +1885,9 @@ async fn run_attach_loop(
                     }
                     AttachClientFrame::Detach => {
                         // Detach implies the user found the prefix too.
-                        onboarding.mark_prefix_discovered().await;
+                        if !read_only {
+                            onboarding.mark_prefix_discovered().await;
+                        }
                         final_frame = Some(AttachServerFrame::DetachAck);
                         break;
                     }
@@ -1758,7 +1896,9 @@ async fn run_attach_loop(
                         // prefix even if they bail without sending an
                         // Action (Ctrl+Space → Escape, etc). The OOTB
                         // hint dismisses forever.
-                        onboarding.mark_prefix_discovered().await;
+                        if !read_only {
+                            onboarding.mark_prefix_discovered().await;
+                        }
                     }
                     AttachClientFrame::Prefix { prefix } => {
                         render_session.lock().await.client_prefix = Some(prefix);
@@ -1814,15 +1954,19 @@ async fn run_attach_loop(
         .mouse_release_written
         .retain(|(_, client), _| *client != registry_id);
     // The next voter takes the panes the moment this one is gone.
-    reconcile_session(&graph, &io_state, &config, session.session_id).await;
+    if !read_only {
+        reconcile_session(&graph, &io_state, &config, session.session_id).await;
+    }
     io_state.lock().await.render_pulse.clone().bump();
 
     // A gesture forwarded to a pane app outlives the attach: the PTY does not
     // go away when the client does. Detaching mid-drag without this leaves the
     // app believing a button is still held, and it stays that way for the rest
     // of the pane's life — visible next time anyone attaches.
-    close_open_pastes(&io_state, client_id).await;
-    release_app_gesture(&io_state, &mut selection_drag, None).await;
+    if let Some(write) = &pty_write {
+        close_open_pastes(write, &io_state, client_id).await;
+    }
+    release_app_gesture(pty_write.as_ref(), &io_state, &mut selection_drag, None).await;
 
     // The writer finishes the frame on the wire, sends the final one and
     // ends; a stalled socket ends it at the write stall.
@@ -1860,6 +2004,7 @@ async fn run_render_loop(
     cancel: CancellationToken,
     graphics: bool,
     plain: bool,
+    no_color: bool,
     tick_period: Duration,
     toast_dwell: Duration,
     // The clock hidden-cursor stamps are read against: `monotonic_now_ns`.
@@ -1922,7 +2067,9 @@ async fn run_render_loop(
     let mut toast_sheet: Option<SheetStamp> = None;
     // A driver handoff at the same size moves no pane, but changes this
     // client's status bar.
-    let mut registry = clients.changed();
+    let mut registry = clients.presence();
+    let mut peers: Option<(usize, usize)> = None;
+    let mut peer_toast: Option<PeerToast> = None;
     // When a pending hidden-cursor latch will move a pane: a frame then.
     let mut latch_at: Option<u64> = None;
     let mut last_shown: Option<Shown> = None;
@@ -1979,6 +2126,19 @@ async fn run_render_loop(
                 compositor.force_redraw();
             }
             _ = tick.tick() => {}
+            // A peer toast ends on time though nothing else draws.
+            () = async {
+                match peer_toast.as_ref().map(|t| t.until) {
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "a toast's expiry the frame must meet; never synchronises a test"
+                    )]
+                    Some(until) => tokio::time::sleep_until(until).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                peer_toast.take_if(|t| t.until <= tokio::time::Instant::now());
+            }
         }
 
         // For the wait after the frame that finds it: a frame not drawn (its
@@ -2128,6 +2288,20 @@ async fn run_render_loop(
         }
         let pane_ids = win.layout.tree.pane_ids();
         let sizing = clients.session_view(attached.session_id, attached.client, &pane_ids);
+        // Peers joining or leaving since the last frame, as one net change;
+        // the first frame only takes stock.
+        if let Some(sharing) = sizing.sharing {
+            let now = (sharing.writers, sharing.viewers);
+            if let Some(before) = peers.replace(now)
+                && let Some((text, warn)) = peer_change(before, now)
+            {
+                peer_toast = Some(PeerToast {
+                    text,
+                    warn,
+                    until: tokio::time::Instant::now() + PEER_TOAST_DWELL,
+                });
+            }
+        }
         // Status bar text. Start from the built-in (always-good)
         // segments so OOTB looks the same even when no script segments
         // are configured. Then `populate_bar` appends any
@@ -2196,23 +2370,38 @@ async fn run_render_loop(
             nerd_fonts,
             cols,
         );
-        crate::statusbar_build::append_watchers(
+        if let Some(toast) = peer_toast
+            .as_ref()
+            .filter(|t| !has_notice && t.until > tokio::time::Instant::now())
+        {
+            let shux_core::theme::Rgb { r, g, b } = if toast.warn {
+                live_theme.status_error
+            } else {
+                live_theme.status_shared
+            };
+            bar.center = vec![shux_ui::StatusSegment::styled(
+                format!(" {} ", toast.text),
+                crossterm::style::Color::Rgb { r, g, b },
+                toast.warn,
+            )];
+        }
+        crate::statusbar_build::append_viewing(&mut bar, bar_label.as_ref(), &live_theme, cols);
+        crate::statusbar_build::append_sharing(
             &mut bar,
-            sizing.attached,
+            sizing
+                .sharing
+                .and_then(crate::statusbar_build::Badge::of)
+                .as_ref(),
             &live_theme,
             cols,
+            if plain || no_color { "*" } else { "◉" },
             has_notice,
-        );
-        crate::statusbar_build::append_viewing(
-            &mut bar,
-            bar_label.as_ref(),
-            sizing.role,
-            &live_theme,
-            cols,
-            plain,
         );
         if has_notice {
             crate::statusbar_build::make_room_for_notice(&mut bar, cols);
+        }
+        if no_color {
+            crate::statusbar_build::monochrome(&mut bar);
         }
 
         // Welcome-toast lifecycle: if it's still showing and the
@@ -2470,6 +2659,52 @@ const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 /// auto-dismissing. Tuned for "long enough to read, short enough to
 /// not get in the way".
 const WELCOME_TOAST_DWELL: Duration = Duration::from_secs(3);
+
+/// How long a peer joining or leaving shows in the status bar.
+const PEER_TOAST_DWELL: Duration = Duration::from_secs(3);
+
+/// A peer change the status bar is showing, until `until`.
+struct PeerToast {
+    text: String,
+    warn: bool,
+    until: tokio::time::Instant,
+}
+
+/// What changed between two counts of a client's other `(writers, viewers)`,
+/// and whether it warns: a writer joining outranks everything else that
+/// happened between the two frames.
+fn peer_change(before: (usize, usize), now: (usize, usize)) -> Option<(String, bool)> {
+    let some = |n: usize, one: &str| match n {
+        1 => format!("a {one}"),
+        n => format!("{n} {one}s"),
+    };
+    let ((bw, bv), (nw, nv)) = (before, now);
+    Some(if nw > bw {
+        (
+            format!("! {} joined · can type", some(nw - bw, "writer")),
+            true,
+        )
+    } else if nv > bv {
+        (format!("{} joined", some(nv - bv, "viewer")), false)
+    } else if nw < bw {
+        (format!("{} left", some(bw - nw, "writer")), false)
+    } else if nv < bv {
+        (format!("{} left", some(bv - nv, "viewer")), false)
+    } else {
+        return None;
+    })
+}
+
+/// What a watcher's refused key or action flashes in its status bar.
+const READ_ONLY_NOTICE: &str = "read-only: keys are not sent";
+
+/// The actions a watcher keeps: its own help, copy mode and redraw.
+fn viewer_action(kind: ActionKind) -> bool {
+    matches!(
+        kind,
+        ActionKind::Redraw | ActionKind::ToggleHelp | ActionKind::EnterCopyMode
+    )
+}
 
 /// The status-bar line for a failed action: `"<verb> failed: <reason>"`.
 fn action_failure_notice(kind: ActionKind, e: &anyhow::Error) -> String {
@@ -2775,6 +3010,10 @@ async fn handle_mouse_selection(
             }
 
             if pane_id != attached.active_pane_id {
+                // A watcher selects only in the focused pane: focus is shared.
+                if attached.read_only {
+                    return Ok(true);
+                }
                 let _ = graph.focus_pane(pane_id).await;
             }
             let state = shux_ui::Selection {
@@ -3210,6 +3449,7 @@ enum MouseRoute {
 /// the event was first offered, so it reaches whoever takes it without one.
 #[expect(clippy::too_many_arguments, reason = "independent inputs")]
 async fn route_mouse(
+    write: Option<&PtyWrite>,
     kind: MouseKind,
     button: ProtoMouseButton,
     (col, row): (u16, u16),
@@ -3227,6 +3467,7 @@ async fn route_mouse(
     for _ in 0..2 {
         let had_copy_mode = session.lock().await.copy_mode.is_some();
         let route = route_mouse_once(
+            write,
             kind,
             button,
             (col, row),
@@ -3252,6 +3493,7 @@ async fn route_mouse(
 
 #[expect(clippy::too_many_arguments, reason = "independent inputs")]
 async fn route_mouse_once(
+    write: Option<&PtyWrite>,
     kind: MouseKind,
     button: ProtoMouseButton,
     (col, row): (u16, u16),
@@ -3271,6 +3513,7 @@ async fn route_mouse_once(
         false
     };
     match handle_app_mouse(
+        write,
         kind,
         button,
         col,
@@ -3564,6 +3807,7 @@ fn button_bit(button: ProtoMouseButton) -> u8 {
 /// detach, session end, the pane's rect vanishing under a zoom or window switch
 /// — so the app is never left believing a button is down.
 async fn release_app_gesture(
+    write: Option<&PtyWrite>,
     io_state: &Arc<Mutex<PaneIoState>>,
     gesture: &mut SelectionDrag,
     client: Option<shux_core::event::ClientId>,
@@ -3578,6 +3822,10 @@ async fn release_app_gesture(
         return;
     };
     *gesture = SelectionDrag::None;
+    // Only a writer forwards a gesture, so only a writer has one to end.
+    let Some(write) = write else {
+        return;
+    };
     // The grid may have shrunk since `last`: release inside what it has now.
     let (sgr, last) = {
         let state = io_state.lock().await;
@@ -3605,7 +3853,7 @@ async fn release_app_gesture(
             continue;
         };
         if let Some(bytes) = encode_mouse_report(cb, true, sgr, last.0, last.1) {
-            forward_bytes_to_pane(io_state, pane_id, bytes, Lane::Urgent, client).await;
+            forward_bytes_to_pane(write, io_state, pane_id, bytes, Lane::Urgent, client).await;
         }
     }
 }
@@ -3635,6 +3883,7 @@ fn holds(rect: Rect, col: u16, row: u16) -> bool {
 /// for them so the scrollback, alt-scroll and forward tiers keep working.
 #[expect(clippy::too_many_arguments, reason = "independent inputs")]
 async fn handle_app_mouse(
+    write: Option<&PtyWrite>,
     kind: MouseKind,
     button: ProtoMouseButton,
     col: u16,
@@ -3651,6 +3900,10 @@ async fn handle_app_mouse(
     border_drag: &Option<DragState>,
     gesture: &mut SelectionDrag,
 ) -> anyhow::Result<AppMouse> {
+    // A watcher's mouse never reaches an app.
+    let Some(write) = write else {
+        return Ok(AppMouse::NotHandled);
+    };
     let action = match kind {
         MouseKind::Down => ButtonAction::Press,
         MouseKind::Up => ButtonAction::Release,
@@ -3674,7 +3927,7 @@ async fn handle_app_mouse(
     let Some(views) = attached.shown.views(frame) else {
         if matches!(*gesture, SelectionDrag::App { .. }) {
             if action == ButtonAction::Release {
-                release_app_gesture(io_state, gesture, attached.client).await;
+                release_app_gesture(Some(write), io_state, gesture, attached.client).await;
             }
             return Ok(AppMouse::Consumed {
                 redraw: false,
@@ -3766,7 +4019,7 @@ async fn handle_app_mouse(
         // because a stuck button does not recover and a mis-placed release does.
         AppMouseRoute::Swallow => {
             if action == ButtonAction::Release && mode != shux_vt::MouseMode::None {
-                release_app_gesture(io_state, gesture, attached.client).await;
+                release_app_gesture(Some(write), io_state, gesture, attached.client).await;
             } else {
                 end_gesture_if_released(gesture, action, button);
             }
@@ -3782,7 +4035,7 @@ async fn handle_app_mouse(
     // it off-screen. Let the app know the button came up rather than letting
     // the gesture evaporate with it still held.
     if !pane_is_shown(graph, &attached, pane_id) {
-        release_app_gesture(io_state, gesture, attached.client).await;
+        release_app_gesture(Some(write), io_state, gesture, attached.client).await;
         return Ok(AppMouse::Consumed {
             redraw: false,
             input: false,
@@ -3825,7 +4078,7 @@ async fn handle_app_mouse(
         if let (Some((_, at)), SelectionDrag::App { last, .. }) = (cell, &mut *gesture) {
             *last = at;
         }
-        release_app_gesture(io_state, gesture, attached.client).await;
+        release_app_gesture(Some(write), io_state, gesture, attached.client).await;
         return Ok(AppMouse::Consumed {
             redraw: false,
             input: false,
@@ -3906,7 +4159,7 @@ async fn handle_app_mouse(
         ButtonAction::Release => Lane::Urgent,
         ButtonAction::Drag => Lane::Main,
     };
-    if !forward_bytes_to_pane(io_state, pane_id, bytes, lane, attached.client).await {
+    if !forward_bytes_to_pane(write, io_state, pane_id, bytes, lane, attached.client).await {
         // Dropped on the floor. Opening a gesture now would hand the app a
         // release with no press behind it.
         return Ok(AppMouse::Consumed {
@@ -3999,6 +4252,16 @@ async fn sync_focus(
         session.active_pane_id = w.active_pane;
     }
     let mut rs = render_session.lock().await;
+    // Focus moved under this client: what it was selecting or copying is in
+    // a pane it no longer shows focused, and a later yank must not copy from
+    // the new one.
+    if (rs.active_window_id, rs.active_pane_id)
+        != (session.active_window_id, session.active_pane_id)
+    {
+        rs.copy_mode = None;
+        rs.mouse_selection = None;
+        rs.copy_menu = None;
+    }
     rs.active_window_id = session.active_window_id;
     rs.active_pane_id = session.active_pane_id;
     true
@@ -4120,6 +4383,7 @@ fn wheel_arrow_seq(up: bool, app_cursor: bool) -> &'static [u8] {
 /// know: a press that was dropped must not open a gesture, or the release that
 /// follows reaches the app with no matching press and leaves it button-held.
 async fn forward_bytes_to_pane(
+    _write: &PtyWrite,
     io_state: &Arc<Mutex<PaneIoState>>,
     pane_id: PaneId,
     bytes: Vec<u8>,
@@ -4179,6 +4443,7 @@ const RELEASE_WRITE_BOUND: Duration = Duration::from_millis(100);
 /// the caller falls through to the layout/focus mouse handler.
 #[expect(clippy::too_many_arguments, reason = "independent inputs")]
 async fn handle_wheel(
+    write: Option<&PtyWrite>,
     kind: MouseKind,
     col: u16,
     row: u16,
@@ -4216,7 +4481,11 @@ async fn handle_wheel(
                 })
         }
     };
-    let pane_id = hit.unwrap_or(attached.active_pane_id);
+    // A watcher scrolls only the focused pane's scrollback: scrolling
+    // another would focus it.
+    let pane_id = hit
+        .filter(|_| write.is_some())
+        .unwrap_or(attached.active_pane_id);
     let Some(rect) = pane_rect_for(graph, &attached, client_size, config, pane_id).await else {
         return Ok(true);
     };
@@ -4241,8 +4510,10 @@ async fn handle_wheel(
         }
     };
 
-    match route_wheel(mouse_on, alt, alt_scroll) {
-        WheelRouting::ForwardMouse => {
+    // Only a writer's wheel reaches an app: a watcher's scrolls shux's own
+    // scrollback, or does nothing.
+    match (route_wheel(mouse_on, alt, alt_scroll), write) {
+        (WheelRouting::ForwardMouse, Some(write)) => {
             let cell = views
                 .and_then(|views| views.get(&pane_id))
                 .and_then(|view| shux_ui::viewport::pane_grid_cell(view, (col, row), false));
@@ -4252,18 +4523,18 @@ async fn handle_wheel(
             if let Some(bytes) = cell.and_then(|(local_col, local_row)| {
                 encode_mouse_wheel(up, sgr, local_col, local_row)
             }) {
-                forward_bytes_to_pane(io_state, pane_id, bytes, Lane::Main, None).await;
+                forward_bytes_to_pane(write, io_state, pane_id, bytes, Lane::Main, None).await;
             }
         }
-        WheelRouting::ArrowKeys => {
+        (WheelRouting::ArrowKeys, Some(write)) => {
             let seq = wheel_arrow_seq(up, app_cursor);
             let mut bytes = Vec::with_capacity(seq.len() * 3);
             for _ in 0..3 {
                 bytes.extend_from_slice(seq);
             }
-            forward_bytes_to_pane(io_state, pane_id, bytes, Lane::Main, None).await;
+            forward_bytes_to_pane(write, io_state, pane_id, bytes, Lane::Main, None).await;
         }
-        WheelRouting::Scrollback => {
+        (WheelRouting::Scrollback, _) | (_, None) => {
             // This tier is only reached while copy mode is INACTIVE (an active
             // copy mode consumes the wheel earlier, in handle_copy_mode_mouse).
             // So wheel-down here has nothing to scroll — only wheel-up opens a
@@ -4978,6 +5249,12 @@ async fn resize_pane(
 
 #[cfg(test)]
 mod tests {
+    /// A writable connection's leave to write to a PTY.
+    fn writable() -> &'static PtyWrite {
+        // Zero-sized: leaking one costs nothing.
+        Box::leak(Box::new(PtyWrite::grant(false).expect("writable")))
+    }
+
     /// A `ConfigHandle` on a path that does not exist, i.e. the defaults. The
     /// mouse handlers take one because the pane viewport is derived from
     /// `appearance.border_style` rather than cached.
@@ -5259,7 +5536,7 @@ mod tests {
         let before = graph.snapshot().sessions.len();
 
         // The short id `session list` prints attaches to that session.
-        let got = resolve_or_create_session(&graph, &Some(short.clone()), &meta)
+        let got = resolve_or_create_session(&graph, &Some(short.clone()), &meta, true)
             .await
             .expect("attach by short id");
         assert_eq!(
@@ -5274,7 +5551,7 @@ mod tests {
         );
 
         // …and so does the full uuid.
-        let got = resolve_or_create_session(&graph, &Some(target.to_string()), &meta)
+        let got = resolve_or_create_session(&graph, &Some(target.to_string()), &meta, true)
             .await
             .expect("attach by full uuid");
         assert_eq!(got.session_id, target);
@@ -5282,7 +5559,7 @@ mod tests {
 
         // A genuinely new NAME still creates — the behaviour the id branch
         // must not have swallowed.
-        let got = resolve_or_create_session(&graph, &Some("brand-new".to_string()), &meta)
+        let got = resolve_or_create_session(&graph, &Some("brand-new".to_string()), &meta, true)
             .await
             .expect("attach by new name");
         assert_ne!(got.session_id, target);
@@ -5298,7 +5575,7 @@ mod tests {
             .create_session(short.clone(), cwd.clone())
             .await
             .expect("create impostor");
-        let got = resolve_or_create_session(&graph, &Some(short.clone()), &meta)
+        let got = resolve_or_create_session(&graph, &Some(short.clone()), &meta, true)
             .await
             .expect("attach by ambiguous-looking name");
         assert_eq!(
@@ -5309,7 +5586,7 @@ mod tests {
         // A well-formed uuid naming nothing is refused, not turned into a
         // session called after itself.
         let orphan = "00000000-0000-4000-8000-000000000001";
-        let err = resolve_or_create_session(&graph, &Some(orphan.to_string()), &meta)
+        let err = resolve_or_create_session(&graph, &Some(orphan.to_string()), &meta, true)
             .await
             .expect_err("an unknown uuid must not create a session");
         assert!(err.to_string().contains(orphan), "{err}");
@@ -5353,6 +5630,7 @@ mod tests {
             Arc::new(Mutex::new((100, 40))),
             tx,
             cancel.clone(),
+            false,
             false,
             false,
             Duration::from_secs(3600),
@@ -5451,6 +5729,7 @@ mod tests {
             cancel.clone(),
             false,
             false,
+            false,
             Duration::from_secs(3600),
             WELCOME_TOAST_DWELL,
             shux_vt::monotonic_now_ns,
@@ -5529,6 +5808,7 @@ mod tests {
             Arc::new(Mutex::new((100, 24))),
             tx,
             cancel.clone(),
+            false,
             false,
             false,
             Duration::from_secs(3600),
@@ -5648,6 +5928,7 @@ mod tests {
             shown: ShownFrames::default(),
             client: None,
             cell_pixels: None,
+            read_only: false,
         };
 
         AttachFixture {
@@ -6713,6 +6994,8 @@ mod tests {
             client_version: "test".to_string(),
             graphics: false,
             plain: false,
+            read_only: false,
+            no_color: false,
         };
         framed
             .send(Bytes::from(serde_json::to_vec(&hello).expect("hello json")))
@@ -7652,6 +7935,7 @@ mod tests {
             )
             .await;
             handle_app_mouse(
+                Some(writable()),
                 kind,
                 button,
                 col,
@@ -7702,6 +7986,7 @@ mod tests {
             frame: Option<u64>,
         ) -> AppMouse {
             handle_app_mouse(
+                Some(writable()),
                 kind,
                 ProtoMouseButton::Left,
                 col,
@@ -7985,6 +8270,7 @@ mod tests {
             cancel.clone(),
             false,
             false,
+            false,
             Duration::from_secs(3600),
             WELCOME_TOAST_DWELL,
             latch_clock,
@@ -8074,6 +8360,7 @@ mod tests {
             Arc::new(Mutex::new((100, 40))),
             tx,
             cancel.clone(),
+            false,
             false,
             false,
             Duration::from_secs(3600),
@@ -8214,6 +8501,7 @@ mod tests {
         )
         .await;
         handle_wheel(
+            Some(writable()),
             MouseKind::ScrollUp,
             r.x + 1,
             r.y + 1,
@@ -8285,6 +8573,7 @@ mod tests {
             Arc::new(Mutex::new((100, 30))),
             tx,
             cancel.clone(),
+            false,
             false,
             false,
             Duration::from_secs(3600),
@@ -8365,6 +8654,7 @@ mod tests {
             Arc::new(Mutex::new((100, 30))),
             tx,
             cancel.clone(),
+            false,
             false,
             false,
             Duration::from_secs(3600),
@@ -8615,6 +8905,7 @@ mod tests {
         )
         .await;
         handle_wheel(
+            Some(writable()),
             MouseKind::ScrollUp,
             4,
             3,
@@ -8673,7 +8964,7 @@ mod tests {
             .get_mut(&pane)
             .expect("vt")
             .resize(20, 40);
-        release_app_gesture(&h.fixture.io_state, &mut h.gesture, None).await;
+        release_app_gesture(Some(writable()), &h.fixture.io_state, &mut h.gesture, None).await;
         assert_eq!(drain(&mut wr), "\x1b[<0;3;20m");
         h.fixture.stop();
     }
@@ -8962,7 +9253,7 @@ mod tests {
         h.send(MouseKind::Drag, ProtoMouseButton::Left, 14, 7).await;
         assert_eq!(recv_text(&mut wr).await, "\x1b[<32;14;7M");
 
-        release_app_gesture(&h.fixture.io_state, &mut h.gesture, None).await;
+        release_app_gesture(Some(writable()), &h.fixture.io_state, &mut h.gesture, None).await;
         assert_eq!(
             recv_text(&mut wr).await,
             "\x1b[<0;14;7m",
@@ -8970,7 +9261,7 @@ mod tests {
         );
         assert_eq!(h.gesture, SelectionDrag::None);
         // Idempotent: nothing left to release.
-        release_app_gesture(&h.fixture.io_state, &mut h.gesture, None).await;
+        release_app_gesture(Some(writable()), &h.fixture.io_state, &mut h.gesture, None).await;
         assert_no_bytes(&mut wr, "a finished gesture releases once").await;
         h.fixture.stop();
     }
@@ -9739,6 +10030,7 @@ mod tests {
 
         ship_frame(&fixture.graph, &fixture.io_state, &session, &client_size).await;
         handle_wheel(
+            Some(writable()),
             MouseKind::ScrollUp,
             3,
             3,
@@ -9811,6 +10103,7 @@ mod tests {
 
         ship_frame(&fixture.graph, &fixture.io_state, &session, &client_size).await;
         let consumed = handle_wheel(
+            Some(writable()),
             MouseKind::ScrollUp,
             3,
             3,
@@ -9854,6 +10147,7 @@ mod tests {
 
         ship_frame(&fixture.graph, &fixture.io_state, &session, &client_size).await;
         handle_wheel(
+            Some(writable()),
             MouseKind::ScrollUp,
             3,
             3,
@@ -9892,6 +10186,7 @@ mod tests {
 
         ship_frame(&fixture.graph, &fixture.io_state, &session, &client_size).await;
         handle_wheel(
+            Some(writable()),
             MouseKind::ScrollDown,
             3,
             3,
@@ -9932,6 +10227,7 @@ mod tests {
         // Wheel-up opens a wheel-initiated scrollback view (via handle_wheel).
         ship_frame(&fixture.graph, &fixture.io_state, &session, &client_size).await;
         handle_wheel(
+            Some(writable()),
             MouseKind::ScrollUp,
             3,
             3,
@@ -10052,6 +10348,7 @@ mod tests {
             .process(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h");
         let (out_tx, _out_rx) = mpsc::channel(8);
         let route = route_mouse(
+            Some(writable()),
             MouseKind::Down,
             ProtoMouseButton::Left,
             (3, 3),
@@ -10127,6 +10424,7 @@ mod tests {
         ship_frame(&fixture.graph, &fixture.io_state, &session, &client_size).await;
         resize_vt(&fixture, fixture.first_pane, 20, 49).await;
         handle_wheel(
+            Some(writable()),
             MouseKind::ScrollUp,
             3,
             3,
@@ -10167,6 +10465,7 @@ mod tests {
             top
         };
         handle_wheel(
+            Some(writable()),
             MouseKind::ScrollUp,
             3,
             3,
@@ -10205,6 +10504,7 @@ mod tests {
         ship_frame(&fixture.graph, &fixture.io_state, &session, &client_size).await;
         session.lock().await.shown.0.pop_front();
         handle_wheel(
+            Some(writable()),
             MouseKind::ScrollUp,
             3,
             3,
@@ -10362,6 +10662,7 @@ mod tests {
         // Wheel-up over pane A opens a transient, wheel-initiated scrollback on A.
         ship_frame(&fixture.graph, &fixture.io_state, &session, &client_size).await;
         handle_wheel(
+            Some(writable()),
             MouseKind::ScrollUp,
             first_point.0,
             first_point.1,
@@ -10413,6 +10714,7 @@ mod tests {
         // the pane under the cursor (B) and focuses it.
         ship_frame(&fixture.graph, &fixture.io_state, &session, &client_size).await;
         handle_wheel(
+            Some(writable()),
             MouseKind::ScrollUp,
             second_point.0,
             second_point.1,
@@ -10597,7 +10899,7 @@ mod tests {
             onboarding: crate::onboarding::OnboardingHandle,
             plain: bool,
         ) -> Self {
-            Self::attach_drawing(fixture, cols, onboarding, plain, false).await
+            Self::attach_as(fixture, cols, 24, onboarding, plain, false, false).await
         }
 
         /// A client whose terminal draws kitty graphics when `graphics`.
@@ -10606,6 +10908,28 @@ mod tests {
             cols: u16,
             onboarding: crate::onboarding::OnboardingHandle,
             plain: bool,
+            graphics: bool,
+        ) -> Self {
+            Self::attach_as(fixture, cols, 24, onboarding, plain, false, graphics).await
+        }
+
+        /// A read-only client, onboarding untouched.
+        async fn watch(
+            fixture: &AttachFixture,
+            cols: u16,
+            rows: u16,
+            onboarding: crate::onboarding::OnboardingHandle,
+        ) -> Self {
+            Self::attach_as(fixture, cols, rows, onboarding, false, true, false).await
+        }
+
+        async fn attach_as(
+            fixture: &AttachFixture,
+            cols: u16,
+            rows: u16,
+            onboarding: crate::onboarding::OnboardingHandle,
+            plain: bool,
+            read_only: bool,
             graphics: bool,
         ) -> Self {
             let (server_stream, client_stream) = tokio::io::duplex(1 << 20);
@@ -10626,10 +10950,12 @@ mod tests {
                 protocol: ATTACH_PROTOCOL_VERSION,
                 session_name: Some(fixture.attached.name.clone()),
                 cols,
-                rows: 24,
+                rows,
                 client_version: "input-test".to_string(),
                 graphics,
                 plain,
+                read_only,
+                no_color: false,
             };
             framed
                 .send(Bytes::from(serde_json::to_vec(&hello).expect("hello json")))
@@ -10642,13 +10968,14 @@ mod tests {
                 .expect("ready bytes");
             assert!(matches!(
                 serde_json::from_slice::<AttachReady>(&ready).expect("ready json"),
-                AttachReady::Ok { plain: echoed, .. } if echoed == plain
+                AttachReady::Ok { plain: echoed, read_only: ro, .. }
+                    if echoed == plain && ro == read_only
             ));
             Self {
                 framed,
-                screen: shux_vt::VirtualTerminal::new(24, usize::from(cols)),
+                screen: shux_vt::VirtualTerminal::new(usize::from(rows), usize::from(cols)),
                 written_frame: None,
-                shadow: shux_vt::VirtualTerminal::new(24, usize::from(cols)),
+                shadow: shux_vt::VirtualTerminal::new(usize::from(rows), usize::from(cols)),
                 cancel,
                 server,
             }
@@ -11974,6 +12301,8 @@ mod tests {
             client_version: "detach-then-stop".to_string(),
             graphics: false,
             plain: false,
+            read_only: false,
+            no_color: false,
         };
         framed
             .send(Bytes::from(serde_json::to_vec(&hello).expect("hello json")))
@@ -12071,6 +12400,8 @@ mod tests {
             client_version: "slow-then-removed".to_string(),
             graphics: false,
             plain: false,
+            read_only: false,
+            no_color: false,
         };
         framed
             .send(Bytes::from(serde_json::to_vec(&hello).expect("hello json")))
@@ -12213,6 +12544,8 @@ mod tests {
             client_version: "copy-then-removed".to_string(),
             graphics: false,
             plain: false,
+            read_only: false,
+            no_color: false,
         };
         let send = |f: &AttachClientFrame| Bytes::from(serde_json::to_vec(f).expect("frame json"));
         framed
@@ -12321,6 +12654,8 @@ mod tests {
             client_version: "stopped-reader".to_string(),
             graphics: false,
             plain: false,
+            read_only: false,
+            no_color: false,
         };
         framed
             .send(Bytes::from(serde_json::to_vec(&hello).expect("hello json")))
@@ -13122,6 +13457,7 @@ mod tests {
             .expect("pane vt")
             .resize(10, 20);
         handle_app_mouse(
+            Some(writable()),
             MouseKind::Drag,
             ProtoMouseButton::Left,
             point.0,
@@ -13386,6 +13722,7 @@ mod tests {
             Arc::new(Mutex::new((100, 30))),
             tx,
             cancel.clone(),
+            false,
             false,
             false,
             Duration::from_secs(3600),
@@ -14299,5 +14636,743 @@ mod tests {
             .await;
         assert!(placed, "the crop was not placed in the client's own pixels");
         h.stop().await;
+    }
+
+    /// Everything a read-only client could move if it leaked: focus, layout,
+    /// pins, every pane's size, and the session's voters.
+    #[derive(Debug, PartialEq)]
+    struct SharedState {
+        focus: (WindowId, PaneId),
+        windows: usize,
+        layout: String,
+        pinned: Vec<bool>,
+        requested: Vec<Option<(u16, u16)>>,
+        grids: Vec<Option<(usize, usize)>>,
+        voters: usize,
+    }
+
+    async fn shared_state(fixture: &AttachFixture) -> SharedState {
+        let snap = fixture.graph.snapshot();
+        let session = &snap.sessions[&fixture.session_id];
+        let window = &snap.windows[&session.active_window];
+        let panes = [fixture.first_pane, fixture.second_pane];
+        let state = fixture.io_state.lock().await;
+        SharedState {
+            focus: (session.active_window, window.active_pane),
+            windows: snap.windows.len(),
+            layout: format!("{:?}", snap.windows[&fixture.first_window].layout),
+            pinned: panes.iter().map(|p| state.clients.is_pinned(*p)).collect(),
+            requested: panes
+                .iter()
+                .map(|p| state.requested_sizes.get(p).map(|s| (s.cols, s.rows)))
+                .collect(),
+            grids: panes
+                .iter()
+                .map(|p| {
+                    state
+                        .vts
+                        .get(p)
+                        .map(|vt| (vt.grid().cols(), vt.grid().rows()))
+                })
+                .collect(),
+            voters: state.clients.list().iter().filter(|c| c.votes).count(),
+        }
+    }
+
+    /// Every frame a read-only client can send that a writer's would turn
+    /// into a write, a focus change, a layout change or a resize.
+    async fn viewer_tries_everything(viewer: &mut Client, fixture: &AttachFixture) {
+        viewer.catch_up().await;
+        let viewport = current_viewport(&Arc::new(Mutex::new((140, 50))), &test_config()).await;
+        let (first, second, border) =
+            find_pane_and_border_points(&fixture.graph, fixture.first_window, viewport);
+        let frame = viewer.written_frame;
+        viewer.key(b"typed\r").await;
+        viewer.key(b"\x1b[A").await;
+        viewer.paste(b"pasted", true).await;
+        viewer.paste(b"more", false).await;
+        viewer.send(&AttachClientFrame::PrefixTapped).await;
+        for kind in [
+            ActionKind::SplitSmart,
+            ActionKind::SplitVertical,
+            ActionKind::SplitHorizontal,
+            ActionKind::FocusUp,
+            ActionKind::FocusDown,
+            ActionKind::FocusLeft,
+            ActionKind::FocusRight,
+            ActionKind::FocusNext,
+            ActionKind::FocusPrev,
+            ActionKind::ToggleZoom,
+            ActionKind::KillPane,
+            ActionKind::NewWindow,
+            ActionKind::NextWindow,
+            ActionKind::PrevWindow,
+            ActionKind::SwitchToWindow,
+            ActionKind::ResizeLeft,
+            ActionKind::ResizeRight,
+            ActionKind::ResizeUp,
+            ActionKind::ResizeDown,
+        ] {
+            assert!(!viewer_action(kind));
+            viewer
+                .send(&AttachClientFrame::Action {
+                    kind,
+                    args: shux_rpc::attach::ActionArgs {
+                        window_index: Some(2),
+                        ..Default::default()
+                    },
+                })
+                .await;
+        }
+        for point in [first, second] {
+            for kind in [MouseKind::Down, MouseKind::Drag, MouseKind::Up] {
+                viewer.send(&left_button(kind, point, frame)).await;
+            }
+            for kind in [MouseKind::ScrollUp, MouseKind::ScrollDown, MouseKind::Move] {
+                viewer.send(&left_button(kind, point, frame)).await;
+            }
+            viewer
+                .send(&AttachClientFrame::Mouse {
+                    kind: MouseKind::Down,
+                    button: ProtoMouseButton::Right,
+                    col: point.0,
+                    row: point.1,
+                    shift: false,
+                    alt: false,
+                    ctrl: false,
+                    frame,
+                })
+                .await;
+        }
+        let dragged = (border.0.saturating_sub(5), border.1);
+        viewer
+            .send(&left_button(MouseKind::Down, border, frame))
+            .await;
+        viewer
+            .send(&left_button(MouseKind::Drag, dragged, frame))
+            .await;
+        viewer
+            .send(&left_button(MouseKind::Up, dragged, frame))
+            .await;
+        viewer
+            .send(&AttachClientFrame::Resize { cols: 60, rows: 20 })
+            .await;
+        viewer
+            .send(&AttachClientFrame::Resize {
+                cols: 150,
+                rows: 45,
+            })
+            .await;
+        // What it keeps: its own help, copy mode and redraw.
+        for kind in [
+            ActionKind::ToggleHelp,
+            ActionKind::Redraw,
+            ActionKind::EnterCopyMode,
+        ] {
+            viewer
+                .send(&AttachClientFrame::Action {
+                    kind,
+                    args: Default::default(),
+                })
+                .await;
+            viewer.key(b"q").await;
+        }
+        idle_for(QUIET).await;
+    }
+
+    /// How a read-only client's connection ends.
+    #[derive(Debug, Clone, Copy)]
+    enum ViewerExit {
+        Detach,
+        Disconnect,
+        Removed,
+    }
+
+    /// Issue #191: a read-only client sends a pane no byte and moves nothing
+    /// shared, however it leaves, while a writer holds a paste open and a
+    /// mouse button down in a pane app across its whole life. The viewer's
+    /// frames are interleaved with the writer's, and a later marker from the
+    /// writer is the first and only input each pane gets.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_only_client_writes_nothing_and_moves_nothing() {
+        let fixture = attach_fixture().await;
+        let (mut writes, rx1, _s1) = seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+        let (mut other, rx2, _s2) = seed_io_for_pane(&fixture.io_state, fixture.second_pane).await;
+        let sized = fake_pty(&fixture.io_state, fixture.first_pane, rx1);
+        let sized2 = fake_pty(&fixture.io_state, fixture.second_pane, rx2);
+        // Both programs ask for the mouse and for bracketed paste: a writer's
+        // clicks, wheel and paste would all reach them.
+        for pane in [fixture.first_pane, fixture.second_pane] {
+            if let Some(vt) = fixture.io_state.lock().await.vts.get_mut(&pane) {
+                vt.process(b"\x1b[?1002h\x1b[?1006h\x1b[?2004h");
+            }
+        }
+        let mut host = Client::attach(&fixture, 90).await;
+        idle_for(QUIET).await;
+        host.catch_up().await;
+        // History in both panes: a wheel over either has scrollback to open,
+        // and a writer's over the unfocused one would focus it.
+        let history: String = (0..100).map(|i| format!("line {i}\r\n")).collect();
+        for pane in [fixture.first_pane, fixture.second_pane] {
+            if let Some(vt) = fixture.io_state.lock().await.vts.get_mut(&pane) {
+                vt.process(history.as_bytes());
+            }
+        }
+        let mut sizing = fixture.io_state.lock().await.clients.changed();
+        sizing.borrow_and_update();
+        let before = shared_state(&fixture).await;
+        let resizes = (sized.lock().unwrap().len(), sized2.lock().unwrap().len());
+        let active_point = {
+            let viewport = current_viewport(&Arc::new(Mutex::new((90, 24))), &test_config()).await;
+            let (first, second, _) =
+                find_pane_and_border_points(&fixture.graph, fixture.first_window, viewport);
+            if before.focus.1 == fixture.first_pane {
+                first
+            } else {
+                second
+            }
+        };
+        let (focused, unfocused) = if before.focus.1 == fixture.first_pane {
+            (&mut writes, &mut other)
+        } else {
+            (&mut other, &mut writes)
+        };
+        let fresh = crate::onboarding::OnboardingState {
+            prefix_discovered: false,
+            welcome_toast_seen: false,
+        };
+
+        let exits = [
+            ViewerExit::Detach,
+            ViewerExit::Disconnect,
+            ViewerExit::Removed,
+        ];
+        for (exit, paste) in exits.into_iter().flat_map(|e| [(e, true), (e, false)]) {
+            // What the writer holds across the viewer's whole life, its
+            // leaving included: a paste open, or a mouse button down.
+            if paste {
+                host.paste(b"p1", true).await;
+            } else {
+                host.send(&left_button(
+                    MouseKind::Down,
+                    active_point,
+                    host.written_frame,
+                ))
+                .await;
+            }
+            let onboarding =
+                crate::onboarding::OnboardingHandle::from_state_for_test(fresh.clone());
+            let mut viewer = Client::watch(&fixture, 140, 50, onboarding.clone()).await;
+            assert!(
+                viewer
+                    .frames_until(|_, text| text.contains("viewing · read-only"))
+                    .await,
+                "{exit:?}: the viewer was never told it is read-only"
+            );
+            viewer_tries_everything(&mut viewer, &fixture).await;
+            match exit {
+                ViewerExit::Detach => viewer.detach().await,
+                ViewerExit::Disconnect => viewer.stop().await,
+                ViewerExit::Removed => {
+                    let id = fixture
+                        .io_state
+                        .lock()
+                        .await
+                        .clients
+                        .list()
+                        .into_iter()
+                        .find(|c| !c.votes)
+                        .expect("the viewer is listed")
+                        .id;
+                    assert!(fixture.io_state.lock().await.clients.remove(id));
+                    assert!(
+                        viewer
+                            .frames_until(|f, _| matches!(
+                                f,
+                                AttachServerFrame::SessionEnded { .. }
+                            ))
+                            .await,
+                        "a removed viewer was not told"
+                    );
+                }
+            }
+            idle_for(QUIET).await;
+            if paste {
+                host.paste(b"p2", false).await;
+            } else {
+                host.send(&left_button(
+                    MouseKind::Up,
+                    active_point,
+                    host.written_frame,
+                ))
+                .await;
+            }
+            host.key(b"MARK").await;
+            idle_for(QUIET).await;
+
+            let got: Vec<u8> = std::iter::from_fn(|| focused.try_recv().ok())
+                .flatten()
+                .collect();
+            let got = String::from_utf8_lossy(&got).into_owned();
+            // Only the writer's bytes, whole and in order: its paste or its
+            // press and release, then its marker.
+            if paste {
+                let start = String::from_utf8_lossy(PASTE_START);
+                let end = String::from_utf8_lossy(PASTE_END);
+                assert_eq!(got, format!("{start}p1p2{end}MARK"), "{exit:?}");
+            } else {
+                let reports: Vec<&str> = got
+                    .strip_suffix("MARK")
+                    .unwrap_or_default()
+                    .split_inclusive(['M', 'm'])
+                    .collect();
+                assert!(
+                    reports.len() == 2
+                        && reports[0].starts_with("\x1b[<0;")
+                        && reports[0].ends_with('M')
+                        && reports[1].starts_with("\x1b[<0;")
+                        && reports[1].ends_with('m'),
+                    "{exit:?}: not just the writer's press, release and marker: {got:?}"
+                );
+            }
+            assert!(
+                unfocused.try_recv().is_err(),
+                "{exit:?}: the other pane got input"
+            );
+            let state = onboarding.current().await;
+            assert!(
+                !state.prefix_discovered && !state.welcome_toast_seen,
+                "{exit:?}: the viewer persisted onboarding"
+            );
+            assert_eq!(shared_state(&fixture).await, before, "{exit:?}");
+            assert_eq!(
+                (sized.lock().unwrap().len(), sized2.lock().unwrap().len()),
+                resizes,
+                "{exit:?}: a pane was resized"
+            );
+            assert!(
+                !sizing.has_changed().unwrap(),
+                "{exit:?}: the viewer moved the sizing generation"
+            );
+        }
+        host.stop().await;
+        fixture.stop();
+    }
+
+    /// A read-only client's yank reaches only its own terminal, and a writer's
+    /// only its own.
+    #[tokio::test(start_paused = true)]
+    async fn a_yank_reaches_only_the_client_that_asked() {
+        let fixture = attach_fixture().await;
+        let _io1 = seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+        let _io2 = seed_io_for_pane(&fixture.io_state, fixture.second_pane).await;
+        let mut host = Client::attach(&fixture, 90).await;
+        let onboarding =
+            crate::onboarding::OnboardingHandle::from_state_for_test(Default::default());
+        let mut viewer = Client::watch(&fixture, 90, 24, onboarding).await;
+        idle_for(QUIET).await;
+        host.catch_up().await;
+        viewer.catch_up().await;
+        viewer
+            .send(&AttachClientFrame::Action {
+                kind: ActionKind::EnterCopyMode,
+                args: Default::default(),
+            })
+            .await;
+        // Select the first line and yank it.
+        viewer.key(b"v").await;
+        viewer.key(b"$").await;
+        viewer.key(b"y").await;
+        let osc = |f: &AttachServerFrame| match f {
+            AttachServerFrame::Render { data, frame: None } => BASE64
+                .decode(data.as_bytes())
+                .is_ok_and(|b| b.windows(4).any(|w| w == b"\x1b]52")),
+            _ => false,
+        };
+        assert!(
+            viewer.frames_until(|f, _| osc(f)).await,
+            "the viewer's yank never came"
+        );
+        idle_for(QUIET).await;
+        let mut leaked = false;
+        while let Ok(Some(Ok(buf))) = tokio::time::timeout(QUIET, host.framed.next()).await {
+            leaked |= osc(&serde_json::from_slice(&buf).expect("server frame"));
+        }
+        assert!(!leaked, "the viewer's yank reached the writer");
+        viewer.stop().await;
+        host.stop().await;
+        fixture.stop();
+    }
+
+    /// Strict v2: a hello of any other version is refused before the session
+    /// is looked up, created, spawned, registered or resized; a read-only
+    /// hello for a session that does not exist creates none.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_hello_has_no_side_effects() {
+        let fixture = attach_fixture().await;
+        let (_w, rx, _s) = seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+        let sized = fake_pty(&fixture.io_state, fixture.first_pane, rx);
+        let sessions = || fixture.graph.snapshot().sessions.len();
+        let before = (sessions(), shared_state(&fixture).await);
+        let mut changed = fixture.io_state.lock().await.clients.changed();
+        let mut presence = fixture.io_state.lock().await.clients.presence();
+        changed.borrow_and_update();
+        presence.borrow_and_update();
+        for (protocol, name, read_only, code) in [
+            (1, "never-made", false, "protocol_mismatch"),
+            (1, fixture.attached.name.as_str(), true, "protocol_mismatch"),
+            (3, "never-made", true, "protocol_mismatch"),
+            (
+                ATTACH_PROTOCOL_VERSION,
+                "never-made",
+                true,
+                "session_resolve",
+            ),
+        ] {
+            let (server_stream, client_stream) = tokio::io::duplex(1 << 16);
+            let server = tokio::spawn(handle_attach_connection(
+                server_stream,
+                fixture.graph.clone(),
+                fixture.io_state.clone(),
+                test_config(),
+                SegmentCache::new(),
+                crate::session_meta::SessionMetaCache::new(),
+                crate::onboarding::OnboardingHandle::from_state_for_test(Default::default()),
+                std::time::Instant::now(),
+                fixture.cancel.child_token(),
+            ));
+            let mut framed = Framed::new(client_stream, create_codec());
+            let hello = AttachHello {
+                protocol,
+                session_name: Some(name.to_string()),
+                cols: 200,
+                rows: 60,
+                client_version: "old".into(),
+                graphics: false,
+                plain: false,
+                read_only,
+                no_color: false,
+            };
+            framed
+                .send(Bytes::from(serde_json::to_vec(&hello).unwrap()))
+                .await
+                .unwrap();
+            let reply = tokio::time::timeout(shux_testkit::BUDGET, framed.next())
+                .await
+                .expect("a reply")
+                .expect("a frame")
+                .expect("bytes");
+            match serde_json::from_slice::<AttachReady>(&reply).unwrap() {
+                AttachReady::Error { code: got, .. } => assert_eq!(got, code, "{protocol}"),
+                ok => panic!("protocol {protocol} attached: {ok:?}"),
+            }
+            let _ = tokio::time::timeout(shux_testkit::BUDGET, server).await;
+            idle_for(QUIET).await;
+            assert_eq!(
+                (sessions(), shared_state(&fixture).await),
+                before,
+                "{protocol}"
+            );
+            assert!(sized.lock().unwrap().is_empty(), "{protocol}: resized");
+            assert!(fixture.io_state.lock().await.clients.list().is_empty());
+            assert!(!changed.has_changed().unwrap() && !presence.has_changed().unwrap());
+        }
+        fixture.stop();
+    }
+
+    /// The share gateway's entry (#297): read-only to exactly its session,
+    /// whatever the hello names, and refused unless the hello asks read-only.
+    #[tokio::test(start_paused = true)]
+    async fn the_in_process_entry_is_read_only_to_its_own_session() {
+        let fixture = attach_fixture().await;
+        let (mut writes, _rx, _s) = seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+        let other = fixture
+            .graph
+            .create_session("other".into(), std::env::temp_dir())
+            .await
+            .expect("another session");
+        for (read_only, named, want) in [
+            (false, "other", Err("read_only_required")),
+            (true, "other", Ok(fixture.session_id)),
+        ] {
+            let (server_stream, client_stream) = tokio::io::duplex(1 << 16);
+            let cancel = fixture.cancel.child_token();
+            let server = tokio::spawn(serve_read_only(
+                server_stream,
+                fixture.graph.clone(),
+                fixture.io_state.clone(),
+                test_config(),
+                SegmentCache::new(),
+                crate::session_meta::SessionMetaCache::new(),
+                crate::onboarding::OnboardingHandle::from_state_for_test(Default::default()),
+                std::time::Instant::now(),
+                cancel.clone(),
+                fixture.session_id,
+            ));
+            let mut framed = Framed::new(client_stream, create_codec());
+            let hello = AttachHello {
+                protocol: ATTACH_PROTOCOL_VERSION,
+                session_name: Some(named.into()),
+                cols: 80,
+                rows: 24,
+                client_version: "gateway".into(),
+                graphics: false,
+                plain: false,
+                read_only,
+                no_color: false,
+            };
+            framed
+                .send(Bytes::from(serde_json::to_vec(&hello).unwrap()))
+                .await
+                .unwrap();
+            let reply = tokio::time::timeout(shux_testkit::BUDGET, framed.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            match (serde_json::from_slice::<AttachReady>(&reply).unwrap(), want) {
+                (AttachReady::Error { code, .. }, Err(want)) => assert_eq!(code, want),
+                (
+                    AttachReady::Ok {
+                        session_id,
+                        read_only: true,
+                        ..
+                    },
+                    Ok(want),
+                ) => {
+                    assert_eq!(session_id, want.to_string());
+                    assert_ne!(session_id, other.to_string());
+                    let input = AttachClientFrame::Input {
+                        data: BASE64.encode(b"x"),
+                    };
+                    framed
+                        .send(Bytes::from(serde_json::to_vec(&input).unwrap()))
+                        .await
+                        .unwrap();
+                    idle_for(QUIET).await;
+                    assert!(
+                        writes.try_recv().is_err(),
+                        "the gateway's key reached a pane"
+                    );
+                    let listed = fixture.io_state.lock().await.clients.list();
+                    assert!(listed.iter().all(|c| !c.votes && c.session_id == want));
+                }
+                (got, want) => panic!("{got:?} for {want:?}"),
+            }
+            cancel.cancel();
+            let _ = tokio::time::timeout(shux_testkit::BUDGET, server).await;
+        }
+        fixture.stop();
+    }
+
+    /// The status row of `text`, a client's screen.
+    fn bar_of(text: &str) -> &str {
+        text.lines().last().unwrap_or_default()
+    }
+
+    /// Issue #191: three clients of different sizes each see their own badge,
+    /// through a sizing handoff and the host leaving.
+    #[tokio::test(start_paused = true)]
+    async fn each_client_sees_its_own_badge_through_a_handoff() {
+        let fixture = attach_fixture().await;
+        let (_w1, rx1, _s1) = seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+        let (_w2, rx2, _s2) = seed_io_for_pane(&fixture.io_state, fixture.second_pane).await;
+        let _log1 = fake_pty(&fixture.io_state, fixture.first_pane, rx1);
+        let _log2 = fake_pty(&fixture.io_state, fixture.second_pane, rx2);
+        let mut host = Client::attach(&fixture, 200).await;
+        let mut writer = Client::attach(&fixture, 80).await;
+        let onboarding =
+            crate::onboarding::OnboardingHandle::from_state_for_test(Default::default());
+        let mut viewer = Client::watch(&fixture, 40, 24, onboarding).await;
+        let shows = async |c: &mut Client, want: &str| {
+            let mut last = String::new();
+            let seen = c
+                .frames_until(|_, text| {
+                    last = bar_of(text).to_string();
+                    last.contains(want)
+                })
+                .await;
+            assert!(seen, "never showed {want:?}; the bar reads {last:?}");
+        };
+        shows(&mut host, "◉ shared · 1 can type · 1 watching").await;
+        shows(&mut writer, "◉ writable · your keys go to this session").await;
+        shows(&mut viewer, "◉ viewing · read-only").await;
+        // The writer takes the panes; the host keeps its seat.
+        writer.key(b"x").await;
+        idle_for(QUIET).await;
+        let driver = fixture
+            .io_state
+            .lock()
+            .await
+            .clients
+            .driver(fixture.session_id);
+        assert_eq!(
+            driver.map(|d| d.cols),
+            Some(80),
+            "the writer did not take the panes"
+        );
+        host.catch_up().await;
+        assert!(bar_of(&host.screen.capture_text(None)).contains("◉ shared · 1 can type"));
+        // The host leaves: the writer takes its seat, and is only watched.
+        host.stop().await;
+        shows(&mut writer, "◉ shared · 1 watching").await;
+        writer.stop().await;
+        viewer.catch_up().await;
+        assert!(bar_of(&viewer.screen.capture_text(None)).contains("◉ viewing · read-only"));
+        viewer.stop().await;
+        fixture.stop();
+    }
+
+    /// With no fallback tick, a host's bar follows its peers on their own:
+    /// the badge appears and goes, a peer toast clears at its expiry, and a
+    /// share link shows `0 watching`.
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_bar_follows_peers_and_a_share_link() {
+        let fixture = attach_fixture().await;
+        let clients = fixture.io_state.lock().await.clients.clone();
+        let info = |votes| crate::clients::ClientInfo {
+            id: shux_core::event::ClientId::new(),
+            session_id: fixture.session_id,
+            cols: 100,
+            rows: 30,
+            attached_at: std::time::SystemTime::now(),
+            votes,
+            last_input: None,
+        };
+        let host = info(true);
+        let _host = clients.register(host.clone(), CancellationToken::new());
+        let onboarding = crate::onboarding::OnboardingHandle::from_state_for_test(
+            crate::onboarding::OnboardingState {
+                prefix_discovered: true,
+                welcome_toast_seen: true,
+            },
+        );
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = fixture.cancel.child_token();
+        let attached = AttachedSession {
+            client: Some(host.id),
+            ..fixture.attached.clone()
+        };
+        let render = tokio::spawn(run_render_loop(
+            fixture.graph.clone(),
+            fixture.io_state.clone(),
+            test_config(),
+            SegmentCache::new(),
+            crate::session_meta::SessionMetaCache::new(),
+            onboarding,
+            std::time::Instant::now(),
+            Arc::new(Mutex::new(attached)),
+            Arc::new(Mutex::new((100, 30))),
+            tx,
+            cancel.clone(),
+            false,
+            false,
+            false,
+            Duration::from_secs(24 * 3600),
+            WELCOME_TOAST_DWELL,
+            shux_vt::monotonic_now_ns,
+        ));
+        let mut screen = shux_vt::VirtualTerminal::new(30, 100);
+        let mut bar_until = async |pred: &dyn Fn(&str) -> bool| {
+            let deadline = shux_testkit::Deadline::start();
+            loop {
+                let row = bar_of(&screen.capture_text(None)).to_string();
+                if pred(&row) {
+                    return row;
+                }
+                match deadline.run(rx.recv()).await {
+                    Some(Some(AttachServerFrame::Render { data, .. })) => {
+                        screen.process(&BASE64.decode(data).expect("render base64"));
+                    }
+                    Some(Some(_)) => {}
+                    _ => panic!("the bar never showed it; it reads {row:?}"),
+                }
+            }
+        };
+        bar_until(&|bar| !bar.trim().is_empty()).await;
+        assert!(
+            !bar_until(&|_| true).await.contains('◉'),
+            "a solo host has a badge"
+        );
+
+        let viewer = clients.register(info(false), CancellationToken::new());
+        bar_until(&|bar| bar.contains("◉ shared · 1 watching") && bar.contains("a viewer joined"))
+            .await;
+        let shown = tokio::time::Instant::now();
+        bar_until(&|bar| bar.contains("◉ shared · 1 watching") && !bar.contains("joined")).await;
+        let dwelt = shown.elapsed();
+        assert!(
+            dwelt >= PEER_TOAST_DWELL && dwelt < PEER_TOAST_DWELL * 2,
+            "the toast cleared after {dwelt:?}, not at its own expiry"
+        );
+
+        let writer = clients.register(info(true), CancellationToken::new());
+        bar_until(&|bar| {
+            bar.contains("◉ shared · 1 can type") && bar.contains("! a writer joined")
+        })
+        .await;
+        drop((writer, viewer));
+        bar_until(&|bar| !bar.contains('◉')).await;
+        clients.set_shared(fixture.session_id, true);
+        bar_until(&|bar| bar.contains("◉ shared · 0 watching")).await;
+        clients.set_shared(fixture.session_id, false);
+        bar_until(&|bar| !bar.contains('◉')).await;
+        cancel.cancel();
+        let _ = render.await;
+        fixture.stop();
+    }
+
+    /// A viewer's copy mode does not survive focus moving under it: a yank
+    /// would copy from a pane it never selected in.
+    #[tokio::test(start_paused = true)]
+    async fn focus_moving_under_a_viewer_ends_its_copy_mode() {
+        let fixture = attach_fixture().await;
+        let _io1 = seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+        let _io2 = seed_io_for_pane(&fixture.io_state, fixture.second_pane).await;
+        let onboarding =
+            crate::onboarding::OnboardingHandle::from_state_for_test(Default::default());
+        let mut viewer = Client::watch(&fixture, 90, 24, onboarding).await;
+        idle_for(QUIET).await;
+        viewer.catch_up().await;
+        viewer
+            .send(&AttachClientFrame::Action {
+                kind: ActionKind::EnterCopyMode,
+                args: Default::default(),
+            })
+            .await;
+        viewer.key(b"v").await;
+        idle_for(QUIET).await;
+        let focused = fixture.graph.snapshot().windows[&fixture.first_window].active_pane;
+        let other = if focused == fixture.first_pane {
+            fixture.second_pane
+        } else {
+            fixture.first_pane
+        };
+        fixture
+            .graph
+            .focus_pane(other)
+            .await
+            .expect("focus the other pane");
+        viewer.key(b"$").await;
+        viewer.key(b"y").await;
+        assert!(
+            viewer
+                .frames_until(|_, text| bar_of(text).contains(READ_ONLY_NOTICE))
+                .await,
+            "the yank key was not refused as a plain key"
+        );
+        let mut yanked = false;
+        while let Ok(Some(Ok(buf))) = tokio::time::timeout(QUIET, viewer.framed.next()).await {
+            if let Ok(AttachServerFrame::Render { data, frame: None }) =
+                serde_json::from_slice(&buf)
+            {
+                yanked |= BASE64
+                    .decode(data.as_bytes())
+                    .is_ok_and(|b| b.windows(4).any(|w| w == b"\x1b]52"));
+            }
+        }
+        assert!(!yanked, "a yank copied from a pane focus moved to");
+        viewer.stop().await;
+        fixture.stop();
     }
 }

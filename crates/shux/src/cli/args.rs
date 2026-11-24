@@ -347,6 +347,13 @@ pub enum SessionCommand {
         /// run the panes' programs.
         #[arg(long)]
         plain: bool,
+
+        /// Watch only: scroll, select, copy and resize your own view, but no
+        /// key, paste or click reaches the session, and nothing shared moves
+        /// (focus, layout, pane sizes). Attaches to a session that exists, on
+        /// a daemon that is running: it creates and starts neither.
+        #[arg(long)]
+        read_only: bool,
     },
 
     /// Rasterize a session's active window to a composed PNG.
