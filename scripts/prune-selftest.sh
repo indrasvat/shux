@@ -88,6 +88,23 @@ start_fake() {
   exit 1
 }
 
+# zombie_cargo <fixture>: a perl parent that forks a `cargo` child, never reaps it,
+# and sleeps until cleanup kills it; returned once the child is a zombie.
+zombie_cargo() {
+  local parent i z
+  perl -e 'my $c = fork(); if (!$c) { exec($ARGV[0], "-e", "exit 0") } sleep 3600' "$1/bin/cargo" \
+    </dev/null >/dev/null 2>&1 &
+  parent=$!
+  echo "${parent}" >>"${work}/pids"
+  for i in $(seq 1 300); do
+    z="$(ps -axo ppid=,stat= | awk -v p="${parent}" '$1 == p && $2 ~ /^Z/ { print "z" }')"
+    [[ -z "${z}" ]] || return 0
+    sleep 0.1
+  done
+  echo "✗ prune self-test: the zombie cargo never appeared" >&2
+  exit 1
+}
+
 # ── Fixture ────────────────────────────────────────────────────────────────
 wt_add() { git -C "$1" worktree add -q -b "$2" "$3"; }
 commit_push() { git -C "$1" add -f -- "${@:3}"; git -C "$1" commit -qm "$2"; git -C "$1" push -q origin HEAD; }
@@ -205,6 +222,12 @@ fixture() {
   start_fake "$(command -v perl)" "${repo}/target/debug/shux" "${f}/daemon" __daemon
   DAEMON="${FAKE}"
   echo "${DAEMON}" >"${f}/daemon.pid"
+  # Builds on the machine that are none of the repo's, as another suite's are: a cargo
+  # whose scratch cwd was deleted, and a zombie cargo (exited, never reaped).
+  mkdir -p "${f}/foreign"
+  start_fake "${f}/bin/cargo" "${f}/bin/cargo" "${f}/foreign" "${f}/foreign.pl"
+  find "${f}/foreign" -delete
+  zombie_cargo "${f}"
 
   blob "${f}/neutral/bin/oldsha-tc/shux"
   blob "${f}/neutral/bin/newsha-tc/shux"
@@ -630,6 +653,9 @@ mutant() { M_NAME+=("$1") M_FROM+=("$2") M_TO+=("$3") M_WANT+=("$4"); }
     'if false; then HOLD="$(build_activity_hold' 'mid-apply fuzz/target was removed'
   mutant 'unreadable cwd' '[[ "$(pid_state "${pid}")" == dead ]] || CWD_UNKNOWN="cannot see the cwd' \
     'true || CWD_UNKNOWN="cannot see the cwd' 'an unreadable build cwd was ignored'
+  mutant 'foreign deleted cwd' '    B_PID+=("${pid}") B_NAME+=("${name}") B_CWD+=("${cwd}")' \
+    '    [[ -d "${cwd}" ]] || { CWD_UNKNOWN=gone; continue; }; B_PID+=("${pid}") B_NAME+=("${name}") B_CWD+=("${cwd}")' \
+    'wt-pushed/target was kept'
 }
 
 # mutate <file> <from> <to> <out>: the first occurrence replaced, literally

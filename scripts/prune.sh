@@ -216,10 +216,7 @@ scan_builds() {
       [[ "$(pid_state "${pid}")" == dead ]] || CWD_UNKNOWN="cannot see the cwd of ${name} (pid ${pid})"
       continue
     fi
-    if [[ ! -d "${cwd}" ]]; then
-      CWD_UNKNOWN="the cwd of ${name} (pid ${pid}) does not resolve"
-      continue
-    fi
+    # Attributed by its text, deleted or not: one outside every worktree builds in none.
     B_PID+=("${pid}") B_NAME+=("${name}") B_CWD+=("${cwd}")
   done <<<"${table}"
 }
