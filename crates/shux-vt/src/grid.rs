@@ -647,6 +647,28 @@ impl ImageGeometry {
     }
 }
 
+/// One axis of a picture `extent` source pixels long, drawn `dest` px long:
+/// the source pixels `first..end` that its part `v0..v1` shows, and how far
+/// into that part the first of them begins. A source pixel cut by `v0` that
+/// spans a whole drawn pixel or more is left out, so none is drawn narrower
+/// than it is, unless nothing would be left, as inside one source pixel.
+pub fn visible_span(extent: u32, dest: u64, v0: u64, v1: u64) -> Option<(u32, u32, u64)> {
+    let e = u64::from(extent);
+    let v1 = v1.min(dest);
+    if e == 0 || v0 >= v1 {
+        return None;
+    }
+    let end = v1.saturating_mul(e).div_ceil(dest).min(e);
+    let ceil = v0.saturating_mul(e).div_ceil(dest);
+    let lead = (ceil.saturating_mul(dest) / e).saturating_sub(v0);
+    let (first, lead) = if lead >= 1 && ceil < end {
+        (ceil, lead)
+    } else {
+        (v0.saturating_mul(e) / dest, 0)
+    };
+    Some((u32::try_from(first).ok()?, u32::try_from(end).ok()?, lead))
+}
+
 /// A placement resolved into a composed multi-pane frame.
 ///
 /// Separate from [`Placement`] because a composed frame numbers rows from zero,
@@ -659,7 +681,9 @@ pub struct ComposedPlacement {
     /// Composed-frame row of the image's top. Negative means the top is above
     /// `clip`: draw from `clip.row`, skipping that many cell rows of bitmap.
     pub row: i64,
-    pub col: usize,
+    /// Composed-frame column of the image's left edge. It may lie left of
+    /// `clip.col`, below zero even, and is cropped there as `row` is above.
+    pub col: i64,
     pub clip: CellRect,
     pub geometry: ImageGeometry,
 }
@@ -2715,6 +2739,7 @@ mod tests {
         let mut cursor = Cursor::default();
         let (mut stashed_grid, mut stashed_cursor, mut spare) = (None, None, None);
         let mut alt_images = crate::graphics::image::ImageStore::default();
+        let mut swaps = crate::screen::Swaps::default();
 
         macro_rules! swap {
             ($m:ident) => {{
@@ -2726,6 +2751,7 @@ mod tests {
                     spare: &mut spare,
                     reuse: true,
                     alt_images: &mut alt_images,
+                    swaps: &mut swaps,
                 }
                 .$m(true);
             }};

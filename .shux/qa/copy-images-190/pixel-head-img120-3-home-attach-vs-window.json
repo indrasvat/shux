@@ -1,0 +1,1 @@
+{"actual": "head-img120-3-home-attach-body.png", "changed_pixels": 0, "diff": "head-img120-3-home-body-diff.png", "expected": "head-img120-3-home-window-body.png", "masks": [], "max_mean_channel_delta": 0.0, "max_pixel_diff_ratio": 0.0, "mean_rgba_channel_delta": 0.0, "pixel_diff_ratio": 0.0, "size": [1080, 741], "status": "pass", "total_pixels": 800280}

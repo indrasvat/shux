@@ -129,6 +129,34 @@ vertical separator, which gives per-pane rects, and asserts:
 It was proven able to fail by building it with the size label turned off: the
 viewer's border then held no more than the driver's, and `label` went red.
 
+### Pictures cropped by a horizontal scroll
+
+`.shux/scripts/gui_terminal_image_crop.sh` pins one pane wider than its rect
+and has it draw three pictures of vertical colour bands: A at its own size,
+one band per cell; B fitted to five cells, so its four bands are 1.25 cells
+wide and the crop cuts one of them mid-cell; and C, four source pixels fitted
+to five cells, so each band is one source pixel and the crop cuts inside one.
+The pane then moves its cursor right, so the slice starts eleven columns in
+(one cell into A, three into B, two into C), and back home. kitty runs at
+font size 20, cells near twice shux's declared 9x19 px, so an `X=` offset in
+declared pixels lands visibly short. `lib/kitty_image_crop_verdict.py` reads
+a row through each picture. For B and C, which kitty blends across (in linear
+light), a band edge is where the colour passes halfway to the next band, and
+each must be within 1 px of true. It asserts:
+
+| Assertion | What a failure means |
+|---|---|
+| `whole` | a picture's bands are not drawn in order, at their widths, from its cell |
+| `cropped` | after the scroll, a picture does not start at its first source pixel wholly inside the slice, where that pixel truly begins (B: at the pane's edge, three quarters of a band left; C: half a cell in, the cut sliver blank) |
+| `contained` | a band colour is painted outside the pane in any frame: on the border, the status bar or past the window |
+| `restored` | the pane does not draw exactly as it did before the scroll |
+
+It was proven able to fail against `444b6ba`, which took a picture down once
+its origin left the slice: `cropped` went red with neither picture drawn.
+Against `c6c0ebd`, which started the source a pixel early, C showed the cut
+pixel stretched over the pane's first two cells; against `164103f`, which sent
+`X=` in declared pixels, C began 4 px short.
+
 ### Tools
 
 `kitty`, `Xvfb`, `xdotool`, ImageMagick's `import`, `python3`, `uv`. The rig

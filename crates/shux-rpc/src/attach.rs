@@ -157,6 +157,11 @@ pub enum AttachClientFrame {
     /// config reload changes it, so the hints the daemon draws name the key
     /// that actually works. A daemon that has none uses its own config's.
     Prefix { prefix: String },
+    /// The size in pixels of one of the client's cells, as its terminal
+    /// reports it. Sent when streaming starts and after each resize, by a
+    /// client whose terminal knows; a picture placed partway into a cell is
+    /// offset in these pixels. A daemon that predates it skips the frame.
+    CellPixels { width: u16, height: u16 },
     /// Heartbeat reply.
     Pong,
 }
@@ -240,6 +245,10 @@ pub struct ActionArgs {
     /// doesn't try to be clever about clamping.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_index: Option<u16>,
+    /// For `ActionKind::EnterCopyMode`: the last `Render { frame }` the
+    /// client wrote, so copy mode opens over the slice the user saw.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame: Option<u64>,
 }
 
 #[cfg(test)]

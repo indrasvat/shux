@@ -43,7 +43,8 @@ pub use graphics::image::StoredImage;
 pub use graphics::kitty::Format as ImageFormat;
 use grid::ResizePoint;
 pub use grid::{
-    CellRect, ComposedPlacement, DirtyRegion, Grid, GridConfig, ImageGeometry, PixelRect, Row,
+    CellRect, ComposedPlacement, DirtyRegion, Grid, GridConfig, ImageGeometry, PixelRect,
+    Placement, Row, visible_span,
 };
 pub use parser::{MouseMode, ScrollRegion, TerminalModes, VtHandler};
 #[cfg(any(test, fuzzing))]
@@ -164,6 +165,8 @@ pub struct VirtualTerminal {
     /// same frozen frame — an alt toggle inside ?2026h must not leak a
     /// future flag against old pixels.
     frozen_alt: Option<bool>,
+    /// Screen swaps, frozen alongside `frozen_alt`.
+    swaps: screen::Swaps,
     /// Whether to take the whole snapshot at `?2026h` rather than at the first
     /// write. Always `false` outside the differential tests — see
     /// [`VirtualTerminal::set_eager_sync_freeze`].
@@ -334,6 +337,7 @@ impl VirtualTerminal {
             frozen_colors: None,
             frozen_title: None,
             frozen_alt: None,
+            swaps: screen::Swaps::default(),
             eager_sync_freeze: false,
             sync_opened_ns: 0,
             sync_bytes: 0,
@@ -446,6 +450,7 @@ impl VirtualTerminal {
         }
         if self.frozen_alt.is_none() {
             self.frozen_alt = Some(self.modes.alternate_screen);
+            self.swaps.freeze();
         }
     }
 
@@ -480,6 +485,7 @@ impl VirtualTerminal {
         self.frozen_colors = None;
         self.frozen_title = None;
         self.frozen_alt = None;
+        self.swaps.frozen = None;
         self.modes.synchronized_output = false;
         self.sync_opened_ns = 0;
         self.sync_bytes = 0;
@@ -563,6 +569,7 @@ impl VirtualTerminal {
             dcs_state: &mut self.dcs_state,
             sync_armed: &self.sync_armed,
             frozen_alt: &mut self.frozen_alt,
+            swaps: &mut self.swaps,
             eager_sync_freeze: self.eager_sync_freeze,
             active_grapheme_cell: &mut self.active_grapheme_cell,
             last_graphic: &mut self.last_graphic,
@@ -1249,6 +1256,13 @@ impl VirtualTerminal {
         }
     }
 
+    /// Lines evicted from the front of the presented history so far: never
+    /// decreases, and presented line `i` names the same line as long as it
+    /// does not change.
+    pub fn presented_evicted(&self) -> u64 {
+        self.presented_history_grid().evicted()
+    }
+
     /// One line of the presented frame by absolute index, counting history
     /// from 0. The companion to [`VirtualTerminal::presented_total_lines`].
     pub fn presented_row(&self, abs: usize) -> Option<&Row> {
@@ -1323,6 +1337,12 @@ impl VirtualTerminal {
     /// review blocker). Live mode state is available via `modes()`.
     pub fn is_alternate_screen(&self) -> bool {
         self.frozen_alt.unwrap_or(self.modes.alternate_screen)
+    }
+
+    /// Which screen the PRESENTED frame shows, as a count of swaps: two reads
+    /// are equal only if no swap came between them, a round trip included.
+    pub fn presented_screen(&self) -> u64 {
+        self.swaps.presented()
     }
 
     /// Whether a valid OSC 4 palette override has been applied to this VT at
@@ -1439,6 +1459,7 @@ impl VirtualTerminal {
             stashed_grid: &mut self.alt_grid,
             stashed_cursor: &mut self.alt_cursor,
             spare: &mut self.alt_spare,
+            swaps: &mut self.swaps,
             reuse: self.reuse_retired_grids,
             alt_images: &mut self.graphics.stores[1],
         }

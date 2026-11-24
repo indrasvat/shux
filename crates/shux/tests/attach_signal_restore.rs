@@ -333,8 +333,13 @@ impl AttachedClient {
 impl Drop for AttachedClient {
     fn drop(&mut self) {
         let _ = self.child.kill();
-        let _ = self.child.wait();
         self.stop_reading();
+        // A client exiting with output its terminal never read waits in the
+        // kernel for that output to drain: closing the master discards it.
+        if let Ok(null) = File::open("/dev/null") {
+            self.master = null;
+        }
+        let _ = self.child.wait();
     }
 }
 
@@ -591,11 +596,19 @@ async fn a_client_whose_session_ends_is_hung_up_on() {
     .await;
 }
 
+/// Whether output the terminal has not read is queued behind the PTY.
+#[cfg(not(target_os = "linux"))]
+fn blocked_writing_to_terminal(slave: &OwnedFd) -> bool {
+    let mut queued: nix::libc::c_int = 0;
+    // SAFETY: TIOCOUTQ writes one int through a pointer to a live local.
+    let ok = unsafe { nix::libc::ioctl(slave.as_raw_fd(), nix::libc::TIOCOUTQ, &mut queued) };
+    ok == 0 && queued > 0
+}
+
 /// A terminal that stops reading (a stalled ssh, a hung emulator) leaves the
 /// client blocked mid-write. A signal must still end it and restore the modes:
-/// that is exactly when someone reaches for `kill`. Linux only: proving the
-/// client really is blocked reads `/proc`.
-#[cfg(target_os = "linux")]
+/// that is exactly when someone reaches for `kill`. On macOS the exit itself
+/// then waits for the unread output to drain, which never comes.
 #[test]
 fn a_signal_ends_a_client_whose_terminal_stopped_reading() {
     let h = Harness::new();
@@ -606,8 +619,12 @@ fn a_signal_ends_a_client_whose_terminal_stopped_reading() {
 
     // Stop reading and let the client's output back up behind the PTY.
     client.stop_reading();
+    #[cfg(target_os = "linux")]
+    let backed_up = || blocked_writing_to_terminal(client.child.id());
+    #[cfg(not(target_os = "linux"))]
+    let backed_up = || blocked_writing_to_terminal(&client._slave);
     assert!(
-        poll_until(BUDGET, || blocked_writing_to_terminal(client.child.id())),
+        poll_until(BUDGET, backed_up),
         "the client never blocked on its terminal; this test proves nothing"
     );
     kill(Pid::from_raw(client.child.id() as i32), Signal::SIGTERM).expect("signal attach");
@@ -618,6 +635,105 @@ fn a_signal_ends_a_client_whose_terminal_stopped_reading() {
     assert_eq!(
         after.local_flags, before.local_flags,
         "local flags not restored while the terminal was not reading"
+    );
+    assert_eq!(
+        status.signal(),
+        Some(Signal::SIGTERM as i32),
+        "got {status}"
+    );
+}
+
+/// Output queued behind the PTY that the terminal has not read. macOS only:
+/// Linux reports 0 for a PTY slave whatever is queued.
+#[cfg(target_os = "macos")]
+fn unread_output(slave: &OwnedFd) -> usize {
+    let mut queued: nix::libc::c_int = 0;
+    // SAFETY: TIOCOUTQ writes one int through a pointer to a live local.
+    let ok = unsafe { nix::libc::ioctl(slave.as_raw_fd(), nix::libc::TIOCOUTQ, &mut queued) };
+    assert_eq!(ok, 0, "TIOCOUTQ: {}", std::io::Error::last_os_error());
+    usize::try_from(queued).unwrap_or(0)
+}
+
+/// A signal that lands while the client is already restoring the terminal,
+/// after its session ended, with the terminal no longer reading: the restore
+/// is stuck waiting on the terminal, and the signal must still end the client.
+/// macOS only: there a process exiting with unread output on its controlling
+/// terminal waits for it to drain; Linux exits regardless.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_signal_during_the_restore_ends_a_client_whose_terminal_stopped_reading() {
+    let h = Harness::new();
+    h.create_session("sig-restoring");
+    let sock = h.runtime_dir().join("shux").join("attach.sock");
+    std::fs::rename(&sock, sock.with_extension("real")).expect("move the real attach socket");
+    let listener = tokio::net::UnixListener::bind(&sock).expect("bind stand-in");
+
+    let mut client = AttachedClient::spawn(&h, "sig-restoring");
+    let before = client.initial.clone();
+    let (stream, _) = tokio::time::timeout(BUDGET, listener.accept())
+        .await
+        .expect("the client never connected")
+        .expect("accept");
+    let mut framed = Framed::new(stream, shux_rpc::create_codec());
+    tokio::time::timeout(BUDGET, framed.next())
+        .await
+        .expect("no hello")
+        .expect("closed before the hello")
+        .expect("read hello");
+    let send = |frame: &AttachServerFrame| Bytes::from(serde_json::to_vec(frame).unwrap());
+    let ready = AttachReady::Ok {
+        session_id: "stand-in".into(),
+        session_name: "sig-restoring".into(),
+        active_window_id: "stand-in".into(),
+        active_pane_id: "stand-in".into(),
+        protocol: ATTACH_PROTOCOL_VERSION,
+        plain: false,
+    };
+    framed
+        .send(Bytes::from(serde_json::to_vec(&ready).unwrap()))
+        .await
+        .expect("send ready");
+    // A frame the client draws once it is in its loop, past everything it
+    // writes on the way in.
+    let marker = format!("RESTORE-{}", std::process::id());
+    framed
+        .send(send(&AttachServerFrame::Render {
+            data: BASE64.encode(format!("\x1b[38;2;1;2;3m{marker}\x1b[0m")),
+            frame: None,
+        }))
+        .await
+        .expect("send render");
+    assert!(
+        poll_until(BUDGET, || find(&client.seen(), marker.as_bytes())),
+        "the client never drew the marker frame"
+    );
+    client.stop_reading();
+    assert_eq!(
+        unread_output(&client._slave),
+        0,
+        "precondition: the client wrote after its marker frame"
+    );
+
+    framed
+        .send(send(&AttachServerFrame::SessionEnded {
+            reason: "test".into(),
+        }))
+        .await
+        .expect("send session ended");
+    // The restore's sequences fit; its drain then waits on a terminal that
+    // will never read them.
+    assert!(
+        poll_until(BUDGET, || unread_output(&client._slave) > 0),
+        "the client never began restoring the terminal"
+    );
+    kill(Pid::from_raw(client.child.id() as i32), Signal::SIGTERM).expect("signal attach");
+    let status = client
+        .exit_status()
+        .expect("a client stuck restoring its terminal ignored SIGTERM");
+    let after = client.termios();
+    assert_eq!(
+        after.local_flags, before.local_flags,
+        "local flags not restored"
     );
     assert_eq!(
         status.signal(),

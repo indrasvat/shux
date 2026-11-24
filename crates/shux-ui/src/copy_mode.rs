@@ -1,15 +1,16 @@
-//! Copy mode — vim-style cursor + selection on the focused pane,
-//! yanking via OSC 52 (terminal-driven system clipboard).
+//! Copy mode — vim-style cursor + selection on one pane, yanking via OSC 52
+//! (terminal-driven system clipboard).
 //!
-//! Captures the common ad-hoc copy use case: move through visible output or
-//! scrollback, search, select text, and put it on the system clipboard.
+//! Activated by `prefix + [` (tmux convention) → `ActionKind::EnterCopyMode`,
+//! or by the wheel over a pane with history. Modal copy mode freezes the
+//! slice of the pane the client was shown when it began ([`CopyView`]) and
+//! reads the presented buffer through it while the application keeps
+//! writing: its text, highlight, cursor, hit-testing and yank all go through
+//! that one view. Cursor and anchor are SOURCE coordinates (column, presented
+//! line), so moving the view keeps a selection.
 //!
-//! Activated by `prefix + [` (tmux convention) → `ActionKind::
-//! EnterCopyMode`. While the mode is active the daemon swallows
-//! every Input frame and routes the bytes through `handle_key`,
-//! which mutates a `CopyModeState`. The render loop overlays a
-//! cursor block and (if a selection anchor is set) a reverse-video
-//! highlight on the focused pane's rect.
+//! A mouse selection outside copy mode is a [`Selection`] over the slice one
+//! frame showed.
 
 use std::io::Write as _;
 
@@ -17,59 +18,337 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
 use shux_core::layout::Rect;
+use shux_core::model::PaneId;
 use shux_core::theme::{Rgb, Theme};
 use std::borrow::Cow;
 
 use shux_vt::{Cell, CellFlags, Color, Row, VirtualTerminal};
 
-use crate::viewport::PaneViewport;
+use crate::viewport::{PaneViewport, blank_like};
 
-/// Per-attach session copy-mode state. `None` means the user is in
-/// normal pane-input mode.
+/// A mouse selection, its ends local to the slice it was made over.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Selection {
+    pub cursor: (u16, u16),
+    pub anchor: Option<(u16, u16)>,
+}
+
+/// The slice of one pane modal copy mode reads, frozen when it began.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CopyView {
+    /// The pane's viewport in the frame copy mode began from.
+    pub entry: PaneViewport,
+    /// Presented line (history counted from 0) at the top when it began.
+    pub entry_top: usize,
+    /// Presented line at the top now.
+    pub top: usize,
+    /// First source column shown.
+    pub col: usize,
+    /// The presented history's eviction count both lines are counted against.
+    evicted: u64,
+    /// [`VirtualTerminal::presented_screen`] when it began.
+    screen: u64,
+}
+
+/// Where a pane's presented lines stood when a frame drew it: output since
+/// moves its lines further into history, and eviction moves them back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Drawn {
+    pub history: usize,
+    pub evicted: u64,
+    /// The screen they were on, as [`VirtualTerminal::presented_screen`].
+    pub screen: u64,
+}
+
+impl Drawn {
+    pub fn of(vt: &VirtualTerminal) -> Self {
+        Self {
+            history: history_len(vt),
+            evicted: vt.presented_evicted(),
+            screen: vt.presented_screen(),
+        }
+    }
+
+    /// Whether `vt` still presents the screen these lines were on.
+    pub fn on_screen_of(&self, vt: &VirtualTerminal) -> bool {
+        self.screen == vt.presented_screen()
+    }
+
+    /// Whether the line at the top of `entry`, drawn when lines stood here,
+    /// is still in `vt`'s history.
+    pub fn keeps_top_of(&self, entry: &PaneViewport, vt: &VirtualTerminal) -> bool {
+        let gone = vt.presented_evicted().saturating_sub(self.evicted);
+        usize::try_from(gone).is_ok_and(|gone| gone <= self.history + entry.row_offset)
+    }
+}
+
+impl CopyView {
+    /// `entry`, drawn when `vt`'s lines stood at `drawn`, over `vt` as it
+    /// presents now; `None` once `vt`'s grid or screen is not the one
+    /// `entry` showed, or its top line has been evicted.
+    pub fn new(entry: PaneViewport, drawn: Drawn, vt: &VirtualTerminal) -> Option<Self> {
+        let grid = vt.grid();
+        if (grid.rows(), grid.cols()) != (entry.grid_rows, entry.grid_cols)
+            || !drawn.on_screen_of(vt)
+            || !drawn.keeps_top_of(&entry, vt)
+        {
+            return None;
+        }
+        let top = drawn.history + entry.row_offset;
+        let view = Self {
+            entry,
+            entry_top: top,
+            top,
+            col: entry.col_offset,
+            evicted: drawn.evicted,
+            screen: drawn.screen,
+        };
+        Some(view.rebased(vt))
+    }
+
+    pub fn rect(&self) -> Rect {
+        self.entry.rect
+    }
+
+    /// Lines shown: as many as the frame it began from showed.
+    pub fn rows(&self) -> usize {
+        self.entry.shown_rows()
+    }
+
+    pub fn cols(&self) -> usize {
+        self.entry.shown_cols()
+    }
+
+    /// Whether this view still names the cells it did in a frame drawing the
+    /// pane in `rect`: the same rect, grid size and screen.
+    pub fn maps(&self, rect: Rect, vt: &VirtualTerminal) -> bool {
+        let grid = vt.grid();
+        rect == self.entry.rect
+            && (grid.rows(), grid.cols()) == (self.entry.grid_rows, self.entry.grid_cols)
+            && self.on_screen_of(vt)
+    }
+
+    /// Whether `vt` still presents the screen this view began on.
+    pub fn on_screen_of(&self, vt: &VirtualTerminal) -> bool {
+        self.screen == vt.presented_screen()
+    }
+
+    fn evicted_since(&self, vt: &VirtualTerminal) -> usize {
+        let gone = vt.presented_evicted().saturating_sub(self.evicted);
+        usize::try_from(gone).unwrap_or(usize::MAX)
+    }
+
+    /// This view with its lines counted against `vt`'s history now.
+    pub fn rebased(self, vt: &VirtualTerminal) -> Self {
+        let gone = self.evicted_since(vt);
+        Self {
+            top: self.top.saturating_sub(gone),
+            entry_top: self.entry_top.saturating_sub(gone),
+            evicted: vt.presented_evicted(),
+            ..self
+        }
+    }
+
+    /// [`Self::rebased`], or `None` once the line at its top has been evicted:
+    /// what it showed is no longer there to name.
+    pub fn rebased_intact(self, vt: &VirtualTerminal) -> Option<Self> {
+        (self.evicted_since(vt) <= self.top).then(|| self.rebased(vt))
+    }
+
+    /// The last line readable at the bottom, above the hint bar.
+    fn max_top(&self, vt: &VirtualTerminal) -> usize {
+        vt.presented_total_lines().saturating_sub(self.readable())
+    }
+
+    /// Lines a page moves: the hint bar covers the last row of a slice as
+    /// tall as its rect.
+    fn readable(&self) -> usize {
+        let rows = self.rows();
+        if rows >= usize::from(self.entry.rect.height) {
+            rows.saturating_sub(1).max(1)
+        } else {
+            rows.max(1)
+        }
+    }
+
+    /// Source `(column, line)` of the shown cell at pane-local `(x, y)`,
+    /// pinned onto the slice's readable rows.
+    pub fn source(&self, (x, y): (u16, u16)) -> (usize, usize) {
+        (
+            self.col + usize::from(x).min(self.cols().saturating_sub(1)),
+            self.top + usize::from(y).min(self.readable() - 1),
+        )
+    }
+
+    /// Pane-local position of source `(column, line)`, if the slice shows it.
+    pub fn local(&self, (col, line): (usize, usize)) -> Option<(u16, u16)> {
+        let x = col.checked_sub(self.col).filter(|&x| x < self.cols())?;
+        let y = line.checked_sub(self.top).filter(|&y| y < self.rows())?;
+        Some((x as u16, y as u16))
+    }
+
+    /// The viewport the frame draws the pane with, and whether the copy view
+    /// is drawn over it: a slice reaching into history, or past the grid's
+    /// own columns, shows lines the grid does not. Pictures follow it, so
+    /// they keep the copy view's column and, under history, the frozen rows.
+    pub fn frame_view(&self, vt: &VirtualTerminal) -> (PaneViewport, bool) {
+        let history = history_len(vt);
+        let within = self.top >= history;
+        let row_offset = if within {
+            self.top - history
+        } else {
+            self.entry.row_offset
+        };
+        let max_col = self
+            .entry
+            .grid_cols
+            .saturating_sub(self.entry.rect.width.into());
+        let view = PaneViewport {
+            row_offset,
+            col_offset: self.col,
+            ..self.entry
+        };
+        (view, !within || self.col > max_col)
+    }
+
+    /// The cell drawn at local column `x` of presented `line`: a wide glyph
+    /// cut by either edge of the slice is its blank half.
+    fn cell<'v>(&self, vt: &'v VirtualTerminal, x: usize, line: usize) -> Option<Cow<'v, Cell>> {
+        if x >= self.cols() {
+            return None;
+        }
+        let row = vt.presented_row(line)?;
+        let c = self.col + x;
+        let cell = row.get(c)?;
+        Some(if x == 0 && c > 0 && cell.is_wide_continuation() {
+            Cow::Owned(blank_like(&row[c - 1]))
+        } else if x + 1 == self.cols() && cell.width == 2 {
+            Cow::Owned(blank_like(cell))
+        } else {
+            Cow::Borrowed(cell)
+        })
+    }
+}
+
+fn history_len(vt: &VirtualTerminal) -> usize {
+    vt.presented_total_lines().saturating_sub(vt.grid().rows())
+}
+
+/// One client's modal copy mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CopyModeState {
-    /// 0-based cursor position relative to the focused pane content
-    /// rect (NOT screen-absolute). 0,0 = top-left of the pane.
-    pub cursor: (u16, u16),
-    /// 0-based anchor for the selection. `None` means no selection
-    /// has been started — `y` yanks just the cursor cell, which is
-    /// rarely what users want, so the UI hint nudges them to press
-    /// `v` first.
-    pub anchor: Option<(u16, u16)>,
-    /// Rows scrolled back from the live bottom of `scrollback + visible`.
-    /// 0 means the normal live viewport. Positive values show older rows.
-    pub scroll_offset: usize,
+    /// The pane it opened on; it ends when focus leaves it.
+    pub pane: PaneId,
+    pub view: CopyView,
+    /// Source `(column, line)` of the copy cursor, always inside the slice.
+    pub cursor: (usize, usize),
+    /// Source `(column, line)` the selection started at.
+    pub anchor: Option<(usize, usize)>,
     /// Active `/` or `?` prompt while the user is typing a search.
     pub search: Option<SearchState>,
     /// Last accepted search, used by `n` / `N`.
     pub last_search: Option<SearchMatch>,
     /// Tracks the first `g` for the vim-style `gg` top-of-history motion.
     pending_g: bool,
-    /// True when this copy-mode session was opened transiently by the scroll
-    /// wheel (not by `Prefix [` / the API). A wheel-initiated session returns to
-    /// the live view — and hands the keyboard back — as soon as the wheel brings
-    /// it back to the bottom; a manually-entered copy mode stays until the user
-    /// exits it, so an in-progress selection or search is never lost to a scroll.
+    /// Opened by the wheel rather than `prefix [`: it ends, handing the
+    /// keyboard back, once the wheel brings the view back down to where it
+    /// began. Starting a search makes it deliberate.
     pub wheel_initiated: bool,
+    /// A selection was dropped, its lines evicted, and none started since.
+    selection_evicted: bool,
 }
 
 impl CopyModeState {
-    pub fn new() -> Self {
-        Self {
-            cursor: (0, 0),
+    /// Copy mode on `pane` over the slice `entry` showed of `vt` when its
+    /// lines stood at `drawn`, its cursor at the slice's top-left. `None`
+    /// when `vt` no longer has that grid.
+    pub fn enter(
+        pane: PaneId,
+        entry: PaneViewport,
+        drawn: Drawn,
+        vt: &VirtualTerminal,
+    ) -> Option<Self> {
+        let view = CopyView::new(entry, drawn, vt)?;
+        Some(Self {
+            pane,
+            view,
+            cursor: (view.col, view.top),
             anchor: None,
-            scroll_offset: 0,
             search: None,
             last_search: None,
             pending_g: false,
             wheel_initiated: false,
-        }
+            selection_evicted: false,
+        })
     }
-}
 
-impl Default for CopyModeState {
-    fn default() -> Self {
-        Self::new()
+    /// This state counted against `vt`'s history now. A selection with
+    /// either end on a line since evicted is dropped.
+    pub fn rebase(&mut self, vt: &VirtualTerminal) {
+        let gone = self.view.evicted_since(vt);
+        if gone == 0 {
+            return;
+        }
+        self.view = self.view.rebased(vt);
+        let cursor_kept = self.cursor.1 >= gone;
+        self.cursor.1 = self.cursor.1.saturating_sub(gone);
+        if let Some((col, line)) = self.anchor {
+            self.anchor = line
+                .checked_sub(gone)
+                .filter(|_| cursor_kept)
+                .map(|line| (col, line));
+            self.selection_evicted = self.anchor.is_none();
+        }
+        self.keep_cursor_in_view();
+    }
+
+    /// The cursor's position in the slice.
+    pub fn cursor_local(&self) -> (u16, u16) {
+        self.view.local(self.cursor).unwrap_or((0, 0))
+    }
+
+    /// Nothing done in it yet: no selection, search or move off where it
+    /// opened, so opening it again elsewhere loses nothing.
+    pub fn is_untouched(&self) -> bool {
+        let v = &self.view;
+        self.anchor.is_none()
+            && self.search.is_none()
+            && self.last_search.is_none()
+            && (v.top, v.col) == (v.entry_top, v.entry.col_offset)
+            && self.cursor == (v.col, v.top)
+    }
+
+    /// Start a selection at the cursor: an evicted one no longer stands in.
+    pub fn select_from_cursor(&mut self) {
+        self.selection_evicted = false;
+        self.anchor = Some(self.cursor);
+    }
+
+    /// Put the cursor on source `(column, line)`, pinned onto the slice.
+    pub fn set_cursor(&mut self, at: (usize, usize)) {
+        self.cursor = at;
+        self.keep_cursor_in_view();
+    }
+
+    fn keep_cursor_in_view(&mut self) {
+        let v = self.view;
+        let (col, line) = self.cursor;
+        self.cursor = (
+            col.clamp(v.col, v.col + v.cols().saturating_sub(1)),
+            line.clamp(v.top, v.top + v.readable() - 1),
+        );
+    }
+
+    /// Move the view's top to `top`, carrying the cursor with it.
+    fn scroll_to(&mut self, top: usize) -> bool {
+        let old = self.view.top;
+        if top == old {
+            return false;
+        }
+        self.view.top = top;
+        self.cursor.1 = (self.cursor.1 + top).saturating_sub(old);
+        self.keep_cursor_in_view();
+        true
     }
 }
 
@@ -101,120 +380,80 @@ pub enum CopyKey {
     Yank,
     /// User pressed `q` / `Esc` — caller should exit copy mode.
     Exit,
+    /// `y` with nothing to yank: the selection's lines left history. Copy
+    /// mode stays, and the caller says why nothing was copied.
+    SelectionEvicted,
     /// Key not bound; ignored.
     Ignored,
 }
 
-/// Decode raw bytes from a single Input frame and update `state`.
-/// `pane_cols` / `pane_rows` are the focused pane's content
-/// dimensions (excluding borders) — used to clamp cursor motion so
-/// it can't run off the pane.
+/// Decode raw bytes from a single Input frame and update `state`, reading
+/// `vt` through its view. The caller has checked the view still maps `vt`.
 ///
-/// Only the first byte that maps to a known action is consumed;
-/// everything else is dropped. This keeps key-repeat behavior
-/// predictable when terminals send escape sequences for arrow keys.
-pub fn handle_key(
-    bytes: &[u8],
-    state: &mut CopyModeState,
-    pane_cols: u16,
-    pane_rows: u16,
-    total_lines: usize,
-) -> CopyKey {
-    handle_key_with_vt(bytes, state, pane_cols, pane_rows, total_lines, None)
-}
-
-pub fn handle_key_with_vt(
-    bytes: &[u8],
-    state: &mut CopyModeState,
-    pane_cols: u16,
-    pane_rows: u16,
-    total_lines: usize,
-    vt: Option<&VirtualTerminal>,
-) -> CopyKey {
+/// Only the first byte that maps to a known action is consumed; everything
+/// else is dropped. This keeps key-repeat behavior predictable when terminals
+/// send escape sequences for arrow keys.
+pub fn handle_key(bytes: &[u8], state: &mut CopyModeState, vt: &VirtualTerminal) -> CopyKey {
     if bytes.is_empty() {
         return CopyKey::Ignored;
     }
-    if pane_cols == 0 || pane_rows == 0 {
-        return CopyKey::Ignored;
-    }
+    state.rebase(vt);
     if state.search.is_some() {
-        return handle_search_key(bytes, state, pane_cols, pane_rows, vt);
+        return handle_search_key(bytes, state, vt);
     }
-    let max_col = pane_cols.saturating_sub(1);
-    let max_row = pane_rows.saturating_sub(1);
-    clamp_scroll_offset(state, total_lines, pane_rows);
+    let page = state.view.readable();
 
     // Arrow keys arrive as the 3-byte sequence ESC [ A/B/C/D. Match
     // the prefix first so users can navigate with arrows AND hjkl.
     if bytes.len() >= 3 && bytes[0] == 0x1b && bytes[1] == b'[' {
         match bytes[2] {
-            b'A' => return move_up(state, 1).then_updated(),
-            b'B' => return move_down(state, 1, max_row).then_updated(),
-            b'C' => return move_right(state, 1, max_col).then_updated(),
-            b'D' => return move_left(state, 1).then_updated(),
+            b'A' => return move_by(state, 0, -1).then_updated(),
+            b'B' => return move_by(state, 0, 1).then_updated(),
+            b'C' => return move_by(state, 1, 0).then_updated(),
+            b'D' => return move_by(state, -1, 0).then_updated(),
             _ => {}
         }
     }
     // PageUp/PageDown arrive as ESC [ 5 ~ / ESC [ 6 ~.
     if bytes.len() >= 4 && bytes[0] == 0x1b && bytes[1] == b'[' && bytes[3] == b'~' {
         match bytes[2] {
-            b'5' => {
-                return scroll_up(state, readable_rows(pane_rows), total_lines, pane_rows)
-                    .then_updated();
-            }
-            b'6' => {
-                return scroll_down(state, readable_rows(pane_rows), total_lines, pane_rows)
-                    .then_updated();
-            }
+            b'5' => return scroll_up(state, page).then_updated(),
+            b'6' => return scroll_down(state, vt, page).then_updated(),
             _ => {}
         }
     }
 
     match bytes[0] {
-        b'h' => move_left(state, 1).then_updated(),
-        b'j' => move_down(state, 1, max_row).then_updated(),
-        b'k' => move_up(state, 1).then_updated(),
-        b'l' => move_right(state, 1, max_col).then_updated(),
-        b'/' => {
+        b'h' => move_by(state, -1, 0).then_updated(),
+        b'j' => move_by(state, 0, 1).then_updated(),
+        b'k' => move_by(state, 0, -1).then_updated(),
+        b'l' => move_by(state, 1, 0).then_updated(),
+        b'/' | b'?' => {
             state.pending_g = false;
+            state.wheel_initiated = false;
+            let direction = if bytes[0] == b'/' {
+                SearchDirection::Forward
+            } else {
+                SearchDirection::Backward
+            };
             state.search = Some(SearchState {
-                direction: SearchDirection::Forward,
+                direction,
                 query: String::new(),
             });
             CopyKey::Updated
         }
-        b'?' => {
-            state.pending_g = false;
-            state.search = Some(SearchState {
-                direction: SearchDirection::Backward,
-                query: String::new(),
-            });
-            CopyKey::Updated
-        }
-        b'n' => repeat_search(state, pane_cols, pane_rows, vt, false).then_updated(),
-        b'N' => repeat_search(state, pane_cols, pane_rows, vt, true).then_updated(),
+        b'n' => repeat_search(state, vt, false).then_updated(),
+        b'N' => repeat_search(state, vt, true).then_updated(),
         // Ctrl-b / Ctrl-f: full-page up/down. Ctrl-u / Ctrl-d: half-page.
-        0x02 => scroll_up(state, readable_rows(pane_rows), total_lines, pane_rows).then_updated(),
-        0x06 => scroll_down(state, readable_rows(pane_rows), total_lines, pane_rows).then_updated(),
-        0x15 => scroll_up(
-            state,
-            readable_rows(pane_rows).div_ceil(2),
-            total_lines,
-            pane_rows,
-        )
-        .then_updated(),
-        0x04 => scroll_down(
-            state,
-            readable_rows(pane_rows).div_ceil(2),
-            total_lines,
-            pane_rows,
-        )
-        .then_updated(),
+        0x02 => scroll_up(state, page).then_updated(),
+        0x06 => scroll_down(state, vt, page).then_updated(),
+        0x15 => scroll_up(state, page.div_ceil(2)).then_updated(),
+        0x04 => scroll_down(state, vt, page.div_ceil(2)).then_updated(),
         b'g' => {
             if state.pending_g {
-                state.scroll_offset = max_scroll_offset(total_lines, pane_rows);
-                state.cursor = (0, 0);
                 state.pending_g = false;
+                state.scroll_to(0);
+                state.cursor = (state.view.col, 0);
                 CopyKey::Updated
             } else {
                 state.pending_g = true;
@@ -222,19 +461,27 @@ pub fn handle_key_with_vt(
             }
         }
         b'G' => {
-            state.scroll_offset = 0;
-            state.cursor = (0, max_row);
             state.pending_g = false;
+            state.scroll_to(state.view.max_top(vt));
+            let v = state.view;
+            state.cursor = (v.col, v.top + v.readable() - 1);
             CopyKey::Updated
         }
         b'v' => {
-            toggle_anchor(state);
             state.pending_g = false;
+            match state.anchor {
+                Some(_) => state.anchor = None,
+                None => state.select_from_cursor(),
+            }
             CopyKey::Updated
         }
         b'y' => {
             state.pending_g = false;
-            CopyKey::Yank
+            if state.selection_evicted {
+                CopyKey::SelectionEvicted
+            } else {
+                CopyKey::Yank
+            }
         }
         b'q' | 0x1b => {
             state.pending_g = false;
@@ -247,13 +494,7 @@ pub fn handle_key_with_vt(
     }
 }
 
-fn handle_search_key(
-    bytes: &[u8],
-    state: &mut CopyModeState,
-    pane_cols: u16,
-    pane_rows: u16,
-    vt: Option<&VirtualTerminal>,
-) -> CopyKey {
+fn handle_search_key(bytes: &[u8], state: &mut CopyModeState, vt: &VirtualTerminal) -> CopyKey {
     let Some(mut search) = state.search.take() else {
         return CopyKey::Ignored;
     };
@@ -262,14 +503,7 @@ fn handle_search_key(
             if search.query.is_empty() {
                 return CopyKey::Ignored;
             }
-            let matched = find_and_focus(
-                state,
-                pane_cols,
-                pane_rows,
-                vt,
-                &search.query,
-                search.direction,
-            );
+            let matched = find_and_focus(state, vt, &search.query, search.direction);
             state.last_search = Some(SearchMatch {
                 direction: search.direction,
                 query: search.query,
@@ -282,15 +516,19 @@ fn handle_search_key(
             state.search = Some(search);
             CopyKey::Updated
         }
-        byte if byte.is_ascii_graphic() || byte == b' ' => {
-            if let Ok(text) = std::str::from_utf8(bytes) {
-                search.query.push_str(text);
-                state.search = Some(search);
-                CopyKey::Updated
-            } else {
-                state.search = Some(search);
-                CopyKey::Ignored
-            }
+        byte if byte >= b' ' => {
+            let typed = std::str::from_utf8(bytes)
+                .ok()
+                .filter(|text| !text.chars().any(char::is_control));
+            let key = match typed {
+                Some(text) => {
+                    search.query.push_str(text);
+                    CopyKey::Updated
+                }
+                None => CopyKey::Ignored,
+            };
+            state.search = Some(search);
+            key
         }
         _ => {
             state.search = Some(search);
@@ -299,350 +537,148 @@ fn handle_search_key(
     }
 }
 
-fn repeat_search(
-    state: &mut CopyModeState,
-    pane_cols: u16,
-    pane_rows: u16,
-    vt: Option<&VirtualTerminal>,
-    reverse: bool,
-) -> bool {
+fn repeat_search(state: &mut CopyModeState, vt: &VirtualTerminal, reverse: bool) -> bool {
     let Some(last) = state.last_search.clone() else {
         return false;
     };
-    let direction = if reverse {
-        match last.direction {
-            SearchDirection::Forward => SearchDirection::Backward,
-            SearchDirection::Backward => SearchDirection::Forward,
-        }
-    } else {
-        last.direction
+    let direction = match (last.direction, reverse) {
+        (d, false) => d,
+        (SearchDirection::Forward, true) => SearchDirection::Backward,
+        (SearchDirection::Backward, true) => SearchDirection::Forward,
     };
-    find_and_focus(state, pane_cols, pane_rows, vt, &last.query, direction)
+    find_and_focus(state, vt, &last.query, direction)
+}
+
+/// A match: its presented line and the first and last cells it covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Hit {
+    line: usize,
+    start: usize,
+    end: usize,
 }
 
 fn find_and_focus(
     state: &mut CopyModeState,
-    pane_cols: u16,
-    pane_rows: u16,
-    vt: Option<&VirtualTerminal>,
+    vt: &VirtualTerminal,
     query: &str,
     direction: SearchDirection,
 ) -> bool {
-    if query.is_empty() {
-        return false;
-    }
-    let Some(vt) = vt else {
-        return false;
-    };
-    // #108: map the copy cursor through the same region the frame shows. Search
-    // itself (search_forward/backward) still scans the whole presented span.
-    let total_lines = effective_total_lines(vt, pane_rows);
-    if total_lines == 0 {
-        return false;
-    }
-
-    let view = view_start(total_lines, pane_rows, state.scroll_offset);
-    let current_row = view
-        .saturating_add(state.cursor.1 as usize)
-        .min(total_lines.saturating_sub(1));
-    let current_col = state.cursor.0 as usize;
-    let found = match direction {
-        SearchDirection::Forward => search_forward(vt, pane_cols, current_row, current_col, query),
-        SearchDirection::Backward => {
-            search_backward(vt, pane_cols, current_row, current_col, query)
-        }
-    };
-    if let Some((row, col)) = found {
-        focus_absolute_cell(state, total_lines, pane_rows, row, col as u16);
-        true
-    } else {
-        false
-    }
-}
-
-fn search_forward(
-    vt: &VirtualTerminal,
-    pane_cols: u16,
-    current_row: usize,
-    current_col: usize,
-    query: &str,
-) -> Option<(usize, usize)> {
     let total = vt.presented_total_lines();
-    for step in 0..total {
-        let row_idx = (current_row + step) % total;
-        let start_col = if step == 0 {
-            current_col.saturating_add(1)
+    if query.is_empty() || total == 0 {
+        return false;
+    }
+    let (col, line) = state.cursor;
+    let line = line.min(total - 1);
+    let forward = direction == SearchDirection::Forward;
+    // Every line once from the cursor's, the way the search reads, then
+    // back onto the cursor's own: matches are told apart by first column.
+    let hit = (0..=total).find_map(|step| {
+        let at = if forward {
+            (line + step) % total
         } else {
-            0
+            (line + total - step % total) % total
         };
-        let Some((col, _)) =
-            search_row_forward(vt.presented_row(row_idx)?, pane_cols, start_col, query)
-        else {
-            continue;
-        };
-        return Some((row_idx, col));
-    }
-    None
-}
-
-fn search_backward(
-    vt: &VirtualTerminal,
-    pane_cols: u16,
-    current_row: usize,
-    current_col: usize,
-    query: &str,
-) -> Option<(usize, usize)> {
-    let total = vt.presented_total_lines();
-    for step in 0..total {
-        let row_idx = (current_row + total - (step % total)) % total;
-        let before_col = if step == 0 {
-            current_col
-        } else {
-            pane_cols as usize
-        };
-        let Some((col, _)) =
-            search_row_backward(vt.presented_row(row_idx)?, pane_cols, before_col, query)
-        else {
-            continue;
-        };
-        return Some((row_idx, col));
-    }
-    None
-}
-
-fn search_row_forward(
-    row: &Row,
-    pane_cols: u16,
-    start_col: usize,
-    query: &str,
-) -> Option<(usize, usize)> {
-    let text = row_text(row, pane_cols);
-    if start_col >= text.chars().count() {
-        return None;
-    }
-    let suffix: String = text.chars().skip(start_col).collect();
-    let byte_idx = suffix.find(query)?;
-    let rel_col = suffix[..byte_idx].chars().count();
-    Some((start_col + rel_col, query.chars().count()))
-}
-
-fn search_row_backward(
-    row: &Row,
-    pane_cols: u16,
-    before_col: usize,
-    query: &str,
-) -> Option<(usize, usize)> {
-    let text = row_text(row, pane_cols);
-    let prefix: String = text.chars().take(before_col).collect();
-    let byte_idx = prefix.rfind(query)?;
-    Some((prefix[..byte_idx].chars().count(), query.chars().count()))
-}
-
-fn row_text(row: &Row, pane_cols: u16) -> String {
-    let mut out = String::new();
-    for col in 0..pane_cols as usize {
-        let Some(cell) = row.get(col) else {
-            break;
-        };
-        if !cell.is_wide_continuation() {
-            cell.push_display_text(&mut out);
+        let matches = row_matches(vt.presented_row(at)?, query);
+        let (start, end) = match (forward, step) {
+            (true, 0) => matches.iter().find(|m| m.0 > col),
+            (true, s) if s == total => matches.iter().find(|m| m.0 <= col),
+            (true, _) => matches.first(),
+            (false, 0) => matches.iter().rev().find(|m| m.0 < col),
+            (false, s) if s == total => matches.iter().rev().find(|m| m.0 >= col),
+            (false, _) => matches.last(),
         }
+        .copied()?;
+        Some(Hit {
+            line: at,
+            start,
+            end,
+        })
+    });
+    match hit {
+        Some(hit) => {
+            reveal(state, vt, hit);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Every match of `query` in a whole row, as the first and last cells its
+/// text occupies: a wide glyph owns both of its cells.
+fn row_matches(row: &Row, query: &str) -> Vec<(usize, usize)> {
+    let mut text = String::new();
+    let mut owner = Vec::new();
+    for c in 0..row.len() {
+        let cell = &row[c];
+        if cell.is_wide_continuation() {
+            continue;
+        }
+        cell.push_display_text(&mut text);
+        owner.resize(text.len(), c);
+    }
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(at) = text.get(from..).and_then(|rest| rest.find(query)) {
+        let begin = from + at;
+        let last = owner[begin + query.len() - 1];
+        let end = if row[last].width == 2 { last + 1 } else { last };
+        out.push((owner[begin], end));
+        from = begin + text[begin..].chars().next().map_or(1, char::len_utf8);
     }
     out
 }
 
-fn focus_absolute_cell(
-    state: &mut CopyModeState,
-    total_lines: usize,
-    pane_rows: u16,
-    abs_row: usize,
-    col: u16,
-) {
-    let max_start = total_lines.saturating_sub(pane_rows as usize);
-    let preferred_start = abs_row.saturating_sub((pane_rows as usize).saturating_sub(1) / 2);
-    let start = preferred_start.min(max_start);
-    state.scroll_offset = max_start.saturating_sub(start);
+/// Bring a hit into the slice and put the cursor on its first cell. The view
+/// moves only as far as it must: vertically not at all while the hit is
+/// readable, else to centre it; across just enough to show it whole, or its
+/// first cell when it is wider than the slice.
+fn reveal(state: &mut CopyModeState, vt: &VirtualTerminal, hit: Hit) {
+    let v = state.view;
+    let readable = v.readable();
+    if hit.line < v.top || hit.line >= v.top + readable {
+        let top = hit.line.saturating_sub(readable.saturating_sub(1) / 2);
+        state.view.top = top.min(v.max_top(vt));
+    }
+    let cols = v.cols();
+    if hit.start < v.col || hit.end >= v.col + cols {
+        state.view.col = if hit.start < v.col || hit.end - hit.start >= cols {
+            hit.start
+        } else {
+            hit.end + 1 - cols
+        };
+    }
+    state.cursor = (hit.start, hit.line);
+    state.pending_g = false;
+}
+
+fn move_by(state: &mut CopyModeState, dx: isize, dy: isize) -> bool {
+    state.pending_g = false;
+    let old = state.cursor;
     state.cursor = (
-        col,
-        abs_row
-            .saturating_sub(start)
-            .min(pane_rows.saturating_sub(1) as usize) as u16,
+        old.0.saturating_add_signed(dx),
+        old.1.saturating_add_signed(dy),
     );
+    state.keep_cursor_in_view();
+    state.cursor != old
+}
+
+pub fn scroll_up(state: &mut CopyModeState, lines: usize) -> bool {
     state.pending_g = false;
+    state.scroll_to(state.view.top.saturating_sub(lines.max(1)))
 }
 
-fn move_left(state: &mut CopyModeState, n: u16) -> bool {
+pub fn scroll_down(state: &mut CopyModeState, vt: &VirtualTerminal, lines: usize) -> bool {
     state.pending_g = false;
-    let (col, row) = state.cursor;
-    let new_col = col.saturating_sub(n);
-    if new_col == col {
-        return false;
-    }
-    state.cursor = (new_col, row);
-    true
+    let max = state.view.max_top(vt);
+    let top = state.view.top.saturating_add(lines.max(1)).min(max);
+    top > state.view.top && state.scroll_to(top)
 }
 
-fn move_right(state: &mut CopyModeState, n: u16, max_col: u16) -> bool {
-    state.pending_g = false;
-    let (col, row) = state.cursor;
-    let new_col = col.saturating_add(n).min(max_col);
-    if new_col == col {
-        return false;
-    }
-    state.cursor = (new_col, row);
-    true
-}
-
-fn move_up(state: &mut CopyModeState, n: u16) -> bool {
-    state.pending_g = false;
-    let (col, row) = state.cursor;
-    let new_row = row.saturating_sub(n);
-    if new_row == row {
-        return false;
-    }
-    state.cursor = (col, new_row);
-    true
-}
-
-fn move_down(state: &mut CopyModeState, n: u16, max_row: u16) -> bool {
-    state.pending_g = false;
-    let (col, row) = state.cursor;
-    let new_row = row.saturating_add(n).min(max_row);
-    if new_row == row {
-        return false;
-    }
-    state.cursor = (col, new_row);
-    true
-}
-
-fn toggle_anchor(state: &mut CopyModeState) {
-    if state.anchor.is_some() {
-        state.anchor = None;
-    } else {
-        state.anchor = Some(state.cursor);
-    }
-}
-
-/// Maximum scrollback offset for a pane view of `pane_rows` rows.
-pub fn max_scroll_offset(total_lines: usize, pane_rows: u16) -> usize {
-    total_lines.saturating_sub(pane_rows as usize)
-}
-
-/// Start absolute row for the currently displayed copy view.
-pub fn view_start(total_lines: usize, pane_rows: u16, scroll_offset: usize) -> usize {
-    total_lines
-        .saturating_sub(pane_rows as usize)
-        .saturating_sub(scroll_offset.min(max_scroll_offset(total_lines, pane_rows)))
-}
-
-/// The slice modal copy mode draws its pane with: rows following the cursor
-/// from column 0, whatever the frame shows. Its cursor, highlight, search and
-/// yank all read the grid through this.
-pub fn copy_mode_view(view: PaneViewport, vt: &VirtualTerminal) -> PaneViewport {
-    view.with_offsets(copy_row_offset(vt, view.rect.height), 0)
-}
-
-fn copy_row_offset(vt: &VirtualTerminal, pane_rows: u16) -> usize {
-    crate::viewport::follow_offset(vt.grid().rows(), pane_rows.into(), vt.cursor().row)
-}
-
-/// The number of lines the copy-mode viewport spans for `vt` at `pane_rows` —
-/// scrollback plus the region the live attach frame actually shows.
-///
-/// Issue #108 made the attach/snapshot frame **cursor-following**: when a pane's
-/// grid is taller than the rect it is drawn into, the frame shows the
-/// cursor-following window rather than the bottom `pane_rows`. Copy mode
-/// maps a screen selection to a grid line off the BOTTOM (`total_lines`), so on
-/// such a pane the row you see and the row you yank diverge. Anchoring copy
-/// mode's coordinate space to this value (instead of `grid.total_lines()`) keeps
-/// the two in lockstep: `view_start(effective, ..)` at `scroll_offset 0` lands
-/// on the same grid row the frame's first row shows.
-///
-/// For a pane whose grid fits its viewport (the overwhelmingly common case) this
-/// is exactly `grid.total_lines()`, so copy mode is byte-for-byte unchanged.
-pub fn effective_total_lines(vt: &VirtualTerminal, pane_rows: u16) -> usize {
-    // The PRESENTED span, not `grid().total_lines()`. While a
-    // synchronized-output window is open the frozen frame is the viewport
-    // alone; history stays live and is reached through `presented_row`
-    // (issue #115), so the grid's own line count describes only the frame.
-    let total = vt.presented_total_lines();
-    let grid_rows = vt.grid().rows();
-    let visible = pane_rows as usize;
-    if grid_rows <= visible {
-        return total; // grid fits — coordinate space is unchanged
-    }
-    let row_offset = copy_row_offset(vt, pane_rows);
-    // Scrollback lines + the live viewport's bottom edge. Excludes any grid rows
-    // below the live frame (they are past the visible screen), matching what the
-    // attach frame shows. `row_offset + visible <= grid_rows`, so this never
-    // exceeds `total`.
-    total
-        .saturating_sub(grid_rows)
-        .saturating_add(row_offset + visible)
-}
-
-/// Rows of the copy view a person can actually READ.
-///
-/// `render_copy_view_into` draws `pane_rows` lines, and the copy-mode hint bar
-/// is then written over the bottom one — so the last line drawn is never seen.
-/// Paging by the full height therefore steps over exactly one line per page:
-/// a 30-row pane showed 0001..0030 and then started the next page at 0032.
-/// Paging by the readable height instead makes consecutive pages tile, with
-/// the line that sat under the bar becoming the top of the next page.
-pub fn readable_rows(pane_rows: u16) -> usize {
-    (pane_rows as usize).saturating_sub(1).max(1)
-}
-
-pub fn scroll_up(
-    state: &mut CopyModeState,
-    lines: usize,
-    total_lines: usize,
-    pane_rows: u16,
-) -> bool {
-    state.pending_g = false;
-    let old = state.scroll_offset;
-    state.scroll_offset = state
-        .scroll_offset
-        .saturating_add(lines.max(1))
-        .min(max_scroll_offset(total_lines, pane_rows));
-    old != state.scroll_offset
-}
-
-pub fn scroll_down(
-    state: &mut CopyModeState,
-    lines: usize,
-    _total_lines: usize,
-    _pane_rows: u16,
-) -> bool {
-    state.pending_g = false;
-    let old = state.scroll_offset;
-    state.scroll_offset = state.scroll_offset.saturating_sub(lines.max(1));
-    old != state.scroll_offset
-}
-
-fn clamp_scroll_offset(state: &mut CopyModeState, total_lines: usize, pane_rows: u16) {
-    state.scroll_offset = state
-        .scroll_offset
-        .min(max_scroll_offset(total_lines, pane_rows));
-}
-
-fn row_for_view(
-    vt: &VirtualTerminal,
-    pane_rows: u16,
-    scroll_offset: usize,
-    view_row: u16,
-) -> Option<&Row> {
-    // #108: anchor to the region the live frame shows, not the grid bottom.
-    let total = effective_total_lines(vt, pane_rows);
-    let abs = view_start(total, pane_rows, scroll_offset).saturating_add(view_row as usize);
-    vt.presented_row(abs)
-}
-
-/// Which grid cell a selection's pane-local cell names.
+/// Which grid cell a pane-local cell names.
 #[derive(Clone, Copy)]
 enum Slice<'a> {
-    /// Modal copy mode's own: the cursor-following rows from column 0.
-    Copy { pane: Rect, scroll_offset: usize },
+    /// Modal copy mode's view.
+    Copy(&'a CopyView),
     /// The slice a frame showed, so a mouse selection reads what it covered.
     Frame(&'a PaneViewport),
 }
@@ -650,18 +686,11 @@ enum Slice<'a> {
 impl Slice<'_> {
     fn cell<'v>(&self, vt: &'v VirtualTerminal, x: u16, y: u16) -> Option<Cow<'v, Cell>> {
         match *self {
-            Slice::Copy {
-                pane,
-                scroll_offset,
-            } => {
-                let cell = row_for_view(vt, pane.height, scroll_offset, y)?.get(usize::from(x))?;
-                // A wide glyph on the pane's last column would spill into the
-                // neighbour: drawn, and yanked, as its blank half.
-                Some(if cell.width == 2 && x + 1 >= pane.width {
-                    Cow::Owned(crate::viewport::blank_like(cell))
-                } else {
-                    Cow::Borrowed(cell)
-                })
+            Slice::Copy(view) => {
+                if usize::from(y) >= view.rows() {
+                    return None;
+                }
+                view.cell(vt, x.into(), view.top + usize::from(y))
             }
             Slice::Frame(view) => {
                 let (x, y) = (usize::from(x), usize::from(y));
@@ -689,133 +718,146 @@ impl BoolExt for bool {
     }
 }
 
-/// Extract the text the user has currently selected. The selection is
-/// inclusive on both ends; if `anchor` is None, returns just the
-/// single character under the cursor (so `y` always emits something).
-///
-/// Reads from the focused pane's visible grid (no scrollback). Cells
-/// outside the pane bounds are treated as blank. The two endpoints
-/// are normalized so the user can drag the cursor in any direction.
-pub fn extract_selection(
-    vt: &VirtualTerminal,
-    state: &CopyModeState,
-    pane_cols: u16,
-    pane_rows: u16,
-) -> String {
-    let slice = Slice::Copy {
-        pane: Rect::new(0, 0, pane_cols, pane_rows),
-        scroll_offset: state.scroll_offset,
+/// The text modal copy mode's selection covers: inclusive at both ends, the
+/// cursor's cell alone with no anchor. Every line reads the columns the view
+/// shows, as drawn, widened to both ends when a pan has left one outside it.
+pub fn extract_selection(vt: &VirtualTerminal, state: &CopyModeState) -> String {
+    let v = &state.view;
+    let ends = ordered(state.anchor.unwrap_or(state.cursor), state.cursor);
+    let ((a, _), (b, _)) = ends;
+    let (first, last) = (
+        v.col.min(a).min(b),
+        (v.col + v.cols().saturating_sub(1)).max(a).max(b),
+    );
+    let cell = |c: usize, line: usize| -> Option<Cow<'_, Cell>> {
+        let row = vt.presented_row(line)?;
+        let cell = row.get(c).filter(|_| (first..=last).contains(&c))?;
+        // A wide glyph the columns read cut is its blank half, as the view
+        // draws one its edge cuts.
+        Some(if c == first && c > 0 && cell.is_wide_continuation() {
+            Cow::Owned(blank_like(&row[c - 1]))
+        } else if c == last && cell.width == 2 {
+            Cow::Owned(blank_like(cell))
+        } else {
+            Cow::Borrowed(cell)
+        })
     };
-    extract_from(vt, state, pane_cols, pane_rows, slice)
+    read(ends, first, |line| span(ends, line, first, last), cell)
+}
+
+/// A selection's ends, as `(column, line)`, in reading order.
+type Ends = ((usize, usize), (usize, usize));
+
+fn ordered(anchor: (usize, usize), cursor: (usize, usize)) -> Ends {
+    if (anchor.1, anchor.0) <= (cursor.1, cursor.0) {
+        (anchor, cursor)
+    } else {
+        (cursor, anchor)
+    }
+}
+
+/// The columns of `line` a selection covers, within `first..=last`.
+fn span(
+    ((start_col, start), (end_col, end)): Ends,
+    line: usize,
+    first: usize,
+    last: usize,
+) -> Option<(usize, usize)> {
+    if line < start || line > end {
+        return None;
+    }
+    let lo = if line == start {
+        start_col.max(first)
+    } else {
+        first
+    };
+    let hi = if line == end { end_col.min(last) } else { last };
+    (lo <= hi).then_some((lo, hi))
+}
+
+/// [`span`] in modal copy mode's view, as columns local to it.
+fn modal_span(v: &CopyView, ends: Ends, line: usize) -> Option<(usize, usize)> {
+    let (lo, hi) = span(ends, line, v.col, v.col + v.cols().saturating_sub(1))?;
+    Some((lo - v.col, hi - v.col))
+}
+
+/// The text a selection covers: each line's span of cells, read through
+/// `cell`, trailing blanks trimmed. A line with no cell at column `first`
+/// is skipped.
+fn read<'v>(
+    ends: Ends,
+    first: usize,
+    span: impl Fn(usize) -> Option<(usize, usize)>,
+    cell: impl Fn(usize, usize) -> Option<Cow<'v, Cell>>,
+) -> String {
+    let mut out = String::new();
+    let ((_, start), (_, end)) = ends;
+    for line in start..=end {
+        if cell(first, line).is_none() {
+            continue;
+        }
+        for x in span(line).into_iter().flat_map(|(lo, hi)| lo..=hi) {
+            let Some(cell) = cell(x, line) else {
+                break;
+            };
+            if !cell.is_wide_continuation() {
+                cell.push_display_text(&mut out);
+            }
+        }
+        if line != end {
+            out.truncate(out.trim_end_matches(' ').len());
+            out.push('\n');
+        }
+    }
+    out.trim_end_matches(' ').to_string()
+}
+
+fn frame_ends(selection: &Selection) -> Ends {
+    let local = |(x, y): (u16, u16)| (usize::from(x), usize::from(y));
+    ordered(
+        local(selection.anchor.unwrap_or(selection.cursor)),
+        local(selection.cursor),
+    )
 }
 
 /// [`extract_selection`] for a mouse selection made over `view`: the cells
 /// that frame drew, cut glyphs at its edges blank as drawn.
 pub fn extract_frame_selection(
     vt: &VirtualTerminal,
-    state: &CopyModeState,
+    selection: &Selection,
     view: &PaneViewport,
 ) -> String {
-    let (cols, rows) = (view.shown_cols() as u16, view.shown_rows() as u16);
-    extract_from(vt, state, cols, rows, Slice::Frame(view))
+    let slice = Slice::Frame(view);
+    let last = view.shown_cols().saturating_sub(1);
+    let cell = |x: usize, y: usize| slice.cell(vt, u16::try_from(x).ok()?, u16::try_from(y).ok()?);
+    let ends = frame_ends(selection);
+    read(ends, 0, |row| span(ends, row, 0, last), cell)
 }
 
-fn extract_from(
-    vt: &VirtualTerminal,
-    state: &CopyModeState,
-    pane_cols: u16,
-    pane_rows: u16,
-    slice: Slice<'_>,
-) -> String {
-    let cursor = state.cursor;
-    let anchor = state.anchor.unwrap_or(cursor);
-    let (start_col, end_col) = if cursor.1 == anchor.1 {
-        // Single-line selection: order columns directly.
-        if cursor.0 <= anchor.0 {
-            (cursor.0, anchor.0)
-        } else {
-            (anchor.0, cursor.0)
-        }
-    } else {
-        (0, 0) // multi-line: column ordering doesn't apply, see below
-    };
-
-    let (start, end) = order_endpoints(anchor, cursor);
-
-    let grid = vt.grid();
-    let max_row = pane_rows.min(grid.rows() as u16);
-    let max_col = pane_cols.min(grid.cols() as u16);
-
-    let mut out = String::new();
-    for row in start.1..=end.1 {
-        if row >= max_row {
-            break;
-        }
-        let line_start = if row == start.1 { start.0 } else { 0 };
-        let line_end = if row == end.1 {
-            end.0
-        } else {
-            max_col.saturating_sub(1)
-        };
-        // Single-line case: use directly-ordered columns instead of the
-        // reading-order (top→bottom) ordering that order_endpoints
-        // gives us. This keeps backwards selection intuitive.
-        let (col_lo, col_hi) = if start.1 == end.1 {
-            (start_col, end_col)
-        } else {
-            (line_start, line_end)
-        };
-
-        if slice.cell(vt, 0, row).is_none() {
-            continue;
-        }
-        for col in col_lo..=col_hi {
-            if col >= max_col {
-                break;
-            }
-            let Some(cell) = slice.cell(vt, col, row) else {
-                break;
-            };
-            if cell.is_wide_continuation() {
-                continue;
-            }
-            cell.push_display_text(&mut out);
-        }
-        if row != end.1 {
-            // Trim trailing whitespace per line for cleaner copies.
-            let trimmed = out.trim_end_matches(' ').to_string();
-            out = trimmed;
-            out.push('\n');
-        }
-    }
-    // Final-line trim too.
-    out.trim_end_matches(' ').to_string()
+/// A mouse selection's `(row, first, last)` runs in the cells `view` showed.
+fn frame_runs(selection: &Selection, view: &PaneViewport) -> Vec<(u16, u16, u16)> {
+    let (ends, last) = (frame_ends(selection), view.shown_cols().saturating_sub(1));
+    (0..view.shown_rows())
+        .filter_map(|row| {
+            span(ends, row, 0, last).map(|(lo, hi)| (row as u16, lo as u16, hi as u16))
+        })
+        .collect()
 }
 
-/// Draw the focused pane's copy viewport over the normal live pane
-/// contents. This is used only while copy mode is active; regular
-/// attach rendering and all snapshot paths still use the normal VT
-/// visible grid.
-pub fn render_copy_view_into(
-    buf: &mut Vec<u8>,
-    pane: Rect,
-    vt: &VirtualTerminal,
-    state: &CopyModeState,
-) {
-    if pane.width == 0 || pane.height == 0 {
-        return;
-    }
-    let slice = Slice::Copy {
-        pane,
-        scroll_offset: state.scroll_offset,
-    };
-    for row in 0..pane.height {
-        if slice.cell(vt, 0, row).is_none() {
+/// Draw modal copy mode's slice over the frame, for a view the frame's own
+/// pane cells cannot show (history, or columns past the grid). Only the
+/// shown cells: surplus beside them stays the compositor's.
+pub fn render_copy_view_into(buf: &mut Vec<u8>, vt: &VirtualTerminal, state: &CopyModeState) {
+    let v = &state.view;
+    let rect = v.rect();
+    for y in 0..v.rows() {
+        let line = v.top + y;
+        if vt.presented_row(line).is_none() {
             continue;
         }
-        let _ = write!(buf, "\x1b[{};{}H", pane.y + row + 1, pane.x + 1);
-        for col in 0..pane.width {
-            match slice.cell(vt, col, row) {
+        let _ = write!(buf, "\x1b[{};{}H", usize::from(rect.y) + y + 1, rect.x + 1);
+        for x in 0..v.cols() {
+            match v.cell(vt, x, line) {
                 // The wide glyph before it covered this cell; a space here
                 // would push the rest of the row one column right.
                 Some(cell) if cell.is_wide_continuation() => {}
@@ -875,39 +917,23 @@ fn write_color(buf: &mut Vec<u8>, color: Color, fg: bool) {
     }
 }
 
-/// Order two (col, row) endpoints in reading order (top-left → bottom-right).
-fn order_endpoints(a: (u16, u16), b: (u16, u16)) -> ((u16, u16), (u16, u16)) {
-    if a.1 < b.1 || (a.1 == b.1 && a.0 <= b.0) {
-        (a, b)
-    } else {
-        (b, a)
-    }
+/// Append ANSI bytes that draw the copy-mode overlay over its pane. Use
+/// [`render_copy_overlay_with_vt_into`] when a VT is available so selection
+/// can repaint the selected glyphs with a high-contrast palette instead of
+/// masking text with a blank band.
+pub fn render_copy_overlay_into(buf: &mut Vec<u8>, state: &CopyModeState, theme: &Theme) {
+    render_copy_overlay_inner(buf, None, state, theme);
 }
 
-/// Append ANSI bytes that draw the copy-mode overlay over the focused pane's
-/// content rect. Use [`render_copy_overlay_with_vt_into`] when a VT is
-/// available so selection can repaint the selected glyphs with a high-contrast
-/// palette instead of masking text with a blank band.
-pub fn render_copy_overlay_into(
-    buf: &mut Vec<u8>,
-    pane: Rect,
-    state: &CopyModeState,
-    theme: &Theme,
-) {
-    render_copy_overlay_inner(buf, pane, None, state, theme);
-}
-
-/// Variant of [`render_copy_overlay_into`] that can redraw selected text from
-/// the active VT viewport. This keeps visual selection legible instead of
-/// painting an opaque band over the glyphs.
+/// Variant of [`render_copy_overlay_into`] that redraws selected text from
+/// the copy view, keeping a visual selection legible.
 pub fn render_copy_overlay_with_vt_into(
     buf: &mut Vec<u8>,
-    pane: Rect,
     vt: &VirtualTerminal,
     state: &CopyModeState,
     theme: &Theme,
 ) {
-    render_copy_overlay_inner(buf, pane, Some(vt), state, theme);
+    render_copy_overlay_inner(buf, Some(vt), state, theme);
 }
 
 /// Draw only the selected text, without the copy-mode cursor or status hint.
@@ -919,50 +945,48 @@ pub fn render_selection_overlay_with_vt_into(
     buf: &mut Vec<u8>,
     view: &PaneViewport,
     vt: &VirtualTerminal,
-    state: &CopyModeState,
+    selection: &Selection,
     theme: &Theme,
 ) {
     // Only cells the frame drew: a run is not highlighted across surplus.
-    let shown = Rect::new(
-        view.rect.x,
-        view.rect.y,
-        view.shown_cols() as u16,
-        view.shown_rows() as u16,
-    );
-    render_selection_overlay_inner(buf, shown, Some(vt), state, theme, Slice::Frame(view));
+    let runs = frame_runs(selection, view);
+    paint_runs(buf, view.rect, Some(vt), Slice::Frame(view), theme, &runs);
 }
 
 /// Variant of [`render_selection_overlay_with_vt_into`] used when the VT has
 /// disappeared between frames.
 pub fn render_selection_overlay_into(
     buf: &mut Vec<u8>,
-    pane: Rect,
-    state: &CopyModeState,
+    view: &PaneViewport,
+    selection: &Selection,
     theme: &Theme,
 ) {
-    let slice = Slice::Copy {
-        pane,
-        scroll_offset: state.scroll_offset,
-    };
-    render_selection_overlay_inner(buf, pane, None, state, theme, slice);
+    let runs = frame_runs(selection, view);
+    paint_runs(buf, view.rect, None, Slice::Frame(view), theme, &runs);
 }
 
 fn render_copy_overlay_inner(
     buf: &mut Vec<u8>,
-    pane: Rect,
     vt: Option<&VirtualTerminal>,
     state: &CopyModeState,
     theme: &Theme,
 ) {
+    let v = &state.view;
+    let pane = v.rect();
     if pane.width < 2 || pane.height < 2 {
         return;
     }
 
-    let slice = Slice::Copy {
-        pane,
-        scroll_offset: state.scroll_offset,
-    };
-    render_selection_overlay_inner(buf, pane, vt, state, theme, slice);
+    if let Some(anchor) = state.anchor {
+        let ends = ordered(anchor, state.cursor);
+        let runs: Vec<(u16, u16, u16)> = (0..v.rows())
+            .filter_map(|y| {
+                let (lo, hi) = modal_span(v, ends, v.top + y)?;
+                Some((y as u16, lo as u16, hi as u16))
+            })
+            .collect();
+        paint_runs(buf, pane, vt, Slice::Copy(v), theme, &runs);
+    }
 
     // Status-line hint at the bottom row of the pane: shows current
     // mode and dismiss/yank shortcuts. The text width changes with
@@ -980,7 +1004,6 @@ fn render_copy_overlay_inner(
         " COPY  hjkl move  PgUp/PgDn scroll  / ? search  v select  y yank  q exit ".to_string()
     };
     let hint_row = pane.y + pane.height.saturating_sub(1);
-    let hint_col = pane.x;
     let usable = pane.width as usize;
     let truncated = truncate_to_width(&hint, usable);
     let pad = usable.saturating_sub(display_width_str(&truncated));
@@ -988,7 +1011,7 @@ fn render_copy_overlay_inner(
         buf,
         "\x1b[{};{}H{}{}{}{}\x1b[0m",
         hint_row + 1,
-        hint_col + 1,
+        pane.x + 1,
         sgr_bg(theme.status_accent),
         sgr_fg(theme.status_bg),
         truncated,
@@ -998,72 +1021,45 @@ fn render_copy_overlay_inner(
     // Cursor block, after the hint so it shows on the hint's row too: the
     // selection palette inverted (fg=status_bg on bg=status_fg), so it stays
     // visible inside a selection run and over bare pane content.
-    let (cx, cy) = state.cursor;
-    if cx < pane.width && cy < pane.height {
-        let (col, glyph) = vt
-            .and_then(|vt| cursor_glyph(vt, pane, state))
-            .unwrap_or((cx, " ".to_string()));
-        cursor_block(
-            buf,
-            pane.x + col,
-            pane.y + cy,
-            &glyph,
-            theme.status_bg,
-            theme.status_fg,
-        );
-    }
+    let (cx, cy) = state.cursor_local();
+    let (col, glyph) = vt
+        .and_then(|vt| cursor_glyph(vt, state))
+        .unwrap_or((cx, " ".to_string()));
+    cursor_block(
+        buf,
+        pane.x + col,
+        pane.y + cy,
+        &glyph,
+        theme.status_bg,
+        theme.status_fg,
+    );
 }
 
-fn render_selection_overlay_inner(
+/// Highlight each `(row, first, last)` local run of `pane`, redrawing the
+/// glyphs `slice` shows there when a VT is at hand.
+fn paint_runs(
     buf: &mut Vec<u8>,
     pane: Rect,
     vt: Option<&VirtualTerminal>,
-    state: &CopyModeState,
-    theme: &Theme,
     slice: Slice<'_>,
+    theme: &Theme,
+    runs: &[(u16, u16, u16)],
 ) {
-    if pane.width < 1 || pane.height < 1 {
-        return;
-    }
-
-    if let Some(anchor) = state.anchor {
-        let (start, end) = order_endpoints(anchor, state.cursor);
-        for row in start.1..=end.1 {
-            if row >= pane.height {
-                break;
-            }
-            let (col_lo, col_hi) = if start.1 == end.1 {
-                if state.cursor.0 <= anchor.0 {
-                    (state.cursor.0, anchor.0)
-                } else {
-                    (anchor.0, state.cursor.0)
-                }
-            } else if row == start.1 {
-                (start.0, pane.width.saturating_sub(1))
-            } else if row == end.1 {
-                (0, end.0)
-            } else {
-                (0, pane.width.saturating_sub(1))
-            };
-            if let Some(vt) = vt {
+    for &(row, lo, hi) in runs {
+        if row >= pane.height {
+            continue;
+        }
+        match vt {
+            Some(vt) => {
                 let ctx = SelectionRenderCtx {
                     pane,
                     vt,
                     slice,
                     theme,
                 };
-                selection_text_run(buf, ctx, col_lo, col_hi, row);
-            } else {
-                highlight_run(
-                    buf,
-                    pane,
-                    col_lo,
-                    col_hi,
-                    row,
-                    theme.status_bg,
-                    theme.status_accent,
-                );
+                selection_text_run(buf, ctx, lo, hi, row);
             }
+            None => highlight_run(buf, pane, lo, hi, row, theme.status_bg, theme.status_accent),
         }
     }
 }
@@ -1214,20 +1210,16 @@ fn highlight_run(
 /// The pane column the cursor block starts at, and the glyph it shows. On the
 /// right half of a wide character that is the character's own cell, so the
 /// block covers the whole glyph instead of splitting it.
-fn cursor_glyph(vt: &VirtualTerminal, pane: Rect, state: &CopyModeState) -> Option<(u16, String)> {
-    let (cx, cy) = state.cursor;
-    let row = row_for_view(vt, pane.height, state.scroll_offset, cy)?;
-    let mut col = cx;
-    let mut cell = row.get(col as usize)?;
+fn cursor_glyph(vt: &VirtualTerminal, state: &CopyModeState) -> Option<(u16, String)> {
+    let v = &state.view;
+    let (mut x, y) = state.cursor_local();
+    let line = v.top + usize::from(y);
+    let mut cell = v.cell(vt, x.into(), line)?;
     if cell.is_wide_continuation() {
-        col = col.checked_sub(1)?;
-        cell = row.get(col as usize)?;
+        x = x.checked_sub(1)?;
+        cell = v.cell(vt, x.into(), line)?;
     }
-    // A wide glyph with no room for its right half would spill past the pane.
-    if cell.is_wide() && col + 1 >= pane.width {
-        return None;
-    }
-    Some((col, shown_text(cell)))
+    Some((x, shown_text(&cell)))
 }
 
 /// What an overlay that recolours `cell` may show of it: concealed (SGR 8)
@@ -1305,6 +1297,24 @@ mod tests {
         vt
     }
 
+    /// Copy mode over `vt` as a frame drawing it in `rect` shows it.
+    fn modal(vt: &VirtualTerminal, rect: Rect) -> CopyModeState {
+        let pane = PaneId::from_uuid(uuid::Uuid::from_u128(1));
+        CopyModeState::enter(pane, PaneViewport::of(rect, vt, 0), Drawn::of(vt), vt)
+            .expect("copy mode")
+    }
+
+    fn whole(vt: &VirtualTerminal) -> CopyModeState {
+        let (rows, cols) = (vt.grid().rows() as u16, vt.grid().cols() as u16);
+        modal(vt, Rect::new(0, 0, cols, rows))
+    }
+
+    /// The cursor at local `(x, y)`, the anchor at local `anchor`.
+    fn select(s: &mut CopyModeState, anchor: Option<(u16, u16)>, cursor: (u16, u16)) {
+        s.anchor = anchor.map(|a| s.view.source(a));
+        s.set_cursor(s.view.source(cursor));
+    }
+
     fn strip_ansi(input: &str) -> String {
         let mut out = String::new();
         let mut chars = input.chars().peekable();
@@ -1324,146 +1334,131 @@ mod tests {
 
     #[test]
     fn handle_key_hjkl_clamps_to_pane() {
-        let mut s = CopyModeState::new();
-        // Try to go up/left at origin — no-op.
-        assert_eq!(handle_key(b"h", &mut s, 10, 5, 20), CopyKey::Ignored);
-        assert_eq!(handle_key(b"k", &mut s, 10, 5, 20), CopyKey::Ignored);
-        assert_eq!(s.cursor, (0, 0));
-        // Move down 1 + right 1.
-        assert_eq!(handle_key(b"j", &mut s, 10, 5, 20), CopyKey::Updated);
-        assert_eq!(handle_key(b"l", &mut s, 10, 5, 20), CopyKey::Updated);
-        assert_eq!(s.cursor, (1, 1));
+        let vt = vt_with(5, 10, "");
+        let mut s = whole(&vt);
+        assert_eq!(handle_key(b"h", &mut s, &vt), CopyKey::Ignored);
+        assert_eq!(handle_key(b"k", &mut s, &vt), CopyKey::Ignored);
+        assert_eq!(s.cursor_local(), (0, 0));
+        assert_eq!(handle_key(b"j", &mut s, &vt), CopyKey::Updated);
+        assert_eq!(handle_key(b"l", &mut s, &vt), CopyKey::Updated);
+        assert_eq!(s.cursor_local(), (1, 1));
+        for _ in 0..20 {
+            handle_key(b"l", &mut s, &vt);
+            handle_key(b"j", &mut s, &vt);
+        }
+        // The last row is under the hint bar: never drawn, never reachable.
+        assert_eq!(s.cursor_local(), (9, 3), "the cursor left what is readable");
     }
 
     #[test]
     fn handle_key_arrow_keys_work() {
-        let mut s = CopyModeState::new();
-        assert_eq!(handle_key(b"\x1b[B", &mut s, 10, 5, 20), CopyKey::Updated);
-        assert_eq!(handle_key(b"\x1b[C", &mut s, 10, 5, 20), CopyKey::Updated);
-        assert_eq!(s.cursor, (1, 1));
+        let vt = vt_with(5, 10, "");
+        let mut s = whole(&vt);
+        assert_eq!(handle_key(b"\x1b[B", &mut s, &vt), CopyKey::Updated);
+        assert_eq!(handle_key(b"\x1b[C", &mut s, &vt), CopyKey::Updated);
+        assert_eq!(s.cursor_local(), (1, 1));
+        handle_key(b"\x1b[A", &mut s, &vt);
+        handle_key(b"\x1b[D", &mut s, &vt);
+        assert_eq!(s.cursor_local(), (0, 0));
     }
 
     #[test]
     fn handle_key_v_toggles_anchor() {
-        let mut s = CopyModeState::new();
-        s.cursor = (3, 2);
-        handle_key(b"v", &mut s, 10, 5, 20);
+        let vt = vt_with(5, 10, "");
+        let mut s = whole(&vt);
+        select(&mut s, None, (3, 2));
+        handle_key(b"v", &mut s, &vt);
         assert_eq!(s.anchor, Some((3, 2)));
-        handle_key(b"v", &mut s, 10, 5, 20);
+        handle_key(b"v", &mut s, &vt);
         assert_eq!(s.anchor, None);
     }
 
     #[test]
     fn handle_key_y_returns_yank() {
-        let mut s = CopyModeState::new();
-        assert_eq!(handle_key(b"y", &mut s, 10, 5, 20), CopyKey::Yank);
+        let vt = vt_with(5, 10, "");
+        assert_eq!(handle_key(b"y", &mut whole(&vt), &vt), CopyKey::Yank);
     }
 
     #[test]
     fn handle_key_q_and_esc_exit() {
-        let mut s = CopyModeState::new();
-        assert_eq!(handle_key(b"q", &mut s, 10, 5, 20), CopyKey::Exit);
-        assert_eq!(handle_key(b"\x1b", &mut s, 10, 5, 20), CopyKey::Exit);
+        let vt = vt_with(5, 10, "");
+        let mut s = whole(&vt);
+        assert_eq!(handle_key(b"q", &mut s, &vt), CopyKey::Exit);
+        assert_eq!(handle_key(b"\x1b", &mut s, &vt), CopyKey::Exit);
     }
 
     #[test]
     fn page_keys_adjust_scroll_offset() {
-        let mut s = CopyModeState::new();
-        // A page is the READABLE height: the bottom row of the rect carries the
-        // copy-mode hint bar, so five rows show four lines.
-        assert_eq!(handle_key(b"\x1b[5~", &mut s, 10, 5, 20), CopyKey::Updated);
-        assert_eq!(s.scroll_offset, 4);
-        assert_eq!(handle_key(b"\x1b[6~", &mut s, 10, 5, 20), CopyKey::Updated);
-        assert_eq!(s.scroll_offset, 0);
+        // A page is the READABLE height: the bottom row of the rect carries
+        // the hint bar, so five rows show four lines.
+        let vt = vt_with_lines(5, 10, 20);
+        let mut s = whole(&vt);
+        let top = s.view.top;
+        assert_eq!(handle_key(b"\x1b[5~", &mut s, &vt), CopyKey::Updated);
+        assert_eq!(s.view.top, top - 4);
+        assert_eq!(handle_key(b"\x1b[6~", &mut s, &vt), CopyKey::Updated);
+        assert_eq!(s.view.top, top);
     }
 
-    /// Paging must TILE the lines a person can read: no line skipped between
-    /// one page and the next, and none shown twice.
-    ///
-    /// The copy view draws `pane_rows` lines and the hint bar is written over
-    /// the last of them, so paging by the full height stepped over exactly one
-    /// line per page — a 30-row pane showed 0001..0030 and then began the next
-    /// page at 0032. Asserted on the visible line RANGES rather than on the
-    /// offset, so it stays true if the offset arithmetic is ever rewritten.
+    /// Paging must TILE the lines a person can read: none skipped between
+    /// pages, none shown twice. The hint bar covers a full-height slice's last
+    /// row, so a page is one line fewer than the rect.
     #[test]
     fn paging_tiles_the_readable_lines_without_skipping_any() {
-        const TOTAL: usize = 400;
         for pane_rows in [3u16, 5, 12, 24, 30] {
-            // Stated here, NOT taken from `readable_rows`: a test that asks the
-            // code under test how many lines are readable moves with the bug
-            // and passes either way. The hint bar is written over the bottom
-            // row of the rect (`render_copy_overlay_inner`), so one fewer line
-            // than the rect is tall can be read.
+            let vt = vt_with_lines(pane_rows, 40, 400);
             let readable = pane_rows as usize - 1;
-            let mut s = CopyModeState::new();
+            let mut s = whole(&vt);
             let mut seen: Vec<usize> = Vec::new();
-
-            // Page back through history, recording the lines actually readable
-            // on each page (the bottom drawn row is hidden by the hint bar).
             for _ in 0..6 {
-                let start = view_start(TOTAL, pane_rows, s.scroll_offset);
-                seen.extend(start..start + readable);
-                if handle_key(b"\x1b[5~", &mut s, 40, pane_rows, TOTAL) != CopyKey::Updated {
+                seen.extend(s.view.top..s.view.top + readable);
+                if handle_key(b"\x1b[5~", &mut s, &vt) != CopyKey::Updated {
                     break;
                 }
             }
-
             seen.sort_unstable();
             seen.dedup();
-            let lo = *seen.first().expect("some lines were readable");
-            let hi = *seen.last().expect("some lines were readable");
+            let (lo, hi) = (seen[0], *seen.last().expect("lines"));
+            assert_eq!(seen.len(), hi - lo + 1, "{pane_rows} rows skipped lines");
             assert_eq!(
                 seen.len(),
-                hi - lo + 1,
-                "paging a {pane_rows}-row pane skipped lines: readable set spans {lo}..={hi} \
-                 but only {} distinct lines were reachable",
-                seen.len(),
+                6 * readable,
+                "{pane_rows} rows overlapped pages"
             );
         }
     }
 
     #[test]
     fn gg_and_g_jump_between_history_edges() {
-        let mut s = CopyModeState::new();
-        assert_eq!(handle_key(b"g", &mut s, 10, 5, 20), CopyKey::Ignored);
-        assert_eq!(handle_key(b"g", &mut s, 10, 5, 20), CopyKey::Updated);
-        assert_eq!(s.scroll_offset, 15);
-        assert_eq!(s.cursor, (0, 0));
-        assert_eq!(handle_key(b"G", &mut s, 10, 5, 20), CopyKey::Updated);
-        assert_eq!(s.scroll_offset, 0);
-        assert_eq!(s.cursor, (0, 4));
+        let vt = vt_with_lines(5, 10, 20);
+        let mut s = whole(&vt);
+        assert_eq!(handle_key(b"g", &mut s, &vt), CopyKey::Ignored);
+        assert_eq!(handle_key(b"g", &mut s, &vt), CopyKey::Updated);
+        assert_eq!((s.view.top, s.cursor), (0, (0, 0)));
+        assert_eq!(handle_key(b"G", &mut s, &vt), CopyKey::Updated);
+        // Four rows readable: the last line sits just above the hint bar.
+        assert_eq!(s.view.top, vt.presented_total_lines() - 4);
+        assert_eq!(
+            s.cursor_local(),
+            (0, 3),
+            "G put the cursor under the hint bar"
+        );
     }
 
     #[test]
     fn slash_search_focuses_scrollback_match() {
         let vt = vt_with_lines(5, 20, 20);
-        let mut s = CopyModeState {
-            cursor: (0, 4),
-            ..Default::default()
-        };
+        let mut s = whole(&vt);
+        for key in ["/", "l", "i", "n", "e", "-", "0", "7", "\r"] {
+            handle_key(key.as_bytes(), &mut s, &vt);
+        }
+        assert!(s.view.top < s.view.entry_top, "{:?}", s.view);
+        assert_eq!(extract_selection(&vt, &s), "l");
         assert_eq!(
-            handle_key_with_vt(b"/", &mut s, 20, 5, vt.grid().total_lines(), Some(&vt)),
-            CopyKey::Updated
+            vt.presented_row(s.cursor.1).map(|r| r[5].ch),
+            Some('0'),
+            "the cursor is not on line-07"
         );
-        assert_eq!(
-            handle_key_with_vt(
-                b"line-07",
-                &mut s,
-                20,
-                5,
-                vt.grid().total_lines(),
-                Some(&vt)
-            ),
-            CopyKey::Updated
-        );
-        assert_eq!(
-            handle_key_with_vt(b"\r", &mut s, 20, 5, vt.grid().total_lines(), Some(&vt)),
-            CopyKey::Updated
-        );
-
-        assert_eq!(s.cursor.0, 0);
-        assert!(s.scroll_offset > 0);
-        assert_eq!(extract_selection(&vt, &s, 20, 5), "l");
         assert_eq!(
             s.last_search,
             Some(SearchMatch {
@@ -1476,173 +1471,184 @@ mod tests {
     #[test]
     fn repeat_search_moves_to_next_and_previous_match() {
         let vt = vt_with(5, 20, "apple\r\nbanana\r\napple\r\nbanana");
-        let mut s = CopyModeState::new();
-        handle_key_with_vt(b"/", &mut s, 20, 5, vt.grid().total_lines(), Some(&vt));
-        handle_key_with_vt(b"apple", &mut s, 20, 5, vt.grid().total_lines(), Some(&vt));
-        handle_key_with_vt(b"\r", &mut s, 20, 5, vt.grid().total_lines(), Some(&vt));
+        let mut s = whole(&vt);
+        for key in ["/", "a", "p", "p", "l", "e", "\r"] {
+            handle_key(key.as_bytes(), &mut s, &vt);
+        }
         let first = s.cursor;
-
-        assert_eq!(
-            handle_key_with_vt(b"n", &mut s, 20, 5, vt.grid().total_lines(), Some(&vt)),
-            CopyKey::Updated
-        );
+        assert_eq!(handle_key(b"n", &mut s, &vt), CopyKey::Updated);
         assert_ne!(s.cursor, first);
-        assert_eq!(
-            handle_key_with_vt(b"N", &mut s, 20, 5, vt.grid().total_lines(), Some(&vt)),
-            CopyKey::Updated
-        );
+        assert_eq!(handle_key(b"N", &mut s, &vt), CopyKey::Updated);
         assert_eq!(s.cursor, first);
+    }
+
+    /// A search that pans the slice keeps the selection's source anchor: the
+    /// yank still starts where `v` was pressed.
+    #[test]
+    fn a_pan_keeps_the_selection_it_started_with() {
+        let vt = vt_with(3, 60, "abc\x1b[1;50Hzz\x1b[1;1H");
+        let mut s = modal(&vt, Rect::new(0, 0, 20, 3));
+        handle_key(b"v", &mut s, &vt);
+        let anchor = s.anchor;
+        for key in ["/", "z", "z", "\r"] {
+            handle_key(key.as_bytes(), &mut s, &vt);
+        }
+        assert_eq!(s.view.col, 49 + 2 - 20, "panned past what it had to");
+        assert_eq!(s.anchor, anchor, "the pan moved the anchor");
+        assert_eq!(s.cursor, (49, 0));
+    }
+
+    fn yank(payload: &str, anchor: Option<(u16, u16)>, cursor: (u16, u16)) -> String {
+        let vt = vt_with(5, 20, payload);
+        let mut s = whole(&vt);
+        select(&mut s, anchor, cursor);
+        extract_selection(&vt, &s)
     }
 
     #[test]
     fn extract_selection_single_line() {
-        let vt = vt_with(5, 20, "hello world");
-        let state = CopyModeState {
-            cursor: (10, 0),
-            anchor: Some((6, 0)),
-            ..Default::default()
-        };
-        let s = extract_selection(&vt, &state, 20, 5);
-        assert_eq!(s, "world");
+        assert_eq!(yank("hello world", Some((6, 0)), (10, 0)), "world");
     }
 
     #[test]
     fn extract_selection_no_anchor_returns_single_cell() {
-        let vt = vt_with(5, 20, "hello world");
-        let state = CopyModeState {
-            cursor: (0, 0),
-            anchor: None,
-            ..Default::default()
-        };
-        let s = extract_selection(&vt, &state, 20, 5);
-        assert_eq!(s, "h");
+        assert_eq!(yank("hello world", None, (0, 0)), "h");
     }
 
     #[test]
     fn extract_selection_multi_line() {
-        // Two lines: "first" (newline) "second"
-        let vt = vt_with(5, 20, "first\r\nsecond");
-        let state = CopyModeState {
-            cursor: (5, 1),
-            anchor: Some((0, 0)),
-            ..Default::default()
-        };
-        let s = extract_selection(&vt, &state, 20, 5);
-        assert_eq!(s, "first\nsecond");
+        assert_eq!(
+            yank("first\r\nsecond", Some((0, 0)), (5, 1)),
+            "first\nsecond"
+        );
     }
 
     #[test]
     fn extract_selection_handles_reversed_endpoints() {
-        let vt = vt_with(5, 20, "hello world");
-        let state = CopyModeState {
-            cursor: (6, 0),
-            anchor: Some((10, 0)),
-            ..Default::default()
-        };
-        let s = extract_selection(&vt, &state, 20, 5);
-        assert_eq!(s, "world");
+        assert_eq!(yank("hello world", Some((10, 0)), (6, 0)), "world");
+    }
+
+    /// Copy mode scrolled to the top of history.
+    fn at_top(vt: &VirtualTerminal) -> CopyModeState {
+        let mut s = whole(vt);
+        handle_key(b"g", &mut s, vt);
+        handle_key(b"g", &mut s, vt);
+        s
     }
 
     #[test]
     fn extract_selection_reads_scrolled_history_view() {
         let vt = vt_with_lines(3, 20, 8);
-        let total = vt.grid().total_lines();
-        let mut state = CopyModeState::new();
-        state.scroll_offset = max_scroll_offset(total, 3);
-        state.cursor = (6, 0);
-        state.anchor = Some((0, 0));
-        let s = extract_selection(&vt, &state, 20, 3);
-        assert!(s.starts_with("line-00"), "expected oldest row, got {s:?}");
+        let mut s = at_top(&vt);
+        select(&mut s, Some((0, 0)), (6, 0));
+        assert_eq!(extract_selection(&vt, &s), "line-00");
     }
 
     #[test]
     fn render_copy_view_draws_scrolled_history() {
         let vt = vt_with_lines(3, 20, 8);
-        let total = vt.grid().total_lines();
-        let state = CopyModeState {
-            scroll_offset: max_scroll_offset(total, 3),
-            ..Default::default()
-        };
+        let s = at_top(&vt);
+        let (_, over) = s.view.frame_view(&vt);
+        assert!(over, "history is not the grid's to draw");
         let mut buf = Vec::new();
-        render_copy_view_into(&mut buf, Rect::new(0, 0, 20, 3), &vt, &state);
-        let rendered = String::from_utf8_lossy(&buf);
-        let plain = strip_ansi(&rendered);
-        assert!(plain.contains("line-00"), "rendered={rendered:?}");
+        render_copy_view_into(&mut buf, &vt, &s);
+        assert!(strip_ansi(&String::from_utf8_lossy(&buf)).contains("line-00"));
+    }
+
+    /// A grid taller than its rect, content and cursor at the top: the frame
+    /// shows the top rows, and copy mode reads the rows it shows.
+    #[test]
+    fn extract_selection_reads_shown_rows_when_grid_exceeds_viewport() {
+        let mut vt = VirtualTerminal::new(60, 40);
+        vt.process(b"TOPLINE-UNIQUE\r\n");
+        let mut s = modal(&vt, Rect::new(0, 0, 40, 20));
+        select(&mut s, Some((0, 0)), (13, 0));
+        assert_eq!(extract_selection(&vt, &s), "TOPLINE-UNIQUE");
+    }
+
+    /// A grid that fits its rect opens copy mode on the live rows, below all
+    /// of its history, drawn as the frame draws them.
+    #[test]
+    fn effective_total_lines_is_unchanged_when_grid_fits() {
+        let mut vt = VirtualTerminal::new(24, 80);
+        for _ in 0..50 {
+            vt.process(b"line\r\n");
+        }
+        let s = whole(&vt);
+        assert_eq!(s.view.top, vt.presented_total_lines() - 24);
+        let live = PaneViewport::of(s.view.rect(), &vt, 0);
+        assert_eq!(s.view.frame_view(&vt), (live, false));
+    }
+
+    /// The view opens where the frame showed the pane, on both axes, and the
+    /// frame keeps drawing it there while the application moves its cursor.
+    #[test]
+    fn copy_view_render_matches_frame_for_oversized_pane() {
+        let mut vt = VirtualTerminal::new(20, 60);
+        for r in 0..20 {
+            vt.process(format!("\x1b[{};1H{r:02}{}", r + 1, "x".repeat(50)).as_bytes());
+        }
+        vt.process(b"\x1b[15;45H");
+        let rect = Rect::new(2, 1, 30, 10);
+        let entry = PaneViewport::of(rect, &vt, 0);
+        assert_eq!((entry.row_offset, entry.col_offset), (5, 15));
+        let s = modal(&vt, rect);
+        vt.process(b"\x1b[1;1H");
+        assert_eq!(s.view.frame_view(&vt), (entry, false));
+        assert!(s.view.maps(rect, &vt));
+        assert!(!s.view.maps(Rect::new(2, 1, 31, 10), &vt));
+        vt.resize(20, 59);
+        assert!(!s.view.maps(rect, &vt), "a resized grid still mapped");
     }
 
     #[test]
     fn osc52_emits_well_formed_sequence() {
         let bytes = osc52_copy("hi");
-        // ESC ] 52 ; c ; <base64> BEL
         assert_eq!(&bytes[..6], b"\x1b]52;c");
         assert_eq!(*bytes.last().unwrap(), 0x07);
         let payload = std::str::from_utf8(&bytes[7..bytes.len() - 1]).unwrap();
-        let decoded = BASE64.decode(payload).unwrap();
-        assert_eq!(decoded, b"hi");
+        assert_eq!(BASE64.decode(payload).unwrap(), b"hi");
     }
 
     #[test]
     fn render_overlay_emits_cursor_position() {
+        let vt = VirtualTerminal::new(10, 20);
+        let mut s = modal(&vt, Rect::new(2, 3, 20, 10));
+        select(&mut s, None, (4, 2));
         let mut buf = Vec::new();
-        let pane = Rect::new(2, 3, 20, 10);
-        let state = CopyModeState {
-            cursor: (4, 2),
-            anchor: None,
-            ..Default::default()
-        };
-        render_copy_overlay_into(&mut buf, pane, &state, &Theme::DEFAULT);
-        let s = String::from_utf8_lossy(&buf);
-        // Cursor is at (pane.x + 4, pane.y + 2) = (6, 5). ANSI is
-        // 1-based, so we expect CSI 6;7 H somewhere.
-        assert!(s.contains("\x1b[6;7H"), "missing cursor position: {s:?}");
-        assert!(s.contains("COPY"), "missing status hint");
+        render_copy_overlay_into(&mut buf, &s, &Theme::DEFAULT);
+        let out = String::from_utf8_lossy(&buf);
+        assert!(
+            out.contains("\x1b[6;7H"),
+            "missing cursor position: {out:?}"
+        );
+        assert!(out.contains("COPY"), "missing status hint");
     }
 
     #[test]
     fn render_overlay_with_vt_keeps_selected_text_legible() {
         let vt = vt_with(3, 20, "abcdef");
-        let pane = Rect::new(0, 0, 20, 3);
-        let state = CopyModeState {
-            cursor: (2, 0),
-            anchor: Some((0, 0)),
-            ..Default::default()
-        };
+        let mut s = whole(&vt);
+        select(&mut s, Some((0, 0)), (2, 0));
         let mut buf = Vec::new();
-        render_copy_overlay_with_vt_into(&mut buf, pane, &vt, &state, &Theme::DEFAULT);
-        let rendered = String::from_utf8_lossy(&buf);
-        let plain = strip_ansi(&rendered);
-        assert!(
-            plain.contains("abc"),
-            "selection should repaint selected glyphs, rendered={rendered:?}"
-        );
-        assert!(
-            rendered.contains("\x1b[48;2;116;199;236m"),
-            "selection should use high-contrast accent background"
-        );
-        assert!(
-            rendered.contains("\x1b[38;2;30;32;48m"),
-            "selection should use dark foreground on accent background"
-        );
+        render_copy_overlay_with_vt_into(&mut buf, &vt, &s, &Theme::DEFAULT);
+        let out = String::from_utf8_lossy(&buf);
+        assert!(strip_ansi(&out).contains("abc"), "{out:?}");
+        assert!(out.contains("\x1b[48;2;116;199;236m"), "accent background");
+        assert!(out.contains("\x1b[38;2;30;32;48m"), "dark foreground");
     }
 
     /// Draw the overlay into a fresh VT and read back the cell at `(col, row)`.
-    fn overlay_cell(
-        vt: &VirtualTerminal,
-        pane: Rect,
-        state: &CopyModeState,
-        col: u16,
-        row: u16,
-    ) -> shux_vt::Cell {
+    fn overlay_cell(vt: &VirtualTerminal, s: &CopyModeState, col: u16, row: u16) -> Cell {
         let mut buf = Vec::new();
-        render_copy_overlay_with_vt_into(&mut buf, pane, vt, state, &Theme::DEFAULT);
-        let mut screen = VirtualTerminal::new(pane.height as usize, pane.width as usize);
+        render_copy_overlay_with_vt_into(&mut buf, vt, s, &Theme::DEFAULT);
+        let r = s.view.rect();
+        let mut screen = VirtualTerminal::new(r.height as usize, r.width as usize);
         screen.process(&buf);
-        row_for_view(&screen, pane.height, 0, row)
-            .and_then(|r| r.get(col as usize).cloned())
-            .expect("cell on screen")
+        screen.grid().visible_row(row.into())[usize::from(col)].clone()
     }
 
-    fn cursor_colours(cell: &shux_vt::Cell) {
+    fn cursor_colours(cell: &Cell) {
         let (bg, fg) = (Theme::DEFAULT.status_bg, Theme::DEFAULT.status_fg);
         assert_eq!(
             (cell.style.fg, cell.style.bg),
@@ -1658,114 +1664,295 @@ mod tests {
             20,
             "\x1b[38;2;120;220;180mTRUECOLOR\x1b[0m \x1b[38;5;208mINDEXED\x1b[0m \x1b[34mBASIC\x1b[0m",
         );
-        let pane = Rect::new(0, 0, 20, 3);
-        let state = CopyModeState {
-            cursor: (0, 0),
-            ..Default::default()
-        };
-        let cell = overlay_cell(&vt, pane, &state, 0, 0);
-        assert_eq!(
-            cell.display_text(),
-            "T",
-            "the cursor blanked the glyph under it"
-        );
+        let s = whole(&vt);
+        let cell = overlay_cell(&vt, &s, 0, 0);
+        assert_eq!(cell.display_text(), "T", "the cursor blanked the glyph");
         cursor_colours(&cell);
     }
 
     #[test]
     fn the_copy_cursor_covers_a_wide_glyph_from_either_half() {
         let vt = vt_with(3, 20, "a漢b");
-        let pane = Rect::new(0, 0, 20, 3);
         for col in [1, 2] {
-            let state = CopyModeState {
-                cursor: (col, 0),
-                ..Default::default()
-            };
-            let cell = overlay_cell(&vt, pane, &state, 1, 0);
-            assert_eq!(
-                cell.display_text(),
-                "漢",
-                "cursor at col {col} split or blanked the wide glyph"
-            );
+            let mut s = whole(&vt);
+            select(&mut s, None, (col, 0));
+            let cell = overlay_cell(&vt, &s, 1, 0);
+            assert_eq!(cell.display_text(), "漢", "cursor at {col} split it");
             assert!(cell.is_wide());
             cursor_colours(&cell);
         }
     }
 
-    /// Concealed text (SGR 8) stays concealed under the copy cursor, narrow
-    /// and wide, and inside a selection.
     #[test]
     fn copy_mode_keeps_concealed_text_concealed() {
         let vt = vt_with(3, 20, "\x1b[8mSECRET\u{6f22}\x1b[0m");
-        let pane = Rect::new(0, 0, 20, 3);
         for (cursor, block) in [(0, 0), (6, 6), (7, 6)] {
-            let state = CopyModeState {
-                cursor: (cursor, 0),
-                ..Default::default()
-            };
-            let cell = overlay_cell(&vt, pane, &state, block, 0);
-            assert!(
-                cell.display_text().trim().is_empty(),
-                "the copy cursor at col {cursor} showed concealed {:?}",
-                cell.display_text()
-            );
+            let mut s = whole(&vt);
+            select(&mut s, None, (cursor, 0));
+            let cell = overlay_cell(&vt, &s, block, 0);
+            assert!(cell.display_text().trim().is_empty(), "cursor at {cursor}");
             cursor_colours(&cell);
         }
-
-        let state = CopyModeState {
-            cursor: (5, 0),
-            anchor: Some((0, 0)),
-            ..Default::default()
-        };
-        let cell = overlay_cell(&vt, pane, &state, 2, 0);
+        let mut s = whole(&vt);
+        select(&mut s, Some((0, 0)), (5, 0));
+        let cell = overlay_cell(&vt, &s, 2, 0);
         assert!(
             cell.display_text().trim().is_empty(),
-            "the selection showed concealed {:?}",
-            cell.display_text()
+            "the selection showed it"
         );
 
         let mut buf = Vec::new();
-        render_copy_view_into(&mut buf, pane, &vt, &CopyModeState::default());
-        let mut screen = VirtualTerminal::new(pane.height as usize, pane.width as usize);
+        render_copy_view_into(&mut buf, &vt, &whole(&vt));
+        let mut screen = VirtualTerminal::new(3, 20);
         screen.process(&buf);
-        let cell = row_for_view(&screen, pane.height, 0, 0)
-            .and_then(|r| r.get(2).cloned())
-            .expect("cell on screen");
+        let cell = &screen.grid().visible_row(0)[2];
         assert!(
             cell.style.flags.contains(CellFlags::HIDDEN),
-            "the copy view drew concealed {:?} unconcealed",
-            cell.display_text()
+            "the view showed it"
         );
     }
 
     /// The hint bar sits on the pane's last row, which the cursor can reach.
     #[test]
     fn the_copy_cursor_shows_over_the_hint_bar() {
+        // The hint bar covers the last row, so neither the cursor, a drag nor
+        // a selection reaches it: what is yanked is what was drawn.
         let vt = vt_with(3, 20, "one\r\ntwo\r\nXYZ");
-        let pane = Rect::new(0, 0, 20, 3);
-        let state = CopyModeState {
-            cursor: (2, 2),
+        let mut s = whole(&vt);
+        select(&mut s, Some((0, 0)), (2, 2));
+        assert_eq!(s.cursor_local(), (2, 1));
+        assert_eq!(
+            s.view.source((2, 2)),
+            (2, 1),
+            "a drag on the hint row named it"
+        );
+        assert_eq!(extract_selection(&vt, &s), "one\ntwo");
+        let cell = overlay_cell(&vt, &s, 2, 1);
+        assert_eq!(cell.display_text(), "o");
+        cursor_colours(&cell);
+    }
+
+    #[test]
+    fn render_overlay_no_cursor_when_pane_too_small() {
+        let vt = VirtualTerminal::new(1, 1);
+        let s = whole(&vt);
+        let mut buf = Vec::new();
+        render_copy_overlay_into(&mut buf, &s, &Theme::DEFAULT);
+        assert!(buf.is_empty());
+    }
+
+    /// A selection whose anchor line has been evicted from history is
+    /// dropped; the view and cursor move down with what is left.
+    #[test]
+    fn rebasing_over_evicted_history_drops_the_selection() {
+        let config = shux_vt::GridConfig {
+            max_scrollback: 4,
             ..Default::default()
         };
-        let cell = overlay_cell(&vt, pane, &state, 2, 2);
-        assert_eq!(cell.display_text(), "Z", "the hint bar covered the cursor");
-        cursor_colours(&cell);
+        let mut vt = VirtualTerminal::with_config(3, 10, config);
+        for i in 0..6 {
+            vt.process(format!("e{i}\r\n").as_bytes());
+        }
+        let mut s = whole(&vt);
+        handle_key(b"v", &mut s, &vt);
+        for i in 6..20 {
+            vt.process(format!("e{i}\r\n").as_bytes());
+        }
+        s.rebase(&vt);
+        assert_eq!(s.anchor, None);
+        assert!(s.view.local(s.cursor).is_some(), "the cursor left the view");
+    }
+
+    /// An upward selection whose CURSOR's line is evicted, its anchor still
+    /// in history, is dropped too: `y` says so rather than copy a shorter one.
+    #[test]
+    fn evicting_the_cursors_line_drops_an_upward_selection() {
+        let config = shux_vt::GridConfig {
+            max_scrollback: 6,
+            ..Default::default()
+        };
+        let mut vt = VirtualTerminal::with_config(3, 10, config);
+        for i in 0..9 {
+            vt.process(format!("e{i}\r\n").as_bytes());
+        }
+        let mut s = at_top(&vt);
+        handle_key(b"j", &mut s, &vt);
+        handle_key(b"v", &mut s, &vt);
+        handle_key(b"k", &mut s, &vt);
+        assert_eq!(
+            (s.anchor.map(|a| a.1), s.cursor.1),
+            (Some(1), 0),
+            "setup: an upward selection from line 1 to 0"
+        );
+        let evicted = vt.presented_evicted();
+        vt.process(b"e9\r\n");
+        assert_eq!(
+            vt.presented_evicted(),
+            evicted + 1,
+            "setup: one more line evicted"
+        );
+        assert_eq!(handle_key(b"y", &mut s, &vt), CopyKey::SelectionEvicted);
+        assert_eq!(s.anchor, None);
+    }
+
+    /// A search match on the last line is brought into the readable rows,
+    /// never left under the hint bar; `G` reaches that line too.
+    #[test]
+    fn the_last_line_is_reachable_above_the_hint_bar() {
+        let vt = vt_with_lines_ending(5, 20, 12, "LAST");
+        let readable = 4;
+        let mut s = at_top(&vt);
+        for key in ["/", "L", "A", "S", "T", "\r"] {
+            handle_key(key.as_bytes(), &mut s, &vt);
+        }
+        assert_eq!(
+            vt.presented_row(s.cursor.1).map(|r| r[0].ch),
+            Some('L'),
+            "the search did not find the last line"
+        );
+        assert!(
+            s.cursor_local().1 < readable,
+            "the match is under the hint bar: {:?}",
+            s.cursor_local()
+        );
+        let mut s = at_top(&vt);
+        handle_key(b"G", &mut s, &vt);
+        assert_eq!(
+            vt.presented_row(s.cursor.1).map(|r| r[0].ch),
+            Some('L'),
+            "G stopped short of the last line"
+        );
+        assert!(s.cursor_local().1 < readable);
+        // The frame draws it from the grid; the row past the grid's last is
+        // the hint bar's.
+        let (view, over) = s.view.frame_view(&vt);
+        let y = usize::from(s.cursor_local().1);
+        assert!(!over);
+        assert_eq!(view.row_offset + y, 4, "the frame does not draw LAST there");
+        assert_eq!(view.shown_rows(), usize::from(readable));
+    }
+
+    /// A frame's slice names lines of the screen it was drawn on: once the
+    /// A frame whose top line has since been evicted opens nothing: the
+    /// lines now at its indices are others.
+    #[test]
+    fn a_stamp_whose_top_line_was_evicted_opens_nothing() {
+        let pane = PaneId::from_uuid(uuid::Uuid::from_u128(1));
+        let config = shux_vt::GridConfig {
+            max_scrollback: 4,
+            ..Default::default()
+        };
+        let mut vt = VirtualTerminal::with_config(3, 10, config);
+        for i in 0..8 {
+            vt.process(format!("e{i}\r\n").as_bytes());
+        }
+        let rect = Rect::new(0, 0, 10, 3);
+        let (entry, drawn) = (PaneViewport::of(rect, &vt, 0), Drawn::of(&vt));
+        for i in 8..20 {
+            vt.process(format!("e{i}\r\n").as_bytes());
+        }
+        assert!(
+            CopyModeState::enter(pane, entry, drawn, &vt).is_none(),
+            "opened over lines that replaced the stamped ones"
+        );
+    }
+
+    /// pane shows another screen, or went to the other and came back, it
+    /// opens nothing and maps nothing.
+    #[test]
+    fn a_stamp_from_another_screen_opens_nothing() {
+        let pane = PaneId::from_uuid(uuid::Uuid::from_u128(1));
+        let rect = Rect::new(0, 0, 20, 5);
+        let mut vt = vt_with_lines(5, 20, 10);
+        let (entry, drawn) = (PaneViewport::of(rect, &vt, 0), Drawn::of(&vt));
+        let s = whole(&vt);
+        vt.process(b"\x1b[?1049hALT");
+        assert!(
+            CopyModeState::enter(pane, entry, drawn, &vt).is_none(),
+            "opened on the alternate screen"
+        );
+        assert!(!s.view.maps(rect, &vt));
+        vt.process(b"\x1b[?1049l");
+        assert!(
+            CopyModeState::enter(pane, entry, drawn, &vt).is_none(),
+            "opened after a round trip through the alternate screen"
+        );
+        assert!(!s.view.maps(rect, &vt), "mapped after a round trip");
+
+        // Inside a synchronized update the frame still shows the screen it
+        // froze; once released it shows the other.
+        let mut vt = vt_with_lines(5, 20, 10);
+        vt.process(b"\x1b[?2026h\x1b[?1049hALT");
+        let (entry, drawn) = (PaneViewport::of(rect, &vt, 0), Drawn::of(&vt));
+        assert!(CopyModeState::enter(pane, entry, drawn, &vt).is_some());
+        vt.process(b"\x1b[?2026l");
+        assert!(CopyModeState::enter(pane, entry, drawn, &vt).is_none());
+    }
+
+    fn vt_with_lines_ending(rows: u16, cols: u16, count: usize, last: &str) -> VirtualTerminal {
+        let mut vt = vt_with_lines(rows, cols, count);
+        vt.process(last.as_bytes());
+        vt
+    }
+
+    /// A wide glyph the view's edge cuts, wholly inside a selection a pan
+    /// widened past that edge, is yanked whole.
+    #[test]
+    fn a_wide_glyph_at_the_views_edge_inside_a_panned_selection_is_yanked() {
+        let vt = vt_with(3, 20, "abc中dzz\x1b[1;1H");
+        let mut s = modal(&vt, Rect::new(0, 0, 4, 3));
+        for key in ["/", "z", "z", "\r"] {
+            handle_key(key.as_bytes(), &mut s, &vt);
+        }
+        handle_key(b"v", &mut s, &vt);
+        for key in ["?", "a", "b", "\r"] {
+            handle_key(key.as_bytes(), &mut s, &vt);
+        }
+        assert_eq!(s.view.col, 0, "setup: the search did not pan back");
+        assert_eq!(extract_selection(&vt, &s), "abc中dz");
+    }
+
+    /// A pan by search keeps the whole selection: the yank reads its source
+    /// columns from end to end, wherever the view has moved since, in both
+    /// directions, wide glyphs whole.
+    #[test]
+    fn a_panned_selection_yanks_every_column_it_covers() {
+        let text = "ab中c\x1b[1;30H文de\x1b[1;50Hzz\x1b[1;1H";
+        let vt = vt_with(3, 60, text);
+        // Columns 0-4, blank to 28, 29-32, blank to 48, then the first `z`.
+        let want = format!("ab中c{}文de{}z", " ".repeat(24), " ".repeat(16));
+        // Right: `v` at column 0, then a search pans to `zz`.
+        let mut s = modal(&vt, Rect::new(0, 0, 20, 3));
+        handle_key(b"v", &mut s, &vt);
+        for key in ["/", "z", "z", "\r"] {
+            handle_key(key.as_bytes(), &mut s, &vt);
+        }
+        assert!(s.view.col > 0, "setup: the search did not pan");
+        assert_eq!(extract_selection(&vt, &s), want, "panned right");
+        // Left: `v` on `zz`, then a backward search pans back to `ab`.
+        let mut s = modal(&vt, Rect::new(0, 0, 20, 3));
+        for key in ["/", "z", "z", "\r"] {
+            handle_key(key.as_bytes(), &mut s, &vt);
+        }
+        handle_key(b"v", &mut s, &vt);
+        for key in ["?", "a", "b", "\r"] {
+            handle_key(key.as_bytes(), &mut s, &vt);
+        }
+        assert_eq!(s.view.col, 0, "setup: the search did not pan back");
+        assert_eq!(extract_selection(&vt, &s), want, "panned left");
     }
 
     #[test]
     fn render_selection_overlay_omits_modal_cursor_and_hint() {
         let vt = vt_with(3, 20, "abcdef");
-        let pane = Rect::new(0, 0, 20, 3);
-        let state = CopyModeState {
+        let sel = Selection {
             cursor: (2, 0),
             anchor: Some((0, 0)),
-            ..Default::default()
         };
         let mut buf = Vec::new();
-        let view = PaneViewport::of(pane, &vt, 0);
-        render_selection_overlay_with_vt_into(&mut buf, &view, &vt, &state, &Theme::DEFAULT);
-        let rendered = String::from_utf8_lossy(&buf);
-        let plain = strip_ansi(&rendered);
+        let view = PaneViewport::of(Rect::new(0, 0, 20, 3), &vt, 0);
+        render_selection_overlay_with_vt_into(&mut buf, &view, &vt, &sel, &Theme::DEFAULT);
+        let plain = strip_ansi(&String::from_utf8_lossy(&buf));
         assert!(plain.contains("abc"));
         assert!(!plain.contains("COPY"));
     }
@@ -1790,75 +1977,6 @@ mod tests {
         assert_eq!(copy_menu_action_at(10, 5, 12, 7), None);
     }
 
-    #[test]
-    fn render_overlay_no_cursor_when_pane_too_small() {
-        let mut buf = Vec::new();
-        let pane = Rect::new(0, 0, 1, 1);
-        let state = CopyModeState::new();
-        render_copy_overlay_into(&mut buf, pane, &state, &Theme::DEFAULT);
-        assert!(buf.is_empty());
-    }
-
-    // ── issue #108 follow-up: copy mode on an oversized pane ─────────────
-    //
-    // When the pane grid is TALLER than the copy-mode viewport (the same
-    // oversized geometry as #108), the live attach frame is cursor-following:
-    // with content + cursor at the TOP it shows the top rows. Copy mode maps a
-    // screen selection to grid rows via `row_for_view`; if that still
-    // bottom-anchors while the frame top-anchors, selecting the row you SEE
-    // yanks a different (blank) row. Copy mode must read the SAME region the
-    // frame shows.
-
-    #[test]
-    fn extract_selection_reads_shown_rows_when_grid_exceeds_viewport() {
-        // 60-row grid, content + cursor at the top, shown in a 20-row viewport.
-        let mut vt = VirtualTerminal::new(60, 40);
-        vt.process(b"TOPLINE-UNIQUE\r\n"); // grid row 0, cursor ends at row 1
-        let pane_rows = 20u16;
-        let mut state = CopyModeState::new();
-        // Select all 14 chars of the FIRST visible screen row.
-        state.anchor = Some((0, 0));
-        state.cursor = (13, 0);
-        let sel = extract_selection(&vt, &state, 40, pane_rows);
-        assert_eq!(
-            sel, "TOPLINE-UNIQUE",
-            "copy mode selected the wrong region of an oversized pane (read the \
-             bottom-anchored band instead of the cursor-following frame)"
-        );
-    }
-
-    #[test]
-    fn copy_view_render_matches_frame_for_oversized_pane() {
-        // The scrolled copy view must draw the top content, not the blank tail.
-        let mut vt = VirtualTerminal::new(60, 40);
-        vt.process(b"TOPLINE-UNIQUE\r\n");
-        let pane = Rect::new(0, 0, 40, 20);
-        // Nudge into "scrolled" so render_copy_view_into is exercised, then back
-        // to the live anchor: the first visible row must be the top content.
-        let state = CopyModeState::new();
-        let mut buf = Vec::new();
-        render_copy_view_into(&mut buf, pane, &vt, &state);
-        let plain = strip_ansi(&String::from_utf8_lossy(&buf));
-        assert!(
-            plain.contains("TOPLINE-UNIQUE"),
-            "copy view drew the blank bottom band instead of the frame's top rows: {plain:?}"
-        );
-    }
-
-    #[test]
-    fn effective_total_lines_is_unchanged_when_grid_fits() {
-        // Guard: for a normally-sized pane (grid == viewport) the copy-mode
-        // coordinate space is identical to before, so existing behavior and
-        // all the tests above/below are unaffected.
-        let vt = VirtualTerminal::new(24, 80);
-        assert_eq!(effective_total_lines(&vt, 24), vt.grid().total_lines());
-        // And with scrollback present but the grid fitting the viewport.
-        let mut vt2 = VirtualTerminal::new(24, 80);
-        for _ in 0..50 {
-            vt2.process(b"line\r\n");
-        }
-        assert_eq!(effective_total_lines(&vt2, 24), vt2.grid().total_lines());
-    }
     /// A mouse selection over a slice cropped on both axes highlights and
     /// yanks the same cells: those the frame drew, a glyph cut by the left
     /// edge blank in both.
@@ -1868,8 +1986,6 @@ mod tests {
         for r in 0..8 {
             vt.process(format!("\x1b[{};1H{r}abcdefghi界jklmnopqrstuvw", r + 1).as_bytes());
         }
-        // Rows 3..=5 and columns 11..=16 shown in a 6x3 rect at (2, 1): column
-        // 11 is the right half of 界.
         let view = PaneViewport {
             rect: Rect::new(2, 1, 6, 3),
             grid_rows: 8,
@@ -1877,14 +1993,13 @@ mod tests {
             row_offset: 3,
             col_offset: 11,
         };
-        let state = CopyModeState {
+        let sel = Selection {
             anchor: Some((0, 0)),
             cursor: (3, 1),
-            ..Default::default()
         };
-        assert_eq!(extract_frame_selection(&vt, &state, &view), " jklmn\n jkl");
+        assert_eq!(extract_frame_selection(&vt, &sel, &view), " jklmn\n jkl");
         let mut buf = Vec::new();
-        render_selection_overlay_with_vt_into(&mut buf, &view, &vt, &state, &Theme::DEFAULT);
+        render_selection_overlay_with_vt_into(&mut buf, &view, &vt, &sel, &Theme::DEFAULT);
         let mut screen = VirtualTerminal::new(5, 10);
         screen.process(&buf);
         let line =
@@ -1893,23 +2008,19 @@ mod tests {
         assert_eq!(&line(2)[..4], " jkl");
     }
 
-    /// A highlighted run keeps every wide glyph it covers whole on screen: a
-    /// space written over the right half erases the glyph in the terminal,
-    /// though the yank still copies it.
     #[test]
     fn a_selection_highlight_keeps_its_wide_glyphs() {
         let text = "A界😀B";
         let mut vt = VirtualTerminal::new(3, 20);
         vt.process(text.as_bytes());
         let view = PaneViewport::of(Rect::new(0, 0, 20, 3), &vt, 0);
-        let state = CopyModeState {
+        let sel = Selection {
             anchor: Some((0, 0)),
             cursor: (5, 0),
-            ..Default::default()
         };
-        assert_eq!(extract_frame_selection(&vt, &state, &view), text);
+        assert_eq!(extract_frame_selection(&vt, &sel, &view), text);
         let mut buf = Vec::new();
-        render_selection_overlay_with_vt_into(&mut buf, &view, &vt, &state, &Theme::DEFAULT);
+        render_selection_overlay_with_vt_into(&mut buf, &view, &vt, &sel, &Theme::DEFAULT);
         let mut screen = VirtualTerminal::new(3, 20);
         screen.process(text.as_bytes());
         screen.process(&buf);
@@ -1921,9 +2032,6 @@ mod tests {
         assert_eq!(shown, text, "the highlight erased a glyph");
     }
 
-    /// A selection's view from before a resize names cells the grid no longer
-    /// has, on either axis: reading it finds none rather than indexing past
-    /// the grid.
     #[test]
     fn a_frame_selection_over_a_shrunk_grid_reads_no_cell_past_it() {
         let view = PaneViewport {
@@ -1933,33 +2041,30 @@ mod tests {
             row_offset: 3,
             col_offset: 11,
         };
-        let state = CopyModeState {
+        let sel = Selection {
             anchor: Some((0, 0)),
             cursor: (5, 2),
-            ..Default::default()
         };
         for (rows, cols) in [(4, 30), (8, 12)] {
             let mut vt = VirtualTerminal::new(8, 30);
             vt.process(b"abcdefghijklmnopqrstuvwxyz");
             vt.resize(rows, cols);
-            let _ = extract_frame_selection(&vt, &state, &view);
+            let _ = extract_frame_selection(&vt, &sel, &view);
             let mut buf = Vec::new();
-            render_selection_overlay_with_vt_into(&mut buf, &view, &vt, &state, &Theme::DEFAULT);
+            render_selection_overlay_with_vt_into(&mut buf, &view, &vt, &sel, &Theme::DEFAULT);
         }
     }
 
-    /// Review of #190: modal copy mode draws and yanks wide glyphs by one rule.
-    /// An intact glyph leaves the rest of its row in place; one on the pane's
-    /// last column would spill into the neighbour, so it is its blank half on
-    /// screen and in the yank.
+    /// Modal copy mode draws and yanks wide glyphs by one rule: one on the
+    /// slice's last column would spill into the neighbour, so it is its blank
+    /// half on screen and in the yank.
     #[test]
     fn modal_copy_mode_draws_and_yanks_wide_glyphs_as_shown() {
         let mut vt = VirtualTerminal::new(2, 10);
-        // a | 界 1-2 | b 3 | 界 4-5 | ...: the pane's last column is 4.
-        vt.process("a界b界xyz".as_bytes());
-        let pane = Rect::new(0, 0, 5, 2);
+        vt.process("a界b界xyz\x1b[1;1H".as_bytes());
+        let mut s = modal(&vt, Rect::new(0, 0, 5, 2));
         let mut buf = Vec::new();
-        render_copy_view_into(&mut buf, pane, &vt, &CopyModeState::default());
+        render_copy_view_into(&mut buf, &vt, &s);
         let mut screen = VirtualTerminal::new(2, 8);
         screen.process(b"\x1b[1;6HNN");
         screen.process(&buf);
@@ -1969,20 +2074,14 @@ mod tests {
             .map(|c| row[c].display_text())
             .collect();
         assert_eq!(shown, "a界b NN", "a glyph shifted or spilled");
-        let state = CopyModeState {
-            anchor: Some((0, 0)),
-            cursor: (4, 0),
-            ..Default::default()
-        };
+        select(&mut s, Some((0, 0)), (4, 0));
         assert_eq!(
-            extract_selection(&vt, &state, 5, 2),
+            extract_selection(&vt, &s),
             "a界b",
             "yanked what was not shown"
         );
     }
 
-    /// Review of #190: a multi-line selection over a grid narrower than its
-    /// rect highlights only the cells the frame drew, not the surplus beside.
     #[test]
     fn a_frame_selection_highlights_no_surplus() {
         let mut vt = VirtualTerminal::new(3, 4);
@@ -1994,13 +2093,12 @@ mod tests {
             row_offset: 0,
             col_offset: 0,
         };
-        let state = CopyModeState {
+        let sel = Selection {
             anchor: Some((1, 0)),
             cursor: (2, 1),
-            ..Default::default()
         };
         let mut buf = Vec::new();
-        render_selection_overlay_with_vt_into(&mut buf, &view, &vt, &state, &Theme::DEFAULT);
+        render_selection_overlay_with_vt_into(&mut buf, &view, &vt, &sel, &Theme::DEFAULT);
         let mut screen = VirtualTerminal::new(3, 10);
         screen.process(&buf);
         let row = screen.grid().visible_row(0);

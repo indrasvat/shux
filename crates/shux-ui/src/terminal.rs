@@ -141,7 +141,10 @@ impl TerminalGuard {
     /// when the terminal has stopped reading and another thread holds stdout
     /// blocked mid-write. Termios needs no stdout lock, so it is restored
     /// first; the escape sequences follow from a helper thread for at most
-    /// `timeout`.
+    /// `timeout`. Past it, the output the terminal never read is discarded:
+    /// a process exiting with output queued on its terminal waits in the
+    /// kernel for it to drain, which a terminal that stopped reading never
+    /// lets happen, not even after SIGKILL.
     pub fn leave_bounded(mut self, timeout: Duration) {
         if self.raw_mode_enabled {
             let _ = disable_raw_mode();
@@ -152,12 +155,51 @@ impl TerminalGuard {
             let _ = self.leave();
             let _ = done_tx.send(());
         });
-        let _ = done_rx.recv_timeout(timeout);
+        if done_rx.recv_timeout(timeout).is_err() {
+            discard_unread_output(timeout);
+        }
     }
 
     /// Query the current terminal size.
     pub fn size() -> io::Result<(u16, u16)> {
         terminal::size()
+    }
+}
+
+/// Point stdout and stderr at `/dev/null`, so nothing more reaches the
+/// terminal, discarding what it holds unread meanwhile, for at most `budget`.
+/// Repointing waits for a write still blocked on the terminal, and that write
+/// moves only as its output is discarded: so the two run side by side. The
+/// terminal is `/dev/tty`, or stdout itself when there is no controlling one.
+pub(crate) fn discard_unread_output(budget: Duration) {
+    use nix::sys::termios::{FlushArg, tcflush};
+    use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+    let tty = std::fs::File::open("/dev/tty")
+        .map(OwnedFd::from)
+        .or_else(|_| io::stdout().as_fd().try_clone_to_owned());
+    let (Ok(tty), Ok(null)) = (
+        tty,
+        std::fs::OpenOptions::new().write(true).open("/dev/null"),
+    ) else {
+        return;
+    };
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for fd in [nix::libc::STDOUT_FILENO, nix::libc::STDERR_FILENO] {
+            // SAFETY: dup2 swaps what the descriptor names atomically; both
+            // are open, and Rust holds no handle that owns either.
+            unsafe { nix::libc::dup2(null.as_raw_fd(), fd) };
+        }
+        let _ = done_tx.send(());
+    });
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        let _ = tcflush(&tty, FlushArg::TCOFLUSH);
+        let repointed = done_rx.recv_timeout(Duration::from_millis(5)).is_ok();
+        if repointed || std::time::Instant::now() >= deadline {
+            let _ = tcflush(&tty, FlushArg::TCOFLUSH);
+            return;
+        }
     }
 }
 

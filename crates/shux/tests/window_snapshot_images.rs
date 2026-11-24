@@ -618,3 +618,147 @@ fn a_borderless_window_snapshot_draws_the_pane_as_its_pane_snapshot_does() {
         "the pane's crop of the window snapshot differs from its pane snapshot"
     );
 }
+
+/// Four opaque columns of `w` px each, one colour per declared cell.
+fn kitty_column_bands(colours: [[u8; 3]; 4]) -> Vec<u8> {
+    let (w, h) = (36u32, 19u32);
+    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+    for _ in 0..h {
+        for x in 0..w {
+            let c = colours[(x / 9) as usize];
+            rgba.extend_from_slice(&[c[0], c[1], c[2], 255]);
+        }
+    }
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&rgba);
+    format!("\x1b_Ga=T,f=32,t=d,s={w},v={h},i=7,C=1;{b64}\x1b\\").into_bytes()
+}
+
+/// A picture whose origin lies left of its pane's slice is drawn cropped from
+/// the pane's left edge: the right-hand pane of a split shows the third and
+/// fourth bands where its first two cells are, and nothing of the first two
+/// lands in the neighbour or on the border.
+#[test]
+fn a_picture_left_of_its_slice_is_drawn_cropped_not_dropped() {
+    const BANDS: [[u8; 3]; 4] = [[250, 20, 20], [20, 250, 20], [20, 20, 250], [250, 250, 20]];
+    let s = split();
+    let width = s.right_rect.width as usize;
+    let mut rvt = VirtualTerminal::new(s.right_rect.height as usize, width + 40);
+    probe_text(&mut rvt);
+    rvt.process(b"\x1b[3;11H");
+    rvt.process(&kitty_column_bands(BANDS));
+    // Cursor-follow puts the slice's first column two right of the origin.
+    rvt.process(format!("\x1b[3;{}H", 12 + width).as_bytes());
+    let mut lvt = VirtualTerminal::new(s.left_rect.height as usize, s.left_rect.width as usize);
+    probe_text(&mut lvt);
+    let (lg, rg) = (lvt.grid().clone_visible(), rvt.grid().clone_visible());
+    let (lc, rc) = (lvt.cursor().clone(), rvt.cursor().clone());
+    let (img, cw, ch) = window_png(&s, (&lg, &lc), (&rg, &rc), 14.0);
+    assert_probes_survived(&img, "left-cropped picture");
+
+    let (x0, y) = (
+        u32::from(s.right_rect.x) * cw,
+        (u32::from(s.right_rect.y) + 2) * ch + ch / 2,
+    );
+    let at = |x: u32| {
+        let p = img.get_pixel(x, y).0;
+        [p[0], p[1], p[2]]
+    };
+    assert_eq!(
+        [at(x0 + cw / 2), at(x0 + cw + cw / 2)],
+        [BANDS[2], BANDS[3]],
+        "the pane's first two cells do not show the picture's last two bands"
+    );
+    let painted = |rgb: [u8; 3]| BANDS.contains(&rgb);
+    assert!(
+        !painted(at(x0 + 2 * cw + cw / 2)),
+        "the picture ran past its fourth band"
+    );
+    let leaked = (0..x0).filter(|&x| painted(at(x))).count();
+    assert_eq!(leaked, 0, "the cropped bands landed left of the pane");
+}
+
+/// `w`x`h` px of opaque `colours`, one per source pixel column, as a pane's
+/// application transmits it under `id` and puts it with `put`.
+fn kitty_columns(colours: &[[u8; 3]], h: u32, id: u32, put: &str) -> Vec<u8> {
+    let w = colours.len() as u32;
+    let mut rgba = Vec::new();
+    for _ in 0..h {
+        for c in colours {
+            rgba.extend_from_slice(&[c[0], c[1], c[2], 255]);
+        }
+    }
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&rgba);
+    format!("\x1b_Ga=t,f=32,t=d,s={w},v={h},i={id};{b64}\x1b\x5c\x1b_Ga=p,i={id},{put}\x1b\x5c")
+        .into_bytes()
+}
+
+/// An upscaled picture cut mid source pixel by the pane's left edge: the
+/// raster starts it at its next whole source pixel, where that pixel truly
+/// begins, as the kitty output does, every band edge within a pixel.
+#[test]
+fn a_left_cropped_upscaled_put_keeps_its_band_edges() {
+    const BANDS: [[u8; 3]; 4] = [[250, 20, 20], [20, 250, 20], [20, 20, 250], [250, 250, 20]];
+    let s = split();
+    let width = s.right_rect.width as usize;
+    let mut rvt = VirtualTerminal::new(s.right_rect.height as usize, width + 40);
+    probe_text(&mut rvt);
+    // Four pixels fitted to five columns at row 2, column 10; the slice
+    // starts at column 11, one cell into it.
+    rvt.process(b"\x1b[3;11H");
+    rvt.process(&kitty_columns(&BANDS, 1, 9, "c=5,r=1,C=1"));
+    rvt.process(format!("\x1b[3;{}H", 11 + width).as_bytes());
+    let lvt = VirtualTerminal::new(s.left_rect.height as usize, s.left_rect.width as usize);
+    let (lg, rg) = (lvt.grid().clone_visible(), rvt.grid().clone_visible());
+    let (lc, rc) = (lvt.cursor().clone(), rvt.cursor().clone());
+    let (img, cw, ch) = window_png(&s, (&lg, &lc), (&rg, &rc), 14.0);
+
+    // An upscale blends neighbouring pixels, so an edge is where the colour
+    // stops being nearer the band before it than the band after.
+    let x0 = u32::from(s.right_rect.x) * cw;
+    let y = (u32::from(s.right_rect.y) + 2) * ch + 2;
+    let at = |x: u32| img.get_pixel(x, y).0;
+    let dist =
+        |p: [u8; 4], c: [u8; 3]| -> u32 { (0..3).map(|i| u32::from(p[i].abs_diff(c[i]))).sum() };
+    let background = at(x0 + 30 * cw);
+    let px = f64::from(5 * cw) / 4.0;
+    let true_x = |band: usize| f64::from(x0) + band as f64 * px - f64::from(cw);
+    let drawn = (x0..x0 + 5 * cw).find(|&x| at(x) != background);
+    assert!(
+        drawn.is_some_and(|x| (f64::from(x) - true_x(1)).abs() <= 1.0),
+        "the picture starts at {drawn:?}, not where its first whole pixel does ({:.1}): \
+         the pixel the edge cuts was drawn narrower than it is",
+        true_x(1)
+    );
+    let mut from = drawn.expect("checked above");
+    for band in 2..4 {
+        let edge =
+            (from..x0 + 5 * cw).find(|&x| dist(at(x), BANDS[band]) < dist(at(x), BANDS[band - 1]));
+        assert!(
+            edge.is_some_and(|e| (f64::from(e) - true_x(band)).abs() <= 1.0),
+            "band {band} begins at {edge:?}, not {:.1}",
+            true_x(band)
+        );
+        from = edge.expect("checked above");
+    }
+}
+
+/// A picture far larger than the decode budget, scaled from one pixel, is
+/// drawn where it shows in its pane: only the visible part is paid for.
+#[test]
+fn a_huge_scaled_picture_draws_its_visible_part() {
+    let s = split();
+    let mut rvt = VirtualTerminal::new(1000, 1000);
+    rvt.process(b"\x1b[1;1H");
+    rvt.process(&kitty_columns(&[MAGENTA], 1, 3, "c=1000,r=1000,C=1"));
+    rvt.process(b"\x1b[500;400H");
+    let lvt = VirtualTerminal::new(s.left_rect.height as usize, s.left_rect.width as usize);
+    let (lg, rg) = (lvt.grid().clone_visible(), rvt.grid().clone_visible());
+    let (lc, rc) = (lvt.cursor().clone(), rvt.cursor().clone());
+    let (img, cw, ch) = window_png(&s, (&lg, &lc), (&rg, &rc), 14.0);
+    let m = magenta(&img, s.right_rect, cw, ch);
+    assert!(
+        m.inside > 0,
+        "the visible part of a huge picture was not drawn"
+    );
+    assert_eq!(m.outside, 0, "the picture escaped its pane");
+}

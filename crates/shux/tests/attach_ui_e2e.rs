@@ -258,6 +258,8 @@ fn the_help_overlay_names_the_configured_prefix_through_a_reload() {
         env.screen()
     );
 
+    // The client arms its config watcher before it draws anything, so with
+    // the overlay up an edit is seen.
     env.write_config(&keys_config("ctrl-b"));
     env.wait_for("keybindings (prefix = ^B)");
 

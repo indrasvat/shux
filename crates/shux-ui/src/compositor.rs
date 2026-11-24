@@ -353,6 +353,12 @@ impl<W: Write> RenderCompositor<W> {
         self.images.set_enabled(enabled);
     }
 
+    /// The size in pixels of one of the client's own cells, if it reported
+    /// one: a picture placed partway into a cell is offset in those pixels.
+    pub fn set_cell_pixels(&mut self, cell: Option<(u16, u16)>) {
+        self.images.set_cell_pixels(cell);
+    }
+
     /// Cells and colours only; see `AttachHello::plain`. Images are the
     /// caller's: `set_graphics(graphics && !plain)`.
     pub fn set_plain(&mut self, plain: bool) {
@@ -493,7 +499,7 @@ impl<W: Write> RenderCompositor<W> {
                 self.pane_views.insert(*pid, *view);
                 self.compose_pane(*view, vt);
                 if self.images.enabled() {
-                    placements.extend(crate::composed::resolve_placements(view, vt.grid()));
+                    placements.extend(crate::kitty_emit::keyed(*pid, view, vt.grid()));
                 }
             } else {
                 // Missing VT: render an "(no output)" placeholder so the

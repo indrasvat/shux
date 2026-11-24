@@ -466,13 +466,13 @@ impl Rasterizer {
         let mut budget = MAX_PANE_DECODE_BYTES;
         for p in grid.placements() {
             let top = p.viewport_row(grid) * i64::from(self.cell_h);
+            let left = (p.col as i64).saturating_mul(i64::from(self.cell_w));
             self.blit(
                 img,
                 &p.image,
                 &p.geometry,
-                top,
-                p.col as u32 * self.cell_w,
-                (0, w, h),
+                (left, top),
+                (0, 0, w, h),
                 &mut budget,
             );
         }
@@ -496,21 +496,22 @@ impl Rasterizer {
                     &mut budgets.last_mut().expect("just pushed").1
                 }
             };
+            let px = |cells: usize, size: u32| {
+                u32::try_from(cells)
+                    .unwrap_or(u32::MAX)
+                    .saturating_mul(size)
+            };
             let clip = (
-                c.row as u32 * self.cell_h,
-                (c.col + c.cols) as u32 * self.cell_w,
-                (c.row + c.rows) as u32 * self.cell_h,
+                px(c.col, self.cell_w),
+                px(c.row, self.cell_h),
+                px(c.col.saturating_add(c.cols), self.cell_w),
+                px(c.row.saturating_add(c.rows), self.cell_h),
             );
-            let top = p.row * i64::from(self.cell_h);
-            self.blit(
-                img,
-                &p.image,
-                &p.geometry,
-                top,
-                p.col as u32 * self.cell_w,
-                clip,
-                budget,
+            let origin = (
+                p.col.saturating_mul(i64::from(self.cell_w)),
+                p.row.saturating_mul(i64::from(self.cell_h)),
             );
+            self.blit(img, &p.image, &p.geometry, origin, clip, budget);
         }
     }
 
@@ -518,48 +519,63 @@ impl Rasterizer {
     /// which is what keeps a cell-stated clip exact under any `appearance.font`,
     /// instead of dropping whole image rows.
     ///
-    /// Has no left clip, and needs none: every producer derives `ox` and the
-    /// clip's left edge from the same pane origin, so a picture cannot start
-    /// left of its own clip.
+    /// The origin is signed on both axes: a picture may start above or left
+    /// of its clip, even off the canvas, and only what lies inside is drawn.
     ///
     /// Only the placement's crop is drawn, at the size its geometry gives
     /// for this cell box: the client's bitmap converted through the DECLARED
     /// cell box (`appearance.font` changes the drawn one), or fitted to the
     /// cells it asked for.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "one placement's pixels, geometry, position and clip"
-    )]
     fn blit(
         &self,
         img: &mut RgbaImage,
         stored: &shux_vt::StoredImage,
         geometry: &shux_vt::ImageGeometry,
-        top: i64,
-        ox: u32,
-        (y0, x1, y1): (u32, u32, u32),
+        (left, top): (i64, i64),
+        (x0, y0, x1, y1): (u32, u32, u32, u32),
         budget: &mut u64,
     ) {
         let (x1, y1) = (x1.min(img.width()), y1.min(img.height()));
-        if y0 >= y1 || ox >= x1 || top >= i64::from(y1) {
+        if x0 >= x1 || y0 >= y1 || left >= i64::from(x1) || top >= i64::from(y1) {
             return;
         }
         let (dest_w, dest_h) = geometry.drawn_px(self.cell_w, self.cell_h);
-        // Both visibility tests run on the size the geometry gives, before any
-        // decode: a placement outside the clip is discarded without inflating
-        // its payload. `decode_placement` refuses a payload that does not
-        // match the declared size, so the crop lies inside anything drawn.
-        let skip = (i64::from(y0) - top).max(0);
-        if skip >= i64::from(dest_h) {
+        // Every visibility test runs on the size the geometry gives, before
+        // any decode: a placement outside the clip is discarded without
+        // inflating its payload. `decode_placement` refuses a payload that does
+        // not match the declared size, so the crop lies inside anything drawn.
+        // The part shown starts at its first whole source pixel, as the kitty
+        // output does (`shux_vt::visible_span`).
+        let c = geometry.crop;
+        let visible = |from: i64, start: u32, end: u32, extent: u32, dest: u32| {
+            let v0 = u64::try_from(i64::from(start) - from).unwrap_or(0);
+            let v1 = u64::try_from(i64::from(end) - from).unwrap_or(0);
+            let (first, last, lead) = shux_vt::visible_span(extent, dest.into(), v0, v1)?;
+            Some((v0 + lead, v1.min(dest.into()), first, last))
+        };
+        let (Some((vx0, vx1, sx, ex)), Some((vy0, vy1, sy, ey))) = (
+            visible(left, x0, x1, c.w, dest_w),
+            visible(top, y0, y1, c.h, dest_h),
+        ) else {
+            return;
+        };
+        if vx0 >= vx1 || vy0 >= vy1 {
             return;
         }
         // Charged AFTER the cheap declared-size tests and BEFORE the decode, so
         // a placement that is off-screen costs nothing and one that is drawn is
-        // paid for once.
+        // paid for once. Scaled whole while that fits; past it, only the part
+        // shown is sampled and paid for.
         let scaled = u64::from(dest_w)
             .saturating_mul(u64::from(dest_h))
             .saturating_mul(4);
-        let cost = (declared_rgba_bytes(stored).unwrap_or(u64::MAX as usize) as u64).max(scaled);
+        let whole = scaled <= MAX_PANE_DECODE_BYTES;
+        let shown = if whole {
+            scaled
+        } else {
+            (vx1 - vx0).saturating_mul(vy1 - vy0).saturating_mul(4)
+        };
+        let cost = (declared_rgba_bytes(stored).unwrap_or(u64::MAX as usize) as u64).max(shown);
         match budget.checked_sub(cost) {
             Some(left) => *budget = left,
             None => return,
@@ -567,7 +583,33 @@ impl Rasterizer {
         let Some(src) = decode_placement(stored) else {
             return;
         };
-        let c = geometry.crop;
+        let (ox, oy) = ((left + vx0 as i64) as u32, (top + vy0 as i64) as u32);
+        let (cols, rows) = ((vx1 - vx0) as u32, (vy1 - vy0) as u32);
+        let mut paint = |x: u32, y: u32, s: [u8; 4]| {
+            let a = u32::from(s[3]);
+            if a == 0 {
+                return;
+            }
+            let d = img.get_pixel_mut(ox + x, oy + y);
+            for c in 0..3 {
+                d[c] = ((u32::from(s[c]) * a + u32::from(d[c]) * (255 - a)) / 255) as u8;
+            }
+            d[3] = 255;
+        };
+        if !whole {
+            // Nearest source pixel for each one shown, within `sx..ex`.
+            let at = |v: u64, dest: u32, extent: u32, lo: u32, hi: u32| {
+                ((v * u64::from(extent) / u64::from(dest)) as u32).clamp(lo, hi - 1)
+            };
+            for y in 0..rows {
+                let sy = c.y + at(vy0 + u64::from(y), dest_h, c.h, sy, ey);
+                for x in 0..cols {
+                    let sx = c.x + at(vx0 + u64::from(x), dest_w, c.w, sx, ex);
+                    paint(x, y, src.get_pixel(sx, sy).0);
+                }
+            }
+            return;
+        }
         let src = if (c.x, c.y, c.w, c.h) == (0, 0, src.width(), src.height()) {
             src
         } else {
@@ -578,25 +620,9 @@ impl Rasterizer {
         } else {
             image::imageops::resize(&src, dest_w, dest_h, image::imageops::Triangle)
         };
-        let skip = skip as u32;
-        if skip >= src.height() {
-            return;
-        }
-        let oy = top.max(i64::from(y0)) as u32;
-        let rows = (src.height() - skip).min(y1.saturating_sub(oy));
-        let cols = src.width().min(x1.saturating_sub(ox));
         for y in 0..rows {
             for x in 0..cols {
-                let s = src.get_pixel(x, y + skip).0;
-                let a = u32::from(s[3]);
-                if a == 0 {
-                    continue;
-                }
-                let d = img.get_pixel_mut(ox + x, oy + y);
-                for c in 0..3 {
-                    d[c] = ((u32::from(s[c]) * a + u32::from(d[c]) * (255 - a)) / 255) as u8;
-                }
-                d[3] = 255;
+                paint(x, y, src.get_pixel(x + vx0 as u32, y + vy0 as u32).0);
             }
         }
     }

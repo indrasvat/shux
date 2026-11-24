@@ -420,6 +420,8 @@ test-gui-terminal: test-gui-terminal-selftest ## Photograph shux in a real GUI t
 	@.shux/scripts/no_leak_guard.sh bash .shux/scripts/gui_terminal_check.sh --scenario image-pane
 	@echo "$(COLOR_BLUE)▶ ...and two clients at different sizes on one split session...$(COLOR_RESET)"
 	@.shux/scripts/no_leak_guard.sh bash .shux/scripts/gui_terminal_two_clients.sh
+	@echo "$(COLOR_BLUE)▶ ...and pictures cropped and restored by a horizontal scroll...$(COLOR_RESET)"
+	@.shux/scripts/no_leak_guard.sh bash .shux/scripts/gui_terminal_image_crop.sh
 	@echo "$(COLOR_GREEN)✓ GUI-terminal rig passed$(COLOR_RESET)"
 
 .PHONY: test-vt-dec-special-graphics

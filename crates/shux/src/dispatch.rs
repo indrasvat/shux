@@ -87,11 +87,10 @@ pub(crate) async fn run_attach(
     // Dropped after a detach or end line, before a failure's error line.
     let hold_logs = crate::client_log::hold();
     let stop_reload = tokio_util::sync::CancellationToken::new();
-    tokio::spawn(shux_core::config::run_hot_reload(
-        cfg_path,
-        live_config.clone(),
-        stop_reload.clone(),
-    ));
+    // Armed before the UI draws, so an edit made once it shows is seen.
+    if let Some(watch) = shux_core::config::watch_config(cfg_path, live_config.clone()) {
+        tokio::spawn(watch.run(stop_reload.clone()));
+    }
     let _stop_reload = stop_reload.drop_guard();
     let cfg = shux_ui::ClientConfig {
         socket_path: attach_path.to_string_lossy().to_string(),

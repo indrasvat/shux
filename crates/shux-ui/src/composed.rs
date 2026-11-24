@@ -102,7 +102,8 @@ pub fn compose(
         if let (Some((src_grid, _)), Some(view)) = (inputs.panes.get(pid), geometry.views.get(pid))
         {
             compose_pane(&mut grid, view, src_grid, surplus);
-            placements.extend(resolve_placements(view, src_grid));
+            let resolved = src_grid.placements().iter();
+            placements.extend(resolved.map(|p| resolve_placement(view, src_grid, p)));
         } else {
             compose_placeholder(&mut grid, *rect, "(no output)");
         }
@@ -211,31 +212,28 @@ fn cell_rect(r: Rect) -> CellRect {
     }
 }
 
-/// Rebase one pane's placements into the frame that shows it through `view`,
-/// clipped to the cells it shows. A picture whose origin lies left of the
-/// slice is omitted: placements cannot start at a negative column.
-pub(crate) fn resolve_placements(view: &PaneViewport, src: &Grid) -> Vec<ComposedPlacement> {
+/// Rebase one of a pane's placements into the frame that shows it through
+/// `view`, clipped to the cells it shows on both axes.
+pub(crate) fn resolve_placement(
+    view: &PaneViewport,
+    src: &Grid,
+    p: &shux_vt::Placement,
+) -> ComposedPlacement {
     let rect = view.rect;
-    let clip = CellRect {
-        col: rect.x as usize,
-        row: rect.y as usize,
-        cols: view.shown_cols(),
-        rows: view.shown_rows(),
-    };
-    src.placements()
-        .iter()
-        .filter_map(|p| {
-            Some(ComposedPlacement {
-                image: p.image.clone(),
-                // `viewport_row` undoes the source grid's own base, the offset
-                // undoes the slice, and `rect.y` rebases into this frame.
-                row: p.viewport_row(src) - view.row_offset as i64 + i64::from(rect.y),
-                col: p.col.checked_sub(view.col_offset)? + rect.x as usize,
-                clip,
-                geometry: p.geometry,
-            })
-        })
-        .collect()
+    ComposedPlacement {
+        image: p.image.clone(),
+        // `viewport_row` undoes the source grid's own base, the offsets undo
+        // the slice, and the rect's origin rebases into this frame.
+        row: p.viewport_row(src) - view.row_offset as i64 + i64::from(rect.y),
+        col: p.col as i64 - view.col_offset as i64 + i64::from(rect.x),
+        clip: CellRect {
+            col: rect.x as usize,
+            row: rect.y as usize,
+            cols: view.shown_cols(),
+            rows: view.shown_rows(),
+        },
+        geometry: p.geometry,
+    }
 }
 
 fn compose_pane(grid: &mut Grid, view: &PaneViewport, src: &Grid, surplus: Color) {

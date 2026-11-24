@@ -49,6 +49,25 @@ pub(crate) struct ScreenSwap<'a> {
     pub reuse: bool,
     /// The alternate screen's images: emptied on the way in and out.
     pub alt_images: &'a mut crate::graphics::image::ImageStore,
+    pub swaps: &'a mut Swaps,
+}
+
+/// How many times the screens have been swapped, live and as the presented
+/// frame was frozen with.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct Swaps {
+    pub live: u64,
+    pub frozen: Option<u64>,
+}
+
+impl Swaps {
+    pub(crate) fn presented(&self) -> u64 {
+        self.frozen.unwrap_or(self.live)
+    }
+
+    pub(crate) fn freeze(&mut self) {
+        self.frozen.get_or_insert(self.live);
+    }
 }
 
 impl ScreenSwap<'_> {
@@ -59,6 +78,7 @@ impl ScreenSwap<'_> {
     /// primary cursor and starts the alternate screen at home, `1047` carries
     /// the cursor across untouched.
     pub(crate) fn enter(&mut self, save_cursor: bool) {
+        self.swaps.live += 1;
         self.alt_images.clear();
         let rows = self.grid.rows();
         let cols = self.grid.cols();
@@ -122,6 +142,7 @@ impl ScreenSwap<'_> {
     /// `restore_cursor` is the `1047`/`1049` distinction again: only `1049`
     /// parked a cursor to put back.
     pub(crate) fn leave(&mut self, restore_cursor: bool) {
+        self.swaps.live += 1;
         self.alt_images.clear();
         if let Some(primary) = self.stashed_grid.take() {
             let retired = std::mem::replace(self.grid, primary);

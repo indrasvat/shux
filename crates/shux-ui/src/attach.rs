@@ -178,6 +178,7 @@ pub async fn run_attach(socket_path: &Path, config: ClientConfig) -> Result<Exit
         _ = leaving => result,
         signo = signals.recv() => {
             let _ = crossterm::terminal::disable_raw_mode();
+            terminal::discard_unread_output(SIGNAL_RESTORE_BUDGET);
             Ok(ExitReason::Signal(signo))
         }
     }
@@ -223,11 +224,13 @@ async fn run_loop<S>(
     config: &ClientConfig,
     mut resized: tokio::signal::unix::Signal,
     // The size the hello reported.
-    mut last_size: (u16, u16),
+    hello_size: (u16, u16),
 ) -> Result<ExitReason>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    // The cell's pixels are first said just below, with the size.
+    let mut last_size = (hello_size, None);
     let (mut sink, mut stream) = framed.split();
     let mut stdout = tokio::io::stdout();
     let mut prefix_active = false;
@@ -381,7 +384,7 @@ where
                                 continue;
                             }
                             if let Some(target) = bindings.resolve_prefix(key) {
-                                send_binding_target(&mut sink, target).await?;
+                                send_binding_target(&mut sink, target, event_frame).await?;
                                 continue;
                             }
                             // Unbound prefix-key: fall through and forward
@@ -408,7 +411,7 @@ where
                         }
                         // Bare-key Tier-1 actions (Alt+key etc.).
                         if let Some(target) = bindings.resolve_root(key) {
-                            send_binding_target(&mut sink, target).await?;
+                            send_binding_target(&mut sink, target, event_frame).await?;
                             continue;
                         }
                         // Otherwise forward as PTY input bytes.
@@ -484,7 +487,12 @@ where
 
 /// Send the terminal's size if it differs from the last one sent. Read here
 /// rather than taken from the event, so a late event cannot report a stale size.
-async fn report_size<K>(sink: &mut K, last_size: &mut (u16, u16)) -> Result<()>
+/// The cell's pixel size goes with it, when the terminal reports one: a font
+/// change moves it and no column.
+async fn report_size<K>(
+    sink: &mut K,
+    (last_size, last_cell): &mut ((u16, u16), Option<(u16, u16)>),
+) -> Result<()>
 where
     K: futures::Sink<Bytes> + Unpin,
     K::Error: std::error::Error + Send + Sync + 'static,
@@ -496,7 +504,22 @@ where
         sink.send(Bytes::from(frame)).await.context("send resize")?;
         *last_size = size;
     }
+    let cell = cell_pixels();
+    if let Some((width, height)) = cell.filter(|_| cell != *last_cell) {
+        let frame = serde_json::to_vec(&AttachClientFrame::CellPixels { width, height })?;
+        sink.send(Bytes::from(frame))
+            .await
+            .context("send cell pixels")?;
+        *last_cell = cell;
+    }
     Ok(())
+}
+
+/// One cell's size in pixels, when the terminal reports its own (TIOCGWINSZ).
+fn cell_pixels() -> Option<(u16, u16)> {
+    let w = crossterm::terminal::window_size().ok()?;
+    (w.width > 0 && w.height > 0 && w.columns > 0 && w.rows > 0)
+        .then(|| (w.width / w.columns, w.height / w.rows))
 }
 
 /// The bindings for the live config's keys when they differ from `keys`,
@@ -536,7 +559,13 @@ where
     }
 }
 
-async fn send_binding_target<SinkT>(sink: &mut SinkT, target: &BindingTarget) -> Result<()>
+/// `frame` is the last one written when the key was read: copy mode opens over
+/// what that frame showed.
+async fn send_binding_target<SinkT>(
+    sink: &mut SinkT,
+    target: &BindingTarget,
+    frame: Option<u64>,
+) -> Result<()>
 where
     SinkT: futures::Sink<Bytes> + Unpin,
     SinkT::Error: std::fmt::Display,
@@ -544,7 +573,10 @@ where
     let frame = match target {
         BindingTarget::Action(kind, args) => AttachClientFrame::Action {
             kind: *kind,
-            args: args.clone(),
+            args: ActionArgs {
+                frame: frame.filter(|_| *kind == ActionKind::EnterCopyMode),
+                ..args.clone()
+            },
         },
         BindingTarget::Detach => AttachClientFrame::Detach,
     };
@@ -859,10 +891,15 @@ mod tests {
                     ..Default::default()
                 },
             ),
+            Some(9),
         )
         .await
         .expect("send action");
-        send_binding_target(&mut tx, &BindingTarget::Detach)
+        let copy = BindingTarget::Action(ActionKind::EnterCopyMode, ActionArgs::default());
+        send_binding_target(&mut tx, &copy, Some(9))
+            .await
+            .expect("send copy mode");
+        send_binding_target(&mut tx, &BindingTarget::Detach, Some(9))
             .await
             .expect("send detach");
         drop(tx);
@@ -873,6 +910,19 @@ mod tests {
             AttachClientFrame::Action { kind, args } => {
                 assert_eq!(kind, ActionKind::SwitchToWindow);
                 assert_eq!(args.window_index, Some(3));
+                assert_eq!(args.frame, None, "only copy mode is stamped");
+            }
+            other => panic!("expected action frame, got {other:?}"),
+        }
+        let copy = rx.next().await.expect("copy mode frame");
+        match serde_json::from_slice(&copy).expect("copy mode json") {
+            AttachClientFrame::Action { kind, args } => {
+                assert_eq!(kind, ActionKind::EnterCopyMode);
+                assert_eq!(
+                    args.frame,
+                    Some(9),
+                    "copy mode not stamped with the shown frame"
+                );
             }
             other => panic!("expected action frame, got {other:?}"),
         }
