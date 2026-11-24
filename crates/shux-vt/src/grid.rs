@@ -1309,8 +1309,16 @@ impl Grid {
             return;
         }
         self.mutations = self.mutations.saturating_add(n as u64);
+        let full_screen = top == 0 && bottom == self.rows - 1;
+        // Rows inside the region move together; links across its edges part.
+        // Scrolling the whole screen into history keeps every link.
+        if !full_screen {
+            self.cut_link_into(top);
+        }
+        let sb = self.scrollback_len();
+        self.raw[sb + bottom].wrapped = false;
 
-        if top == 0 && bottom == self.rows - 1 {
+        if full_screen {
             // Full-screen: the scrolled-off lines become scrollback, and the
             // deque is trimmed back to the cap.
             //
@@ -1377,6 +1385,11 @@ impl Grid {
         self.mutations = self.mutations.saturating_add(n as u64);
 
         let sb = self.scrollback_len();
+        self.cut_link_into(top);
+        if n < height {
+            // Its continuation is discarded; it lands on the region's bottom.
+            self.raw[sb + bottom - n].wrapped = false;
+        }
         let (start, end) = (sb + top, sb + bottom + 1);
         // Rotate right by n == rotate left by height - n.
         self.rotate_range_left(start, end, height - n);
@@ -1407,6 +1420,7 @@ impl Grid {
         for i in sb..self.raw.len() {
             self.raw[i].reset(bg);
         }
+        self.cut_history_link();
         self.dirty.mark_rows(0, self.rows, self.rows, self.cols);
     }
 
@@ -1426,6 +1440,7 @@ impl Grid {
         for i in sb..self.raw.len() {
             self.raw[i].fill_alignment_pattern();
         }
+        self.cut_history_link();
         self.dirty.mark_rows(0, self.rows, self.rows, self.cols);
     }
 
@@ -1447,6 +1462,7 @@ impl Grid {
         for row in self.raw.range_mut(sb..=sb + end_row) {
             row.reset(bg);
         }
+        self.cut_history_link();
         self.dirty
             .mark_rows(0, end_row.saturating_add(1), self.rows, self.cols);
     }
@@ -1842,6 +1858,38 @@ impl Grid {
         };
         if let Some(range) = dirty {
             self.dirty.mark_range(row, range, self.rows, self.cols);
+        }
+    }
+
+    /// Erase `row` from `col` to its end (ED 0, EL 0, EL 2). The row no
+    /// longer runs on into the next, so its soft wrap ends; erasing the whole
+    /// first visible row also ends history's link into it.
+    pub fn erase_to_row_end(&mut self, row: usize, col: usize, bg: Color) {
+        self.bump_mutations();
+        let count = self.cols.saturating_sub(col);
+        let dirty = {
+            let r = self.visible_row_mut_untracked(row);
+            r.wrapped = false;
+            r.erase_chars_expanding_wide_pairs(col, count, bg)
+        };
+        if let Some(range) = dirty {
+            self.dirty.mark_range(row, range, self.rows, self.cols);
+        }
+        if row == 0 && col == 0 {
+            self.cut_history_link();
+        }
+    }
+
+    /// History's last row no longer continues into the first visible row.
+    fn cut_history_link(&mut self) {
+        self.cut_link_into(0);
+    }
+
+    /// The row above visible `row`, in history for row 0, no longer continues
+    /// into it.
+    fn cut_link_into(&mut self, row: usize) {
+        if let Some(above) = (self.scrollback_len() + row).checked_sub(1) {
+            self.raw[above].wrapped = false;
         }
     }
 

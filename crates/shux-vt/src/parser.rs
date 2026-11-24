@@ -386,13 +386,13 @@ impl<'a> VtHandler<'a> {
         self.cursor.extended.clone()
     }
 
-    /// Erase the cursor row from `from` to its end. The row no longer runs
-    /// on into the next one, so its soft wrap ends too (as xterm's ClearRight).
+    /// Erase the cursor row from `from` to its end; see
+    /// [`crate::Grid::erase_to_row_end`]. Like xterm's ClearRight it also
+    /// cancels a deferred wrap, and the print intent goes with it.
     fn erase_to_row_end(&mut self, from: usize, bg: Color) {
-        let cols = self.grid.cols();
-        self.grid
-            .erase_chars(self.cursor.row, from, cols.saturating_sub(from), bg);
-        self.grid.visible_row_mut_marked(self.cursor.row).wrapped = false;
+        self.grid.erase_to_row_end(self.cursor.row, from, bg);
+        self.cursor.auto_wrap_pending = false;
+        self.cursor.after_print = false;
     }
 
     fn save_cursor_state(&mut self) {
@@ -582,11 +582,18 @@ impl<'a> VtHandler<'a> {
         self.clear_active_grapheme_cell();
         self.cursor.col = 0;
         self.cursor.auto_wrap_pending = false;
-        self.grid.visible_row_mut_marked(self.cursor.row).wrapped = true;
-        if self.cursor.row == self.scroll_region.bottom {
-            self.grid
-                .scroll_up(self.scroll_region.top, self.scroll_region.bottom);
+        // The row continues into the one the cursor moves to, so the link is
+        // set once that row is in place, and only if the cursor got there.
+        let region = *self.scroll_region;
+        if self.cursor.row == region.bottom {
+            self.grid.scroll_up(region.top, region.bottom);
+            if region.top < region.bottom {
+                self.grid
+                    .visible_row_mut_marked(self.cursor.row - 1)
+                    .wrapped = true;
+            }
         } else if self.cursor.row + 1 < self.grid.rows() {
+            self.grid.visible_row_mut_marked(self.cursor.row).wrapped = true;
             // Same guard `linefeed` has, and for the same reason: when the
             // cursor sits BELOW the scroll region — a bottom status line
             // outside the region is the common case — it is not equal to
