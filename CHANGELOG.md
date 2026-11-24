@@ -1,3 +1,10 @@
+## [0.59.1](https://github.com/indrasvat/shux/compare/v0.59.0...v0.59.1) (2026-11-24)
+
+
+### Bug Fixes
+
+* **vt:** a resize keeps blank cells' background colour ([#300](https://github.com/indrasvat/shux/issues/300)) ([6bc9d94](https://github.com/indrasvat/shux/commit/6bc9d94ce1b5daa451f153bb6a28321f171460ce)), closes [#295](https://github.com/indrasvat/shux/issues/295) [#294](https://github.com/indrasvat/shux/issues/294)
+
 # [0.59.0](https://github.com/indrasvat/shux/compare/v0.58.2...v0.59.0) (2026-11-23)
 
 
