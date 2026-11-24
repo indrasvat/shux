@@ -2350,6 +2350,30 @@ mod tests {
     }
 
     #[test]
+    fn a_one_row_screen_keeps_the_autowrap_link_into_history() {
+        let mut vt = VirtualTerminal::new(1, 5);
+        vt.process(b"ABCDEF");
+        vt.resize(1, 10);
+        assert_eq!(visible_text(&vt, 0), "ABCDEF");
+    }
+
+    #[test]
+    fn any_erase_that_clears_the_first_visible_row_cuts_the_history_link() {
+        let mut wrong = Vec::new();
+        for seq in [
+            "\x1b[1;5H\x1b[1J\x1b[HXYZ",
+            "\x1b[1;5H\x1b[1K\x1b[HXYZ",
+            "\x1b[H\x1b[5XXYZ",
+        ] {
+            let got = after_history_edit(seq);
+            if got != ("ABCDE".to_string(), "XYZ".to_string()) {
+                wrong.push((seq, got));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:?}");
+    }
+
+    #[test]
     fn row_shrink_without_a_parked_cursor_lets_erase_fill_yield() {
         let mut vt = VirtualTerminal::new(6, 10);
         vt.process(b"\x1b[44m\x1b[2J\x1b[0mAB\x1b7\x1b[?1047h");

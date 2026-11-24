@@ -587,10 +587,11 @@ impl<'a> VtHandler<'a> {
         let region = *self.scroll_region;
         if self.cursor.row == region.bottom {
             self.grid.scroll_up(region.top, region.bottom);
-            if region.top < region.bottom {
-                self.grid
-                    .visible_row_mut_marked(self.cursor.row - 1)
-                    .wrapped = true;
+            // The old row now sits above the cursor, or in history when the
+            // region is the whole screen; a one-row inner region discarded it.
+            let full_screen = region.top == 0 && region.bottom + 1 == self.grid.rows();
+            if region.top < region.bottom || full_screen {
+                self.grid.set_link_into(self.cursor.row, true);
             }
         } else if self.cursor.row + 1 < self.grid.rows() {
             self.grid.visible_row_mut_marked(self.cursor.row).wrapped = true;

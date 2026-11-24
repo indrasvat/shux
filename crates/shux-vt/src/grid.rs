@@ -1850,6 +1850,7 @@ fn append_reflowed_line(
 
 impl Grid {
     /// Erase `count` characters starting at `(row, col)` in the visible area.
+    /// Clearing the whole first visible row ends history's link into it.
     pub fn erase_chars(&mut self, row: usize, col: usize, count: usize, bg: Color) {
         self.bump_mutations();
         let dirty = {
@@ -1858,6 +1859,9 @@ impl Grid {
         };
         if let Some(range) = dirty {
             self.dirty.mark_range(row, range, self.rows, self.cols);
+        }
+        if row == 0 && col == 0 && count >= self.cols {
+            self.cut_history_link();
         }
     }
 
@@ -1888,8 +1892,14 @@ impl Grid {
     /// The row above visible `row`, in history for row 0, no longer continues
     /// into it.
     fn cut_link_into(&mut self, row: usize) {
+        self.set_link_into(row, false);
+    }
+
+    /// Set whether the row above visible `row` (in history for row 0)
+    /// continues into it.
+    pub(crate) fn set_link_into(&mut self, row: usize, wrapped: bool) {
         if let Some(above) = (self.scrollback_len() + row).checked_sub(1) {
-            self.raw[above].wrapped = false;
+            self.raw[above].wrapped = wrapped;
         }
     }
 
