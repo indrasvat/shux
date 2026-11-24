@@ -107,14 +107,13 @@ mod tests {
     use shux_core::event::ClientId;
     use tokio_util::sync::CancellationToken;
 
-    /// `read_only` is true exactly for a client that does not vote.
     #[tokio::test]
-    async fn list_says_which_clients_are_read_only() {
+    async fn list_names_each_client_and_detach_takes_a_unique_prefix() {
         let h = RpcHarness::new();
         let (session_id, _, _) = h.seed_session("watched").await;
         let clients = h.io.lock().await.clients.clone();
-        let info = |votes| ClientInfo {
-            id: ClientId::new(),
+        let info = |id: uuid::Uuid, votes| ClientInfo {
+            id: ClientId::from(id),
             session_id,
             cols: 100,
             rows: 30,
@@ -122,54 +121,31 @@ mod tests {
             votes,
             last_input: None,
         };
-        let (writer, viewer) = (info(true), info(false));
-        let _gw = clients.register(writer.clone(), CancellationToken::new());
-        let _gv = clients.register(viewer.clone(), CancellationToken::new());
-        let listed = dispatch_ok(&h.router, "client.list", serde_json::json!({})).await;
-        let read_only = |id: ClientId| {
-            listed["clients"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|r| r["id"] == id.0.to_string())
-                .map(|r| r["read_only"].clone())
-        };
-        assert_eq!(
-            read_only(writer.id),
-            Some(serde_json::json!(false)),
-            "{listed}"
-        );
-        assert_eq!(
-            read_only(viewer.id),
-            Some(serde_json::json!(true)),
-            "{listed}"
-        );
-    }
-
-    #[tokio::test]
-    async fn list_names_each_client_and_detach_takes_a_unique_prefix() {
-        let h = RpcHarness::new();
-        let (session_id, _, _) = h.seed_session("watched").await;
-        let clients = h.io.lock().await.clients.clone();
-        let info = |id: uuid::Uuid| ClientInfo {
-            id: ClientId::from(id),
-            session_id,
-            cols: 100,
-            rows: 30,
-            attached_at: std::time::SystemTime::now(),
-            votes: true,
-            last_input: None,
-        };
         // Two ids sharing a prefix, so a short one is ambiguous.
         let a = uuid::Uuid::parse_str("aaaa1111-0000-4000-8000-000000000000").unwrap();
         let b = uuid::Uuid::parse_str("aaaa2222-0000-4000-8000-000000000000").unwrap();
         let (end_a, end_b) = (CancellationToken::new(), CancellationToken::new());
-        let _ga = clients.register(info(a), end_a.clone());
-        let _gb = clients.register(info(b), end_b.clone());
+        // `b` watches read-only.
+        let _ga = clients.register(info(a, true), end_a.clone());
+        let _gb = clients.register(info(b, false), end_b.clone());
 
         let listed = dispatch_ok(&h.router, "client.list", serde_json::json!({})).await;
         let rows = listed["clients"].as_array().expect("clients array");
         assert_eq!(rows.len(), 2, "{listed}");
+        let read_only: Vec<(String, bool)> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r["id"].as_str().unwrap().to_string(),
+                    r["read_only"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            read_only,
+            [(a.to_string(), false), (b.to_string(), true)],
+            "{listed}"
+        );
         assert!(
             rows.iter()
                 .all(|r| r["session"] == "watched" && r["cols"] == 100)

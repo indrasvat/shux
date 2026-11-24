@@ -30,15 +30,6 @@ pub struct ClientInfo {
     pub last_input: Option<Instant>,
 }
 
-/// A client's part in sizing its session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Role {
-    Driving,
-    /// Votes, but another client drives: its own input would take over.
-    Viewing,
-    ReadOnly,
-}
-
 /// Where a client sits among the session's other clients.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Seat {
@@ -58,17 +49,17 @@ pub struct Sharing {
     pub writers: usize,
     /// Other read-only clients.
     pub viewers: usize,
-    /// A share link to the session is open (#297).
-    pub link: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionView {
     pub attached: usize,
-    /// `None` for a frame no attached client asked for.
-    pub role: Option<Role>,
+    /// The asking client is the one that sizes the panes now.
+    pub driving: bool,
     /// `None` for a frame no attached client asked for.
     pub sharing: Option<Sharing>,
+    /// The session's other clients, and whether each can type.
+    pub peers: Vec<(ClientId, bool)>,
     pub pinned: std::collections::HashSet<PaneId>,
 }
 
@@ -124,8 +115,6 @@ struct State {
     pins: HashMap<PaneId, Pin>,
     next_pin: u64,
     next_seq: u64,
-    /// Sessions with an open share link.
-    shared: std::collections::HashSet<SessionId>,
 }
 
 /// Every attached client, plus the sizing decisions made from them. A change
@@ -194,25 +183,9 @@ impl ClientRegistry {
     }
 
     /// Wakes whenever what a status bar shows of the clients may have
-    /// changed: who is attached, a share link, or a size decision.
+    /// changed: who is attached, or a size decision.
     pub fn presence(&self) -> watch::Receiver<u64> {
         self.presence.subscribe()
-    }
-
-    /// Open or close the share link to `session`. The host's badge shows
-    /// `shared` while one is open, though nobody watches yet.
-    pub fn set_shared(&self, session: SessionId, open: bool) {
-        let changed = {
-            let mut s = self.state();
-            if open {
-                s.shared.insert(session)
-            } else {
-                s.shared.remove(&session)
-            }
-        };
-        if changed {
-            self.bump_presence();
-        }
     }
 
     /// Ask for the sizes to be worked out again: a pane gained its resizer.
@@ -257,8 +230,9 @@ impl ClientRegistry {
             }
             _ => None,
         };
-        if let Some(votes) = changed {
-            self.bump_for(votes);
+        // Only a voter's size shows anywhere but its own screen and the list.
+        if changed == Some(true) {
+            self.bump();
         }
     }
 
@@ -329,8 +303,8 @@ impl ClientRegistry {
     }
 
     /// What a frame for `client` (none for a snapshot) shows about `session`,
-    /// read under one lock: who is attached, the client's role, and which of
-    /// `panes` are pinned. Decides nothing: the driver is the one
+    /// read under one lock: who is attached, whether the client drives, who
+    /// else is there, and which of `panes` are pinned. Decides nothing: the driver is the one
     /// [`ClientRegistry::driver`] would elect now.
     pub fn session_view(
         &self,
@@ -341,15 +315,6 @@ impl ClientRegistry {
         let s = self.state();
         let (voters, driver) = s.voters_and_elected(session);
         let me = client.and_then(|id| s.clients.get(&id));
-        let role = me.map(|e| {
-            if !e.info.votes {
-                Role::ReadOnly
-            } else if driver == Some(e.info.id) {
-                Role::Driving
-            } else {
-                Role::Viewing
-            }
-        });
         let attached = s.count(session);
         let sharing = me.map(|e| {
             let seat = if !e.info.votes {
@@ -364,13 +329,20 @@ impl ClientRegistry {
                 seat,
                 writers,
                 viewers: attached - voters.len() - usize::from(!e.info.votes),
-                link: s.shared.contains(&session),
             }
         });
+        let mut peers: Vec<(ClientId, bool)> = s
+            .clients
+            .values()
+            .filter(|e| e.info.session_id == session && Some(e.info.id) != client)
+            .map(|e| (e.info.id, e.info.votes))
+            .collect();
+        peers.sort_by_key(|(id, _)| id.0);
         SessionView {
             attached,
-            role,
+            driving: client.is_some() && driver == client,
             sharing,
+            peers,
             pinned: panes
                 .iter()
                 .copied()
@@ -585,15 +557,20 @@ mod tests {
         let _gw = reg.register(watcher.clone(), CancellationToken::new());
         let (pinned, free) = (PaneId::new(), PaneId::new());
         reg.pin(pinned);
-        let role = |id| reg.session_view(s, Some(id), &[pinned, free]).role;
-        assert_eq!(role(a.id), Some(Role::Driving), "the first voter, untyped");
-        assert_eq!(role(b.id), Some(Role::Viewing));
-        assert_eq!(role(watcher.id), Some(Role::ReadOnly));
+        let driving = |id| reg.session_view(s, Some(id), &[pinned, free]).driving;
+        assert!(driving(a.id), "the first voter, untyped");
+        assert!(!driving(b.id) && !driving(watcher.id));
         assert!(reg.mark_input(b.id, Instant::now()));
-        assert_eq!(role(b.id), Some(Role::Driving));
-        assert_eq!(role(a.id), Some(Role::Viewing));
+        assert!(driving(b.id) && !driving(a.id));
+        let peers = reg.session_view(s, Some(a.id), &[]).peers;
+        let mut want = vec![(b.id, true), (watcher.id, false)];
+        want.sort_by_key(|(id, _)| id.0);
+        assert_eq!(
+            peers, want,
+            "a client's peers are the others, with their votes"
+        );
         let view = reg.session_view(s, None, &[pinned, free]);
-        assert_eq!(view.role, None);
+        assert!(!view.driving);
         assert_eq!(view.attached, 3);
         assert_eq!(view.pinned, [pinned].into_iter().collect());
         assert_eq!(view.sharing, None);
@@ -623,7 +600,7 @@ mod tests {
         let guard = reg.register(viewer.clone(), CancellationToken::new());
         assert_eq!(settle(), (false, true), "register");
         reg.set_size(viewer.id, 200, 60);
-        assert_eq!(settle(), (false, true), "resize");
+        assert_eq!(settle(), (false, false), "resize");
         assert!(!reg.mark_input(viewer.id, Instant::now()));
         assert_eq!(settle(), (false, false), "input");
         drop(guard);
@@ -636,10 +613,6 @@ mod tests {
         settle();
         assert!(reg.remove(removed.id));
         assert_eq!(settle(), (false, true), "client detach");
-        reg.set_shared(s, true);
-        assert_eq!(settle(), (false, true), "share link");
-        reg.set_shared(s, true);
-        assert_eq!(settle(), (false, false), "an open link opened again");
 
         let _w = reg.register(info(s), CancellationToken::new());
         assert_eq!(settle(), (true, true), "a voter");
@@ -670,11 +643,8 @@ mod tests {
             (2, 0)
         );
         assert!(reg.mark_input(b.id, Instant::now()));
-        assert_eq!(reg.driver(s).map(|d| d.id), Some(b.id));
+        assert!(reg.session_view(s, Some(b.id), &[]).driving);
         assert_eq!(seat(a.id), Seat::Host, "a handoff moved the host");
-        assert!(!sharing(a.id).link);
-        reg.set_shared(s, true);
-        assert!(sharing(a.id).link);
         drop(ga);
         assert_eq!(seat(b.id), Seat::Host, "the next writer took the seat");
         assert_eq!((sharing(b.id).writers, sharing(b.id).viewers), (0, 1));

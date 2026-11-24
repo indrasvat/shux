@@ -346,10 +346,11 @@ pub fn append_viewing(
 /// Marks the segments of a sharing badge: no fitting pass drops one.
 const BADGE: usize = usize::MAX;
 
-/// A live client's sharing badge: its words longest first, down to none, the
-/// colour and whether it warns that another client's keys reach the session.
+/// A live client's sharing badge: its words longest first, down to a letter
+/// glued to the mark, the colour and whether it warns that another client's
+/// keys reach the session.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Badge {
+struct Badge {
     rungs: Vec<String>,
     /// The first rung without the optional peer counts.
     core: usize,
@@ -357,23 +358,18 @@ pub struct Badge {
 }
 
 impl Badge {
-    /// None for a writer alone with its session and no share link.
-    pub fn of(sharing: Sharing) -> Option<Self> {
+    /// None for a writer alone with its session.
+    fn of(sharing: Sharing) -> Option<Self> {
         let Sharing {
             seat,
             writers,
             viewers,
-            link,
         } = sharing;
         let watching = (viewers > 0).then(|| format!(" · {viewers} watching"));
         let typing = format!("{writers} can type");
         let (rungs, core, warn): (Vec<String>, usize, bool) = match seat {
             Seat::Viewer => (
-                vec![
-                    "viewing · read-only".into(),
-                    "read-only".into(),
-                    String::new(),
-                ],
+                vec!["viewing · read-only".into(), "read-only".into(), "r".into()],
                 0,
                 false,
             ),
@@ -385,7 +381,7 @@ impl Badge {
                 rungs.extend([core, typing, "!".into()]);
                 (rungs, counted, true)
             }
-            Seat::Host if viewers > 0 || link => (
+            Seat::Host if viewers > 0 => (
                 vec![
                     format!("shared · {viewers} watching"),
                     "shared".into(),
@@ -420,9 +416,11 @@ impl Badge {
             theme.status_shared
         };
         let color = Color::Rgb { r, g, b };
+        // A one-letter rung is glued to the mark, so the narrowest badge
+        // still says what it is: `◉!` another client can type, `◉r` read-only.
         let words = match self.rungs[rung].as_str() {
             "" => " ".to_string(),
-            "!" => "! ".to_string(),
+            w if w.chars().count() == 1 => format!("{w} "),
             w => format!(" {w} "),
         };
         [mark.to_string(), words]
@@ -437,17 +435,17 @@ impl Badge {
 
 /// The sharing badge at the head of the right zone. It is never cut: its peer
 /// counts go first, then the bar's other segments, then its words down to the
-/// mark alone (`◉!` for a warning), then the session name. `mark` is `◉`, or
-/// `*` where colour cannot carry it.
+/// mark and one letter (`◉!` for a warning, `◉r` read-only), then the session
+/// name. `mark` is `◉`, or `*` where colour cannot carry it.
 pub fn append_sharing(
     bar: &mut StatusBar,
-    badge: Option<&Badge>,
+    sharing: Option<Sharing>,
     theme: &Theme,
     cols: u16,
     mark: &str,
     has_notice: bool,
 ) {
-    let Some(badge) = badge else {
+    let Some(badge) = sharing.and_then(Badge::of) else {
         return;
     };
     let width = StatusBar::segments_width;
@@ -733,7 +731,7 @@ mod tests {
     /// The focused pane's size label sheds words to fit, and is dropped whole
     /// rather than cut mid-word.
     #[test]
-    fn the_size_label_follows_a_width_ladder() {
+    fn the_viewing_segments_follow_a_width_ladder() {
         use shux_ui::viewport::SizeLabel;
         let pinned = SizeLabel {
             cols: 60,
@@ -762,12 +760,11 @@ mod tests {
         }
     }
 
-    fn sharing(seat: Seat, writers: usize, viewers: usize, link: bool) -> Sharing {
+    fn sharing(seat: Seat, writers: usize, viewers: usize) -> Sharing {
         Sharing {
             seat,
             writers,
             viewers,
-            link,
         }
     }
 
@@ -779,45 +776,24 @@ mod tests {
             let badge = Badge::of(s)?;
             Some((badge.rungs[0].clone(), badge.warn))
         };
-        assert_eq!(full(sharing(Seat::Host, 0, 0, false)), None, "solo");
+        assert_eq!(full(sharing(Seat::Host, 0, 0)), None, "solo");
         for (s, words, warn) in [
+            (sharing(Seat::Host, 0, 2), "shared · 2 watching", false),
+            (sharing(Seat::Host, 1, 0), "shared · 1 can type", true),
             (
-                sharing(Seat::Host, 0, 2, false),
-                "shared · 2 watching",
-                false,
-            ),
-            (
-                sharing(Seat::Host, 0, 0, true),
-                "shared · 0 watching",
-                false,
-            ),
-            (
-                sharing(Seat::Host, 1, 0, false),
-                "shared · 1 can type",
-                true,
-            ),
-            (
-                sharing(Seat::Host, 1, 2, false),
+                sharing(Seat::Host, 1, 2),
                 "shared · 1 can type · 2 watching",
                 true,
             ),
+            (sharing(Seat::Viewer, 1, 0), "viewing · read-only", false),
+            (sharing(Seat::Viewer, 0, 0), "viewing · read-only", false),
             (
-                sharing(Seat::Viewer, 1, 0, false),
-                "viewing · read-only",
-                false,
-            ),
-            (
-                sharing(Seat::Viewer, 0, 0, false),
-                "viewing · read-only",
-                false,
-            ),
-            (
-                sharing(Seat::Writer, 1, 0, false),
+                sharing(Seat::Writer, 1, 0),
                 "writable · your keys go to this session · 1 can type",
                 true,
             ),
             (
-                sharing(Seat::Writer, 1, 3, false),
+                sharing(Seat::Writer, 1, 3),
                 "writable · your keys go to this session · 1 can type · 3 watching",
                 true,
             ),
@@ -845,14 +821,7 @@ mod tests {
         if notice {
             b.center = vec![StatusSegment::plain(" [pane split] ")];
         }
-        append_sharing(
-            &mut b,
-            Badge::of(s).as_ref(),
-            &Theme::DEFAULT,
-            cols,
-            "◉",
-            notice,
-        );
+        append_sharing(&mut b, Some(s), &Theme::DEFAULT, cols, "◉", notice);
         if notice {
             make_room_for_notice(&mut b, cols);
         }
@@ -872,10 +841,10 @@ mod tests {
     #[test]
     fn the_badge_is_never_cut_down_to_two_columns() {
         for s in [
-            sharing(Seat::Host, 1, 2, false),
-            sharing(Seat::Host, 0, 2, false),
-            sharing(Seat::Viewer, 2, 0, false),
-            sharing(Seat::Writer, 1, 1, false),
+            sharing(Seat::Host, 1, 2),
+            sharing(Seat::Host, 0, 2),
+            sharing(Seat::Viewer, 2, 0),
+            sharing(Seat::Writer, 1, 1),
         ] {
             let rungs = Badge::of(s).unwrap().rungs;
             let mut last = 0;
@@ -891,7 +860,7 @@ mod tests {
                         .iter()
                         .position(|w| {
                             badge.trim_end() == format!("◉ {w}").trim_end()
-                                || (w == "!" && badge.trim_end() == "◉!")
+                                || badge.trim_end() == format!("◉{w}")
                         })
                         .unwrap_or_else(|| panic!("{s:?} at {cols}: {badge:?} is no rung"));
                     if !notice {
@@ -900,16 +869,27 @@ mod tests {
                     }
                 }
             }
+            // Down to two columns the mark keeps a letter saying what it is:
+            // `!` someone else can type, `r` read-only.
             let (badge, row, _) = badged(s, 2, false);
-            let warns = Badge::of(s).unwrap().warn;
-            assert_eq!(row, if warns { "◉!" } else { "◉ " }, "{s:?}: {badge:?}");
+            let want = match (Badge::of(s).unwrap().warn, s.seat) {
+                (true, _) => "◉!",
+                (false, Seat::Viewer) => "◉r",
+                (false, _) => "◉ ",
+            };
+            assert_eq!(row, want, "{s:?}: {badge:?}");
         }
+        let mut b = busy_bar();
+        let viewer = sharing(Seat::Viewer, 1, 0);
+        append_sharing(&mut b, Some(viewer), &Theme::DEFAULT, 2, "*", false);
+        let row: String = b.render_row(2).iter().map(|c| c.ch).collect();
+        assert_eq!(row, "*r", "NO_COLOR");
     }
 
     /// The counts give way before any other segment does.
     #[test]
     fn counts_go_before_other_segments() {
-        let s = sharing(Seat::Host, 0, 2, false);
+        let s = sharing(Seat::Host, 0, 2);
         let full = badged(s, 200, false);
         assert_eq!(full.0, "◉ shared · 2 watching ");
         let others = |b: &StatusBar| {
@@ -941,7 +921,7 @@ mod tests {
     #[test]
     fn the_badge_takes_the_theme_and_monochrome_strips_it() {
         let rgb = |Rgb { r, g, b }: Rgb| Some(Color::Rgb { r, g, b });
-        let (_, _, watched) = badged(sharing(Seat::Host, 0, 1, false), 120, false);
+        let (_, _, watched) = badged(sharing(Seat::Host, 0, 1), 120, false);
         assert!(
             watched
                 .right
@@ -949,7 +929,7 @@ mod tests {
                 .filter(|s| s.group == BADGE)
                 .all(|s| s.fg == rgb(Theme::DEFAULT.status_shared) && !s.bold)
         );
-        let (_, _, mut warned) = badged(sharing(Seat::Writer, 1, 0, false), 120, false);
+        let (_, _, mut warned) = badged(sharing(Seat::Writer, 1, 0), 120, false);
         assert!(
             warned
                 .right
@@ -971,7 +951,7 @@ mod tests {
         let mut star = busy_bar();
         append_sharing(
             &mut star,
-            Badge::of(sharing(Seat::Viewer, 1, 0, false)).as_ref(),
+            Some(sharing(Seat::Viewer, 1, 0)),
             &Theme::DEFAULT,
             120,
             "*",
