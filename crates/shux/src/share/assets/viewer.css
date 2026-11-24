@@ -30,8 +30,29 @@ body {
 #session { font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
 #state { margin-left: auto; color: var(--muted); }
 #state.bad { color: var(--shared); }
-#stage { flex: 1; overflow: auto; position: relative; }
-#frame { transform-origin: 0 0; }
+#stage {
+  flex: 1;
+  overflow: auto;
+  position: relative;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+}
+/* Takes the scaled frame's size, so the stage scrolls (pans) over exactly it. */
+#sizer { overflow: hidden; }
+#frame { transform-origin: 0 0; width: max-content; }
+#stage, #stage * { touch-action: pan-x pan-y; }
+#bar .sep[hidden] { display: none; }
+#zoom {
+  font: inherit;
+  font-weight: 600;
+  padding: 2px 10px;
+  border: 1px solid var(--muted);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--bar-text);
+  cursor: pointer;
+}
+#zoom[hidden] { display: none; }
 #gate {
   max-width: 28em;
   margin: 15vh auto 0;

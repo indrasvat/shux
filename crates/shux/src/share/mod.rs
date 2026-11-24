@@ -314,7 +314,8 @@ impl Gateway {
     /// Ends link `id` and every viewer it admitted; returns once their
     /// sockets are closed.
     pub async fn revoke(&self, id: &GrantId) -> Result<(), ShareError> {
-        let ended = self.store().revoke(id).ok_or(ShareError::NoGrant)?;
+        let at = self.now().mono;
+        let ended = self.store().revoke(id, at).ok_or(ShareError::NoGrant)?;
         settle(ended).await
     }
 
@@ -670,7 +671,7 @@ mod tests {
         let grants::Admit::Ready(stuck) = store.admit(&minted.id, &cookie, now) else {
             panic!("not admitted");
         };
-        let ended = store.revoke(&minted.id).unwrap();
+        let ended = store.revoke(&minted.id, now.mono).unwrap();
         assert!(matches!(settle(ended).await, Err(ShareError::Teardown(1))));
         stuck.live.done().cancel();
         assert!(settle(vec![stuck.live]).await.is_ok());

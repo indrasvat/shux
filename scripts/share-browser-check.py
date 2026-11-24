@@ -152,8 +152,8 @@ async def open_link(ctx, url: str, violations: list[str]):
     page.on("pageerror", lambda e: violations.append(str(e)))
 
     def response(r) -> None:
-        # An ended link answers its redeem and status with 410; nothing else fails.
-        expected = r.status == 410 and r.url.endswith(("/redeem", "/status"))
+        # Only a redeem may answer 404 or 410: the status probe always says 200.
+        expected = r.status in (404, 410) and r.url.endswith("/redeem")
         if r.status >= 400 and not expected:
             violations.append(f"{r.status} {r.url}")
 
@@ -178,6 +178,8 @@ async def run_browser(kind: str, browser, rig: Rig, env: dict, bin_: str, work: 
     page = await open_link(ctx, link["url"], violations)
     check("#" not in page.url, "the fragment leaves the address bar before anything else")
     check(await page.is_visible("#watch"), "redemption waits for a click on Watch session")
+    gate_bar = " ".join((await page.inner_text("#bar")).split())
+    check("Read-only ·" not in gate_bar, f"no separator dangles before a session name ({gate_bar!r})")
     listed = rig.call(op="list")
     check(any(g["id"] == link["id"] and g["redeemed"] == 0 for g in listed), "loading the page spends no use")
     await page.click("#watch")
@@ -260,6 +262,66 @@ async def run_browser(kind: str, browser, rig: Rig, env: dict, bin_: str, work: 
 
     shux(bin_, env, "session.kill", {"id": s["id"]})
     await ended(page)
+
+    step(f"{kind}: links that ended before they were opened say why")
+    t_sess = shux(bin_, env, "session.create", {"name": f"{kind}-ends", "command": PRODUCER})
+    revoked = rig.call(op="create", session=t_sess["id"], uses=1)
+    rig.call(op="revoke", id=revoked["id"])
+    expired = rig.call(op="create", session=t_sess["id"], uses=1, ttl_ms=1000)
+    await asyncio.sleep(1.5)  # past the expired link's second
+    for gone, want in ((revoked, "owner ended this link"), (expired, "has expired")):
+        fresh = await browser.new_context(ignore_https_errors=True)
+        p = await open_link(fresh, gone["url"], violations)
+        await p.click("#watch")
+        msg = await ended(p)
+        check(want in msg, f"a fresh browser is told why: {want} ({msg!r})")
+        await fresh.close()
+    shux(bin_, env, "session.kill", {"id": t_sess["id"]})
+
+    step(f"{kind}: a phone reads the host's layout, and pans it")
+    plog = work / f"{kind}-phone.log"
+    ps = shux(bin_, env, "session.create", {"name": f"{kind}-phone", "command": recorder(plog)})
+    shux(bin_, env, "pane.set_size", {"pane_id": ps["pane_id"], "cols": 200, "rows": 58})
+    psize = shux(bin_, env, "pane.capture", {"pane_id": ps["pane_id"]})
+    plink = rig.call(op="create", session=ps["id"], uses=1)
+    phone = await browser.new_context(
+        ignore_https_errors=True, viewport={"width": 390, "height": 844},
+        device_scale_factor=3, is_mobile=True, has_touch=True,
+    )
+    pp = await open_link(phone, plink["url"], violations)
+    await pp.tap("#watch")
+    await live(pp, "RECORDING")
+    glyph = await pp.evaluate("window.__shux.glyph")
+    check(glyph is not None and glyph >= 9, f"text is readable at 390 px ({glyph} CSS px glyphs)")
+    stage = "document.querySelector('#stage')"
+    check(await pp.evaluate(f"{stage}.scrollWidth > {stage}.clientWidth"), "the readable view pans")
+    await pp.screenshot(path=str(out / f"v2_phone-{kind}_390x844_readable.png"))
+    await pp.mouse.move(200, 400)
+    await pp.mouse.wheel(700, 300)
+    await until(pp, f"{stage}.scrollLeft > 0")
+    check(True, "a pan over the terminal moves the view")
+    await pp.screenshot(path=str(out / f"v2_phone-{kind}_390x844_panned.png"))
+    await pp.tap("#zoom")
+    check(await pp.evaluate("window.__shux.mode") == "fit", "a tap shows the whole layout")
+    await pp.screenshot(path=str(out / f"v2_phone-{kind}_390x844_fit.png"))
+    await pp.tap("#zoom")
+    check(await pp.evaluate("window.__shux.mode") == "readable", "another tap reads it again")
+    await pp.tap("#term")
+    typing = await pp.evaluate(
+        "(() => { const a = document.activeElement;"
+        " return !!a && (a.isContentEditable || a.tagName === 'TEXTAREA') && a.inputMode !== 'none'; })()"
+    )
+    check(not typing, "a tap on the terminal opens no keyboard")
+    shux(bin_, env, "pane.send_keys", {"pane_id": ps["pane_id"], "text": "MARK"})
+    for _ in range(300):
+        if plog.exists() and plog.read_bytes():
+            break
+        await asyncio.sleep(0.05)
+    check(plog.read_bytes() == b"MARK", f"no phone gesture reached the pane ({plog.read_bytes()[:40]!r})")
+    after = shux(bin_, env, "pane.capture", {"pane_id": ps["pane_id"]})
+    check((psize["cols"], psize["rows"]) == (after["cols"], after["rows"]), "the phone never sized the pane")
+    await phone.close()
+    shux(bin_, env, "session.kill", {"id": ps["id"]})
     check(not violations, f"no CSP violation or page error ({violations[:3]})")
     await ctx.close()
 

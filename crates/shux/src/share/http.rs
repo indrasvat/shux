@@ -403,7 +403,12 @@ struct RedeemBody {
 fn refused(why: Refused) -> Response {
     let (status, code) = match why {
         Refused::NotFound => (StatusCode::NOT_FOUND, "not_found"),
-        Refused::Gone => (StatusCode::GONE, "gone"),
+        Refused::Gone(ended) => {
+            // Why, so the page can say it: used up, expired, revoked.
+            let reason = ended.map_or("used", super::EndReason::code);
+            let body = serde_json::json!({ "error": "gone", "reason": reason });
+            return json(StatusCode::GONE, body);
+        }
         Refused::Full => (StatusCode::SERVICE_UNAVAILABLE, "full"),
         Refused::Throttled => (StatusCode::TOO_MANY_REQUESTS, "throttled"),
     };
@@ -472,7 +477,8 @@ async fn redeem(
 }
 
 /// Whether this browser's credential may stream: for a page that cannot see
-/// why its WebSocket failed.
+/// why its WebSocket failed. Always 200, so a page that probes keeps a clean
+/// console; the state says, and for a link that ended, why.
 async fn status(State(gw): State<Gateway>, Path(id): Path<String>, headers: HeaderMap) -> Response {
     if host_ok(&gw, &headers).is_none() {
         return not_found();
@@ -492,7 +498,13 @@ async fn status(State(gw): State<Gateway>, Path(id): Path<String>, headers: Head
                 "expires_in_ms": expires.remaining_ms(now),
             }),
         ),
-        None => json(StatusCode::GONE, serde_json::json!({"state": "ended"})),
+        None => {
+            let reason = gw.store().ended(&id).map(super::EndReason::code);
+            json(
+                StatusCode::OK,
+                serde_json::json!({ "state": "ended", "reason": reason }),
+            )
+        }
     }
 }
 

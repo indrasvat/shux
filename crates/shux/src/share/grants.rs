@@ -41,6 +41,9 @@ pub const OFFLINE_GRACE: Duration = Duration::from_secs(10 * 60);
 pub const ADMIT_BURST: usize = 5;
 pub const ADMIT_WINDOW: Duration = Duration::from_secs(10);
 pub const MAX_LABEL: usize = 64;
+/// How long, and how many, ended links are remembered by their reason.
+pub const ENDED_GRACE: Duration = Duration::from_secs(60 * 60);
+pub const MAX_ENDED: usize = 256;
 
 const ID_ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 const ID_LEN: usize = 8;
@@ -352,8 +355,10 @@ impl std::fmt::Debug for Redeemed {
 pub enum Refused {
     /// No such link, or not its secret: nothing is said about which.
     NotFound,
-    /// The right secret for a link that has ended or has no uses left.
-    Gone,
+    /// A link that has no uses left (`None`), or that ended (and why). An
+    /// ended link answers so for [`ENDED_GRACE`] whatever secret is
+    /// presented: it holds none by then.
+    Gone(Option<EndReason>),
     /// The daemon or the link holds as many viewers or streams as it will,
     /// or a viewer cannot be minted.
     Full,
@@ -402,6 +407,8 @@ pub struct Store {
     viewers: HashMap<ViewerId, Viewer>,
     next_stream: u64,
     origin: Option<super::Origin>,
+    /// Links that ended of late, and why: so a guest who opens one is told.
+    ended: HashMap<GrantId, (EndReason, Instant)>,
     /// Moves on with every stop and origin change: a request checked under
     /// an older one is admitted to nothing.
     generation: u64,
@@ -481,15 +488,23 @@ impl Store {
         let presented = presented(secret);
         let viewers = self.viewers.len();
         let of_link = self.viewers.values().filter(|v| v.grant == *id).count();
-        let grant = self.grants.get_mut(id).ok_or(Refused::NotFound)?;
+        let Some(grant) = self.grants.get_mut(id) else {
+            return Err(match self.ended.get(id) {
+                Some(&(why, _)) => Refused::Gone(Some(why)),
+                None => Refused::NotFound,
+            });
+        };
         // Compared whatever was presented, so a malformed secret costs what a
         // wrong one does.
         let matched = same(&presented.unwrap_or([0; 32]), &grant.digest) && presented.is_some();
         if !matched {
             return Err(Refused::NotFound);
         }
-        if grant.expires.passed(at) || grant.uses_left == Some(0) {
-            return Err(Refused::Gone);
+        if grant.expires.passed(at) {
+            return Err(Refused::Gone(Some(EndReason::Expired)));
+        }
+        if grant.uses_left == Some(0) {
+            return Err(Refused::Gone(None));
         }
         if viewers >= MAX_VIEWERS || of_link >= MAX_VIEWERS_PER_LINK {
             return Err(Refused::Full);
@@ -546,7 +561,7 @@ impl Store {
             return Admit::Refused(Refused::NotFound);
         };
         let Some(g) = self.grants.get(grant).filter(|g| !g.expires.passed(at)) else {
-            return Admit::Refused(Refused::Gone);
+            return Admit::Refused(Refused::Gone(Some(EndReason::Expired)));
         };
         let (session, expires) = (g.session, g.expires);
         let streaming = self
@@ -612,9 +627,34 @@ impl Store {
     }
 
     /// Ends `id` and every viewer it admitted, live or not.
-    pub fn revoke(&mut self, id: &GrantId) -> Option<Vec<Live>> {
+    pub fn revoke(&mut self, id: &GrantId, at: Instant) -> Option<Vec<Live>> {
         self.grants.remove(id)?;
+        self.bury(id.clone(), EndReason::Revoked, at);
         Some(self.drop_viewers(|v| v.grant == *id, EndReason::Revoked))
+    }
+
+    /// Why `id` ended, while it is remembered.
+    pub fn ended(&self, id: &GrantId) -> Option<EndReason> {
+        self.ended.get(id).map(|&(why, _)| why)
+    }
+
+    /// Remembers that `id` ended and why, for [`ENDED_GRACE`] and among at
+    /// most [`MAX_ENDED`]: no digest, use or viewer, only the reason.
+    fn bury(&mut self, id: GrantId, why: EndReason, at: Instant) {
+        self.ended
+            .retain(|_, &mut (_, when)| when + ENDED_GRACE > at);
+        while self.ended.len() >= MAX_ENDED {
+            let oldest = self
+                .ended
+                .iter()
+                .min_by_key(|(_, (_, when))| *when)
+                .map(|(id, _)| id.clone());
+            match oldest {
+                Some(id) => self.ended.remove(&id),
+                None => break,
+            };
+        }
+        self.ended.insert(id, (why, at));
     }
 
     /// Drops one viewer; its link stays.
@@ -649,7 +689,10 @@ impl Store {
         let mut lives = Vec::new();
         for (id, why) in ended {
             lives.extend(self.drop_viewers(|v| v.grant == id, why));
+            self.bury(id, why, at.mono);
         }
+        self.ended
+            .retain(|_, &mut (_, when)| when + ENDED_GRACE > at.mono);
         // Only an unlimited link's credentials leave for idling: a limited
         // link's are its viewers' only way back in, and its uses bound them.
         let unlimited: Vec<GrantId> = self
@@ -788,7 +831,7 @@ mod tests {
         store.redeem(&a.id, &a.secret, now).expect("first use");
         assert_eq!(
             store.redeem(&a.id, &a.secret, now).unwrap_err(),
-            Refused::Gone
+            Refused::Gone(None)
         );
     }
 
@@ -808,17 +851,53 @@ mod tests {
         let later = at(now + Duration::from_secs(60));
         assert_eq!(
             store.redeem(&g.id, &g.secret, later).unwrap_err(),
-            Refused::Gone
+            Refused::Gone(Some(EndReason::Expired))
         );
         assert!(matches!(
             store.admit(&g.id, &r.cookie, later),
-            Admit::Refused(Refused::Gone)
+            Admit::Refused(Refused::Gone(_))
         ));
         assert!(
             store.end_grants(later, |_| false).is_empty(),
             "nothing was streaming"
         );
         assert!(store.list().is_empty());
+    }
+
+    /// An ended link says why to whoever opens it after, for a while: it
+    /// expired, or its owner revoked it. Past the grace it is unknown again.
+    #[test]
+    fn an_ended_link_says_why_for_a_while() {
+        // why: an origin handed to the store, which reads no clock; later instants are data
+        // ast-grep-ignore: test-wall-clock-unit
+        let now = Instant::now();
+        let mut store = Store::default();
+        let short = CreateOpts {
+            ttl: Duration::from_secs(60),
+            ..CreateOpts::new(session())
+        };
+        let expired = mint(&mut store, short, at(now));
+        let revoked = mint(&mut store, CreateOpts::new(session()), at(now));
+        store.revoke(&revoked.id, now);
+        let later = at(now + Duration::from_secs(60));
+        let _ = store.end_grants(later, |_| false);
+        for (g, why) in [
+            (&expired, EndReason::Expired),
+            (&revoked, EndReason::Revoked),
+        ] {
+            assert_eq!(
+                store.redeem(&g.id, &g.secret, later).unwrap_err(),
+                Refused::Gone(Some(why))
+            );
+        }
+        let forgotten = at(now + ENDED_GRACE + Duration::from_secs(60));
+        let _ = store.end_grants(forgotten, |_| false);
+        assert_eq!(
+            store
+                .redeem(&revoked.id, &revoked.secret, forgotten)
+                .unwrap_err(),
+            Refused::NotFound
+        );
     }
 
     /// The monotonic clock stops while a laptop sleeps: an hour's link must
@@ -1099,7 +1178,7 @@ mod tests {
         let Admit::Ready(streaming) = store.admit(&a.id, &online.cookie, now) else {
             panic!("not admitted");
         };
-        let ended = store.revoke(&a.id).expect("revoked");
+        let ended = store.revoke(&a.id, now.mono).expect("revoked");
         assert_eq!(ended.len(), 1);
         assert_eq!(streaming.live.reason(), Some(EndReason::Revoked));
         assert!(streaming.live.stop().is_cancelled());
@@ -1107,7 +1186,7 @@ mod tests {
             store.admit(&a.id, &offline.cookie, now),
             Admit::Refused(_)
         ));
-        assert!(store.revoke(&a.id).is_none(), "revoked twice");
+        assert!(store.revoke(&a.id, now.mono).is_none(), "revoked twice");
         // The other session's viewer is untouched until its session ends.
         assert!(matches!(
             store.admit(&b.id, &other.cookie, now),
@@ -1264,7 +1343,9 @@ mod tests {
                                 viewers.push(MViewer { grant: i, redeemed: r, live: None, gone: false, offline_since: now.mono, admits: Vec::new() });
                             }
                             Err(Refused::NotFound) => prop_assert!(!right || g.ended),
-                            Err(Refused::Gone) => prop_assert!(right && !g.ended && !open),
+                            Err(Refused::Gone(None)) => prop_assert!(right && !g.ended && !open),
+                            // An ended link says why, whatever secret: it holds none.
+                            Err(Refused::Gone(Some(_))) => prop_assert!(g.ended),
                             Err(Refused::Full) => prop_assert!(open && held >= MAX_VIEWERS_PER_LINK),
                             Err(Refused::Throttled) => prop_assert!(false, "a redeem is never throttled"),
                         }
@@ -1303,7 +1384,7 @@ mod tests {
                     }
                     Op::Revoke { grant } => {
                         let Some(i) = (!grants.is_empty()).then(|| grant % grants.len()) else { continue };
-                        let got = store.revoke(&grants[i].minted.id);
+                        let got = store.revoke(&grants[i].minted.id, now.mono);
                         prop_assert_eq!(got.is_some(), !grants[i].ended);
                         grants[i].ended = true;
                         for v in viewers.iter_mut().filter(|v| v.grant == i) {

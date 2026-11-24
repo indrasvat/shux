@@ -4,7 +4,7 @@
 //!
 //! Serves `$SHUX_SOCKET`, prints `{"addr": "127.0.0.1:N"}`, then answers one
 //! JSON line per request line:
-//! `{"op":"origin","origin":"https://…"}`, `{"op":"create","session":ID,"uses":N}`
+//! `{"op":"origin","origin":"https://…"}`, `{"op":"create","session":ID,"uses":N,"ttl_ms":MS}`
 //! (`uses` 0 is unlimited), `{"op":"revoke","id":ID}`, `{"op":"list"}`,
 //! `{"op":"stop"}`, `{"op":"quit"}`.
 
@@ -37,6 +37,9 @@ async fn main() -> anyhow::Result<()> {
                 let mut opts = CreateOpts::new(field("session").parse()?);
                 if let Some(n) = req["uses"].as_u64() {
                     opts.uses = std::num::NonZeroU32::new(u32::try_from(n)?).map_or(Uses::Unlimited, Uses::Limited);
+                }
+                if let Some(ms) = req["ttl_ms"].as_u64() {
+                    opts.ttl = std::time::Duration::from_millis(ms);
                 }
                 match gw.create(opts) {
                     Ok(c) => json!({ "id": c.id.as_str(), "url": c.url }),

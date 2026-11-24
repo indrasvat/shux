@@ -14,17 +14,18 @@
 <header id="bar" role="status">
   <span class="mark">◉</span>
   <span class="ro">Read-only</span>
-  <span class="sep">·</span>
+  <span class="sep" hidden>·</span>
   <span id="session"></span>
   <span id="expiry"></span>
   <span id="state">loading…</span>
+  <button id="zoom" type="button" hidden>Zoom</button>
 </header>
 <main id="stage">
   <section id="gate" hidden>
     <p id="gate-text">Someone shared a read-only view of a terminal session with you.</p>
     <button id="watch" type="button">Watch session</button>
   </section>
-  <div id="frame"><div id="term"></div></div>
+  <div id="sizer"><div id="frame"><div id="term"></div></div></div>
 </main>
 </body>
 </html>

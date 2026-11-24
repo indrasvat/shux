@@ -40,6 +40,11 @@ let expiresAt = null;
 // The same moment on this page's monotonic clock, which a changed system
 // clock cannot move.
 let deadline = null;
+// Why the link ended, as the status probe said.
+let endedWhy = null;
+// The view the guest picked: "fit" or "readable"; null until they do.
+let zoom = null;
+const READABLE_PX = 9.5;
 let retries = 0;
 
 // Counted down from the server's remaining time: this clock may be off.
@@ -66,7 +71,7 @@ function end(message) {
   $("#gate-text").textContent = message;
   $("#watch").hidden = true;
   $("#gate").hidden = false;
-  $("#frame").hidden = true;
+  $("#sizer").hidden = true;
 }
 
 function screenText() {
@@ -93,11 +98,34 @@ function fitted() {
 
 // A grid wider than the screen is shown whole, scaled: an overview the
 // browser's own zoom and scroll can close in on.
+// Two views of a grid wider than the screen: "fit", the whole layout
+// scaled down, and "readable", glyphs no smaller than READABLE_PX, panned by
+// scrolling the stage. Readable is the default once fit would go below it.
+// Both are local: nothing here reaches the session, and no size is asked for.
 function layout() {
   const frame = $("#frame");
+  const sizer = $("#sizer");
+  const stage = $("#stage");
   frame.style.transform = "";
-  const scale = Math.min(1, $("#stage").clientWidth / Math.max(1, frame.scrollWidth));
+  const w = frame.scrollWidth;
+  const h = frame.scrollHeight;
+  const fit = Math.min(1, stage.clientWidth / Math.max(1, w));
+  const readable = Math.min(1, Math.max(fit, READABLE_PX / FONT.size));
+  const mode = zoom ?? (fit < readable ? "readable" : "fit");
+  const scale = mode === "readable" ? readable : fit;
   frame.style.transform = scale < 1 ? `scale(${scale})` : "";
+  sizer.style.width = `${Math.ceil(w * scale)}px`;
+  sizer.style.height = `${Math.ceil(h * scale)}px`;
+  const button = $("#zoom");
+  button.hidden = readable === fit;
+  button.textContent = mode === "readable" ? "Fit" : "Zoom";
+  view.mode = mode;
+  view.glyph = FONT.size * scale;
+}
+
+function toggleZoom() {
+  zoom = view.mode === "readable" ? "fit" : "readable";
+  layout();
 }
 
 function applyPalette(p) {
@@ -125,6 +153,8 @@ function freshTerminal(size, palette) {
     theme: { background: palette.background, foreground: palette.foreground },
   });
   term.open($("#term"));
+  // Read-only: a tap must not raise a phone keyboard over the view.
+  for (const el of [$("#term"), ...$("#term").querySelectorAll("textarea")]) el.inputMode = "none";
   view.size = [size.cols, size.rows];
   layout();
 }
@@ -144,6 +174,7 @@ function onText(m) {
       setExpiry(m.expires_in_ms);
       applyPalette(m.palette);
       $("#session").textContent = m.session;
+      $("#bar .sep").hidden = false;
       showExpiry();
       freshTerminal(m.size, m.palette);
       view.received = 0;
@@ -185,7 +216,12 @@ async function status() {
   try {
     const r = await fetch(`/v/${id}/status`, { cache: "no-store", credentials: "same-origin" });
     if (!r.ok) return false;
-    setExpiry((await r.json()).expires_in_ms);
+    const j = await r.json();
+    if (j.state !== "ok") {
+      endedWhy = j.reason;
+      return false;
+    }
+    setExpiry(j.expires_in_ms);
     return true;
   } catch {
     return null;
@@ -199,7 +235,7 @@ async function connect() {
   view.phase = "connecting";
   setState(view.connects > 1 ? "reconnecting…" : "connecting…");
   $("#gate").hidden = true;
-  $("#frame").hidden = false;
+  $("#sizer").hidden = false;
   const scheme = location.protocol === "https:" ? "wss" : "ws";
   const socket = new WebSocket(`${scheme}://${location.host}/v/${id}/ws`);
   ws = socket;
@@ -226,7 +262,7 @@ async function reconnectOrEnd(reason) {
   // The socket cannot say why it failed; the status can. An unreachable
   // server is one more retry, not an ending.
   const ok = await status();
-  if (ok === false) return end("This link has ended.");
+  if (ok === false) return end(FINAL[endedWhy] ?? "This link has ended.");
   if (ok === null) return reconnectOrEnd("");
   connect();
 }
@@ -258,16 +294,21 @@ async function redeem() {
     setExpiry((await r.json()).expires_in_ms);
     connect();
   } else {
-    end(r.status === 410 ? "This link has already been used, or has ended." : "This link is not valid.");
+    const why = r.status === 410 ? (await r.json().catch(() => ({}))).reason : null;
+    if (r.status !== 410) end("This link is not valid.");
+    else end(FINAL[why] ?? "This link has already been used.");
   }
 }
 
 async function boot() {
   window.addEventListener("resize", layout);
+  $("#zoom").addEventListener("click", toggleZoom);
+  // The terminal's own wheel handler would swallow the pan; a read-only view has nothing to scroll in it.
+  $("#stage").addEventListener("wheel", (e) => e.stopPropagation(), { capture: true, passive: true });
   if (secret) {
     setState("ready");
     $("#watch").addEventListener("click", redeem, { once: true });
-    $("#frame").hidden = true;
+    $("#sizer").hidden = true;
     $("#gate").hidden = false;
     return;
   }
@@ -276,7 +317,7 @@ async function boot() {
   const ok = await status();
   if (ok) connect();
   else if (ok === null) reconnectOrEnd("");
-  else end("This link has ended, or was opened in another browser.");
+  else end(FINAL[endedWhy] ?? "This link has ended, or was opened in another browser.");
 }
 
 boot();

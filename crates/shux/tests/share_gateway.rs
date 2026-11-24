@@ -939,8 +939,21 @@ fn revoke_ends_the_live_stream_at_the_origin_and_its_reconnect() {
             "",
         )
         .await;
-        assert_eq!(status.status, 410);
-        assert_eq!(rig.redeem(&id, &secret).await.status, 404);
+        // The probe answers, and says the link ended and why.
+        assert_eq!(status.status, 200);
+        let said: serde_json::Value = serde_json::from_str(&status.body).expect("status json");
+        assert_eq!(
+            (said["state"].as_str(), said["reason"].as_str()),
+            (Some("ended"), Some("revoked"))
+        );
+        // Opened afresh, the link says it was revoked, as often as it is
+        // tried: that is no guess at a secret.
+        for _ in 0..12 {
+            let again = rig.redeem(&id, &secret).await;
+            assert_eq!(again.status, 410, "{}", again.body);
+            let said: serde_json::Value = serde_json::from_str(&again.body).expect("redeem json");
+            assert_eq!(said["reason"], "revoked");
+        }
         assert!(rig.gw.list().is_empty());
         rig.stop().await;
     });
@@ -1585,7 +1598,12 @@ fn administrative_detach_invalidates_the_browser_credential() {
             "",
         )
         .await;
-        assert_eq!(status.status, 410);
+        assert_eq!(status.status, 200);
+        assert!(
+            status.body.contains(r#""state":"ended""#),
+            "{}",
+            status.body
+        );
         assert_eq!(viewer.ends().await.as_deref(), Some("kicked"));
         rig.stop().await;
     });
