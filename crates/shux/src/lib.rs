@@ -50,6 +50,7 @@ pub(crate) mod run_framing;
 pub mod session_meta;
 pub mod session_persist;
 pub mod settle;
+pub mod share;
 pub mod snapshot;
 pub mod statusbar_build;
 pub mod statusbar_runner;

@@ -534,12 +534,50 @@ pub(crate) fn handle_daemon_command(
 pub(crate) struct Teardown {
     io_state: Arc<Mutex<PaneIoState>>,
     plugins: shux_plugin::PluginManager,
+    share: crate::share::Gateway,
 }
 
 impl Teardown {
-    /// Reap every pane and every plugin, side by side.
+    /// End every share viewer, then reap every pane and every plugin, side
+    /// by side.
     pub(crate) async fn drain(self) {
+        self.share.stop().await;
         tokio::join!(shutdown_all_pane_io(self.io_state), self.plugins.shutdown());
+    }
+}
+
+/// The daemon's services, run in this process: what [`run_daemon`] serves
+/// once forked, on `socket`, under the `XDG_*` directories of this process.
+/// For harnesses that drive the share gateway, which no RPC reaches yet.
+pub struct InProcess {
+    pub gateway: crate::share::Gateway,
+    cancel: tokio_util::sync::CancellationToken,
+    teardown: Teardown,
+}
+
+impl InProcess {
+    pub async fn start(socket: PathBuf) -> anyhow::Result<Self> {
+        daemon::ensure_runtime_dir()?;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let teardown = run_rpc_server(
+            socket,
+            Arc::new(|| true),
+            cancel.clone(),
+            lens_scratch::LensAuditLog::open_default(),
+            Vec::new(),
+        )
+        .await?;
+        Ok(Self {
+            gateway: teardown.share.clone(),
+            cancel,
+            teardown,
+        })
+    }
+
+    /// Stops serving and reaps every pane.
+    pub async fn shutdown(self) {
+        self.cancel.cancel();
+        self.teardown.drain().await;
     }
 }
 
@@ -650,6 +688,20 @@ pub(crate) async fn run_rpc_server(
     // Daemon start instant — drives the "up Nh Nm" segment in the right
     // zone post-hint-dismissal.
     let daemon_start = std::time::Instant::now();
+
+    // The share gateway: built here, serving nothing until a link is made.
+    let share = crate::share::Gateway::new(
+        attach::AttachDeps {
+            graph: graph_handle.clone(),
+            io_state: io_state.clone(),
+            config: config_handle.clone(),
+            segments: segment_cache.clone(),
+            meta_cache: session_meta_cache.clone(),
+            onboarding: onboarding.clone(),
+            daemon_start,
+        },
+        cancel.clone(),
+    );
 
     // Spawn the attach UDS listener (separate socket, dedicated streaming
     // protocol). The JSON-RPC socket below stays request-response.
@@ -868,6 +920,7 @@ pub(crate) async fn run_rpc_server(
     Ok(Teardown {
         io_state: shutdown_io_state,
         plugins,
+        share,
     })
 }
 

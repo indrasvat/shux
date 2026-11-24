@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex, nofollow">
+<title>shux · shared session</title>
+<link rel="icon" href="/_/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/_/viewer.css">
+<script type="module" src="/_/viewer.js"></script>
+</head>
+<body>
+<header id="bar" role="status">
+  <span class="mark">◉</span>
+  <span class="ro">Read-only</span>
+  <span class="sep">·</span>
+  <span id="session"></span>
+  <span id="expiry"></span>
+  <span id="state">loading…</span>
+</header>
+<main id="stage">
+  <section id="gate" hidden>
+    <p id="gate-text">Someone shared a read-only view of a terminal session with you.</p>
+    <button id="watch" type="button">Watch session</button>
+  </section>
+  <div id="frame"><div id="term"></div></div>
+</main>
+</body>
+</html>
