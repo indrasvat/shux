@@ -1501,51 +1501,60 @@ fn parse_frames(raw: &[u8]) -> (u64, Vec<String>) {
     (payload, texts)
 }
 
+/// A viewer whose origin write is blocked partway through a chunk on a
+/// socket that holds almost nothing and reads nothing, on a flooding
+/// session `name`. Returns its host (kept attached), its link, the cookie, the socket and
+/// the terminal bytes the origin had sent when it stuck.
+async fn stalled_viewer(rig: &Rig, name: &str) -> (Host, GrantId, String, TcpStream, u64) {
+    let flood = serde_json::json!([
+        "sh",
+        "-c",
+        "i=0; while :; do i=$((i+1)); printf \"\\033[3%dmTICK %s %0200d\\033[0m\\n\" $((i%7+1)) $i 0; done"
+    ]);
+    let (session, _) = rig.session(name, flood).await;
+    let mut host = Host::attach(rig, name, 240, 101).await;
+    host.draws("TICK").await;
+    let (id, secret) = rig.link(&session, |_| {});
+    let cookie = rig.redeem(&id, &secret).await.cookie(&id);
+    let sock = tokio::net::TcpSocket::new_v4().expect("socket");
+    sock.set_recv_buffer_size(4096).expect("rcvbuf");
+    let tcp = sock.connect(rig.addr).await.expect("connect");
+    let mut tcp = raw_upgrade_on(tcp, &id, &cookie).await;
+    tcp.write_all(&frame(0x1, br#"{"t":"hello","cols":240,"rows":100}"#))
+        .await
+        .expect("hello");
+    // Stuck: what the origin has fully sent holds still while the pane
+    // keeps printing and the host keeps drawing it. A full window held
+    // back is credit, not a blocked write: acknowledge it (unread) until
+    // the origin stops short of the window, its write blocked on the
+    // socket.
+    let mut acked = 0;
+    let cut = loop {
+        let before = rig.gw.bytes_sent();
+        let seen = host.frames();
+        host.frames_past(seen + 10).await;
+        let now = rig.gw.bytes_sent();
+        if now != before || now == 0 {
+            continue;
+        }
+        if now - acked < shux::share::wire::WINDOW {
+            break now;
+        }
+        acked = now;
+        let ack = format!(r#"{{"t":"ack","offset":{acked}}}"#);
+        tcp.write_all(&frame(0x1, ack.as_bytes()))
+            .await
+            .expect("ack");
+    };
+    (host, id, cookie, tcp, cut)
+}
+
 #[test]
 fn a_revoked_viewer_gets_no_terminal_bytes_past_the_cutoff() {
     let _ = dirs();
     runtime().block_on(async {
         let rig = Rig::start("cutoff").await;
-        let flood = serde_json::json!([
-            "sh",
-            "-c",
-            "i=0; while :; do i=$((i+1)); printf \"\\033[3%dmTICK %s %0200d\\033[0m\\n\" $((i%7+1)) $i 0; done"
-        ]);
-        let (session, _) = rig.session("cutoff", flood).await;
-        let mut host = Host::attach(&rig, "cutoff", 240, 101).await;
-        host.draws("TICK").await;
-        let (id, secret) = rig.link(&session, |_| {});
-        let cookie = rig.redeem(&id, &secret).await.cookie(&id);
-        // A viewer whose socket holds almost nothing and which reads nothing:
-        // the origin's write blocks partway through a chunk.
-        let sock = tokio::net::TcpSocket::new_v4().expect("socket");
-        sock.set_recv_buffer_size(4096).expect("rcvbuf");
-        let tcp = sock.connect(rig.addr).await.expect("connect");
-        let mut tcp = raw_upgrade_on(tcp, &id, &cookie).await;
-        tcp.write_all(&frame(0x1, br#"{"t":"hello","cols":240,"rows":100}"#))
-            .await
-            .expect("hello");
-        // Stuck: what the origin has fully sent holds still while the pane
-        // keeps printing and the host keeps drawing it. A full window held
-        // back is credit, not a blocked write: acknowledge it (unread) until
-        // the origin stops short of the window, its write blocked on the
-        // socket.
-        let mut acked = 0;
-        let cut = loop {
-            let before = rig.gw.bytes_sent();
-            let seen = host.frames();
-            host.frames_past(seen + 10).await;
-            let now = rig.gw.bytes_sent();
-            if now != before || now == 0 {
-                continue;
-            }
-            if now - acked < shux::share::wire::WINDOW {
-                break now;
-            }
-            acked = now;
-            let ack = format!(r#"{{"t":"ack","offset":{acked}}}"#);
-            tcp.write_all(&frame(0x1, ack.as_bytes())).await.expect("ack");
-        };
+        let (_host, id, _, mut tcp, cut) = stalled_viewer(&rig, "cutoff").await;
         // Read alongside the revoke, so anything the origin still writes
         // gets through.
         let reader = tokio::spawn(async move {
@@ -1559,6 +1568,36 @@ fn a_revoked_viewer_gets_no_terminal_bytes_past_the_cutoff() {
         assert!(
             payload <= cut,
             "{payload} terminal bytes reached the viewer; the origin had sent {cut} before the cutoff"
+        );
+        rig.stop().await;
+    });
+}
+
+#[test]
+fn deleting_the_session_cuts_off_a_viewer_whose_write_is_blocked() {
+    let _ = dirs();
+    runtime().block_on(async {
+        let rig = Rig::start("killcut").await;
+        let (_host, id, cookie, mut tcp, cut) = stalled_viewer(&rig, "killcut").await;
+        rig.rpc("session.kill", serde_json::json!({ "name": "killcut" }))
+            .await;
+        // Reading drains the socket, so the blocked write completes: only a
+        // cutoff on the deletion itself keeps what follows from the viewer.
+        let mut raw = Vec::new();
+        let closed = tokio::time::timeout(BUDGET, tcp.read_to_end(&mut raw)).await;
+        assert!(
+            closed.is_ok(),
+            "the socket stayed open after its session was deleted"
+        );
+        let (payload, _) = parse_frames(&raw);
+        assert!(
+            payload <= cut,
+            "{payload} terminal bytes reached the viewer; the origin had sent {cut} before the cutoff"
+        );
+        assert_eq!(
+            upgrade(rig.addr, &id, &cookie, ORIGIN).await.err(),
+            Some(403),
+            "the credential outlived its session"
         );
         rig.stop().await;
     });

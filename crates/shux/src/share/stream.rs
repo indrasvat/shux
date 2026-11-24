@@ -178,12 +178,14 @@ fn fit((cols, rows): (u16, u16), layout: Option<&wire::Size>) -> (u16, u16) {
 }
 
 /// Runs `work` until it ends or the stream's cutoff comes, whichever is
-/// first: the stream's end, or its link's expiry by either clock.
+/// first: the stream's end, its link's expiry by either clock, or its
+/// session's deletion.
 async fn while_live(gw: &Gateway, admitted: &Admitted, work: impl Future<Output = Exit>) -> Exit {
     let exit = tokio::select! {
         biased;
         () = admitted.live.stop().cancelled() => Exit::Ended(EndReason::Stopped),
         () = expired(gw, admitted) => Exit::Ended(EndReason::Expired),
+        () = session_gone(gw, admitted.session) => Exit::Ended(EndReason::SessionEnded),
         exit = work => exit,
     };
     match admitted.live.reason() {
@@ -203,6 +205,29 @@ async fn expired(gw: &Gateway, admitted: &Admitted) {
         tokio::select! {
             () = at(Some(admitted.expires.mono.min(Instant::now() + CHECK))) => {}
             () = moved => {}
+        }
+    }
+}
+
+/// Resolves once `session` is gone from the graph; never on a daemon
+/// without an event bus.
+async fn session_gone(gw: &Gateway, session: SessionId) {
+    let bus = gw.inner.deps.io_state.lock().await.event_bus.clone();
+    let Some(bus) = bus else {
+        return std::future::pending().await;
+    };
+    // Watched before the first look, so a deletion between them still wakes it.
+    let mut killed = bus.watch_filtered(vec!["session.killed".into()]);
+    while gw
+        .inner
+        .deps
+        .graph
+        .snapshot()
+        .sessions
+        .contains_key(&session)
+    {
+        if killed.changed().await.is_err() {
+            return std::future::pending().await;
         }
     }
 }
@@ -250,7 +275,10 @@ pub(super) async fn run(mut ws: WebSocket, gw: Gateway, admitted: Admitted, guar
     // The cutoff: the socket closes first, then the slot and credential go.
     drop(ws);
     drop(guard);
-    if matches!(exit, Exit::Ended(EndReason::Expired)) {
+    if matches!(
+        exit,
+        Exit::Ended(EndReason::Expired | EndReason::SessionEnded)
+    ) {
         gw.prune();
     }
     attach_cancel.cancel();
