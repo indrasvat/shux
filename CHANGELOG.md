@@ -1,3 +1,10 @@
+# [0.62.0](https://github.com/indrasvat/shux/compare/v0.61.3...v0.62.0) (2026-11-24)
+
+
+### Features
+
+* **share:** the share gateway: a read-only browser view of a session, over links you can revoke ([#315](https://github.com/indrasvat/shux/issues/315)) ([68c0153](https://github.com/indrasvat/shux/commit/68c01530b4b52a3aa11a7a32f9da3318a0069daa)), closes [#297](https://github.com/indrasvat/shux/issues/297) [#191](https://github.com/indrasvat/shux/issues/191) [#297](https://github.com/indrasvat/shux/issues/297)
+
 ## [0.61.3](https://github.com/indrasvat/shux/compare/v0.61.2...v0.61.3) (2026-11-24)
 
 
