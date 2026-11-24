@@ -31,6 +31,7 @@ make check-test-groups  # nextest groups still bound what they claim
 make shellcheck         # every tracked shell script (the guards live in shell)
 make test-gui-terminal  # what a REAL GUI terminal (kitty/Xvfb) draws from shux's output
 make reap               # stop daemons this checkout leaked when a run was interrupted
+make prune / disk-check # dry-run report of regenerable disk (APPLY=1 removes) / warn when free disk is low (docs/agents/disk.md)
 make test-stress        # repeat tests under CPU load (STRESS_COUNT/FILTER/LOAD) to expose timing
 make check-test-timing  # ast-grep bans on timing in disguise in test code (lint/ast-grep/)
 make check-test-ignores # every #[ignore] names an open issue ("see #N") or is a "generator:"
@@ -307,6 +308,7 @@ Every feature/fix PR.
     *Tooling fallbacks*.
 13. **Post-merge `curl|sh` smoke.** After merge + semantic-release tags, install via
     `curl -fsSL https://shux.pages.dev/install.sh | sh` and smoke the *published* binary.
+14. **Prune.** After the post-merge smoke, `make prune APPLY=1` (`docs/agents/disk.md`).
 
 **PR description: problem, change, measured result, risks.** Detail goes in commits,
 evidence in comments. Not a transcript.

@@ -256,6 +256,18 @@ out="$(clean "$t" 2>&1)"
 [[ -L "$t/target" && -e "${work}/linked2/debug/deps/x.rcgu.o" && "${out}" == *"not cleaning $t/target"* ]] \
   || die "--clean emptied or broke a symlinked target:"$'\n'"${out}"
 
+# --list names exactly what --clean would empty, and changes nothing.
+t="${work}/list"; tree "$t"; stale "$t/target/debug/deps/x.rlib"
+stale "$t/.shux/out/test-inventory/target/debug/deps/z.rlib"
+mkdir -p "$t/wt"; printf 'gitdir: x\n' >"$t/wt/.git"; tree "$t/wt"; stale "$t/wt/target/debug/x"
+ln -s "${work}/linked2" "$t/fuzz/target"
+nl="$t/a"$'\n'"b"; mkdir -p "${nl}"; printf '[workspace]\n' >"${nl}/Cargo.toml"; stale "${nl}/target/x"
+real_t="$(cd "$t" && pwd -P)"
+out="$("${GUARD}" --list "$t" 2>/dev/null | tr '\0' '|')"
+want="${real_t}/target|${real_t}/a"$'\n'"b/target|${real_t}/.shux/out/test-inventory/target|"
+[[ "${out}" == "${want}" ]] || die "--list printed:"$'\n'"${out}"$'\n'"wanted:"$'\n'"${want}"
+[[ -e "$t/target/debug/deps/x.rlib" ]] || die "--list deleted something"
+
 # A configured target dir is never emptied: not outside the repo, not inside
 # it (here: src/), not when its name smuggles a newline.
 t="${work}/clean-configured"; tree "$t"
