@@ -1,3 +1,10 @@
+## [0.59.2](https://github.com/indrasvat/shux/compare/v0.59.1...v0.59.2) (2026-11-24)
+
+
+### Bug Fixes
+
+* **vt:** a clear no longer joins rows, so a resize keeps every coloured blank row ([#302](https://github.com/indrasvat/shux/issues/302)) ([0764a91](https://github.com/indrasvat/shux/commit/0764a9150a71e633e34b811aab2025d7e9dba704)), closes [#301](https://github.com/indrasvat/shux/issues/301) [#301](https://github.com/indrasvat/shux/issues/301) [#301](https://github.com/indrasvat/shux/issues/301) [#301](https://github.com/indrasvat/shux/issues/301)
+
 ## [0.59.1](https://github.com/indrasvat/shux/compare/v0.59.0...v0.59.1) (2026-11-24)
 
 
