@@ -1,6 +1,6 @@
 //! The daemon's services in one process, with the share gateway driven from
-//! stdin: what `make test-share-browser` puts behind its TLS proxy. Stands in
-//! for the `share.*` RPCs until they exist.
+//! stdin: what `make test-share-browser` puts behind its TLS proxy, at a
+//! fixed origin and with no tunnel, which the `share.*` RPCs always start.
 //!
 //! Serves `$SHUX_SOCKET`, prints `{"addr": "127.0.0.1:N"}`, then answers one
 //! JSON line per request line:

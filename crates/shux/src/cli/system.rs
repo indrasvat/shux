@@ -9,8 +9,17 @@ pub async fn handle_api(
     params_str: &str,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
-    let params: serde_json::Value = serde_json::from_str(params_str)
+    let mut params: serde_json::Value = serde_json::from_str(params_str)
         .map_err(|e| anyhow::anyhow!("Invalid JSON params: {e}"))?;
+    // A link made from inside a pane is never printed: the caller's pane is
+    // filled in unless the params name one (or `null`) themselves.
+    if method == "share.create"
+        && let Some(obj) = params.as_object_mut()
+        && !obj.contains_key("from_pane")
+        && let Some(pane) = crate::cli::share::caller_pane()
+    {
+        obj.insert("from_pane".into(), pane.into());
+    }
 
     // PR 3b: surface RPC errors as part of the JSON-RPC envelope on
     // stdout, not as a human-readable anyhow error on stderr. Callers

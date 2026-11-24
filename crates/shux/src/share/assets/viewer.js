@@ -7,6 +7,7 @@ const FINAL = {
   expired: "This link has expired.",
   stopped: "The owner stopped sharing.",
   session_ended: "The session ended.",
+  tunnel_lost: "The owner's connection dropped. Ask them for a new link.",
   kicked: "The owner removed you from this session.",
   replaced: "This session is open in another tab.",
   protocol: "The viewer lost its place in the stream.",

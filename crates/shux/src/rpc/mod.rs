@@ -20,6 +20,7 @@ pub(crate) mod params;
 pub(crate) mod plugin;
 pub(crate) mod program_status;
 pub(crate) mod session;
+pub(crate) mod share;
 pub(crate) mod state;
 pub(crate) mod wait_command;
 pub(crate) mod wait_exit;
@@ -32,7 +33,7 @@ pub(crate) mod test_harness;
 ///
 /// The order is the registration order and is preserved verbatim: builtins
 /// first, then session → window → pane → pane I/O → lens.run → program status →
-/// events → state → plugin. Later registrations of the same method name would win, so this is
+/// events → state → share → plugin. Later registrations of the same method name would win, so this is
 /// part of the surface, not a formatting choice.
 #[expect(clippy::too_many_arguments, reason = "independent inputs")]
 pub(crate) fn build_router(
@@ -47,28 +48,35 @@ pub(crate) fn build_router(
     lens_audit: Arc<crate::lens_scratch::LensAuditLog>,
     event_bus: shux_core::bus::EventBus,
     plugins: shux_plugin::PluginManager,
+    share: crate::share::Gateway,
 ) -> shux_rpc::Router {
+    let (share_graph, share_scratch) = (graph.clone(), scratch_registry.clone());
     crate::rpc::plugin::register_plugin_methods(
-        crate::rpc::state::register_state_methods(
-            crate::rpc::events::register_events_methods(
-                crate::rpc::program_status::register_program_status_methods(
-                    crate::lens_scratch::register_lens_run_method(
-                        crate::rpc::pane_io::register_pane_io_methods(
-                            crate::rpc::pane::register_pane_methods(
-                                crate::rpc::window::register_window_methods(
-                                    crate::rpc::client::register_client_methods(
-                                        crate::rpc::session::register_session_methods(
-                                            shux_rpc::server::register_builtin_methods(
-                                                shux_rpc::Router::builder(),
+        crate::rpc::share::register_share_methods(
+            crate::rpc::state::register_state_methods(
+                crate::rpc::events::register_events_methods(
+                    crate::rpc::program_status::register_program_status_methods(
+                        crate::lens_scratch::register_lens_run_method(
+                            crate::rpc::pane_io::register_pane_io_methods(
+                                crate::rpc::pane::register_pane_methods(
+                                    crate::rpc::window::register_window_methods(
+                                        crate::rpc::client::register_client_methods(
+                                            crate::rpc::session::register_session_methods(
+                                                shux_rpc::server::register_builtin_methods(
+                                                    shux_rpc::Router::builder(),
+                                                ),
+                                                graph.clone(),
+                                                io_state.clone(),
+                                                cancel.clone(),
+                                                session_meta.clone(),
+                                                scratch_registry.clone(),
                                             ),
                                             graph.clone(),
                                             io_state.clone(),
-                                            cancel.clone(),
-                                            session_meta.clone(),
-                                            scratch_registry.clone(),
                                         ),
                                         graph.clone(),
                                         io_state.clone(),
+                                        cancel.clone(),
                                     ),
                                     graph.clone(),
                                     io_state.clone(),
@@ -77,32 +85,32 @@ pub(crate) fn build_router(
                                 graph.clone(),
                                 io_state.clone(),
                                 cancel.clone(),
+                                config,
+                                session_meta,
+                                onboarding,
+                                segments,
+                                lens_audit,
                             ),
                             graph.clone(),
                             io_state.clone(),
                             cancel.clone(),
-                            config,
-                            session_meta,
-                            onboarding,
-                            segments,
-                            lens_audit,
+                            event_bus.clone(),
+                            scratch_registry,
                         ),
                         graph.clone(),
                         io_state.clone(),
-                        cancel.clone(),
                         event_bus.clone(),
-                        scratch_registry,
                     ),
+                    event_bus,
                     graph.clone(),
-                    io_state.clone(),
-                    event_bus.clone(),
                 ),
-                event_bus,
-                graph.clone(),
+                graph,
+                io_state,
+                cancel,
             ),
-            graph,
-            io_state,
-            cancel,
+            share_graph,
+            share_scratch,
+            share,
         ),
         plugins,
     )

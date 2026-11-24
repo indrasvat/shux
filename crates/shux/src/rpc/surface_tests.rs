@@ -72,6 +72,11 @@ const EXPECTED_SURFACE: &[&str] = &[
     "session.list => Public",
     "session.rename => OwnedMutation",
     "session.snapshot => ContentRead",
+    "share.create => PluginsForbidden, owner-local",
+    "share.kick => PluginsForbidden, owner-local",
+    "share.list => PluginsForbidden, owner-local",
+    "share.revoke => PluginsForbidden, owner-local",
+    "share.stop => PluginsForbidden, owner-local",
     "state.apply => Grantable",
     "system.health => Public",
     "system.version => Public",
@@ -94,6 +99,27 @@ fn describe(policy: &Policy) -> String {
             format!("ParamAware(broad={broad:?}, self_scoped={scoped:?})")
         }
     }
+}
+
+fn gateway(
+    graph: &shux_core::graph::GraphHandle,
+    io_state: &Arc<Mutex<PaneIoState>>,
+    config: &shux_core::config::ConfigHandle,
+    onboarding: &crate::onboarding::OnboardingHandle,
+    segments: &crate::statusbar_runner::SegmentCache,
+) -> crate::share::Gateway {
+    crate::share::Gateway::new(
+        crate::attach::AttachDeps {
+            graph: graph.clone(),
+            io_state: io_state.clone(),
+            config: config.clone(),
+            segments: segments.clone(),
+            meta_cache: crate::session_meta::SessionMetaCache::new(),
+            onboarding: onboarding.clone(),
+            daemon_start: std::time::Instant::now(),
+        },
+        tokio_util::sync::CancellationToken::new(),
+    )
 }
 
 fn actual_surface() -> Vec<String> {
@@ -119,6 +145,7 @@ fn actual_surface() -> Vec<String> {
     let plugins =
         shux_plugin::PluginManager::with_state_root(bus.clone(), state_dir.path().join("plugins"));
 
+    let share = gateway(&graph, &io_state, &config, &onboarding, &segments);
     let router = super::build_router(
         graph,
         io_state,
@@ -131,6 +158,7 @@ fn actual_surface() -> Vec<String> {
         lens_audit,
         bus,
         plugins,
+        share,
     );
 
     let mut lines: Vec<String> = router
@@ -140,7 +168,12 @@ fn actual_surface() -> Vec<String> {
             let policy = router
                 .policy(m)
                 .expect("assert_every_route_has_policy covers this");
-            format!("{m} => {}", describe(policy))
+            let local = if router.is_owner_local(m) {
+                ", owner-local"
+            } else {
+                ""
+            };
+            format!("{m} => {}{local}", describe(policy))
         })
         .collect();
     lines.sort();
@@ -169,20 +202,27 @@ async fn every_registered_method_declares_a_policy() {
     let (graph_tx, _graph_rx) = tokio::sync::mpsc::channel(1);
     let state_dir = tempfile::tempdir().expect("state dir");
     let lens_audit = crate::lens_scratch::LensAuditLog::open(state_dir.path());
+    let graph = shux_core::graph::GraphHandle::new(graph_tx, state);
+    let io_state = Arc::new(Mutex::new(PaneIoState::new().with_event_bus(bus.clone())));
+    let config = shux_core::config::ConfigHandle::load_or_default(
+        &state_dir.path().join("no-such-config.toml"),
+    );
+    let onboarding = crate::onboarding::OnboardingHandle::from_state_for_test(Default::default());
+    let segments = crate::statusbar_runner::SegmentCache::new();
+    let share = gateway(&graph, &io_state, &config, &onboarding, &segments);
     let router = super::build_router(
-        shux_core::graph::GraphHandle::new(graph_tx, state),
-        Arc::new(Mutex::new(PaneIoState::new().with_event_bus(bus.clone()))),
+        graph,
+        io_state,
         tokio_util::sync::CancellationToken::new(),
         crate::session_meta::SessionMetaCache::new(),
         crate::lens_scratch::ScratchRegistry::new(state_dir.path(), lens_audit.clone()),
-        shux_core::config::ConfigHandle::load_or_default(
-            &state_dir.path().join("no-such-config.toml"),
-        ),
-        crate::onboarding::OnboardingHandle::from_state_for_test(Default::default()),
-        crate::statusbar_runner::SegmentCache::new(),
+        config,
+        onboarding,
+        segments,
         lens_audit,
         bus.clone(),
         shux_plugin::PluginManager::with_state_root(bus, state_dir.path().join("plugins")),
+        share,
     );
     router.assert_every_route_has_policy();
 }

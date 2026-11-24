@@ -412,6 +412,17 @@ test-share-browser: ## The share gateway (#297) in headless Chrome behind a loca
 	@.shux/scripts/no_leak_guard.sh uv run --offline --script scripts/share-browser-check.py \
 		target/debug/shux target/debug/examples/share_rig .shux/out/share-gateway-297
 
+# Opt-in, never in `make check` or CI: it opens a real public quick tunnel, so
+# it needs network, cloudflared on PATH, Chrome and a cached Playwright. It
+# shares one demo session for about a minute and stops it. SHOWCASE=1 also
+# keeps a guest frame of lazygit for the landing page.
+.PHONY: test-share-tunnel
+test-share-tunnel: ## `shux share` over a REAL Cloudflare quick tunnel to headless Chrome (#297; network)
+	@echo "$(COLOR_BLUE)▶ Building the shux binary...$(COLOR_RESET)"
+	@cargo build -p shux --bin shux
+	@.shux/scripts/no_leak_guard.sh uv run --offline --script scripts/share-tunnel-check.py \
+		target/debug/shux .shux/out/share-tunnel-297 $(if $(SHOWCASE),--showcase,)
+
 # Deliberately NOT in `make check` or `make ci`: this needs an X server and a GUI
 # terminal, and it costs minutes. Image work and emit-path changes invoke it.
 # docs/agents/visual-testing.md says what it can and cannot see.

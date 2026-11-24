@@ -550,7 +550,7 @@ impl Teardown {
 
 /// The daemon's services, run in this process: what [`run_daemon`] serves
 /// once forked, on `socket`, under the `XDG_*` directories of this process.
-/// For harnesses that drive the share gateway, which no RPC reaches yet.
+/// For harnesses that drive the share gateway directly, with no tunnel.
 pub struct InProcess {
     pub gateway: crate::share::Gateway,
     cancel: tokio_util::sync::CancellationToken,
@@ -852,6 +852,7 @@ pub(crate) async fn run_rpc_server(
         lens_audit.clone(),
         event_bus,
         plugins.clone(),
+        share.clone(),
     );
 
     // Startup assertion: every registered RPC method must declare a

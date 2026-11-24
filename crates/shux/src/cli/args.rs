@@ -115,6 +115,24 @@ pub enum Command {
         command: ClientCommand,
     },
 
+    /// Share a session read-only through a private link a guest opens in a
+    /// browser. Mirrors `share.*` RPC.
+    ///
+    /// Bare `shux share` makes one link: one use, for one hour. The guest
+    /// sees the session live and cannot type into it or resize it. A public
+    /// Cloudflare quick tunnel carries it, so cloudflared must be installed;
+    /// Cloudflare sees the stream in plaintext at its edge. Inside any shux
+    /// pane the link goes to the clipboard and is never printed; with no
+    /// clipboard there, nothing is made. Run `shux share stop` when you are
+    /// done.
+    #[command(args_conflicts_with_subcommands = true)]
+    Share {
+        #[command(subcommand)]
+        command: Option<ShareCommand>,
+        #[command(flatten)]
+        create: ShareCreateArgs,
+    },
+
     /// Typed bus events — `shux events watch` long-polls, `shux events
     /// history` returns the ring buffer. Mirrors `events.*` RPC.
     Events {
@@ -187,6 +205,19 @@ pub enum Command {
         reason = "the hidden subcommand's name is its argv spelling"
     )]
     __daemon,
+
+    /// Internal: the share tunnel's supervisor, exec'd by the daemon.
+    #[command(name = "__share-supervise", hide = true)]
+    #[expect(
+        non_camel_case_types,
+        reason = "the hidden subcommand's name is its argv spelling"
+    )]
+    __share_supervise {
+        #[arg(long)]
+        cloudflared: PathBuf,
+        #[arg(long)]
+        port: u16,
+    },
 }
 
 /// `shux state <verb>` — bulk state operations. Mirrors `state.*` RPC.
@@ -460,6 +491,71 @@ pub enum ClientCommand {
         /// The client id, or a unique prefix of it, from `shux client list`.
         id: String,
     },
+}
+
+/// `shux share` and `shux share create`: one new link.
+#[derive(Debug, clap::Args, Clone, Default)]
+pub struct ShareCreateArgs {
+    /// The session to share. Default: the session of the pane this runs in,
+    /// or the only session there is.
+    #[arg(short, long)]
+    pub session: Option<String>,
+    /// How long the link lasts: e.g. 30m, 2h, 1d (at most 24h). Default 1h.
+    #[arg(long = "for", value_name = "DURATION", value_parser = parse_share_duration)]
+    pub for_: Option<u64>,
+    /// How many guests may open it, at most 32; 0 means up to 32 and needs --for.
+    #[arg(long, default_value_t = 1)]
+    pub uses: u32,
+    /// A note for `shux share list`; never shown to the guest.
+    #[arg(long)]
+    pub label: Option<String>,
+    /// Also draw the link as a QR code. Refused inside a shux pane, and with --format json.
+    #[arg(long)]
+    pub qr: bool,
+}
+
+/// `shux share <verb>`. Mirrors `share.*` RPC.
+#[derive(Debug, Subcommand)]
+pub enum ShareCommand {
+    /// Make a link (the same as bare `shux share`).
+    Create(ShareCreateArgs),
+    /// The links that are live: session, expiry, uses left and their viewers.
+    List,
+    /// End a link and drop everyone it let in; `all` ends every link.
+    Revoke {
+        /// A link id from `shux share list`, or `all`.
+        id: String,
+    },
+    /// Drop one viewer; the link stays.
+    Kick {
+        /// A viewer id from `shux share list`.
+        viewer: String,
+    },
+    /// End every link and viewer and close the tunnel.
+    Stop,
+}
+
+/// `--for`: a bare number is seconds; `d` days on top of `s`/`m`/`h`.
+pub fn parse_share_duration(s: &str) -> Result<u64, String> {
+    let t = s.trim();
+    if let Some(days) = t.strip_suffix('d') {
+        let n: u64 = days
+            .trim()
+            .parse()
+            .map_err(|_| format!("invalid duration {s:?} (use e.g. 30m, 2h, 1d)"))?;
+        return n
+            .checked_mul(86_400)
+            .ok_or_else(|| format!("duration {s:?} overflows"));
+    }
+    if let Ok(secs) = t.parse::<u64>() {
+        return Ok(secs);
+    }
+    let ms = parse_duration_ms(t)
+        .map_err(|_| format!("invalid duration {s:?} (use e.g. 30m, 2h, 1d)"))?;
+    if ms % 1000 != 0 {
+        return Err(format!("duration {s:?} is not whole seconds"));
+    }
+    Ok(ms / 1000)
 }
 
 #[derive(Debug, Subcommand)]

@@ -264,6 +264,7 @@ fn router(gw: Gateway) -> Router {
         .route("/v/{id}/status", get(status))
         .route("/v/{id}/ws", get(stream))
         .route("/_/{name}", get(asset))
+        .route(super::tunnel::PROBE_PATH, get(probe))
         .fallback(|| async { not_found() })
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .layer(axum::middleware::from_fn_with_state(gw.clone(), authority))
@@ -292,6 +293,15 @@ async fn authority(State(gw): State<Gateway>, req: Request, next: Next) -> Respo
         return not_found();
     }
     next.run(req).await
+}
+
+/// The marker of a tunnel being brought up, to a request naming its host:
+/// proof that the public origin reaches this gateway, and this generation.
+async fn probe(State(gw): State<Gateway>, headers: HeaderMap) -> Response {
+    match one(&headers, header::HOST).and_then(|h| gw.probe_marker(h)) {
+        Some(m) => ([(header::CONTENT_TYPE, "text/plain")], m).into_response(),
+        None => not_found(),
+    }
 }
 
 async fn harden(mut res: Response) -> Response {

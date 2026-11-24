@@ -9,21 +9,26 @@
 //! sockets of the streams they end before they report success, and say so
 //! when one outlives the teardown deadline.
 //!
-//! The owner-facing operations ([`Gateway::create`], [`Gateway::list`],
-//! [`Gateway::revoke`], [`Gateway::kick`], [`Gateway::stop`]) are what the
-//! `share.*` RPCs call.
+//! [`Gateway::open`] brings up the quick tunnel ([`tunnel`]) on the first
+//! link and mints it; the tunnel goes down once no guest can reach the
+//! daemon any more, on [`Gateway::stop`], and when cloudflared dies, which
+//! ends every link it carried. These are what the `share.*` RPCs call.
 
 pub mod grants;
 mod http;
 mod stream;
+pub mod tunnel;
 pub mod wire;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::os::fd::{AsFd, OwnedFd};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
 use std::time::{Duration, SystemTime};
 
+use shux_core::event::EventData;
+use shux_core::model::SessionId;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -31,6 +36,7 @@ use tokio_util::sync::CancellationToken;
 use crate::attach::AttachDeps;
 use grants::{Admit, Live, Now, Redeemed, Refused, Store};
 pub use grants::{CreateError, CreateOpts, EndReason, GrantId, GrantInfo, Uses, ViewerId};
+pub use tunnel::{Probe, TunnelError};
 
 /// Streams open at once, across the daemon.
 pub const MAX_STREAMS: usize = 16;
@@ -43,6 +49,14 @@ const CLIENT_FAILURES: usize = 10;
 const ALL_FAILURES: usize = 300;
 const FAILURE_WINDOW: Duration = Duration::from_secs(60);
 const MAX_TRACKED_CLIENTS: usize = 4096;
+/// How often a live share looks for sessions that were deleted under it.
+const SESSION_CHECK: Duration = Duration::from_secs(2);
+/// The most `share.*` events held for announcing; past it the oldest go.
+const MAX_PENDING_EVENTS: usize = 1024;
+/// What `share list` says of the tunnel, without waiting on one starting.
+const TUNNEL_DOWN: u8 = 0;
+const TUNNEL_STARTING: u8 = 1;
+const TUNNEL_UP: u8 = 2;
 
 /// The public origin a tunnel serves the gateway at: `https://host[:port]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,12 +133,51 @@ pub enum ShareError {
     /// open at the deadline.
     #[error("{0} viewer stream(s) still open after {TEARDOWN:?}")]
     Teardown(usize),
+    #[error(transparent)]
+    Tunnel(#[from] TunnelError),
 }
 
 struct Server {
     addr: SocketAddr,
+    /// A duplicate of the listener, for the tunnel's supervisor to hold.
+    fd: OwnedFd,
     cancel: CancellationToken,
     task: tokio::task::JoinHandle<()>,
+}
+
+/// One tunnel generation: links minted under it die with it.
+struct Connector {
+    generation: u64,
+    supervisor: tunnel::Supervisor,
+    /// Fires when cloudflared or its supervisor has gone.
+    lost: CancellationToken,
+}
+
+/// Why a tunnel generation is taken down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Down {
+    /// cloudflared or its supervisor went away.
+    Lost,
+    /// No guest can reach the daemon any more.
+    Idle,
+    Stopped,
+}
+
+impl Down {
+    fn code(self) -> &'static str {
+        match self {
+            Self::Lost => "lost",
+            Self::Idle => "idle",
+            Self::Stopped => "stopped",
+        }
+    }
+    /// What the links it carried end as.
+    fn ends_as(self) -> EndReason {
+        match self {
+            Self::Lost => EndReason::TunnelLost,
+            Self::Idle | Self::Stopped => EndReason::Stopped,
+        }
+    }
 }
 
 /// Failed redemptions, by client and in all, within [`FAILURE_WINDOW`].
@@ -175,6 +228,19 @@ pub(crate) struct Inner {
     streams: Arc<tokio::sync::Semaphore>,
     failures: StdMutex<Failures>,
     server: Mutex<Option<Server>>,
+    tunnel: Mutex<Option<Connector>>,
+    /// The public host a new tunnel is being probed at, and its marker.
+    probe: StdMutex<Option<(String, String)>>,
+    /// One per `open` in progress: `stop` cancels them all.
+    starting: StdMutex<Vec<(u64, CancellationToken)>>,
+    /// [`TUNNEL_DOWN`], [`TUNNEL_STARTING`] or [`TUNNEL_UP`].
+    tunnel_state: AtomicU8,
+    /// Numbers tunnel generations and startups.
+    tunnels: AtomicU64,
+    /// `share.*` events in the order they happened, not yet published.
+    events: StdMutex<VecDeque<EventData>>,
+    /// Wakes the keeper of a live tunnel: links changed.
+    changed: tokio::sync::Notify,
     /// The daemon's own shutdown.
     shutdown: CancellationToken,
     sent: AtomicU64,
@@ -215,13 +281,50 @@ impl Drop for StreamGuard {
     }
 }
 
+/// Removes its startup token from the list `stop` cancels, however `open`
+/// ends.
+struct Starting<'a> {
+    gw: &'a Gateway,
+    id: u64,
+    token: CancellationToken,
+}
+
+impl Drop for Starting<'_> {
+    fn drop(&mut self) {
+        lock(&self.gw.inner.starting).retain(|(id, _)| *id != self.id);
+    }
+}
+
+/// Puts a tunnel still `starting` back to `down` when dropped: forgotten
+/// once the startup has an answer.
+struct DownOnDrop<'a>(&'a AtomicU8);
+
+impl Drop for DownOnDrop<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.compare_exchange(
+            TUNNEL_STARTING,
+            TUNNEL_DOWN,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+}
+
 fn lock<T>(m: &StdMutex<T>) -> MutexGuard<'_, T> {
     // Nothing panics while holding these; a poisoned one is still whole.
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn rfc3339(t: SystemTime) -> String {
+pub fn rfc3339(t: SystemTime) -> String {
     chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the keeper wakes at the next link's expiry; never synchronises a test"
+)]
+async fn until(deadline: Instant) {
+    tokio::time::sleep_until(deadline).await;
 }
 
 impl Gateway {
@@ -237,6 +340,13 @@ impl Gateway {
                 streams: Arc::new(tokio::sync::Semaphore::new(MAX_STREAMS)),
                 failures: StdMutex::default(),
                 server: Mutex::default(),
+                tunnel: Mutex::default(),
+                probe: StdMutex::default(),
+                starting: StdMutex::default(),
+                tunnel_state: AtomicU8::new(TUNNEL_DOWN),
+                tunnels: AtomicU64::new(0),
+                events: StdMutex::default(),
+                changed: tokio::sync::Notify::new(),
                 shutdown,
                 sent: AtomicU64::new(0),
                 clock,
@@ -269,9 +379,15 @@ impl Gateway {
         }
         let listener = tokio::net::TcpListener::bind(addr).await?;
         let addr = listener.local_addr()?;
+        let fd = listener.as_fd().try_clone_to_owned()?;
         let cancel = self.inner.shutdown.child_token();
         let task = tokio::spawn(http::serve(listener, self.clone(), cancel.clone()));
-        *server = Some(Server { addr, cancel, task });
+        *server = Some(Server {
+            addr,
+            fd,
+            cancel,
+            task,
+        });
         Ok(addr)
     }
 
@@ -282,7 +398,7 @@ impl Gateway {
         settle(ended).await
     }
 
-    /// Mints a link to `opts.session`.
+    /// Mints a link to `opts.session` at the current origin.
     pub fn create(&self, opts: CreateOpts) -> Result<Created, ShareError> {
         let now = self.now();
         let mut store = self.store();
@@ -293,7 +409,14 @@ impl Gateway {
             return Err(ShareError::NoSession(opts.session));
         }
         let _ = store.end_grants(now, |s| !sessions.sessions.contains_key(&s));
+        let session = opts.session;
         let minted = store.create(opts, now)?;
+        drop(store);
+        self.note(EventData::ShareCreated {
+            link_id: minted.id.as_str().to_string(),
+            session_id: session,
+            expires_at: rfc3339(minted.expires_wall),
+        });
         Ok(Created {
             url: format!(
                 "{}/v/{}#{}",
@@ -306,31 +429,258 @@ impl Gateway {
         })
     }
 
+    fn session_exists(&self, session: SessionId) -> Result<(), ShareError> {
+        self.inner
+            .deps
+            .graph
+            .snapshot()
+            .sessions
+            .contains_key(&session)
+            .then_some(())
+            .ok_or(ShareError::NoSession(session))
+    }
+
+    /// Brings the tunnel up if it is not, then mints a link to
+    /// `opts.session` through it. Dropped part way, it leaves no connector
+    /// running.
+    pub async fn open(&self, opts: CreateOpts) -> Result<Created, ShareError> {
+        opts.check()?;
+        self.session_exists(opts.session)?;
+        // Registered before anything is awaited, so a `stop` from here on
+        // ends this startup, wherever it has got to.
+        let starting = Starting {
+            gw: self,
+            id: self.inner.tunnels.fetch_add(1, Ordering::Relaxed),
+            token: self.inner.shutdown.child_token(),
+        };
+        lock(&self.inner.starting).push((starting.id, starting.token.clone()));
+        let mut tunnel = self.inner.tunnel.lock().await;
+        if let Some(old) = tunnel.take_if(|c| c.lost.is_cancelled()) {
+            // The links it carried end either way; the next tunnel is new.
+            let _ = self.down(old, Down::Lost).await;
+        }
+        if tunnel.is_none() {
+            // Reads `starting` until this settles it, or is dropped: a
+            // caller that hangs up mid-startup leaves no tunnel behind.
+            let state = &self.inner.tunnel_state;
+            state.store(TUNNEL_STARTING, Ordering::Relaxed);
+            let settled = DownOnDrop(state);
+            let up = if starting.token.is_cancelled() {
+                Err(TunnelError::Cancelled.into())
+            } else {
+                self.up(&starting.token).await
+            };
+            std::mem::forget(settled);
+            state.store(
+                if up.is_ok() { TUNNEL_UP } else { TUNNEL_DOWN },
+                Ordering::Relaxed,
+            );
+            match up {
+                Ok(c) => *tunnel = Some(c),
+                Err(e) => {
+                    if let ShareError::Tunnel(t) = &e {
+                        self.note(EventData::ShareTunnel {
+                            state: "failed".into(),
+                            reason: Some(t.code().into()),
+                        });
+                    }
+                    drop(tunnel);
+                    self.flush().await;
+                    return Err(e);
+                }
+            }
+        }
+        let created = self.create(opts);
+        drop(tunnel);
+        self.inner.changed.notify_one();
+        self.flush().await;
+        created
+    }
+
+    /// Starts a supervised quick tunnel to the gateway and proves it reaches
+    /// this generation's marker.
+    async fn up(&self, cancel: &CancellationToken) -> Result<Connector, ShareError> {
+        let cloudflared = tunnel::find_cloudflared()?;
+        let addr = self
+            .listen(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .map_err(|_| TunnelError::SpawnFailed)?;
+        let fd = {
+            let server = self.inner.server.lock().await;
+            let s = server.as_ref().ok_or(TunnelError::SpawnFailed)?;
+            s.fd.try_clone().map_err(|_| TunnelError::SpawnFailed)?
+        };
+        let shux = std::env::current_exe().map_err(|_| TunnelError::SpawnFailed)?;
+        let probe = default_probe(addr);
+        let mut supervisor = tunnel::Supervisor::spawn(&shux, &cloudflared, &fd, addr.port())?;
+        drop(fd);
+        let origin = supervisor.origin(cancel).await?;
+        let marker = tunnel::marker().map_err(|_| TunnelError::SpawnFailed)?;
+        *lock(&self.inner.probe) = Some((origin.host().to_string(), marker.clone()));
+        let reached = tunnel::verify(probe, &origin, &marker, cancel).await;
+        *lock(&self.inner.probe) = None;
+        reached?;
+        // A new tunnel is a new origin: nothing minted before it reaches it.
+        let ended = {
+            let mut store = self.store();
+            let links = store.links();
+            let mut ended = store.end_all(EndReason::Stopped);
+            ended.extend(store.set_origin(origin));
+            drop(store);
+            for (id, session) in links {
+                self.note_ended(id, session, EndReason::Stopped);
+            }
+            ended
+        };
+        settle(ended).await?;
+        let generation = self.inner.tunnels.fetch_add(1, Ordering::Relaxed);
+        let lost = supervisor.watch();
+        tokio::spawn(self.clone().keep(generation, lost.clone()));
+        self.note(EventData::ShareTunnel {
+            state: "up".into(),
+            reason: None,
+        });
+        Ok(Connector {
+            generation,
+            supervisor,
+            lost,
+        })
+    }
+
+    /// Takes a generation down: ends what it carried, stops serving, then
+    /// stops and reaps the connector, whatever the teardown reports.
+    async fn down(&self, c: Connector, why: Down) -> Result<(), ShareError> {
+        self.inner
+            .tunnel_state
+            .store(TUNNEL_DOWN, Ordering::Relaxed);
+        let ended = {
+            let mut store = self.store();
+            let links = store.links();
+            let ended = store.end_all(why.ends_as());
+            store.clear_origin();
+            drop(store);
+            for (id, session) in links {
+                self.note_ended(id, session, why.ends_as());
+            }
+            ended
+        };
+        let settled = settle(ended).await;
+        if let Some(server) = self.inner.server.lock().await.take() {
+            server.cancel.cancel();
+            let _ = tokio::time::timeout(TEARDOWN, server.task).await;
+        }
+        c.supervisor.stop().await;
+        self.note(EventData::ShareTunnel {
+            state: "down".into(),
+            reason: Some(why.code().into()),
+        });
+        self.flush().await;
+        settled
+    }
+
+    /// Keeps generation `generation` until no guest can reach it, it is
+    /// lost, or another call took it down.
+    async fn keep(self, generation: u64, lost: CancellationToken) {
+        loop {
+            let next = self
+                .store()
+                .next_expiry()
+                .map_or(Instant::now() + SESSION_CHECK, |e| {
+                    e.min(Instant::now() + SESSION_CHECK)
+                });
+            let lost_now = tokio::select! {
+                () = self.inner.shutdown.cancelled() => return,
+                () = lost.cancelled() => true,
+                () = self.inner.changed.notified() => false,
+                () = until(next) => false,
+            };
+            self.prune();
+            if lost_now || self.store().reachable().is_empty() {
+                // Decided again under the lock a new link is minted under.
+                let mut tunnel = self.inner.tunnel.lock().await;
+                self.prune();
+                let idle = self.store().reachable().is_empty();
+                let reason = if lost.is_cancelled() {
+                    Down::Lost
+                } else {
+                    Down::Idle
+                };
+                if lost.is_cancelled() || idle {
+                    if let Some(c) = tunnel.take_if(|c| c.generation == generation)
+                        && let Err(e) = self.down(c, reason).await
+                    {
+                        tracing::warn!(error = %e, "share: taking the tunnel down");
+                    }
+                    return;
+                }
+            }
+            self.flush().await;
+        }
+    }
+
     pub fn list(&self) -> Vec<GrantInfo> {
         self.prune();
         self.store().list()
     }
 
+    /// `up`, `starting` or `down`, read without waiting on a startup.
+    pub fn tunnel_state(&self) -> &'static str {
+        match self.inner.tunnel_state.load(Ordering::Relaxed) {
+            TUNNEL_UP => "up",
+            TUNNEL_STARTING => "starting",
+            _ => "down",
+        }
+    }
+
     /// Ends link `id` and every viewer it admitted; returns once their
     /// sockets are closed.
     pub async fn revoke(&self, id: &GrantId) -> Result<(), ShareError> {
-        let at = self.now().mono;
-        let ended = self.store().revoke(id, at).ok_or(ShareError::NoGrant)?;
-        settle(ended).await
+        let (session, ended) = {
+            let mut store = self.store();
+            let session = *store.links().get(id).ok_or(ShareError::NoGrant)?;
+            let at = self.now().mono;
+            (session, store.revoke(id, at).ok_or(ShareError::NoGrant)?)
+        };
+        self.note_ended(id.clone(), session, EndReason::Revoked);
+        let settled = settle(ended).await;
+        self.flush().await;
+        settled
     }
 
     /// Drops one viewer and its credential; its link stays.
     pub async fn kick(&self, viewer: &ViewerId) -> Result<(), ShareError> {
         let ended = self.store().kick(viewer).ok_or(ShareError::NoViewer)?;
-        settle(ended.into_iter().collect()).await
+        self.inner.changed.notify_one();
+        let settled = settle(ended.into_iter().collect()).await;
+        self.flush().await;
+        settled
     }
 
     /// Ends every link and viewer, refuses whatever was in flight under them,
-    /// and stops serving. Idempotent.
+    /// stops serving, and takes the tunnel down. Idempotent.
     pub async fn stop(&self) -> Result<(), ShareError> {
+        // A tunnel still starting holds the lock below until it gives up.
+        for (_, starting) in lock(&self.inner.starting).drain(..) {
+            starting.cancel();
+        }
+        let mut tunnel = self.inner.tunnel.lock().await;
+        let down = match tunnel.take() {
+            Some(c) => self.down(c, Down::Stopped).await,
+            None => Ok(()),
+        };
+        drop(tunnel);
+        let ended = {
+            let mut store = self.store();
+            let links = store.links();
+            let ended = store.stop();
+            drop(store);
+            for (id, session) in links {
+                self.note_ended(id, session, EndReason::Stopped);
+            }
+            ended
+        };
         // One deadline for the streams and the listener together.
         let deadline = Instant::now() + TEARDOWN;
-        let ended = self.store().stop();
         let settled = settle_by(ended, deadline).await;
         if let Some(server) = self.inner.server.lock().await.take() {
             server.cancel.cancel();
@@ -341,7 +691,8 @@ impl Gateway {
                 tracing::warn!("share: the listener outlived stop's deadline");
             }
         }
-        settled
+        self.flush().await;
+        down.and(settled)
     }
 
     /// Terminal bytes written to viewers' sockets, over the gateway's life.
@@ -349,13 +700,39 @@ impl Gateway {
         self.inner.sent.load(Ordering::Relaxed)
     }
 
-    /// Ends the links to sessions that no longer exist, and expired ones.
+    /// The marker a tunnel being probed answers with at `host`.
+    fn probe_marker(&self, host: &str) -> Option<String> {
+        lock(&self.inner.probe)
+            .as_ref()
+            .filter(|(h, _)| h.eq_ignore_ascii_case(host))
+            .map(|(_, m)| m.clone())
+    }
+
+    /// Ends the links to sessions that no longer exist, and expired ones,
+    /// noting each, once, for the reason that ended it.
     fn prune(&self) {
         let now = self.now();
         let mut store = self.store();
         let live = self.inner.deps.graph.snapshot();
+        let before = store.links();
         // Each ended stream has been told; none is waited for here.
+        let _ = store.end_grants(now, |_| false);
+        let swept = store.links();
         let _ = store.end_grants(now, |s| !live.sessions.contains_key(&s));
+        let after = store.links();
+        drop(store);
+        let gone = |from: &HashMap<GrantId, SessionId>, to: &HashMap<GrantId, SessionId>| {
+            from.iter()
+                .filter(|(id, _)| !to.contains_key(*id))
+                .map(|(id, s)| (id.clone(), *s))
+                .collect::<Vec<_>>()
+        };
+        for (id, session) in gone(&before, &swept) {
+            self.note_ended(id, session, EndReason::Expired);
+        }
+        for (id, session) in gone(&swept, &after) {
+            self.note_ended(id, session, EndReason::SessionEnded);
+        }
     }
 
     /// Redeems for `client`, under the generation its request was checked
@@ -396,6 +773,52 @@ impl Gateway {
         }
         store.admit(id, cookie, now)
     }
+
+    /// Queues `data` for the next [`Self::flush`], in order.
+    fn note(&self, data: EventData) {
+        let mut events = lock(&self.inner.events);
+        if events.len() >= MAX_PENDING_EVENTS {
+            events.pop_front();
+        }
+        events.push_back(data);
+        drop(events);
+        self.inner.changed.notify_one();
+    }
+
+    fn note_ended(&self, id: GrantId, session: SessionId, why: EndReason) {
+        self.note(EventData::ShareEnded {
+            link_id: id.as_str().to_string(),
+            session_id: session,
+            reason: why.code().into(),
+        });
+    }
+
+    /// Announces what happened, and shows hosts which of their sessions a
+    /// guest can still reach.
+    async fn flush(&self) {
+        let events = std::mem::take(&mut *lock(&self.inner.events));
+        let bus = self.inner.deps.io_state.lock().await.event_bus.clone();
+        if let Some(bus) = bus {
+            for e in events {
+                bus.publish(e);
+            }
+        }
+        let reachable: HashSet<SessionId> = self.store().reachable();
+        let clients = self.inner.deps.io_state.lock().await.clients.clone();
+        clients.set_shared(reachable);
+    }
+}
+
+/// The probe a daemon uses: the public origin, unless a debug build is told
+/// to fetch from its own listener (`SHUX_TEST_SHARE_PROBE=loopback`), for
+/// tests whose cloudflared is a stand-in.
+fn default_probe(listener: SocketAddr) -> Probe {
+    #[cfg(debug_assertions)]
+    if std::env::var("SHUX_TEST_SHARE_PROBE").as_deref() == Ok("loopback") {
+        return Probe::Loopback(listener);
+    }
+    let _ = listener;
+    Probe::Public
 }
 
 /// Waits, all together and within one deadline, for each ended stream to

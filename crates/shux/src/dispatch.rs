@@ -1114,6 +1114,28 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
             }
         }
 
+        Some(Command::Share { command, create }) => {
+            let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
+            match command {
+                None => cli::handle_share_create(&mut stream, create, args.format).await,
+                Some(cli::ShareCommand::Create(c)) => {
+                    cli::handle_share_create(&mut stream, c, args.format).await
+                }
+                Some(cli::ShareCommand::List) => {
+                    cli::handle_share_list(&mut stream, args.format).await
+                }
+                Some(cli::ShareCommand::Revoke { id }) => {
+                    cli::handle_share_revoke(&mut stream, &id, args.format).await
+                }
+                Some(cli::ShareCommand::Kick { viewer }) => {
+                    cli::handle_share_kick(&mut stream, &viewer, args.format).await
+                }
+                Some(cli::ShareCommand::Stop) => {
+                    cli::handle_share_stop(&mut stream, args.format).await
+                }
+            }
+        }
+
         Some(Command::Events { command: ev_cmd }) => {
             let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
             match ev_cmd {
@@ -1189,7 +1211,9 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
             Ok(())
         }
 
-        Some(Command::__daemon) => unreachable!("handled above"),
+        Some(Command::__daemon | Command::__share_supervise { .. }) => {
+            unreachable!("handled above")
+        }
     }
 }
 

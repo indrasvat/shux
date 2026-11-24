@@ -312,6 +312,7 @@ async fn serve(
     let Some(mut attach) = open_attach(gw, admitted, size, attach_cancel, task).await else {
         return Exit::Attach;
     };
+    admitted.live.mark_drawing();
     let config = gw.inner.deps.config.current();
     let ready = Outbound::Ready {
         v: wire::PROTOCOL,

@@ -2394,7 +2394,215 @@ fn client_line(c: &serde_json::Value) -> String {
     if c.get("read_only").and_then(serde_json::Value::as_bool) == Some(true) {
         line.push_str(&format!("  {}", warning("read-only")));
     }
+    if c.get("share").and_then(serde_json::Value::as_bool) == Some(true) {
+        line.push_str(&format!("  {}", accent("share guest")));
+    }
     line
+}
+
+// ── shux share ─────────────────────────────────────────────────
+
+/// `expires_at` as local wall time, `HH:MM` (with the date when not today).
+fn share_expiry(v: &serde_json::Value) -> String {
+    let Some(t) = v
+        .get("expires_at")
+        .and_then(|v| v.as_str())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+    else {
+        return "?".into();
+    };
+    let local = t.with_timezone(&chrono::Local);
+    if local.date_naive() == chrono::Local::now().date_naive() {
+        local.format("%H:%M").to_string()
+    } else {
+        local.format("%b %-d %H:%M").to_string()
+    }
+}
+
+fn share_uses(n: Option<u64>) -> String {
+    match n {
+        None => format!(
+            "up to {} guests",
+            crate::share::grants::MAX_VIEWERS_PER_LINK
+        ),
+        Some(1) => "1 use".into(),
+        Some(n) => format!("{n} uses"),
+    }
+}
+
+/// A made link's first line: `✓ <what> <session>  <uses> · until <t> · <id>`.
+fn share_summary(out: &mut impl Write, what: &str, r: &serde_json::Value) -> io::Result<()> {
+    let s = |k: &str| r.get(k).and_then(|v| v.as_str()).unwrap_or("?");
+    writeln!(
+        out,
+        "{} {what} {}  {}",
+        success("\u{2713}"),
+        bold(safe_label(s("session"))),
+        muted(format!(
+            "{} · until {} · {}",
+            share_uses(r.get("uses").and_then(|v| v.as_u64())),
+            share_expiry(r),
+            s("id")
+        )),
+    )
+}
+
+/// A link just made: what it shows, the URL, and how to end it.
+pub fn print_share_created(r: &serde_json::Value) -> Printed {
+    let s = |k: &str| r.get(k).and_then(|v| v.as_str()).unwrap_or("?");
+    let mut out = io::stdout().lock();
+    share_summary(&mut out, "sharing read-only:", r)?;
+    writeln!(out, "  {}", accent(safe_label(s("url"))))?;
+    writeln!(
+        out,
+        "  {}",
+        muted(format!(
+            "anyone with this link can watch; send it privately · end it: shux share revoke {} · done: shux share stop",
+            s("id")
+        ))
+    )?;
+    out.flush()?;
+    Ok(())
+}
+
+/// A link put on the clipboard instead of the screen.
+pub fn print_share_copied(r: &serde_json::Value) -> Printed {
+    let mut out = io::stdout().lock();
+    share_summary(&mut out, "copied to the clipboard: a link to", r)?;
+    writeln!(
+        out,
+        "  {}",
+        muted("not printed: inside shux, a link never is · done: shux share stop")
+    )?;
+    out.flush()?;
+    Ok(())
+}
+
+/// The link again, as a QR code of half-height blocks.
+pub fn print_share_qr(url: &str) -> Printed {
+    let mut out = io::stdout().lock();
+    match qrcode::QrCode::new(url.as_bytes()) {
+        Ok(code) => {
+            let art = code
+                .render::<qrcode::render::unicode::Dense1x2>()
+                .quiet_zone(true)
+                .build();
+            writeln!(out, "{art}")?;
+        }
+        Err(e) => writeln!(out, "{} no QR code: {e}", warning("!"))?,
+    }
+    out.flush()?;
+    Ok(())
+}
+
+fn share_watching(link: &serde_json::Value) -> usize {
+    link.get("viewers")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|v| v.get("connected").and_then(|c| c.as_bool()) == Some(true))
+        .count()
+}
+
+/// Each live link, then each of its viewers.
+pub fn print_share_list(links: &[serde_json::Value], tunnel: Option<&str>) -> Printed {
+    let mut out = io::stdout().lock();
+    if links.is_empty() {
+        writeln!(out, "{}", muted("no share links"))?;
+    }
+    for l in links {
+        let s = |k: &str| l.get(k).and_then(|v| v.as_str()).unwrap_or("?");
+        let left = match l.get("uses_left").and_then(|v| v.as_u64()) {
+            None => "unlimited".to_string(),
+            Some(n) => format!("{n} left"),
+        };
+        let watching = share_watching(l);
+        let mut line = format!(
+            "{}  {}  {}  {}",
+            accent(s("id")),
+            bold(safe_label(s("session"))),
+            muted(format!("until {} · {left}", share_expiry(l))),
+            if watching > 0 {
+                success(format!("{watching} watching")).to_string()
+            } else {
+                muted(format!("{watching} watching")).to_string()
+            },
+        );
+        if let Some(label) = l.get("label").and_then(|v| v.as_str()) {
+            line.push_str(&format!("  {}", muted(safe_label(label))));
+        }
+        writeln!(out, "{line}")?;
+        for v in l
+            .get("viewers")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let id = v.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+            let state = if v.get("connected").and_then(|c| c.as_bool()) == Some(true) {
+                success("connected").to_string()
+            } else {
+                muted("can reconnect").to_string()
+            };
+            writeln!(out, "    {} viewer {id}  {state}", muted("·"))?;
+        }
+    }
+    if tunnel == Some("up") {
+        writeln!(out, "{}", muted("tunnel up · shux share stop ends it all"))?;
+    }
+    out.flush()?;
+    Ok(())
+}
+
+/// One link per line for scripts: id, session, expiry, uses left (`-` for
+/// unlimited), live viewers.
+pub fn print_share_list_plain(links: &[serde_json::Value]) -> Printed {
+    let mut out = io::stdout().lock();
+    for l in links {
+        let s = |k: &str| l.get(k).and_then(|v| v.as_str()).unwrap_or("");
+        let left = l
+            .get("uses_left")
+            .and_then(|v| v.as_u64())
+            .map_or("-".to_string(), |n| n.to_string());
+        let watching = share_watching(l);
+        writeln!(
+            out,
+            "{}\t{}\t{}\t{left}\t{watching}",
+            s("id"),
+            safe_label(s("session")),
+            s("expires_at")
+        )?;
+    }
+    out.flush()?;
+    Ok(())
+}
+
+pub fn print_share_revoked(ids: &[String]) -> Printed {
+    let mut out = io::stdout().lock();
+    if ids.is_empty() {
+        writeln!(out, "{}", muted("no share links to revoke"))?;
+    }
+    for id in ids {
+        writeln!(out, "{} revoked link {}", success("\u{2713}"), bold(id))?;
+    }
+    out.flush()?;
+    Ok(())
+}
+
+pub fn print_share_stopped(links: u64) -> Printed {
+    let mut out = io::stdout().lock();
+    writeln!(
+        out,
+        "{} stopped sharing  {}",
+        success("\u{2713}"),
+        muted(match links {
+            0 => "no links were live".to_string(),
+            1 => "1 link ended; the tunnel is closed".to_string(),
+            n => format!("{n} links ended; the tunnel is closed"),
+        })
+    )?;
+    out.flush()?;
+    Ok(())
 }
 
 // ── Tests ──────────────────────────────────────────────────────
