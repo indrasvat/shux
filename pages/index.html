@@ -768,6 +768,93 @@
   }
   .hero-sub { font-size: 16px; max-width: 100%; }
 }
+
+/* ── Share: a guest's read-only view, next to the one command. ── */
+#share { --shared: #f5a97f; --shared-soft: rgba(245,169,127,0.12); overflow: hidden; }
+.share-grid {
+  display: grid; gap: var(--s-6);
+  grid-template-columns: minmax(0, 0.82fr) minmax(0, 1.18fr);
+  align-items: center; margin-top: var(--s-6);
+}
+@media (max-width: 900px) { .share-grid { grid-template-columns: minmax(0, 1fr); gap: var(--s-5); } }
+.share-cmd, .share-shot { min-width: 0; }
+.share-cmd pre { margin: 0; font-size: 12.5px; padding: 16px 18px; white-space: pre; overflow-x: auto; }
+.share-cmd .ok { color: var(--moss); }
+.share-cmd .link { color: var(--shared); }
+.share-cmd .mask { letter-spacing: 0.12em; color: var(--ink-4); }
+.share-facts { list-style: none; padding: 0; margin: var(--s-5) 0 0; display: grid; gap: var(--s-3); }
+.share-facts li {
+  display: grid; grid-template-columns: 22px 1fr; gap: var(--s-2);
+  font-size: 14px; line-height: 1.5; color: var(--ink-2);
+}
+.share-facts li b { color: var(--ink); font-weight: 600; }
+.share-facts .glyph { font-family: var(--font-mono); color: var(--shared); padding-top: 1px; }
+
+.share-shot { margin: 0; position: relative; }
+.share-shot::before {
+  /* A warm glow behind the guest's window: the session leaving the room. */
+  content: ""; position: absolute; inset: -12% -8% -8% -6%; z-index: 0;
+  background: radial-gradient(60% 55% at 55% 45%, rgba(245,169,127,0.16), transparent 70%);
+  pointer-events: none;
+}
+.browser {
+  position: relative; z-index: 1;
+  border: 1px solid var(--line-2); border-radius: 10px; overflow: hidden;
+  background: #0e0c08;
+  box-shadow: 0 60px 90px -50px rgba(0,0,0,0.75), 0 10px 30px -16px rgba(0,0,0,0.6),
+              inset 0 1px 0 rgba(236,228,210,0.05);
+  transform: rotate(-0.6deg);
+}
+.browser-bar {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 12px; border-bottom: 1px solid rgba(236,228,210,0.08);
+  background: linear-gradient(180deg, #221d18, #1a1612);
+}
+.browser-bar .pills { display: flex; gap: 6px; }
+.browser-bar .pills span { width: 10px; height: 10px; border-radius: 50%; background: var(--ink-4); }
+.browser-bar .pills span:first-child { background: #d4524b; }
+.browser-bar .pills span:nth-child(2) { background: #d8a93b; }
+.browser-bar .pills span:nth-child(3) { background: var(--moss); }
+.browser-bar .addr {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-family: var(--font-mono); font-size: 11px; color: var(--ink-3);
+  background: rgba(0,0,0,0.28); border: 1px solid rgba(236,228,210,0.07);
+  border-radius: 999px; padding: 4px 12px;
+}
+.browser-bar .addr b { color: var(--ink-2); font-weight: 500; }
+.browser img { display: block; width: 100%; height: auto; }
+.share-shot figcaption {
+  position: relative; z-index: 1;
+  font-family: var(--font-mono); font-size: 11px; color: var(--ink-3);
+  margin-top: var(--s-3); display: flex; align-items: center; gap: 8px;
+}
+.share-shot figcaption .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--shared); flex: 0 0 auto; }
+
+/* The host's own status bar, as shux draws it while a link is live. */
+.host-bar {
+  margin-top: var(--s-7);
+  display: flex; align-items: center; justify-content: space-between; gap: var(--s-4);
+  font-family: var(--font-mono); font-size: 12.5px;
+  background: #1e1a15; border: 1px solid var(--line); border-radius: var(--r-2);
+  padding: 7px 12px; color: var(--ink-3);
+}
+.host-bar .left { color: var(--ink-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.host-bar .left b { color: var(--accent-ink); font-weight: 600; }
+.host-bar .badge { color: var(--shared); white-space: nowrap; display: inline-flex; align-items: center; gap: 8px; }
+.host-bar .badge .pulse {
+  width: 8px; height: 8px; border-radius: 50%; background: var(--shared);
+  box-shadow: 0 0 0 0 rgba(245,169,127,0.55); animation: share-pulse 2.4s ease-out infinite;
+}
+@keyframes share-pulse {
+  0% { box-shadow: 0 0 0 0 rgba(245,169,127,0.55); }
+  70%, 100% { box-shadow: 0 0 0 9px rgba(245,169,127,0); }
+}
+@media (prefers-reduced-motion: reduce) { .host-bar .badge .pulse { animation: none; } }
+.host-note { margin-top: var(--s-2); font-size: 13px; color: var(--ink-3); }
+@media (max-width: 560px) {
+  .host-bar .left .hide-s { display: none; }
+  .browser { transform: none; }
+}
 </style>
 </head>
 <body>
@@ -781,6 +868,7 @@
     <a href="#agents"><span class="lbl">agents</span></a>
     <a href="#lens"><span class="lbl">lens</span></a>
     <a href="#gate"><span class="lbl">gate</span></a>
+    <a href="#share"><span class="lbl">share</span></a>
     <a href="#replaces"><span class="lbl">replaces</span></a>
     <a href="#plugins"><span class="lbl">plugins</span></a>
     <a href="#quickstart"><span class="lbl">install</span></a>
@@ -1080,6 +1168,58 @@ command = ["lazygit"]
       build instead of minting one, and blessing is refused in CI outright —
       so a baseline can never quietly write itself.
     </p>
+  </div>
+</section>
+
+<!-- ─── Share: a read-only view for a person ──────────── -->
+<section class="section" id="share">
+  <div class="wrap">
+    <p class="eyebrow">share, read-only</p>
+    <h2 class="measure">Let someone watch.<br>Nobody else gets to type.</h2>
+    <p class="lede" style="margin-top:var(--s-3)">
+      <b>shux share</b> hands one person a private link to a live session.
+      They open it in any browser, and see your panes as you see them. No
+      account, no SSH, no shell on your machine, and no way for a keystroke
+      to come back.
+    </p>
+
+    <div class="share-grid">
+      <div class="share-cmd">
+        <pre><code><span class="link">$ shux share -s review</span>
+<span class="ok">✓</span> sharing read-only: <b>review</b>
+  <span style="color:var(--code-comment)">1 use · until 15:04 · k3v9q2xa</span>
+  <span class="link">https://brave-otter.trycloudflare.com/v/k3v9q2xa#</span><span class="mask">••••••••</span>
+
+<span style="color:var(--code-comment)"># they watch; you keep working.</span>
+<span class="link">$ shux share list</span>
+k3v9q2xa  review  until 15:04 · 0 left  <span class="ok">1 watching</span>
+
+<span class="link">$ shux share stop</span>
+<span class="ok">✓</span> stopped sharing  <span style="color:var(--code-comment)">1 link ended; the tunnel is closed</span></code></pre>
+        <ul class="share-facts">
+          <li><span class="glyph">1×</span><span><b>One use, one hour</b>, unless you say otherwise. Revoke it, or let it run out.</span></li>
+          <li><span class="glyph">◌</span><span><b>Nothing comes back.</b> The viewer has no path for keys, paste, clicks or resize. Your panes keep their size.</span></li>
+          <li><span class="glyph">⧉</span><span><b>Never on a shared screen.</b> Run it inside the session and the link goes to your clipboard, not the pane.</span></li>
+        </ul>
+      </div>
+
+      <figure class="share-shot">
+        <div class="browser">
+          <div class="browser-bar">
+            <div class="pills"><span></span><span></span><span></span></div>
+            <div class="addr">🔒 <b>brave-otter.trycloudflare.com</b>/v/k3v9q2xa</div>
+          </div>
+          <img src="/screenshots/share-guest.png" alt="A guest's browser showing a shared shux session running lazygit, live, under a bar that reads Read-only and when the link expires" width="1600" height="909" loading="lazy" decoding="async">
+        </div>
+        <figcaption><span class="dot"></span> a guest's browser, over a real quick tunnel: lazygit, live, read-only.</figcaption>
+      </figure>
+    </div>
+
+    <div class="host-bar" aria-label="The host's shux status bar while a link is live">
+      <span class="left"><b>◆ review</b>  <span class="hide-s">#1 lazygit  ·  #2 shell</span></span>
+      <span class="badge"><span class="pulse"></span>◉ shared · 1 watching</span>
+    </div>
+    <p class="host-note">Your status bar says so the whole time: amber <code>◉ shared · 0 watching</code> the moment a link exists. Needs <code>cloudflared</code>. Done? <code>shux share stop</code>.</p>
   </div>
 </section>
 
