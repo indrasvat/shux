@@ -386,6 +386,15 @@ impl<'a> VtHandler<'a> {
         self.cursor.extended.clone()
     }
 
+    /// Erase the cursor row from `from` to its end; see
+    /// [`crate::Grid::erase_to_row_end`]. Like xterm's ClearRight it also
+    /// cancels a deferred wrap, and the print intent goes with it.
+    fn erase_to_row_end(&mut self, from: usize, bg: Color) {
+        self.grid.erase_to_row_end(self.cursor.row, from, bg);
+        self.cursor.auto_wrap_pending = false;
+        self.cursor.after_print = false;
+    }
+
     fn save_cursor_state(&mut self) {
         self.cursor.save(self.modes.origin_mode, *self.charsets);
         if let Some(saved) = &mut self.cursor.saved {
@@ -573,11 +582,19 @@ impl<'a> VtHandler<'a> {
         self.clear_active_grapheme_cell();
         self.cursor.col = 0;
         self.cursor.auto_wrap_pending = false;
-        self.grid.visible_row_mut_marked(self.cursor.row).wrapped = true;
-        if self.cursor.row == self.scroll_region.bottom {
-            self.grid
-                .scroll_up(self.scroll_region.top, self.scroll_region.bottom);
+        // The row continues into the one the cursor moves to, so the link is
+        // set once that row is in place, and only if the cursor got there.
+        let region = *self.scroll_region;
+        if self.cursor.row == region.bottom {
+            self.grid.scroll_up(region.top, region.bottom);
+            // The old row now sits above the cursor, or in history when the
+            // region is the whole screen; a one-row inner region discarded it.
+            let full_screen = region.top == 0 && region.bottom + 1 == self.grid.rows();
+            if region.top < region.bottom || full_screen {
+                self.grid.set_link_into(self.cursor.row, true);
+            }
         } else if self.cursor.row + 1 < self.grid.rows() {
+            self.grid.visible_row_mut_marked(self.cursor.row).wrapped = true;
             // Same guard `linefeed` has, and for the same reason: when the
             // cursor sits BELOW the scroll region — a bottom status line
             // outside the region is the common case — it is not equal to
@@ -1451,12 +1468,7 @@ impl<'a> vte::Perform for VtHandler<'a> {
                 match p(0, 0) {
                     0 => {
                         // Clear from cursor to end.
-                        self.grid.erase_chars(
-                            self.cursor.row,
-                            self.cursor.col,
-                            cols - self.cursor.col,
-                            bg,
-                        );
+                        self.erase_to_row_end(self.cursor.col, bg);
                         if self.cursor.row + 1 < rows {
                             self.grid.clear_below(self.cursor.row + 1, bg);
                         }
@@ -1485,16 +1497,11 @@ impl<'a> vte::Perform for VtHandler<'a> {
             ('K', []) => {
                 let bg = self.cursor.style.bg;
                 match p(0, 0) {
-                    0 => self.grid.erase_chars(
-                        self.cursor.row,
-                        self.cursor.col,
-                        cols - self.cursor.col,
-                        bg,
-                    ),
+                    0 => self.erase_to_row_end(self.cursor.col, bg),
                     1 => self
                         .grid
                         .erase_chars(self.cursor.row, 0, self.cursor.col + 1, bg),
-                    2 => self.grid.erase_chars(self.cursor.row, 0, cols, bg),
+                    2 => self.erase_to_row_end(0, bg),
                     _ => {}
                 }
             }

@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "tool": "scripts/vt-neutrality.sh",
+  "base": "974f3b2e4837dab61486b28b6f1fb6415937867e",
+  "head": "2e153c49848c4f8ab8a81fe5267a8865d9ec4d6a",
+  "dirty": false,
+  "toolchain_key": "40346bd63a68ae74",
+  "base_cache_hit": true,
+  "fuzz_seconds_per_target": 15,
+  "status": "pass",
+  "metrics": 54,
+  "layers": {
+    "colour-probe": {
+      "status": "pass",
+      "cases": 9,
+      "failed": []
+    },
+    "corpus-ab": {
+      "status": "pass",
+      "cases": 19,
+      "failed": []
+    },
+    "corpus-goldens": {
+      "status": "pass",
+      "cases": 19,
+      "failed": []
+    },
+    "fuzz": {
+      "status": "pass",
+      "cases": 1,
+      "failed": []
+    },
+    "leaks": {
+      "status": "pass",
+      "cases": 2,
+      "failed": []
+    },
+    "live-ab": {
+      "status": "pass",
+      "cases": 15,
+      "failed": []
+    }
+  },
+  "metrics_dir": "neutrality"
+}

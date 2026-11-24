@@ -2144,6 +2144,256 @@ mod tests {
         assert_eq!(visible_text(&vt, 1), "F");
     }
 
+    /// What `bash --norc` echoes and prints for the #301 smoke: the command
+    /// line soft-wraps at 80 columns, then `clear` is `CSI H CSI J`.
+    fn smoke_301(fill: usize) -> Vec<u8> {
+        let echo = format!(
+            "\x1b[?2004hbash-5.3$ clear; printf '\\033[48;2;30;60;160m%{fill}s\\033[0m\\n\
+\\033[48;5;130m%{fill}s\\033[0m\\n\\033[42m%{fill}s\\033[0m\\n' '' '' ''; printf 'DONE%s\\n' -mark\r\n\
+\x1b[?2004l\r\x1b[H\x1b[J"
+        );
+        let mut bytes = echo.into_bytes();
+        for sgr in [&b"\x1b[48;2;30;60;160m"[..], b"\x1b[48;5;130m", b"\x1b[42m"] {
+            bytes.extend_from_slice(sgr);
+            bytes.extend(std::iter::repeat_n(b' ', fill));
+            bytes.extend_from_slice(b"\x1b[0m\r\n");
+        }
+        bytes.extend_from_slice(b"DONE-mark\r\n\x1b[?2004hbash-5.3$ ");
+        bytes
+    }
+
+    /// Row `r` shows `bg` on exactly its first `n` cells and the default after.
+    fn assert_fill(vt: &VirtualTerminal, r: usize, bg: Color, n: usize, ctx: &str) {
+        let row = vt.grid().visible_row(r);
+        for c in 0..row.len() {
+            let want = if c < n { bg } else { Color::Default };
+            assert_eq!(row[c].style.bg, want, "{ctx} row {r} col {c}");
+        }
+    }
+
+    #[test]
+    fn a_clear_does_not_join_the_next_line_onto_a_wrapped_row() {
+        let blue = Color::Rgb(30, 60, 160);
+        let (brown, green) = (Color::Indexed(130), Color::Indexed(2));
+        for (fill, steps) in [
+            (40, &[(10, 40), (40, 120)][..]),
+            (40, &[(10, 39)][..]),
+            (40, &[(10, 41)][..]),
+            (40, &[(24, 60)][..]),
+            (60, &[(10, 40), (40, 120)][..]),
+        ] {
+            let mut vt = VirtualTerminal::new(24, 80);
+            vt.process(&smoke_301(fill));
+            // Padding clipped by a narrow is not regained by a later widen.
+            let mut kept = fill;
+            for &(rows, cols) in steps {
+                vt.resize(rows, cols);
+                kept = kept.min(cols);
+                let ctx = format!("fill {fill} at {cols}x{rows}");
+                for (r, bg) in [blue, brown, green].into_iter().enumerate() {
+                    assert_fill(&vt, r, bg, kept, &ctx);
+                }
+                assert_eq!(
+                    visible_text(&vt, 3),
+                    "DONE-mark",
+                    "fill {fill} at {cols}x{rows}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn erasing_to_the_end_of_a_row_ends_its_soft_wrap() {
+        for erase in [&b"\x1b[J"[..], b"\x1b[K", b"\x1b[2K"] {
+            let mut vt = VirtualTerminal::new(4, 5);
+            vt.process(b"ABCDEFG\x1b[H");
+            assert!(vt.grid().visible_row(0).wrapped);
+            vt.process(erase);
+            assert!(!vt.grid().visible_row(0).wrapped, "{erase:?}");
+        }
+        let mut vt = VirtualTerminal::new(4, 5);
+        vt.process(b"ABCDEFG\x1b[1;3H\x1b[1K");
+        assert!(vt.grid().visible_row(0).wrapped, "EL 1 leaves the wrap");
+        let mut vt = VirtualTerminal::new(4, 5);
+        vt.process(b"ABCDEFG\x1b[1;2H\x1b[2X");
+        assert!(
+            vt.grid().visible_row(0).wrapped,
+            "interior ECH leaves the wrap"
+        );
+    }
+
+    #[test]
+    fn a_suffix_erase_splits_the_line_for_a_widen() {
+        let mut vt = VirtualTerminal::new(4, 5);
+        vt.process(b"ABCDEFG\x1b[1;3H\x1b[K");
+        vt.resize(4, 10);
+        assert_eq!(visible_text(&vt, 0), "AB");
+        assert_eq!(visible_text(&vt, 1), "FG");
+    }
+
+    #[test]
+    fn an_erase_cancels_the_deferred_wrap_and_print_intent() {
+        // xterm: ED 0, EL 0 and EL 2 all reset the deferred wrap; EL 0 at the
+        // last column erases that column.
+        let mut wrong = Vec::new();
+        for (erase, row0) in [
+            ("\x1b[J", "ABCDX"),
+            ("\x1b[K", "ABCDX"),
+            ("\x1b[2K", "    X"),
+        ] {
+            let mut vt = VirtualTerminal::new(4, 5);
+            vt.process(format!("ABCDE{erase}X").as_bytes());
+            let got = (visible_text(&vt, 0), visible_text(&vt, 1));
+            if got != (row0.to_string(), String::new()) {
+                wrong.push((erase, got));
+            }
+        }
+        let mut vt = VirtualTerminal::new(4, 5);
+        vt.process(b"ABCDE\x1b[J");
+        vt.resize(4, 4);
+        vt.process(b"X");
+        let got = (visible_text(&vt, 0), visible_text(&vt, 1));
+        if got != ("ABCX".to_string(), String::new()) {
+            wrong.push(("ED 0 then 5->4", got));
+        }
+        assert!(wrong.is_empty(), "{wrong:?}");
+    }
+
+    /// History row 0 and visible row 0 after `ABCDEF CRLF`, `seq` and a widen.
+    fn after_history_edit(seq: &str) -> (String, String) {
+        let mut vt = VirtualTerminal::new(2, 5);
+        vt.process(format!("ABCDEF\r\n{seq}").as_bytes());
+        vt.resize(2, 10);
+        (row_text(&vt, 0), visible_text(&vt, 0))
+    }
+
+    #[test]
+    fn a_full_erase_of_the_first_visible_row_cuts_the_link_from_history() {
+        let mut wrong = Vec::new();
+        for seq in [
+            "\x1b[H\x1b[JXYZ",
+            "\x1b[H\x1b[KXYZ",
+            "\x1b[H\x1b[2KXYZ",
+            "\x1b[2J\x1b[HXYZ",
+            "\x1b[2;1H\x1b[1J\x1b[HXYZ",
+        ] {
+            let got = after_history_edit(seq);
+            if got != ("ABCDE".to_string(), "XYZ".to_string()) {
+                wrong.push((seq, got));
+            }
+        }
+        let got = after_history_edit("\x1b#8");
+        if got.0 != "ABCDE" {
+            wrong.push(("DECALN", got));
+        }
+        assert!(wrong.is_empty(), "{wrong:?}");
+        // A suffix erase leaves the continuation's prefix: the link holds.
+        let mut vt = VirtualTerminal::new(2, 5);
+        vt.process(b"ABCDEFG\r\n\x1b[1;2H\x1b[K");
+        vt.resize(2, 10);
+        assert_eq!(visible_text(&vt, 0), "ABCDEF");
+    }
+
+    #[test]
+    fn an_erase_marks_only_what_it_erased_dirty_and_counts_once() {
+        let mut vt = VirtualTerminal::new(2, 8);
+        vt.process(b"ABCDEFGH\x1b[1;5H");
+        vt.grid.take_dirty_regions();
+        let before = vt.grid().mutations();
+        vt.process(b"\x1b[K");
+        assert_eq!(vt.grid().mutations(), before + 1);
+        let dirty = vt.grid.take_dirty_regions();
+        assert_eq!(dirty, vec![DirtyRegion { row: 0, cols: 4..8 }]);
+    }
+
+    #[test]
+    fn line_edits_cut_wrap_links_whose_rows_part() {
+        let cases: [(&str, &[u8], &[&str]); 5] = [
+            // IL between a wrapped row and its continuation.
+            ("IL", b"ABCDEFG\x1b[2;1H\x1b[L", &["ABCDE", "", "FG"]),
+            // DL of the continuation.
+            ("DL", b"ABCDEFG\r\nHI\x1b[2;1H\x1b[M", &["ABCDE", "HI"]),
+            // SD inside a region below the wrapped row.
+            ("SD", b"ABCDEFG\x1b[2;4r\x1b[T", &["ABCDE", "", "FG"]),
+            // Rows scrolling together inside a region keep their link.
+            (
+                "region scroll",
+                b"\x1b[2;4r\x1b[3;1HABCDEFG\n",
+                &["", "ABCDEFG"],
+            ),
+            // Autowrap at a region's bottom margin links into the new row.
+            (
+                "bottom-margin autowrap",
+                b"\x1b[1;2r\x1b[2;1HABCDEFG",
+                &["ABCDEFG"],
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (name, bytes, want) in cases {
+            let mut vt = VirtualTerminal::new(4, 5);
+            vt.process(bytes);
+            vt.resize(4, 10);
+            let got: Vec<_> = (0..want.len()).map(|r| visible_text(&vt, r)).collect();
+            if got != want {
+                wrong.push((name, got));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:?}");
+    }
+
+    #[test]
+    fn a_wrap_with_nowhere_to_go_sets_no_link() {
+        // Cursor below a scroll region on the last row: autowrap cannot advance.
+        let mut vt = VirtualTerminal::new(3, 5);
+        vt.process(b"\x1b[1;2r\x1b[3;1HABCDEFG");
+        assert!(!vt.grid().visible_row(2).wrapped);
+    }
+
+    #[test]
+    fn a_one_row_screen_keeps_the_autowrap_link_into_history() {
+        let mut vt = VirtualTerminal::new(1, 5);
+        vt.process(b"ABCDEF");
+        vt.resize(1, 10);
+        assert_eq!(visible_text(&vt, 0), "ABCDEF");
+    }
+
+    #[test]
+    fn any_erase_that_clears_the_first_visible_row_cuts_the_history_link() {
+        let mut wrong = Vec::new();
+        for seq in [
+            "\x1b[1;5H\x1b[1J\x1b[HXYZ",
+            "\x1b[1;5H\x1b[1K\x1b[HXYZ",
+            "\x1b[H\x1b[5XXYZ",
+        ] {
+            let got = after_history_edit(seq);
+            if got != ("ABCDE".to_string(), "XYZ".to_string()) {
+                wrong.push((seq, got));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:?}");
+    }
+
+    #[test]
+    fn an_erase_widened_over_a_wide_glyph_to_the_whole_row_cuts_the_history_link() {
+        let mut wrong = Vec::new();
+        for bytes in [
+            // EL 0 from the glyph's second cell widens to column 0.
+            "ABCDE界\r\n\x1b[1;2H\x1b[K\x1b[HXYZ",
+            // EL 1 and ECH ending on the glyph's first cell widen to the edge.
+            "ABCDEabc界\r\n\x1b[1;4H\x1b[1K\x1b[HXYZ",
+            "ABCDEabc界\r\n\x1b[H\x1b[4XXYZ",
+        ] {
+            let mut vt = VirtualTerminal::new(2, 5);
+            vt.process(bytes.as_bytes());
+            vt.resize(2, 10);
+            let got = (row_text(&vt, 0), visible_text(&vt, 0));
+            if got != ("ABCDE".to_string(), "XYZ".to_string()) {
+                wrong.push((bytes, got));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:?}");
+    }
+
     #[test]
     fn row_shrink_without_a_parked_cursor_lets_erase_fill_yield() {
         let mut vt = VirtualTerminal::new(6, 10);
