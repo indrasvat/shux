@@ -61,16 +61,22 @@ start_fake() {
   fifo="${arg}"
   [[ "${fifo}" == /* ]] || fifo="${cwd}/${arg}"
   [[ -p "${fifo}" ]] || mkfifo "${fifo}"
-  # Its output detached, or a command substitution around the caller waits for it.
-  (cd "${cwd}" && exec -a "${argv0}" "${exe}" "${arg}") </dev/null >/dev/null 2>&1 &
+  # Its stdout detached, or a command substitution around the caller waits for it.
+  (cd "${cwd}" && exec -a "${argv0}" "${exe}" "${arg}") </dev/null >/dev/null 2>"${fifo}.err" &
   FAKE=$!
   echo "${FAKE}" >>"${work}/pids"
-  for i in $(seq 1 100); do
-    args="$(ps -o args= -p "${FAKE}" 2>/dev/null || true)"
+  for i in $(seq 1 300); do
+    if [[ -r "/proc/${FAKE}/cmdline" ]]; then
+      args="$(tr '\0' ' ' <"/proc/${FAKE}/cmdline" 2>/dev/null || true)"
+    else
+      args="$(ps -o args= -p "${FAKE}" 2>/dev/null || true)"
+    fi
     [[ "${args}" != "${argv0} "* ]] || return 0
     sleep 0.1
   done
-  echo "✗ prune self-test: ${argv0} never started" >&2
+  echo "✗ prune self-test: ${argv0} never started; it shows as '${args}'" >&2
+  ps -o pid=,stat=,comm=,args= -p "${FAKE}" >&2 || echo "  (pid ${FAKE} is gone)" >&2
+  sed 's/^/  stderr: /' "${fifo}.err" >&2
   exit 1
 }
 
@@ -404,10 +410,27 @@ suite() {
   OUT="$(ps_fails_hold "${f}" "${f}/tmp1/shuxpsfail" 2>&1)" || :
   [[ "${OUT}" == *"ps cannot say"* ]] || fail "a ps failure was not held"
 
-  # A lock left by a dead pid is replaced; one held by a live pid is not.
+  # A lock left by a dead pid is replaced; one held by a live pid is not, even by a
+  # caller that read the dead holder before another caller replaced it.
   rc=0
-  OUT="$(lock_cases "${f}" 2>&1)" || rc=$?
+  OUT="$(lock_cases "${f}" "${repo}/.shux/scripts/lib/cache_lock.sh" 2>&1)" || rc=$?
   [[ "${rc}" -eq 0 ]] || fail "cache lock: ${OUT}"
+
+  # A build whose cwd cannot be read (another user's, under sudo) holds every worktree.
+  OUT="$(unreadable_cwd "${f}" 2>&1)" || :
+  [[ -n "${OUT}" ]] || fail "an unreadable build cwd was ignored"
+
+  # A build dir written to while an earlier entry of its worktree was being removed stays.
+  wt_add "${repo}" feat/two "${f}/wt-two"
+  git -C "${f}/wt-two" push -q origin feat/two
+  blob "${f}/wt-two/target/debug/x"
+  blob "${f}/wt-two/fuzz/target/debug/x"
+  backdate "${OLD}" "${f}/wt-two/target" "${f}/wt-two/fuzz/target"
+  rc=0
+  OUT="$(mid_apply "${f}" 2>&1)" || rc=$?
+  [[ "${rc}" -eq 0 ]] || fail "the mid-apply run exited ${rc}"
+  gone "${f}/wt-two/target"
+  [[ -e "${f}/wt-two/fuzz/target/debug/during" ]] || fail "mid-apply fuzz/target was removed"
 
   # safe_rm itself: empty, `/`, relative, outside the root, `..`, a symlink on the way, newlines.
   mkdir -p "${f}/root/inside" "${f}/root/real/victim" "${f}/elsewhere" "${f}/root/dir"$'\n'
@@ -453,17 +476,72 @@ ps_fails_hold() (
   prune_cleanup
 )
 
-# lock_cases <fixture>: cache_lock_take replaces a dead holder's lock, not a live one's.
+# lock_cases <fixture> <cache_lock.sh>: cache_lock_take replaces a dead holder's
+# lock, never a live one's, and never two callers' at once.
 lock_cases() (
   # shellcheck source=.shux/scripts/lib/cache_lock.sh
-  . "$1/repo/.shux/scripts/lib/cache_lock.sh"
-  mkdir -p "$1/locks/stale" "$1/locks/live"
+  . "$2"
+  live="$(cat "$1/daemon.pid")"
+  rm -rf "$1/locks"
+  mkdir -p "$1/locks/stale" "$1/locks/live" "$1/locks/race"
   dead_pid >"$1/locks/stale/pid"
-  cat "$1/daemon.pid" >"$1/locks/live/pid"
+  echo "${live}" >"$1/locks/live/pid"
   cache_lock_take "$1/locks/stale" 1 || { echo "a dead holder's lock was not replaced"; exit 1; }
   [[ "$(cat "$1/locks/stale/pid")" == "$$" ]] || { echo "the replaced lock does not name its new holder"; exit 1; }
   cache_lock_release "$1/locks/stale" || { echo "release failed"; exit 1; }
   if cache_lock_take "$1/locks/live" 1; then echo "a live holder's lock was taken"; exit 1; fi
+  # Another caller breaks the dead holder's lock and takes it between our read and our claim.
+  race="$1/locks/race" dead="$(dead_pid)"
+  echo "${dead}" >"${race}/pid"
+  eval "real_$(declare -f pid_state)"
+  # shellcheck disable=SC2329  # shadows pid_state for cache_lock_take, which calls it by name
+  pid_state() {
+    if [[ "$1" == "${dead}" && ! -e "${race}.swapped" ]]; then
+      : >"${race}.swapped"
+      rm -f "${race}/pid"
+      rmdir "${race}"
+      mkdir "${race}"
+      echo "${live}" >"${race}/pid"
+      echo dead
+      return
+    fi
+    real_pid_state "$1"
+  }
+  if cache_lock_take "${race}" 1; then echo "two callers both hold the lock after a stale-lock race"; exit 1; fi
+  [[ "$(cat "${race}/pid" 2>/dev/null)" == "${live}" ]] || { echo "a stale-lock race moved the live lock away"; exit 1; }
+)
+
+# unreadable_cwd <fixture>: CWD_UNKNOWN after scan_builds when no build's cwd can be read.
+unreadable_cwd() (
+  prune_env "$1"
+  # shellcheck source=scripts/prune.sh
+  . "$1/repo/scripts/prune.sh"
+  prune_setup
+  # shellcheck disable=SC2329  # shadows pid_cwd for scan_builds, which calls it by name
+  pid_cwd() { :; }
+  scan_builds
+  printf '%s' "${CWD_UNKNOWN}"
+  prune_cleanup
+)
+
+# mid_apply <fixture>: plan, then apply with a write to wt-two/fuzz/target landing
+# just after wt-two/target is removed.
+mid_apply() (
+  prune_env "$1"
+  mid="$1"
+  # shellcheck source=scripts/prune.sh
+  . "${mid}/repo/scripts/prune.sh"
+  prune_setup
+  plan_worktrees >/dev/null
+  printf '%s\n' "${P_PATH[@]}" | grep -qxF "${mid}/wt-two/fuzz/target" || { echo "wt-two/fuzz/target not planned"; exit 3; }
+  eval "real_$(declare -f safe_rm)"
+  # shellcheck disable=SC2329  # shadows safe_rm for prune_apply, which calls it by name
+  safe_rm() {
+    real_safe_rm "$@" || return
+    [[ "$1" != "${mid}/wt-two/target" ]] || blob "${mid}/wt-two/fuzz/target/debug/during"
+  }
+  prune_apply
+  prune_cleanup
 )
 rt() { mkdir -p "$(dirname "$1")"; printf '%s\n' "$2" >"$1"; }
 
@@ -483,9 +561,9 @@ mutant() { M_NAME+=("$1") M_FROM+=("$2") M_TO+=("$3") M_WANT+=("$4"); }
 {
   mutant dirty 'if [[ -n "${st}" ]]; then' 'if false; then' 'wt-dirty/target was removed'
   mutant unpushed 'if [[ "${n}" -gt 0 ]]; then' 'if false; then' 'wt-unpushed/target was removed'
-  mutant busy 'if [[ "$(owner_of "${B_CWD[${i}]}")" == "${wt}" ]]; then' 'if false; then' 'busy/target was removed'
-  mutant 'fresh build dir' 'if touched_within "${d}" "${BUSY_REF}"; then echo "${d} written' \
-    'if false; then echo "${d} written' 'fresh was removed'
+  mutant busy 'if [[ "$(owner_of "${B_CWD[${i}]}")" == "$1" ]]; then' 'if false; then' 'busy/target was removed'
+  mutant 'fresh build dir' 'if touched_within "$1" "${BUSY_REF}"; then echo "$1 written' \
+    'if false; then echo "$1 written' 'fresh was removed'
   mutant 'live daemon pid' 'alive) echo "pid ${PIDFILE_PID}' 'alive) : "pid ${PIDFILE_PID}' 'shuxlive was removed'
   mutant 'ps failure' 'unknown) echo "ps cannot say' 'unknown) : "ps cannot say' 'a ps failure was not held'
   mutant 'lock at apply' 'WT_HOLD="$(worktree_hold "${ctx}" "$(wt_flag "${ctx}")")"' \
@@ -509,20 +587,43 @@ mutant() { M_NAME+=("$1") M_FROM+=("$2") M_TO+=("$3") M_WANT+=("$4"); }
   mutant 'stale plan' '    recheck "${i}"' '    HOLD=""' $'wt-pushed/target was removed\nneutral-stale/lock was kept'
   mutant 'squash merge' '== "${BASE_TREE}" ]]; }; then' '== "never" ]]; }; then' 'wt-merged/target was kept'
   mutant inert '      plan_worktree "${WTS[${i}]}"' '      :' 'wt-pushed/target was kept'
+  mutant 'per-item build recheck' 'if [[ -z "${HOLD}" && "${kind}" == build ]]; then HOLD="$(build_activity_hold' \
+    'if false; then HOLD="$(build_activity_hold' 'mid-apply fuzz/target was removed'
+  mutant 'unreadable cwd' '[[ "$(pid_state "${pid}")" == dead ]] || CWD_UNKNOWN="cannot see the cwd' \
+    'true || CWD_UNKNOWN="cannot see the cwd' 'an unreadable build cwd was ignored'
 }
+
+# mutate <file> <from> <to> <out>: the first occurrence replaced, literally
+# (ENVIRON: no escape processing; Bash 3.2's ${var/…/…} takes tens of seconds here).
+mutate() {
+  F="$2" T="$3" awk 'BEGIN { f = ENVIRON["F"]; t = ENVIRON["T"] }
+    !done && (p = index($0, f)) { $0 = substr($0, 1, p - 1) t substr($0, p + length(f)); done = 1 }
+    { print }' "$1" >"$4"
+  if cmp -s "$1" "$4"; then
+    echo "✗ prune self-test: a mutant no longer applies to $1: $2" >&2
+    exit 1
+  fi
+}
+
+# The lock library's claim check, taken out: the race case must catch it.
+# shellcheck disable=SC2016  # cache_lock.sh source text
+mutate "${SRC}/.shux/scripts/lib/cache_lock.sh" \
+  'if pidfile_pid "${claimed}/pid" && [[ "${PIDFILE_PID}" == "${dead}" ]]; then' 'if true; then' \
+  "${work}/cache_lock.mutant.sh"
+mkdir -p "${work}/lockmut"
+echo "$$" >"${work}/lockmut/daemon.pid"
+if (lock_cases "${work}/lockmut" "${work}/cache_lock.mutant.sh") >"${work}/lockmut.log" 2>&1; then
+  echo "✗ prune self-test: passed with the stale-lock claim check removed from cache_lock.sh" >&2
+  exit 1
+elif ! grep -q "stale-lock race" "${work}/lockmut.log"; then
+  echo "✗ prune self-test: the cache_lock.sh mutant failed for the wrong reason: $(cat "${work}/lockmut.log")" >&2
+  exit 1
+fi
 
 # Each mutant in its own fixture, all at once; then each verdict is read.
 jobs_=()
 for i in "${!M_NAME[@]}"; do
-  # The first occurrence, literally (ENVIRON: no escape processing). Bash 3.2's
-  # ${var/…/…} takes tens of seconds on a file this size.
-  F="${M_FROM[${i}]}" T="${M_TO[${i}]}" awk 'BEGIN { f = ENVIRON["F"]; t = ENVIRON["T"] }
-    !done && (p = index($0, f)) { $0 = substr($0, 1, p - 1) t substr($0, p + length(f)); done = 1 }
-    { print }' "${PRUNE}" >"${work}/mutant-${i}.sh"
-  if cmp -s "${PRUNE}" "${work}/mutant-${i}.sh"; then
-    echo "✗ prune self-test: mutant '${M_NAME[${i}]}' no longer applies to prune.sh" >&2
-    exit 1
-  fi
+  mutate "${PRUNE}" "${M_FROM[${i}]}" "${M_TO[${i}]}" "${work}/mutant-${i}.sh"
   (suite "${work}/m${i}" "${work}/mutant-${i}.sh" >"${work}/m${i}.log" 2>&1) &
   jobs_+=("$!")
 done

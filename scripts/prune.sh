@@ -212,9 +212,8 @@ scan_builds() {
     case "${chain}" in *" ${pid} "*) continue ;; esac
     cwd="$(pid_cwd "${pid}")"
     if [[ -z "${cwd}" ]]; then
-      if [[ ! -r /proc/self/cwd ]] && ! command -v lsof >/dev/null 2>&1; then
-        CWD_UNKNOWN="cannot see build processes' cwd (no /proc, no lsof)"
-      fi
+      # Gone since ps listed it, or a cwd we may not read (another user's, sudo's): only the first is safe.
+      [[ "$(pid_state "${pid}")" == dead ]] || CWD_UNKNOWN="cannot see the cwd of ${name} (pid ${pid})"
       continue
     fi
     if [[ ! -d "${cwd}" ]]; then
@@ -238,7 +237,7 @@ owner_of() {
 # list_builds <wt>: TMPF lists, NUL-delimited, the build dirs `make clean` empties there.
 list_builds() {
   tmpf
-  bash "${ROOT}/scripts/check-target-hygiene.sh" --list "$1" >"${TMPF}"
+  "${BASH}" "${ROOT}/scripts/check-target-hygiene.sh" --list "$1" >"${TMPF}"
 }
 
 # The flag git reports for worktree $1 now: locked, prunable, missing or empty.
@@ -261,7 +260,7 @@ wt_flag() {
 
 # Why worktree $1 must be kept whole, or nothing. Uses the last scan_builds.
 worktree_hold() {
-  local wt="$1" flag="$2" st n tree i d
+  local wt="$1" flag="$2" st n tree d h
   case "${flag}" in
     prunable | missing) echo "missing on disk"; return ;;
     locked) echo "locked (git worktree lock)"; return ;;
@@ -282,17 +281,30 @@ worktree_hold() {
       return
     fi
   fi
+  h="$(running_build "${wt}")"
+  if [[ -n "${h}" ]]; then echo "${h}"; return; fi
+  if ! list_builds "${wt}"; then echo "${LIST_FAILED}"; return; fi
+  while IFS= read -r -d '' d <&3; do
+    h="$(fresh_build "${d}")"
+    if [[ -n "${h}" ]]; then echo "${h}"; return; fi
+  done 3<"${TMPF}"
+}
+
+# Why worktree $1 has a build running in it, by the last scan_builds, or nothing.
+running_build() {
+  local i
   if [[ -n "${CWD_UNKNOWN}" ]]; then echo "${CWD_UNKNOWN}"; return; fi
   for i in "${!B_PID[@]}"; do
-    if [[ "$(owner_of "${B_CWD[${i}]}")" == "${wt}" ]]; then
+    if [[ "$(owner_of "${B_CWD[${i}]}")" == "$1" ]]; then
       echo "running build: ${B_NAME[${i}]} (pid ${B_PID[${i}]})"
       return
     fi
   done
-  if ! list_builds "${wt}"; then echo "${LIST_FAILED}"; return; fi
-  while IFS= read -r -d '' d <&3; do
-    if touched_within "${d}" "${BUSY_REF}"; then echo "${d} written in the last ${BUSY_MIN} min"; return; fi
-  done 3<"${TMPF}"
+}
+
+# Why build dir $1 is in use, or nothing.
+fresh_build() {
+  if touched_within "$1" "${BUSY_REF}"; then echo "$1 written in the last ${BUSY_MIN} min"; fi
 }
 
 # Why worktree $1's build dirs must stay: a live daemon runs a binary built there.
@@ -583,6 +595,16 @@ plan_runtime() {
 }
 
 # ── Apply ──────────────────────────────────────────────────────────────────
+# Why build dir $2 of worktree $1 must stay at the moment of its removal: a build
+# started there, or $2 was written, since the worktree as a whole was checked.
+build_activity_hold() {
+  local h
+  scan_builds
+  h="$(running_build "$1")"
+  [[ -n "${h}" ]] || h="$(fresh_build "$2")"
+  printf '%s' "${h}"
+}
+
 # HOLD: why planned entry $1 must stay now, or nothing; the plan may have gone
 # stale. Runs in this shell: it takes the vt-neutrality lock.
 recheck() {
@@ -598,6 +620,7 @@ recheck() {
       fi
       HOLD="${WT_HOLD}"
       [[ -n "${HOLD}" ]] || HOLD="$(item_hold "${kind}" "${ctx}" "${path}")"
+      if [[ -z "${HOLD}" && "${kind}" == build ]]; then HOLD="$(build_activity_hold "${ctx}" "${path}")"; fi
       ;;
     neutral)
       if [[ "${NEUTRAL_LOCKED}" != "${ctx}" ]]; then

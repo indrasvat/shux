@@ -34,7 +34,9 @@ fi
 ROOT="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 
 # -c, not a heredoc on stdin: the guard never needs stdin, but keep the habit.
-PROGRAM="$(cat <<'PY'
+# `read -d ''`, not "$(cat <<'PY' …)": Bash 3.2 mis-parses the quotes in a heredoc
+# inside $(…) and refuses the whole script. read returns 1 at the end of input.
+IFS= read -r -d '' PROGRAM <<'PY' || :
 import json
 import os
 import re
@@ -425,5 +427,4 @@ if failures:
 print(f"✓ target hygiene: {len(roots)} workspace(s) packed, "
       f"{len(scanned)} target dir(s) within the stale-object limit")
 PY
-)"
 exec python3 -c "${PROGRAM}" "${mode}" "${ROOT}"
