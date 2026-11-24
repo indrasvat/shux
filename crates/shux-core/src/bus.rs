@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
 
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tracing::{debug, warn};
 
 use serde::{Deserialize, Serialize};
@@ -104,6 +104,9 @@ struct EventBusInner {
     /// gap-detect each independently. Held across the send so chunks reach
     /// subscribers in seq order.
     data_seq: Mutex<u64>,
+    /// Counters bumped by each event their filters match: see
+    /// [`EventBus::watch_filtered`].
+    watches: Mutex<Vec<(Vec<String>, watch::Sender<u64>)>>,
 }
 
 /// Ring buffer for event history.
@@ -195,6 +198,7 @@ impl EventBus {
                 history: RwLock::new(EventHistory::new(config.history_capacity)),
                 data_plane,
                 data_seq: Mutex::new(1),
+                watches: Mutex::default(),
             }),
         }
     }
@@ -233,12 +237,38 @@ impl EventBus {
         };
 
         history.push(event.clone());
+        self.bump_watches(&event);
         let sent = self.inner.sender.send(event);
         drop(history);
         // No receivers is fine: the event is still in history.
         debug!(seq, receivers = sent.unwrap_or(0), "event published");
 
         seq
+    }
+
+    /// A counter that moves whenever an event matching `filters` is published.
+    /// Unlike a [`Subscription`] it cannot lag: a burst of other events never
+    /// reaches it, and a burst of matching ones is one change. For a consumer
+    /// that only needs to know something of a kind happened.
+    pub fn watch_filtered(&self, filters: Vec<String>) -> watch::Receiver<u64> {
+        let (tx, rx) = watch::channel(0);
+        self.watches().push((filters, tx));
+        rx
+    }
+
+    fn watches(&self) -> std::sync::MutexGuard<'_, Vec<(Vec<String>, watch::Sender<u64>)>> {
+        // A panic while holding this lock leaves a list that is still whole.
+        self.inner.watches.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn bump_watches(&self, event: &Event) {
+        let mut watches = self.watches();
+        watches.retain(|(_, tx)| !tx.is_closed());
+        for (filters, tx) in watches.iter() {
+            if filters.iter().any(|f| event.matches_filter(f)) {
+                tx.send_modify(|n| *n = n.wrapping_add(1));
+            }
+        }
     }
 
     /// Subscribe to all events (unfiltered).
@@ -484,6 +514,28 @@ mod tests {
     use super::*;
     use crate::event::EventData;
     use crate::model::{PaneId, SessionId, WindowId};
+
+    /// A filtered watch moves for its events only, and a burst far past the
+    /// broadcast capacity of others never moves it: it cannot lag.
+    #[test]
+    fn a_filtered_watch_moves_only_for_its_events_and_never_lags() {
+        let bus = EventBus::new();
+        let watch = bus.watch_filtered(vec!["window.".into()]);
+        for _ in 0..10_000 {
+            bus.publish(session_created("other"));
+        }
+        assert!(!watch.has_changed().unwrap(), "unmatched events moved it");
+        bus.publish(EventData::WindowCreated {
+            window_id: WindowId::new(),
+            session_id: SessionId::new(),
+            title: "w".into(),
+            index: 1,
+        });
+        assert!(watch.has_changed().unwrap(), "a matching event did not");
+        drop(watch);
+        bus.publish(session_created("after"));
+        assert!(bus.watches().is_empty(), "a dropped watch was kept");
+    }
 
     /// Helper to create a simple SessionCreated event data.
     fn session_created(name: &str) -> EventData {
