@@ -17,7 +17,9 @@ fn drive(chunks: &[&[u8]], enabled: bool) -> (String, String, String, Option<Str
     (
         FrameEnvelope::from_terminal(&vt, &MaskSet::new()).to_canonical_json(),
         vt.capture_text(None),
-        format!("{:?}", vt.cursor()),
+        // When the cursor was hidden is a clock reading, not state: the two
+        // runs read the clock at different times.
+        format!("{:?}", shux_vt::Cursor { hidden_since_ns: 0, ..vt.cursor().clone() }),
         vt.title().map(str::to_owned),
         vt.content_revision(),
         responses,
