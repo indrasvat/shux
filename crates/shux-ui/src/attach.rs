@@ -223,11 +223,13 @@ async fn run_loop<S>(
     config: &ClientConfig,
     mut resized: tokio::signal::unix::Signal,
     // The size the hello reported.
-    mut last_size: (u16, u16),
+    hello_size: (u16, u16),
 ) -> Result<ExitReason>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    // The cell's pixels are first said just below, with the size.
+    let mut last_size = (hello_size, None);
     let (mut sink, mut stream) = framed.split();
     let mut stdout = tokio::io::stdout();
     let mut prefix_active = false;
@@ -484,7 +486,12 @@ where
 
 /// Send the terminal's size if it differs from the last one sent. Read here
 /// rather than taken from the event, so a late event cannot report a stale size.
-async fn report_size<K>(sink: &mut K, last_size: &mut (u16, u16)) -> Result<()>
+/// The cell's pixel size goes with it, when the terminal reports one: a font
+/// change moves it and no column.
+async fn report_size<K>(
+    sink: &mut K,
+    (last_size, last_cell): &mut ((u16, u16), Option<(u16, u16)>),
+) -> Result<()>
 where
     K: futures::Sink<Bytes> + Unpin,
     K::Error: std::error::Error + Send + Sync + 'static,
@@ -496,7 +503,22 @@ where
         sink.send(Bytes::from(frame)).await.context("send resize")?;
         *last_size = size;
     }
+    let cell = cell_pixels();
+    if let Some((width, height)) = cell.filter(|_| cell != *last_cell) {
+        let frame = serde_json::to_vec(&AttachClientFrame::CellPixels { width, height })?;
+        sink.send(Bytes::from(frame))
+            .await
+            .context("send cell pixels")?;
+        *last_cell = cell;
+    }
     Ok(())
+}
+
+/// One cell's size in pixels, when the terminal reports its own (TIOCGWINSZ).
+fn cell_pixels() -> Option<(u16, u16)> {
+    let w = crossterm::terminal::window_size().ok()?;
+    (w.width > 0 && w.height > 0 && w.columns > 0 && w.rows > 0)
+        .then(|| (w.width / w.columns, w.height / w.rows))
 }
 
 /// The bindings for the live config's keys when they differ from `keys`,

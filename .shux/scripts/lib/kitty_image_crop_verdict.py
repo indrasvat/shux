@@ -9,14 +9,17 @@
     kitty_image_crop_verdict.py --same a.png b.png
 
 `run.json` is written by `.shux/scripts/gui_terminal_image_crop.sh`: one pane
-pinned wider than its rect, holding two banded pictures, photographed whole,
+pinned wider than its rect, holding banded pictures, photographed whole,
 with its slice scrolled `offset` columns right, and scrolled back. Assertions:
 
   chrome     the window draws one pane outline
   whole      each picture's bands, in order and at their widths, from its cell
-  cropped    each picture's bands that start right of the slice's first
-             column, from the pane's left edge: the band cut by that edge at
-             the part of its width that is left
+  cropped    each picture's bands from its first source pixel wholly right of
+             the slice's first column, where that pixel truly begins; the
+             sliver of a pixel the edge cuts is blank. A picture with
+             `edge_px` has one source pixel per band, which kitty blends
+             across, so its band edges are where the nearest colour changes,
+             within `edge_px` of true
   contained  no band colour outside the pane in any frame: not on the border,
              not on the status bar
   restored   the pane draws exactly as it did before the scroll
@@ -28,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -76,24 +80,58 @@ def runs(line: np.ndarray, bands: list[list[int]]) -> list[tuple[int, int, int]]
     return out
 
 
+def linear(rgb: np.ndarray) -> np.ndarray:
+    """sRGB to linear light, where kitty blends a scaled picture's pixels."""
+    c = rgb.astype(np.float64) / 255
+    return np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
+
+
+def crossings(line: np.ndarray, lo: int, hi: int, bands: list[list[int]], want: list) -> list[tuple[int, int, int]]:
+    """(band, first x, length) of `want`'s bands as drawn along `line[lo:hi]`:
+    the picture's drawn extent, cut where the colour passes halfway from each
+    band to the next. A band whose middle is nearer another band's colour is
+    reported as that band."""
+    drawn = np.where((np.abs(line[lo:hi]) > TOLERANCE).any(axis=1))[0]
+    if drawn.size == 0 or not want:
+        return []
+    end = lo + int(drawn.max()) + 1
+    cuts = [lo + int(drawn.min())]
+    px = linear(line)
+    for (a, _, wn), (b, wx, _) in zip(want, want[1:]):
+        ca, cb = linear(np.array(bands[a])), linear(np.array(bands[b]))
+        t = (px - ca) @ (cb - ca) / ((cb - ca) @ (cb - ca))
+        # From the middle of where band `a` is due: nearer its edges, kitty's
+        # blend with the band before it can project past halfway.
+        start = max(cuts[-1], int(wx - wn / 2))
+        cuts.append(next((x for x in range(start, end) if t[x] >= 0.5), end))
+    cuts.append(end)
+    ref = linear(np.array(bands))
+    out = []
+    for i in range(len(want)):
+        mid = px[(cuts[i] + cuts[i + 1] - 1) // 2]
+        out.append((int(((ref - mid) ** 2).sum(axis=1).argmin()), cuts[i], cuts[i + 1] - cuts[i]))
+    return out
+
+
 def expected(pic: dict, first: int, x0: float, cell_w: float) -> list[tuple[int, float, float]]:
     """(band, first x, width) of each band a slice from grid column `first` shows."""
-    per = pic["cells_per_band"]
+    per, px = pic["cells_per_band"], pic["cells_per_px"]
     col = pic["at"][1]
+    start = col + math.ceil(max(first - col, 0) / px - 1e-6) * px
     out = []
     for i in range(len(pic["bands"])):
-        lo, hi = max(col + i * per, first), col + (i + 1) * per
+        lo, hi = max(col + i * per, start), col + (i + 1) * per
         if hi > lo:
             out.append((i, x0 + (lo - first) * cell_w, (hi - lo) * cell_w))
     return out
 
 
-def compare(name: str, got: list, want: list) -> list[str]:
+def compare(name: str, got: list, want: list, tol: float = EDGE_PX) -> list[str]:
     if [b for b, _, _ in got] != [b for b, _, _ in want]:
         return [f"{name}: bands {[b for b, *_ in got]} drawn, not {[b for b, *_ in want]} (runs {got})"]
     bad = []
     for (b, x, n), (_, wx, wn) in zip(got, want):
-        if abs(x - wx) > EDGE_PX or abs(n - wn) > EDGE_PX:
+        if abs(x - wx) > tol or abs(n - wn) > tol or abs(x + n - wx - wn) > tol:
             bad.append(f"band {b} at {x}+{n} px, not {wx:.1f}+{wn:.1f}")
     return [f"{name}: {'; '.join(bad)}"] if bad else []
 
@@ -108,7 +146,7 @@ def judge(run: dict) -> list[str]:
     if box is None:
         return ["chrome: no pane outline in the window"]
     left, top, right, bottom = box
-    pics = {"A": run["a"], "B": run["b"]}
+    pics = run["pictures"]
 
     whole = frames["whole"]
     a_mask = np.zeros(whole.shape[:2], dtype=bool)
@@ -137,9 +175,18 @@ def judge(run: dict) -> list[str]:
         img = frames[frame]
         for name, pic in pics.items():
             y = int(y0 + (pic["at"][0] + 0.5) * cell_h)
-            got = runs(img[y, left + 1 : right], pic["bands"])
-            got = [(b, x + left + 1, n) for b, x, n in got]
-            failures += compare(f"{frame}: picture {name}", got, expected(pic, clip, x0, cell_w))
+            want = expected(pic, clip, x0, cell_w)
+            tol = pic.get("edge_px")
+            if tol is None:
+                got = runs(img[y, left + 1 : right], pic["bands"])
+                got = [(b, x + left + 1, n) for b, x, n in got]
+            else:
+                # Within the pane's cells, a cell either side of where the picture is due.
+                span = len(pic["bands"]) * pic["cells_per_band"]
+                lo = max(math.ceil(x0), int(x0 + (pic["at"][1] - clip - 1) * cell_w))
+                hi = min(right, int(x0 + (pic["at"][1] + span - clip + 1) * cell_w))
+                got = crossings(img[y], lo, hi, pic["bands"], want)
+            failures += compare(f"{frame}: picture {name}", got, want, EDGE_PX if tol is None else tol)
 
     inside = np.zeros(whole.shape[:2], dtype=bool)
     inside[top + 1 : bottom, left + 1 : right] = True

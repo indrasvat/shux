@@ -658,6 +658,8 @@ struct AttachedSession {
     shown: ShownFrames,
     /// This attach's entry in the client registry, once registered.
     client: Option<shux_core::event::ClientId>,
+    /// One of the client's cells in pixels, once it has said.
+    cell_pixels: Option<(u16, u16)>,
 }
 
 /// Frames queued to one client before the render loop waits for it.
@@ -754,6 +756,7 @@ async fn resolve_or_create_session(
             show_welcome_toast: true,
             shown: ShownFrames::default(),
             client: None,
+            cell_pixels: None,
         })
     };
 
@@ -831,6 +834,7 @@ async fn resolve_or_create_session(
         show_welcome_toast: true,
         shown: ShownFrames::default(),
         client: None,
+        cell_pixels: None,
     })
 }
 
@@ -1801,6 +1805,11 @@ async fn run_attach_loop(
                         let pulse = io_state.lock().await.render_pulse.clone();
                         pulse.bump();
                     }
+                    AttachClientFrame::CellPixels { width, height } => {
+                        render_session.lock().await.cell_pixels = Some((width, height));
+                        let pulse = io_state.lock().await.render_pulse.clone();
+                        pulse.bump();
+                    }
                     AttachClientFrame::Pong => {}
                 }
             }
@@ -2266,6 +2275,7 @@ async fn run_render_loop(
                     .as_ref()
                     .is_some_and(|o| matches!(o.kind, CopyOverlayKind::Modal(..))),
         );
+        compositor.set_cell_pixels(attached.cell_pixels);
         // Reset the buffer first so we only ship the new frame's bytes.
         compositor.inner_mut().clear();
         let _ = compositor.render_multi_pane(frame);
@@ -5439,6 +5449,7 @@ mod tests {
             show_welcome_toast: true,
             shown: ShownFrames::default(),
             client: None,
+            cell_pixels: None,
         };
 
         AttachFixture {
@@ -10292,6 +10303,17 @@ mod tests {
             onboarding: crate::onboarding::OnboardingHandle,
             plain: bool,
         ) -> Self {
+            Self::attach_drawing(fixture, cols, onboarding, plain, false).await
+        }
+
+        /// A client whose terminal draws kitty graphics when `graphics`.
+        async fn attach_drawing(
+            fixture: &AttachFixture,
+            cols: u16,
+            onboarding: crate::onboarding::OnboardingHandle,
+            plain: bool,
+            graphics: bool,
+        ) -> Self {
             let (server_stream, client_stream) = tokio::io::duplex(1 << 20);
             let cancel = fixture.cancel.child_token();
             let server = tokio::spawn(handle_attach_connection(
@@ -10312,7 +10334,7 @@ mod tests {
                 cols,
                 rows: 24,
                 client_version: "input-test".to_string(),
-                graphics: false,
+                graphics,
                 plain,
             };
             framed
@@ -13594,6 +13616,47 @@ mod tests {
         }
         // Five rows a page: the slice now starts five lines above h25.
         assert_eq!(h.yanked().await.as_deref(), Some("h20"));
+        h.stop().await;
+    }
+
+    /// A client that says how big its cells are in pixels is told where
+    /// inside a cell a cropped picture begins in those pixels.
+    #[tokio::test(start_paused = true)]
+    async fn a_mid_cell_crop_is_placed_in_the_clients_own_pixels() {
+        use base64::Engine as _;
+        let mut h = InputHarness::new(64).await;
+        let rect = h.first_rect().await;
+        let onboarding = crate::onboarding::OnboardingHandle::from_state_for_test(
+            crate::onboarding::OnboardingState {
+                prefix_discovered: true,
+                welcome_toast_seen: true,
+            },
+        );
+        let drawing = Client::attach_drawing(&h.fixture, 90, onboarding, false, true).await;
+        std::mem::replace(&mut h.client, drawing).stop().await;
+        h.send(&AttachClientFrame::CellPixels {
+            width: 18,
+            height: 38,
+        })
+        .await;
+        // 4x1 px fitted to five columns at column 3; the slice starts at
+        // column 4, a quarter of pixel 1 cut: 4.5 px of an 18 px cell.
+        let mut vt = shux_vt::VirtualTerminal::new(10, 120);
+        let px = base64::engine::general_purpose::STANDARD.encode([90u8; 12]);
+        vt.process(format!("\x1b[1;4H\x1b_Ga=t,f=24,s=4,v=1,i=5;{px}\x1b\\").as_bytes());
+        vt.process(b"\x1b_Ga=p,i=5,c=5,r=1,C=1\x1b\\");
+        vt.process(&follow_to(rect, 0, 4));
+        h.show(vt).await;
+        let placed = h
+            .frames_until(|f, _| {
+                let AttachServerFrame::Render { data, .. } = f else {
+                    return false;
+                };
+                let bytes = BASE64.decode(data.as_bytes()).unwrap_or_default();
+                String::from_utf8_lossy(&bytes).contains("w=3,h=1,c=4,r=1,X=4")
+            })
+            .await;
+        assert!(placed, "the crop was not placed in the client's own pixels");
         h.stop().await;
     }
 }

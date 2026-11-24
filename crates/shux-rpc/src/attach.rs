@@ -157,6 +157,11 @@ pub enum AttachClientFrame {
     /// config reload changes it, so the hints the daemon draws name the key
     /// that actually works. A daemon that has none uses its own config's.
     Prefix { prefix: String },
+    /// The size in pixels of one of the client's cells, as its terminal
+    /// reports it. Sent when streaming starts and after each resize, by a
+    /// client whose terminal knows; a picture placed partway into a cell is
+    /// offset in these pixels. A daemon that predates it skips the frame.
+    CellPixels { width: u16, height: u16 },
     /// Heartbeat reply.
     Pong,
 }

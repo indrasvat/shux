@@ -5,12 +5,13 @@
 #   SHUX_BIN=<binary> .shux/scripts/gui_terminal_image_crop.sh [--out DIR]
 #
 # One kitty window attaches to one pane pinned wider than its rect. The pane
-# draws two banded pictures: one a whole number of cells per band, one scaled
-# so its band edges fall inside cells. Its cursor then moves right, so the
-# slice starts past both pictures' left edges, and back home. Photographed at
-# each step, the cropped frame must show each picture's trailing bands from the
-# pane's left edge, at their widths, and nothing of either picture outside the
-# pane; the restored frame must draw the pane as the first one did. The rest of
+# draws three banded pictures: one a whole number of cells per band, one scaled
+# so its band edges fall inside cells, and one upscaled so the slice's edge
+# cuts inside one of its source pixels. Its cursor then moves right, so the
+# slice starts past every picture's left edge, and back home. Photographed at
+# each step, the cropped frame must show each picture's trailing whole source
+# pixels where they truly begin, at their widths, and nothing of any picture
+# outside the pane; the restored frame must draw the pane as the first one did. The rest of
 # the rig: docs/agents/visual-testing.md § "The GUI-terminal rig".
 #
 # Exit: 0 pass · 1 an assertion failed · 2 usage · 3 a tool is missing.
@@ -50,18 +51,27 @@ STATUS_RGB="0,0,255"
 A_BANDS="0,200,0 230,230,0 0,200,200 255,140,0"
 # Picture B: four 5 px bands of a 20 px image fitted to 5 cells, 1.25 each.
 B_BANDS="160,0,200 255,120,180 120,70,20 90,160,255"
+# Picture C: four 1 px bands of a 4x2 image fitted to 5 columns, 1.25 each.
+C_BANDS="0,90,0 230,120,40 120,0,120 0,150,150"
 A_AT="5 10"
 B_AT="10 8"
+C_AT="14 9"
 B_COLS=5
-# The scrolled slice starts this many columns into the grid: one cell into A,
-# three into B, so B's first visible band is three quarters of a cell wide.
+C_COLS=5
+# The scrolled slice starts this many columns into the grid: one cell into A;
+# three into B, so B's first visible band is three quarters of a cell wide;
+# two into C, inside its second source pixel, so C shows from its third pixel,
+# half a cell in, and the cut sliver is blank.
 OFFSET=11
 GRID_COLS=200
 GRID_ROWS=20
 TITLE="shux-gui-rig"
 SCREEN_W=1400
 SCREEN_H=900
-WINDOW="1000x640"
+WINDOW="1000x880"
+# Cells near twice shux's declared 9x19 px, so an offset sent in declared
+# pixels lands visibly short.
+FONT_SIZE=20
 
 missing=()
 probe_tool() {
@@ -183,9 +193,10 @@ export DISPLAY
 # The pictures, as the pane's application sends them: A transmitted and shown
 # at its own size, B transmitted under an id and put fitted to B_COLS columns.
 payload="${runtime}/pictures.esc"
-python3 - "${payload}" "${A_BANDS}" "${B_BANDS}" "${A_AT}" "${B_AT}" "${B_COLS}" <<'PY'
+python3 - "${payload}" "${A_BANDS}" "${B_BANDS}" "${C_BANDS}" "${A_AT}" "${B_AT}" "${C_AT}" \
+    "${B_COLS}" "${C_COLS}" <<'PY'
 import base64, sys
-out, a_bands, b_bands, a_at, b_at, b_cols = sys.argv[1:]
+out, a_bands, b_bands, c_bands, a_at, b_at, c_at, b_cols, c_cols = sys.argv[1:]
 def bands(spec, band_w, h):
     cols = [bytes(int(c) for c in rgb.split(",")) for rgb in spec.split()]
     row = b"".join(c * band_w for c in cols)
@@ -195,10 +206,13 @@ def cup(at):
     return f"\x1b[{r + 1};{c + 1}H"
 a, aw, ah = bands(a_bands, 9, 19)
 b, bw, bh = bands(b_bands, 5, 20)
+c, cw, chh = bands(c_bands, 1, 2)
 with open(out, "w") as f:
     f.write(cup(a_at) + f"\x1b_Ga=T,f=24,s={aw},v={ah},C=1;{a}\x1b\\")
     f.write(f"\x1b_Ga=t,f=24,s={bw},v={bh},i=7;{b}\x1b\\")
     f.write(cup(b_at) + f"\x1b_Ga=p,i=7,c={b_cols},C=1\x1b\\")
+    f.write(f"\x1b_Ga=t,f=24,s={cw},v={chh},i=8;{c}\x1b\\")
+    f.write(cup(c_at) + f"\x1b_Ga=p,i=8,c={c_cols},C=1\x1b\\")
 PY
 
 # Told to go once its grid is pinned, the pane draws the pictures, prints a
@@ -229,7 +243,7 @@ sx pane wait-for -s "${session}" -p "${pane}" -t "${marker}" --timeout-ms 30000 
 LIBGL_ALWAYS_SOFTWARE=1 env -u SHUX_SOCKET HOME="${runtime}" XDG_RUNTIME_DIR="${runtime}" \
     XDG_CONFIG_HOME="${config_home}" XDG_STATE_HOME="${state_home}" \
     XDG_CACHE_HOME="${runtime}/cache" XDG_DATA_HOME="${runtime}/data" \
-    kitty --config NONE -o font_family="DejaVu Sans Mono" -o font_size=12 \
+    kitty --config NONE -o font_family="DejaVu Sans Mono" -o font_size="${FONT_SIZE}" \
     -o remember_window_size=no -o initial_window_width="${WINDOW%x*}" \
     -o initial_window_height="${WINDOW#*x}" -o cursor_blink_interval=0 \
     -e "${shux_bin}" session attach "${session}" >"${out_dir}/kitty.log" 2>&1 &
@@ -316,8 +330,14 @@ out, frames = sys.argv[1:]
 json.dump({
     "border_rgb": [int(c) for c in "${BORDER_RGB}".split(",")],
     "status_rgb": [int(c) for c in "${STATUS_RGB}".split(",")],
-    "a": {"bands": rgbs("${A_BANDS}"), "cells_per_band": 1.0, "at": [int(v) for v in "${A_AT}".split()]},
-    "b": {"bands": rgbs("${B_BANDS}"), "cells_per_band": ${B_COLS} / 4, "at": [int(v) for v in "${B_AT}".split()]},
+    "pictures": {
+        "A": {"bands": rgbs("${A_BANDS}"), "cells_per_band": 1.0, "cells_per_px": 1 / 9,
+              "at": [int(v) for v in "${A_AT}".split()]},
+        "B": {"bands": rgbs("${B_BANDS}"), "cells_per_band": ${B_COLS} / 4, "cells_per_px": ${B_COLS} / 20,
+              "at": [int(v) for v in "${B_AT}".split()], "edge_px": 1},
+        "C": {"bands": rgbs("${C_BANDS}"), "cells_per_band": ${C_COLS} / 4, "cells_per_px": ${C_COLS} / 4,
+              "at": [int(v) for v in "${C_AT}".split()], "edge_px": 1},
+    },
     "offset": ${OFFSET},
     "window": {"x": ${wx}, "y": ${wy}, "w": ${ww}, "h": ${wh}},
     "whole": f"{frames}/whole.png",
@@ -331,4 +351,4 @@ verdict_status=0
 "${verdict_py}" --geometry "${out_dir}/run.json" || verdict_status=$?
 [ "${verdict_status}" -eq 0 ] ||
     fail "gui_terminal_image_crop: the frames failed the assertions (exit ${verdict_status})"
-echo "✓ gui_terminal_image_crop: both pictures crop at the pane's left edge, stay inside it, and come back whole"
+echo "✓ gui_terminal_image_crop: every picture crops at its first whole source pixel, stays inside the pane, and comes back whole"

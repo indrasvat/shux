@@ -27,6 +27,10 @@ fn make_compositor(width: u16, height: u16) -> RenderCompositor<Cursor<Vec<u8>>>
     };
     let mut c = RenderCompositor::new(width, height, Cursor::new(Vec::new()), cfg);
     c.set_graphics(true);
+    // A terminal whose cells are the declared size, as kitty's are at its
+    // default font.
+    let (w, h) = shux_vt::DECLARED_CELL_PIXELS;
+    c.set_cell_pixels(Some((w as u16, h as u16)));
     c
 }
 
@@ -910,11 +914,13 @@ fn an_addressable_placement_put_elsewhere_moves_without_a_re_send() {
     assert_eq!(graphics(&out).len(), 1, "{:?}", graphics(&out));
 }
 
-/// One frame's graphics after the slice moves, for a pane holding `vt`.
-fn after_scroll(vt: &mut VirtualTerminal, to: &[u8]) -> String {
+/// One frame's graphics after the slice moves, for a pane holding `vt`, to a
+/// client whose cells are `cell` pixels.
+fn after_scroll_in(vt: &mut VirtualTerminal, to: &[u8], cell: Option<(u16, u16)>) -> String {
     let p = pane(1);
     let layout = LayoutNode::leaf(p);
     let mut c = make_compositor(20, 6);
+    c.set_cell_pixels(cell);
     c.render_multi_pane(frame(&layout, &HashMap::from([(p, &*vt)]), p))
         .unwrap();
     drain(&mut c);
@@ -926,34 +932,51 @@ fn after_scroll(vt: &mut VirtualTerminal, to: &[u8]) -> String {
 
 /// An upscaled picture cut mid source pixel by the slice's edge starts at
 /// its next whole source pixel, placed where that pixel truly begins:
-/// `X=`/`Y=` inside the first cell, never a pixel squeezed or stretched to
-/// fill it.
+/// `X=`/`Y=` inside the first cell, in the pixels of the CLIENT's cells, as
+/// the terminal applies them.
 #[test]
 fn a_left_cropped_upscaled_put_keeps_its_band_edges() {
-    // 4x1 px fitted to 5 columns: 11.25 px a pixel. One cell (9 px) cut off:
-    // pixel 1 truly begins 2.25 px into the first visible cell.
+    // 4x1 px fitted to 5 columns: 11.25 declared px a pixel. One cell cut
+    // off: pixel 1 truly begins a quarter cell in, 4.5 px of an 18 px cell.
     let mut vt = VirtualTerminal::new(12, 60);
     vt.process(b"\x1b[1;4H");
     vt.process(&transmit_then_put(5, 4, 1, "a=p,i=5,c=5,r=1,C=1"));
     vt.process(b"\x1b[1;1H");
-    let out = after_scroll(&mut vt, b"\x1b[1;24H");
+    let out = after_scroll_in(&mut vt, b"\x1b[1;24H", Some((18, 38)));
     assert!(
-        out.contains("\x1b[1;1H\x1b_Ga=p,") && out.contains(",x=1,y=0,w=3,h=1,c=4,r=1,X=2\x1b\\"),
+        out.contains("\x1b[1;1H\x1b_Ga=p,") && out.contains(",x=1,y=0,w=3,h=1,c=4,r=1,X=4\x1b\\"),
         "{:?}",
         graphics(&out)
     );
 
-    // 1x4 px fitted to 2 columns: 18 px a pixel, 72 tall. One row (19 px)
-    // cut off: pixel 2 truly begins 17 px into the first visible row.
+    // 1x4 px fitted to 2 columns, 72 declared px tall. One row cut off:
+    // pixel 2 truly begins 17/19 of a row in, 34 px of a 38 px cell.
     let mut vt = VirtualTerminal::new(12, 20);
     vt.process(b"\x1b[3;1H");
     vt.process(&transmit_then_put(5, 1, 4, "a=p,i=5,c=2,C=1"));
     vt.process(b"\x1b[1;1H");
-    let out = after_scroll(&mut vt, b"\x1b[9;1H");
+    let out = after_scroll_in(&mut vt, b"\x1b[9;1H", Some((18, 38)));
     assert!(
-        out.contains("\x1b[1;1H\x1b_Ga=p,") && out.contains(",y=2,w=1,h=2,c=2,r=3,Y=17\x1b\\"),
+        out.contains("\x1b[1;1H\x1b_Ga=p,") && out.contains(",y=2,w=1,h=2,c=2,r=3,Y=34\x1b\\"),
         "{:?}",
         graphics(&out)
+    );
+}
+
+/// A client that never said how big its cells are in pixels cannot be told
+/// where inside a cell a picture begins: a picture that would begin there is
+/// taken down rather than drawn at the wrong place.
+#[test]
+fn a_mid_cell_crop_is_not_placed_for_a_client_of_unknown_cell_size() {
+    let mut vt = VirtualTerminal::new(12, 60);
+    vt.process(b"\x1b[1;4H");
+    vt.process(&transmit_then_put(5, 4, 1, "a=p,i=5,c=5,r=1,C=1"));
+    vt.process(b"\x1b[1;1H");
+    let cmds = graphics(&after_scroll_in(&mut vt, b"\x1b[1;24H", None));
+    assert_eq!(cmds.len(), 1, "{cmds:?}");
+    assert!(
+        cmds[0].starts_with("a=d"),
+        "placed mid cell blind: {cmds:?}"
     );
 }
 

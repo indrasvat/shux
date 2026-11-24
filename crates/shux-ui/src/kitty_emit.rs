@@ -112,12 +112,20 @@ pub(crate) struct KittyEmitter {
     enabled: bool,
     live: Vec<Live>,
     next_id: u32,
+    /// One of the client's cells in pixels, as its terminal reported it.
+    cell_px: Option<(u32, u32)>,
 }
 
 impl KittyEmitter {
     /// Gate every emission on the client's own answer.
     pub(crate) fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
+    }
+
+    pub(crate) fn set_cell_pixels(&mut self, cell: Option<(u16, u16)>) {
+        self.cell_px = cell
+            .filter(|&(w, h)| w > 0 && h > 0)
+            .map(|(w, h)| (u32::from(w), u32::from(h)));
     }
 
     pub(crate) fn enabled(&self) -> bool {
@@ -137,7 +145,7 @@ impl KittyEmitter {
         let mut spent = 0usize;
         let want: Vec<(&Keyed, Placed)> = placements
             .iter()
-            .filter_map(|k| resolve(&k.placement).map(|r| (k, r)))
+            .filter_map(|k| resolve(&k.placement, self.cell_px).map(|r| (k, r)))
             // Charged whether or not this frame re-transmits it: any resolved
             // placement can be sent whole on any frame, and that frame is the
             // one that has to fit.
@@ -222,7 +230,7 @@ impl KittyEmitter {
 /// Intersect a placement with its pane. `None` once nothing of it is left
 /// inside. The visible part, in drawn pixels at the declared cell size, maps
 /// back through the placement's scale to the source rectangle sent.
-fn resolve(p: &ComposedPlacement) -> Option<Placed> {
+fn resolve(p: &ComposedPlacement, cell_px: Option<(u32, u32)>) -> Option<Placed> {
     // An empty payload is placeable, and transmitting it would record a host id
     // the terminal never heard of. Judged here, so it never enters `want`.
     if p.image.payload.is_empty() {
@@ -264,9 +272,10 @@ fn resolve(p: &ComposedPlacement) -> Option<Placed> {
     let vy1 = vy0 + (bottom - top) as u64 * ch;
     let vx1 = vx0 + (right - left) as u64 * cw;
     let crop = p.geometry.crop;
-    let (sy, ey, lead_y) = shux_vt::visible_span(crop.h, dest_h, vy0, vy1)?;
-    let (sx, ex, lead_x) = shux_vt::visible_span(crop.w, dest_w, vx0, vx1)?;
-    let (top, left) = (top + (lead_y / ch) as i64, left + (lead_x / cw) as i64);
+    let (real_w, real_h) = (cell_px.map(|c| c.0), cell_px.map(|c| c.1));
+    let (sy, ey, skip_y, off_y) = place(crop.h, dest_h, vy0, vy1, ch, real_h)?;
+    let (sx, ex, skip_x, off_x) = place(crop.w, dest_w, vx0, vx1, cw, real_w)?;
+    let (top, left) = (top + skip_y as i64, left + skip_x as i64);
     if bottom <= top || right <= left {
         return None;
     }
@@ -278,8 +287,40 @@ fn resolve(p: &ComposedPlacement) -> Option<Placed> {
             u16::try_from(right - left).ok()?,
             u16::try_from(bottom - top).ok()?,
         ),
-        offset: (lead_x % cw, lead_y % ch),
+        offset: (off_x, off_y),
     })
+}
+
+/// One axis of [`resolve`]: the source pixels `first..end` shown, and where
+/// the first begins, in whole declared cells and then pixels of the client's
+/// own `real` cell, as the host applies `X=`/`Y=`. Not knowing the client's
+/// cell, a pixel that begins partway into one cannot be placed truly: the
+/// first later pixel that begins on a cell edge is used, or none.
+fn place(
+    extent: u32,
+    dest: u64,
+    v0: u64,
+    v1: u64,
+    cell: u64,
+    real: Option<u32>,
+) -> Option<(u32, u32, u64, u64)> {
+    let (first, end, _) = shux_vt::visible_span(extent, dest, v0, v1)?;
+    let e = u64::from(extent);
+    // Where pixel `j` begins past `v0`, in 1/e of a declared pixel.
+    let lead = |j: u32| (u64::from(j) * dest).saturating_sub(v0 * e);
+    let whole = cell * e;
+    let at = |j: u32| (j, end, lead(j) / whole);
+    match real {
+        Some(real) => {
+            let (j, end, cells) = at(first);
+            Some((j, end, cells, (lead(j) % whole) * u64::from(real) / whole))
+        }
+        None => {
+            let j = (first..end).find(|&j| lead(j) % whole == 0)?;
+            let (j, end, cells) = at(j);
+            Some((j, end, cells, 0))
+        }
+    }
 }
 
 /// `C=1` so display never moves the host's cursor: kitty otherwise advances it
