@@ -1,0 +1,24 @@
+{
+  "scope": "copy-images-190",
+  "tier": "full",
+  "base": "6bc9d94ce1b5daa451f153bb6a28321f171460ce",
+  "commit_under_audit": "4c2894b25aa39a4cdfb33df1082fbec9bcc4fd3a",
+  "verdict": "PASS",
+  "solid_qa_report": "SOLID-QA.md",
+  "dootsabha_design": "council-design.md",
+  "dootsabha_implementation": "council-implementation.json",
+  "neutrality": "neutrality.json",
+  "screenshots": [],
+  "screenshots_note": "No PNG is committed: no tracked baseline exists for these scenes, so the metrics stand alone. Every frame, crop and diff they name is in .shux/out/copy-images-190/ (gitignored) and was opened during the audit.",
+  "pixel_metrics": [
+    "pixel-head-img-1-live-attach-vs-window.json",
+    "pixel-head-img-2-crop-attach-vs-window.json",
+    "pixel-head-img-3-home-attach-vs-window.json",
+    "pixel-head-img-restore-vs-live.json",
+    "pixel-head-img120-1-live-attach-vs-window.json",
+    "pixel-head-img120-2-crop-attach-vs-window.json",
+    "pixel-head-img120-3-home-attach-vs-window.json",
+    "pixel-head-img120-restore-vs-live.json"
+  ],
+  "pixel_metrics_note": "Live attach output (the client's bytes, kitty a=p crops included, drawn by an outer shux) vs window.snapshot of the same pane, body rows only (the status row's uptime clock differs by path), at 90x28 and 120x40 client sizes, before/after a left crop by 3 cells and after restore; plus restore vs the first live frame. All 0/0."
+}
