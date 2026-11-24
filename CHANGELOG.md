@@ -1,3 +1,10 @@
+## [0.61.3](https://github.com/indrasvat/shux/compare/v0.61.2...v0.61.3) (2026-11-24)
+
+
+### Bug Fixes
+
+* **prune:** builds outside every worktree, and zombies, hold nothing ([#314](https://github.com/indrasvat/shux/issues/314)) ([3e2ad57](https://github.com/indrasvat/shux/commit/3e2ad57807fe17c08fe0880c176e6e35903ff301)), closes [#313](https://github.com/indrasvat/shux/issues/313) [#313](https://github.com/indrasvat/shux/issues/313)
+
 ## [0.61.2](https://github.com/indrasvat/shux/compare/v0.61.1...v0.61.2) (2026-11-24)
 
 
