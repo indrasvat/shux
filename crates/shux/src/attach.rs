@@ -15505,6 +15505,25 @@ mod tests {
         fixture.stop();
     }
 
+    /// #297: a share link nobody has opened shows on an idle host's bar, and
+    /// goes with it; the share state alone wakes the bar.
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_bar_shows_a_share_link_nobody_opened() {
+        let fixture = attach_fixture().await;
+        let mut bar = HostBar::start(&fixture).await;
+        assert!(!bar.now().contains('◉'), "a solo host has a badge");
+        bar.clients.set_shared([bar.session].into());
+        bar.until(|b| b.contains("◉ shared · 0 watching")).await;
+        let guest = bar.join(false);
+        bar.until(|b| b.contains("◉ shared · 1 watching")).await;
+        drop(guest);
+        bar.until(|b| b.contains("◉ shared · 0 watching")).await;
+        bar.clients.set_shared(Default::default());
+        bar.until(|b| !b.contains('◉')).await;
+        bar.stop().await;
+        fixture.stop();
+    }
+
     /// Review of #191: one writer leaving as another joins keeps the counts,
     /// and is still a new client that can type.
     #[tokio::test(start_paused = true)]
