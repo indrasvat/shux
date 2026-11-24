@@ -710,6 +710,7 @@ impl<'a> VtHandler<'a> {
             self.cursor.col = cols.saturating_sub(1);
             self.cursor.auto_wrap_pending = true;
         }
+        self.cursor.printed_to = Some((self.cursor.row, self.cursor.col));
     }
 
     fn append_zero_width_scalar(&mut self, ch: char) {

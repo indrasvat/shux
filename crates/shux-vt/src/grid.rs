@@ -247,6 +247,9 @@ pub(crate) struct ResizePoint {
     pub past_glyph: bool,
     /// The point's row stays on screen: content-free rows below it are kept.
     pub holds_row: bool,
+    /// The point is where printing left it, not a position a sequence
+    /// addressed: past the new edge it becomes a deferred wrap.
+    pub after_print: bool,
 }
 
 #[derive(Debug)]
@@ -1581,11 +1584,10 @@ impl Grid {
                 logical_lines.push(std::mem::take(&mut current));
             }
         }
-        if current.read_width > 0 {
+        // A last row still soft-wrapping opens a line that anchors may point
+        // into, even when every cell it read was a dropped gap.
+        if self.raw.back().is_some_and(|row| row.wrapped) || logical_lines.is_empty() {
             logical_lines.push(current);
-        }
-        if logical_lines.is_empty() {
-            logical_lines.push(LogicalLine::default());
         }
 
         let mut reflowed = VecDeque::new();
@@ -1598,7 +1600,11 @@ impl Grid {
             .iter()
             .map(|a| {
                 let line = &line_ranges[a.logical_line];
-                (a.point, line.position_for_offset(a.display_offset))
+                let after_print = points[a.point].after_print;
+                (
+                    a.point,
+                    line.position_for_offset(a.display_offset, after_print),
+                )
             })
             .collect();
         let floor = mapped
@@ -1611,8 +1617,12 @@ impl Grid {
             reflowed.push_back(Row::new(new_cols));
         }
         let (top_line, top_offset) = viewport_top;
-        let history = line_ranges[top_line].position_for_offset(top_offset).0;
-        let min_total_to_keep = history.min(self.config.max_scrollback) + new_rows;
+        let history = line_ranges[top_line]
+            .position_for_offset(top_offset, false)
+            .0;
+        // Uncapped: the history cap evicts from the front below, never by
+        // pulling history into the viewport.
+        let min_total_to_keep = history + new_rows;
         while reflowed.len() > min_total_to_keep
             && floor.is_none_or(|floor| reflowed.len() - 1 > floor)
             && reflowed.back().is_some_and(|row| !row_has_content(row))
@@ -1668,18 +1678,18 @@ impl Grid {
 
 impl ReflowedLineMap {
     /// `(abs_row, col, past_glyph)` for a display offset into the logical
-    /// line. Past the content, the offset counts on along the final row. A
-    /// position at the edge, or one the edge would clamp onto content,
-    /// becomes a deferred wrap at the last column; one further out in blank
-    /// columns clamps to them.
-    fn position_for_offset(&self, offset: usize) -> (usize, usize, bool) {
+    /// line. Past the content, the offset counts on along the final row and
+    /// clamps to the last column. A position printing left there becomes a
+    /// deferred wrap when it lands on the edge, or when the clamp would put
+    /// it on content; an addressed one never does.
+    fn position_for_offset(&self, offset: usize, after_print: bool) -> (usize, usize, bool) {
         let last_col = self.cols.saturating_sub(1);
         if offset >= self.display_width {
             let target = self.end_col + (offset - self.display_width);
             if target < self.cols {
                 return (self.end_row, target, false);
             }
-            let past = target == self.cols || self.end_col >= self.cols;
+            let past = after_print && (target == self.cols || self.end_col >= self.cols);
             return (self.end_row, last_col, past);
         }
 
@@ -1846,6 +1856,7 @@ impl Grid {
         }
         // Shift right from the end.
         let cells = r.cells_mut();
+        clear_stale_gaps(cells);
         for i in (col..len).rev() {
             let target = i + count;
             if target < len {
@@ -1875,6 +1886,7 @@ impl Grid {
         }
         // Shift left. Blanks filling in after a wide gap at the edge are gap too.
         let cells = r.cells_mut();
+        clear_stale_gaps(cells);
         let fill = if cells[len - 1].is_wide_gap() {
             Cell::wide_gap(Cell::default())
         } else {
@@ -1890,6 +1902,16 @@ impl Grid {
         r.sanitize_wide_pairs(Color::Default);
         self.dirty
             .mark_range(row, col.saturating_sub(1)..len, self.rows, self.cols);
+    }
+}
+
+/// A gap mark means something only in a row's trailing run of marks; drop
+/// any a later write has stranded before content, so a shift cannot revive it.
+fn clear_stale_gaps(cells: &mut [Cell]) {
+    let trailing = cells.iter().rev().take_while(|c| c.is_wide_gap()).count();
+    let end = cells.len() - trailing;
+    for cell in cells[..end].iter_mut().filter(|c| c.is_wide_gap()) {
+        cell.meta = Default::default();
     }
 }
 

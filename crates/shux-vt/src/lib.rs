@@ -1534,13 +1534,14 @@ fn resize_primary(
     cursor: Option<&mut Cursor>,
     carried: Option<&mut SavedCursor>,
 ) {
-    let point = |row, col, pending: bool, holds_row| ResizePoint {
+    let point = |row, col, pending: bool, holds_row, after_print: bool| ResizePoint {
         row,
         col,
         past_glyph: pending && auto_wrap,
         holds_row,
+        after_print: pending || after_print,
     };
-    let slot_point = |s: &SavedCursor| point(s.row, s.col, s.auto_wrap_pending, false);
+    let slot_point = |s: &SavedCursor| point(s.row, s.col, s.auto_wrap_pending, false, false);
     let primary_slot = |slot: &&SavedCursor| !slot.on_alternate;
     let mut points = Vec::with_capacity(3);
     if let Some(cursor) = &cursor {
@@ -1549,6 +1550,7 @@ fn resize_primary(
             cursor.col,
             cursor.auto_wrap_pending,
             true,
+            cursor.at_print_end(),
         ));
         points.extend(cursor.saved.as_ref().filter(primary_slot).map(slot_point));
     }
@@ -1565,6 +1567,7 @@ fn resize_primary(
         cursor.row = p.row.min(rows.saturating_sub(1));
         cursor.col = p.col.min(cols.saturating_sub(1));
         cursor.auto_wrap_pending = p.past_glyph;
+        cursor.printed_to = p.after_print.then_some((cursor.row, cursor.col));
         if let Some(slot) = &mut cursor.saved {
             place_slot(slot, &mut points, rows, cols);
         }
@@ -2070,6 +2073,45 @@ mod tests {
         vt.resize(3, 5);
         assert_eq!(visible_text(&vt, 0), "TOP", "narrow");
         assert_eq!(visible_text(&vt, 1), "mid", "narrow");
+    }
+
+    #[test]
+    fn capped_history_is_evicted_not_pulled_into_view() {
+        let config = GridConfig {
+            max_scrollback: 1,
+            ..GridConfig::default()
+        };
+        let mut vt = VirtualTerminal::with_config(3, 10, config);
+        vt.process(b"HHHHHHHHHH\r\nTOP\r\nmid\r\n\x1b[2;4H");
+        vt.resize(3, 5);
+        assert_eq!(visible_text(&vt, 0), "TOP");
+        assert_eq!(visible_text(&vt, 1), "mid");
+    }
+
+    #[test]
+    fn a_line_left_with_only_gap_cells_survives_a_resize() {
+        let mut vt = VirtualTerminal::new(2, 3);
+        vt.process("ab界\x1b[T\x1b[2;1H\x1b[3P".as_bytes());
+        vt.resize(2, 8);
+        assert_eq!((vt.cursor().row, vt.cursor().col), (1, 0));
+    }
+
+    #[test]
+    fn a_cup_one_past_the_new_edge_sets_no_deferred_wrap() {
+        let mut vt = VirtualTerminal::new(4, 10);
+        vt.process(b"abc\x1b[1;6H");
+        vt.resize(4, 5);
+        vt.process(b"F");
+        assert_eq!(visible_text(&vt, 0), "abc F");
+        assert_eq!(visible_text(&vt, 1), "");
+    }
+
+    #[test]
+    fn ich_does_not_carry_stale_gap_marks_into_the_trailing_run() {
+        let mut vt = VirtualTerminal::new(4, 4);
+        vt.process("abc界\x1b[1;1H\x1b[2P\x1b[1;4HZ\x1b[1;2H\x1b[@".as_bytes());
+        vt.resize(4, 8);
+        assert_eq!(visible_text(&vt, 0), "c   界");
     }
 
     #[test]
