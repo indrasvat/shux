@@ -2,7 +2,7 @@
   "schema_version": 1,
   "tool": "scripts/vt-neutrality.sh",
   "base": "974f3b2e4837dab61486b28b6f1fb6415937867e",
-  "head": "916bdcdf937e24c0421c55c8666bfc504d25e682",
+  "head": "81b3c8de860b869c8cc1b90e8dfdbf13f75253e0",
   "dirty": false,
   "toolchain_key": "40346bd63a68ae74",
   "base_cache_hit": true,
