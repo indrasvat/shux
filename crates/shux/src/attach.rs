@@ -558,7 +558,7 @@ async fn serve_connection(
             return Ok(());
         }
     };
-    let hello: AttachHello = match serde_json::from_slice(&first) {
+    let mut hello: AttachHello = match serde_json::from_slice(&first) {
         Ok(h) => h,
         Err(e) => {
             warn!(error = %e, "attach: hello parse failed");
@@ -580,16 +580,9 @@ async fn serve_connection(
         return Ok(());
     }
 
-    if let Scope::Browser(_) = scope
-        && !(hello.read_only && hello.plain)
-    {
-        send_ready_error(
-            &mut framed,
-            "read_only_required",
-            "this connection only attaches read-only and plain",
-        )
-        .await?;
-        return Ok(());
+    // The gateway's attach is read-only and plain whatever its hello says.
+    if let Scope::Browser(_) = scope {
+        (hello.read_only, hello.plain) = (true, true);
     }
     let read_only = hello.read_only;
 
@@ -1310,9 +1303,14 @@ async fn run_attach_loop(
     let read_only = hello.read_only;
     let pty_write = PtyWrite::grant(read_only);
     let registry_id = registered.id();
+    // A browser viewer publishes no client events: the gateway reports its
+    // viewers, and a reconnecting one would flood the history.
     let (clients, bus) = {
         let io = io_state.lock().await;
-        (io.clients.clone(), io.event_bus.clone())
+        (
+            io.clients.clone(),
+            io.event_bus.clone().filter(|_| !session.browser),
+        )
     };
     let (cols0, rows0) = *client_size.lock().await;
     if let Some(bus) = &bus {
@@ -2129,6 +2127,18 @@ async fn run_render_loop(
                 if changed.is_err() {
                     break;
                 }
+                // Peers coming and going redraw this client at most so often:
+                // a viewer reconnecting in a loop must not repaint the host.
+                if let Some(next) = last_frame.map(|at| at + PRESENCE_REDRAW)
+                    && next > tokio::time::Instant::now()
+                {
+                    #[expect(clippy::disallowed_methods, reason = "paces frames; never synchronises a test")]
+                    let pace = tokio::time::sleep_until(next);
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        _ = pace => {}
+                    }
+                }
             }
             changed = pulse.changed() => {
                 // Unreachable while `PaneIoState` lives; never spin on it.
@@ -2376,80 +2386,103 @@ async fn run_render_loop(
                 .as_deref()
                 .unwrap_or(&live_cfg.keys.prefix),
         );
-        let session_meta = meta_cache.get(attached.session_id).await;
-        let onboarding_state = onboarding.current().await;
-        let toast_up = !onboarding_state.welcome_toast_seen && attached.show_welcome_toast;
+        // A browser draws no bar: nothing that fills one is read for it.
+        let onboarding_state = if browser {
+            None
+        } else {
+            Some(onboarding.current().await)
+        };
+        let toast_up = attached.show_welcome_toast
+            && onboarding_state
+                .as_ref()
+                .is_some_and(|o| !o.welcome_toast_seen);
         // A key ends the toast between frames, here or on another client;
         // its cells changed in no VT grid, so only a full redraw clears them.
         if toast_drawn && !toast_up {
             compositor.force_redraw();
             toast_drawn = false;
         }
-        let daemon_uptime = daemon_start.elapsed();
-        let last_action_ref = attached.last_action.as_ref().map(|(s, i)| (s.as_str(), *i));
-        let render_ctx = StatusBarCtx {
-            session_id: attached.session_id,
-            // The graph, not the name cached at attach: a rename shows at once.
-            session_name: snap
-                .sessions
-                .get(&attached.session_id)
-                .map_or(attached.name.as_str(), |s| s.name.as_str()),
-            active_window_id: attached.active_window_id,
-            active_pane_id: attached.active_pane_id,
-            session_meta: &session_meta,
-            onboarding: &onboarding_state,
-            daemon_uptime,
-            nerd_fonts,
-            prefix_label: &prefix_label,
-            client_cols: cols,
-            // As resolved for this frame: the one that ends it drops the flag.
-            copy_mode_active: modal.is_some(),
-            last_action: last_action_ref,
-            action_error: attached.action_error.as_deref(),
+        let bar = match &onboarding_state {
+            None => None,
+            Some(onboarding_state) => {
+                let session_meta = meta_cache.get(attached.session_id).await;
+                let daemon_uptime = daemon_start.elapsed();
+                let last_action_ref = attached.last_action.as_ref().map(|(s, i)| (s.as_str(), *i));
+                let render_ctx = StatusBarCtx {
+                    session_id: attached.session_id,
+                    // The graph, not the name cached at attach: a rename shows at once.
+                    session_name: snap
+                        .sessions
+                        .get(&attached.session_id)
+                        .map_or(attached.name.as_str(), |s| s.name.as_str()),
+                    active_window_id: attached.active_window_id,
+                    active_pane_id: attached.active_pane_id,
+                    session_meta: &session_meta,
+                    onboarding: onboarding_state,
+                    daemon_uptime,
+                    nerd_fonts,
+                    prefix_label: &prefix_label,
+                    client_cols: cols,
+                    // As resolved for this frame: the one that ends it drops the flag.
+                    copy_mode_active: modal.is_some(),
+                    last_action: last_action_ref,
+                    action_error: attached.action_error.as_deref(),
+                };
+                let has_notice = attached.action_error.is_some()
+                    || last_action_ref.is_some_and(|(_, at)| {
+                        at.elapsed() < crate::statusbar_build::ACTION_FEEDBACK_DWELL
+                    });
+                let mut bar = build_status_bar_shared(&snap, &live_theme, &render_ctx);
+                populate_bar(&mut bar, &live_cfg, &segments).await;
+                crate::statusbar_build::append_waiting(
+                    &mut bar,
+                    crate::pane_chrome::waiting_count(
+                        &snap,
+                        attached.session_id,
+                        &live_cfg.program_status,
+                    ),
+                    &live_theme,
+                    nerd_fonts,
+                    cols,
+                );
+                if let Some(toast) = peer_toast
+                    .as_ref()
+                    .filter(|t| !has_notice && t.until > tokio::time::Instant::now())
+                {
+                    let shux_core::theme::Rgb { r, g, b } = if toast.warn {
+                        live_theme.status_error
+                    } else {
+                        live_theme.status_shared
+                    };
+                    bar.center = vec![shux_ui::StatusSegment::styled(
+                        format!(" {} ", toast.text),
+                        crossterm::style::Color::Rgb { r, g, b },
+                        toast.warn,
+                    )];
+                }
+                crate::statusbar_build::append_viewing(
+                    &mut bar,
+                    bar_label.as_ref(),
+                    &live_theme,
+                    cols,
+                );
+                crate::statusbar_build::append_sharing(
+                    &mut bar,
+                    sizing.sharing,
+                    &live_theme,
+                    cols,
+                    if plain { "*" } else { "◉" },
+                    has_notice,
+                );
+                if has_notice {
+                    crate::statusbar_build::make_room_for_notice(&mut bar, cols);
+                }
+                if no_color {
+                    crate::statusbar_build::monochrome(&mut bar);
+                }
+                Some(bar)
+            }
         };
-        let has_notice = attached.action_error.is_some()
-            || last_action_ref.is_some_and(|(_, at)| {
-                at.elapsed() < crate::statusbar_build::ACTION_FEEDBACK_DWELL
-            });
-        let mut bar = build_status_bar_shared(&snap, &live_theme, &render_ctx);
-        populate_bar(&mut bar, &live_cfg, &segments).await;
-        crate::statusbar_build::append_waiting(
-            &mut bar,
-            crate::pane_chrome::waiting_count(&snap, attached.session_id, &live_cfg.program_status),
-            &live_theme,
-            nerd_fonts,
-            cols,
-        );
-        if let Some(toast) = peer_toast
-            .as_ref()
-            .filter(|t| !has_notice && t.until > tokio::time::Instant::now())
-        {
-            let shux_core::theme::Rgb { r, g, b } = if toast.warn {
-                live_theme.status_error
-            } else {
-                live_theme.status_shared
-            };
-            bar.center = vec![shux_ui::StatusSegment::styled(
-                format!(" {} ", toast.text),
-                crossterm::style::Color::Rgb { r, g, b },
-                toast.warn,
-            )];
-        }
-        crate::statusbar_build::append_viewing(&mut bar, bar_label.as_ref(), &live_theme, cols);
-        crate::statusbar_build::append_sharing(
-            &mut bar,
-            sizing.sharing,
-            &live_theme,
-            cols,
-            if plain { "*" } else { "◉" },
-            has_notice,
-        );
-        if has_notice {
-            crate::statusbar_build::make_room_for_notice(&mut bar, cols);
-        }
-        if no_color {
-            crate::statusbar_build::monochrome(&mut bar);
-        }
 
         // Welcome-toast lifecycle: if it's still showing and the
         // first-render-tick has passed, mark seen on the daemon side.
@@ -2463,7 +2496,7 @@ async fn run_render_loop(
             focused: attached.active_pane_id,
             vts: &vt_refs,
             chrome: Some(&pane_chrome),
-            status_bar: (!browser).then_some(&bar),
+            status_bar: bar.as_ref(),
             geometry: Some(&geometry),
         };
         compositor.set_cursor_hidden(
@@ -2706,6 +2739,9 @@ const RENDER_PART_BYTES: usize = 8 * 1024 * 1024;
 /// The shortest gap between two frames of one client while output arrives
 /// faster than it renders. Output after an idle wait draws at once.
 const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+
+/// The shortest gap between a frame and one drawn for a change of peers.
+const PRESENCE_REDRAW: Duration = Duration::from_millis(100);
 
 /// How long the first-attach welcome toast stays on screen before
 /// auto-dismissing. Tuned for "long enough to read, short enough to
