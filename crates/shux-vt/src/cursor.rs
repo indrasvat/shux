@@ -26,7 +26,7 @@ pub struct SavedCursor {
     /// coordinates, which no reflow moves.
     pub on_alternate: bool,
     /// The saved cursor's [`Cursor::after_print`].
-    pub(crate) after_print: bool,
+    pub after_print: bool,
 }
 
 /// Terminal cursor state.
@@ -55,7 +55,7 @@ pub struct Cursor {
     pub saved: Option<SavedCursor>,
     /// Printing put the cursor here and no cursor command has run since: it
     /// is an insertion point, not an addressed position.
-    pub(crate) after_print: bool,
+    pub after_print: bool,
 }
 
 impl Cursor {

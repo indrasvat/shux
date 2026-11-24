@@ -166,6 +166,7 @@ pub(crate) fn blank_like(cell: &Cell) -> Cell {
             flags,
         },
         extended: None,
+        meta: Default::default(),
     }
 }
 
