@@ -455,15 +455,6 @@ trait AttachStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin 
 
 impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static> AttachStream for S {}
 
-/// Who decides what a connection may do.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Scope {
-    /// Its hello: any session by name or id, writable or read-only.
-    Hello,
-    /// An in-process caller: read-only, to exactly this session.
-    ReadOnly(SessionId),
-}
-
 /// Handle one attach connection: handshake, then run the streaming loop.
 #[expect(clippy::too_many_arguments, reason = "independent inputs")]
 async fn handle_attach_connection(
@@ -476,60 +467,6 @@ async fn handle_attach_connection(
     onboarding: crate::onboarding::OnboardingHandle,
     daemon_start: std::time::Instant,
     cancel: CancellationToken,
-) -> anyhow::Result<()> {
-    serve_connection(
-        stream,
-        (graph, io_state, config, segments, meta_cache, onboarding),
-        daemon_start,
-        cancel,
-        Scope::Hello,
-    )
-    .await
-}
-
-/// A read-only attach to `session` over an in-process stream, for a caller
-/// that is not the attach socket (the share gateway, #297). The peer speaks
-/// the ordinary protocol and must ask for `read_only`; it gets no other
-/// session whatever its hello names, and no way to write to a pane: this
-/// connection never holds a [`PtyWrite`].
-#[expect(clippy::too_many_arguments, reason = "independent inputs")]
-pub async fn serve_read_only(
-    stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
-    graph: GraphHandle,
-    io_state: Arc<Mutex<PaneIoState>>,
-    config: ConfigHandle,
-    segments: SegmentCache,
-    meta_cache: crate::session_meta::SessionMetaCache,
-    onboarding: crate::onboarding::OnboardingHandle,
-    daemon_start: std::time::Instant,
-    cancel: CancellationToken,
-    session: SessionId,
-) -> anyhow::Result<()> {
-    serve_connection(
-        stream,
-        (graph, io_state, config, segments, meta_cache, onboarding),
-        daemon_start,
-        cancel,
-        Scope::ReadOnly(session),
-    )
-    .await
-}
-
-type Shared = (
-    GraphHandle,
-    Arc<Mutex<PaneIoState>>,
-    ConfigHandle,
-    SegmentCache,
-    crate::session_meta::SessionMetaCache,
-    crate::onboarding::OnboardingHandle,
-);
-
-async fn serve_connection(
-    stream: impl AttachStream,
-    (graph, io_state, config, segments, meta_cache, onboarding): Shared,
-    daemon_start: std::time::Instant,
-    cancel: CancellationToken,
-    scope: Scope,
 ) -> anyhow::Result<()> {
     let (stream, taken) = crate::write_progress::Metered::new(stream);
     let mut framed = Framed::new(stream, create_codec());
@@ -574,32 +511,11 @@ async fn serve_connection(
         return Ok(());
     }
 
-    if let Scope::ReadOnly(_) = scope
-        && !hello.read_only
-    {
-        send_ready_error(
-            &mut framed,
-            "read_only_required",
-            "this connection only attaches read-only",
-        )
-        .await?;
-        return Ok(());
-    }
     let read_only = hello.read_only;
 
     // Step 2: Resolve the target session. A watcher only finds one.
-    let resolved = match scope {
-        Scope::ReadOnly(id) => {
-            let snap = graph.snapshot();
-            match snap.sessions.get(&id) {
-                Some(sess) => attached_to(&snap, sess),
-                None => Err(anyhow::anyhow!("session {id} not found")),
-            }
-        }
-        Scope::Hello => {
-            resolve_or_create_session(&graph, &hello.session_name, &meta_cache, !read_only).await
-        }
-    };
+    let resolved =
+        resolve_or_create_session(&graph, &hello.session_name, &meta_cache, !read_only).await;
     let mut session = match resolved {
         Ok(s) => s,
         Err(e) => {
@@ -773,6 +689,8 @@ struct AttachedSession {
     cell_pixels: Option<(u16, u16)>,
     /// A watcher: it moves nothing shared, focus included.
     read_only: bool,
+    /// Redraws this client alone, for a change only it shows.
+    redraw: Arc<tokio::sync::Notify>,
 }
 
 /// Frames queued to one client before the render loop waits for it.
@@ -860,6 +778,7 @@ fn attached_to(
         client: None,
         cell_pixels: None,
         read_only: false,
+        redraw: Arc::default(),
     })
 }
 
@@ -1532,10 +1451,11 @@ async fn run_attach_loop(
                             }
                         }
                         // A key no overlay took reaches a pane only from a writer.
+                        // Not one that only cleared a selection, or Escape.
                         let Some(write) = &pty_write else {
-                            render_session.lock().await.last_action =
-                                Some((READ_ONLY_NOTICE.into(), std::time::Instant::now()));
-                            io_state.lock().await.render_pulse.bump();
+                            if !cleared_mouse_selection && bytes != [ESC] {
+                                refuse(&render_session).await;
+                            }
                             continue;
                         };
                         let active = render_session.lock().await.active_pane_id;
@@ -1607,7 +1527,12 @@ async fn run_attach_loop(
                         let (old_cols, old_rows) =
                             std::mem::replace(&mut *client_size.lock().await, (cols, rows));
                         clients.set_size(registry_id, cols, rows);
-                        if let Some(bus) = bus.as_ref().filter(|_| (old_cols, old_rows) != (cols, rows)) {
+                        // A watcher's size moves nothing: `client list` shows it,
+                        // and a burst of its resizes must not flood the bus.
+                        if let Some(bus) = bus
+                            .as_ref()
+                            .filter(|_| !read_only && (old_cols, old_rows) != (cols, rows))
+                        {
                             bus.publish(shux_core::event::EventData::ClientResized {
                                 client_id: registry_id,
                                 old_cols,
@@ -1618,16 +1543,17 @@ async fn run_attach_loop(
                         }
                         // Only the driver's size reaches the panes, and a watcher
                         // never drives.
-                        if !read_only {
+                        if read_only {
+                            // Only this client's own screen changed.
+                            render_session.lock().await.redraw.notify_one();
+                        } else {
                             reconcile_session(&graph, &io_state, &config, session.session_id).await;
+                            let pulse = io_state.lock().await.render_pulse.clone();
+                            pulse.bump();
                         }
-                        let pulse = io_state.lock().await.render_pulse.clone();
-                        pulse.bump();
                     }
                     AttachClientFrame::Action { kind, .. } if read_only && !viewer_action(kind) => {
-                        render_session.lock().await.last_action =
-                            Some((READ_ONLY_NOTICE.into(), std::time::Instant::now()));
-                        io_state.lock().await.render_pulse.bump();
+                        refuse(&render_session).await;
                     }
                     AttachClientFrame::Action { kind, args } => {
                         sync_focus(&graph, &mut session, &render_session).await;
@@ -1683,11 +1609,7 @@ async fn run_attach_loop(
                         }
                         // An action that did something is input, and may have
                         // changed the layout the panes are sized from.
-                        let committed = action_result.is_ok()
-                            && !matches!(
-                                kind,
-                                ActionKind::Redraw | ActionKind::ToggleHelp | ActionKind::EnterCopyMode
-                            );
+                        let committed = action_result.is_ok() && !viewer_action(kind);
                         if committed {
                             clients.mark_input(registry_id, tokio::time::Instant::now());
                             reconcile_session(&graph, &io_state, &config, session.session_id).await;
@@ -1768,8 +1690,7 @@ async fn run_attach_loop(
                                 // another cell than its press.
                                 let driving = clients
                                     .session_view(session.session_id, Some(registry_id), &[])
-                                    .role
-                                    == Some(crate::clients::Role::Driving);
+                                    .driving;
                                 // The driver's release too: the hold it had while
                                 // still lasts a settle window past letting go.
                                 if input && driving && kind != MouseKind::Move {
@@ -2068,7 +1989,8 @@ async fn run_render_loop(
     // A driver handoff at the same size moves no pane, but changes this
     // client's status bar.
     let mut registry = clients.presence();
-    let mut peers: Option<(usize, usize)> = None;
+    let mut peers: Option<Vec<(shux_core::event::ClientId, bool)>> = None;
+    let own_redraw = session.lock().await.redraw.clone();
     let mut peer_toast: Option<PeerToast> = None;
     // When a pending hidden-cursor latch will move a pane: a frame then.
     let mut latch_at: Option<u64> = None;
@@ -2126,6 +2048,7 @@ async fn run_render_loop(
                 compositor.force_redraw();
             }
             _ = tick.tick() => {}
+            () = own_redraw.notified() => {}
             // A peer toast ends on time though nothing else draws.
             () = async {
                 match peer_toast.as_ref().map(|t| t.until) {
@@ -2290,15 +2213,20 @@ async fn run_render_loop(
         let sizing = clients.session_view(attached.session_id, attached.client, &pane_ids);
         // Peers joining or leaving since the last frame, as one net change;
         // the first frame only takes stock.
-        if let Some(sharing) = sizing.sharing {
-            let now = (sharing.writers, sharing.viewers);
-            if let Some(before) = peers.replace(now)
-                && let Some((text, warn)) = peer_change(before, now)
-            {
+        if sizing.sharing.is_some()
+            && let Some(before) = peers.replace(sizing.peers.clone())
+            && let Some((text, warn)) = peer_change(&before, &sizing.peers)
+        {
+            let at = tokio::time::Instant::now();
+            // A warning stands until its own expiry: only another replaces it.
+            let held = peer_toast
+                .as_ref()
+                .is_some_and(|t| t.warn && !warn && t.until > at);
+            if !held {
                 peer_toast = Some(PeerToast {
                     text,
                     warn,
-                    until: tokio::time::Instant::now() + PEER_TOAST_DWELL,
+                    until: at + PEER_TOAST_DWELL,
                 });
             }
         }
@@ -2388,10 +2316,7 @@ async fn run_render_loop(
         crate::statusbar_build::append_viewing(&mut bar, bar_label.as_ref(), &live_theme, cols);
         crate::statusbar_build::append_sharing(
             &mut bar,
-            sizing
-                .sharing
-                .and_then(crate::statusbar_build::Badge::of)
-                .as_ref(),
+            sizing.sharing,
             &live_theme,
             cols,
             if plain || no_color { "*" } else { "◉" },
@@ -2500,7 +2425,12 @@ async fn run_render_loop(
         if attached.help_visible {
             let base_emitted = !compositor.inner().is_empty();
             if sheet_due(&mut help_sheet, sheet(prefix_label.clone()), base_emitted) {
-                shux_ui::render_help_overlay_into(
+                let sheet = if attached.read_only {
+                    shux_ui::render_viewer_help_overlay_into
+                } else {
+                    shux_ui::render_help_overlay_into
+                };
+                sheet(
                     compositor.inner_mut(),
                     cols,
                     rows,
@@ -2670,26 +2600,35 @@ struct PeerToast {
     until: tokio::time::Instant,
 }
 
-/// What changed between two counts of a client's other `(writers, viewers)`,
+/// What changed between two frames' lists of a client's peers, by identity,
 /// and whether it warns: a writer joining outranks everything else that
-/// happened between the two frames.
-fn peer_change(before: (usize, usize), now: (usize, usize)) -> Option<(String, bool)> {
+/// happened between them, though another left meanwhile and the counts held.
+fn peer_change(
+    before: &[(shux_core::event::ClientId, bool)],
+    now: &[(shux_core::event::ClientId, bool)],
+) -> Option<(String, bool)> {
     let some = |n: usize, one: &str| match n {
         1 => format!("a {one}"),
         n => format!("{n} {one}s"),
     };
-    let ((bw, bv), (nw, nv)) = (before, now);
-    Some(if nw > bw {
+    let new = |a: &[_], b: &[_], votes| {
+        a.iter()
+            .filter(|p: &&(_, bool)| p.1 == votes && !b.contains(*p))
+            .count()
+    };
+    let (joined_w, joined_v) = (new(now, before, true), new(now, before, false));
+    let (left_w, left_v) = (new(before, now, true), new(before, now, false));
+    Some(if joined_w > 0 {
         (
-            format!("! {} joined · can type", some(nw - bw, "writer")),
+            format!("! {} joined · can type", some(joined_w, "writer")),
             true,
         )
-    } else if nv > bv {
-        (format!("{} joined", some(nv - bv, "viewer")), false)
-    } else if nw < bw {
-        (format!("{} left", some(bw - nw, "writer")), false)
-    } else if nv < bv {
-        (format!("{} left", some(bv - nv, "viewer")), false)
+    } else if joined_v > 0 {
+        (format!("{} joined", some(joined_v, "viewer")), false)
+    } else if left_w > 0 {
+        (format!("{} left", some(left_w, "writer")), false)
+    } else if left_v > 0 {
+        (format!("{} left", some(left_v, "viewer")), false)
     } else {
         return None;
     })
@@ -2698,7 +2637,16 @@ fn peer_change(before: (usize, usize), now: (usize, usize)) -> Option<(String, b
 /// What a watcher's refused key or action flashes in its status bar.
 const READ_ONLY_NOTICE: &str = "read-only: keys are not sent";
 
-/// The actions a watcher keeps: its own help, copy mode and redraw.
+/// Tell a watcher its key or action was refused, redrawing only its own
+/// screen: nothing changed that anyone else shows.
+async fn refuse(session: &Arc<Mutex<AttachedSession>>) {
+    let mut s = session.lock().await;
+    s.last_action = Some((READ_ONLY_NOTICE.into(), std::time::Instant::now()));
+    s.redraw.notify_one();
+}
+
+/// The actions a watcher keeps: its own help, copy mode and redraw. The
+/// rest change something shared.
 fn viewer_action(kind: ActionKind) -> bool {
     matches!(
         kind,
@@ -3308,7 +3256,9 @@ async fn handle_copy_mode_mouse(
             // session-global — only one is active at a time).
             let viewport = current_viewport(client_size, config).await;
             let cursor_pane = pane_under_pointer(graph, &attached, viewport, col, row);
-            if cm.wheel_initiated && cursor_pane != cm.pane {
+            // A watcher's wheel only ever scrolls the focused pane, so the
+            // pointer elsewhere hands it nowhere: it keeps scrolling.
+            if cm.wheel_initiated && !attached.read_only && cursor_pane != cm.pane {
                 session.lock().await.copy_mode = None;
                 *dragging = SelectionDrag::None;
                 return Ok(false);
@@ -5929,6 +5879,7 @@ mod tests {
             client: None,
             cell_pixels: None,
             read_only: false,
+            redraw: Arc::default(),
         };
 
         AttachFixture {
@@ -14959,8 +14910,19 @@ mod tests {
         fixture.stop();
     }
 
-    /// A read-only client's yank reaches only its own terminal, and a writer's
-    /// only its own.
+    /// A frame that puts text on the client's clipboard: OSC 52, sent outside
+    /// any numbered frame.
+    fn is_yank(frame: &AttachServerFrame) -> bool {
+        match frame {
+            AttachServerFrame::Render { data, frame: None } => BASE64
+                .decode(data.as_bytes())
+                .is_ok_and(|b| b.windows(4).any(|w| w == b"\x1b]52")),
+            _ => false,
+        }
+    }
+
+    /// A read-only client's yank reaches only its own terminal, never a
+    /// writer attached beside it.
     #[tokio::test(start_paused = true)]
     async fn a_yank_reaches_only_the_client_that_asked() {
         let fixture = attach_fixture().await;
@@ -14983,20 +14945,14 @@ mod tests {
         viewer.key(b"v").await;
         viewer.key(b"$").await;
         viewer.key(b"y").await;
-        let osc = |f: &AttachServerFrame| match f {
-            AttachServerFrame::Render { data, frame: None } => BASE64
-                .decode(data.as_bytes())
-                .is_ok_and(|b| b.windows(4).any(|w| w == b"\x1b]52")),
-            _ => false,
-        };
         assert!(
-            viewer.frames_until(|f, _| osc(f)).await,
+            viewer.frames_until(|f, _| is_yank(f)).await,
             "the viewer's yank never came"
         );
         idle_for(QUIET).await;
         let mut leaked = false;
         while let Ok(Some(Ok(buf))) = tokio::time::timeout(QUIET, host.framed.next()).await {
-            leaked |= osc(&serde_json::from_slice(&buf).expect("server frame"));
+            leaked |= is_yank(&serde_json::from_slice(&buf).expect("server frame"));
         }
         assert!(!leaked, "the viewer's yank reached the writer");
         viewer.stop().await;
@@ -15080,91 +15036,6 @@ mod tests {
         fixture.stop();
     }
 
-    /// The share gateway's entry (#297): read-only to exactly its session,
-    /// whatever the hello names, and refused unless the hello asks read-only.
-    #[tokio::test(start_paused = true)]
-    async fn the_in_process_entry_is_read_only_to_its_own_session() {
-        let fixture = attach_fixture().await;
-        let (mut writes, _rx, _s) = seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
-        let other = fixture
-            .graph
-            .create_session("other".into(), std::env::temp_dir())
-            .await
-            .expect("another session");
-        for (read_only, named, want) in [
-            (false, "other", Err("read_only_required")),
-            (true, "other", Ok(fixture.session_id)),
-        ] {
-            let (server_stream, client_stream) = tokio::io::duplex(1 << 16);
-            let cancel = fixture.cancel.child_token();
-            let server = tokio::spawn(serve_read_only(
-                server_stream,
-                fixture.graph.clone(),
-                fixture.io_state.clone(),
-                test_config(),
-                SegmentCache::new(),
-                crate::session_meta::SessionMetaCache::new(),
-                crate::onboarding::OnboardingHandle::from_state_for_test(Default::default()),
-                std::time::Instant::now(),
-                cancel.clone(),
-                fixture.session_id,
-            ));
-            let mut framed = Framed::new(client_stream, create_codec());
-            let hello = AttachHello {
-                protocol: ATTACH_PROTOCOL_VERSION,
-                session_name: Some(named.into()),
-                cols: 80,
-                rows: 24,
-                client_version: "gateway".into(),
-                graphics: false,
-                plain: false,
-                read_only,
-                no_color: false,
-            };
-            framed
-                .send(Bytes::from(serde_json::to_vec(&hello).unwrap()))
-                .await
-                .unwrap();
-            let reply = tokio::time::timeout(shux_testkit::BUDGET, framed.next())
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
-            match (serde_json::from_slice::<AttachReady>(&reply).unwrap(), want) {
-                (AttachReady::Error { code, .. }, Err(want)) => assert_eq!(code, want),
-                (
-                    AttachReady::Ok {
-                        session_id,
-                        read_only: true,
-                        ..
-                    },
-                    Ok(want),
-                ) => {
-                    assert_eq!(session_id, want.to_string());
-                    assert_ne!(session_id, other.to_string());
-                    let input = AttachClientFrame::Input {
-                        data: BASE64.encode(b"x"),
-                    };
-                    framed
-                        .send(Bytes::from(serde_json::to_vec(&input).unwrap()))
-                        .await
-                        .unwrap();
-                    idle_for(QUIET).await;
-                    assert!(
-                        writes.try_recv().is_err(),
-                        "the gateway's key reached a pane"
-                    );
-                    let listed = fixture.io_state.lock().await.clients.list();
-                    assert!(listed.iter().all(|c| !c.votes && c.session_id == want));
-                }
-                (got, want) => panic!("{got:?} for {want:?}"),
-            }
-            cancel.cancel();
-            let _ = tokio::time::timeout(shux_testkit::BUDGET, server).await;
-        }
-        fixture.stop();
-    }
-
     /// The status row of `text`, a client's screen.
     fn bar_of(text: &str) -> &str {
         text.lines().last().unwrap_or_default()
@@ -15200,17 +15071,18 @@ mod tests {
         // The writer takes the panes; the host keeps its seat.
         writer.key(b"x").await;
         idle_for(QUIET).await;
-        let driver = fixture
-            .io_state
-            .lock()
-            .await
-            .clients
-            .driver(fixture.session_id);
-        assert_eq!(
-            driver.map(|d| d.cols),
-            Some(80),
-            "the writer did not take the panes"
-        );
+        let clients = fixture.io_state.lock().await.clients.clone();
+        let drives = clients
+            .list()
+            .iter()
+            .filter(|c| {
+                clients
+                    .session_view(fixture.session_id, Some(c.id), &[])
+                    .driving
+            })
+            .map(|c| c.cols)
+            .collect::<Vec<_>>();
+        assert_eq!(drives, [80], "the writer did not take the panes");
         host.catch_up().await;
         assert!(bar_of(&host.screen.capture_text(None)).contains("◉ shared · 1 can type"));
         // The host leaves: the writer takes its seat, and is only watched.
@@ -15223,103 +15095,197 @@ mod tests {
         fixture.stop();
     }
 
-    /// With no fallback tick, a host's bar follows its peers on their own:
-    /// the badge appears and goes, a peer toast clears at its expiry, and a
-    /// share link shows `0 watching`.
-    #[tokio::test(start_paused = true)]
-    async fn an_idle_bar_follows_peers_and_a_share_link() {
-        let fixture = attach_fixture().await;
-        let clients = fixture.io_state.lock().await.clients.clone();
-        let info = |votes| crate::clients::ClientInfo {
-            id: shux_core::event::ClientId::new(),
-            session_id: fixture.session_id,
-            cols: 100,
-            rows: 30,
-            attached_at: std::time::SystemTime::now(),
-            votes,
-            last_input: None,
-        };
-        let host = info(true);
-        let _host = clients.register(host.clone(), CancellationToken::new());
-        let onboarding = crate::onboarding::OnboardingHandle::from_state_for_test(
-            crate::onboarding::OnboardingState {
-                prefix_discovered: true,
-                welcome_toast_seen: true,
-            },
-        );
-        let (tx, mut rx) = mpsc::channel(64);
-        let cancel = fixture.cancel.child_token();
-        let attached = AttachedSession {
-            client: Some(host.id),
-            ..fixture.attached.clone()
-        };
-        let render = tokio::spawn(run_render_loop(
-            fixture.graph.clone(),
-            fixture.io_state.clone(),
-            test_config(),
-            SegmentCache::new(),
-            crate::session_meta::SessionMetaCache::new(),
-            onboarding,
-            std::time::Instant::now(),
-            Arc::new(Mutex::new(attached)),
-            Arc::new(Mutex::new((100, 30))),
-            tx,
-            cancel.clone(),
-            false,
-            false,
-            false,
-            Duration::from_secs(24 * 3600),
-            WELCOME_TOAST_DWELL,
-            shux_vt::monotonic_now_ns,
-        ));
-        let mut screen = shux_vt::VirtualTerminal::new(30, 100);
-        let mut bar_until = async |pred: &dyn Fn(&str) -> bool| {
+    /// A host's status bar, drawn by a render loop with no fallback tick: only
+    /// a change it is told about draws a frame.
+    struct HostBar {
+        clients: crate::clients::ClientRegistry,
+        session: SessionId,
+        screen: shux_vt::VirtualTerminal,
+        rx: mpsc::Receiver<AttachServerFrame>,
+        cancel: CancellationToken,
+        render: tokio::task::JoinHandle<()>,
+        _host: crate::clients::Registered,
+    }
+
+    impl HostBar {
+        async fn start(fixture: &AttachFixture) -> Self {
+            let clients = fixture.io_state.lock().await.clients.clone();
+            let host = Self::info(fixture.session_id, true);
+            let _host = clients.register(host.clone(), CancellationToken::new());
+            let onboarding = crate::onboarding::OnboardingHandle::from_state_for_test(
+                crate::onboarding::OnboardingState {
+                    prefix_discovered: true,
+                    welcome_toast_seen: true,
+                },
+            );
+            let (tx, rx) = mpsc::channel(64);
+            let cancel = fixture.cancel.child_token();
+            let attached = AttachedSession {
+                client: Some(host.id),
+                ..fixture.attached.clone()
+            };
+            let render = tokio::spawn(run_render_loop(
+                fixture.graph.clone(),
+                fixture.io_state.clone(),
+                test_config(),
+                SegmentCache::new(),
+                crate::session_meta::SessionMetaCache::new(),
+                onboarding,
+                std::time::Instant::now(),
+                Arc::new(Mutex::new(attached)),
+                Arc::new(Mutex::new((100, 30))),
+                tx,
+                cancel.clone(),
+                false,
+                false,
+                false,
+                Duration::from_secs(24 * 3600),
+                WELCOME_TOAST_DWELL,
+                shux_vt::monotonic_now_ns,
+            ));
+            let mut bar = Self {
+                clients,
+                session: fixture.session_id,
+                screen: shux_vt::VirtualTerminal::new(30, 100),
+                rx,
+                cancel,
+                render,
+                _host,
+            };
+            bar.until(|bar| !bar.trim().is_empty()).await;
+            bar
+        }
+
+        fn info(session: SessionId, votes: bool) -> crate::clients::ClientInfo {
+            crate::clients::ClientInfo {
+                id: shux_core::event::ClientId::new(),
+                session_id: session,
+                cols: 100,
+                rows: 30,
+                attached_at: std::time::SystemTime::now(),
+                votes,
+                last_input: None,
+            }
+        }
+
+        fn join(&self, votes: bool) -> crate::clients::Registered {
+            self.clients
+                .register(Self::info(self.session, votes), CancellationToken::new())
+        }
+
+        fn now(&self) -> String {
+            bar_of(&self.screen.capture_text(None)).to_string()
+        }
+
+        /// The bar once it satisfies `pred`, checked on the screen as it is
+        /// and after each frame.
+        async fn until(&mut self, pred: impl Fn(&str) -> bool) -> String {
             let deadline = shux_testkit::Deadline::start();
             loop {
-                let row = bar_of(&screen.capture_text(None)).to_string();
+                let row = self.now();
                 if pred(&row) {
                     return row;
                 }
-                match deadline.run(rx.recv()).await {
+                match deadline.run(self.rx.recv()).await {
                     Some(Some(AttachServerFrame::Render { data, .. })) => {
-                        screen.process(&BASE64.decode(data).expect("render base64"));
+                        self.screen
+                            .process(&BASE64.decode(data).expect("render base64"));
                     }
                     Some(Some(_)) => {}
                     _ => panic!("the bar never showed it; it reads {row:?}"),
                 }
             }
-        };
-        bar_until(&|bar| !bar.trim().is_empty()).await;
-        assert!(
-            !bar_until(&|_| true).await.contains('◉'),
-            "a solo host has a badge"
-        );
+        }
 
-        let viewer = clients.register(info(false), CancellationToken::new());
-        bar_until(&|bar| bar.contains("◉ shared · 1 watching") && bar.contains("a viewer joined"))
+        async fn stop(self) {
+            self.cancel.cancel();
+            let _ = self.render.await;
+        }
+    }
+
+    /// With no fallback tick, a host's bar follows its peers on their own:
+    /// the badge appears and goes, and a peer toast clears at its expiry.
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_bar_follows_its_peers() {
+        let fixture = attach_fixture().await;
+        let mut bar = HostBar::start(&fixture).await;
+        assert!(!bar.now().contains('◉'), "a solo host has a badge");
+
+        let viewer = bar.join(false);
+        bar.until(|b| b.contains("◉ shared · 1 watching") && b.contains("a viewer joined"))
             .await;
         let shown = tokio::time::Instant::now();
-        bar_until(&|bar| bar.contains("◉ shared · 1 watching") && !bar.contains("joined")).await;
+        bar.until(|b| b.contains("◉ shared · 1 watching") && !b.contains("joined"))
+            .await;
         let dwelt = shown.elapsed();
         assert!(
             dwelt >= PEER_TOAST_DWELL && dwelt < PEER_TOAST_DWELL * 2,
             "the toast cleared after {dwelt:?}, not at its own expiry"
         );
 
-        let writer = clients.register(info(true), CancellationToken::new());
-        bar_until(&|bar| {
-            bar.contains("◉ shared · 1 can type") && bar.contains("! a writer joined")
-        })
-        .await;
+        let writer = bar.join(true);
+        bar.until(|b| b.contains("◉ shared · 1 can type") && b.contains("! a writer joined"))
+            .await;
         drop((writer, viewer));
-        // Settled: no toast left whose expiry would draw the next change.
-        bar_until(&|bar| !bar.contains('◉') && !bar.contains("left")).await;
-        clients.set_shared(fixture.session_id, true);
-        bar_until(&|bar| bar.contains("◉ shared · 0 watching")).await;
-        clients.set_shared(fixture.session_id, false);
-        bar_until(&|bar| !bar.contains('◉')).await;
-        cancel.cancel();
-        let _ = render.await;
+        bar.until(|b| !b.contains('◉')).await;
+        bar.stop().await;
+        fixture.stop();
+    }
+
+    /// Review of #191: one writer leaving as another joins keeps the counts,
+    /// and is still a new client that can type.
+    #[tokio::test(start_paused = true)]
+    async fn a_writer_swapped_in_at_equal_counts_still_warns() {
+        let fixture = attach_fixture().await;
+        let mut bar = HostBar::start(&fixture).await;
+        let first = bar.join(true);
+        bar.until(|b| b.contains("! a writer joined")).await;
+        bar.until(|b| b.contains("◉ shared · 1 can type") && !b.contains("joined"))
+            .await;
+        // Between two frames: the counts end where they began.
+        let second = bar.join(true);
+        drop(first);
+        let shown = bar.until(|b| b.contains("! a writer joined")).await;
+        assert!(shown.contains("◉ shared · 1 can type"), "{shown:?}");
+        drop(second);
+        bar.stop().await;
+        fixture.stop();
+    }
+
+    /// Review of #191: a warning holds until its own expiry; a later change
+    /// that warns of nothing does not replace it.
+    #[tokio::test(start_paused = true)]
+    async fn a_writer_warning_outlasts_later_peer_changes() {
+        let fixture = attach_fixture().await;
+        let mut bar = HostBar::start(&fixture).await;
+        let old = bar.join(true);
+        bar.until(|b| b.contains("! a writer joined")).await;
+        bar.until(|b| !b.contains("joined")).await;
+
+        let new = bar.join(true);
+        bar.until(|b| b.contains("! a writer joined")).await;
+        let warned = tokio::time::Instant::now();
+        tokio::time::advance(Duration::from_millis(50)).await;
+        drop(old);
+        let after_leave = bar
+            .until(|b| !b.contains("2 can type") && b.contains("1 can type"))
+            .await;
+        let viewer = bar.join(false);
+        let after_view = bar.until(|b| b.contains("1 watching")).await;
+        for shown in [&after_leave, &after_view] {
+            assert!(
+                shown.contains("! a writer joined"),
+                "a later change replaced the warning: {shown:?}"
+            );
+        }
+        bar.until(|b| !b.contains("joined") && !b.contains("left"))
+            .await;
+        assert!(
+            warned.elapsed() >= PEER_TOAST_DWELL,
+            "the warning went early"
+        );
+        drop((new, viewer));
+        bar.stop().await;
         fixture.stop();
     }
 
@@ -15364,15 +15330,285 @@ mod tests {
         );
         let mut yanked = false;
         while let Ok(Some(Ok(buf))) = tokio::time::timeout(QUIET, viewer.framed.next()).await {
-            if let Ok(AttachServerFrame::Render { data, frame: None }) =
-                serde_json::from_slice(&buf)
-            {
-                yanked |= BASE64
-                    .decode(data.as_bytes())
-                    .is_ok_and(|b| b.windows(4).any(|w| w == b"\x1b]52"));
-            }
+            yanked |= serde_json::from_slice(&buf).is_ok_and(|f| is_yank(&f));
         }
         assert!(!yanked, "a yank copied from a pane focus moved to");
+        viewer.stop().await;
+        fixture.stop();
+    }
+
+    /// Review of #191: a viewer's help sheet says it is read-only and lists
+    /// only what a viewer can do.
+    #[tokio::test(start_paused = true)]
+    async fn a_viewers_help_lists_only_what_it_can_do() {
+        let fixture = attach_fixture().await;
+        let _io1 = seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+        let _io2 = seed_io_for_pane(&fixture.io_state, fixture.second_pane).await;
+        let onboarding =
+            crate::onboarding::OnboardingHandle::from_state_for_test(Default::default());
+        let mut viewer = Client::watch(&fixture, 120, 50, onboarding).await;
+        viewer
+            .send(&AttachClientFrame::Action {
+                kind: ActionKind::ToggleHelp,
+                args: Default::default(),
+            })
+            .await;
+        let mut sheet = String::new();
+        assert!(
+            viewer
+                .frames_until(|_, text| {
+                    sheet = text.to_string();
+                    text.contains("Esc or q to dismiss")
+                })
+                .await,
+            "no help sheet"
+        );
+        let body: String = sheet
+            .lines()
+            .filter(|l| l.contains('│') || l.contains('╭'))
+            .collect();
+        assert!(
+            body.contains("read-only"),
+            "the sheet does not say read-only: {sheet}"
+        );
+        for (what, gone) in [
+            ("split", "Split"),
+            ("kill", "Kill"),
+            ("resize", "Resize"),
+            ("windows", "Create / next"),
+            ("focus", "Focus pane"),
+        ] {
+            assert!(
+                !body.contains(gone),
+                "a viewer's help offers {what}: {sheet}"
+            );
+        }
+        for kept in ["Enter copy mode", "search", "Scroll", "Detach", "redraw"] {
+            assert!(
+                body.contains(kept),
+                "a viewer's help lacks {kept:?}: {sheet}"
+            );
+        }
+        viewer.stop().await;
+        fixture.stop();
+    }
+
+    /// Review of #191: a viewer's resizes publish no `client.resized`: a
+    /// burst would flush the bus's history for every subscriber.
+    #[tokio::test(start_paused = true)]
+    async fn a_viewers_resizes_publish_no_events() {
+        let fixture = attach_fixture().await;
+        let _io1 = seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+        let bus = shux_core::bus::EventBus::new();
+        let mut events = bus.subscribe_filtered(vec!["client.resized".into()]);
+        fixture.io_state.lock().await.event_bus = Some(bus);
+        let mut host = Client::attach(&fixture, 90).await;
+        let onboarding =
+            crate::onboarding::OnboardingHandle::from_state_for_test(Default::default());
+        let mut viewer = Client::watch(&fixture, 80, 24, onboarding).await;
+        for n in 0..50 {
+            viewer
+                .send(&AttachClientFrame::Resize {
+                    cols: 60 + n,
+                    rows: 20,
+                })
+                .await;
+        }
+        idle_for(QUIET).await;
+        host.send(&AttachClientFrame::Resize {
+            cols: 133,
+            rows: 33,
+        })
+        .await;
+        let first = tokio::time::timeout(shux_testkit::BUDGET, events.recv())
+            .await
+            .expect("no resize event")
+            .expect("bus closed");
+        match first {
+            shux_core::bus::SubscriptionEvent::Event(shux_core::event::Event {
+                data: shux_core::event::EventData::ClientResized { new_cols, .. },
+                ..
+            }) => {
+                assert_eq!(new_cols, 133, "a viewer's resize was published first")
+            }
+            other => panic!("{other:?}"),
+        }
+        viewer.stop().await;
+        host.stop().await;
+        fixture.stop();
+    }
+
+    /// Review of #191: a refused key or action redraws the viewer that sent
+    /// it, and wakes no other client's render loop.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_viewer_key_wakes_only_its_own_connection() {
+        let fixture = attach_fixture().await;
+        let _io1 = seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+        let onboarding =
+            crate::onboarding::OnboardingHandle::from_state_for_test(Default::default());
+        let mut viewer = Client::watch(&fixture, 90, 24, onboarding).await;
+        idle_for(QUIET).await;
+        viewer.catch_up().await;
+        let mut pulse = fixture.io_state.lock().await.render_pulse.subscribe();
+        pulse.borrow_and_update();
+        for frame in [
+            AttachClientFrame::Input {
+                data: BASE64.encode(b"x"),
+            },
+            AttachClientFrame::Action {
+                kind: ActionKind::SplitSmart,
+                args: Default::default(),
+            },
+        ] {
+            viewer.send(&frame).await;
+            assert!(
+                viewer
+                    .frames_until(|_, text| bar_of(text).contains(READ_ONLY_NOTICE))
+                    .await,
+                "the viewer was not told"
+            );
+            assert!(
+                !pulse.has_changed().unwrap(),
+                "a refused {frame:?} woke every client"
+            );
+            idle_for(crate::statusbar_build::ACTION_FEEDBACK_DWELL * 2).await;
+            viewer.catch_up().await;
+        }
+        viewer.stop().await;
+        fixture.stop();
+    }
+
+    /// Review of #191: a viewer's wheel over the pane it does not focus keeps
+    /// scrolling the focused pane, three lines a tick, as the attach loop
+    /// routes it.
+    #[tokio::test(start_paused = true)]
+    async fn a_viewers_wheel_over_another_pane_keeps_scrolling() {
+        let fixture = attach_fixture().await;
+        let _io1 = seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+        let _io2 = seed_io_for_pane(&fixture.io_state, fixture.second_pane).await;
+        let history: String = (0..100).map(|i| format!("line {i}\r\n")).collect();
+        for pane in [fixture.first_pane, fixture.second_pane] {
+            if let Some(vt) = fixture.io_state.lock().await.vts.get_mut(&pane) {
+                vt.process(history.as_bytes());
+            }
+        }
+        let session = Arc::new(Mutex::new(AttachedSession {
+            read_only: true,
+            ..fixture.attached.clone()
+        }));
+        let client_size = Arc::new(Mutex::new((100, 30)));
+        let viewport = current_viewport(&client_size, &test_config()).await;
+        let active = fixture.attached.active_pane_id;
+        let other = fixture.graph.snapshot().windows[&fixture.first_window]
+            .layout
+            .compute_rects(viewport)
+            .into_iter()
+            .find_map(|(p, r)| (p != active).then_some((r.x + 1, r.y + 1)))
+            .expect("another pane");
+        let (out_tx, _out_rx) = mpsc::channel(8);
+        let mut drag = SelectionDrag::None;
+        for _ in 0..3 {
+            // Each tick lands on the frame drawn after the one before.
+            ship_frame(&fixture.graph, &fixture.io_state, &session, &client_size).await;
+            let consumed = handle_copy_mode_mouse(
+                MouseKind::ScrollUp,
+                ProtoMouseButton::None,
+                other.0,
+                other.1,
+                &fixture.graph,
+                &fixture.io_state,
+                &session,
+                &client_size,
+                &test_config(),
+                &out_tx,
+                &mut drag,
+                None,
+            )
+            .await
+            .expect("copy-mode mouse");
+            if !consumed {
+                handle_wheel(
+                    None,
+                    MouseKind::ScrollUp,
+                    other.0,
+                    other.1,
+                    None,
+                    &fixture.graph,
+                    &fixture.io_state,
+                    &session,
+                    &client_size,
+                    &test_config(),
+                )
+                .await
+                .expect("wheel");
+            }
+        }
+        let s = session.lock().await;
+        assert_eq!(s.active_pane_id, active, "the wheel moved focus");
+        assert_eq!(
+            s.copy_mode
+                .as_ref()
+                .map(|cm| cm.view.entry_top - cm.view.top),
+            Some(9),
+            "three ticks did not scroll nine lines"
+        );
+        drop(s);
+        fixture.stop();
+    }
+
+    /// Review of #191: a key that clears a viewer's selection, or Escape, is
+    /// not a refused key: no "keys are not sent" for it.
+    #[tokio::test(start_paused = true)]
+    async fn a_key_that_clears_a_selection_flashes_no_notice() {
+        let fixture = attach_fixture().await;
+        let _io1 = seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+        let _io2 = seed_io_for_pane(&fixture.io_state, fixture.second_pane).await;
+        let onboarding =
+            crate::onboarding::OnboardingHandle::from_state_for_test(Default::default());
+        let mut viewer = Client::watch(&fixture, 80, 24, onboarding).await;
+        idle_for(QUIET).await;
+        viewer.catch_up().await;
+        let viewport = current_viewport(&Arc::new(Mutex::new((80, 24))), &test_config()).await;
+        let active = fixture.attached.active_pane_id;
+        let rect = fixture.graph.snapshot().windows[&fixture.first_window]
+            .layout
+            .compute_rects(viewport)
+            .into_iter()
+            .find_map(|(p, r)| (p == active).then_some(r))
+            .expect("the focused pane");
+        let (from, to) = ((rect.x, rect.y), (rect.x + 3, rect.y));
+        let shows_notice =
+            |v: &Client| bar_of(&v.screen.capture_text(None)).contains(READ_ONLY_NOTICE);
+        for key in [&b"x"[..], b"\x1b"] {
+            for (kind, at) in [
+                (MouseKind::Down, from),
+                (MouseKind::Drag, to),
+                (MouseKind::Up, to),
+            ] {
+                viewer
+                    .send(&left_button(kind, at, viewer.written_frame))
+                    .await;
+            }
+            idle_for(QUIET).await;
+            viewer.catch_up().await;
+            idle_for(crate::statusbar_build::ACTION_FEEDBACK_DWELL * 2).await;
+            viewer.catch_up().await;
+            viewer.key(key).await;
+            idle_for(QUIET).await;
+            viewer.catch_up().await;
+            assert!(!shows_notice(&viewer), "{key:?} only cleared a selection");
+        }
+        viewer.key(b"\x1b").await;
+        idle_for(QUIET).await;
+        viewer.catch_up().await;
+        assert!(!shows_notice(&viewer), "a bare Escape is no refused key");
+        viewer.key(b"x").await;
+        assert!(
+            viewer
+                .frames_until(|_, text| bar_of(text).contains(READ_ONLY_NOTICE))
+                .await,
+            "a plain key was not refused"
+        );
         viewer.stop().await;
         fixture.stop();
     }
