@@ -25,6 +25,8 @@ pub struct SavedCursor {
     /// Saved on the alternate screen: its position is in that screen's
     /// coordinates, which no reflow moves.
     pub on_alternate: bool,
+    /// The saved cursor's [`Cursor::after_print`].
+    pub(crate) after_print: bool,
 }
 
 /// Terminal cursor state.
@@ -51,9 +53,9 @@ pub struct Cursor {
     pub auto_wrap_pending: bool,
     /// Saved cursor state (DECSC/DECRC).
     pub saved: Option<SavedCursor>,
-    /// Where the last printed glyph left the cursor. A cursor still there is
-    /// an insertion point, not an addressed position.
-    pub(crate) printed_to: Option<(usize, usize)>,
+    /// Printing put the cursor here and no cursor command has run since: it
+    /// is an insertion point, not an addressed position.
+    pub(crate) after_print: bool,
 }
 
 impl Cursor {
@@ -68,7 +70,7 @@ impl Cursor {
             hidden_since_ns: 0,
             auto_wrap_pending: false,
             saved: None,
-            printed_to: None,
+            after_print: false,
         }
     }
 
@@ -76,11 +78,6 @@ impl Cursor {
     /// [`crate::monotonic_now_ns`] clock; `None` while it shows.
     pub fn hidden_for_ns(&self, now_ns: u64) -> Option<u64> {
         (!self.visible).then(|| now_ns.saturating_sub(self.hidden_since_ns))
-    }
-
-    /// Whether the cursor sits where the last print left it.
-    pub(crate) fn at_print_end(&self) -> bool {
-        self.printed_to == Some((self.row, self.col))
     }
 
     /// Save cursor state (DECSC -- ESC 7).
@@ -94,6 +91,7 @@ impl Cursor {
             origin_mode,
             charsets,
             on_alternate: false,
+            after_print: self.after_print,
         });
     }
 
@@ -105,6 +103,7 @@ impl Cursor {
             self.style = saved.style;
             self.extended = saved.extended.clone();
             self.auto_wrap_pending = saved.auto_wrap_pending;
+            self.after_print = saved.after_print;
             Some((saved.origin_mode, saved.charsets))
         } else {
             None

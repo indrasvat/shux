@@ -1541,7 +1541,8 @@ fn resize_primary(
         holds_row,
         after_print: pending || after_print,
     };
-    let slot_point = |s: &SavedCursor| point(s.row, s.col, s.auto_wrap_pending, false, false);
+    let slot_point =
+        |s: &SavedCursor| point(s.row, s.col, s.auto_wrap_pending, false, s.after_print);
     let primary_slot = |slot: &&SavedCursor| !slot.on_alternate;
     let mut points = Vec::with_capacity(3);
     if let Some(cursor) = &cursor {
@@ -1550,7 +1551,7 @@ fn resize_primary(
             cursor.col,
             cursor.auto_wrap_pending,
             true,
-            cursor.at_print_end(),
+            cursor.after_print,
         ));
         points.extend(cursor.saved.as_ref().filter(primary_slot).map(slot_point));
     }
@@ -1567,7 +1568,6 @@ fn resize_primary(
         cursor.row = p.row.min(rows.saturating_sub(1));
         cursor.col = p.col.min(cols.saturating_sub(1));
         cursor.auto_wrap_pending = p.past_glyph;
-        cursor.printed_to = p.after_print.then_some((cursor.row, cursor.col));
         if let Some(slot) = &mut cursor.saved {
             place_slot(slot, &mut points, rows, cols);
         }
@@ -1588,6 +1588,7 @@ fn place_slot(
     {
         (slot.row, slot.col, slot.auto_wrap_pending) = (p.row, p.col, p.past_glyph);
     } else {
+        slot.after_print = false;
         slot.row = slot.row.min(rows.saturating_sub(1));
         slot.col = slot.col.min(cols.saturating_sub(1));
         slot.auto_wrap_pending = false;
@@ -2112,6 +2113,35 @@ mod tests {
         vt.process("abc界\x1b[1;1H\x1b[2P\x1b[1;4HZ\x1b[1;2H\x1b[@".as_bytes());
         vt.resize(4, 8);
         assert_eq!(visible_text(&vt, 0), "c   界");
+    }
+
+    #[test]
+    fn a_cursor_command_ends_print_intent_even_in_place() {
+        for moves in [
+            "\x1b[1;6H",
+            "\x1b[C\x1b[D",
+            "\x1b[6G",
+            "\r\x1b[5C",
+            "\x1b[1;6f",
+        ] {
+            let mut vt = VirtualTerminal::new(4, 10);
+            vt.process(format!("ABCDE{moves}").as_bytes());
+            assert_eq!(vt.cursor().col, 5, "{moves:?}");
+            vt.resize(4, 5);
+            vt.process(b"X");
+            assert_eq!(visible_text(&vt, 0), "ABCDX", "{moves:?}");
+            assert_eq!(visible_text(&vt, 1), "", "{moves:?}");
+        }
+    }
+
+    #[test]
+    fn a_saved_cursor_keeps_print_intent_across_reflow() {
+        let mut vt = VirtualTerminal::new(4, 10);
+        vt.process(b"ABCDE\x1b[?1049h");
+        vt.resize(4, 5);
+        vt.process(b"\x1b[?1049lF");
+        assert_eq!(visible_text(&vt, 0), "ABCDE");
+        assert_eq!(visible_text(&vt, 1), "F");
     }
 
     #[test]
