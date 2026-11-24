@@ -35,7 +35,7 @@ pub use compositor::{
     CompositorConfig, MultiPaneFrame, RenderCompositor, RenderStats, pane_viewport,
 };
 pub use copy_mode::{
-    CopyKey, CopyModeState, CopyView, Selection, handle_key as copy_mode_key, osc52_copy,
+    CopyKey, CopyModeState, CopyView, Drawn, Selection, handle_key as copy_mode_key, osc52_copy,
     render_copy_overlay_into, render_copy_overlay_with_vt_into, render_copy_view_into,
 };
 pub use help_overlay::render_help_overlay_into;

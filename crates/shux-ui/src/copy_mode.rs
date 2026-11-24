@@ -49,23 +49,41 @@ pub struct CopyView {
     alt_screen: bool,
 }
 
+/// Where a pane's presented lines stood when a frame drew it: output since
+/// moves its lines further into history, and eviction moves them back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Drawn {
+    pub history: usize,
+    pub evicted: u64,
+}
+
+impl Drawn {
+    pub fn of(vt: &VirtualTerminal) -> Self {
+        Self {
+            history: history_len(vt),
+            evicted: vt.presented_evicted(),
+        }
+    }
+}
+
 impl CopyView {
-    /// `entry` over `vt` as it presents now; `None` once `vt`'s grid is not
-    /// the one `entry` showed.
-    pub fn new(entry: PaneViewport, vt: &VirtualTerminal) -> Option<Self> {
+    /// `entry`, drawn when `vt`'s lines stood at `drawn`, over `vt` as it
+    /// presents now; `None` once `vt`'s grid is not the one `entry` showed.
+    pub fn new(entry: PaneViewport, drawn: Drawn, vt: &VirtualTerminal) -> Option<Self> {
         let grid = vt.grid();
         if (grid.rows(), grid.cols()) != (entry.grid_rows, entry.grid_cols) {
             return None;
         }
-        let top = history_len(vt) + entry.row_offset;
-        Some(Self {
+        let top = drawn.history + entry.row_offset;
+        let view = Self {
             entry,
             entry_top: top,
             top,
             col: entry.col_offset,
-            evicted: vt.presented_evicted(),
+            evicted: drawn.evicted,
             alt_screen: vt.is_alternate_screen(),
-        })
+        };
+        Some(view.rebased(vt))
     }
 
     pub fn rect(&self) -> Rect {
@@ -122,11 +140,11 @@ impl CopyView {
     }
 
     /// Source `(column, line)` of the shown cell at pane-local `(x, y)`,
-    /// pinned onto the slice.
+    /// pinned onto the slice's readable rows.
     pub fn source(&self, (x, y): (u16, u16)) -> (usize, usize) {
         (
             self.col + usize::from(x).min(self.cols().saturating_sub(1)),
-            self.top + usize::from(y).min(self.rows().saturating_sub(1)),
+            self.top + usize::from(y).min(self.readable() - 1),
         )
     }
 
@@ -204,13 +222,21 @@ pub struct CopyModeState {
     /// keyboard back, once the wheel brings the view back down to where it
     /// began. Starting a search makes it deliberate.
     pub wheel_initiated: bool,
+    /// A selection was dropped, its lines evicted, and none started since.
+    selection_evicted: bool,
 }
 
 impl CopyModeState {
-    /// Copy mode on `pane` over the slice `entry` showed of `vt`, its cursor
-    /// at the slice's top-left. `None` when `vt` no longer has that grid.
-    pub fn enter(pane: PaneId, entry: PaneViewport, vt: &VirtualTerminal) -> Option<Self> {
-        let view = CopyView::new(entry, vt)?;
+    /// Copy mode on `pane` over the slice `entry` showed of `vt` when its
+    /// lines stood at `drawn`, its cursor at the slice's top-left. `None`
+    /// when `vt` no longer has that grid.
+    pub fn enter(
+        pane: PaneId,
+        entry: PaneViewport,
+        drawn: Drawn,
+        vt: &VirtualTerminal,
+    ) -> Option<Self> {
+        let view = CopyView::new(entry, drawn, vt)?;
         Some(Self {
             pane,
             view,
@@ -220,6 +246,7 @@ impl CopyModeState {
             last_search: None,
             pending_g: false,
             wheel_initiated: false,
+            selection_evicted: false,
         })
     }
 
@@ -232,9 +259,10 @@ impl CopyModeState {
         }
         self.view = self.view.rebased(vt);
         self.cursor.1 = self.cursor.1.saturating_sub(gone);
-        self.anchor = self
-            .anchor
-            .and_then(|(col, line)| line.checked_sub(gone).map(|line| (col, line)));
+        if let Some((col, line)) = self.anchor {
+            self.anchor = line.checked_sub(gone).map(|line| (col, line));
+            self.selection_evicted = self.anchor.is_none();
+        }
         self.keep_cursor_in_view();
     }
 
@@ -265,7 +293,7 @@ impl CopyModeState {
         let (col, line) = self.cursor;
         self.cursor = (
             col.clamp(v.col, v.col + v.cols().saturating_sub(1)),
-            line.clamp(v.top, v.top + v.rows().saturating_sub(1)),
+            line.clamp(v.top, v.top + v.readable() - 1),
         );
     }
 
@@ -310,6 +338,9 @@ pub enum CopyKey {
     Yank,
     /// User pressed `q` / `Esc` — caller should exit copy mode.
     Exit,
+    /// `y` with nothing to yank: the selection's lines left history. Copy
+    /// mode stays, and the caller says why nothing was copied.
+    SelectionEvicted,
     /// Key not bound; ignored.
     Ignored,
 }
@@ -391,11 +422,12 @@ pub fn handle_key(bytes: &[u8], state: &mut CopyModeState, vt: &VirtualTerminal)
             state.pending_g = false;
             state.scroll_to(state.view.max_top(vt));
             let v = state.view;
-            state.cursor = (v.col, v.top + v.rows().saturating_sub(1));
+            state.cursor = (v.col, v.top + v.readable() - 1);
             CopyKey::Updated
         }
         b'v' => {
             state.pending_g = false;
+            state.selection_evicted = false;
             state.anchor = match state.anchor {
                 Some(_) => None,
                 None => Some(state.cursor),
@@ -404,7 +436,11 @@ pub fn handle_key(bytes: &[u8], state: &mut CopyModeState, vt: &VirtualTerminal)
         }
         b'y' => {
             state.pending_g = false;
-            CopyKey::Yank
+            if state.selection_evicted {
+                CopyKey::SelectionEvicted
+            } else {
+                CopyKey::Yank
+            }
         }
         b'q' | 0x1b => {
             state.pending_g = false;
@@ -1207,7 +1243,8 @@ mod tests {
     /// Copy mode over `vt` as a frame drawing it in `rect` shows it.
     fn modal(vt: &VirtualTerminal, rect: Rect) -> CopyModeState {
         let pane = PaneId::from_uuid(uuid::Uuid::from_u128(1));
-        CopyModeState::enter(pane, PaneViewport::of(rect, vt, 0), vt).expect("copy mode")
+        CopyModeState::enter(pane, PaneViewport::of(rect, vt, 0), Drawn::of(vt), vt)
+            .expect("copy mode")
     }
 
     fn whole(vt: &VirtualTerminal) -> CopyModeState {
@@ -1252,7 +1289,8 @@ mod tests {
             handle_key(b"l", &mut s, &vt);
             handle_key(b"j", &mut s, &vt);
         }
-        assert_eq!(s.cursor_local(), (9, 4), "the cursor left the slice");
+        // The last row is under the hint bar: never drawn, never reachable.
+        assert_eq!(s.cursor_local(), (9, 3), "the cursor left what is readable");
     }
 
     #[test]
@@ -1342,7 +1380,11 @@ mod tests {
         assert_eq!((s.view.top, s.cursor), (0, (0, 0)));
         assert_eq!(handle_key(b"G", &mut s, &vt), CopyKey::Updated);
         assert_eq!(s.view.top, vt.presented_total_lines() - 5);
-        assert_eq!(s.cursor_local(), (0, 4));
+        assert_eq!(
+            s.cursor_local(),
+            (0, 3),
+            "G put the cursor under the hint bar"
+        );
     }
 
     #[test]
@@ -1615,11 +1657,20 @@ mod tests {
     /// The hint bar sits on the pane's last row, which the cursor can reach.
     #[test]
     fn the_copy_cursor_shows_over_the_hint_bar() {
+        // The hint bar covers the last row, so neither the cursor, a drag nor
+        // a selection reaches it: what is yanked is what was drawn.
         let vt = vt_with(3, 20, "one\r\ntwo\r\nXYZ");
         let mut s = whole(&vt);
-        select(&mut s, None, (2, 2));
-        let cell = overlay_cell(&vt, &s, 2, 2);
-        assert_eq!(cell.display_text(), "Z", "the hint bar covered the cursor");
+        select(&mut s, Some((0, 0)), (2, 2));
+        assert_eq!(s.cursor_local(), (2, 1));
+        assert_eq!(
+            s.view.source((2, 2)),
+            (2, 1),
+            "a drag on the hint row named it"
+        );
+        assert_eq!(extract_selection(&vt, &s), "one\ntwo");
+        let cell = overlay_cell(&vt, &s, 2, 1);
+        assert_eq!(cell.display_text(), "o");
         cursor_colours(&cell);
     }
 

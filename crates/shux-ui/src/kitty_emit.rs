@@ -36,6 +36,8 @@ struct Placed {
     /// Source rectangle as `x, y, w, h`: what of the crop the clip leaves.
     src: (u32, u32, u32, u32),
     cells: (u16, u16),
+    /// Pixels into the first cell the picture starts: `X=`, `Y=`.
+    offset: (u64, u64),
 }
 
 /// Which placement of which pane a composed one is, from frame to frame,
@@ -154,11 +156,28 @@ impl KittyEmitter {
         }
         let mut wrote = false;
         let mut was = std::mem::take(&mut self.live);
-        for (k, placed) in want {
-            let p = &k.placement;
-            match was.iter().position(|l| l.key == k.key) {
-                Some(i) if Arc::ptr_eq(&was[i].image, &p.image) => {
-                    let mut live = was.swap_remove(i);
+        // What the host already holds for each wanted placement: its own key's
+        // with the same pixels, else, once every key has claimed its own, any
+        // left over with the same pixels, as when a picture moves under no
+        // placement id or the one stacked before it goes.
+        let same = |l: &Live, k: &Keyed| Arc::ptr_eq(&l.image, &k.placement.image);
+        let mut held: Vec<Option<Live>> = want
+            .iter()
+            .map(|(k, _)| {
+                let i = was.iter().position(|l| l.key == k.key && same(l, k))?;
+                Some(was.swap_remove(i))
+            })
+            .collect();
+        for ((k, _), held) in want.iter().zip(&mut held) {
+            if held.is_none()
+                && let Some(i) = was.iter().position(|l| same(l, k))
+            {
+                *held = Some(was.swap_remove(i));
+            }
+        }
+        for ((k, placed), held) in want.into_iter().zip(held) {
+            match held {
+                Some(mut live) => {
                     if live.placed != placed || replace_all {
                         // Same pixels, new geometry. Re-putting under the same
                         // image AND placement id replaces the placement in
@@ -168,19 +187,15 @@ impl KittyEmitter {
                         live.placed = placed;
                         wrote = true;
                     }
+                    live.key = k.key;
                     self.live.push(live);
                 }
-                old => {
+                None => {
                     let id = self.take_id();
-                    transmit(out, id, &p.image, &placed)?;
-                    // Transmit first, then retire: the old id must stay live
-                    // until the replacement is up.
-                    if let Some(i) = old {
-                        delete(out, was.swap_remove(i).host_id)?;
-                    }
+                    transmit(out, id, &k.placement.image, &placed)?;
                     self.live.push(Live {
                         key: k.key,
-                        image: p.image.clone(),
+                        image: k.placement.image.clone(),
                         host_id: id,
                         placed,
                     });
@@ -189,6 +204,7 @@ impl KittyEmitter {
             }
         }
 
+        // Retired only now, every replacement already up.
         for gone in was {
             delete(out, gone.host_id)?;
             wrote = true;
@@ -228,42 +244,41 @@ fn resolve(p: &ComposedPlacement) -> Option<Placed> {
         .row
         .saturating_add(nat_rows)
         .min(clip_top + p.clip.rows as i64);
-    let rows = (bottom - top).max(0);
     let left = p.col.max(clip_left);
     let right = p
         .col
         .saturating_add(nat_cols)
         .min(clip_left + p.clip.cols as i64);
-    let cols = (right - left).max(0);
-    if rows == 0 || cols == 0 {
+    if bottom <= top || right <= left {
         return None;
     }
 
+    // The source rows and columns the visible cells show, in drawn pixels at
+    // the declared cell size. The end rounds out: the host stretches the
+    // source to the last visible cell's edge. The start is the first whole
+    // source pixel, `X=`/`Y=` pixels into its cell.
     let (dest_w, dest_h) = (u64::from(dest_w), u64::from(dest_h));
-    let vy0 = (top - p.row) as u64 * u64::from(ch);
-    let vy1 = (vy0 + rows as u64 * u64::from(ch)).min(dest_h);
-    let vx0 = (left - p.col) as u64 * u64::from(cw);
-    let vx1 = (vx0 + cols as u64 * u64::from(cw)).min(dest_w);
-    if vy0 >= vy1 || vx0 >= vx1 {
-        return None;
-    }
+    let (cw, ch) = (u64::from(cw), u64::from(ch));
+    let vy0 = (top - p.row) as u64 * ch;
+    let vx0 = (left - p.col) as u64 * cw;
+    let vy1 = vy0 + (bottom - top) as u64 * ch;
+    let vx1 = vx0 + (right - left) as u64 * cw;
     let crop = p.geometry.crop;
-    // The start rounds down and the end up, so a visible slice of an upscaled
-    // picture never maps to an empty source.
-    let to_src = |v: u64, extent: u32, dest: u64| (v * u64::from(extent) / dest) as u32;
-    let to_src_end = |v: u64, extent: u32, dest: u64| (v * u64::from(extent)).div_ceil(dest) as u32;
-    let y = crop.y + to_src(vy0, crop.h, dest_h);
-    let h = to_src_end(vy1, crop.h, dest_h) - to_src(vy0, crop.h, dest_h);
-    let x = crop.x + to_src(vx0, crop.w, dest_w);
-    let w = to_src_end(vx1, crop.w, dest_w) - to_src(vx0, crop.w, dest_w);
-    if w == 0 || h == 0 {
+    let (sy, ey, lead_y) = shux_vt::visible_span(crop.h, dest_h, vy0, vy1)?;
+    let (sx, ex, lead_x) = shux_vt::visible_span(crop.w, dest_w, vx0, vx1)?;
+    let (top, left) = (top + (lead_y / ch) as i64, left + (lead_x / cw) as i64);
+    if bottom <= top || right <= left {
         return None;
     }
     Some(Placed {
         row: u16::try_from(top).ok()?,
         col: u16::try_from(left).ok()?,
-        src: (x, y, w, h),
-        cells: (u16::try_from(cols).ok()?, u16::try_from(rows).ok()?),
+        src: (crop.x + sx, crop.y + sy, ex - sx, ey - sy),
+        cells: (
+            u16::try_from(right - left).ok()?,
+            u16::try_from(bottom - top).ok()?,
+        ),
+        offset: (lead_x % cw, lead_y % ch),
     })
 }
 
@@ -284,7 +299,18 @@ fn keys(p: &Placed) -> String {
     } else {
         format!("x={x},")
     };
-    format!("p=1,C=1,q=2,z=-1,{x}y={y},w={w},h={h},c={c},r={r}")
+    let (dx, dy) = p.offset;
+    let dx = if dx == 0 {
+        String::new()
+    } else {
+        format!(",X={dx}")
+    };
+    let dy = if dy == 0 {
+        String::new()
+    } else {
+        format!(",Y={dy}")
+    };
+    format!("p=1,C=1,q=2,z=-1,{x}y={y},w={w},h={h},c={c},r={r}{dx}{dy}")
 }
 
 fn cup(out: &mut impl Write, p: &Placed) -> io::Result<()> {

@@ -909,3 +909,101 @@ fn an_addressable_placement_put_elsewhere_moves_without_a_re_send() {
     );
     assert_eq!(graphics(&out).len(), 1, "{:?}", graphics(&out));
 }
+
+/// One frame's graphics after the slice moves, for a pane holding `vt`.
+fn after_scroll(vt: &mut VirtualTerminal, to: &[u8]) -> String {
+    let p = pane(1);
+    let layout = LayoutNode::leaf(p);
+    let mut c = make_compositor(20, 6);
+    c.render_multi_pane(frame(&layout, &HashMap::from([(p, &*vt)]), p))
+        .unwrap();
+    drain(&mut c);
+    vt.process(to);
+    c.render_multi_pane(frame(&layout, &HashMap::from([(p, &*vt)]), p))
+        .unwrap();
+    drain(&mut c)
+}
+
+/// An upscaled picture cut mid source pixel by the slice's edge starts at
+/// its next whole source pixel, placed where that pixel truly begins:
+/// `X=`/`Y=` inside the first cell, never a pixel squeezed or stretched to
+/// fill it.
+#[test]
+fn a_left_cropped_upscaled_put_keeps_its_band_edges() {
+    // 4x1 px fitted to 5 columns: 11.25 px a pixel. One cell (9 px) cut off:
+    // pixel 1 truly begins 2.25 px into the first visible cell.
+    let mut vt = VirtualTerminal::new(12, 60);
+    vt.process(b"\x1b[1;4H");
+    vt.process(&transmit_then_put(5, 4, 1, "a=p,i=5,c=5,r=1,C=1"));
+    vt.process(b"\x1b[1;1H");
+    let out = after_scroll(&mut vt, b"\x1b[1;24H");
+    assert!(
+        out.contains("\x1b[1;1H\x1b_Ga=p,") && out.contains(",x=1,y=0,w=3,h=1,c=4,r=1,X=2\x1b\\"),
+        "{:?}",
+        graphics(&out)
+    );
+
+    // 1x4 px fitted to 2 columns: 18 px a pixel, 72 tall. One row (19 px)
+    // cut off: pixel 2 truly begins 17 px into the first visible row.
+    let mut vt = VirtualTerminal::new(12, 20);
+    vt.process(b"\x1b[3;1H");
+    vt.process(&transmit_then_put(5, 1, 4, "a=p,i=5,c=2,C=1"));
+    vt.process(b"\x1b[1;1H");
+    let out = after_scroll(&mut vt, b"\x1b[9;1H");
+    assert!(
+        out.contains("\x1b[1;1H\x1b_Ga=p,") && out.contains(",y=2,w=1,h=2,c=2,r=3,Y=17\x1b\\"),
+        "{:?}",
+        graphics(&out)
+    );
+}
+
+/// Two anonymous pictures at one cell: deleting the first leaves the second
+/// where it was on the host, not sent again.
+#[test]
+fn deleting_one_of_two_stacked_pictures_does_not_re_send_the_other() {
+    let p = pane(1);
+    let layout = LayoutNode::leaf(p);
+    let mut vt = VirtualTerminal::new(10, 20);
+    vt.process(b"\x1b[3;3H");
+    vt.process(&transmit_then_put(72, 9, 19, "a=p,i=72,C=1"));
+    vt.process(&transmit_then_put(73, 9, 19, "a=p,i=73,C=1"));
+    let mut c = make_compositor(20, 10);
+    c.render_multi_pane(frame(&layout, &HashMap::from([(p, &vt)]), p))
+        .unwrap();
+    let sent = ids(&graphics(&drain(&mut c)), "a=T");
+    assert_eq!(sent.len(), 2, "{sent:?}");
+
+    vt.process(b"\x1b_Ga=d,d=I,i=72,q=2\x1b\\");
+    c.render_multi_pane(frame(&layout, &HashMap::from([(p, &vt)]), p))
+        .unwrap();
+    let cmds = graphics(&drain(&mut c));
+    assert_eq!(ids(&cmds, "a=T"), Vec::<String>::new(), "re-sent: {cmds:?}");
+    assert_eq!(ids(&cmds, "a=d"), vec![sent[0].clone()], "{cmds:?}");
+}
+
+/// A picture with an image id but no placement id, moved by its
+/// application, is put again under its host id rather than sent again.
+#[test]
+fn a_moved_picture_without_a_placement_id_is_put_not_re_sent() {
+    let p = pane(1);
+    let layout = LayoutNode::leaf(p);
+    let mut vt = VirtualTerminal::new(10, 20);
+    vt.process(b"\x1b[3;3H");
+    vt.process(&transmit_then_put(80, 9, 19, "a=p,i=80,C=1"));
+    let mut c = make_compositor(20, 10);
+    c.render_multi_pane(frame(&layout, &HashMap::from([(p, &vt)]), p))
+        .unwrap();
+    let id = &ids(&graphics(&drain(&mut c)), "a=T")[0];
+
+    vt.process(b"\x1b_Ga=d,d=i,i=80,q=2\x1b\\\x1b[5;10H\x1b_Ga=p,i=80,C=1,q=2\x1b\\");
+    c.render_multi_pane(frame(&layout, &HashMap::from([(p, &vt)]), p))
+        .unwrap();
+    let out = drain(&mut c);
+    let put = format!("\x1b[5;10H\x1b_Ga=p,i={id},p=1,");
+    assert!(
+        out.contains(&put),
+        "expected {put:?} in {:?}",
+        graphics(&out)
+    );
+    assert_eq!(graphics(&out).len(), 1, "{:?}", graphics(&out));
+}

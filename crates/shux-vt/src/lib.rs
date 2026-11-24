@@ -44,7 +44,7 @@ pub use graphics::kitty::Format as ImageFormat;
 use grid::ResizePoint;
 pub use grid::{
     CellRect, ComposedPlacement, DirtyRegion, Grid, GridConfig, ImageGeometry, PixelRect,
-    Placement, Row,
+    Placement, Row, visible_span,
 };
 pub use parser::{MouseMode, ScrollRegion, TerminalModes, VtHandler};
 #[cfg(any(test, fuzzing))]
