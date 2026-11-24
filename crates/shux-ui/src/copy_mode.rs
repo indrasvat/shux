@@ -46,7 +46,8 @@ pub struct CopyView {
     pub col: usize,
     /// The presented history's eviction count both lines are counted against.
     evicted: u64,
-    alt_screen: bool,
+    /// [`VirtualTerminal::presented_screen`] when it began.
+    screen: u64,
 }
 
 /// Where a pane's presented lines stood when a frame drew it: output since
@@ -55,6 +56,8 @@ pub struct CopyView {
 pub struct Drawn {
     pub history: usize,
     pub evicted: u64,
+    /// The screen they were on, as [`VirtualTerminal::presented_screen`].
+    pub screen: u64,
 }
 
 impl Drawn {
@@ -62,16 +65,25 @@ impl Drawn {
         Self {
             history: history_len(vt),
             evicted: vt.presented_evicted(),
+            screen: vt.presented_screen(),
         }
+    }
+
+    /// Whether `vt` still presents the screen these lines were on.
+    pub fn on_screen_of(&self, vt: &VirtualTerminal) -> bool {
+        self.screen == vt.presented_screen()
     }
 }
 
 impl CopyView {
     /// `entry`, drawn when `vt`'s lines stood at `drawn`, over `vt` as it
-    /// presents now; `None` once `vt`'s grid is not the one `entry` showed.
+    /// presents now; `None` once `vt`'s grid or screen is not the one
+    /// `entry` showed.
     pub fn new(entry: PaneViewport, drawn: Drawn, vt: &VirtualTerminal) -> Option<Self> {
         let grid = vt.grid();
-        if (grid.rows(), grid.cols()) != (entry.grid_rows, entry.grid_cols) {
+        if (grid.rows(), grid.cols()) != (entry.grid_rows, entry.grid_cols)
+            || !drawn.on_screen_of(vt)
+        {
             return None;
         }
         let top = drawn.history + entry.row_offset;
@@ -81,7 +93,7 @@ impl CopyView {
             top,
             col: entry.col_offset,
             evicted: drawn.evicted,
-            alt_screen: vt.is_alternate_screen(),
+            screen: drawn.screen,
         };
         Some(view.rebased(vt))
     }
@@ -105,7 +117,12 @@ impl CopyView {
         let grid = vt.grid();
         rect == self.entry.rect
             && (grid.rows(), grid.cols()) == (self.entry.grid_rows, self.entry.grid_cols)
-            && vt.is_alternate_screen() == self.alt_screen
+            && self.on_screen_of(vt)
+    }
+
+    /// Whether `vt` still presents the screen this view began on.
+    pub fn on_screen_of(&self, vt: &VirtualTerminal) -> bool {
+        self.screen == vt.presented_screen()
     }
 
     fn evicted_since(&self, vt: &VirtualTerminal) -> usize {
@@ -1793,6 +1810,39 @@ mod tests {
         assert!(!over);
         assert_eq!(view.row_offset + y, 4, "the frame does not draw LAST there");
         assert_eq!(view.shown_rows(), usize::from(readable));
+    }
+
+    /// A frame's slice names lines of the screen it was drawn on: once the
+    /// pane shows another screen, or went to the other and came back, it
+    /// opens nothing and maps nothing.
+    #[test]
+    fn a_stamp_from_another_screen_opens_nothing() {
+        let pane = PaneId::from_uuid(uuid::Uuid::from_u128(1));
+        let rect = Rect::new(0, 0, 20, 5);
+        let mut vt = vt_with_lines(5, 20, 10);
+        let (entry, drawn) = (PaneViewport::of(rect, &vt, 0), Drawn::of(&vt));
+        let s = whole(&vt);
+        vt.process(b"\x1b[?1049hALT");
+        assert!(
+            CopyModeState::enter(pane, entry, drawn, &vt).is_none(),
+            "opened on the alternate screen"
+        );
+        assert!(!s.view.maps(rect, &vt));
+        vt.process(b"\x1b[?1049l");
+        assert!(
+            CopyModeState::enter(pane, entry, drawn, &vt).is_none(),
+            "opened after a round trip through the alternate screen"
+        );
+        assert!(!s.view.maps(rect, &vt), "mapped after a round trip");
+
+        // Inside a synchronized update the frame still shows the screen it
+        // froze; once released it shows the other.
+        let mut vt = vt_with_lines(5, 20, 10);
+        vt.process(b"\x1b[?2026h\x1b[?1049hALT");
+        let (entry, drawn) = (PaneViewport::of(rect, &vt, 0), Drawn::of(&vt));
+        assert!(CopyModeState::enter(pane, entry, drawn, &vt).is_some());
+        vt.process(b"\x1b[?2026l");
+        assert!(CopyModeState::enter(pane, entry, drawn, &vt).is_none());
     }
 
     fn vt_with_lines_ending(rows: u16, cols: u16, count: usize, last: &str) -> VirtualTerminal {

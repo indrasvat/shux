@@ -236,6 +236,8 @@ pub struct VtHandler<'a> {
     /// lives inside `TerminalModes` among fields that are not presented state;
     /// written only via [`VtHandler::set_alternate_screen`].
     pub(crate) frozen_alt: &'a mut Option<bool>,
+    /// Screen swaps, frozen with `frozen_alt`.
+    pub(crate) swaps: &'a mut crate::screen::Swaps,
     /// Take the whole snapshot at `?2026h` instead of at the first write.
     /// Always `false` in production — see
     /// [`crate::VirtualTerminal::set_eager_sync_freeze`].
@@ -278,6 +280,7 @@ impl<'a> VtHandler<'a> {
             spare: self.alt_spare,
             reuse: self.reuse_retired_grids,
             alt_images: &mut self.image_stores[1],
+            swaps: self.swaps,
         }
     }
 
@@ -288,6 +291,7 @@ impl<'a> VtHandler<'a> {
     fn freeze_alt_flag(&mut self) {
         if self.sync_armed.load(Ordering::Relaxed) && self.frozen_alt.is_none() {
             *self.frozen_alt = Some(self.modes.alternate_screen);
+            self.swaps.freeze();
         }
     }
 
@@ -323,6 +327,7 @@ impl<'a> VtHandler<'a> {
         self.title.discard();
         self.default_colors.discard();
         *self.frozen_alt = None;
+        self.swaps.frozen = None;
     }
 
     fn clear_active_grapheme_cell(&mut self) {
@@ -1172,11 +1177,14 @@ impl<'a> VtHandler<'a> {
                     // Enter alternate screen: swap grids. 1049 parks the
                     // primary cursor and homes the alternate one; 1047 carries
                     // the cursor across and parks nothing.
+                    // Frozen first: the swap counts itself.
+                    self.freeze_alt_flag();
                     self.screen_swap().enter(mode == 1049);
                     self.set_alternate_screen(true);
                 } else {
                     // Leave alternate screen: restore grids.
                     if self.modes.alternate_screen {
+                        self.freeze_alt_flag();
                         self.screen_swap().leave(mode == 1049);
                         self.set_alternate_screen(false);
                     }
@@ -2587,6 +2595,7 @@ mod tests {
         frozen_colors: Option<TerminalDefaultColors>,
         frozen_title: Option<Option<String>>,
         frozen_alt: Option<bool>,
+        swaps: crate::screen::Swaps,
         active_grapheme_cell: Option<(usize, usize)>,
         last_graphic: Option<LastGraphic>,
         charsets: TerminalCharsets,
@@ -2617,6 +2626,7 @@ mod tests {
                 frozen_colors: None,
                 frozen_title: None,
                 frozen_alt: None,
+                swaps: Default::default(),
                 active_grapheme_cell: None,
                 last_graphic: None,
                 charsets: TerminalCharsets::default(),
@@ -2652,6 +2662,7 @@ mod tests {
                 dcs_state: &mut self.dcs_state,
                 sync_armed: &self.sync_armed,
                 frozen_alt: &mut self.frozen_alt,
+                swaps: &mut self.swaps,
                 eager_sync_freeze: false,
                 active_grapheme_cell: &mut self.active_grapheme_cell,
                 last_graphic: &mut self.last_graphic,

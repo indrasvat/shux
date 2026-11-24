@@ -2739,6 +2739,7 @@ mod tests {
         let mut cursor = Cursor::default();
         let (mut stashed_grid, mut stashed_cursor, mut spare) = (None, None, None);
         let mut alt_images = crate::graphics::image::ImageStore::default();
+        let mut swaps = crate::screen::Swaps::default();
 
         macro_rules! swap {
             ($m:ident) => {{
@@ -2750,6 +2751,7 @@ mod tests {
                     spare: &mut spare,
                     reuse: true,
                     alt_images: &mut alt_images,
+                    swaps: &mut swaps,
                 }
                 .$m(true);
             }};

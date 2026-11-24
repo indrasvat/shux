@@ -2950,7 +2950,8 @@ async fn handle_mouse_selection(
 
 /// Copy mode on `pane` over the lines `shown`, a frame, drew; when an action
 /// since has moved or resized the pane, over the slice the next frame draws in
-/// `rect`, which copy mode shows before anything is selected.
+/// `rect`, which copy mode shows before anything is selected. None once the
+/// pane shows another screen than that frame did.
 fn copy_mode_over(
     pane: PaneId,
     shown: Option<&Shown>,
@@ -2958,8 +2959,11 @@ fn copy_mode_over(
     state: &PaneIoState,
 ) -> Option<shux_ui::CopyModeState> {
     let vt = state.vts.get(&pane)?;
-    shown
-        .and_then(|frame| frame.of(pane))
+    let stamped = shown.and_then(|frame| frame.of(pane));
+    if stamped.is_some_and(|(_, drawn)| !drawn.on_screen_of(vt)) {
+        return None;
+    }
+    stamped
         .and_then(|(view, drawn)| shux_ui::CopyModeState::enter(pane, *view, drawn, vt))
         .or_else(|| {
             let live = PaneViewport::of(rect?, vt, shux_vt::monotonic_now_ns());
@@ -2970,7 +2974,8 @@ fn copy_mode_over(
 /// The pane's VT, with `cm` counted against it, while copy mode maps: focus
 /// on its pane, drawn in `rect`, the grid and screen its view began on. One
 /// nothing was done in yet reopens over the slice `rect` shows now, so an
-/// action's resize landing under it loses nothing. `None` ends copy mode.
+/// action's resize landing under it loses nothing; never over another
+/// screen. `None` ends copy mode.
 fn resolve_copy_mode<'s>(
     cm: &mut shux_ui::CopyModeState,
     active: PaneId,
@@ -2981,7 +2986,7 @@ fn resolve_copy_mode<'s>(
     let vt = state.vts.get(&cm.pane).filter(|_| cm.pane == active)?;
     let rect = rect?;
     if !cm.view.maps(rect, vt) {
-        if !cm.is_untouched() {
+        if !cm.is_untouched() || !cm.view.on_screen_of(vt) {
             return None;
         }
         let view = PaneViewport::of(rect, vt, now_ns);
@@ -13489,6 +13494,45 @@ mod tests {
         }
         // The frame showed S11..S19 and END.
         assert_eq!(h.yanked().await.as_deref(), Some("S11"));
+        h.stop().await;
+    }
+
+    /// A frame of one screen names nothing on the other: `prefix [` stamped
+    /// with it opens no copy mode, rather than one over the screen shown now.
+    #[tokio::test(start_paused = true)]
+    async fn a_stamp_from_another_screen_opens_no_copy_mode() {
+        let mut h = InputHarness::new(64).await;
+        h.show(lettered(10, 40)).await;
+        h.catch_up().await;
+        let shown = h.written_frame;
+        h.app_writes(b"\x1b[?1049hALT").await;
+        h.enter_copy_mode(shown).await;
+        h.key(b"x").await;
+        assert_eq!(
+            h.next_input().await,
+            b"x",
+            "copy mode opened over the other screen"
+        );
+        h.stop().await;
+    }
+
+    /// Copy mode ends when its pane changes screen, even with nothing done in
+    /// it yet: the next key is the pane's.
+    #[tokio::test(start_paused = true)]
+    async fn copy_mode_ends_when_its_pane_changes_screen() {
+        let mut h = InputHarness::new(64).await;
+        h.show(lettered(10, 40)).await;
+        h.catch_up().await;
+        let shown = h.written_frame;
+        h.enter_copy_mode(shown).await;
+        assert!(h.frames_until(|_, text| text.contains("COPY")).await);
+        h.app_writes(b"\x1b[?1049hALT\x1b[?1049l").await;
+        h.key(b"x").await;
+        assert_eq!(
+            h.next_input().await,
+            b"x",
+            "copy mode reopened over the screen shown after a switch"
+        );
         h.stop().await;
     }
 
