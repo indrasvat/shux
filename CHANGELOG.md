@@ -1,3 +1,10 @@
+# [0.61.0](https://github.com/indrasvat/shux/compare/v0.60.0...v0.61.0) (2026-11-24)
+
+
+### Features
+
+* **attach:** read-only attach, enforced by the daemon, and a sharing badge everyone can trust ([#309](https://github.com/indrasvat/shux/issues/309)) ([ea954aa](https://github.com/indrasvat/shux/commit/ea954aad32c20d6fbd1ede45b4fa796a8ea83773)), closes [#191](https://github.com/indrasvat/shux/issues/191) [#297](https://github.com/indrasvat/shux/issues/297) [#297](https://github.com/indrasvat/shux/issues/297)
+
 # [0.60.0](https://github.com/indrasvat/shux/compare/v0.59.3...v0.60.0) (2026-11-24)
 
 
