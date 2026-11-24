@@ -2857,6 +2857,14 @@ fn pane_at(
 /// (only one pane is visible) or the point lands on no pane (e.g. a border
 /// cell). Mirrors the cursor hit-test `handle_wheel` performs, so both the
 /// copy-mode and non-copy-mode wheel paths agree on which pane a scroll hits.
+/// The pane a frame drew under `(col, row)`.
+fn shown_pane_at(views: &HashMap<PaneId, PaneViewport>, col: u16, row: u16) -> Option<PaneId> {
+    views
+        .iter()
+        .find(|(_, view)| holds(view.rect, col, row))
+        .map(|(pid, _)| *pid)
+}
+
 fn pane_under_pointer(
     graph: &GraphHandle,
     attached: &AttachedSession,
@@ -3284,8 +3292,16 @@ async fn handle_copy_mode_mouse(
             // mode keeps the wheel so a stray scroll over another pane never
             // discards an in-progress selection/search (copy mode is
             // session-global — only one is active at a time).
-            let viewport = current_viewport(client_size, config).await;
-            let cursor_pane = pane_under_pointer(graph, &attached, viewport, col, row);
+            // Under the pointer in the frame the client had drawn: a divider
+            // that moved since must not hand the tick to a pane it never saw
+            // there. A frame no longer kept falls back to the live layout.
+            let cursor_pane = match attached.shown.views(frame) {
+                Some(views) => shown_pane_at(views, col, row).unwrap_or(attached.active_pane_id),
+                None => {
+                    let viewport = current_viewport(client_size, config).await;
+                    pane_under_pointer(graph, &attached, viewport, col, row)
+                }
+            };
             // A watcher's wheel only ever scrolls the focused pane, so the
             // pointer elsewhere hands it nowhere: it keeps scrolling.
             if cm.wheel_initiated && !attached.read_only && cursor_pane != cm.pane {
@@ -4446,10 +4462,7 @@ async fn handle_wheel(
     // pane). Only a shown frame can place a report in an app.
     let views = attached.shown.views(frame);
     let hit = match views {
-        Some(views) => views
-            .iter()
-            .find(|(_, view)| holds(view.rect, col, row))
-            .map(|(pid, _)| *pid),
+        Some(views) => shown_pane_at(views, col, row),
         None => {
             let viewport = current_viewport(client_size, config).await;
             let snap = graph.snapshot();
@@ -16044,6 +16057,96 @@ mod tests {
             );
         }
         viewer.stop().await;
+        fixture.stop();
+    }
+
+    /// Closure of #191, item 4: a wheel tick hands wheel-opened scrollback
+    /// off to another pane only when the frame the client saw put the
+    /// pointer over that pane. A divider that moved since, under a pointer
+    /// still over the scrolled pane in that frame, keeps its scrollback.
+    #[tokio::test(start_paused = true)]
+    async fn the_wheel_hands_scrollback_off_by_the_frame_the_client_saw() {
+        let fixture = attach_fixture().await;
+        let _io1 = seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+        let _io2 = seed_io_for_pane(&fixture.io_state, fixture.second_pane).await;
+        let history: String = (0..100)
+            .map(|i| {
+                format!(
+                    "line {i}
+"
+                )
+            })
+            .collect();
+        for pane in [fixture.first_pane, fixture.second_pane] {
+            if let Some(vt) = fixture.io_state.lock().await.vts.get_mut(&pane) {
+                vt.process(history.as_bytes());
+            }
+        }
+        fixture
+            .graph
+            .focus_pane(fixture.first_pane)
+            .await
+            .expect("focus");
+        let session = Arc::new(Mutex::new(AttachedSession {
+            active_pane_id: fixture.first_pane,
+            ..fixture.attached.clone()
+        }));
+        let client_size: ClientSize = Arc::new(Mutex::new((100, 30)));
+        open_copy_mode(&fixture.graph, &fixture.io_state, &session, &client_size).await;
+        if let Some(cm) = session.lock().await.copy_mode.as_mut() {
+            cm.wheel_initiated = true;
+        }
+        let seen = session.lock().await.shown.0.back().map(|(n, _)| *n);
+        let first = session
+            .lock()
+            .await
+            .shown
+            .views(seen)
+            .and_then(|v| v.get(&fixture.first_pane).copied())
+            .expect("the first pane was shown")
+            .rect;
+        // The pointer: the first pane's last column in the frame the client
+        // saw. The divider then moves left past it, and no frame shows that.
+        let at = (first.x + first.width - 1, first.y + 1);
+        fixture
+            .graph
+            .resize_pane(
+                fixture.first_pane,
+                shux_core::layout::Direction::Vertical,
+                -0.3,
+                None,
+            )
+            .await
+            .expect("move the divider");
+        let viewport = current_viewport(&client_size, &test_config()).await;
+        let attached = session.lock().await.clone();
+        assert_eq!(
+            pane_under_pointer(&fixture.graph, &attached, viewport, at.0, at.1),
+            fixture.second_pane,
+            "the divider did not move past the pointer"
+        );
+        let (out_tx, _out_rx) = mpsc::channel(8);
+        let consumed = handle_copy_mode_mouse(
+            MouseKind::ScrollUp,
+            ProtoMouseButton::None,
+            at.0,
+            at.1,
+            &fixture.graph,
+            &fixture.io_state,
+            &session,
+            &client_size,
+            &test_config(),
+            &out_tx,
+            &mut SelectionDrag::None,
+            seen,
+        )
+        .await
+        .expect("wheel");
+        assert!(consumed, "the tick was handed to the other pane");
+        assert!(
+            session.lock().await.copy_mode.is_some(),
+            "scrollback the client still saw under its pointer was closed"
+        );
         fixture.stop();
     }
 }
