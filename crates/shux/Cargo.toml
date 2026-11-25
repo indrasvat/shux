@@ -41,6 +41,8 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 bytes = "1"
 futures = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Local time with its zone's name ("PST"): chrono knows only the offset.
+jiff = { version = "1", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 regex = "1"
 arc-swap = { workspace = true }
 sha2 = { workspace = true }

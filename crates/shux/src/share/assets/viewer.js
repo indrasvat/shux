@@ -60,13 +60,60 @@ function setState(text, bad = false) {
   el.classList.toggle("bad", bad);
 }
 
-// In the guest's own time, as they would say it: "3:55 PM".
-const clock = (d) => d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
-
-function showExpiry() {
-  if (!expiresAt) return;
-  $("#expiry").textContent = `· until ${clock(expiresAt)}`;
+// "23h 51m", "1d 2h": counted up to the minute as a countdown is, and said
+// as the CLI says a span.
+function timeLeft(ms) {
+  const mins = Math.max(1, Math.ceil(ms / 60000));
+  const d = Math.floor(mins / 1440);
+  const h = Math.floor((mins % 1440) / 60);
+  const m = mins % 60;
+  if (d) return h ? `${d}d ${h}h` : `${d}d`;
+  if (h) return m ? `${h}h ${m}m` : `${h}h`;
+  return `${m}m`;
 }
+
+// In the guest's own time and zone, as they would say it: "3:55 PM PST",
+// "tomorrow 3:55 PM PST", "Fri, Nov 27, 3:55 PM PST".
+function when(d) {
+  const t = d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit", timeZoneName: "short" });
+  const now = new Date();
+  if (d.toDateString() === now.toDateString()) return t;
+  const tomorrow = new Date(now);
+  tomorrow.setDate(now.getDate() + 1);
+  if (d.toDateString() === tomorrow.toDateString()) return `tomorrow ${t}`;
+  return `${d.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" })}, ${t}`;
+}
+
+// Uses left, as the first page last heard them.
+let gateUses = null;
+
+// The first page counts down to its end; the bar keeps the time left on a
+// phone, where the end time gives way first.
+function showExpiry() {
+  if (deadline === null) return;
+  const ms = deadline - performance.now();
+  if (view.phase === "idle") {
+    if (ms <= 0) return end(FINAL.expired);
+    let text = `This link works for ${timeLeft(ms)} more, until ${when(expiresAt)}`;
+    // Non-breaking: "1 use left" never wraps in the middle.
+    if (gateUses != null) text += ` · ${gateUses} ${gateUses === 1 ? "use" : "uses"} left`;
+    $("#gate-when").textContent = text;
+    $("#gate-when").hidden = false;
+    return;
+  }
+  if (view.phase !== "live") return;
+  $("#left").textContent = ms > 0 ? `· ${timeLeft(ms)} left` : "";
+  $("#expiry").textContent = ms > 0 ? `· until ${when(expiresAt)}` : "";
+}
+setInterval(showExpiry, 15000);
+// A sleeping phone stops this page's clocks: ask the server again on waking.
+document.addEventListener("visibilitychange", async () => {
+  if (document.hidden || deadline === null || view.phase === "ended") return;
+  if (view.phase === "idle") {
+    if (secret) await peek();
+  } else await status();
+  showExpiry();
+});
 
 // Once a page: typing reaches nobody, and the guest should know.
 let nudged = false;
@@ -90,12 +137,16 @@ async function peek() {
       credentials: "same-origin",
       cache: "no-store",
     });
+    // Ended while this page slept: the server says so, whatever its clock says.
+    if (r.status === 410) {
+      const why = (await r.json().catch(() => ({}))).reason;
+      return end(FINAL[why] ?? "This link has already been used.");
+    }
     if (!r.ok) return;
     const { expires_in_ms: ms, uses_left: left } = await r.json();
-    let text = `This link works until ${clock(new Date(Date.now() + ms))}`;
-    if (left != null) text += ` · ${left} ${left === 1 ? "use" : "uses"} left`;
-    $("#gate-when").textContent = text;
-    $("#gate-when").hidden = false;
+    gateUses = left;
+    setExpiry(ms);
+    showExpiry();
   } catch {
     // The gate reads as well without it.
   }
@@ -113,6 +164,8 @@ function end(message) {
   // Nothing to fit and nobody to count once it has ended.
   $("#zoom").hidden = true;
   $("#watching").textContent = "";
+  $("#left").textContent = "";
+  $("#expiry").textContent = "";
 }
 
 function screenText() {
@@ -216,10 +269,10 @@ function onText(m) {
       applyPalette(m.palette);
       $("#session").textContent = m.session;
       $("#bar .sep").hidden = false;
-      showExpiry();
       freshTerminal(m.size, m.palette);
       view.received = 0;
       view.phase = "live";
+      showExpiry();
       retries = 0;
       setState("live");
       // Draw at the host's own layout when it fits, so no pane is clipped.

@@ -15,6 +15,7 @@ Exit 0 only when every check passed.
 import asyncio
 import json
 import os
+import re
 import shutil
 import ssl
 import subprocess
@@ -26,6 +27,11 @@ from playwright.async_api import async_playwright
 
 GREEN, RED, YELLOW, CYAN, OFF = "\033[1;32m", "\033[1;31m", "\033[1;33m", "\033[1;36m", "\033[0m"
 BUDGET_MS = 30_000
+# "23h 51m", "2h", "45m"; then a clock time and its zone: "3:55 PM PST".
+LEFT = r"\d+[dhm](?: \d+[hm])?"
+CLOCK = r"(?:tomorrow |\w{3}, \w{3} \d+, )?\d{1,2}:\d\d\s?[AP]M [A-Z][\w+:-]+"
+# One locale and zone, so the wording the checks read does not depend on the machine.
+PINNED = {"ignore_https_errors": True, "locale": "en-US", "timezone_id": "America/Los_Angeles"}
 FAILURES: list[str] = []
 
 
@@ -123,6 +129,17 @@ def recorder(log: Path) -> list[str]:
 PRODUCER = ["sh", "-c", 'i=0; while :; do i=$((i+1)); echo "TICK $i"; done']
 
 
+async def pan(page, kind: str, stage: str) -> None:
+    """Pan the readable view: a wheel where the browser has one; mobile WebKit
+    has none, so there the view is scrolled as a swipe would."""
+    if kind == "webkit":
+        await page.evaluate(f"{stage}.scrollBy(300, 0)")
+    else:
+        await page.mouse.move(200, 400)
+        await page.mouse.wheel(700, 300)
+    await until(page, f"{stage}.scrollLeft > 0")
+
+
 async def until(page, cond: str) -> None:
     """Polls `cond` from outside the page: the page's CSP forbids the eval
     `wait_for_function` injects, and loosening it would test something else."""
@@ -158,6 +175,7 @@ async def ended(page) -> str:
 async def open_link(ctx, url: str, violations: list[str]):
     page = await ctx.new_page()
     page.on("console", lambda m: m.text.startswith("CSP ") and violations.append(m.text))
+    page.on("console", lambda m: m.text.startswith("CSP-unsourced ") and print(f"  {YELLOW}! {m.text}{OFF}"))
     page.on("pageerror", lambda e: violations.append(str(e)))
 
     def response(r) -> None:
@@ -173,9 +191,12 @@ async def open_link(ctx, url: str, violations: list[str]):
 
 async def run_browser(kind: str, browser, rig: Rig, env: dict, bin_: str, work: Path, out: Path, proxy: Proxy):
     violations: list[str] = []
-    ctx = await browser.new_context(ignore_https_errors=True, viewport={"width": 1400, "height": 900})
+    ctx = await browser.new_context(**PINNED, viewport={"width": 1400, "height": 900})
     await ctx.add_init_script(
-        "document.addEventListener('securitypolicyviolation', e => console.error('CSP ' + e.violatedDirective + ' ' + e.blockedURI));"
+        # A violation with no source file came from no script of the page's: Playwright's
+        # own injected script draws one in WebKit. It is shown, not counted.
+        "document.addEventListener('securitypolicyviolation', e => console.error((e.sourceFile ? 'CSP ' : 'CSP-unsourced ')"
+        " + e.violatedDirective + ' ' + e.blockedURI + ' at ' + e.sourceFile + ':' + e.lineNumber));"
     )
 
     step(f"{kind}: a recorder pane, viewed read-only")
@@ -190,6 +211,9 @@ async def run_browser(kind: str, browser, rig: Rig, env: dict, bin_: str, work: 
     peeked = await holds(page, "document.querySelector('#gate-when')?.textContent.includes('until')")
     gate = " ".join((await page.inner_text("#gate")).split())
     check(peeked and "1 use left" in gate, f"the gate says until when, and the uses left ({gate!r})")
+    # The time left, then the end in the guest's own time with its zone: "3:55 PM PST".
+    check(re.search(rf"for {LEFT} more, until {CLOCK}", gate) is not None,
+          f"the gate says how long is left and until when, with the zone ({gate!r})")
     for line in (
         "A live terminal session is being shared with you",
         "You'll watch it as it happens. You can't type into it.",
@@ -199,7 +223,7 @@ async def run_browser(kind: str, browser, rig: Rig, env: dict, bin_: str, work: 
     ):
         check(line in gate, f"the gate says {line!r}")
     check(f"{kind}-watched" not in gate, "the gate names no session before a use is spent")
-    await page.screenshot(path=str(out / f"v3_gate-{kind}_1400.png"))
+    await page.screenshot(caret="initial", path=str(out / f"v3_gate-{kind}_1400.png"))
     gate_bar = " ".join((await page.inner_text("#bar")).split())
     check("Read-only ·" not in gate_bar, f"no separator dangles before a session name ({gate_bar!r})")
     listed = rig.call(op="list")
@@ -211,9 +235,11 @@ async def run_browser(kind: str, browser, rig: Rig, env: dict, bin_: str, work: 
     check(f"{kind}-watched" not in text and "read-only" not in text, "no native status segment in the stream")
     bar = await page.inner_text("#bar")
     check("Read-only" in bar and "until" in bar, f"the bar says read-only and until when ({bar.strip()!r})")
+    check(re.search(rf"{LEFT} left", bar) is not None and re.search(rf"until {CLOCK}", bar) is not None,
+          f"the bar says how long is left and until when, with the zone ({bar.strip()!r})")
     check(await holds(page, "document.querySelector('#watching')?.textContent.includes('1 watching')"),
           f"the bar says how many watch ({bar.strip()!r})")
-    await page.screenshot(path=str(out / f"v1_browser-{kind}_1400_default.png"))
+    await page.screenshot(caret="initial", path=str(out / f"v1_browser-{kind}_1400_default.png"))
     # The guest types, pastes and clicks: none of it may reach the pane.
     await page.click("#term")
     await page.keyboard.type("guest typed\n")
@@ -224,7 +250,7 @@ async def run_browser(kind: str, browser, rig: Rig, env: dict, bin_: str, work: 
     await page.evaluate("navigator.clipboard?.writeText?.('x').catch(()=>{})")
     await page.mouse.wheel(0, 300)
     await page.set_viewport_size({"width": 390, "height": 844})
-    await page.screenshot(path=str(out / f"v1_browser-{kind}_390_default.png"))
+    await page.screenshot(caret="initial", path=str(out / f"v1_browser-{kind}_390_default.png"))
     shux(bin_, env, "pane.send_keys", {"pane_id": pane, "text": "MARK"})
     for _ in range(300):
         if log.exists() and log.read_bytes():
@@ -241,8 +267,8 @@ async def run_browser(kind: str, browser, rig: Rig, env: dict, bin_: str, work: 
 
     step(f"{kind}: a one-use link, raced by two browsers")
     raced = rig.call(op="create", session=s["id"], uses=1)
-    a_ctx = await browser.new_context(ignore_https_errors=True)
-    b_ctx = await browser.new_context(ignore_https_errors=True)
+    a_ctx = await browser.new_context(**PINNED)
+    b_ctx = await browser.new_context(**PINNED)
     a = await open_link(a_ctx, raced["url"], violations)
     b = await open_link(b_ctx, raced["url"], violations)
     await asyncio.gather(a.click("#watch"), b.click("#watch"))
@@ -297,12 +323,32 @@ async def run_browser(kind: str, browser, rig: Rig, env: dict, bin_: str, work: 
     expired = rig.call(op="create", session=t_sess["id"], uses=1, ttl_ms=1000)
     await asyncio.sleep(1.5)  # past the expired link's second
     for gone, want in ((revoked, "owner ended this link"), (expired, "has expired")):
-        fresh = await browser.new_context(ignore_https_errors=True)
+        fresh = await browser.new_context(**PINNED)
         p = await open_link(fresh, gone["url"], violations)
-        await p.click("#watch")
+        # The first page asks before a use is spent, so it says why with no click.
         msg = await ended(p)
         check(want in msg, f"a fresh browser is told why: {want} ({msg!r})")
         await fresh.close()
+    # Left open on the first page, a link that runs out says so with no click.
+    lapsing = rig.call(op="create", session=t_sess["id"], uses=1, ttl_ms=4000)
+    fresh = await browser.new_context(**PINNED)
+    p = await open_link(fresh, lapsing["url"], violations)
+    await holds(p, "document.querySelector('#gate-when')?.textContent.includes('1m more')")
+    msg = await ended(p)
+    check("has expired" in msg, f"an open first page ends when its link does ({msg!r})")
+    await fresh.close()
+    # A phone asleep on the first page: its clock stops while the link ends.
+    # On waking, the server's answer ends the page, whatever its clock says.
+    asleep = rig.call(op="create", session=t_sess["id"], uses=1, ttl_ms=3000)
+    fresh = await browser.new_context(**PINNED)
+    p = await open_link(fresh, asleep["url"], violations)
+    await holds(p, "document.querySelector('#gate-when')?.textContent.includes('1m more')")
+    await p.evaluate("(() => { const t = performance.now(); performance.now = () => t; })()")
+    await asyncio.sleep(3.5)  # past the link's end, as the phone sleeps
+    await p.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
+    msg = await ended(p)
+    check("has expired" in msg, f"a first page woken after its link ended says so ({msg!r})")
+    await fresh.close()
     shux(bin_, env, "session.kill", {"id": t_sess["id"]})
 
     step(f"{kind}: a phone reads the host's layout, and pans it")
@@ -314,18 +360,21 @@ async def run_browser(kind: str, browser, rig: Rig, env: dict, bin_: str, work: 
     psize = shux(bin_, env, "pane.capture", {"pane_id": ps["pane_id"]})
     plink = rig.call(op="create", session=ps["id"], uses=1)
     phone = await browser.new_context(
-        ignore_https_errors=True, viewport={"width": 390, "height": 844},
+        **PINNED, viewport={"width": 390, "height": 844},
         device_scale_factor=3, is_mobile=True, has_touch=True,
     )
     pp = await open_link(phone, plink["url"], violations)
     await holds(pp, "document.querySelector('#gate-when')?.textContent.includes('until')")
-    await pp.screenshot(path=str(out / f"v3_gate-{kind}_390.png"))
+    await pp.screenshot(caret="initial", path=str(out / f"v3_gate-{kind}_390.png"))
     await pp.tap("#watch")
     await live(pp, "RECORDING")
     glyph = await pp.evaluate("window.__shux.glyph")
     check(glyph is not None and glyph >= 9, f"text is readable at 390 px ({glyph} CSS px glyphs)")
     check(await holds(pp, "document.querySelector('#watching')?.textContent.includes('1 watching')"),
           "a phone's bar says how many watch")
+    check(await holds(pp, "document.querySelector('#left')?.offsetWidth > 0"
+                          " && document.querySelector('#left').textContent.endsWith(' left')"),
+          "a phone's bar keeps the time left")
     # Safari's text is wider than Chromium's: at 280 px (a folding phone's
     # cover screen) Chromium's runs out of room the way Safari's does at 402.
     for width in (390, 280):
@@ -342,15 +391,13 @@ async def run_browser(kind: str, browser, rig: Rig, env: dict, bin_: str, work: 
     check(scrolled[0] == 0, f"the page itself does not scroll the bar away ({scrolled})")
     stage = "document.querySelector('#stage')"
     check(await pp.evaluate(f"{stage}.scrollWidth > {stage}.clientWidth"), "the readable view pans")
-    await pp.screenshot(path=str(out / f"v2_phone-{kind}_390x844_readable.png"))
-    await pp.mouse.move(200, 400)
-    await pp.mouse.wheel(700, 300)
-    await until(pp, f"{stage}.scrollLeft > 0")
+    await pp.screenshot(caret="initial", path=str(out / f"v2_phone-{kind}_390x844_readable.png"))
+    await pan(pp, kind, stage)
     check(True, "a pan over the terminal moves the view")
-    await pp.screenshot(path=str(out / f"v2_phone-{kind}_390x844_panned.png"))
+    await pp.screenshot(caret="initial", path=str(out / f"v2_phone-{kind}_390x844_panned.png"))
     await pp.tap("#zoom")
     check(await pp.evaluate("window.__shux.mode") == "fit", "a tap shows the whole layout")
-    await pp.screenshot(path=str(out / f"v2_phone-{kind}_390x844_fit.png"))
+    await pp.screenshot(caret="initial", path=str(out / f"v2_phone-{kind}_390x844_fit.png"))
     await pp.tap("#zoom")
     check(await pp.evaluate("window.__shux.mode") == "readable", "another tap reads it again")
     await pp.tap("#term")
@@ -369,9 +416,7 @@ async def run_browser(kind: str, browser, rig: Rig, env: dict, bin_: str, work: 
     check(plog.read_bytes() == b"MARK", f"no phone gesture reached the pane ({plog.read_bytes()[:40]!r})")
     after = shux(bin_, env, "pane.capture", {"pane_id": ps["pane_id"]})
     check((psize["cols"], psize["rows"]) == (after["cols"], after["rows"]), "the phone never sized the pane")
-    await pp.mouse.move(200, 400)
-    await pp.mouse.wheel(700, 300)
-    await until(pp, f"{stage}.scrollLeft > 0")
+    await pan(pp, kind, stage)
     rig.call(op="revoke", id=plink["id"])
     msg = await ended(pp)
     box = await pp.evaluate(
@@ -382,10 +427,10 @@ async def run_browser(kind: str, browser, rig: Rig, env: dict, bin_: str, work: 
         box[0] >= 0 and box[1] <= box[2] and abs((box[0] + box[1]) / 2 - box[2] / 2) <= 2,
         f"after a pan, the end message is centred on the phone ({box}, {msg!r})",
     )
-    await pp.screenshot(path=str(out / f"v2_phone-{kind}_390x844_ended-after-pan.png"))
+    await pp.screenshot(caret="initial", path=str(out / f"v2_phone-{kind}_390x844_ended-after-pan.png"))
     await phone.close()
     shux(bin_, env, "session.kill", {"id": ps["id"]})
-    check(not violations, f"no CSP violation or page error ({violations[:3]})")
+    check(not violations, f"no CSP violation or page error ({violations[:6]})")
     await ctx.close()
 
 

@@ -54,14 +54,15 @@ TCP and plugins get `permission_denied` with `reason: "owner_local"`) and
   "hold": false }             // revoke unless share.confirm comes before the connection closes
 → { "id": "ab12cd34", "url": "https://<words>.trycloudflare.com/v/ab12cd34#<secret>",
     "session_id": "<uuid>", "session": "demo", "expires_at": "2026-11-24T15:00:00Z",
+    "expires_in_ms": 3600000, // by the daemon's clock, as the guest page has it
     "uses": 1,                // null when unlimited
     "label": "review", "deliver": "print",    // or "clipboard"
-    "notice": "Anyone with this link sees everything in demo, live, until 15:00. End it with: shux share stop" }
+    "notice": "Anyone with this link sees everything in demo, live, for the next 1h. End it with: shux share stop" }
 
 // share.list (shux share list)
 {} → { "tunnel": "up",        // "starting" or "down"
        "links": [{ "id": "ab12cd34", "session_id": "<uuid>", "session": "demo",
-                   "label": "review", "expires_at": "…", "uses_left": 0,
+                   "label": "review", "expires_at": "…", "expires_in_ms": 1500000, "uses_left": 0,
                    "redeemed": 1,
                    "viewers": [{ "id": "v9x8y7w6", "connected": true }] }] }
 

@@ -260,11 +260,14 @@ fn a_new_link_says_what_it_exposes_and_how_to_end_it() {
     let pane = h.session("demo");
     let made = h.json(&["share", "-s", "demo"]);
     let notice = made["notice"].as_str().unwrap_or_default();
-    assert!(
-        notice.starts_with("Anyone with this link sees everything in demo, live, until ")
-            && notice.ends_with(". End it with: shux share stop"),
+    // A fresh default link: how long, and no clock time in a zone the reader may not share.
+    assert_eq!(
+        notice,
+        "Anyone with this link sees everything in demo, live, for the next 1h. End it with: shux share stop",
         "{made}"
     );
+    let ms = made["expires_in_ms"].as_u64().unwrap_or_default();
+    assert!(ms > 3_500_000 && ms <= 3_600_000, "{made}");
     // Copied from a pane: the summary prints whatever the output is.
     let bin = fake_clipboard(h.fake.path());
     let copied = h
@@ -276,10 +279,7 @@ fn a_new_link_says_what_it_exposes_and_how_to_end_it() {
         .output()
         .expect("run shux");
     let text = ok_and_quiet(&copied);
-    assert!(
-        text.contains(notice.split(", until").next().unwrap_or("?")),
-        "{text}"
-    );
+    assert!(text.contains(notice), "{text}");
     assert!(text.contains("End it with: shux share stop"), "{text}");
 }
 

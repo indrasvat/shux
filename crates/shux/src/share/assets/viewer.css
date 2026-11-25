@@ -44,12 +44,12 @@ body {
 /* The state and the button always show; the names give way, expiry first. */
 #bar > * { flex: none; }
 #bar .mark, #bar .ro { color: var(--shared); font-weight: 600; }
-#bar .sep, #expiry { color: var(--muted); }
+#bar .sep, #left, #expiry { color: var(--muted); }
 #session { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; font-weight: 600; }
 #bar #watching { color: var(--muted); }
-#expiry:empty, #watching:empty { display: none; }
-/* Narrow, the expiry goes (the first page said it), then the count: never
-   the state or the Fit button. */
+#left:empty, #expiry:empty, #watching:empty { display: none; }
+/* Narrow, the end time goes (the first page said it) while the time left
+   stays, then the count: never the state or the Fit button. */
 @media (max-width: 480px) { #expiry { display: none; } }
 @media (max-width: 360px) { #watching { display: none; } }
 #state { margin-left: auto; color: var(--muted); }
