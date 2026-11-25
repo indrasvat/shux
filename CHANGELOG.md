@@ -1,3 +1,10 @@
+# [0.63.0](https://github.com/indrasvat/shux/compare/v0.62.0...v0.63.0) (2026-11-25)
+
+
+### Features
+
+* **share:** shux share, a private read-only link to a live session, over a Cloudflare tunnel ([#317](https://github.com/indrasvat/shux/issues/317)) ([eef4bd8](https://github.com/indrasvat/shux/commit/eef4bd8109059318277c5f871c6214704491a200)), closes [#297](https://github.com/indrasvat/shux/issues/297)
+
 # [0.62.0](https://github.com/indrasvat/shux/compare/v0.61.3...v0.62.0) (2026-11-24)
 
 
