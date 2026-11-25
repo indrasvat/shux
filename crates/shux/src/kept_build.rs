@@ -401,6 +401,10 @@ fn read_build_file(socket: &Path) -> Option<serde_json::Value> {
 
 /// Write this daemon's build file.
 fn write_build_file(socket: &Path) {
+    // Startup and retirement both write it: one at a time, or one could
+    // publish the other's half-written file.
+    static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = WRITING.lock().unwrap_or_else(|e| e.into_inner());
     let _ = SOCKET.set(socket.to_path_buf());
     let written = (|| {
         let path = build_file_for(socket).map_err(|e| e.to_string())?;
@@ -408,7 +412,7 @@ fn write_build_file(socket: &Path) {
         answer["pid"] = std::process::id().into();
         answer["retiring"] = RETIRING.load(std::sync::atomic::Ordering::SeqCst).into();
         answer["build"] = advertised();
-        let tmp = path.with_extension("build.json.tmp");
+        let tmp = path.with_extension(format!("build.json.{}.tmp", std::process::id()));
         fs::write(&tmp, answer.to_string()).map_err(|e| e.to_string())?;
         fs::rename(&tmp, &path).map_err(|e| e.to_string())
     })();
@@ -550,6 +554,40 @@ mod tests {
         drop(lock);
         remove_unused(root.path(), now);
         assert!(!held.exists(), "a released build outlived its daemon");
+    }
+
+    /// Writes of the build file from several threads (startup's and
+    /// retirement's) never publish a half-written file.
+    #[test]
+    fn concurrent_build_file_writes_publish_whole_files() {
+        let runtime = tempfile::tempdir().unwrap();
+        // SAFETY: nextest runs this test alone in its process.
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", runtime.path()) };
+        let dir = crate::daemon::ensure_runtime_dir().unwrap();
+        let socket = dir.join("t.sock");
+        let path = build_file_for(&socket).unwrap();
+        let writers: Vec<_> = (0..8)
+            .map(|_| {
+                let socket = socket.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..200 {
+                        write_build_file(&socket);
+                    }
+                })
+            })
+            .collect();
+        let mut seen = 0;
+        while writers.iter().any(|w| !w.is_finished()) {
+            if let Ok(text) = fs::read_to_string(&path) {
+                let parsed: Result<serde_json::Value, _> = serde_json::from_str(&text);
+                assert!(parsed.is_ok(), "a half-written build file: {text:?}");
+                seen += 1;
+            }
+        }
+        for w in writers {
+            w.join().unwrap();
+        }
+        assert!(seen > 0, "never read a build file");
     }
 
     /// The kept build is the bytes of the open binary even after its path

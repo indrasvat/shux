@@ -704,6 +704,8 @@ enum Probe {
     Absent,
     /// It closed the connection before answering: probe again.
     Gone,
+    /// It answered that it is shutting down: wait for it to go.
+    Leaving,
     /// Something accepted the connection and never answered.
     Unresponsive,
 }
@@ -721,7 +723,7 @@ async fn probe(socket_path: &Path, confirmed: bool) -> Result<Probe, ClientError
     };
     let found = match asked {
         Asked::Gone => return Ok(Probe::Gone),
-        Asked::Error(e) if stopping(&e) => return Ok(Probe::Gone),
+        Asked::Error(e) if stopping(&e) => return Ok(Probe::Leaving),
         Asked::Result(result) => version_in(&result),
         Asked::Error(_) | Asked::Malformed => None,
     };
@@ -940,6 +942,8 @@ async fn claim_socket(socket: &Path) -> Result<Option<UnixStream>, ClientError> 
                 }
             }
             Probe::Gone => hang_up(&mut hung_up)?,
+            // It said it is going: waited for below, like one that left.
+            Probe::Leaving => {}
             Probe::Absent => {
                 if daemon::try_lock_file(&lock_path)?.is_some() {
                     return Ok(None);
@@ -1016,7 +1020,7 @@ async fn connect_at(socket_path: &Path) -> Result<UnixStream, ClientError> {
                 return Ok(stream);
             }
         }
-        Probe::Gone | Probe::Absent => {}
+        Probe::Gone | Probe::Leaving | Probe::Absent => {}
     }
     // A command handed to a daemon's own build is for that daemon alone: it
     // never starts or replaces one.
@@ -1465,6 +1469,90 @@ mod tests {
         assert!(
             op("ops.title").is_some(),
             "an op field this build has, the daemon lacks"
+        );
+        set_peer(None);
+    }
+
+    /// A daemon that answers every probe `daemon_stopping` for a while (it
+    /// is leaving) is waited out, never refused as unidentified (exit 10).
+    #[tokio::test]
+    async fn a_daemon_on_its_way_out_is_waited_out_not_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("d.sock");
+        stub(&socket, |n, method| match (n, method) {
+            (0..=5, _) => Some(json!({ "error": {
+                "code": -32603, "message": "internal_error",
+                "data": { "kind": shux_rpc::server::DAEMON_STOPPING },
+            } })),
+            (_, "system.version") => Some(version(CLIENT_GIT_SHA)),
+            _ => Some(sessions(0)),
+        });
+        let connected = ensure_daemon_running_at(&socket).await;
+        assert!(connected.is_ok(), "{connected:?}");
+    }
+
+    /// A call sent again after a retirement passes the same checks as the
+    /// first: a key 0.64.0 would drop is never sent to a 0.64.0 successor.
+    #[tokio::test]
+    async fn a_resent_call_is_checked_against_the_new_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("d.sock");
+        let got_key = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = got_key.clone();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            for n in 0.. {
+                let Ok((mut conn, _)) = listener.accept().await else {
+                    return;
+                };
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let mut len = [0u8; 4];
+                        if conn.read_exact(&mut len).await.is_err() {
+                            return;
+                        }
+                        let mut req = vec![0u8; u32::from_be_bytes(len) as usize];
+                        if conn.read_exact(&mut req).await.is_err() {
+                            return;
+                        }
+                        let req: serde_json::Value = serde_json::from_slice(&req).unwrap();
+                        let method = req["method"].as_str().unwrap_or_default();
+                        let mut resp = match (n, method) {
+                            (0 | 1, "system.version") => version(CLIENT_GIT_SHA),
+                            (0 | 1, _) => json!({ "error": {
+                                "code": -32603, "message": "internal_error",
+                                "data": { "kind": crate::rpc::convert::DAEMON_RETIRING },
+                            } }),
+                            (_, "system.version") => {
+                                json!({ "result": { "version": "0.64.0", "git_sha": "old" } })
+                            }
+                            (_, "session.create") => {
+                                seen.store(
+                                    req["params"].get("zz_new").is_some(),
+                                    std::sync::atomic::Ordering::SeqCst,
+                                );
+                                json!({ "result": {} })
+                            }
+                            _ => json!({ "result": { "retired": false, "sessions": 1 } }),
+                        };
+                        resp["jsonrpc"] = "2.0".into();
+                        resp["id"] = req["id"].clone();
+                        let resp = serde_json::to_vec(&resp).unwrap();
+                        let framed = [&(resp.len() as u32).to_be_bytes()[..], &resp].concat();
+                        if conn.write_all(&framed).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let mut stream = ensure_daemon_running_at(&socket).await.unwrap();
+        let params = json!({ "name": "x", "zz_new": 1 });
+        let _ = crate::cli::rpc::rpc_call(&mut stream, "session.create", params).await;
+        assert!(
+            !got_key.load(std::sync::atomic::Ordering::SeqCst),
+            "a key 0.64.0 would drop reached it on the resend"
         );
         set_peer(None);
     }

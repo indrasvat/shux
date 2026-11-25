@@ -156,14 +156,7 @@ pub async fn rpc_call(
     method: &str,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, RpcClientError> {
-    if let Some((code, data)) = crate::client::refuse_for_legacy_peer(method, &params) {
-        return Err(RpcClientError::Rpc {
-            code,
-            message: "not served by shux 0.64.0".into(),
-            data: Some(data),
-        });
-    }
-    let answer = call_once(stream, method, &params).await;
+    let answer = checked_call(stream, method, &params).await;
     let Some((socket, pid)) = crate::client::last_daemon() else {
         return answer;
     };
@@ -173,13 +166,21 @@ pub async fn rpc_call(
     // or never read. A request read and left unanswered is never resent: it
     // may have run. A watch or a wait was for that daemon, and ends with it.
     let retired = pid.is_some_and(|pid| crate::kept_build::retired(&socket, pid));
+    // To the daemon after it, once it has gone: probing it as it leaves
+    // could reach it again.
+    let gone = || async {
+        match pid {
+            Some(pid) => crate::client::daemon_left(pid, &socket).await,
+            None => true,
+        }
+    };
     let again = match resend(&answer, method, retired) {
         Resend::No => false,
-        Resend::Yes => true,
-        Resend::OnceGone => match pid {
-            Some(pid) => crate::client::daemon_left(pid, &socket).await,
-            None => false,
-        },
+        Resend::Yes => {
+            gone().await;
+            true
+        }
+        Resend::OnceGone => pid.is_some() && gone().await,
     };
     if !again {
         return answer;
@@ -187,7 +188,24 @@ pub async fn rpc_call(
     *stream = crate::client::ensure_daemon_running_at(&socket)
         .await
         .map_err(RpcClientError::Reconnect)?;
-    call_once(stream, method, &params).await
+    // Checked as a first send is: the successor may be another build.
+    checked_call(stream, method, &params).await
+}
+
+/// One call, unless the daemon is 0.64.0 and would not serve it as asked.
+async fn checked_call(
+    stream: &mut tokio::net::UnixStream,
+    method: &str,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, RpcClientError> {
+    if let Some((code, data)) = crate::client::refuse_for_legacy_peer(method, params) {
+        return Err(RpcClientError::Rpc {
+            code,
+            message: "not served by shux 0.64.0".into(),
+            data: Some(data),
+        });
+    }
+    call_once(stream, method, params).await
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -206,14 +224,16 @@ fn resend(
     retired: bool,
 ) -> Resend {
     let kind = |d: &serde_json::Value| d.get("kind").and_then(|k| k.as_str()).map(String::from);
-    let waits = method.contains("watch") || method.contains("wait");
+    if method.contains("watch") || method.contains("wait") {
+        return Resend::No;
+    }
     match answer {
         Err(RpcClientError::Rpc { data: Some(d), .. }) => match kind(d).as_deref() {
             Some(crate::rpc::convert::DAEMON_RETIRING) => Resend::Yes,
             Some(shux_rpc::server::DAEMON_STOPPING) if retired => Resend::Yes,
             _ => Resend::No,
         },
-        Err(RpcClientError::NotSent(_)) if retired && !waits => Resend::OnceGone,
+        Err(RpcClientError::NotSent(_)) if retired => Resend::OnceGone,
         _ => Resend::No,
     }
 }
@@ -273,6 +293,15 @@ mod resend_tests {
             Resend::No
         );
         assert_eq!(resend(&rpc("not_found"), create, true), Resend::No);
+        let wait = "pane.wait_exit";
+        assert_eq!(
+            resend(&rpc(crate::rpc::convert::DAEMON_RETIRING), wait, true),
+            Resend::No
+        );
+        assert_eq!(
+            resend(&rpc(shux_rpc::server::DAEMON_STOPPING), wait, true),
+            Resend::No
+        );
     }
 }
 
