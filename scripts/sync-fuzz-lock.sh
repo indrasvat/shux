@@ -46,7 +46,8 @@ if [[ "$mode" == "--check" ]]; then
         exit 1
     fi
     # A dependency added to a shux crate is missing until cargo resolves it.
-    if [[ "$LOCK" == fuzz/Cargo.lock ]] && ! cargo metadata --locked --offline --format-version 1 --manifest-path fuzz/Cargo.toml >/dev/null; then
+    # Not --offline: a fresh checkout has not fetched the fuzz-only crates.
+    if [[ "$LOCK" == fuzz/Cargo.lock ]] && ! cargo metadata --locked --format-version 1 --manifest-path fuzz/Cargo.toml >/dev/null; then
         echo "✗ $LOCK lacks a dependency the workspace now uses" >&2
         echo "  fix: scripts/sync-fuzz-lock.sh" >&2
         exit 1
