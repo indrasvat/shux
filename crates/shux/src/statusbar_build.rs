@@ -354,15 +354,20 @@ pub fn append_upgrade(
     theme: &Theme,
     cols: u16,
 ) {
-    let Some(version) = newer else {
-        return;
-    };
     // A leading gap: the zone's last segment may end flush (a clock).
     let mut ladder = Vec::new();
-    if pending {
-        ladder.push(format!(" ↑ {version} at idle "));
+    match (newer, pending) {
+        (None, false) => return,
+        // Asked for by a build of the same release: no number to show.
+        (None, true) => ladder.push(" ↑ at idle ".to_string()),
+        (Some(version), pending) => {
+            if pending {
+                ladder.push(format!(" ↑ {version} at idle "));
+            }
+            ladder.push(format!(" ↑ {version} "));
+        }
     }
-    ladder.extend([format!(" ↑ {version} "), " ↑ ".to_string()]);
+    ladder.push(" ↑ ".to_string());
     let Rgb { r, g, b } = theme.status_accent;
     let width = StatusBar::segments_width;
     let (lw, cw, rw) = (width(&bar.left), width(&bar.center), width(&bar.right));
@@ -677,8 +682,15 @@ mod tests {
         assert_eq!(full.left[0].text, "session");
 
         let mut none = bar("session", "", "up 3m");
-        append_upgrade(&mut none, None, true, &Theme::DEFAULT, 80);
+        append_upgrade(&mut none, None, false, &Theme::DEFAULT, 80);
         assert_eq!(none.right.len(), 1, "no newer build, no badge");
+        let mut same = bar("session", "", "up 3m");
+        append_upgrade(&mut same, None, true, &Theme::DEFAULT, 80);
+        assert_eq!(
+            last(&same).as_deref(),
+            Some(" ↑ at idle "),
+            "pending, by a same-release build"
+        );
 
         let mut plain = at(80, true);
         monochrome(&mut plain);

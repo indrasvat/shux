@@ -509,10 +509,20 @@ fn a_create_racing_a_pending_upgrade_lands_on_the_successor() {
         serde_json::json!({ "name": "late" }),
     );
     let kind = refused["error"]["data"]["kind"].clone();
-    // The daemon may be gone already; a reply, if any, is the safe refusal.
+    // The daemon may be gone already; a reply, if any, says nothing ran:
+    // the graph refused it, or the daemon never dispatched it.
     if refused.get("gone").is_none() {
-        assert_eq!(kind, "daemon_retiring", "{refused}");
+        assert!(
+            kind == "daemon_retiring" || kind == "daemon_stopping",
+            "{refused}"
+        );
     }
+    let file = h.build_file_raw();
+    assert_eq!(
+        (&file["pid"], &file["retiring"]),
+        (&old.into(), &true.into()),
+        "a retired daemon leaves its build file saying so: {file}"
+    );
     shux_testkit::wait_until("the old daemon to exit", || !alive(old));
     ok(
         &h.run(&["session", "create", "late", "-d", "--", "/bin/sh"]),
@@ -877,6 +887,49 @@ fn a_planted_build_is_never_taken_for_the_daemons() {
         std::fs::read(&now_kept).expect("kept"),
         std::fs::read(&installed).expect("installed"),
         "the kept build is not the daemon's bytes"
+    );
+}
+
+/// An install writable by its group (a shared `0775` prefix) is still kept:
+/// as a private file no one else can write.
+#[test]
+fn a_group_writable_install_is_still_kept() {
+    let h = Harness::new();
+    let install = tempfile::tempdir().expect("install dir");
+    let installed = install.path().join("shux");
+    std::fs::copy(&h.bin, &installed).expect("install");
+    std::fs::set_permissions(
+        &installed,
+        std::os::unix::fs::PermissionsExt::from_mode(0o775),
+    )
+    .expect("chmod 775");
+    let started = h
+        .shux_at(&installed)
+        .args(["session", "create", "a", "-d", "--", "/bin/sh"])
+        .output()
+        .expect("run");
+    ok(&started, "start");
+    let file = h.build_file_raw();
+    let exe = file["build"]["exe"]
+        .as_str()
+        .unwrap_or_else(|| panic!("nothing kept: {file}"));
+    let mode = std::os::unix::fs::PermissionsExt::mode(
+        &std::fs::metadata(exe).expect("kept").permissions(),
+    );
+    assert_eq!(
+        mode & 0o022,
+        0,
+        "the kept build is writable by others: {mode:o}"
+    );
+    let installed_mode = std::os::unix::fs::PermissionsExt::mode(
+        &std::fs::metadata(&installed)
+            .expect("installed")
+            .permissions(),
+    );
+    assert_eq!(
+        installed_mode & 0o777,
+        0o775,
+        "keeping it changed the install"
     );
 }
 

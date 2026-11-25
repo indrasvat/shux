@@ -248,7 +248,11 @@ impl DaemonTooOld {
                     .iter()
                     .filter_map(|p| p.as_str());
                 let known: Vec<String> = named
-                    .filter(|p| ours.contains(p) || p.starts_with(OP_FIELD))
+                    .filter(|p| {
+                        ours.contains(p)
+                            || p.strip_prefix(OP_FIELD)
+                                .is_some_and(|f| shux_core::apply::OP_FIELDS.contains(&f))
+                    })
                     .map(String::from)
                     .collect();
                 if known.is_empty() {
@@ -323,8 +327,7 @@ impl std::fmt::Display for DaemonTooOld {
 
 const INVALID_PARAMS: i64 = -32602;
 
-/// Prefix of a field inside `state.apply` ops, as its refusal names it: this
-/// CLI wrote the ops from its own schema, so it knows every field it sent.
+/// Prefix of a field inside `state.apply` ops, as its refusal names it.
 pub(crate) const OP_FIELD: &str = "ops.";
 
 /// `shux daemon upgrade <flag>` for the daemon on `socket`, runtime dir
@@ -548,10 +551,13 @@ pub(crate) async fn ask_daemon_version(socket_path: &Path) -> (DaemonAnswer, Opt
         Ok(asked) => asked,
         Err(unanswered) => return (unanswered, None),
     };
-    let Some(dv) = (match asked {
+    let dv = match asked {
         Asked::Result(result) => version_in(&result),
+        // On its way out: as good as gone.
+        Asked::Error(e) if stopping(&e) => return (DaemonAnswer::Absent, None),
         _ => None,
-    }) else {
+    };
+    let Some(dv) = dv else {
         return (DaemonAnswer::Unreadable, None);
     };
     let params = json!({ "include_scratch": true });
@@ -715,6 +721,7 @@ async fn probe(socket_path: &Path, confirmed: bool) -> Result<Probe, ClientError
     };
     let found = match asked {
         Asked::Gone => return Ok(Probe::Gone),
+        Asked::Error(e) if stopping(&e) => return Ok(Probe::Gone),
         Asked::Result(result) => version_in(&result),
         Asked::Error(_) | Asked::Malformed => None,
     };
@@ -815,6 +822,7 @@ async fn verdict(
     match asked.await {
         Err(_) => return Err(unresponsive()),
         Ok(Asked::Gone) => return Ok(Verdict::Gone),
+        Ok(Asked::Error(e)) if stopping(&e) => return Ok(Verdict::Gone),
         Ok(Asked::Result(r)) => {
             let sessions = r.get("sessions").and_then(|n| n.as_u64());
             return match r.get("retired").and_then(|b| b.as_bool()) {
@@ -837,6 +845,7 @@ async fn verdict(
     let sessions = match tokio::time::timeout(patience, listed).await {
         Err(_) => return Err(unresponsive()),
         Ok(Asked::Gone) => return Ok(Verdict::Gone),
+        Ok(Asked::Error(e)) if stopping(&e) => return Ok(Verdict::Gone),
         Ok(Asked::Result(r)) => r.get("sessions").and_then(|s| s.as_array()).map(Vec::len),
         Ok(_) => None,
     };
@@ -848,6 +857,11 @@ async fn verdict(
 }
 
 const METHOD_NOT_FOUND: i64 = -32601;
+
+/// A `daemon_stopping` refusal: the daemon is leaving and ran nothing.
+fn stopping(error: &serde_json::Value) -> bool {
+    error.pointer("/data/kind").and_then(|k| k.as_str()) == Some(shux_rpc::server::DAEMON_STOPPING)
+}
 
 /// Records the daemon of another build this process is about to use.
 fn serve(socket: &Path, found: Option<DaemonVersion>) {
@@ -1026,6 +1040,10 @@ async fn connect_at(socket_path: &Path) -> Result<UnixStream, ClientError> {
             || crate::daemon_boot::our_live_daemon(socket_path).is_some()
     };
     let connected = wait_for_daemon(socket_path, &CONNECT_BUDGET, starting).await;
+    // This very build now: nothing of a predecessor's build applies.
+    if connected.is_ok() {
+        set_peer(None);
+    }
     // Reap it: a long-lived client would otherwise keep a zombie. It may
     // still be on its way out, since the daemon can bind before it exits.
     std::thread::spawn(move || child.wait());
@@ -1432,6 +1450,22 @@ mod tests {
         );
         let skew = unknown(json!(["lines", "Pane_id"])).expect("a key this build takes");
         assert_eq!(skew.params, vec!["lines".to_string()]);
+        let op = |field: &str| {
+            DaemonTooOld::from_error(
+                INVALID_PARAMS,
+                Some(
+                    &json!({ "kind": shux_rpc::UNKNOWN_PARAMS, "method": "state.apply", "params": [field] }),
+                ),
+            )
+        };
+        assert!(
+            op("ops.titel").is_none(),
+            "a misspelt op field was blamed on the daemon"
+        );
+        assert!(
+            op("ops.title").is_some(),
+            "an op field this build has, the daemon lacks"
+        );
         set_peer(None);
     }
 

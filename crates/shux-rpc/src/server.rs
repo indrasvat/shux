@@ -560,9 +560,29 @@ where
     // Executor loop. Errors (`?` on writes) must still abort the read task,
     // so run the loop in an inner async block and join on `result` below.
     let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
+        // Once the daemon is leaving, a request it never dispatched is told
+        // so (`daemon_stopping`) rather than dropped: a client then knows
+        // nothing of it ran. Bounded, so an idle connection does not hold it.
+        let mut stopping = false;
         loop {
+            if stopping {
+                let Ok(Some(Ok(data))) =
+                    tokio::time::timeout(STOPPING_DRAIN, frame_rx.recv()).await
+                else {
+                    break;
+                };
+                pending_frames.fetch_sub(1, Ordering::SeqCst);
+                pending_bytes.fetch_sub(data.len(), Ordering::SeqCst);
+                framed_tx
+                    .send(Bytes::from(encode_response(&stopping_response(&data))?))
+                    .await?;
+                continue;
+            }
             let maybe_frame = tokio::select! {
-                _ = cancel.cancelled() => break,
+                _ = cancel.cancelled() => {
+                    stopping = true;
+                    continue;
+                }
                 // Client DEAD (peer-death monitor / IO read error) or cap
                 // violation: stop deterministically instead of draining a
                 // dead client's queued frames (accepted fire-and-forget
@@ -690,6 +710,27 @@ async fn process_frame(data: impl AsRef<[u8]>, router: &Router) -> JsonRpcRespon
         Ok(request) => dispatch_request(request, router).await,
         Err(response) => *response,
     }
+}
+
+/// How long a leaving daemon still answers requests it will not dispatch.
+const STOPPING_DRAIN: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// `error.data.kind` of a request a leaving daemon never dispatched.
+pub const DAEMON_STOPPING: &str = "daemon_stopping";
+
+/// The answer to a frame a leaving daemon will not dispatch.
+fn stopping_response(data: &[u8]) -> JsonRpcResponse {
+    let id = parse_request(data).ok().and_then(|r| r.id);
+    JsonRpcResponse::error(
+        id,
+        RpcError::with_data(
+            ErrorCode::InternalError,
+            serde_json::json!({
+                "kind": DAEMON_STOPPING,
+                "detail": "the daemon is shutting down and did not run this request",
+            }),
+        ),
+    )
 }
 
 /// A frame's request, or the error response it gets instead.

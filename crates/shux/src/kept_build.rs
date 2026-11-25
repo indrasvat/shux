@@ -239,11 +239,13 @@ fn materialize(image: &fs::File, to: &Path) -> std::io::Result<()> {
         // SAFETY: `fd` is open for the call's length, `dst` is a NUL-ended
         // path that outlives it; the call only reads both.
         if unsafe { nix::libc::fclonefileat(fd, nix::libc::AT_FDCWD, dst.as_ptr(), 0) } == 0 {
-            return Ok(());
+            // A clone is its own file, with the install's mode: made private.
+            return fs::set_permissions(to, fs::Permissions::from_mode(0o755));
         }
     }
+    // A link shares the install's mode, so only one nobody else can write.
     #[cfg(target_os = "linux")]
-    {
+    if image.metadata()?.mode() & 0o022 == 0 {
         let proc_fd = format!("/proc/self/fd/{fd}");
         let linked = nix::unistd::linkat(
             nix::fcntl::AT_FDCWD,
@@ -377,11 +379,24 @@ pub(crate) fn mark_retiring() {
 /// Whether daemon `pid`, now gone, retired from `socket`, as its build file
 /// says. A daemon that was stopped or crashed did not.
 pub(crate) fn retired(socket: &Path, pid: u32) -> bool {
-    let read = || {
-        let text = fs::read_to_string(build_file_for(socket).ok()?).ok()?;
-        serde_json::from_str::<serde_json::Value>(&text).ok()
-    };
-    read().is_some_and(|f| f["pid"] == pid && f["retiring"] == true)
+    read_build_file(socket).is_some_and(|f| f["pid"] == pid && f["retiring"] == true)
+}
+
+/// The build file for `socket`: a regular file, never through a link, read
+/// only up to a size no build file reaches.
+fn read_build_file(socket: &Path) -> Option<serde_json::Value> {
+    use std::io::Read as _;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(build_file_for(socket).ok()?)
+        .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut text = String::new();
+    file.take(64 * 1024).read_to_string(&mut text).ok()?;
+    serde_json::from_str(&text).ok()
 }
 
 /// Write this daemon's build file.
@@ -442,8 +457,7 @@ pub(crate) fn hand_off(socket: &Path) {
 /// is live, speaks another wire generation, and its copy is the very file it
 /// recorded: a regular file of this user, writable by nobody else.
 fn handoff_target(socket: &Path) -> Option<(PathBuf, String)> {
-    let text = fs::read_to_string(build_file_for(socket).ok()?).ok()?;
-    let file: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let file = read_build_file(socket)?;
     let wire = file.get("wire")?.as_u64()?;
     if wire == u64::from(shux_rpc::WIRE_GENERATION) {
         return None;
@@ -464,7 +478,12 @@ fn handoff_target(socket: &Path) -> Option<(PathBuf, String)> {
     let key_dir = exe.parent()?;
     let builds = key_dir.parent()?;
     let expected = crate::daemon::runtime_dir().ok()?.join("builds");
-    if builds != expected || private_dir(builds).is_err() || private_dir(key_dir).is_err() {
+    let ours = |dir: &Path| {
+        fs::symlink_metadata(dir).is_ok_and(|m| {
+            m.is_dir() && m.uid() == nix::unistd::getuid().as_raw() && m.mode() & 0o022 == 0
+        })
+    };
+    if builds != expected || !ours(builds) || !ours(key_dir) {
         tracing::warn!(exe = %exe.display(), "the daemon's kept build is not in a private builds dir");
         return None;
     }

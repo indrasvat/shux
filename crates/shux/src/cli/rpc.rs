@@ -141,6 +141,8 @@ pub enum RpcClientError {
     },
     #[error("the daemon retired as this call reached it, and no successor could be reached")]
     Reconnect(#[source] crate::client::ClientError),
+    #[error("could not send the request: {0}")]
+    NotSent(std::io::Error),
 }
 
 /// Send a JSON-RPC request over a UDS and read the response.
@@ -165,25 +167,19 @@ pub async fn rpc_call(
     let Some((socket, pid)) = crate::client::last_daemon() else {
         return answer;
     };
-    let again = match &answer {
-        Err(RpcClientError::Rpc { data: Some(d), .. }) => {
-            d.get("kind").and_then(|k| k.as_str()) == Some(crate::rpc::convert::DAEMON_RETIRING)
-        }
-        // Dropped by a daemon that retired (it took no new session, and held
-        // none): nothing of this call can survive to be done twice. A watch
-        // or a wait was for that daemon, and ends with it.
-        Err(RpcClientError::Io(e))
-            if connection_lost(e) && !method.contains("watch") && !method.contains("wait") =>
-        {
-            match pid {
-                Some(pid) => {
-                    crate::client::daemon_left(pid, &socket).await
-                        && crate::kept_build::retired(&socket, pid)
-                }
-                None => false,
-            }
-        }
-        _ => false,
+    // Sent again only what provably never ran, and only to a daemon that
+    // retired (not one stopped on purpose, or that crashed): a retired graph's
+    // refusal; or, from a daemon that retired, a request it never dispatched
+    // or never read. A request read and left unanswered is never resent: it
+    // may have run. A watch or a wait was for that daemon, and ends with it.
+    let retired = pid.is_some_and(|pid| crate::kept_build::retired(&socket, pid));
+    let again = match resend(&answer, method, retired) {
+        Resend::No => false,
+        Resend::Yes => true,
+        Resend::OnceGone => match pid {
+            Some(pid) => crate::client::daemon_left(pid, &socket).await,
+            None => false,
+        },
     };
     if !again {
         return answer;
@@ -194,12 +190,90 @@ pub async fn rpc_call(
     call_once(stream, method, &params).await
 }
 
-fn connection_lost(e: &std::io::Error) -> bool {
-    use std::io::ErrorKind::*;
-    matches!(
-        e.kind(),
-        BrokenPipe | UnexpectedEof | ConnectionReset | ConnectionAborted
-    )
+#[derive(Debug, PartialEq, Eq)]
+enum Resend {
+    No,
+    Yes,
+    /// Once the daemon has exited.
+    OnceGone,
+}
+
+/// Whether a failed call is sent again to the daemon's successor. `retired`:
+/// the daemon's build file says it retired.
+fn resend(
+    answer: &Result<serde_json::Value, RpcClientError>,
+    method: &str,
+    retired: bool,
+) -> Resend {
+    let kind = |d: &serde_json::Value| d.get("kind").and_then(|k| k.as_str()).map(String::from);
+    let waits = method.contains("watch") || method.contains("wait");
+    match answer {
+        Err(RpcClientError::Rpc { data: Some(d), .. }) => match kind(d).as_deref() {
+            Some(crate::rpc::convert::DAEMON_RETIRING) => Resend::Yes,
+            Some(shux_rpc::server::DAEMON_STOPPING) if retired => Resend::Yes,
+            _ => Resend::No,
+        },
+        Err(RpcClientError::NotSent(_)) if retired && !waits => Resend::OnceGone,
+        _ => Resend::No,
+    }
+}
+
+#[cfg(test)]
+mod resend_tests {
+    use super::*;
+
+    fn rpc(kind: &str) -> Result<serde_json::Value, RpcClientError> {
+        Err(RpcClientError::Rpc {
+            code: -32603,
+            message: "internal_error".into(),
+            data: Some(serde_json::json!({ "kind": kind })),
+        })
+    }
+
+    fn io(kind: std::io::ErrorKind, sent: bool) -> Result<serde_json::Value, RpcClientError> {
+        let e = std::io::Error::from(kind);
+        Err(if sent {
+            RpcClientError::Io(e)
+        } else {
+            RpcClientError::NotSent(e)
+        })
+    }
+
+    /// Only what provably never ran is sent again, and only away from a daemon
+    /// that retired: never a request it read and left unanswered (it may have
+    /// run, as the kill that ended its last session did), never one a stopped
+    /// or crashed daemon dropped, never a watch or a wait.
+    #[test]
+    fn only_a_call_that_never_ran_is_sent_again() {
+        use std::io::ErrorKind::{BrokenPipe, UnexpectedEof};
+        let create = "session.create";
+        assert_eq!(
+            resend(&rpc(crate::rpc::convert::DAEMON_RETIRING), create, false),
+            Resend::Yes
+        );
+        assert_eq!(
+            resend(&rpc(shux_rpc::server::DAEMON_STOPPING), create, true),
+            Resend::Yes
+        );
+        assert_eq!(
+            resend(&rpc(shux_rpc::server::DAEMON_STOPPING), create, false),
+            Resend::No
+        );
+        assert_eq!(
+            resend(&io(BrokenPipe, false), create, true),
+            Resend::OnceGone
+        );
+        assert_eq!(resend(&io(BrokenPipe, false), create, false), Resend::No);
+        assert_eq!(
+            resend(&io(UnexpectedEof, true), "session.kill", true),
+            Resend::No
+        );
+        assert_eq!(
+            resend(&io(BrokenPipe, false), "events.watch", true),
+            Resend::No
+        );
+        assert_eq!(resend(&rpc("not_found"), create, true), Resend::No);
+    }
 }
 
 async fn call_once(
@@ -218,11 +292,15 @@ async fn call_once(
 
     let payload = serde_json::to_vec(&request)?;
 
-    // Write length prefix (4 bytes, big-endian)
+    // Write length prefix (4 bytes, big-endian). A failed write is a request
+    // the daemon never read whole: it cannot have run.
     let len = payload.len() as u32;
-    stream.write_all(&len.to_be_bytes()).await?;
-    stream.write_all(&payload).await?;
-    stream.flush().await?;
+    let sent = async {
+        stream.write_all(&len.to_be_bytes()).await?;
+        stream.write_all(&payload).await?;
+        stream.flush().await
+    };
+    sent.await.map_err(RpcClientError::NotSent)?;
 
     // Read response length prefix
     let mut len_buf = [0u8; 4];

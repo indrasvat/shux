@@ -91,6 +91,23 @@ impl<'de> Deserialize<'de> for PaneRef {
     }
 }
 
+/// Every field an op of this build takes, at any depth: a refused field
+/// outside it is a mistake, one inside it a field an older daemon lacks.
+pub const OP_FIELDS: &[&str] = &[
+    "command",
+    "cwd",
+    "direction",
+    "initial_command",
+    "initial_window_title",
+    "name",
+    "op",
+    "ratio",
+    "ref_op",
+    "session",
+    "target",
+    "title",
+];
+
 /// A single operation in a batch. Each op is validated against the staging
 /// snapshot (with prior ops' outputs already applied) and then mutates the
 /// staged snapshot. If any op fails validation, the entire batch rolls back
@@ -221,6 +238,49 @@ pub fn new_correlation_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `OP_FIELDS` is exactly the fields ops serialize to, back-references
+    /// included: a field added to an op and not to the list fails here.
+    #[test]
+    fn op_fields_name_every_field_ops_have() {
+        let back = |op_index| SessionRef::BackRef { op_index };
+        let ops = [
+            Op::CreateSession {
+                name: Some("s".into()),
+                cwd: "/".into(),
+                initial_command: vec!["sh".into()],
+                initial_window_title: Some("t".into()),
+            },
+            Op::CreateWindow {
+                session: back(0),
+                title: "w".into(),
+                cwd: Some("/".into()),
+                initial_command: vec!["sh".into()],
+            },
+            Op::SplitPane {
+                target: PaneRef::BackRef { op_index: 1 },
+                direction: Direction::Horizontal,
+                ratio: 0.5,
+                command: vec!["sh".into()],
+                cwd: Some("/".into()),
+            },
+        ];
+        fn keys(v: &serde_json::Value, out: &mut std::collections::BTreeSet<String>) {
+            if let Some(o) = v.as_object() {
+                for (k, v) in o {
+                    out.insert(k.clone());
+                    keys(v, out);
+                }
+            }
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for op in &ops {
+            keys(&serde_json::to_value(op).unwrap(), &mut seen);
+        }
+        let listed: std::collections::BTreeSet<String> =
+            OP_FIELDS.iter().map(|s| s.to_string()).collect();
+        assert_eq!(seen, listed);
+    }
 
     /// An op field this build does not know is refused, not dropped: a batch
     /// from a newer client never commits with part of what it asked for

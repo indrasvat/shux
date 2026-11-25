@@ -1924,7 +1924,13 @@ async fn spawn_scratch_core(
     let session_id = graph
         .create_session_with_command(scratch_name, cwd.clone(), p.argv.clone())
         .await
-        .map_err(|e| shux_rpc::RpcError::internal(&format!("scratch allocation failed: {e}")))?;
+        .map_err(|e| match e {
+            // Refused before anything changed: the caller may send it on.
+            shux_core::graph::GraphError::Retired | shux_core::graph::GraphError::Shutdown => {
+                crate::rpc::convert::graph_error_to_rpc(e)
+            }
+            e => shux_rpc::RpcError::internal(&format!("scratch allocation failed: {e}")),
+        })?;
 
     #[cfg(test)]
     test_hooks::maybe_pause(&test_hooks::PAUSE_AFTER_CREATE).await;

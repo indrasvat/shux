@@ -280,7 +280,8 @@ jobs:
         run: |
           set -euo pipefail
           prev=()
-          for tag in $(git tag --list 'v[0-9]*' --sort=-v:refname | head -n 2); do
+          # The two latest, and 0.64.0: the last release before wire generations.
+          for tag in $({ git tag --list 'v[0-9]*' --sort=-v:refname | head -n 2; echo v0.64.0; } | sort -u); do
             sh install.sh --version "$tag" --dir "$RUNNER_TEMP/prev/$tag"
             prev+=("$RUNNER_TEMP/prev/$tag/shux")
           done
