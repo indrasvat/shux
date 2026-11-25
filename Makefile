@@ -159,13 +159,25 @@ check-darwin: ## Clippy the workspace for macOS — catches cfg-gated code a Lin
 	@# it this printed the defect and reported success.
 	@# Native only: ring's build script compiles C for the target, and a Linux
 	@# host has no macOS toolchain for it. CI runs this on its macOS runner.
-	@if [ "$$(uname -s)" != Darwin ]; then \
+	@if [ "$(UNAME_S)" != Darwin ]; then \
 	  echo "$(COLOR_RED)✗ check-darwin needs a macOS host (ring builds C for the target); CI runs it on macos-latest$(COLOR_RESET)" >&2; \
 	  exit 1; \
 	fi
 	@echo "$(COLOR_BLUE)▶ Clippy on macOS...$(COLOR_RESET)"
 	@CLIPPY_CONF_DIR="$(CURDIR)" cargo clippy --workspace --all-targets --color never -- -D warnings
 	@echo "$(COLOR_GREEN)✓ macOS clippy passed$(COLOR_RESET)"
+
+# `check` and `ci` run the macOS clippy where it can run, and say so elsewhere.
+UNAME_S ?= $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+MACOS_CLIPPY := check-darwin
+else
+MACOS_CLIPPY := check-darwin-skipped
+endif
+
+.PHONY: check-darwin-skipped
+check-darwin-skipped:
+	@echo "$(COLOR_YELLOW)⚠ macOS clippy: skipped on $(UNAME_S), not passed; CI's macOS job runs it$(COLOR_RESET)"
 
 .PHONY: check-linux
 check-linux: ## Clippy the workspace for Linux — catches cfg-gated code a macOS build never sees
@@ -815,7 +827,7 @@ fmt: ## Format all code
 	@echo "$(COLOR_GREEN)✓ Formatting complete$(COLOR_RESET)"
 
 .PHONY: check-after-hygiene
-check-after-hygiene: lint shellcheck check-test-sleeps check-test-timing check-test-ignores check-darwin test check-build-rerun check-test-groups check-test-opt-out check-test-inventory check-ci-parity test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-lens-frozen check-no-bin-mods check-action-pins check-vt-corpus-scratch check-fuzz-lock check-prune
+check-after-hygiene: lint shellcheck check-test-sleeps check-test-timing check-test-ignores $(MACOS_CLIPPY) test check-build-rerun check-test-groups check-test-opt-out check-test-inventory check-ci-parity test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-lens-frozen check-no-bin-mods check-action-pins check-vt-corpus-scratch check-fuzz-lock check-prune
 
 .PHONY: check
 check: hooks-check check-target-hygiene ## Run lint + test + process/QA guards (what pre-commit runs)
@@ -827,7 +839,7 @@ check: hooks-check check-target-hygiene ## Run lint + test + process/QA guards (
 	@echo ""
 
 .PHONY: ci
-ci: lint shellcheck check-test-sleeps check-test-timing check-test-ignores check-darwin test check-test-groups check-test-inventory check-ci-parity test-doc test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-no-bin-mods check-action-pins check-vt-corpus-scratch check-fuzz-lock check-prune ## Run the CI pipeline locally (lint + full test + doc tests + process/QA guards)
+ci: lint shellcheck check-test-sleeps check-test-timing check-test-ignores $(MACOS_CLIPPY) test check-test-groups check-test-inventory check-ci-parity test-doc test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-no-bin-mods check-action-pins check-vt-corpus-scratch check-fuzz-lock check-prune ## Run the CI pipeline locally (lint + full test + doc tests + process/QA guards)
 	@echo ""
 	@echo "$(COLOR_GREEN)$(COLOR_BOLD)✓ CI pipeline passed!$(COLOR_RESET)"
 	@echo ""
