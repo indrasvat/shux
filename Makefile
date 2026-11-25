@@ -157,10 +157,14 @@ check-ci-parity: nextest-ready ## Run the cargo-output parsers under CI's enviro
 check-darwin: ## Clippy the workspace for macOS — catches cfg-gated code a Linux build never sees
 	@# Needs the -Dwarnings above: dead cfg-gated items are warnings, so without
 	@# it this printed the defect and reported success.
-	@echo "$(COLOR_BLUE)▶ Cross-checking aarch64-apple-darwin...$(COLOR_RESET)"
-	@rustup target list --installed | grep -qx aarch64-apple-darwin \
-	  || rustup target add aarch64-apple-darwin
-	@CLIPPY_CONF_DIR="$(CURDIR)" cargo clippy --workspace --all-targets --target aarch64-apple-darwin --color never -- -D warnings
+	@# Native only: ring's build script compiles C for the target, and a Linux
+	@# host has no macOS toolchain for it. CI runs this on its macOS runner.
+	@if [ "$$(uname -s)" != Darwin ]; then \
+	  echo "$(COLOR_RED)✗ check-darwin needs a macOS host (ring builds C for the target); CI runs it on macos-latest$(COLOR_RESET)" >&2; \
+	  exit 1; \
+	fi
+	@echo "$(COLOR_BLUE)▶ Clippy on macOS...$(COLOR_RESET)"
+	@CLIPPY_CONF_DIR="$(CURDIR)" cargo clippy --workspace --all-targets --color never -- -D warnings
 	@echo "$(COLOR_GREEN)✓ macOS clippy passed$(COLOR_RESET)"
 
 .PHONY: check-linux
