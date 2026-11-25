@@ -3,7 +3,7 @@
 //! 0.64.0 predates strict parameters and says no wire generation, so a CLI
 //! checks its own calls against this before sending: a key 0.64.0 would
 //! silently ignore never reaches it. Frozen, macro included: never edit.
-//! `state.apply` is left out because 0.64.0 ignores unknown fields inside `ops`.
+//! It ignores unknown fields inside `state.apply` ops too: [`LEGACY_0_64_OPS`].
 
 /// `pane_id`, `window_id` and `session_id`, then the method's own keys.
 macro_rules! pane_target {
@@ -177,6 +177,7 @@ pub(crate) const LEGACY_0_64: &[(&str, shux_rpc::Accepts)] = &[
     ("share.list", &[]),
     ("share.revoke", &["id"]),
     ("share.stop", &[]),
+    ("state.apply", &["ops"]),
     ("system.health", &[]),
     ("system.version", &[]),
     ("window.create", &["command", "cwd", "name", "session_id"]),
@@ -191,3 +192,28 @@ pub(crate) const LEGACY_0_64: &[(&str, shux_rpc::Accepts)] = &[
         &["cols", "rows", "session_id", "window_id"],
     ),
 ];
+
+/// Each op kind of 0.64.0's `state.apply` → the fields it took.
+pub(crate) const LEGACY_0_64_OPS: &[(&str, &[&str])] = &[
+    (
+        "create_session",
+        &[
+            "cwd",
+            "initial_command",
+            "initial_window_title",
+            "name",
+            "op",
+        ],
+    ),
+    (
+        "create_window",
+        &["cwd", "initial_command", "op", "session", "title"],
+    ),
+    (
+        "split_pane",
+        &["command", "cwd", "direction", "op", "ratio", "target"],
+    ),
+];
+
+/// The fields of a 0.64.0 back-reference (`session`, `target`).
+pub(crate) const LEGACY_0_64_BACK_REF: &[&str] = &["ref_op"];

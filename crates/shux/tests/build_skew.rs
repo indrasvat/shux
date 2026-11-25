@@ -81,6 +81,26 @@ impl Harness {
         self.shux_at(&self.bin)
     }
 
+    /// `args` as a hand-off runs them: handed to build `id` by a CLI of
+    /// `caller` ("<version> <sha>"), in the very process it was set for
+    /// (`exec` keeps the shell's pid).
+    fn handed(&self, id: &str, caller: &str, args: &[&str]) -> Output {
+        let shux = self.shux();
+        let mut sh = Command::new("/bin/sh");
+        for (k, v) in shux.get_envs() {
+            match v {
+                Some(v) => sh.env(k, v),
+                None => sh.env_remove(k),
+            };
+        }
+        sh.arg("-c")
+            .arg(format!(r#"SHUX_HANDOFF="{id} $$ {caller}" exec "$0" "$@""#))
+            .arg(shux.get_program())
+            .args(args)
+            .output()
+            .expect("run")
+    }
+
     fn run(&self, args: &[&str]) -> Output {
         self.shux().args(args).output().expect("run shux")
     }
@@ -461,6 +481,38 @@ fn only_an_older_idle_daemon_is_replaced() {
     );
 }
 
+/// A newer CLI that meets a busy daemon of an older release arms its
+/// upgrade: the daemon retires as its last session ends, whoever ends it,
+/// and the next command runs on the newer build. No older CLI that started
+/// its own build again in between keeps it for long: the next newer CLI
+/// arms it again.
+#[test]
+fn a_newer_cli_arms_the_upgrade_of_a_busy_older_daemon() {
+    let h = Harness::new();
+    h.occupied_by(OLDER);
+    let old = h.daemon_pid();
+    ok(&h.run(&["session", "list"]), "a newer CLI");
+    let v = h.version();
+    assert_eq!(v["daemon"]["upgrade_pending"], true, "{v}");
+    assert!(alive(old), "a busy daemon was retired");
+    ok(
+        &h.run(&["session", "kill", "agent"]),
+        "end the last session",
+    );
+    shux_testkit::wait_until("the older daemon to retire", || !alive(old));
+    ok(
+        &h.run(&["session", "create", "next", "-d", "--", "/bin/sh"]),
+        "the next command",
+    );
+    assert_eq!(h.version()["daemon"]["compat"], "same");
+
+    // Same release at another commit: nothing newer, nothing armed.
+    let sibling = Harness::new();
+    sibling.occupied_by(SIBLING);
+    ok(&sibling.run(&["session", "list"]), "a sibling CLI");
+    assert_eq!(sibling.version()["daemon"]["upgrade_pending"], false);
+}
+
 /// `daemon upgrade` in every state: same build, idle, busy, busy and
 /// deferred, busy and forced, and a newer daemon.
 #[test]
@@ -485,8 +537,9 @@ fn daemon_upgrade_in_every_state() {
     assert_eq!((code, &r["outcome"]), (Some(0), &"retired".into()), "{r}");
     shux_testkit::wait_until("the idle daemon to retire", || !alive(old));
 
+    // Busy and of this release: nothing newer arms it, so it is refused.
     let busy = Harness::new();
-    let pane = busy.occupied_by(OLDER);
+    let pane = busy.occupied_by(SIBLING);
     let old = busy.daemon_pid();
     let (code, r) = busy.json(&["daemon", "upgrade"]);
     assert_eq!(
@@ -495,6 +548,14 @@ fn daemon_upgrade_in_every_state() {
         "{r}"
     );
     assert!(alive(old), "a refused upgrade stopped the daemon");
+    let older = Harness::new();
+    older.occupied_by(OLDER);
+    let (code, r) = older.json(&["daemon", "upgrade"]);
+    assert_eq!(
+        (code, &r["outcome"]),
+        (Some(0), &"pending".into()),
+        "a newer CLI's upgrade is armed: {r}"
+    );
 
     let (code, r) = busy.json(&["daemon", "upgrade", "--when-idle"]);
     assert_eq!((code, &r["outcome"]), (Some(0), &"pending".into()), "{r}");
@@ -679,25 +740,26 @@ fn force_ends_a_daemon_that_does_not_answer() {
     shux_testkit::wait_until("the forced daemon to exit", || !alive(pid));
 }
 
-/// A call refused for skew is `daemon_too_old` under `--format json` too, on
-/// paths that print their own errors.
+/// A call refused for skew exits 11 under `--format json` too; `rpc call`
+/// keeps the raw envelope it got on stdout.
 #[test]
-fn a_refused_apply_is_daemon_too_old_under_json() {
+fn a_refused_call_exits_11_under_json() {
     let h = Harness::new();
     h.occupied_by(V0_64);
-    let spec = h.runtime.path().join("t.toml");
-    std::fs::write(
-        &spec,
-        "[session]\nname = \"tpl\"\n[[windows]]\ntitle = \"w\"\n[[windows.panes]]\ncommand = [\"/bin/sh\"]\n",
-    )
-    .expect("template");
-    let (code, r) = h.json(&["state", "apply", spec.to_str().expect("utf-8")]);
+    let (code, r) = h.json(&[
+        "rpc",
+        "call",
+        shux_rpc::UPGRADE,
+        "--params",
+        r#"{"when":"idle"}"#,
+    ]);
     assert_eq!(code, Some(DAEMON_TOO_OLD), "{r}");
-    assert_eq!(r["error"]["data"]["kind"], "daemon_too_old", "{r}");
+    assert_eq!(r["error"]["code"], -32601, "{r}");
+    assert_eq!(r["error"]["data"]["method"], shux_rpc::UPGRADE, "{r}");
 }
 
-/// 0.64.0 ignores keys it does not know: a call it would not serve as asked
-/// never reaches it, and fails as `daemon_too_old`; what it does serve works.
+/// 0.64.0 ignores keys it does not know: what it serves as asked works, a
+/// template included; what it would not never reaches it.
 #[test]
 fn a_0_64_daemon_serves_only_what_it_serves_as_asked() {
     let h = Harness::new();
@@ -715,15 +777,12 @@ fn a_0_64_daemon_serves_only_what_it_serves_as_asked() {
         "[session]\nname = \"tpl\"\n[[windows]]\ntitle = \"w\"\n[[windows.panes]]\ncommand = [\"/bin/sh\"]\n",
     )
     .expect("template");
-    let applied = h.run(&["state", "apply", spec.to_str().expect("utf-8")]);
-    assert_eq!(
-        applied.status.code(),
-        Some(DAEMON_TOO_OLD),
-        "{}",
-        text(&applied.stderr)
+    ok(
+        &h.run(&["state", "apply", spec.to_str().expect("utf-8")]),
+        "a template 0.64.0 serves as written",
     );
     let listed = ok(&h.run(&["session", "list"]), "list");
-    assert!(!listed.contains("tpl"), "the refused apply ran: {listed}");
+    assert!(listed.contains("tpl"), "the template's session: {listed}");
 
     let (code, r) = h.json(&["daemon", "upgrade", "--when-idle"]);
     assert_eq!((code, &r["outcome"]), (Some(0), &"automatic".into()), "{r}");
@@ -791,13 +850,10 @@ fn another_wire_generation_runs_the_command_with_the_daemons_own_build() {
     assert!(listed.contains("agent"), "{listed}");
     assert_eq!(h.daemon_pid(), daemon);
 
+    let kept = format!("999.0.0-{OTHER_SHA}");
+    let caller = "1.0.0 c4113r";
     // Told it was handed to a build the daemon is not: refused, not a loop.
-    let wrong = h
-        .shux()
-        .env("SHUX_HANDOFF", "0.0.0-nobody")
-        .args(["session", "list"])
-        .output()
-        .expect("run");
+    let wrong = h.handed("0.0.0-nobody", caller, &["session", "list"]);
     assert_eq!(
         wrong.status.code(),
         Some(DAEMON_IN_USE),
@@ -807,12 +863,7 @@ fn another_wire_generation_runs_the_command_with_the_daemons_own_build() {
 
     // A command the daemon's own build does not know, as one written for a
     // newer build would be: said as such, not as a usage error.
-    let unknown = h
-        .shux()
-        .env("SHUX_HANDOFF", format!("999.0.0-{OTHER_SHA}"))
-        .args(["pane", "teleport"])
-        .output()
-        .expect("run");
+    let unknown = h.handed(&kept, caller, &["pane", "teleport"]);
     assert_eq!(
         unknown.status.code(),
         Some(DAEMON_TOO_OLD),
@@ -825,13 +876,27 @@ fn another_wire_generation_runs_the_command_with_the_daemons_own_build() {
         text(&unknown.stderr)
     );
 
-    let empty = Harness::new();
-    let lost = empty
+    // Set by hand, or inherited by another process: not a hand-off.
+    let typo = h
         .shux()
-        .env("SHUX_HANDOFF", format!("999.0.0-{OTHER_SHA}"))
-        .args(["session", "list"])
+        .env("SHUX_HANDOFF", format!("{kept} 1 {caller}"))
+        .args(["pane", "teleport"])
         .output()
         .expect("run");
+    assert_eq!(typo.status.code(), Some(2), "{}", text(&typo.stderr));
+    let fresh = Harness::new();
+    ok(
+        &fresh
+            .shux()
+            .env("SHUX_HANDOFF", format!("{kept} 1 {caller}"))
+            .args(["session", "list"])
+            .output()
+            .expect("run"),
+        "an exported SHUX_HANDOFF starts a daemon as any command does",
+    );
+
+    let empty = Harness::new();
+    let lost = empty.handed(&kept, caller, &["session", "list"]);
     assert!(!lost.status.success());
     assert!(
         text(&lost.stderr).contains("handed to"),
@@ -842,6 +907,30 @@ fn another_wire_generation_runs_the_command_with_the_daemons_own_build() {
         live_pidfiles(&empty.pid_dir()).is_empty(),
         "a handed-off command started a daemon"
     );
+}
+
+/// A handed-off command speaks for the CLI that handed it, not the daemon's
+/// own build that runs it: a newer caller may switch the daemon, and the
+/// daemon learns a newer shux exists.
+#[test]
+fn a_handed_off_command_speaks_for_the_cli_that_handed_it() {
+    let h = Harness::new();
+    h.occupied_by(NEXT_WIRE);
+    let kept = format!("999.0.0-{OTHER_SHA}");
+    let out = h.handed(
+        &kept,
+        "1000.0.0 c4113r",
+        &["--format", "json", "daemon", "upgrade", "--when-idle"],
+    );
+    let r: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("not JSON ({e}): {}", text(&out.stderr)));
+    assert_eq!(
+        (out.status.code(), &r["outcome"]),
+        (Some(0), &"pending".into()),
+        "a newer caller was refused as older: {r}"
+    );
+    assert_eq!(r["client_version"], "1000.0.0", "{r}");
+    assert_eq!(h.version()["daemon"]["superseded_by"], "1000.0.0");
 }
 
 /// A kept build that is not the file the daemon recorded is never run: the

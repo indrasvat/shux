@@ -150,6 +150,12 @@ common "new→peer" "$NEW" "$rt" "$pane"
 expect 0 "new→peer: version" "$NEW" "$rt" --format json version
 contains "new→peer: version says compatible" '"compat": "compatible"'
 same_daemon "$rt" "$before" "the peer daemon was neither stopped nor replaced"
+contains "new→peer: this newer CLI armed its upgrade" '"upgrade_pending": true'
+kill_all "$NEW" "$rt"
+if wait_gone "$before"; then pass "it retired as its last session ended"; else fail "it never retired"; fi
+expect 0 "new→peer: the next command" "$NEW" "$rt" session list
+expect 0 "new→peer: version" "$NEW" "$rt" --format json version
+contains "new→peer: the next command started this build" '"mismatch": false'
 
 step "2. the peer CLI against a busy daemon of this build"
 new_runtime
@@ -164,7 +170,8 @@ step "3. daemon upgrade --when-idle hands over when the last session ends"
 new_runtime
 occupy "$PEER" "$rt" >/dev/null
 old="$(daemon_pid "$rt")"
-expect 1 "upgrade without a flag refuses while busy" "$NEW" "$rt" daemon upgrade
+expect 0 "upgrade without a flag, from a newer CLI, is pending while busy" "$NEW" "$rt" --format json daemon upgrade
+contains "it is pending" '"outcome": "pending"'
 expect 0 "upgrade --when-idle" "$NEW" "$rt" --format json daemon upgrade --when-idle
 contains "it is pending" '"outcome": "pending"'
 expect 0 "still serving while pending" "$NEW" "$rt" session list
@@ -188,6 +195,20 @@ RUNTIMES+=("$bin_dir")
 cp "$PEER" "$bin_dir/shux"
 pane="$(occupy "$bin_dir/shux" "$rt")"
 old="$(daemon_pid "$rt")"
+kept="$(jq -r .build.exe "$rt/shux/shux.build.json")"
+# Written into the very file the daemon runs: Linux refuses it (text file busy).
+if cp "$NEW" "$bin_dir/shux" 2>"$OUT/err"; then
+  pass "the install rewritten in place"
+elif grep -qi busy "$OUT/err"; then
+  pass "the system refuses to rewrite a running binary in place"
+else
+  fail "rewrite in place: $(cat "$OUT/err")"
+fi
+expect 0 "rewritten in place: session list" "$NEW" "$rt" session list
+colours "rewritten in place" "$NEW" "$rt" "$pane"
+same_daemon "$rt" "$old" "the same daemon, after the rewrite in place"
+expect 0 "its kept build still runs" "$kept" "$rt" --format json version
+contains "its kept build is still the peer build" "$(XDG_RUNTIME_DIR="$rt" "$PEER" --format json version | jq -r .cli.git_sha)"
 cp "$NEW" "$bin_dir/shux.new" && mv -f "$bin_dir/shux.new" "$bin_dir/shux"
 common "replaced by rename" "$bin_dir/shux" "$rt" "$pane"
 rm -f "$bin_dir/shux"
@@ -211,7 +232,9 @@ for prev in $PREV; do
     expect 0 "new→$build: session list" "$NEW" "$rt" session list
     expect 0 "new→$build: capture" "$NEW" "$rt" pane capture -s agent -p "$pane"
     printf '[session]\nname = "tpl"\n[[windows]]\ntitle = "w"\n[[windows.panes]]\ncommand = ["/bin/sh"]\n' >"$OUT/t.toml"
-    expect 11 "new→$build: state apply is refused before it is sent" "$NEW" "$rt" state apply "$OUT/t.toml"
+    expect 0 "new→$build: a template it serves as written applies" "$NEW" "$rt" state apply "$OUT/t.toml"
+    expect 0 "new→$build: session list" "$NEW" "$rt" session list
+    contains "new→$build: the template's session exists" "tpl"
   else
     expect 10 "new→$build: refused, as a build before wire generations" "$NEW" "$rt" session list
     contains "new→$build: the advice names no overwritten CLI" "after its last session ends"

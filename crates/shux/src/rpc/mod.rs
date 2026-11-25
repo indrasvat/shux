@@ -28,6 +28,8 @@ pub(crate) mod state;
 pub(crate) mod wait_command;
 pub(crate) mod wait_exit;
 pub(crate) mod window;
+#[cfg(test)]
+pub(crate) mod wire_1;
 
 #[cfg(test)]
 pub(crate) mod test_harness;
@@ -122,6 +124,8 @@ pub(crate) fn build_router(
         plugins,
     )
     .accepts(accepts::ACCEPTS)
+    // `null` means absent for every parameter added since 0.64.0.
+    .keeps_null(legacy_0_64::LEGACY_0_64)
     .build()
 }
 

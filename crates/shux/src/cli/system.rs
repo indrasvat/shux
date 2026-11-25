@@ -139,11 +139,8 @@ pub async fn handle_daemon_upgrade(
     format: OutputFormat,
 ) -> anyhow::Result<()> {
     use crate::client::{Compat, DaemonAnswer};
-    // A command handed to the daemon's own build names no build of its own.
-    let this = match crate::kept_build::handed_to() {
-        Some(_) => "the installed shux".to_string(),
-        None => format!("shux {} ({})", shux_rpc::VERSION, shux_rpc::GIT_SHA),
-    };
+    let (version, sha) = crate::client::caller();
+    let this = format!("shux {version} ({sha})");
     let starts = format!("the next shux command starts {this}");
     let mut report = Report {
         format,
@@ -172,7 +169,7 @@ pub async fn handle_daemon_upgrade(
     }
     // A daemon of another wire generation is asked by its own build.
     crate::kept_build::hand_off(socket);
-    let (answer, held) = crate::client::ask_daemon_version(socket).await;
+    let (answer, held, asked) = crate::client::ask_daemon_version(socket).await;
     report.sessions = held;
     let dv = match answer {
         DaemonAnswer::Absent => {
@@ -228,7 +225,9 @@ pub async fn handle_daemon_upgrade(
     }
     match dv.compat() {
         Compat::Same | Compat::Wire => {
-            let mut stream = crate::client::try_connect(socket).await?;
+            let Some(mut stream) = asked else {
+                anyhow::bail!("the daemon answered on no connection");
+            };
             let mut params = crate::client::client_build();
             params["when"] = if when_idle { "idle" } else { "now" }.into();
             let r = rpc_call(&mut stream, shux_rpc::UPGRADE, params).await?;
@@ -247,7 +246,7 @@ pub async fn handle_daemon_upgrade(
                     1,
                     "busy",
                     &format!("the daemon is in use: {sessions}"),
-                    "left running; `--when-idle` swaps it when its last session ends, `--force` ends them now",
+                    "it keeps running: `--when-idle` swaps it when its last session ends, `--force` ends them now",
                 )
             }
         }
@@ -267,7 +266,7 @@ pub async fn handle_daemon_upgrade(
             1,
             "busy",
             &format!("the daemon is in use: {sessions}"),
-            "left running; it is replaced by the first shux command after its last session ends, or `--force` ends them now",
+            "it keeps running, and the first shux command after its last session ends replaces it; `--force` ends them now",
         ),
         Compat::WireBreak => report.say(
             3,
@@ -365,8 +364,8 @@ impl Report {
                     "exit_code": code,
                     "daemon_version": daemon.map(|d| &d.version),
                     "daemon_git_sha": daemon.map(|d| &d.git_sha),
-                    "client_version": shux_rpc::VERSION,
-                    "client_git_sha": shux_rpc::GIT_SHA,
+                    "client_version": crate::client::caller().0,
+                    "client_git_sha": crate::client::caller().1,
                     "sessions": self.sessions,
                     "detail": detail,
                 });
@@ -399,7 +398,7 @@ pub async fn handle_version(
     // `daemon`: `None` when no daemon serves the socket, `Err` when one is
     // there but did not say which build. `mismatch`: whether it is not this
     // build, as far as it said. `held`: its sessions at the time of asking.
-    let (answer, held) = crate::client::ask_daemon_version(socket_path).await;
+    let (answer, held, _) = crate::client::ask_daemon_version(socket_path).await;
     let (daemon, mismatch) = match answer {
         DaemonAnswer::Absent => (None, None),
         DaemonAnswer::Answered(dv) => {

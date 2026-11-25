@@ -1440,14 +1440,28 @@ pub fn print_error(msg: &str) {
 
 /// `shux daemon upgrade`: what happened, then what happens next.
 pub fn print_upgrade(done: bool, headline: &str, next: &str) -> Printed {
-    let mut out = io::stdout().lock();
-    if done {
-        write!(out, "{} {}", success("\u{2713}"), bold(headline))?;
-    } else {
-        write!(out, "{} {}", warning("!"), bold(headline))?;
-    }
-    writeln!(out, " {}", muted(safe_diagnostic(next)))?;
+    writeln!(
+        io::stdout().lock(),
+        "{}",
+        upgrade_line(done, headline, next)
+    )?;
     Ok(())
+}
+
+fn upgrade_line(done: bool, headline: &str, next: &str) -> String {
+    let mark = if done {
+        success("\u{2713}").to_string()
+    } else {
+        warning("!").to_string()
+    };
+    match next {
+        "" => format!("{mark} {}", bold(headline)),
+        next => format!(
+            "{mark} {}{}",
+            bold(headline),
+            muted(format!("; {}", safe_diagnostic(next)))
+        ),
+    }
 }
 
 /// One muted line on stderr: a note on how the command ran, never its output.
@@ -2684,6 +2698,25 @@ pub fn print_share_stopped(links: u64) -> Printed {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Without colour the headline and the next step stay apart, as JSON's
+    /// `detail` keeps them; with nothing next, nothing trails the headline.
+    #[test]
+    fn an_upgrade_line_keeps_its_headline_and_next_step_apart_without_colour() {
+        assert!(!colors_enabled(), "tests run without a terminal");
+        assert_eq!(
+            upgrade_line(
+                true,
+                "no daemon is running",
+                "the next shux command starts this build"
+            ),
+            "\u{2713} no daemon is running; the next shux command starts this build"
+        );
+        assert_eq!(
+            upgrade_line(false, "could not reach it", ""),
+            "! could not reach it"
+        );
+    }
 
     /// The time left comes first, then the local end with its day and zone.
     #[test]

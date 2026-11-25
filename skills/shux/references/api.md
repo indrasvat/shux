@@ -786,7 +786,11 @@ flow through the data-plane sealed bus, not the event history).
 `wire` is the protocol generation: any two builds of one generation serve each
 other, and a call one lacks fails alone. `capabilities` is every method with the
 top-level parameters it takes; any other key is refused (`invalid_params`,
-`data.kind: "unknown_params"`). A newer caller's `client` sets `superseded_by`.
+`data.kind: "unknown_params"`); a key set to `null` is absent (in `state.apply`
+ops at any depth), but for a few that mean something by it, such as
+`share.create`'s `from_pane`. A
+newer caller's `client` sets `superseded_by` and, while sessions remain, arms the
+upgrade: `upgrade_pending` turns true, as `daemon.upgrade` with `"idle"` makes it.
 
 ### `daemon.upgrade` — owner-local
 
@@ -796,7 +800,8 @@ top-level parameters it takes; any other key is refused (`invalid_params`,
 
 With no sessions the daemon retires at once and the next command starts the
 caller's build. With sessions, `"idle"` retires it in the same step that ends
-the last of them; `"now"` refuses. `shux daemon upgrade [--when-idle|--force]`
+the last of them; `"now"` refuses, unless the caller is a newer release or an
+upgrade is already armed (`pending: true`). `shux daemon upgrade [--when-idle|--force]`
 wraps it (`--force` stops the daemon instead).
 
 ### `plugin.state.{get,set,delete}` — plugin-only

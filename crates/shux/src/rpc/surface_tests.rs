@@ -233,6 +233,63 @@ async fn an_unknown_op_field_is_refused_as_unknown_params() {
         assert_eq!(data["kind"], shux_rpc::UNKNOWN_PARAMS, "{data}");
         assert_eq!(data["params"], serde_json::json!([field]), "{data}");
     }
+
+    // Set to `null`, at any depth, a field asks for nothing, as at the top
+    // level: the ops parse, and the batch goes on to the graph.
+    let op = serde_json::json!({
+        "op": "create_window", "session": {"ref_op": 5, "zz_ref": null},
+        "title": "t", "cwd": null, "zz_new": null,
+    });
+    let call = router.dispatch("state.apply", Some(serde_json::json!({ "ops": [op] })));
+    let err = shux_rpc::with_transport(shux_rpc::Transport::Uds, call)
+        .await
+        .expect_err("this router runs no graph");
+    let said = format!("{err:?}");
+    assert!(
+        !said.contains(shux_rpc::UNKNOWN_PARAMS) && !said.contains("ops parse error"),
+        "a null op field was refused: {said}"
+    );
+}
+
+/// Generation 1 only grows: what `wire_1.rs` records is still served, and
+/// what is served is recorded there, so a parameter added after 0.64.0 cannot
+/// be removed again without a new generation.
+#[test]
+fn wire_generation_1_only_grows() {
+    use std::collections::{BTreeSet, HashMap};
+    assert_eq!(
+        shux_rpc::WIRE_GENERATION,
+        1,
+        "a new generation starts a baseline of its own"
+    );
+    let served: HashMap<&str, &[&str]> = super::accepts::ACCEPTS.iter().copied().collect();
+    let recorded: HashMap<&str, &[&str]> = super::wire_1::WIRE_1.iter().copied().collect();
+    for (method, keys) in &recorded {
+        let now = served
+            .get(method)
+            .unwrap_or_else(|| panic!("{method} was removed from generation 1"));
+        for key in *keys {
+            assert!(now.contains(key), "{method} no longer takes {key}");
+        }
+    }
+    for (method, keys) in &served {
+        let then = recorded
+            .get(method)
+            .unwrap_or_else(|| panic!("{method} is not recorded in wire_1.rs"));
+        for key in *keys {
+            assert!(
+                then.contains(key),
+                "{method} {key} is not recorded in wire_1.rs"
+            );
+        }
+    }
+    let ops: BTreeSet<&str> = super::wire_1::WIRE_1_OPS
+        .iter()
+        .flat_map(|(_, fields)| fields.iter().copied())
+        .chain(super::wire_1::WIRE_1_BACK_REF.iter().copied())
+        .collect();
+    let now: BTreeSet<&str> = shux_core::apply::OP_FIELDS.iter().copied().collect();
+    assert_eq!(ops, now, "state.apply op fields differ from wire_1.rs");
 }
 
 /// The table names only methods the daemon serves: a stale entry would be
@@ -266,6 +323,16 @@ fn no_method_or_parameter_of_an_earlier_release_is_gone() {
         for key in *keys {
             assert!(served.contains(key), "{method} no longer takes {key}");
         }
+    }
+    let legacy_ops = super::legacy_0_64::LEGACY_0_64_OPS.iter();
+    for field in legacy_ops
+        .flat_map(|(_, fields)| fields.iter())
+        .chain(super::legacy_0_64::LEGACY_0_64_BACK_REF)
+    {
+        assert!(
+            shux_core::apply::OP_FIELDS.contains(field),
+            "state.apply ops no longer take {field}"
+        );
     }
 }
 

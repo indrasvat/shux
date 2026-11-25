@@ -341,10 +341,12 @@ older build. Your sessions, panes and agents are untouched, and nothing exits 10
   "daemon_version", "client_version", "upgrade"}}}`. The next call still works.
 - **The daemon holds none:** the next command replaces it with the new build, as
   before. An older CLI never replaces a newer daemon.
-- **To switch now or soon:** `shux daemon upgrade --when-idle` makes the daemon retire
-  the moment its last session ends (the status bar shows `↑ <version> at idle`);
-  `--force` ends its sessions now. Bare `daemon upgrade` swaps an idle daemon and
-  refuses (exit 1) while it holds sessions.
+- **It switches on its own:** once a CLI of a newer release has talked to a busy
+  daemon of this release or later, the daemon retires the moment its last session ends
+  (the status bar shows `↑ <version> at idle`), and the next command starts the newer
+  build. `shux daemon upgrade --when-idle` asks for that from any build; `--force` ends
+  its sessions now. Bare `daemon upgrade` swaps an idle daemon, says `pending` when the
+  switch is already armed, and refuses (exit 1) a busy daemon of the same release.
 - **The status bar** shows `↑ <version>` once a newer CLI has talked to the daemon.
   `shux version --format json` says `daemon.compat` (`compatible`, `legacy_0_64`,
   `legacy`, `wire_break`) and `daemon.upgrade_pending`.
@@ -358,8 +360,8 @@ Exit 10 (`daemon_in_use`, -32015) is left for daemons that cannot be served safe
 a build from before 0.64 that holds sessions, one that did not say which build it is,
 and one of another wire generation with no copy of its build left. Its message names
 the `daemon stop` for that socket and runtime dir. A **0.64.0** daemon is served too,
-but only with calls it takes whole (it ignores keys it does not know), so a newer
-call fails with exit 11 before it is sent. A shipped CLI of 0.64 or earlier still
+but only with calls it takes whole (it ignores keys it does not know, inside
+`state apply` ops too), so a newer call fails with exit 11 before it is sent. A shipped CLI of 0.64 or earlier still
 refuses (exit 10) against a newer daemon: that is its own code.
 
 A daemon of another **wire generation** (a protocol change, rare) is never spoken to

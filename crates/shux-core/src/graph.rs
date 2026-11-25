@@ -527,6 +527,17 @@ impl SessionGraph {
         Err(n)
     }
 
+    /// [`Self::retire_when_empty`] while sessions remain; an empty graph is
+    /// left as it is. `true` when a retirement is now pending.
+    pub fn retire_when_empty_if_busy(&self) -> bool {
+        if self.retiring.load(std::sync::atomic::Ordering::SeqCst)
+            || self.current().sessions.is_empty()
+        {
+            return false;
+        }
+        self.retire_when_empty().is_err()
+    }
+
     fn retire_now(&self) {
         self.retiring
             .store(true, std::sync::atomic::Ordering::SeqCst);

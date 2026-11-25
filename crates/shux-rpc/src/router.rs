@@ -57,6 +57,7 @@ pub struct Router {
     policies: Arc<HashMap<String, Policy>>,
     owner_local: Arc<HashSet<String>>,
     accepts: Arc<HashMap<String, Accepts>>,
+    keeps_null: Arc<HashMap<String, Accepts>>,
 }
 
 /// The top-level parameters a method accepts. Any other key is refused before
@@ -72,6 +73,7 @@ impl Router {
             policies: Arc::new(HashMap::new()),
             owner_local: Arc::default(),
             accepts: Arc::default(),
+            keeps_null: Arc::default(),
         }
     }
 
@@ -82,6 +84,7 @@ impl Router {
             policies: HashMap::new(),
             owner_local: HashSet::new(),
             accepts: HashMap::new(),
+            keeps_null: HashMap::new(),
         }
     }
 
@@ -112,10 +115,11 @@ impl Router {
                 let mut params = params;
                 if let Some(accepted) = self.accepts.get(method) {
                     check_params(method, accepted, params.as_ref())?;
-                    // An unknown key set to `null` asks for nothing: gone, so
-                    // a handler that parses strictly sees an absent key.
+                    // A key set to `null` asks for nothing, unless it is one
+                    // whose `null` means something: gone, as if absent.
+                    let keep = self.keeps_null.get(method).copied().unwrap_or_default();
                     if let Some(Value::Object(object)) = params.as_mut() {
-                        object.retain(|k, v| accepted.contains(&k.as_str()) || !v.is_null());
+                        object.retain(|k, v| !v.is_null() || keep.contains(&k.as_str()));
                     }
                 }
                 debug!(method, "dispatching RPC method");
@@ -203,6 +207,7 @@ pub struct RouterBuilder {
     policies: HashMap<String, Policy>,
     owner_local: HashSet<String>,
     accepts: HashMap<String, Accepts>,
+    keeps_null: HashMap<String, Accepts>,
 }
 
 impl RouterBuilder {
@@ -262,6 +267,15 @@ impl RouterBuilder {
         self
     }
 
+    /// The keys whose `null` reaches the handler, per method: every other
+    /// key set to `null` is removed first, as if absent.
+    pub fn keeps_null(mut self, table: &[(&str, Accepts)]) -> Self {
+        for (method, keys) in table {
+            self.keeps_null.insert((*method).to_string(), keys);
+        }
+        self
+    }
+
     /// Build the router.
     pub fn build(self) -> Router {
         Router {
@@ -269,6 +283,7 @@ impl RouterBuilder {
             policies: Arc::new(self.policies),
             owner_local: Arc::new(self.owner_local),
             accepts: Arc::new(self.accepts),
+            keeps_null: Arc::new(self.keeps_null),
         }
     }
 }
@@ -427,20 +442,22 @@ mod tests {
         assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 4);
     }
 
-    /// An unknown key set to `null` never reaches the handler: one that
-    /// parses strictly itself sees exactly what an absent key gives it.
+    /// A key set to `null`, declared or not, never reaches the handler, but
+    /// for the keys whose `null` means something: no other parameter can give
+    /// `null` a meaning a daemon of an older build would drop.
     #[tokio::test]
-    async fn an_unknown_null_key_is_removed_before_the_handler() {
+    async fn a_null_key_is_removed_before_the_handler() {
         let router = Router::builder()
             .register("m.echo", |p: Option<Value>| async move {
                 Ok(p.unwrap_or(Value::Null))
             })
-            .accepts(&[("m.echo", &["a", "b"])])
+            .accepts(&[("m.echo", &["a", "b", "c"])])
+            .keeps_null(&[("m.echo", &["b"])])
             .build();
         let seen = router
             .dispatch(
                 "m.echo",
-                Some(serde_json::json!({"a": 1, "b": null, "zz": null})),
+                Some(serde_json::json!({"a": 1, "b": null, "c": null, "zz": null})),
             )
             .await
             .unwrap();

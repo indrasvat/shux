@@ -2,10 +2,10 @@
 //!
 //! The router refuses any other key before the handler runs, and
 //! `system.version` publishes this table as the daemon's capabilities. A new
-//! parameter goes here in the change that reads it; a removed one is a
-//! [`shux_rpc::WIRE_GENERATION`] bump. A new parameter must not give `null` a
-//! meaning absent does not have: a daemon that does not know it drops it.
-//! 0.64.0's surface is frozen in `legacy_0_64.rs`.
+//! parameter goes here, and in `wire_1.rs`, in the change that reads it; a
+//! removed one is a [`shux_rpc::WIRE_GENERATION`] bump. A key set to `null`
+//! reaches a handler only if 0.64.0 took it, so a newer parameter's `null`
+//! always means absent. 0.64.0's surface is frozen in `legacy_0_64.rs`.
 
 /// `pane_id`, `window_id` and `session_id`, which name a pane (or the active
 /// one of a window or session) or scope events, then the method's own keys.

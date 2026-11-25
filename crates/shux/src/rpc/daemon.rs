@@ -20,17 +20,18 @@ pub(crate) fn superseded_by() -> Option<String> {
         .clone()
 }
 
-/// Notes the build a call's `client` param names, if it is a newer release.
-pub(crate) fn note_client(params: Option<&Value>) {
+/// Notes the build a call's `client` param names, if it is a newer release:
+/// `true` then.
+pub(crate) fn note_client(params: Option<&Value>) -> bool {
     let Some(version) = params
         .and_then(|p| p.get("client"))
         .and_then(|c| c.get("version"))
         .and_then(|v| v.as_str())
     else {
-        return;
+        return false;
     };
     let Some(seen) = crate::client::semver(version) else {
-        return;
+        return false;
     };
     // As this daemon says it is: clients compare against the same answer.
     let answer = shux_rpc::server::version_answer();
@@ -39,7 +40,7 @@ pub(crate) fn note_client(params: Option<&Value>) {
         .and_then(|v| v.as_str())
         .and_then(crate::client::semver);
     if ours.is_none_or(|ours| seen <= ours) {
-        return;
+        return false;
     }
     let mut newest = SUPERSEDED_BY.lock().unwrap_or_else(|e| e.into_inner());
     let newer = newest
@@ -51,6 +52,7 @@ pub(crate) fn note_client(params: Option<&Value>) {
         let (major, minor, patch) = seen;
         *newest = Some(format!("{major}.{minor}.{patch}"));
     }
+    true
 }
 
 pub(crate) fn register_daemon_methods(
@@ -66,20 +68,31 @@ pub(crate) fn register_daemon_methods(
             "system.version",
             Policy::fixed(Sensitivity::Public),
             move |params: Option<Value>| {
-                note_client(params.as_ref());
-                let snap = g_version.snapshot();
-                let mut answer = shux_rpc::server::version_answer();
-                if answer.get("version").is_some() {
-                    let capabilities: serde_json::Map<String, Value> = crate::rpc::accepts::ACCEPTS
-                        .iter()
-                        .map(|(m, keys)| ((*m).to_string(), json!(keys)))
-                        .collect();
-                    answer["capabilities"] = Value::Object(capabilities);
-                    answer["superseded_by"] = json!(superseded_by());
-                    answer["upgrade_pending"] = json!(snap.retire_pending && !snap.retired);
-                    answer["build"] = crate::kept_build::advertised();
+                let newer = note_client(params.as_ref());
+                let graph = g_version.clone();
+                async move {
+                    // A newer CLI exists: switch to it once this build's sessions end.
+                    if newer {
+                        graph
+                            .atomically(|g| g.retire_when_empty_if_busy())
+                            .await
+                            .map_err(graph_error_to_rpc)?;
+                    }
+                    let snap = graph.snapshot();
+                    let mut answer = shux_rpc::server::version_answer();
+                    if answer.get("version").is_some() {
+                        let capabilities: serde_json::Map<String, Value> =
+                            crate::rpc::accepts::ACCEPTS
+                                .iter()
+                                .map(|(m, keys)| ((*m).to_string(), json!(keys)))
+                                .collect();
+                        answer["capabilities"] = Value::Object(capabilities);
+                        answer["superseded_by"] = json!(superseded_by());
+                        answer["upgrade_pending"] = json!(snap.retire_pending && !snap.retired);
+                        answer["build"] = crate::kept_build::advertised();
+                    }
+                    Ok(answer)
                 }
-                async move { Ok(answer) }
             },
         )
         .register_to_completion(
@@ -89,14 +102,15 @@ pub(crate) fn register_daemon_methods(
                 let gh = graph.clone();
                 let cancel = cancel.clone();
                 async move {
-                    note_client(params.as_ref());
+                    let newer = note_client(params.as_ref());
                     let when = params
                         .as_ref()
                         .and_then(|p| p.get("when"))
                         .and_then(|w| w.as_str())
                         .unwrap_or("now");
+                    // A newer CLI arms it anyway, as `system.version` does.
                     let deferred = match when {
-                        "now" => false,
+                        "now" => newer,
                         "idle" => true,
                         other => {
                             return Err(RpcError::invalid_params(&format!(
@@ -106,13 +120,14 @@ pub(crate) fn register_daemon_methods(
                     };
                     // One graph step: no session lands between the count and
                     // the refusal of every later one.
-                    let outcome = gh
+                    let (outcome, pending) = gh
                         .atomically(move |g| {
-                            if deferred {
+                            let outcome = if deferred {
                                 g.retire_when_empty()
                             } else {
                                 g.retire_if_empty()
-                            }
+                            };
+                            (outcome, g.current().retire_pending)
                         })
                         .await
                         .map_err(graph_error_to_rpc)?;
@@ -123,7 +138,7 @@ pub(crate) fn register_daemon_methods(
                             cancel.cancel();
                             json!({ "retired": true, "pending": false, "sessions": 0 })
                         }
-                        Err(n) => json!({ "retired": false, "pending": deferred, "sessions": n }),
+                        Err(n) => json!({ "retired": false, "pending": pending, "sessions": n }),
                     })
                 }
             },

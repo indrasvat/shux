@@ -132,6 +132,7 @@ impl RpcHarness {
         let router =
             crate::rpc::events::register_events_methods(builder, bus.clone(), graph.clone())
                 .accepts(crate::rpc::accepts::ACCEPTS)
+                .keeps_null(crate::rpc::legacy_0_64::LEGACY_0_64)
                 .build();
         router.assert_every_route_has_policy();
         router.assert_every_route_declares_params();

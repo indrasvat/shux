@@ -10,6 +10,7 @@ files:
 ignores:
   - "crates/shux/src/rpc/test_harness.rs"
   - "crates/shux/src/rpc/surface_tests.rs"
+  - "crates/shux/src/rpc/wire_1.rs"
   - "crates/shux/src/cli/test_support.rs"
   - "crates/shux/src/pane_record_fuzz.rs"
 rule:

@@ -224,7 +224,11 @@ fn resend(
     retired: bool,
 ) -> Resend {
     let kind = |d: &serde_json::Value| d.get("kind").and_then(|k| k.as_str()).map(String::from);
-    if method.contains("watch") || method.contains("wait") {
+    // A retirement was asked of that daemon; a watch or a wait was for it.
+    if method.contains("watch")
+        || method.contains("wait")
+        || [shux_rpc::UPGRADE, shux_rpc::RETIRE_IF_IDLE].contains(&method)
+    {
         return Resend::No;
     }
     match answer {
@@ -315,6 +319,15 @@ mod resend_tests {
             resend(&rpc(shux_rpc::server::DAEMON_STOPPING), wait, true),
             Resend::No
         );
+        // Asked of that daemon: its successor is the build asked for.
+        for retire in [shux_rpc::UPGRADE, shux_rpc::RETIRE_IF_IDLE] {
+            assert_eq!(resend(&retiring, retire, true), Resend::No, "{retire}");
+            assert_eq!(
+                resend(&io(BrokenPipe, false), retire, true),
+                Resend::No,
+                "{retire}"
+            );
+        }
     }
 }
 

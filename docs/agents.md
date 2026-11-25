@@ -219,7 +219,9 @@ Stable codes:
 
 `-32602` with `data.kind == "unknown_params"` names the parameters a method does not
 take (`data.params`) and those it does (`data.accepted`). Every method refuses a key
-it does not know, before doing anything; a key set to `null` counts as absent.
+it does not know, before doing anything; a key set to `null` is absent (at any
+depth of `state.apply` ops too), unless 0.64.0 already took it, so no newer
+parameter gives `null` a meaning.
 `system.version` lists each method's parameters under `capabilities`.
 
 CLI translates these to exit code 1 with a human-readable message;

@@ -21,9 +21,43 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
-/// Set on a command handed to the daemon's own build: that build's id. The
-/// command trusts that daemon as its own and never hands off again.
+/// Set on a command handed to the daemon's own build: `<that build's id>
+/// <pid> <caller version> <caller sha>`. Only the process `<pid>` honours it
+/// (exec keeps the pid, so an exported or inherited value is ignored); it
+/// then trusts that daemon as its own, speaks for the caller, and never hands
+/// off again.
 pub(crate) const HANDOFF_ENV: &str = "SHUX_HANDOFF";
+
+/// A command handed to this build by [`hand_off`].
+pub struct Handoff {
+    /// The build it was handed to: the daemon's.
+    pub id: String,
+    pub caller_version: String,
+    pub caller_git_sha: String,
+}
+
+fn parse_handoff(raw: &str, pid: u32) -> Option<Handoff> {
+    let mut f = raw.split(' ');
+    let (id, for_pid, version, sha) = (f.next()?, f.next()?, f.next()?, f.next()?);
+    let valid = f.next().is_none()
+        && for_pid.parse() == Ok(pid)
+        && !id.is_empty()
+        && crate::client::semver(version).is_some()
+        && !sha.is_empty();
+    valid.then(|| Handoff {
+        id: id.to_string(),
+        caller_version: version.to_string(),
+        caller_git_sha: sha.to_string(),
+    })
+}
+
+/// This command's hand-off, when it is one: see [`HANDOFF_ENV`].
+pub fn handoff() -> Option<&'static Handoff> {
+    static HANDOFF: OnceLock<Option<Handoff>> = OnceLock::new();
+    HANDOFF
+        .get_or_init(|| parse_handoff(&std::env::var(HANDOFF_ENV).ok()?, std::process::id()))
+        .as_ref()
+}
 
 /// A build no daemon holds is kept this long after it was made or last
 /// touched: a daemon between making its copy and locking it is not robbed.
@@ -424,7 +458,7 @@ fn write_build_file(socket: &Path) {
 
 /// The build a command was handed to, when it was: see [`HANDOFF_ENV`].
 pub fn handed_to() -> Option<String> {
-    std::env::var(HANDOFF_ENV).ok().filter(|id| !id.is_empty())
+    handoff().map(|h| h.id.clone())
 }
 
 /// Before a command that talks to the daemon: when the daemon serving
@@ -453,7 +487,15 @@ pub(crate) fn hand_off(socket: &Path) {
     use std::os::unix::process::CommandExt as _;
     let err = std::process::Command::new(&exe)
         .args(std::env::args_os().skip(1))
-        .env(HANDOFF_ENV, &id)
+        .env(
+            HANDOFF_ENV,
+            format!(
+                "{id} {} {} {}",
+                std::process::id(),
+                shux_rpc::VERSION,
+                shux_rpc::GIT_SHA
+            ),
+        )
         .exec();
     tracing::warn!(exe = %exe.display(), error = %err, "could not hand the command off");
 }
