@@ -204,6 +204,8 @@ fn hold_listener(port: u16) -> Option<std::net::TcpListener> {
 
 enum Msg {
     Line(String),
+    /// Its log reached its end.
+    LogEnd,
     Exited,
     Stop,
 }
@@ -308,6 +310,7 @@ pub fn supervise(cloudflared: &Path, port: u16) -> anyhow::Result<()> {
                     return;
                 }
             }
+            let _ = tx.send(Msg::LogEnd);
         });
     }
     let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -337,7 +340,25 @@ pub fn supervise(cloudflared: &Path, port: u16) -> anyhow::Result<()> {
                     alive &= report(r);
                 }
             }
-            Ok(Msg::Exited) => break Exit::Exited,
+            Ok(Msg::Exited) => {
+                // Its last words (a 429, say) may still be in the pipe: with
+                // its group gone nothing else holds the log, so read to its
+                // end before saying why it went.
+                kill_group(group);
+                while let Ok(m) = rx.recv_timeout(DRAIN) {
+                    match m {
+                        Msg::Line(line) => {
+                            if let Some(r) = parser.feed(&line) {
+                                report(r);
+                            }
+                        }
+                        Msg::LogEnd => break,
+                        Msg::Exited | Msg::Stop => {}
+                    }
+                }
+                break Exit::Exited;
+            }
+            Ok(Msg::LogEnd) => {}
             Ok(Msg::Stop) | Err(_) => break Exit::Stopped,
         }
     };

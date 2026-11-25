@@ -120,7 +120,7 @@ cloudflared dies, every link it carried ends; a new link gets a new address.
 | Guests per link | 1 by default; at most 32 (`--uses 0` means up to 32) |
 | Watching at once, per link | 4 |
 | Reconnects | 5 per guest in 10 seconds |
-| A guest who leaves | can come back on the same link for 10 minutes |
+| A guest who leaves | can come back on the same link while it lasts; on a `--uses 0` link, for 10 minutes |
 | Per daemon | 64 live links, 16 streams |
 | Wrong secrets | 10 a minute from one address, 300 a minute in all; past either, refused (429) for a while |
 

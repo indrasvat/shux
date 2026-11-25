@@ -400,10 +400,25 @@ impl Gateway {
         if !sessions.sessions.contains_key(&opts.session) {
             return Err(ShareError::NoSession(opts.session));
         }
+        let before = store.links();
         let _ = store.end_grants(now, |s| !sessions.sessions.contains_key(&s));
+        let after = store.links();
+        // Announced as the keeper's sweep would have: it will not see them.
+        let gone: Vec<_> = before
+            .into_iter()
+            .filter(|(id, _)| !after.contains_key(id))
+            .map(|(id, s)| {
+                let why = store.ended(&id).unwrap_or(EndReason::SessionEnded);
+                (id, s, why)
+            })
+            .collect();
         let session = opts.session;
-        let minted = store.create(opts, now)?;
+        let minted = store.create(opts, now);
         drop(store);
+        for (id, s, why) in gone {
+            self.note_ended(id, s, why);
+        }
+        let minted = minted?;
         self.note(EventData::ShareCreated {
             link_id: minted.id.as_str().to_string(),
             session_id: session,
@@ -1287,6 +1302,42 @@ mod tests {
             "{settled:?}"
         );
         drop(held);
+    }
+
+    /// A link that minting another finds without its session is announced as
+    /// ended, as the keeper's sweep would have.
+    #[tokio::test]
+    async fn a_link_ended_while_minting_another_is_announced() {
+        let gw = gateway();
+        let gone = shared(&gw).await;
+        let kept = gw
+            .inner
+            .deps
+            .graph
+            .create_session("t".into(), std::env::temp_dir())
+            .await
+            .unwrap();
+        let link = gw.create(CreateOpts::new(gone)).unwrap();
+        gw.inner
+            .deps
+            .graph
+            .destroy_session(gone, None)
+            .await
+            .unwrap();
+        gw.create(CreateOpts::new(kept)).unwrap();
+        let ended: Vec<_> = lock(&gw.inner.events)
+            .iter()
+            .filter_map(|e| match e {
+                EventData::ShareEnded {
+                    link_id, reason, ..
+                } => Some((link_id.clone(), reason.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ended,
+            vec![(link.id.as_str().to_string(), "session_ended".to_string())]
+        );
     }
 
     /// Revoke all leaves each link's tombstone, as one revoke does: it

@@ -9,7 +9,8 @@ else `PATH`; the **daemon's** environment counts). Human guide:
 
 Limits: 24 h per link; at most 32 guests per link (`--uses 0` = up to 32); 4
 watching one link at once; 5 reconnects per guest per 10 s; a departed
-guest's credential lasts 10 minutes; 64 links and 16 streams per daemon; wrong
+guest's credential lasts as long as its link (10 minutes offline on an
+unlimited link); 64 links and 16 streams per daemon; wrong
 secrets are limited to 10 a minute per address (`CF-Connecting-IP`) and 300
 a minute in all, past which redemption answers 429.
 
