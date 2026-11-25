@@ -286,20 +286,20 @@ pub async fn handle_plugin_list(
                 let status = p.get("status").and_then(|v| v.as_str()).unwrap_or("?");
                 let pid = p.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
                 let up_ms = p.get("uptime_ms").and_then(|v| v.as_u64()).unwrap_or(0);
-                let up_s = up_ms / 1000;
+                let up = style::duration_words(up_ms / 1000);
                 let dot = if status == "running" {
                     style::success("●").to_string()
                 } else {
                     style::warning("○").to_string()
                 };
                 println!(
-                    "  {} {} {} {} (pid {}, up {}s)",
+                    "  {} {} {} {} (pid {}, up {})",
                     dot,
                     style::bold(name),
                     style::muted(&format!("v{ver}")),
                     style::muted(status),
                     pid,
-                    up_s
+                    up
                 );
             }
         }
@@ -557,12 +557,13 @@ pub async fn handle_plugin_audit(
             if entries.is_empty() {
                 println!("  {}", style::muted("(empty)"));
             }
+            let now = jiff::ZonedDateTime::now();
             for e in entries {
                 let ts = e.get("ts").and_then(|v| v.as_str()).unwrap_or("?");
                 let m = e.get("method").and_then(|v| v.as_str()).unwrap_or("?");
                 let d = e.get("decision").and_then(|v| v.as_str()).unwrap_or("?");
                 let r = e.get("reason").and_then(|v| v.as_str()).unwrap_or("?");
-                let stamp = style::muted(ts);
+                let stamp = style::muted(style::log_stamp(ts, &now));
                 let method = style::accent(m);
                 let decision = if d == "allow" {
                     style::success(d).to_string()

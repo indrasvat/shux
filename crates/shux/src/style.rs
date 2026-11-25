@@ -2402,21 +2402,81 @@ fn client_line(c: &serde_json::Value) -> String {
 
 // ── shux share ─────────────────────────────────────────────────
 
-/// `expires_at` as local wall time, `HH:MM` (with the date when not today).
+/// A link's `expires_at`, as [`expiry_words`] says it now. The time left is
+/// the daemon's `expires_in_ms` when given: its clock decides the end.
 fn share_expiry(v: &serde_json::Value) -> String {
-    let Some(t) = v
+    let Some(until) = v
         .get("expires_at")
         .and_then(|v| v.as_str())
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .and_then(|s| s.parse::<jiff::Timestamp>().ok())
     else {
         return "?".into();
     };
-    let local = t.with_timezone(&chrono::Local);
-    if local.date_naive() == chrono::Local::now().date_naive() {
-        local.format("%H:%M").to_string()
-    } else {
-        local.format("%b %-d %H:%M").to_string()
+    let now = jiff::ZonedDateTime::now();
+    match v.get("expires_in_ms").and_then(|v| v.as_u64()) {
+        Some(ms) => expiry_left_words(until, i128::from(ms), &now),
+        None => expiry_words(until, &now),
     }
+}
+
+/// When a link ends, seen from `now` in `now`'s zone:
+/// `23h 51m left · until tomorrow 20:46 PST`.
+pub(crate) fn expiry_words(until: jiff::Timestamp, now: &jiff::ZonedDateTime) -> String {
+    expiry_left_words(
+        until,
+        until.duration_since(now.timestamp()).as_millis(),
+        now,
+    )
+}
+
+fn expiry_left_words(until: jiff::Timestamp, left_ms: i128, now: &jiff::ZonedDateTime) -> String {
+    let Some(left) = time_left(left_ms) else {
+        return "expired".into();
+    };
+    let end = until.to_zoned_datetime(now.time_zone().clone());
+    let day = if end.date() == now.date() {
+        String::new()
+    } else if now.date().tomorrow().is_ok_and(|d| d == end.date()) {
+        "tomorrow ".into()
+    } else {
+        end.strftime("%a %b %-d ").to_string()
+    };
+    format!("{left} left · until {day}{}", end.strftime("%H:%M %Z"))
+}
+
+/// Time left, counted up to the minute as a countdown is; `None` once over.
+pub(crate) fn time_left(ms: i128) -> Option<String> {
+    let mins = u64::try_from((ms + 59_999) / 60_000)
+        .ok()
+        .filter(|&m| m > 0)?;
+    Some(duration_words(mins.saturating_mul(60)))
+}
+
+/// A span as shux says it everywhere: `42s`, `5m`, `2h 5m`, `2d 2h`.
+pub(crate) fn duration_words(secs: u64) -> String {
+    match (secs / 86_400, secs % 86_400 / 3600, secs % 3600 / 60) {
+        (0, 0, 0) => format!("{secs}s"),
+        (0, 0, m) => format!("{m}m"),
+        (0, h, 0) => format!("{h}h"),
+        (0, h, m) => format!("{h}h {m}m"),
+        (d, 0, _) => format!("{d}d"),
+        (d, h, _) => format!("{d}d {h}h"),
+    }
+}
+
+/// An RFC 3339 stamp in `now`'s zone, with the day when it is not today:
+/// `21:12:33 PST`, `Nov 23 21:12:33 PST`. Anything else is shown as given.
+pub(crate) fn log_stamp(ts: &str, now: &jiff::ZonedDateTime) -> String {
+    let Ok(t) = ts.parse::<jiff::Timestamp>() else {
+        return ts.to_string();
+    };
+    let at = t.to_zoned_datetime(now.time_zone().clone());
+    let format = if at.date() == now.date() {
+        "%H:%M:%S %Z"
+    } else {
+        "%b %-d %H:%M:%S %Z"
+    };
+    at.strftime(format).to_string()
 }
 
 fn share_uses(n: Option<u64>) -> String {
@@ -2430,7 +2490,7 @@ fn share_uses(n: Option<u64>) -> String {
     }
 }
 
-/// A made link's first line: `✓ <what> <session>  <uses> · until <t> · <id>`.
+/// A made link's first line: `✓ <what> <session>  <uses> · <left> · until <t> · <id>`.
 fn share_summary(out: &mut impl Write, what: &str, r: &serde_json::Value) -> io::Result<()> {
     let s = |k: &str| r.get(k).and_then(|v| v.as_str()).unwrap_or("?");
     writeln!(
@@ -2439,7 +2499,7 @@ fn share_summary(out: &mut impl Write, what: &str, r: &serde_json::Value) -> io:
         success("\u{2713}"),
         bold(safe_label(s("session"))),
         muted(format!(
-            "{} · until {} · {}",
+            "{} · {} · {}",
             share_uses(r.get("uses").and_then(|v| v.as_u64())),
             share_expiry(r),
             s("id")
@@ -2508,15 +2568,16 @@ pub fn print_share_list(links: &[serde_json::Value], tunnel: Option<&str>) -> Pr
     for l in links {
         let s = |k: &str| l.get(k).and_then(|v| v.as_str()).unwrap_or("?");
         let left = match l.get("uses_left").and_then(|v| v.as_u64()) {
-            None => "unlimited".to_string(),
-            Some(n) => format!("{n} left"),
+            None => "unlimited uses".to_string(),
+            Some(1) => "1 use left".to_string(),
+            Some(n) => format!("{n} uses left"),
         };
         let watching = share_watching(l);
         let mut line = format!(
             "{}  {}  {}  {}",
             accent(s("id")),
             bold(safe_label(s("session"))),
-            muted(format!("until {} · {left}", share_expiry(l))),
+            muted(format!("{} · {left}", share_expiry(l))),
             if watching > 0 {
                 success(format!("{watching} watching")).to_string()
             } else {
@@ -2605,6 +2666,80 @@ pub fn print_share_stopped(links: u64) -> Printed {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The time left comes first, then the local end with its day and zone.
+    #[test]
+    fn a_link_expiry_says_how_long_is_left_and_when_with_its_zone() {
+        let tz = jiff::tz::TimeZone::posix("PST8PDT,M3.2.0,M11.1.0").expect("a POSIX zone");
+        let now = jiff::civil::date(2026, 11, 24)
+            .at(20, 55, 0, 0)
+            .to_zoned_datetime(tz)
+            .expect("a time in the zone");
+        let words = |secs: i64| {
+            let until = now
+                .timestamp()
+                .checked_add(jiff::SignedDuration::from_secs(secs))
+                .expect("in range");
+            expiry_words(until, &now)
+        };
+        assert_eq!(words(30 * 60), "30m left · until 21:25 PST");
+        assert_eq!(words(59), "1m left · until 20:55 PST");
+        assert_eq!(words(2 * 3600), "2h left · until 22:55 PST");
+        assert_eq!(words(24 * 3600), "1d left · until tomorrow 20:55 PST");
+        assert_eq!(
+            words(23 * 3600 + 51 * 60),
+            "23h 51m left · until tomorrow 20:46 PST"
+        );
+        assert_eq!(words(3 * 86400), "3d left · until Fri Nov 27 20:55 PST");
+        assert_eq!(words(0), "expired");
+    }
+
+    /// Part of a second still counts: rounded up, never down to "expired".
+    #[test]
+    fn a_link_with_part_of_a_second_left_is_not_expired() {
+        let tz = jiff::tz::TimeZone::posix("PST8PDT,M3.2.0,M11.1.0").expect("a POSIX zone");
+        let now = jiff::civil::date(2026, 11, 24)
+            .at(20, 55, 0, 0)
+            .to_zoned_datetime(tz)
+            .expect("a time in the zone");
+        let in_ms = |ms: i64| {
+            let until = now
+                .timestamp()
+                .checked_add(jiff::SignedDuration::from_millis(ms))
+                .expect("in range");
+            expiry_words(until, &now)
+        };
+        assert_eq!(in_ms(500), "1m left · until 20:55 PST");
+        assert_eq!(in_ms(60_500), "2m left · until 20:56 PST");
+    }
+
+    /// One way of saying a span, wherever shux says one.
+    #[test]
+    fn a_span_reads_the_same_everywhere() {
+        assert_eq!(duration_words(42), "42s");
+        assert_eq!(duration_words(5 * 60 + 9), "5m");
+        assert_eq!(duration_words(3600), "1h");
+        assert_eq!(duration_words(2 * 3600 + 5 * 60), "2h 5m");
+        assert_eq!(duration_words(50 * 3600), "2d 2h");
+        assert_eq!(duration_words(3 * 86400), "3d");
+    }
+
+    /// A log stamp is read in local time with its zone; the day shows when it
+    /// is not today.
+    #[test]
+    fn a_log_stamp_reads_in_local_time_with_its_zone() {
+        let tz = jiff::tz::TimeZone::posix("PST8PDT,M3.2.0,M11.1.0").expect("a POSIX zone");
+        let now = jiff::civil::date(2026, 11, 24)
+            .at(21, 30, 0, 0)
+            .to_zoned_datetime(tz)
+            .expect("a time in the zone");
+        assert_eq!(log_stamp("2026-11-25T05:12:33.123Z", &now), "21:12:33 PST");
+        assert_eq!(
+            log_stamp("2026-11-24T05:12:33Z", &now),
+            "Nov 23 21:12:33 PST"
+        );
+        assert_eq!(log_stamp("not a time", &now), "not a time");
+    }
 
     /// A watcher is marked in `client list`, a writer is not.
     #[test]

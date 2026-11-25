@@ -28,6 +28,12 @@ pub(crate) const METHODS: [&str; 6] = [
 
 use crate::share::rfc3339;
 
+/// Milliseconds until `t` by this machine's clock, as the guest page has it.
+fn ms_left(t: std::time::SystemTime) -> u64 {
+    t.duration_since(std::time::SystemTime::now())
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
 /// A refusal with a stable `reason`, and the `detail` the CLI prints.
 fn refusal(code: ErrorCode, reason: &str, detail: &str) -> RpcError {
     RpcError::with_data(
@@ -259,10 +265,12 @@ pub(crate) fn register_share_methods(
                 let created = gw.open(opts, hold).await.map_err(|e| share_error(e, ""))?;
                 let snap = graph.snapshot();
                 let name = snap.sessions.get(&session).map(|s| s.name.clone());
-                let until = chrono::DateTime::<chrono::Local>::from(created.expires_wall).format("%H:%M");
+                let left_ms = ms_left(created.expires_wall);
+                // No clock time: the daemon's zone may not be the reader's.
                 let notice = format!(
-                    "Anyone with this link sees everything in {}, live, until {until}. End it with: shux share stop",
+                    "Anyone with this link sees everything in {}, live, for the next {}. End it with: shux share stop",
                     name.as_deref().unwrap_or("the session"),
+                    crate::style::time_left(i128::from(left_ms)).unwrap_or_else(|| "moment".into()),
                 );
                 Ok(serde_json::json!({
                     "notice": notice,
@@ -271,6 +279,7 @@ pub(crate) fn register_share_methods(
                     "session_id": session.to_string(),
                     "session": name,
                     "expires_at": rfc3339(created.expires_wall),
+                    "expires_in_ms": left_ms,
                     "uses": match uses { Uses::Limited(n) => Some(n.get()), Uses::Unlimited => None },
                     "label": label,
                     "deliver": deliver,
@@ -292,6 +301,7 @@ pub(crate) fn register_share_methods(
                             "session": snap.sessions.get(&g.session).map(|s| s.name.clone()),
                             "label": g.label,
                             "expires_at": rfc3339(g.expires_wall),
+                            "expires_in_ms": g.expires.remaining_ms(crate::share::grants::Now::current()),
                             "uses_left": g.uses_left,
                             "redeemed": g.redeemed,
                             "viewers": g.viewers.iter().map(|v| serde_json::json!({

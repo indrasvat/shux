@@ -13,13 +13,7 @@ pub fn format_created_at(value: &serde_json::Value) -> String {
             value.as_u64().map(|ts| {
                 let dt = std::time::UNIX_EPOCH + std::time::Duration::from_secs(ts);
                 let elapsed = dt.elapsed().unwrap_or_default();
-                if elapsed.as_secs() < 60 {
-                    format!("{}s ago", elapsed.as_secs())
-                } else if elapsed.as_secs() < 3600 {
-                    format!("{}m ago", elapsed.as_secs() / 60)
-                } else {
-                    format!("{}h ago", elapsed.as_secs() / 3600)
-                }
+                format!("{} ago", style::duration_words(elapsed.as_secs()))
             })
         })
         .unwrap_or_else(|| "?".to_string())
@@ -538,6 +532,16 @@ pub async fn handle_snapshot(
 mod tests {
     use super::*;
     use crate::cli::test_support::*;
+
+    /// A session two days old says so, not "50h ago".
+    #[test]
+    fn an_old_session_says_how_old_in_days() {
+        let then = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+            - 50 * 3600;
+        assert_eq!(format_created_at(&serde_json::json!(then)), "2d 2h ago");
+    }
 
     #[test]
     fn test_resolve_session_create_cwd_defaults_to_invocation_cwd() {
