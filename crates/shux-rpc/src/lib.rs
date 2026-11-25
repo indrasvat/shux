@@ -7,6 +7,23 @@
 /// The short git SHA this build came from (`unknown` outside a checkout).
 pub const GIT_SHA: &str = env!("SHUX_GIT_SHA");
 
+/// This build's version, as daemons and CLIs compare builds. Cargo's, unless
+/// `SHUX_VERSION_OVERRIDE` was set at compile time (a skew-test peer build).
+pub const VERSION: &str = match option_env!("SHUX_VERSION_OVERRIDE") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
+/// Bumped only when the framing, the version handshake or the meaning of an
+/// existing method or field changes incompatibly. Builds of one generation
+/// serve each other's calls; anything a build lacks fails that call alone.
+/// Removing a method or parameter is such a change.
+pub const WIRE_GENERATION: u32 = 1;
+
+/// Asks a daemon to retire once its last session ends, or now when it has
+/// none: `{"when": "idle"}`. Owner-local.
+pub const UPGRADE: &str = "daemon.upgrade";
+
 /// Asks a daemon with no sessions to refuse every new one and shut down:
 /// `{"retired": bool, "sessions": n}`. Builds before it answer -32601.
 pub const RETIRE_IF_IDLE: &str = "daemon.retire_if_idle";
@@ -31,5 +48,5 @@ pub use codec::{MAX_FRAME_SIZE, create_codec};
 pub use connection::{Transport, current_connection, current_transport, with_transport};
 pub use error::{ErrorCode, RpcError};
 pub use policy::{Policy, Sensitivity};
-pub use router::{Handler, Router, RouterBuilder};
+pub use router::{Accepts, Handler, Router, RouterBuilder, UNKNOWN_PARAMS};
 pub use server::{Server, ServerConfig};

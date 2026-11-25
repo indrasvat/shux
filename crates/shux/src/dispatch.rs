@@ -155,6 +155,21 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
     }
     let socket_path = args.socket_path();
 
+    // Decided before anything reads stdin or changes state.
+    let local = matches!(
+        args.command,
+        Some(
+            Command::Version
+                | Command::Daemon { .. }
+                | Command::Config { .. }
+                | Command::Init { .. }
+                | Command::ShellIntegration { .. }
+        )
+    );
+    if !local {
+        crate::kept_build::hand_off(&socket_path);
+    }
+
     match args.command {
         // No subcommand: attach to last session (TTY only). On a
         // non-TTY stdin OR stdout (piped, CI, redirected), don't
@@ -1053,9 +1068,7 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
             };
             let code = match ran {
                 Ok(code) => code,
-                Err(e)
-                    if gate::driver::reader_left(&e) || client::DaemonInUse::find(&e).is_some() =>
-                {
+                Err(e) if gate::driver::reader_left(&e) || cli::is_build_refusal(&e) => {
                     return Err(e);
                 }
                 Err(e) => gate::driver::infra_failure(&e),
@@ -1080,6 +1093,10 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
             let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
             cli::handle_api(&mut stream, &method, &resolved, args.format).await
         }
+
+        Some(Command::Daemon {
+            command: cli::DaemonCommand::Upgrade { when_idle, force },
+        }) => cli::handle_daemon_upgrade(&socket_path, when_idle, force, args.format).await,
 
         Some(Command::Daemon { command }) => {
             handle_daemon_command(command, args.format, &socket_path)

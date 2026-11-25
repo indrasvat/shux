@@ -66,9 +66,7 @@ pub async fn handle_pane_wait_status(
 /// Exits 3: the daemon could not be reached. For the verbs that keep 1 for a
 /// timeout. A daemon of another build left running exits as everywhere else.
 pub fn wait_unreachable(verb: &str, err: anyhow::Error, format: OutputFormat) -> ! {
-    if let Some(refusal) = crate::client::DaemonInUse::find(&err) {
-        super::exit_daemon_in_use(refusal, format);
-    }
+    super::exit_if_build_refusal(&err, format);
     match format {
         OutputFormat::Json => {
             if let Err(e) = print_json_error(&format!("{err:#}")) {

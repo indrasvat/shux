@@ -751,26 +751,50 @@ fn try_authenticate(
     Ok(token == Some(expected.as_str()))
 }
 
-/// Debug builds only: a daemon started with this set reports that git SHA as
-/// its build, or no version at all when it is `-`, so tests can stand up a
-/// daemon of "another build" from this one.
+/// Debug builds only: a daemon started with these set reports that git SHA,
+/// version or wire generation as its build, so tests can stand up a daemon
+/// of "another build" from this one. A SHA of `-` reports no version at all;
+/// a wire of `-` reports none, as builds before it did.
 #[cfg(debug_assertions)]
 const TEST_DAEMON_GIT_SHA_ENV: &str = "SHUX_TEST_DAEMON_GIT_SHA";
+#[cfg(debug_assertions)]
+const TEST_DAEMON_VERSION_ENV: &str = "SHUX_TEST_DAEMON_VERSION";
+#[cfg(debug_assertions)]
+const TEST_DAEMON_WIRE_ENV: &str = "SHUX_TEST_DAEMON_WIRE";
 
-fn version_answer() -> serde_json::Value {
-    let answer = serde_json::json!({
-        "version": env!("CARGO_PKG_VERSION"),
+/// What this daemon says of its build: `version`, `git_sha`, `wire`.
+pub fn version_answer() -> serde_json::Value {
+    #[cfg_attr(
+        not(debug_assertions),
+        expect(unused_mut, reason = "mutated by the debug-only overrides")
+    )]
+    let mut answer = serde_json::json!({
+        "version": crate::VERSION,
         "git_sha": crate::GIT_SHA,
         "name": "shux",
+        "wire": crate::WIRE_GENERATION,
     });
     #[cfg(debug_assertions)]
-    if let Ok(sha) = std::env::var(TEST_DAEMON_GIT_SHA_ENV) {
-        if sha == "-" {
+    {
+        let var = |name| std::env::var(name).ok();
+        if var(TEST_DAEMON_GIT_SHA_ENV).as_deref() == Some("-") {
             return serde_json::json!({ "name": "shux" });
         }
-        let mut answer = answer;
-        answer["git_sha"] = sha.into();
-        return answer;
+        if let Some(sha) = var(TEST_DAEMON_GIT_SHA_ENV) {
+            answer["git_sha"] = sha.into();
+        }
+        if let Some(version) = var(TEST_DAEMON_VERSION_ENV) {
+            answer["version"] = version.into();
+        }
+        match var(TEST_DAEMON_WIRE_ENV).as_deref() {
+            Some("-") => {
+                if let Some(o) = answer.as_object_mut() {
+                    o.remove("wire");
+                }
+            }
+            Some(wire) => answer["wire"] = wire.parse::<u64>().unwrap_or(u64::MAX).into(),
+            None => {}
+        }
     }
     answer
 }

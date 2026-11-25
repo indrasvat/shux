@@ -433,7 +433,7 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
             outcome
         }
         // Refused before it ran: the trace is left as it was.
-        Err(e) if crate::client::DaemonInUse::find(&e).is_some() => return Err(e),
+        Err(e) if crate::cli::is_build_refusal(&e) => return Err(e),
         // No verdict: the error exits 3, but the trace still ends as it would.
         Err(e) => {
             trace.arm();

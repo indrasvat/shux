@@ -55,9 +55,7 @@ pub(crate) async fn wait_after_create(
 /// A `--wait` verb that failed before its wait began: 2 for a request the
 /// daemon refused, 3 for one it could not answer. Never 1, the timeout code.
 fn wait_create_failed(err: anyhow::Error, verb: &str, format: OutputFormat) -> ! {
-    if let Some(refusal) = crate::client::DaemonInUse::find(&err) {
-        super::exit_daemon_in_use(refusal, format);
-    }
+    super::exit_if_build_refusal(&err, format);
     match err.downcast_ref::<RpcClientError>() {
         Some(e) => std::process::exit(report_failed(e, verb, format, None)),
         None => super::lens::lens_emit_error_and_exit(

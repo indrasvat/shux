@@ -139,14 +139,47 @@ pub enum RpcClientError {
         message: String,
         data: Option<serde_json::Value>,
     },
+    #[error("the daemon retired as this call reached it, and no successor could be reached")]
+    Reconnect(#[source] crate::client::ClientError),
 }
 
 /// Send a JSON-RPC request over a UDS and read the response.
 /// Uses 4-byte big-endian length-prefix framing (matching server in task 008).
+///
+/// A call a retiring daemon refused before changing anything (a new session
+/// as its last one ended) is sent once more, to the daemon that serves the
+/// socket next, and `stream` becomes that connection.
 pub async fn rpc_call(
     stream: &mut tokio::net::UnixStream,
     method: &str,
     params: serde_json::Value,
+) -> Result<serde_json::Value, RpcClientError> {
+    if let Some((code, data)) = crate::client::refuse_for_legacy_peer(method, &params) {
+        return Err(RpcClientError::Rpc {
+            code,
+            message: "not served by shux 0.64.0".into(),
+            data: Some(data),
+        });
+    }
+    match call_once(stream, method, &params).await {
+        Err(RpcClientError::Rpc { data: Some(d), .. })
+            if d.get("kind").and_then(|k| k.as_str())
+                == Some(crate::rpc::convert::DAEMON_RETIRING)
+                && let Some(socket) = crate::client::last_socket() =>
+        {
+            *stream = crate::client::ensure_daemon_running_at(&socket)
+                .await
+                .map_err(RpcClientError::Reconnect)?;
+            call_once(stream, method, &params).await
+        }
+        answer => answer,
+    }
+}
+
+async fn call_once(
+    stream: &mut tokio::net::UnixStream,
+    method: &str,
+    params: &serde_json::Value,
 ) -> Result<serde_json::Value, RpcClientError> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

@@ -481,7 +481,8 @@ pub(crate) fn register_session_methods(
         .register_to_completion(
             shux_rpc::RETIRE_IF_IDLE,
             Policy::fixed(Sensitivity::PluginsForbidden),
-            move |_params: Option<serde_json::Value>| {
+            move |params: Option<serde_json::Value>| {
+                crate::rpc::daemon::note_client(params.as_ref());
                 let gh = g7.clone();
                 let cancel = cancel_retire.clone();
                 async move {

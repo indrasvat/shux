@@ -11,8 +11,12 @@ fn git(args: &[&str]) -> Option<String> {
 
 fn main() {
     // Capture git short SHA at compile time
-    let sha = git(&["rev-parse", "--short", "HEAD"])
-        .map(|s| s.trim().to_string())
+    // A skew-test peer build names its own SHA: two builds of one tree that
+    // the version handshake tells apart.
+    println!("cargo:rerun-if-env-changed=SHUX_GIT_SHA_OVERRIDE");
+    let sha = std::env::var("SHUX_GIT_SHA_OVERRIDE")
+        .ok()
+        .or_else(|| git(&["rev-parse", "--short", "HEAD"]).map(|s| s.trim().to_string()))
         .unwrap_or_else(|| "unknown".to_string());
 
     println!("cargo:rustc-env=SHUX_GIT_SHA={sha}");

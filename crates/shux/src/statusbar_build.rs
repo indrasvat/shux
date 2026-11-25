@@ -343,6 +343,39 @@ pub fn append_viewing(
     }
 }
 
+/// A newer shux than this daemon is installed: `↑ <version>`, and `at idle`
+/// once the daemon will hand over when its last session ends. The badge
+/// sheds words to fit and is dropped whole rather than cut; any other
+/// segment outranks it.
+pub fn append_upgrade(
+    bar: &mut StatusBar,
+    newer: Option<&str>,
+    pending: bool,
+    theme: &Theme,
+    cols: u16,
+) {
+    let Some(version) = newer else {
+        return;
+    };
+    let mut ladder = Vec::new();
+    if pending {
+        ladder.push(format!("↑ {version} at idle "));
+    }
+    ladder.extend([format!("↑ {version} "), "↑ ".to_string()]);
+    let Rgb { r, g, b } = theme.status_accent;
+    let width = StatusBar::segments_width;
+    let (lw, cw, rw) = (width(&bar.left), width(&bar.center), width(&bar.right));
+    let gaps = if cw > 0 { 2 } else { 1 };
+    let room = usize::from(cols).saturating_sub(lw + cw + rw + gaps);
+    let fits = ladder
+        .into_iter()
+        .map(|t| StatusSegment::styled(t, Color::Rgb { r, g, b }, false))
+        .find(|s| width(std::slice::from_ref(s)) <= room);
+    if let Some(segment) = fits {
+        bar.right.push(segment);
+    }
+}
+
 /// Marks the segments of a sharing badge: no fitting pass drops one.
 const BADGE: usize = usize::MAX;
 

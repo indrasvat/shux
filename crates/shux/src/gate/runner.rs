@@ -1541,10 +1541,15 @@ mod tests {
                             return;
                         }
                         let req: serde_json::Value = serde_json::from_slice(&req).unwrap();
-                        let sha = if n < 2 { shux_rpc::GIT_SHA } else { "0ther00" };
+                        // From the third connection on, a build too old to serve it.
+                        let (version, sha) = if n < 2 {
+                            (shux_rpc::VERSION, shux_rpc::GIT_SHA)
+                        } else {
+                            ("0.63.0", "0ther00")
+                        };
                         let result = match req["method"].as_str().unwrap() {
                             "system.version" => serde_json::json!({
-                                "version": env!("CARGO_PKG_VERSION"), "git_sha": sha,
+                                "version": version, "git_sha": sha,
                             }),
                             "events.watch" => serde_json::json!({ "next_seq": 0 }),
                             _ => serde_json::json!({ "retired": false, "sessions": 1 }),

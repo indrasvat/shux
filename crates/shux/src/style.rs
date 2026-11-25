@@ -1438,6 +1438,24 @@ pub fn print_error(msg: &str) {
     let _ = writeln!(err, "{}", safe_diagnostic(msg));
 }
 
+/// `shux daemon upgrade`: what happened, then what happens next.
+pub fn print_upgrade(done: bool, headline: &str, next: &str) -> Printed {
+    let mut out = io::stdout().lock();
+    if done {
+        write!(out, "{} {}", success("\u{2713}"), bold(headline))?;
+    } else {
+        write!(out, "{} {}", warning("!"), bold(headline))?;
+    }
+    writeln!(out, " {}", muted(safe_diagnostic(next)))?;
+    Ok(())
+}
+
+/// One muted line on stderr: a note on how the command ran, never its output.
+pub fn print_muted_note(msg: &str) {
+    let mut err = io::stderr().lock();
+    let _ = writeln!(err, "{}", muted(safe_diagnostic(msg)));
+}
+
 // ── Egress Guard (issue #104) ──────────────────────────────────
 
 /// Render an untrusted label — an entity name, a title, an error message

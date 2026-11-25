@@ -25,6 +25,7 @@ const EXPECTED_SURFACE: &[&str] = &[
     "client.detach => Grantable",
     "client.list => Public",
     "daemon.retire_if_idle => PluginsForbidden",
+    "daemon.upgrade => PluginsForbidden, owner-local",
     "events.history => ContentRead",
     "events.watch => ParamAware(broad=ContentRead, self_scoped=Public)",
     "lens.run => Grantable",
@@ -124,6 +125,28 @@ fn gateway(
 }
 
 fn actual_surface() -> Vec<String> {
+    let router = daemon_router();
+    let mut lines: Vec<String> = router
+        .methods()
+        .into_iter()
+        .map(|m| {
+            let policy = router
+                .policy(m)
+                .expect("assert_every_route_has_policy covers this");
+            let local = if router.is_owner_local(m) {
+                ", owner-local"
+            } else {
+                ""
+            };
+            format!("{m} => {}{local}", describe(policy))
+        })
+        .collect();
+    lines.sort();
+    lines
+}
+
+/// The daemon's router, built as the daemon builds it.
+fn daemon_router() -> shux_rpc::Router {
     let bus = shux_core::bus::EventBus::new();
     let (_graph, state) = shux_core::graph::SessionGraph::new_with_event_bus(Some(bus.clone()));
     // Registration only stores handles in closures; nothing is dispatched here,
@@ -147,7 +170,7 @@ fn actual_surface() -> Vec<String> {
         shux_plugin::PluginManager::with_state_root(bus.clone(), state_dir.path().join("plugins"));
 
     let share = gateway(&graph, &io_state, &config, &onboarding, &segments);
-    let router = super::build_router(
+    super::build_router(
         graph,
         io_state,
         cancel,
@@ -160,25 +183,65 @@ fn actual_surface() -> Vec<String> {
         bus,
         plugins,
         share,
-    );
+    )
+}
 
-    let mut lines: Vec<String> = router
-        .methods()
-        .into_iter()
-        .map(|m| {
-            let policy = router
-                .policy(m)
-                .expect("assert_every_route_has_policy covers this");
-            let local = if router.is_owner_local(m) {
-                ", owner-local"
-            } else {
-                ""
-            };
-            format!("{m} => {}{local}", describe(policy))
-        })
+/// Every method of the daemon refuses a key it does not take, before its
+/// handler runs: the graph loop here is never spawned, so a handler that ran
+/// would hang rather than answer.
+#[tokio::test]
+async fn every_method_refuses_a_parameter_it_does_not_take() {
+    let router = daemon_router();
+    router.assert_every_route_declares_params();
+    let mut methods = router.methods();
+    methods.sort_unstable();
+    for method in methods {
+        let call = router.dispatch(method, Some(serde_json::json!({ "zz_not_a_param": 1 })));
+        let err = shux_rpc::with_transport(shux_rpc::Transport::Uds, call)
+            .await
+            .expect_err(method);
+        let data = err.data.unwrap_or_default();
+        assert_eq!(data["kind"], shux_rpc::UNKNOWN_PARAMS, "{method}: {data}");
+        assert_eq!(
+            data["params"],
+            serde_json::json!(["zz_not_a_param"]),
+            "{method}"
+        );
+    }
+}
+
+/// The table names only methods the daemon serves: a stale entry would be
+/// published as a capability the daemon does not have.
+#[tokio::test]
+async fn the_accepted_params_name_only_served_methods() {
+    let router = daemon_router();
+    let stale: Vec<&str> = super::accepts::ACCEPTS
+        .iter()
+        .map(|(m, _)| *m)
+        .filter(|m| !router.has_method(m))
         .collect();
-    lines.sort();
-    lines
+    assert!(stale.is_empty(), "declared but not served: {stale:?}");
+}
+
+/// Within a wire generation the surface only grows: every method and
+/// parameter 0.64.0 served is still served. Removing one is a generation bump.
+#[test]
+fn no_method_or_parameter_of_an_earlier_release_is_gone() {
+    assert_eq!(
+        shux_rpc::WIRE_GENERATION,
+        1,
+        "a new generation starts a new baseline"
+    );
+    let now: std::collections::HashMap<&str, &[&str]> =
+        super::accepts::ACCEPTS.iter().copied().collect();
+    for (method, keys) in super::accepts::LEGACY_0_64 {
+        let served = now
+            .get(method)
+            .unwrap_or_else(|| panic!("{method} was removed"));
+        for key in *keys {
+            assert!(served.contains(key), "{method} no longer takes {key}");
+        }
+    }
 }
 
 #[tokio::test]

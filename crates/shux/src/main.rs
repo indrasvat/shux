@@ -51,9 +51,7 @@ fn main() {
     };
 
     if let Err(e) = result {
-        if let Some(refusal) = shux::client::DaemonInUse::find(&e) {
-            cli::exit_daemon_in_use(refusal, format);
-        }
+        cli::exit_if_build_refusal(&e, format);
         report_fatal(&e, format);
     }
 }

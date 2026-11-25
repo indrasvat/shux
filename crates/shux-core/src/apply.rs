@@ -28,7 +28,7 @@ use crate::model::{PaneId, SessionId, WindowId};
 /// Back-references let templates express "create a window in the session I
 /// just created" without two round-trips. Resolved during validation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(untagged, deny_unknown_fields)]
 pub enum SessionRef {
     /// Absolute SessionId.
     Id(SessionId),
@@ -40,7 +40,7 @@ pub enum SessionRef {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(untagged, deny_unknown_fields)]
 pub enum PaneRef {
     Id(PaneId),
     BackRef {
@@ -54,7 +54,7 @@ pub enum PaneRef {
 /// staged snapshot. If any op fails validation, the entire batch rolls back
 /// (no commit, no events).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Op {
     /// Create a session with an initial window + pane.
     CreateSession {
@@ -174,4 +174,30 @@ pub enum BatchError {
 /// other potential correlation prefixes (event interceptors, plugin batches).
 pub fn new_correlation_id() -> String {
     format!("apply-{}", uuid::Uuid::new_v4())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An op field this build does not know is refused, not dropped: a batch
+    /// from a newer client never commits with part of what it asked for
+    /// silently missing, at any level of the op.
+    #[test]
+    fn an_unknown_field_anywhere_in_an_op_is_refused() {
+        let session = serde_json::json!({"op": "create_session", "cwd": "/tmp"});
+        let window =
+            serde_json::json!({"op": "create_window", "session": {"ref_op": 0}, "title": "t"});
+        assert!(serde_json::from_value::<Op>(session.clone()).is_ok());
+        assert!(serde_json::from_value::<Op>(window.clone()).is_ok());
+
+        let mut extra = session;
+        extra["zz_new"] = true.into();
+        let mut nested = window;
+        nested["session"]["zz_new"] = 1.into();
+        for op in [extra, nested] {
+            let parsed = serde_json::from_value::<Op>(op.clone());
+            assert!(parsed.is_err(), "accepted {op}: {parsed:?}");
+        }
+    }
 }
