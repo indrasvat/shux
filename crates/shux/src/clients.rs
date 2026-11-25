@@ -49,6 +49,9 @@ pub struct Sharing {
     pub writers: usize,
     /// Other read-only clients.
     pub viewers: usize,
+    /// A share link to the session can still be redeemed, or a guest can
+    /// still reconnect (#297).
+    pub link: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -117,6 +120,8 @@ struct State {
     pins: HashMap<PaneId, Pin>,
     next_pin: u64,
     next_seq: u64,
+    /// Sessions a share link still reaches.
+    shared: std::collections::HashSet<SessionId>,
 }
 
 /// Every attached client, plus the sizing decisions made from them. A change
@@ -185,9 +190,24 @@ impl ClientRegistry {
     }
 
     /// Wakes whenever what a status bar shows of the clients may have
-    /// changed: who is attached, or a size decision.
+    /// changed: who is attached, a share link, or a size decision.
     pub fn presence(&self) -> watch::Receiver<u64> {
         self.presence.subscribe()
+    }
+
+    /// The sessions a share link reaches now. A host's badge shows `shared`
+    /// while its session is among them, though nobody watches yet; a change
+    /// wakes every bar, and never the sizing reconciler.
+    pub fn set_shared(&self, sessions: std::collections::HashSet<SessionId>) {
+        let changed = {
+            let mut s = self.state();
+            let changed = s.shared != sessions;
+            s.shared = sessions;
+            changed
+        };
+        if changed {
+            self.bump_presence();
+        }
     }
 
     /// Ask for the sizes to be worked out again: a pane gained its resizer.
@@ -229,11 +249,32 @@ impl ClientRegistry {
         }
     }
 
+    /// The read-only clients on `session`: what a host's badge counts as
+    /// watching.
+    pub fn watching(&self, session: SessionId) -> usize {
+        self.state()
+            .clients
+            .values()
+            .filter(|e| e.info.session_id == session && !e.info.votes)
+            .count()
+    }
+
     pub fn list(&self) -> Vec<ClientInfo> {
         let s = self.state();
         let mut all: Vec<&Entry> = s.clients.values().collect();
         all.sort_by_key(|e| e.seq);
         all.into_iter().map(|e| e.info.clone()).collect()
+    }
+
+    /// The clients whose forced removal revokes more than their socket: a
+    /// share guest's revokes its credential.
+    pub fn guests(&self) -> std::collections::HashSet<ClientId> {
+        self.state()
+            .clients
+            .values()
+            .filter(|e| e.on_remove.is_some())
+            .map(|e| e.info.id)
+            .collect()
     }
 
     pub fn count_for(&self, session: SessionId) -> usize {
@@ -352,6 +393,7 @@ impl ClientRegistry {
                 seat,
                 writers,
                 viewers: attached - voters.len() - usize::from(!e.info.votes),
+                link: s.shared.contains(&session),
             }
         });
         let mut peers: Vec<(ClientId, bool)> = s
@@ -636,6 +678,12 @@ mod tests {
         settle();
         assert!(reg.remove(removed.id));
         assert_eq!(settle(), (false, true), "client detach");
+        reg.set_shared([s].into());
+        assert_eq!(settle(), (false, true), "a share link");
+        reg.set_shared([s].into());
+        assert_eq!(settle(), (false, false), "the same links again");
+        reg.set_shared(Default::default());
+        assert_eq!(settle(), (false, true), "the last link ended");
 
         let _w = reg.register(info(s), CancellationToken::new());
         assert_eq!(settle(), (true, true), "a voter");
@@ -668,6 +716,11 @@ mod tests {
         assert!(reg.mark_input(b.id, Instant::now()));
         assert!(reg.session_view(s, Some(b.id), &[]).driving);
         assert_eq!(seat(a.id), Seat::Host, "a handoff moved the host");
+        assert!(!sharing(a.id).link);
+        reg.set_shared([s].into());
+        assert!(sharing(a.id).link && sharing(viewer.id).link);
+        reg.set_shared([SessionId::new()].into());
+        assert!(!sharing(a.id).link, "another session's link");
         drop(ga);
         assert_eq!(seat(b.id), Seat::Host, "the next writer took the seat");
         assert_eq!((sharing(b.id).writers, sharing(b.id).viewers), (0, 1));

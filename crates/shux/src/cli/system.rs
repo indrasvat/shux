@@ -11,13 +11,28 @@ pub async fn handle_api(
 ) -> anyhow::Result<()> {
     let params: serde_json::Value = serde_json::from_str(params_str)
         .map_err(|e| anyhow::anyhow!("Invalid JSON params: {e}"))?;
+    // This prints its answer, so inside a pane it never asks for a link,
+    // whatever the params say of where it runs.
+    let answer = if method == "share.create" && crate::cli::share::caller_pane().is_some() {
+        Err(RpcClientError::Rpc {
+            code: shux_rpc::ErrorCode::PermissionDenied.code(),
+            message: "permission_denied".into(),
+            data: Some(serde_json::json!({
+                "reason": "in_pane",
+                "detail": "inside a shux pane `shux rpc call share.create` would print the link; \
+                           run `shux share`, which copies it to the clipboard",
+            })),
+        })
+    } else {
+        rpc_call(stream, method, params).await
+    };
 
     // PR 3b: surface RPC errors as part of the JSON-RPC envelope on
     // stdout, not as a human-readable anyhow error on stderr. Callers
     // of `shux rpc call` are debug tools / agents that expect to parse the
     // raw `{result | error}` shape — including bounded `data` fields
     // like `expected_version` / `actual_version` for retry loops.
-    match rpc_call(stream, method, params).await {
+    match answer {
         Ok(result) => {
             let envelope = serde_json::json!({"result": result});
             match format {

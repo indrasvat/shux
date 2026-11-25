@@ -54,8 +54,20 @@ tempfile.workspace = true
 # connection itself, so the gateway caps connections, bounds header reads and
 # drops a socket by dropping its task.
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws"] }
-hyper = { version = "1", features = ["http1", "server"] }
+# `client`: the one GET that proves a new tunnel reaches this gateway before
+# a link is issued. A single request on one connection, so no redirect is
+# ever followed.
+hyper = { version = "1", features = ["http1", "server", "client"] }
 hyper-util = { version = "0.1", features = ["tokio", "service"] }
+http-body-util = "0.1"
+# That GET is HTTPS to the tunnel's public origin, trusting the OS's roots.
+# ring, not aws-lc-rs: no cmake at build time. ring still compiles C for its
+# target, so it cannot be cross-built for macOS from Linux.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-native-certs = "0.8"
+# `shux share --qr`: the link as a QR code in the terminal. No image support.
+qrcode = { version = "0.14", default-features = false }
 # The link and viewer secrets: 256 bits from the OS. Already in-tree.
 getrandom = "0.4"
 # Constant-time comparison of a presented secret's digest.

@@ -134,6 +134,15 @@ async def until(page, cond: str) -> None:
         await asyncio.sleep(0.05)
 
 
+async def holds(page, cond: str) -> bool:
+    """`until`, as a verdict for `check` instead of an abort."""
+    try:
+        await until(page, cond)
+        return True
+    except TimeoutError:
+        return False
+
+
 async def live(page, word: str | None = None) -> None:
     cond = "window.__shux && window.__shux.phase === 'live'"
     if word:
@@ -178,6 +187,19 @@ async def run_browser(kind: str, browser, rig: Rig, env: dict, bin_: str, work: 
     page = await open_link(ctx, link["url"], violations)
     check("#" not in page.url, "the fragment leaves the address bar before anything else")
     check(await page.is_visible("#watch"), "redemption waits for a click on Watch session")
+    peeked = await holds(page, "document.querySelector('#gate-when')?.textContent.includes('until')")
+    gate = " ".join((await page.inner_text("#gate")).split())
+    check(peeked and "1 use left" in gate, f"the gate says until when, and the uses left ({gate!r})")
+    for line in (
+        "A live terminal session is being shared with you",
+        "You'll watch it as it happens. You can't type into it.",
+        "The person sharing it can see how many people are watching.",
+        "Shared with shux",
+        "shux.pages.dev",
+    ):
+        check(line in gate, f"the gate says {line!r}")
+    check(f"{kind}-watched" not in gate, "the gate names no session before a use is spent")
+    await page.screenshot(path=str(out / f"v3_gate-{kind}_1400.png"))
     gate_bar = " ".join((await page.inner_text("#bar")).split())
     check("Read-only ·" not in gate_bar, f"no separator dangles before a session name ({gate_bar!r})")
     listed = rig.call(op="list")
@@ -188,11 +210,16 @@ async def run_browser(kind: str, browser, rig: Rig, env: dict, bin_: str, work: 
     check(all(p in text for p in ("TRUECOLOR", "INDEXED", "BASIC")), "colour probes reach the browser")
     check(f"{kind}-watched" not in text and "read-only" not in text, "no native status segment in the stream")
     bar = await page.inner_text("#bar")
-    check("Read-only" in bar and "expires at" in bar, f"the bar says read-only and when it expires ({bar.strip()!r})")
+    check("Read-only" in bar and "until" in bar, f"the bar says read-only and until when ({bar.strip()!r})")
+    check(await holds(page, "document.querySelector('#watching')?.textContent.includes('1 watching')"),
+          f"the bar says how many watch ({bar.strip()!r})")
     await page.screenshot(path=str(out / f"v1_browser-{kind}_1400_default.png"))
     # The guest types, pastes and clicks: none of it may reach the pane.
     await page.click("#term")
     await page.keyboard.type("guest typed\n")
+    toast = await holds(page, "document.querySelector('#toast') && !document.querySelector('#toast').hidden")
+    said = await page.evaluate("document.querySelector('#toast')?.textContent ?? ''")
+    check(toast and said == "View only: your keys aren't sent.", f"typing says it goes nowhere ({said!r})")
     await page.keyboard.press("Control+C")
     await page.evaluate("navigator.clipboard?.writeText?.('x').catch(()=>{})")
     await page.mouse.wheel(0, 300)
@@ -280,7 +307,9 @@ async def run_browser(kind: str, browser, rig: Rig, env: dict, bin_: str, work: 
 
     step(f"{kind}: a phone reads the host's layout, and pans it")
     plog = work / f"{kind}-phone.log"
-    ps = shux(bin_, env, "session.create", {"name": f"{kind}-phone", "command": recorder(plog)})
+    # 30 characters: a long name must not push the state or the button off a phone.
+    pname = f"{kind}-phone-".ljust(30, "x")
+    ps = shux(bin_, env, "session.create", {"name": pname, "command": recorder(plog)})
     shux(bin_, env, "pane.set_size", {"pane_id": ps["pane_id"], "cols": 200, "rows": 58})
     psize = shux(bin_, env, "pane.capture", {"pane_id": ps["pane_id"]})
     plink = rig.call(op="create", session=ps["id"], uses=1)
@@ -289,10 +318,28 @@ async def run_browser(kind: str, browser, rig: Rig, env: dict, bin_: str, work: 
         device_scale_factor=3, is_mobile=True, has_touch=True,
     )
     pp = await open_link(phone, plink["url"], violations)
+    await holds(pp, "document.querySelector('#gate-when')?.textContent.includes('until')")
+    await pp.screenshot(path=str(out / f"v3_gate-{kind}_390.png"))
     await pp.tap("#watch")
     await live(pp, "RECORDING")
     glyph = await pp.evaluate("window.__shux.glyph")
     check(glyph is not None and glyph >= 9, f"text is readable at 390 px ({glyph} CSS px glyphs)")
+    check(await holds(pp, "document.querySelector('#watching')?.textContent.includes('1 watching')"),
+          "a phone's bar says how many watch")
+    # Safari's text is wider than Chromium's: at 280 px (a folding phone's
+    # cover screen) Chromium's runs out of room the way Safari's does at 402.
+    for width in (390, 280):
+        await pp.set_viewport_size({"width": width, "height": 844})
+        for sel in ("#zoom", "#state"):
+            box = await pp.evaluate(
+                f"(() => {{ const r = document.querySelector('{sel}').getBoundingClientRect();"
+                " return [r.left, r.right, r.width, innerWidth]; })()"
+            )
+            check(box[2] > 0 and box[0] >= 0 and box[1] <= box[3], f"{sel} sits inside a {width} px phone ({box})")
+    await pp.set_viewport_size({"width": 390, "height": 844})
+    await pp.evaluate("window.scrollTo(0, 200)")
+    scrolled = await pp.evaluate("[scrollY, document.documentElement.scrollHeight, innerHeight]")
+    check(scrolled[0] == 0, f"the page itself does not scroll the bar away ({scrolled})")
     stage = "document.querySelector('#stage')"
     check(await pp.evaluate(f"{stage}.scrollWidth > {stage}.clientWidth"), "the readable view pans")
     await pp.screenshot(path=str(out / f"v2_phone-{kind}_390x844_readable.png"))
@@ -312,6 +359,8 @@ async def run_browser(kind: str, browser, rig: Rig, env: dict, bin_: str, work: 
         " return !!a && (a.isContentEditable || a.tagName === 'TEXTAREA') && a.inputMode !== 'none'; })()"
     )
     check(not typing, "a tap on the terminal opens no keyboard")
+    check(await holds(pp, "document.querySelector('#toast') && !document.querySelector('#toast').hidden"),
+          "a tap to type says keys go nowhere")
     shux(bin_, env, "pane.send_keys", {"pane_id": ps["pane_id"], "text": "MARK"})
     for _ in range(300):
         if plog.exists() and plog.read_bytes():
@@ -320,6 +369,20 @@ async def run_browser(kind: str, browser, rig: Rig, env: dict, bin_: str, work: 
     check(plog.read_bytes() == b"MARK", f"no phone gesture reached the pane ({plog.read_bytes()[:40]!r})")
     after = shux(bin_, env, "pane.capture", {"pane_id": ps["pane_id"]})
     check((psize["cols"], psize["rows"]) == (after["cols"], after["rows"]), "the phone never sized the pane")
+    await pp.mouse.move(200, 400)
+    await pp.mouse.wheel(700, 300)
+    await until(pp, f"{stage}.scrollLeft > 0")
+    rig.call(op="revoke", id=plink["id"])
+    msg = await ended(pp)
+    box = await pp.evaluate(
+        "(() => { const r = document.querySelector('#gate').getBoundingClientRect();"
+        " return [r.left, r.right, innerWidth]; })()"
+    )
+    check(
+        box[0] >= 0 and box[1] <= box[2] and abs((box[0] + box[1]) / 2 - box[2] / 2) <= 2,
+        f"after a pan, the end message is centred on the phone ({box}, {msg!r})",
+    )
+    await pp.screenshot(path=str(out / f"v2_phone-{kind}_390x844_ended-after-pan.png"))
     await phone.close()
     shux(bin_, env, "session.kill", {"id": ps["id"]})
     check(not violations, f"no CSP violation or page error ({violations[:3]})")

@@ -30,6 +30,9 @@ fn main() {
         // Internal daemon subcommand — called by auto-start. `--socket` is a
         // global arg, so the re-exec'd daemon sees whatever the client saw.
         run_daemon(args.socket.clone())
+    } else if let Some(Command::__share_supervise { cloudflared, port }) = &args.command {
+        // Internal: exec'd by the daemon to run the share tunnel.
+        shux::share::tunnel::supervise(cloudflared, *port)
     } else {
         // Normal CLI client mode
         end_on_a_failed_print();

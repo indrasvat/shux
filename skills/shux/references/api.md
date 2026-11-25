@@ -145,6 +145,18 @@ client gets at most the frame already on the wire, then `session_ended`
 `connection_lost`, `session_destroyed`, `daemon_stopped`), and
 `session.attached` / `session.detached` with the session id.
 
+A share guest (`shux share`) is listed here as a read-only client with
+`"share": true`, but publishes no `client.*` events (watch `share.*`), and
+`client.detach` of one is a kick: its credential stops working and it is
+told `kicked`. A host whose session has a live share link reads `◉ shared ·
+0 watching` before anyone opens it.
+
+## Share links
+
+`share.create` · `share.confirm` · `share.list` · `share.revoke` · `share.kick` · `share.stop`:
+owner-local, closed to plugins. Shapes, delivery rules, events and errors:
+[share.md](share.md).
+
 ## Window
 
 ```json

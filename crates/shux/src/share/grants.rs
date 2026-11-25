@@ -166,6 +166,17 @@ impl ViewerId {
 }
 
 /// How many times a link may be redeemed.
+/// A format character (Unicode `Cf`: zero-width, direction marks and
+/// overrides, BOM, tags): invisible, so a label holding one can read as
+/// something it is not.
+fn invisible(c: char) -> bool {
+    matches!(c,
+        '\u{ad}' | '\u{600}'..='\u{605}' | '\u{61c}' | '\u{6dd}' | '\u{70f}' | '\u{180e}'
+        | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2064}'
+        | '\u{2066}'..='\u{206f}' | '\u{feff}' | '\u{fff9}'..='\u{fffb}' | '\u{110bd}'
+        | '\u{1d173}'..='\u{1d17a}' | '\u{e0001}' | '\u{e0020}'..='\u{e007f}')
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Uses {
     Limited(std::num::NonZeroU32),
@@ -190,6 +201,20 @@ impl CreateOpts {
             uses: Uses::Limited(std::num::NonZeroU32::MIN),
             label: None,
         }
+    }
+
+    /// The checks [`Store::create`] makes of the options themselves.
+    pub fn check(&self) -> Result<(), CreateError> {
+        if self.ttl.is_zero() || self.ttl > MAX_TTL {
+            return Err(CreateError::Ttl);
+        }
+        if let Some(label) = &self.label
+            && (label.chars().count() > MAX_LABEL
+                || label.chars().any(|c| c.is_control() || invisible(c)))
+        {
+            return Err(CreateError::Label);
+        }
+        Ok(())
     }
 }
 
@@ -217,6 +242,8 @@ pub enum EndReason {
     Lagging,
     /// The same credential opened another stream.
     Replaced,
+    /// The public tunnel went away; a new one needs new links.
+    TunnelLost,
 }
 
 impl EndReason {
@@ -229,6 +256,7 @@ impl EndReason {
             Self::Kicked => "kicked",
             Self::Lagging => "lagging",
             Self::Replaced => "replaced",
+            Self::TunnelLost => "tunnel_lost",
         }
     }
 }
@@ -246,6 +274,8 @@ pub struct Live {
     reason: Arc<OnceLock<EndReason>>,
     done: CancellationToken,
     slot_to: Arc<std::sync::Mutex<Option<SlotTo>>>,
+    /// Its attach is open and drawing: it counts as watching.
+    drawing: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Live {
@@ -256,6 +286,7 @@ impl Live {
             reason: Arc::default(),
             done: CancellationToken::new(),
             slot_to: Arc::default(),
+            drawing: Arc::default(),
         }
     }
     /// Ends the stream for its replacement, which takes its slot through
@@ -273,6 +304,15 @@ impl Live {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
+    }
+    /// Set by the stream once its attach is open, as the host's badge
+    /// counts it.
+    pub fn mark_drawing(&self) {
+        self.drawing
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn drawing(&self) -> bool {
+        self.drawing.load(std::sync::atomic::Ordering::Relaxed)
     }
     /// Ends the stream for `why`; the first reason given stands.
     pub fn end(&self, why: EndReason) {
@@ -436,15 +476,15 @@ impl Store {
         ended
     }
 
+    /// No origin any more: a tunnel went down. Requests checked before it
+    /// are admitted to nothing.
+    pub fn clear_origin(&mut self) {
+        self.origin = None;
+        self.generation += 1;
+    }
+
     pub fn create(&mut self, opts: CreateOpts, at: Now) -> Result<Minted, CreateError> {
-        if opts.ttl.is_zero() || opts.ttl > MAX_TTL {
-            return Err(CreateError::Ttl);
-        }
-        if let Some(label) = &opts.label
-            && (label.chars().count() > MAX_LABEL || label.chars().any(char::is_control))
-        {
-            return Err(CreateError::Label);
-        }
+        opts.check()?;
         let _ = self.end_grants(at, |_| false);
         if self.grants.len() >= MAX_GRANTS {
             return Err(CreateError::Full);
@@ -481,14 +521,16 @@ impl Store {
         })
     }
 
-    /// Spends one use of `id` for whoever presents its secret. Atomic: the
-    /// caller holds the store, so two redemptions of a one-use link cannot
-    /// both pass.
-    pub fn redeem(&mut self, id: &GrantId, secret: &str, at: Now) -> Result<Redeemed, Refused> {
+    /// Whether `secret` would redeem `id` now, spending nothing: when the
+    /// link ends and the uses it has left.
+    pub fn peek(
+        &self,
+        id: &GrantId,
+        secret: &str,
+        at: Now,
+    ) -> Result<(Expiry, Option<u32>), Refused> {
         let presented = presented(secret);
-        let viewers = self.viewers.len();
-        let of_link = self.viewers.values().filter(|v| v.grant == *id).count();
-        let Some(grant) = self.grants.get_mut(id) else {
+        let Some(grant) = self.grants.get(id) else {
             return Err(match self.ended.get(id) {
                 Some(&(why, _)) => Refused::Gone(Some(why)),
                 None => Refused::NotFound,
@@ -506,6 +548,19 @@ impl Store {
         if grant.uses_left == Some(0) {
             return Err(Refused::Gone(None));
         }
+        Ok((grant.expires, grant.uses_left))
+    }
+
+    /// Spends one use of `id` for whoever presents its secret. Atomic: the
+    /// caller holds the store, so two redemptions of a one-use link cannot
+    /// both pass.
+    pub fn redeem(&mut self, id: &GrantId, secret: &str, at: Now) -> Result<Redeemed, Refused> {
+        self.peek(id, secret, at)?;
+        let viewers = self.viewers.len();
+        let of_link = self.viewers.values().filter(|v| v.grant == *id).count();
+        let Some(grant) = self.grants.get_mut(id) else {
+            return Err(Refused::NotFound);
+        };
         if viewers >= MAX_VIEWERS || of_link >= MAX_VIEWERS_PER_LINK {
             return Err(Refused::Full);
         }
@@ -665,9 +720,40 @@ impl Store {
 
     /// Ends every link and viewer.
     pub fn stop(&mut self) -> Vec<Live> {
+        self.end_all(EndReason::Stopped)
+    }
+
+    /// Ends every link and viewer for `why`.
+    pub fn end_all(&mut self, why: EndReason) -> Vec<Live> {
         self.generation += 1;
         self.grants.clear();
-        self.drop_viewers(|_| true, EndReason::Stopped)
+        self.drop_viewers(|_| true, why)
+    }
+
+    /// Every live link and the session it shows.
+    pub fn links(&self) -> HashMap<GrantId, SessionId> {
+        self.grants
+            .iter()
+            .map(|(id, g)| (id.clone(), g.session))
+            .collect()
+    }
+
+    /// The sessions a guest can still reach: through a link with a use left,
+    /// or a credential that can reconnect. A spent link nobody holds is not
+    /// one, though `list` shows it until it expires.
+    pub fn reachable(&self) -> std::collections::HashSet<SessionId> {
+        self.grants
+            .iter()
+            .filter(|(id, g)| {
+                g.uses_left != Some(0) || self.viewers.values().any(|v| v.grant == **id)
+            })
+            .map(|(_, g)| g.session)
+            .collect()
+    }
+
+    /// When the next link expires.
+    pub fn next_expiry(&self) -> Option<Instant> {
+        self.grants.values().map(|g| g.expires.mono).min()
     }
 
     /// Ends every link past its expiry, and every link to a session `gone`
@@ -735,7 +821,7 @@ impl Store {
                     .filter(|(_, v)| v.grant == *id)
                     .map(|(vid, v)| ViewerInfo {
                         id: vid.clone(),
-                        connected: v.live.is_some(),
+                        connected: v.live.as_ref().is_some_and(Live::drawing),
                     })
                     .collect();
                 viewers.sort_by(|a, b| a.id.cmp(&b.id));

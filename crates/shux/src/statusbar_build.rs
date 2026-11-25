@@ -358,12 +358,13 @@ struct Badge {
 }
 
 impl Badge {
-    /// None for a writer alone with its session.
+    /// None for a writer alone with its session and no share link.
     fn of(sharing: Sharing) -> Option<Self> {
         let Sharing {
             seat,
             writers,
             viewers,
+            link,
         } = sharing;
         let watching = (viewers > 0).then(|| format!(" · {viewers} watching"));
         let typing = format!("{writers} can type");
@@ -381,7 +382,8 @@ impl Badge {
                 rungs.extend([core, typing, "!".into()]);
                 (rungs, counted, true)
             }
-            Seat::Host if viewers > 0 => (
+            // A link no guest has opened yet still says so: `0 watching`.
+            Seat::Host if viewers > 0 || link => (
                 vec![
                     format!("shared · {viewers} watching"),
                     "shared".into(),
@@ -767,7 +769,12 @@ mod tests {
             seat,
             writers,
             viewers,
+            link: false,
         }
+    }
+
+    fn linked(s: Sharing) -> Sharing {
+        Sharing { link: true, ..s }
     }
 
     /// The design's table, at full width: what each seat says, and whether
@@ -781,6 +788,26 @@ mod tests {
         assert_eq!(full(sharing(Seat::Host, 0, 0)), None, "solo");
         for (s, words, warn) in [
             (sharing(Seat::Host, 0, 2), "shared · 2 watching", false),
+            (
+                linked(sharing(Seat::Host, 0, 0)),
+                "shared · 0 watching",
+                false,
+            ),
+            (
+                linked(sharing(Seat::Host, 0, 1)),
+                "shared · 1 watching",
+                false,
+            ),
+            (
+                linked(sharing(Seat::Host, 1, 0)),
+                "shared · 1 can type",
+                true,
+            ),
+            (
+                linked(sharing(Seat::Viewer, 0, 0)),
+                "viewing · read-only",
+                false,
+            ),
             (sharing(Seat::Host, 1, 0), "shared · 1 can type", true),
             (
                 sharing(Seat::Host, 1, 2),

@@ -39,8 +39,15 @@ const RESIZE_COALESCE: Duration = Duration::from_millis(250);
 /// completes a chunk it was sent is not counted. Past it, the viewer is
 /// dropped.
 const INBOUND_PER_SEC: u32 = 256;
+/// At most one watching count is sent per this, however often viewers come
+/// and go.
+const WATCHING_EVERY: Duration = Duration::from_secs(1);
 /// The most an ended viewer's farewell may hold up its cutoff.
 const FAREWELL: Duration = Duration::from_millis(100);
+/// The most messages a farewell reads from the viewer before closing: a
+/// window's acks, with room to spare.
+const FAREWELL_READS: usize = 32;
+const _: () = assert!(FAREWELL_READS as u64 >= wire::WINDOW / wire::CHUNK as u64);
 /// How long an ended stream waits for its attach to finish, once its socket
 /// is closed.
 const ATTACH_JOIN: Duration = Duration::from_secs(2);
@@ -49,6 +56,26 @@ const _: () = assert!(ATTACH_JOIN.as_millis() + FAREWELL.as_millis() < TEARDOWN.
 /// broke the protocol.
 const CLOSE_ENDED: u16 = 4000;
 const CLOSE_PROTOCOL: u16 = 4400;
+
+/// When the next watching count is due: a change waits out the rest of
+/// [`WATCHING_EVERY`] since the last one sent, and changes meanwhile join it.
+#[derive(Default)]
+struct Pacer {
+    sent: Option<Instant>,
+    due: Option<Instant>,
+}
+
+impl Pacer {
+    fn changed(&mut self, now: Instant) {
+        if self.due.is_none() {
+            self.due = Some(self.sent.map_or(now, |s| (s + WATCHING_EVERY).max(now)));
+        }
+    }
+
+    fn sent(&mut self, now: Instant) {
+        (self.sent, self.due) = (Some(now), None);
+    }
+}
 
 enum Exit {
     Ended(EndReason),
@@ -268,7 +295,18 @@ pub(super) async fn run(mut ws: WebSocket, gw: Gateway, admitted: Admitted, guar
         // taking bytes.
         let _ = tokio::time::timeout(FAREWELL, async {
             ws.send(Message::Text(text.into())).await?;
-            ws.send(Message::Close(Some(close))).await
+            ws.send(Message::Close(Some(close))).await?;
+            // Read what the viewer sent meanwhile, up to its own Close: a
+            // socket closed with input unread is reset, and the reset throws
+            // away the frames above before the viewer has read them. An
+            // honest viewer owes a window's acks at most; a flood is not read.
+            for _ in 0..FAREWELL_READS {
+                match ws.next().await {
+                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                    Some(Ok(_)) => {}
+                }
+            }
+            Ok::<(), axum::Error>(())
         })
         .await;
     }
@@ -306,12 +344,14 @@ async fn serve(
         _ => return Exit::Viewer("no hello"),
     };
     // Subscribed before the layout is read, so no change between is missed.
-    let mut presence = gw.inner.deps.io_state.lock().await.clients.presence();
+    let clients = gw.inner.deps.io_state.lock().await.clients.clone();
+    let mut presence = clients.presence();
     let mut host = layout_size(gw, admitted.session).await;
     let mut size = fit(asked, host.as_ref());
     let Some(mut attach) = open_attach(gw, admitted, size, attach_cancel, task).await else {
         return Exit::Attach;
     };
+    admitted.live.mark_drawing();
     let config = gw.inner.deps.config.current();
     let ready = Outbound::Ready {
         v: wire::PROTOCOL,
@@ -342,6 +382,8 @@ async fn serve(
     }
 
     let mut credit = Credit::default();
+    let (mut pacer, mut watching) = (Pacer::default(), None);
+    pacer.changed(Instant::now());
     let mut pending_resize: Option<(u16, u16)> = None;
     let mut resize_at: Option<Instant> = None;
     let mut last_progress = Instant::now();
@@ -382,6 +424,13 @@ async fn serve(
                 next_check = Instant::now() + CHECK;
             }
             () = at(ack_due) => return Exit::Ended(EndReason::Lagging),
+            () = at(pacer.due) => {
+                pacer.sent(Instant::now());
+                let n = clients.watching(admitted.session);
+                if watching.replace(n) != Some(n) {
+                    credit.push_text(&Outbound::Watching { n });
+                }
+            }
             () = at(resize_at) => {
                 resize_at = None;
                 if let Some(want) = pending_resize.take().map(|w| fit(w, host.as_ref())).filter(|&w| w != size) {
@@ -434,6 +483,7 @@ async fn serve(
                 if changed.is_err() {
                     return Exit::Attach;
                 }
+                pacer.changed(Instant::now());
                 let now = layout_size(gw, admitted.session).await;
                 if now != host {
                     host = now;
@@ -484,6 +534,28 @@ mod tests {
     use crate::share::grants::{Admit, CreateOpts, Now};
     use std::sync::atomic::AtomicU64;
     use std::time::SystemTime;
+
+    /// A flood of comings and goings sends one count a second, not one each.
+    #[test]
+    fn watching_counts_are_paced_whatever_the_churn() {
+        // why: an origin handed to the pacer, which reads no clock; later instants are data
+        // ast-grep-ignore: test-wall-clock-unit
+        let t0 = Instant::now();
+        let mut p = Pacer::default();
+        p.changed(t0);
+        assert_eq!(p.due, Some(t0), "the first count goes at once");
+        p.sent(t0);
+        let mut sent = 0;
+        for ms in 0..3000 {
+            let now = t0 + Duration::from_millis(ms);
+            p.changed(now);
+            if p.due.is_some_and(|d| d <= now) {
+                p.sent(now);
+                sent += 1;
+            }
+        }
+        assert_eq!(sent, 2, "3000 changes in 3 s sent {sent} counts");
+    }
 
     static WALL: AtomicU64 = AtomicU64::new(1 << 30);
 

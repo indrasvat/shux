@@ -7,6 +7,7 @@ const FINAL = {
   expired: "This link has expired.",
   stopped: "The owner stopped sharing.",
   session_ended: "The session ended.",
+  tunnel_lost: "The owner's connection dropped. Ask them for a new link.",
   kicked: "The owner removed you from this session.",
   replaced: "This session is open in another tab.",
   protocol: "The viewer lost its place in the stream.",
@@ -59,19 +60,59 @@ function setState(text, bad = false) {
   el.classList.toggle("bad", bad);
 }
 
+// In the guest's own time, as they would say it: "3:55 PM".
+const clock = (d) => d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+
 function showExpiry() {
   if (!expiresAt) return;
-  const at = expiresAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  $("#expiry").textContent = `· expires at ${at}`;
+  $("#expiry").textContent = `· until ${clock(expiresAt)}`;
+}
+
+// Once a page: typing reaches nobody, and the guest should know.
+let nudged = false;
+function nudge(e) {
+  if (nudged || view.phase !== "live") return;
+  if (e.type === "keydown" && ["Shift", "Control", "Alt", "Meta"].includes(e.key)) return;
+  nudged = true;
+  const toast = $("#toast");
+  toast.hidden = false;
+  setTimeout(() => (toast.hidden = true), 4000);
+}
+
+// What the gate says before a use is spent: the secret proves the asker
+// holds the link, and nothing is redeemed.
+async function peek() {
+  try {
+    const r = await fetch(`/v/${id}/redeem`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ secret, peek: true }),
+      credentials: "same-origin",
+      cache: "no-store",
+    });
+    if (!r.ok) return;
+    const { expires_in_ms: ms, uses_left: left } = await r.json();
+    let text = `This link works until ${clock(new Date(Date.now() + ms))}`;
+    if (left != null) text += ` · ${left} ${left === 1 ? "use" : "uses"} left`;
+    $("#gate-when").textContent = text;
+    $("#gate-when").hidden = false;
+  } catch {
+    // The gate reads as well without it.
+  }
 }
 
 function end(message) {
   view.phase = "ended";
   setState("ended", true);
+  $("#gate-about").hidden = true;
   $("#gate-text").textContent = message;
+  $("#gate-text").hidden = false;
   $("#watch").hidden = true;
   $("#gate").hidden = false;
   $("#sizer").hidden = true;
+  // Nothing to fit and nobody to count once it has ended.
+  $("#zoom").hidden = true;
+  $("#watching").textContent = "";
 }
 
 function screenText() {
@@ -117,7 +158,7 @@ function layout() {
   sizer.style.width = `${Math.ceil(w * scale)}px`;
   sizer.style.height = `${Math.ceil(h * scale)}px`;
   const button = $("#zoom");
-  button.hidden = readable === fit;
+  button.hidden = readable === fit || view.phase === "ended";
   button.textContent = mode === "readable" ? "Fit" : "Zoom";
   view.mode = mode;
   view.glyph = FONT.size * scale;
@@ -195,6 +236,9 @@ function onText(m) {
     case "ended":
       view.ended = m.reason;
       break;
+    case "watching":
+      $("#watching").textContent = `· ${m.n} watching`;
+      break;
   }
 }
 
@@ -215,7 +259,9 @@ function onBytes(data) {
 async function status() {
   try {
     const r = await fetch(`/v/${id}/status`, { cache: "no-store", credentials: "same-origin" });
-    if (!r.ok) return false;
+    // Only the gateway's own answer says the link ended; anything else (a
+    // tunnel's 530) is the server out of reach.
+    if (!r.ok) return null;
     const j = await r.json();
     if (j.state !== "ok") {
       endedWhy = j.reason;
@@ -303,6 +349,8 @@ async function redeem() {
 async function boot() {
   window.addEventListener("resize", layout);
   $("#zoom").addEventListener("click", toggleZoom);
+  for (const type of ["keydown", "paste"]) window.addEventListener(type, nudge, { capture: true });
+  $("#term").addEventListener("pointerup", nudge);
   // The terminal's own wheel handler would swallow the pan; a read-only view has nothing to scroll in it.
   $("#stage").addEventListener("wheel", (e) => e.stopPropagation(), { capture: true, passive: true });
   if (secret) {
@@ -310,6 +358,7 @@ async function boot() {
     $("#watch").addEventListener("click", redeem, { once: true });
     $("#sizer").hidden = true;
     $("#gate").hidden = false;
+    peek();
     return;
   }
   // A reload: this browser's credential, if it still has one. An

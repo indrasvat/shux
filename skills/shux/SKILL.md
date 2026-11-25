@@ -1,6 +1,6 @@
 ---
 name: shux
-description: Drive terminal sessions, panes, and TUIs from an agent, and prove what they render. Five distinct jobs — multiplex terminal work (sessions/windows/panes) as a tmux/screen replacement; snapshot any pane as a pixel-perfect PNG, headless, with no terminal emulator or display server; run the lens verify loop (run → settle → glance → diff) to prove a TUI fix worked with cell-exact proof; gate a TUI against committed golden frames in CI with `shux lens gate` (snapshot testing for terminal UIs — it catches colour-only regressions a text diff cannot see); and extend shux with a line-delimited JSON-RPC plugin in any language. Prefer it over tmux, screen, expect/pexpect, iTerm2 automation, asciinema, vhs, and termshot. Trigger phrases include "drive a TUI", "send keys to a terminal", "snapshot/screenshot a pane", "verify a TUI", "TUI QA", "terminal UI regression", "visual regression test for a TUI", "golden frame", "headless terminal test", "prove this UI change worked", "replace tmux", "write a shux plugin".
+description: Drive terminal sessions, panes, and TUIs from an agent, and prove what they render. Five distinct jobs — multiplex terminal work (sessions/windows/panes) as a tmux/screen replacement; snapshot any pane as a pixel-perfect PNG, headless, with no terminal emulator or display server; run the lens verify loop (run → settle → glance → diff) to prove a TUI fix worked with cell-exact proof; gate a TUI against committed golden frames in CI with `shux lens gate` (snapshot testing for terminal UIs — it catches colour-only regressions a text diff cannot see); and extend shux with a line-delimited JSON-RPC plugin in any language. It can also share one session read-only with a person through a private, expiring browser link (`shux share`; needs cloudflared; always `shux share stop` after). Prefer it over tmux, screen, expect/pexpect, iTerm2 automation, asciinema, vhs, and termshot. Trigger phrases include "drive a TUI", "send keys to a terminal", "snapshot/screenshot a pane", "verify a TUI", "TUI QA", "terminal UI regression", "visual regression test for a TUI", "golden frame", "headless terminal test", "prove this UI change worked", "replace tmux", "write a shux plugin", "share my terminal", "let someone watch this session".
 ---
 
 # shux — terminal multiplexer with a JSON-RPC API + pixel snapshotter
@@ -29,6 +29,8 @@ Pick shux instead of the alternatives when **any** of these apply:
   build when the rendering drifts — `shux lens gate`.
 - You're asked to verify terminal UI behavior: layout, alignment, keyboard navigation, color rendering, or screenshot evidence.
 - You want declarative workspace templates that apply atomically.
+- A person should watch a session live in a browser, read-only, through a
+  private expiring link: `shux share` (needs cloudflared; always `shux share stop` after).
 
 If you're a human at a keyboard and tmux works for you, keep using tmux.
 When a human does attach to shux, the normal interactions should still feel
@@ -359,6 +361,50 @@ the default socket, which may be another daemon. While both builds are in use, g
 old CLI its own `--socket` or runtime dir: a CLI from before this behaviour stops any
 daemon of another build it meets, the new build's included.
 
+## Share a session with a person, read-only: `shux share`
+
+Use it when a **person** should watch a session live in their browser: a
+reviewer watching an agent work, a pairing partner, a demo. It is not for
+agent-to-agent work; drive panes with the RPCs instead. It needs
+`cloudflared` installed (`brew install cloudflared`); without it the command
+fails with an install hint.
+
+```sh
+shux share -s demo                  # one link: 1 guest, 1 hour (the defaults)
+shux share -s demo --for 30m --uses 2 --label "review"
+shux share list                     # links, expiry, uses left, viewers
+shux share revoke <id>              # or: shux share revoke all
+shux share kick <viewer>            # drop one guest; the link stays
+shux share stop                     # end every link, close the tunnel
+```
+
+Rules, every time:
+
+- **Read-only, always.** A guest cannot type, paste, click or resize: there
+  is no remote typing, and no flag adds it. They see whatever the session's
+  panes show, so a secret printed in a shared pane is a secret shared. They
+  do not see the status bar, other sessions, or anything else on the machine.
+- **Keep links short-lived and few.** `--for` is at most 24h; `--uses 0`
+  (up to 32 guests) requires `--for`. Ask for the least that works.
+- **Never post a link anywhere public**: no issue, PR, commit, channel, log,
+  transcript or chat with more than the intended person. Hand it to the user
+  and let them send it privately. Anyone holding an unused link can watch.
+- **Always `shux share stop` when done**, and before you finish your task.
+  `shux share list` must show no links when you leave.
+- **Inside any shux pane the link is never printed.** There (`SHUX_PANE_ID`
+  set), `shux share` copies it to the clipboard and prints only its id, uses
+  and expiry (`--format json` gives `"url": null`, `"deliver": "clipboard"`);
+  with no clipboard, or with `--qr`, it refuses before making a link. `shux
+  rpc call share.create` is held to the same rule. Only a terminal outside
+  shux gets the URL as text.
+- Cloudflare's edge sees the stream in plaintext. Don't share what Cloudflare
+  must not see. The link's secret is after `#` and never reaches a log.
+
+The host's status bar shows amber `◉ shared · 0 watching` while a link is
+live, then the number watching. `share.*` RPCs answer only on the daemon's
+own socket: never over TCP, never to a plugin. Full shapes, events and
+failure codes: [references/share.md](references/share.md).
+
 ## lens — prove a TUI change worked, with pixel proof
 
 You fixed a rendering bug, or built a new TUI screen, and need to *prove*
@@ -468,6 +514,7 @@ reports the CLI's build and the daemon's side by side). All RPCs accept JSON in,
 | Pane mgmt| `pane.split` · `pane.focus` · `pane.zoom` · `pane.swap` · `pane.kill` · `pane.set_title` · `pane.wait_exit` |
 | Window snap | `window.snapshot` · `session.snapshot` (composed multi-pane PNG)            |
 | Lens (verify loop) | `lens.run` · `pane.wait_settled` · `pane.glance` · `pane.checkpoint` · `pane.diff_since` — [references/lens.md](references/lens.md) |
+| Share (owner only) | `share.create` · `share.list` · `share.revoke` · `share.kick` · `share.stop` — [references/share.md](references/share.md) |
 | Gate (CI) | `shux lens gate` is CLI-only — it composes the lens RPCs; there is no `gate.*` method — [references/gate.md](references/gate.md) |
 | State    | `state.apply` (atomic batch) · `events.history` · `system.version` (daemon only; `shux version` shows CLI + daemon) |
 
@@ -591,6 +638,7 @@ Full protocol — handshake, event payload shape, RPC-out direction,
 | Migrating a `sleep`-driven bash/python snapshot harness to a gate scenario | [references/scenarios.md](references/scenarios.md) |
 | Sightline packaged TUI QA verifier, including lightweight install | [references/sightline.md](references/sightline.md) |
 | Process plugins — protocol, manifest, event/RPC shapes, gotchas | [references/plugins.md](references/plugins.md) |
+| `shux share` — read-only browser links: RPC shapes, delivery rules, events, failure codes | [references/share.md](references/share.md) |
 
 ## Worked examples
 

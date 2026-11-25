@@ -428,6 +428,30 @@ pub enum EventData {
         new_action: String,
     },
 
+    // ── Share (#297) ───────────────────────────────────────────
+    // Public ids and stable reason codes only: never a secret, an origin, a
+    // label, or anything about a guest.
+    /// A share link was made.
+    ShareCreated {
+        link_id: String,
+        session_id: SessionId,
+        expires_at: String,
+    },
+
+    /// A share link ended: `revoked`, `expired`, `stopped`, `session_ended`
+    /// or `tunnel_lost`. Its viewers ended with it.
+    ShareEnded {
+        link_id: String,
+        session_id: SessionId,
+        reason: String,
+    },
+
+    /// The public tunnel came `up` or went `down`, with why it went down.
+    ShareTunnel {
+        state: String,
+        reason: Option<String>,
+    },
+
     // ── System ─────────────────────────────────────────────────
     /// A system error occurred.
     Error {
@@ -506,6 +530,9 @@ impl EventData {
             EventData::PluginError { .. } => "plugin.error",
             EventData::PluginEvent { .. } => "plugin.event",
             EventData::KeybindingChanged { .. } => "keybinding.changed",
+            EventData::ShareCreated { .. } => "share.created",
+            EventData::ShareEnded { .. } => "share.ended",
+            EventData::ShareTunnel { .. } => "share.tunnel",
             EventData::Error { .. } => "error",
         }
     }

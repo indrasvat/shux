@@ -29,6 +29,30 @@ pub async fn with_connection<F: Future>(life: CancellationToken, fut: F) -> F::O
     RPC_CONNECTION.scope(life, fut).await
 }
 
+/// The socket a request arrived on. An owner-local method
+/// ([`crate::RouterBuilder::owner_local`]) answers only [`Transport::Uds`]:
+/// the daemon's own socket, which only its user can open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    Uds,
+    Tcp,
+}
+
+tokio::task_local! {
+    static RPC_TRANSPORT: Transport;
+}
+
+/// The transport of the request being served; `None` outside a socket
+/// connection (plugin dispatch, daemon-internal calls).
+pub fn current_transport() -> Option<Transport> {
+    RPC_TRANSPORT.try_with(|t| *t).ok()
+}
+
+/// Run `fut` as a connection served on `transport`.
+pub async fn with_transport<F: Future>(transport: Transport, fut: F) -> F::Output {
+    RPC_TRANSPORT.scope(transport, fut).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -36,5 +60,6 @@ mod tests {
     #[tokio::test]
     async fn absent_outside_a_served_request() {
         assert!(current_connection().is_none());
+        assert!(current_transport().is_none());
     }
 }

@@ -8,29 +8,54 @@
   color-scheme: dark;
 }
 * { box-sizing: border-box; }
-html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); }
+/* The page is pinned to the screen and only the stage scrolls: a document
+   that scrolls or widens takes the bar under the status bar and off-screen. */
+html, body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--fg);
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
 body {
+  position: fixed;
+  inset: 0;
   display: flex;
   flex-direction: column;
   font: 13px/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
 }
+/* iOS zooms the page in on focusing a field under 16px: the terminal's input
+   elements are focused, never typed into, and must not zoom. */
+#term, #term textarea { font-size: 16px; }
 #bar {
   flex: none;
   display: flex;
   gap: 0.5em;
   align-items: center;
-  padding: 6px 12px;
+  padding: max(8px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right)) 8px
+    max(12px, env(safe-area-inset-left));
   background: var(--bar);
   color: var(--bar-text);
   white-space: nowrap;
   overflow: hidden;
 }
+/* The state and the button always show; the names give way, expiry first. */
+#bar > * { flex: none; }
 #bar .mark, #bar .ro { color: var(--shared); font-weight: 600; }
 #bar .sep, #expiry { color: var(--muted); }
-#session { font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
+#session { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; font-weight: 600; }
+#bar #watching { color: var(--muted); }
+#expiry:empty, #watching:empty { display: none; }
+/* Narrow, the expiry goes (the first page said it), then the count: never
+   the state or the Fit button. */
+@media (max-width: 480px) { #expiry { display: none; } }
+@media (max-width: 360px) { #watching { display: none; } }
 #state { margin-left: auto; color: var(--muted); }
 #state.bad { color: var(--shared); }
 #stage {
+  min-height: 0;
   flex: 1;
   overflow: auto;
   position: relative;
@@ -53,13 +78,40 @@ body {
   cursor: pointer;
 }
 #zoom[hidden] { display: none; }
+/* On the viewport, not the stage: a panned stage would carry it off-centre. */
 #gate {
+  position: fixed;
+  top: 15vh;
+  left: 0;
+  right: 0;
   max-width: 28em;
-  margin: 15vh auto 0;
+  margin: 0 auto;
   padding: 0 16px;
   text-align: center;
 }
-#gate[hidden] { display: none; }
+#gate[hidden], #gate [hidden] { display: none; }
+#gate h1 { font-size: 1.35em; line-height: 1.3; margin: 0 0 0.8em; }
+#gate p { margin: 0 0 0.6em; }
+#gate-when { color: var(--shared); }
+#gate-text { font-size: 1.1em; }
+#watch { margin-top: 1em; }
+#gate .made { margin-top: 2.5em; font-size: 0.85em; color: var(--muted); }
+#gate .made a { color: inherit; }
+#toast {
+  position: fixed;
+  left: 50%;
+  bottom: max(24px, env(safe-area-inset-bottom));
+  transform: translateX(-50%);
+  max-width: calc(100% - 32px);
+  padding: 8px 14px;
+  border-radius: 6px;
+  background: var(--bar);
+  color: var(--bar-text);
+  border: 1px solid var(--muted);
+  pointer-events: none;
+  z-index: 1;
+}
+#toast[hidden] { display: none; }
 #watch {
   font: inherit;
   font-weight: 600;

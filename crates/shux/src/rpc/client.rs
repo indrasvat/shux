@@ -25,6 +25,7 @@ pub(crate) fn register_client_methods(
                 async move {
                     let clients = io.lock().await.clients.clone();
                     let snap = gh.snapshot();
+                    let guests = clients.guests();
                     let rows: Vec<serde_json::Value> = clients
                         .list()
                         .into_iter()
@@ -42,6 +43,8 @@ pub(crate) fn register_client_methods(
                                 "rows": c.rows,
                                 "attached_at": attached_at,
                                 "read_only": !c.votes,
+                                // A `shux share` guest; detaching one is a kick.
+                                "share": guests.contains(&c.id),
                             })
                         })
                         .collect();

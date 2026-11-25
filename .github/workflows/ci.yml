@@ -110,10 +110,6 @@ jobs:
         run: make check-test-ignores
       - name: Actions pinned to commits
         run: make check-action-pins
-      - name: Clippy (macOS cfg)
-        # Linux clippy never sees cfg(target_os = "macos") code, so a sleep or
-        # any other lint there would otherwise reach only the macOS test job.
-        run: make check-darwin
       # The guards, leak checks and evidence harnesses are all shell. A defect
       # there does not fail loudly the way a test does — it makes a guard quietly
       # stop guarding, which is the failure mode this repo can least afford.
@@ -305,7 +301,15 @@ jobs:
             | sh -s -- -y --profile minimal --default-toolchain none --no-modify-path
           echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec  # stable branch
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
+      - name: Clippy (macOS cfg)
+        # Linux clippy never sees cfg(target_os = "macos") code, so a sleep or
+        # any other lint there would otherwise reach only the macOS tests. Run
+        # natively: ring's build compiles C for the target, which a Linux host
+        # cannot do for macOS.
+        run: make check-darwin
       # The lens suites compare goldens with .claude/automations/pixel_verify.py, a uv script.
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6.8.0
       - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32  # v2.88.0

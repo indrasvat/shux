@@ -264,6 +264,7 @@ fn router(gw: Gateway) -> Router {
         .route("/v/{id}/status", get(status))
         .route("/v/{id}/ws", get(stream))
         .route("/_/{name}", get(asset))
+        .route(super::tunnel::PROBE_PATH, get(probe))
         .fallback(|| async { not_found() })
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .layer(axum::middleware::from_fn_with_state(gw.clone(), authority))
@@ -292,6 +293,15 @@ async fn authority(State(gw): State<Gateway>, req: Request, next: Next) -> Respo
         return not_found();
     }
     next.run(req).await
+}
+
+/// The marker of a tunnel being brought up, to a request naming its host:
+/// proof that the public origin reaches this gateway, and this generation.
+async fn probe(State(gw): State<Gateway>, headers: HeaderMap) -> Response {
+    match one(&headers, header::HOST).and_then(|h| gw.probe_marker(h)) {
+        Some(m) => ([(header::CONTENT_TYPE, "text/plain")], m).into_response(),
+        None => not_found(),
+    }
 }
 
 async fn harden(mut res: Response) -> Response {
@@ -398,6 +408,10 @@ async fn asset(
 #[serde(deny_unknown_fields)]
 struct RedeemBody {
     secret: String,
+    /// Check the secret and say when the link ends and its uses left,
+    /// spending nothing: what the page shows before Watch session.
+    #[serde(default)]
+    peek: bool,
 }
 
 fn refused(why: Refused) -> Response {
@@ -440,7 +454,7 @@ async fn redeem(
             serde_json::json!({"error": "json"}),
         );
     }
-    let Ok(RedeemBody { secret }) = serde_json::from_slice(&body) else {
+    let Ok(RedeemBody { secret, peek }) = serde_json::from_slice(&body) else {
         return json(
             StatusCode::BAD_REQUEST,
             serde_json::json!({"error": "body"}),
@@ -448,6 +462,18 @@ async fn redeem(
     };
     if !claim(conn.as_ref()) {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    if peek {
+        return match gw.peek(client(&headers), generation, &id, &secret) {
+            Ok((expires, uses_left)) => json(
+                StatusCode::OK,
+                serde_json::json!({
+                    "expires_in_ms": expires.remaining_ms(gw.now()),
+                    "uses_left": uses_left,
+                }),
+            ),
+            Err(why) => refused(why),
+        };
     }
     match gw.redeem(client(&headers), generation, &id, &secret) {
         Ok(r) => {

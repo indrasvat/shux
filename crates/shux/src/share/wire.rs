@@ -4,8 +4,10 @@
 //! binary messages, each an 8-byte big-endian offset (the stream position of
 //! its first byte) and at most [`CHUNK`] bytes of ANSI. Text messages
 //! between them keep their place: `resize` marks the grid the bytes after it
-//! are drawn for, `host` reports the host's layout size, and `ended` says why
-//! the stream is closing. Browser to server: text only, and only `hello`
+//! are drawn for, `host` reports the host's layout size, `watching` the
+//! number of read-only clients on the session (sent on a change, at most one
+//! a second; a count only, never who), and `ended` says why the stream is
+//! closing. Browser to server: text only, and only `hello`
 //! (first), `resize` and `ack`, each a few dozen bytes.
 //!
 //! The browser acknowledges the offset its terminal has parsed. No more than
@@ -117,6 +119,11 @@ pub enum Outbound {
     },
     Ended {
         reason: &'static str,
+    },
+    /// How many read-only clients watch the session, this one included: the
+    /// count the host's badge shows, and nothing about who they are.
+    Watching {
+        n: usize,
     },
 }
 

@@ -1774,3 +1774,65 @@ fn a_hostless_view_never_outgrows_the_size_ready_promised() {
         rig.stop().await;
     });
 }
+
+/// `share list` counts a viewer as connected only once its stream draws, as
+/// the host's badge does, not from the moment its socket is admitted.
+#[test]
+fn a_viewer_is_connected_only_once_it_draws() {
+    let _ = dirs();
+    runtime().block_on(async {
+        let rig = Rig::start("connecting").await;
+        let (session, _) = rig
+            .session("waited", serde_json::json!(["sh", "-c", "exec cat"]))
+            .await;
+        let (id, secret) = rig.link(&session, |_| {});
+        let reply = rig.redeem(&id, &secret).await;
+        let cookie = reply.cookie(&id);
+        let mut ws = upgrade(rig.addr, &id, &cookie, ORIGIN)
+            .await
+            .expect("upgrade");
+        let connected = |gw: &Gateway| gw.list()[0].viewers.iter().filter(|v| v.connected).count();
+        assert_eq!(connected(&rig.gw), 0, "admitted, but it has not said hello");
+        let hello = serde_json::json!({ "t": "hello", "cols": 80, "rows": 24 });
+        ws.send(tungstenite::Message::text(hello.to_string()))
+            .await
+            .expect("hello");
+        let gw = rig.gw.clone();
+        shux_testkit::wait_until_async("the viewer to read as connected", || {
+            let gw = gw.clone();
+            async move { connected(&gw) == 1 }
+        })
+        .await;
+        drop(ws);
+        rig.stop().await;
+    });
+}
+
+/// A share guest is listed as one, and `client detach` of it is a kick: the
+/// owner may still use it, and the guest hears why.
+#[test]
+fn a_share_guest_is_marked_in_the_client_list() {
+    let _ = dirs();
+    runtime().block_on(async {
+        let rig = Rig::start("marked").await;
+        let (session, _) = rig.session("marked", producer()).await;
+        let (id, secret) = rig.link(&session, |_| {});
+        let mut viewer = rig.viewer(&id, &secret, 80, 24).await;
+        assert!(viewer.draws("TICK").await);
+        let _host = Host::attach(&rig, "marked", 100, 30).await;
+        let listed = rig.rpc("client.list", serde_json::json!({})).await;
+        let clients = listed["clients"].as_array().unwrap();
+        let guest: Vec<_> = clients.iter().filter(|c| c["share"] == true).collect();
+        assert_eq!(guest.len(), 1, "{listed}");
+        assert_eq!(guest[0]["read_only"], true);
+        assert_eq!(
+            clients.iter().filter(|c| c["share"] == false).count(),
+            1,
+            "the host is not a guest: {listed}"
+        );
+        rig.rpc("client.detach", serde_json::json!({ "id": guest[0]["id"] }))
+            .await;
+        assert_eq!(viewer.ends().await.as_deref(), Some("kicked"));
+        rig.stop().await;
+    });
+}

@@ -157,11 +157,27 @@ check-ci-parity: nextest-ready ## Run the cargo-output parsers under CI's enviro
 check-darwin: ## Clippy the workspace for macOS — catches cfg-gated code a Linux build never sees
 	@# Needs the -Dwarnings above: dead cfg-gated items are warnings, so without
 	@# it this printed the defect and reported success.
-	@echo "$(COLOR_BLUE)▶ Cross-checking aarch64-apple-darwin...$(COLOR_RESET)"
-	@rustup target list --installed | grep -qx aarch64-apple-darwin \
-	  || rustup target add aarch64-apple-darwin
-	@CLIPPY_CONF_DIR="$(CURDIR)" cargo clippy --workspace --all-targets --target aarch64-apple-darwin --color never -- -D warnings
+	@# Native only: ring's build script compiles C for the target, and a Linux
+	@# host has no macOS toolchain for it. CI runs this on its macOS runner.
+	@if [ "$(UNAME_S)" != Darwin ]; then \
+	  echo "$(COLOR_RED)✗ check-darwin needs a macOS host (ring builds C for the target); CI runs it on macos-latest$(COLOR_RESET)" >&2; \
+	  exit 1; \
+	fi
+	@echo "$(COLOR_BLUE)▶ Clippy on macOS...$(COLOR_RESET)"
+	@CLIPPY_CONF_DIR="$(CURDIR)" cargo clippy --workspace --all-targets --color never -- -D warnings
 	@echo "$(COLOR_GREEN)✓ macOS clippy passed$(COLOR_RESET)"
+
+# `check` and `ci` run the macOS clippy where it can run, and say so elsewhere.
+UNAME_S ?= $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+MACOS_CLIPPY := check-darwin
+else
+MACOS_CLIPPY := check-darwin-skipped
+endif
+
+.PHONY: check-darwin-skipped
+check-darwin-skipped:
+	@echo "$(COLOR_YELLOW)⚠ macOS clippy: skipped on $(UNAME_S), not passed; CI's macOS job runs it$(COLOR_RESET)"
 
 .PHONY: check-linux
 check-linux: ## Clippy the workspace for Linux — catches cfg-gated code a macOS build never sees
@@ -411,6 +427,17 @@ test-share-browser: ## The share gateway (#297) in headless Chrome behind a loca
 	@cargo build -p shux --bin shux --example share_rig
 	@.shux/scripts/no_leak_guard.sh uv run --offline --script scripts/share-browser-check.py \
 		target/debug/shux target/debug/examples/share_rig .shux/out/share-gateway-297
+
+# Opt-in, never in `make check` or CI: it opens a real public quick tunnel, so
+# it needs network, cloudflared on PATH, Chrome and a cached Playwright. It
+# shares one demo session for about a minute and stops it. SHOWCASE=1 also
+# keeps a guest frame of lazygit for the landing page.
+.PHONY: test-share-tunnel
+test-share-tunnel: ## `shux share` over a REAL Cloudflare quick tunnel to headless Chrome (#297; network)
+	@echo "$(COLOR_BLUE)▶ Building the shux binary...$(COLOR_RESET)"
+	@cargo build -p shux --bin shux
+	@.shux/scripts/no_leak_guard.sh uv run --offline --script scripts/share-tunnel-check.py \
+		target/debug/shux .shux/out/share-tunnel-297 $(if $(SHOWCASE),--showcase,)
 
 # Deliberately NOT in `make check` or `make ci`: this needs an X server and a GUI
 # terminal, and it costs minutes. Image work and emit-path changes invoke it.
@@ -800,7 +827,7 @@ fmt: ## Format all code
 	@echo "$(COLOR_GREEN)✓ Formatting complete$(COLOR_RESET)"
 
 .PHONY: check-after-hygiene
-check-after-hygiene: lint shellcheck check-test-sleeps check-test-timing check-test-ignores check-darwin test check-build-rerun check-test-groups check-test-opt-out check-test-inventory check-ci-parity test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-lens-frozen check-no-bin-mods check-action-pins check-vt-corpus-scratch check-fuzz-lock check-prune
+check-after-hygiene: lint shellcheck check-test-sleeps check-test-timing check-test-ignores $(MACOS_CLIPPY) test check-build-rerun check-test-groups check-test-opt-out check-test-inventory check-ci-parity test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-lens-frozen check-no-bin-mods check-action-pins check-vt-corpus-scratch check-fuzz-lock check-prune
 
 .PHONY: check
 check: hooks-check check-target-hygiene ## Run lint + test + process/QA guards (what pre-commit runs)
@@ -812,7 +839,7 @@ check: hooks-check check-target-hygiene ## Run lint + test + process/QA guards (
 	@echo ""
 
 .PHONY: ci
-ci: lint shellcheck check-test-sleeps check-test-timing check-test-ignores check-darwin test check-test-groups check-test-inventory check-ci-parity test-doc test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-no-bin-mods check-action-pins check-vt-corpus-scratch check-fuzz-lock check-prune ## Run the CI pipeline locally (lint + full test + doc tests + process/QA guards)
+ci: lint shellcheck check-test-sleeps check-test-timing check-test-ignores $(MACOS_CLIPPY) test check-test-groups check-test-inventory check-ci-parity test-doc test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-no-bin-mods check-action-pins check-vt-corpus-scratch check-fuzz-lock check-prune ## Run the CI pipeline locally (lint + full test + doc tests + process/QA guards)
 	@echo ""
 	@echo "$(COLOR_GREEN)$(COLOR_BOLD)✓ CI pipeline passed!$(COLOR_RESET)"
 	@echo ""

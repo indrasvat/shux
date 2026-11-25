@@ -73,8 +73,15 @@ shux session create work --title work  # also pin the initial pane title
 shux pane split -s work           # split the active pane
 shux pane snapshot -s work        # PNG of the current frame
 shux pane record -s work -p <pane-id> --to pane.raw  # byte-exact PTY capture
+shux share -s work                # a private read-only browser link (needs cloudflared)
+shux share stop                   # end every link when you are done
 shux config init                  # scaffold ~/.config/shux/config.toml
 ```
+
+`shux share` gives one person a live, read-only view of a session in their
+browser: one use and one hour by default, no account and no SSH. Send the
+link privately, and run `shux share stop` when you are done; see
+[`docs/share.md`](docs/share.md).
 
 PNG snapshots are headless: no terminal emulator participates. shux bundles a
 snapshot font chain for common TUI output out of the box: JetBrains Mono Nerd
@@ -166,14 +173,16 @@ Read in this order:
    customization, dotfile integration
 2. [**Quickstart for agents**](docs/agents.md) — typed JSON-RPC surface,
    `ensure` semantics, event streaming, scripting patterns
-3. [**Configuration**](docs/configuration.md) — `~/.config/shux/config.toml`
+3. [**Sharing a session**](docs/share.md) — `shux share`: read-only links a
+   guest opens in a browser, what they can see, and how to end them
+4. [**Configuration**](docs/configuration.md) — `~/.config/shux/config.toml`
    schema, hot reload, status-bar segments, starship integration
-4. [**Architecture**](docs/architecture.md) — daemon model, the seven crates,
+5. [**Architecture**](docs/architecture.md) — daemon model, the seven crates,
    why each one exists, the patterns that hold it all together
-5. [**Development**](docs/development.md) — dev setup, make targets, the L1–L4
+6. [**Development**](docs/development.md) — dev setup, make targets, the L1–L4
    testing strategy
-6. [**Roadmap**](docs/roadmap.md) — what's done, what's next, milestone plan
-7. [**Full PRD**](docs/PRD.md) — design philosophy, competitive analysis,
+7. [**Roadmap**](docs/roadmap.md) — what's done, what's next, milestone plan
+8. [**Full PRD**](docs/PRD.md) — design philosophy, competitive analysis,
    plugin WIT interfaces, performance budgets
 
 ## License
