@@ -230,7 +230,11 @@ fn resend(
     match answer {
         Err(RpcClientError::Rpc { data: Some(d), .. }) => match kind(d).as_deref() {
             Some(crate::rpc::convert::DAEMON_RETIRING) => Resend::Yes,
-            Some(shux_rpc::server::DAEMON_STOPPING) if retired => Resend::Yes,
+            // The reply says whether it retired; its build file may already
+            // be its successor's.
+            Some(shux_rpc::server::DAEMON_STOPPING) if retired || d["retiring"] == true => {
+                Resend::Yes
+            }
             _ => Resend::No,
         },
         Err(RpcClientError::NotSent(_)) if retired => Resend::OnceGone,
@@ -279,6 +283,15 @@ mod resend_tests {
             resend(&rpc(shux_rpc::server::DAEMON_STOPPING), create, false),
             Resend::No
         );
+        // Its reply says it retired, whatever its build file says by now.
+        let retiring = Err(RpcClientError::Rpc {
+            code: -32603,
+            message: "internal_error".into(),
+            data: Some(serde_json::json!({
+                "kind": shux_rpc::server::DAEMON_STOPPING, "retiring": true,
+            })),
+        });
+        assert_eq!(resend(&retiring, create, false), Resend::Yes);
         assert_eq!(
             resend(&io(BrokenPipe, false), create, true),
             Resend::OnceGone

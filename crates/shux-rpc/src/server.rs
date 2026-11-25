@@ -36,6 +36,7 @@ pub struct Server {
     router: Router,
     cancel: tokio_util::sync::CancellationToken,
     rebind_gate: Option<crate::uds::RebindGate>,
+    connections: tokio_util::task::TaskTracker,
 }
 
 /// A JSON-RPC 2.0 request (parsed from incoming frames).
@@ -95,7 +96,14 @@ impl Server {
             router,
             cancel,
             rebind_gate: None,
+            connections: tokio_util::task::TaskTracker::new(),
         }
+    }
+
+    /// Every connection this server serves. A daemon leaving waits on it,
+    /// so the reply to the call that ended it is written before it exits.
+    pub fn connections(&self) -> tokio_util::task::TaskTracker {
+        self.connections.clone()
     }
 
     /// Rebind an unlinked socket only while `gate` says this process may.
@@ -176,7 +184,7 @@ impl BoundServer {
                             debug!("accepted UDS connection");
                             let router = router.clone();
                             let cancel = cancel.clone();
-                            tokio::spawn(async move {
+                            server.connections.spawn(async move {
                                 if let Err(e) = handle_uds_connection(stream, router, cancel).await {
                                     warn!(error = %e, "UDS connection error");
                                 }
@@ -202,7 +210,7 @@ impl BoundServer {
                             let router = router.clone();
                             let cancel = cancel.clone();
                             let token = auth_token.clone();
-                            tokio::spawn(async move {
+                            server.connections.spawn(async move {
                                 if let Err(e) = handle_tcp_connection(stream, router, cancel, token).await {
                                     warn!(error = %e, addr = %addr, "TCP connection error");
                                 }
@@ -721,15 +729,27 @@ pub const DAEMON_STOPPING: &str = "daemon_stopping";
 /// The answer to a frame a leaving daemon will not dispatch.
 fn stopping_response(data: &[u8]) -> JsonRpcResponse {
     let id = parse_request(data).ok().and_then(|r| r.id);
-    JsonRpcResponse::error(
-        id,
-        RpcError::with_data(
-            ErrorCode::InternalError,
-            serde_json::json!({
-                "kind": DAEMON_STOPPING,
-                "detail": "the daemon is shutting down and did not run this request",
-            }),
-        ),
+    JsonRpcResponse::error(id, stopping_error())
+}
+
+static RETIRING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// This daemon is leaving because it retired (no session, none admitted),
+/// not because it was stopped: what it refuses from now on says so.
+pub fn mark_retiring() {
+    RETIRING.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// A leaving daemon's refusal of a request it did not run; `retiring` when
+/// it retired, so a client knows sending it on cannot do anything twice.
+pub fn stopping_error() -> RpcError {
+    RpcError::with_data(
+        ErrorCode::InternalError,
+        serde_json::json!({
+            "kind": DAEMON_STOPPING,
+            "retiring": RETIRING.load(std::sync::atomic::Ordering::SeqCst),
+            "detail": "the daemon is shutting down and did not run this request",
+        }),
     )
 }
 

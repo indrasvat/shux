@@ -47,10 +47,7 @@ pub(crate) fn graph_error_to_rpc(e: shux_core::graph::GraphError) -> shux_rpc::R
             serde_json::json!({ "kind": DAEMON_RETIRING, "detail": e.to_string() }),
         ),
         // The graph loop is gone: the daemon is leaving, for whatever reason.
-        GraphError::Shutdown => shux_rpc::RpcError::with_data(
-            shux_rpc::ErrorCode::InternalError,
-            serde_json::json!({ "kind": shux_rpc::server::DAEMON_STOPPING, "detail": e.to_string() }),
-        ),
+        GraphError::Shutdown => shux_rpc::server::stopping_error(),
     }
 }
 

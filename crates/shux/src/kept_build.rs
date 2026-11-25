@@ -370,6 +370,7 @@ static RETIRING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 /// The daemon retires: say so in its build file, which it then leaves behind,
 /// so a client whose call it dropped knows nothing of that call survives.
 pub(crate) fn mark_retiring() {
+    shux_rpc::server::mark_retiring();
     RETIRING.store(true, std::sync::atomic::Ordering::SeqCst);
     if let Some(socket) = SOCKET.get() {
         write_build_file(socket);

@@ -554,16 +554,34 @@ pub(crate) struct Teardown {
     io_state: Arc<Mutex<PaneIoState>>,
     plugins: shux_plugin::PluginManager,
     share: crate::share::Gateway,
+    connections: tokio_util::task::TaskTracker,
 }
 
+/// How long a leaving daemon waits for its connections to write their last
+/// replies: the call that ended it, and the refusals of calls it will not run.
+const CONNECTIONS_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
+
 impl Teardown {
-    /// End every share viewer, then reap every pane and every plugin, side
-    /// by side.
+    /// End every share viewer, then reap every pane and every plugin, and let
+    /// every connection write its last reply, side by side.
     pub(crate) async fn drain(self) {
         if let Err(e) = self.share.stop().await {
             tracing::warn!(error = %e, "share gateway stop");
         }
-        tokio::join!(shutdown_all_pane_io(self.io_state), self.plugins.shutdown());
+        self.connections.close();
+        let connections = async {
+            if tokio::time::timeout(CONNECTIONS_DRAIN, self.connections.wait())
+                .await
+                .is_err()
+            {
+                tracing::warn!("connections still open at shutdown");
+            }
+        };
+        tokio::join!(
+            shutdown_all_pane_io(self.io_state),
+            self.plugins.shutdown(),
+            connections
+        );
     }
 }
 
@@ -944,6 +962,7 @@ pub(crate) async fn run_rpc_server(
 
     let server =
         shux_rpc::Server::new(config, router, cancel.clone()).with_rebind_gate(rebind_gate);
+    let connections = server.connections();
 
     tokio::spawn(async move {
         if let Err(e) = server.run().await {
@@ -965,6 +984,7 @@ pub(crate) async fn run_rpc_server(
         io_state: shutdown_io_state,
         plugins,
         share,
+        connections,
     })
 }
 
