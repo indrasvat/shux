@@ -198,6 +198,59 @@ fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
+/// Truecolor, indexed and basic colour drawn in `pane` of `session` through
+/// this CLI reach the other build's daemon and come back in its cells.
+#[track_caller]
+fn assert_colour_probes(h: &Harness, session: &str, pane: &str) {
+    let probes = "printf '\\033[38;2;120;220;180mTRUE%sCOLOR\\033[0m \\033[38;5;208mINDE%sXED\\033[0m \\033[34mBA%sSIC\\033[0m\\n' '' '' ''\n";
+    ok(
+        &h.run(&[
+            "pane",
+            "send-keys",
+            "-s",
+            session,
+            "-p",
+            pane,
+            "--text",
+            probes,
+        ]),
+        "send the colour probes",
+    );
+    ok(
+        &h.run(&[
+            "pane",
+            "wait-for",
+            "-s",
+            session,
+            "-p",
+            pane,
+            "--text",
+            "BASIC",
+            "--timeout-ms",
+            "20000",
+        ]),
+        "the probes to draw",
+    );
+    let (code, glanced) = h.json(&["pane", "glance", pane, "--cells"]);
+    assert_eq!(code, Some(0), "{glanced}");
+    let runs: Vec<&serde_json::Value> = glanced["result"]["cells"]["rows"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|r| r["runs"].as_array().into_iter().flatten())
+        .collect();
+    for (word, fg) in [
+        ("TRUECOLOR", serde_json::json!({ "rgb": [120, 220, 180] })),
+        ("INDEXED", serde_json::json!({ "idx": 208 })),
+        ("BASIC", serde_json::json!({ "idx": 4 })),
+    ] {
+        assert!(
+            runs.iter().any(|r| r[1] == word && r[2]["fg"] == fg),
+            "{word} did not come back in {fg}: {runs:?}"
+        );
+    }
+}
+
 #[track_caller]
 fn ok(out: &Output, what: &str) -> String {
     assert!(
@@ -218,6 +271,7 @@ fn every_common_command_runs_against_a_busy_daemon_of_another_build() {
     let h = Harness::new();
     let pane = h.occupied_by(SIBLING);
     let daemon = h.daemon_pid();
+    assert_colour_probes(&h, "agent", &pane);
 
     let listed = ok(&h.run(&["session", "list"]), "session list");
     assert!(listed.contains("agent"), "{listed}");
@@ -470,7 +524,8 @@ fn daemon_upgrade_in_every_state() {
     let old = forced.daemon_pid();
     let (code, r) = forced.json(&["daemon", "upgrade", "--force"]);
     assert_eq!((code, &r["outcome"]), (Some(0), &"stopped".into()), "{r}");
-    assert!(!alive(old));
+    // It no longer serves the socket; the process may take a moment to go.
+    shux_testkit::wait_until("the forced daemon to exit", || !alive(old));
 
     let newer = Harness::new();
     newer.occupied_by(NEWER);
@@ -517,12 +572,14 @@ fn a_create_racing_a_pending_upgrade_lands_on_the_successor() {
             "{refused}"
         );
     }
-    let file = h.build_file_raw();
-    assert_eq!(
-        (&file["pid"], &file["retiring"]),
-        (&old.into(), &true.into()),
-        "a retired daemon leaves its build file saying so: {file}"
-    );
+    // Written as it retires, after the kill's reply: waited for, not raced.
+    let path = h.pid_dir().join("shux.build.json");
+    shux_testkit::wait_until("a retired daemon to leave its build file saying so", || {
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .is_some_and(|f| f["pid"] == old && f["retiring"] == true)
+    });
     shux_testkit::wait_until("the old daemon to exit", || !alive(old));
     ok(
         &h.run(&["session", "create", "late", "-d", "--", "/bin/sh"]),
@@ -646,6 +703,7 @@ fn a_0_64_daemon_serves_only_what_it_serves_as_asked() {
     let h = Harness::new();
     let pane = h.occupied_by(V0_64);
     ok(&h.run(&["session", "list"]), "session list");
+    assert_colour_probes(&h, "agent", &pane);
     ok(
         &h.run(&["pane", "capture", "-s", "agent", "-p", &pane]),
         "capture",

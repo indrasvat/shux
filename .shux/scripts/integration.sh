@@ -94,7 +94,7 @@ count=$("$SHUX" rpc call window.list --params "{\"session_id\":\"$sid_w\"}" \
 # Kill the middle one, assert remaining two are correct titles.
 mid_id=$("$SHUX" rpc call window.list --params "{\"session_id\":\"$sid_w\"}" \
          | jq -r '.result[] | select(.title=="second") | .id')
-"$SHUX" rpc call window.kill --params "{\"session_id\":\"$sid_w\",\"id\":\"$mid_id\"}" >/dev/null
+"$SHUX" rpc call window.kill --params "{\"id\":\"$mid_id\"}" >/dev/null
 
 titles=$("$SHUX" rpc call window.list --params "{\"session_id\":\"$sid_w\"}" \
          | jq -r '[.result[].title] | sort | join(",")')

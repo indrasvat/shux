@@ -102,6 +102,25 @@ kill_all() {
   done
 }
 
+# Truecolor, indexed and basic colour, typed so the echo cannot hold the words.
+PROBES=$'printf \'\\033[38;2;120;220;180mTRUE%sCOLOR\\033[0m \\033[38;5;208mINDE%sXED\\033[0m \\033[34mBA%sSIC\\033[0m\\n\' \'\' \'\' \'\'\n'
+
+# colours <label> <cli> <runtime> <pane>: the probes come back in their colours.
+colours() {
+  local label="$1" cli="$2" rt="$3" pane="$4"
+  expect 0 "$label: colour probes typed" "$cli" "$rt" pane send-keys -s agent -p "$pane" --text "$PROBES"
+  expect 0 "$label: colour probes drawn" "$cli" "$rt" pane wait-for -s agent -p "$pane" --text BASIC --timeout-ms 20000
+  expect 0 "$label: glance cells" "$cli" "$rt" --format json pane glance "$pane" --cells
+  if jq -e '[.result.cells.rows[].runs[]] as $r
+        | ([$r[] | select(.[1]=="TRUECOLOR" and .[2].fg.rgb==[120,220,180])] | length > 0)
+        and ([$r[] | select(.[1]=="INDEXED" and .[2].fg.idx==208)] | length > 0)
+        and ([$r[] | select(.[1]=="BASIC" and .[2].fg.idx==4)] | length > 0)' "$OUT/out" >/dev/null; then
+    pass "$label: truecolor, indexed and basic colour come back"
+  else
+    fail "$label: a colour probe came back in the wrong colour"
+  fi
+}
+
 # common <label> <cli> <runtime> <pane>: the commands agents run all day.
 common() {
   local label="$1" cli="$2" rt="$3" pane="$4"
@@ -111,6 +130,7 @@ common() {
   expect 0 "$label: wait-for" "$cli" "$rt" pane wait-for -s agent -p "$pane" --text skew-42 --timeout-ms 20000
   expect 0 "$label: capture" "$cli" "$rt" pane capture -s agent -p "$pane"
   contains "$label: capture shows the output" skew-42
+  colours "$label" "$cli" "$rt" "$pane"
   expect 0 "$label: pane run" "$cli" "$rt" --format json pane run -s agent -p "$pane" --boundaries markers --timeout 30s -c "printf 'r%sn\n' u"
   contains "$label: pane run returns the output" run
   expect 0 "$label: snapshot" "$cli" "$rt" --format json pane snapshot -s agent -p "$pane"
