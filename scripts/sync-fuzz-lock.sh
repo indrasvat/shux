@@ -8,7 +8,8 @@
 #
 # Usage:
 #   scripts/sync-fuzz-lock.sh           rewrite the lock to the workspace version
-#   scripts/sync-fuzz-lock.sh --check   fail if any shux crate in it disagrees
+#   scripts/sync-fuzz-lock.sh --check   fail if any shux crate in it disagrees, or a
+#                                       dependency the workspace added is missing
 #   LOCK=<path> scripts/sync-fuzz-lock.sh --check   check another lockfile
 set -euo pipefail
 
@@ -44,6 +45,12 @@ if [[ "$mode" == "--check" ]]; then
         echo "  fix: scripts/sync-fuzz-lock.sh" >&2
         exit 1
     fi
+    # A dependency added to a shux crate is missing until cargo resolves it.
+    if [[ "$LOCK" == fuzz/Cargo.lock ]] && ! cargo metadata --locked --offline --format-version 1 --manifest-path fuzz/Cargo.toml >/dev/null; then
+        echo "✗ $LOCK lacks a dependency the workspace now uses" >&2
+        echo "  fix: scripts/sync-fuzz-lock.sh" >&2
+        exit 1
+    fi
     echo "✓ $LOCK is at the workspace version $version ($(wc -l <<<"$found" | tr -d ' ') crates)"
     exit 0
 fi
@@ -54,4 +61,7 @@ awk -v want="$version" '/^name = "/ { name = $0 }
     { print }' "$LOCK" > "$tmp"
 cat "$tmp" > "$LOCK"
 rm -f "$tmp"
+if [[ "$LOCK" == fuzz/Cargo.lock ]]; then
+    cargo metadata --format-version 1 --manifest-path fuzz/Cargo.toml >/dev/null
+fi
 echo "Updated $LOCK to version $version"
