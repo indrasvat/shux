@@ -32,7 +32,7 @@ pub mod daemon_boot;
 pub mod dispatch;
 pub mod features;
 pub mod gate;
-pub(crate) mod kept_build;
+pub mod kept_build;
 pub mod lens_render;
 pub mod lens_scratch;
 pub mod onboarding;

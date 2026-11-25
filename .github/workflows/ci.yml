@@ -261,6 +261,33 @@ jobs:
       - name: Run integration regressions (12 deterministic scenarios)
         run: SHUX="$PWD/target/debug/shux" .shux/scripts/no_leak_guard.sh bash .shux/scripts/integration.sh
 
+  # A CLI of one build against a busy daemon of another, both ways (#318):
+  # this tree, the same tree built as an older release, and the two latest
+  # shipped releases. An update that strands running sessions fails here.
+  build-skew:
+    name: Build skew (ubuntu)
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec  # stable branch
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
+      - name: Install jq
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends jq
+      - name: Install the two latest releases
+        run: |
+          set -euo pipefail
+          prev=()
+          for tag in $(git tag --list 'v[0-9]*' --sort=-v:refname | head -n 2); do
+            sh install.sh --version "$tag" --dir "$RUNNER_TEMP/prev/$tag"
+            prev+=("$RUNNER_TEMP/prev/$tag/shux")
+          done
+          echo "PREV=${prev[*]}" >> "$GITHUB_ENV"
+      - name: Run the build-skew suite
+        run: make test-skew PREV="$PREV"
+
   # Combined macOS job: unit tests + doc tests + e2e smoke + integration
   # all on a single runner. macOS pricing is ~10x Linux; deduping setup
   # (checkout/toolchain install/cache restore) saves ~30% vs running

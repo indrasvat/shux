@@ -448,6 +448,22 @@ test-gui-terminal-selftest: release ## Prove the GUI-terminal rig can FAIL (kitt
 	@.shux/scripts/no_leak_guard.sh bash scripts/check-gui-terminal-selftest.sh
 	@echo "$(COLOR_GREEN)✓ GUI-terminal rig self-test passed$(COLOR_RESET)"
 
+SKEW_PEER_DIR := target/skew-peer
+
+.PHONY: build-skew-peer
+build-skew-peer: ## Build this tree as an older release (0.0.1, its own SHA): the other half of test-skew
+	@echo "$(COLOR_BLUE)▶ Building the skew peer (0.0.1, sha skewpeer)...$(COLOR_RESET)"
+	@SHUX_VERSION_OVERRIDE=0.0.1 SHUX_GIT_SHA_OVERRIDE=skewpeer CARGO_TARGET_DIR=$(SKEW_PEER_DIR) \
+		cargo build --release -p shux --bin shux
+	@echo "$(COLOR_GREEN)✓ Built $(SKEW_PEER_DIR)/release/shux$(COLOR_RESET)"
+
+.PHONY: test-skew
+test-skew: release build-skew-peer ## Real builds against each other, both ways (PREV="<shipped shux>..." adds releases)
+	@echo "$(COLOR_BLUE)▶ Running the build-skew suite...$(COLOR_RESET)"
+	@NEW=target/release/$(BINARY_NAME) PEER=$(SKEW_PEER_DIR)/release/shux PREV="$(PREV)" \
+		.shux/scripts/no_leak_guard.sh bash .shux/scripts/build_skew_check.sh
+	@echo "$(COLOR_GREEN)✓ Build-skew suite passed$(COLOR_RESET)"
+
 .PHONY: test-gui-terminal
 test-gui-terminal: test-gui-terminal-selftest ## Photograph shux in a real GUI terminal (kitty + Xvfb)
 	@echo "$(COLOR_BLUE)▶ Running the GUI-terminal rig...$(COLOR_RESET)"

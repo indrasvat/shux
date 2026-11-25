@@ -328,38 +328,43 @@ shux daemon stop                    # then stop the daemon itself
   the runtime dir is not in its argv, so that matches nothing and reports success while the
   daemon lives on.
 
-## After an upgrade: daemons of the old build
+## After an upgrade: keep working
 
-Upgrading replaces the binary, not the daemons already running. A CLI of the new build
-meets a daemon of the old one (another version or git SHA) and then:
+Upgrading replaces the binary, not the daemons already running. Keep using `shux`
+as before: a CLI of the new build **serves itself from the running daemon** of an
+older build. Your sessions, panes and agents are untouched, and nothing exits 10.
 
-- **It holds no sessions:** it is replaced by the new build, as if nothing had been
-  running. A daemon of this build or later retires itself, refusing any session created
-  meanwhile; an older one is counted, then stopped, so a session created in between is
-  lost (once, on the upgrade from such a build).
-- **It holds any session (scratch ones too), or cannot say, or no shux daemon process
-  serves the socket:** the command does **not** run and the daemon is left untouched.
-  It exits **10**, names both builds and the session count; under `--format json`
-  stdout is `{"error": {"code": -32015, "message", "data": {"kind": "daemon_in_use",
-  "exit_code": 10, "daemon_version", "daemon_git_sha", "client_version",
-  "client_git_sha", "sessions", "stoppable"}}}` (`sessions` is `null` when they could
-  not be counted, `daemon_version` when it did not say). Read-only commands,
-  `session attach` and `lens gate` (before writing any file) refuse the same way.
-  Match on `error.code`: `lens run --wait` also exits 10 when its program does.
-
-`shux version` never starts or stops anything and says which of the two applies, as of
-the moment it asked (`--format json` adds `daemon.sessions`, `--format plain` a sixth column). Ways forward, both deliberate:
+- **The daemon holds sessions:** every command runs against it. A call it cannot
+  serve (a method or parameter added since) fails alone, exit **11**, and says what
+  is missing; nothing of it ran. Under `--format json`: `{"error": {"code": -32016,
+  "data": {"kind": "daemon_too_old", "exit_code": 11, "method", "params",
+  "daemon_version", "client_version", "upgrade"}}}`. The next call still works.
+- **The daemon holds none:** the next command replaces it with the new build, as
+  before. An older CLI never replaces a newer daemon.
+- **To switch now or soon:** `shux daemon upgrade --when-idle` makes the daemon retire
+  the moment its last session ends (the status bar shows `↑ <version> at idle`);
+  `--force` ends its sessions now. Bare `daemon upgrade` swaps an idle daemon and
+  refuses (exit 1) while it holds sessions.
+- **The status bar** shows `↑ <version>` once a newer CLI has talked to the daemon.
+  `shux version --format json` says `daemon.compat` (`compatible`, `legacy_0_64`,
+  `legacy`, `wire_break`) and `daemon.upgrade_pending`.
 
 ```bash
-shux daemon stop          # ends those sessions; the next command starts the new build
-<old-shux> session list   # or keep working with the old build's CLI until its sessions are done
+shux pane run -s agent -p "$P" -c 'make test'   # works against the old daemon
+shux daemon upgrade --when-idle                 # switch builds when the work is done
 ```
 
-The refusal and `shux version` print the stop command for the socket and runtime dir in
-use (`XDG_RUNTIME_DIR=… shux --socket … daemon stop`); a bare `shux daemon stop` targets
-the default socket, which may be another daemon. While both builds are in use, give the
-old CLI its own `--socket` or runtime dir: a CLI from before this behaviour stops any
-daemon of another build it meets, the new build's included.
+Exit 10 (`daemon_in_use`, -32015) is left for daemons that cannot be served safely:
+a build from before 0.64 that holds sessions, one that did not say which build it is,
+and one of another wire generation with no copy of its build left. Its message names
+the `daemon stop` for that socket and runtime dir. A **0.64.0** daemon is served too,
+but only with calls it takes whole (it ignores keys it does not know), so a newer
+call fails with exit 11 before it is sent. A shipped CLI of 0.64 or earlier still
+refuses (exit 10) against a newer daemon: that is its own code.
+
+A daemon of another **wire generation** (a protocol change, rare) is never spoken to
+by the new CLI: the command is run, unchanged, by that daemon's own build, which
+each daemon keeps under its runtime dir. On a TTY one muted stderr line says so.
 
 ## Share a session with a person, read-only: `shux share`
 

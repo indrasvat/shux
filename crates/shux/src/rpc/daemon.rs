@@ -32,7 +32,13 @@ pub(crate) fn note_client(params: Option<&Value>) {
     let Some(seen) = crate::client::semver(version) else {
         return;
     };
-    if crate::client::semver(shux_rpc::VERSION).is_none_or(|ours| seen <= ours) {
+    // As this daemon says it is: clients compare against the same answer.
+    let answer = shux_rpc::server::version_answer();
+    let ours = answer
+        .get("version")
+        .and_then(|v| v.as_str())
+        .and_then(crate::client::semver);
+    if ours.is_none_or(|ours| seen <= ours) {
         return;
     }
     let mut newest = SUPERSEDED_BY.lock().unwrap_or_else(|e| e.into_inner());

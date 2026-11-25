@@ -652,6 +652,39 @@ mod tests {
         b
     }
 
+    /// The upgrade badge sheds words to fit, is dropped whole rather than
+    /// cut or squeezing anything out, and loses only its colour under
+    /// NO_COLOR.
+    #[test]
+    fn the_upgrade_badge_sheds_words_then_goes() {
+        let last = |b: &StatusBar| b.right.last().map(|s| s.text.clone());
+        let at = |cols, pending| {
+            let mut b = bar("session", "", "up 3m");
+            append_upgrade(&mut b, Some("0.65.0"), pending, &Theme::DEFAULT, cols);
+            b
+        };
+        assert_eq!(last(&at(80, true)).as_deref(), Some("↑ 0.65.0 at idle "));
+        assert_eq!(last(&at(80, false)).as_deref(), Some("↑ 0.65.0 "));
+        assert_eq!(last(&at(24, true)).as_deref(), Some("↑ 0.65.0 "));
+        assert_eq!(last(&at(16, true)).as_deref(), Some("↑ "));
+        let full = at(14, true);
+        assert_eq!(
+            last(&full).as_deref(),
+            Some("up 3m"),
+            "the badge pushed nothing out"
+        );
+        assert_eq!(full.left[0].text, "session");
+
+        let mut none = bar("session", "", "up 3m");
+        append_upgrade(&mut none, None, true, &Theme::DEFAULT, 80);
+        assert_eq!(none.right.len(), 1, "no newer build, no badge");
+
+        let mut plain = at(80, true);
+        monochrome(&mut plain);
+        let badge = plain.right.last().expect("badge");
+        assert_eq!((badge.text.as_str(), badge.fg), ("↑ 0.65.0 at idle ", None));
+    }
+
     #[test]
     fn waiting_leads_the_right_zone_when_it_fits() {
         let mut b = bar("left", "", "right");

@@ -33,18 +33,14 @@ pub fn run_daemon(socket_override: Option<PathBuf>) -> anyhow::Result<()> {
         None => daemon::socket_path()?,
     };
 
-    // Step 0: run from this build's own copy, so replacing or deleting the
-    // installed binary never touches this daemon or its helpers.
-    crate::kept_build::exec_from_kept_copy();
-
     // Step 1: Daemonize BEFORE tokio. The instance lock is held until this
     // function returns, which is after its socket and pidfile are removed.
     let Some(instance_lock) = daemon::daemonize(&sock_path)? else {
         return Ok(());
     };
     let instance_lock = Arc::new(instance_lock);
-    crate::kept_build::adopt();
-    crate::kept_build::write_build_file(&sock_path);
+    // Held before an install can replace the path (see `kept_build`).
+    crate::kept_build::open_image();
 
     // Step 2: Now we are the daemon process — create tokio runtime
     let rt = tokio::runtime::Runtime::new()?;
@@ -130,6 +126,10 @@ pub fn run_daemon(socket_override: Option<PathBuf>) -> anyhow::Result<()> {
             unresolved_scratch,
         )
         .await?;
+        {
+            let socket = sock_path.clone();
+            tokio::task::spawn_blocking(move || crate::kept_build::keep(&socket));
+        }
 
         // Run the daemon state loop (blocks until shutdown)
         shux_core::daemon::run_daemon_state_loop(cmd_rx, tokens.clone(), config_reload_notify)

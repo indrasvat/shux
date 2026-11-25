@@ -38,10 +38,12 @@ struct ConnectBudget {
     deadline: Duration,
 }
 
+/// A daemon binds a few hundred milliseconds after it is spawned; a probe
+/// that just misses it costs at most `max_backoff` more.
 const CONNECT_BUDGET: ConnectBudget = ConnectBudget {
-    retries: 10,
-    backoff: Duration::from_millis(50),
-    max_backoff: Duration::from_millis(2000),
+    retries: 20,
+    backoff: Duration::from_millis(25),
+    max_backoff: Duration::from_millis(100),
     deadline: Duration::from_secs(30),
 };
 
@@ -1292,6 +1294,31 @@ mod tests {
         assert!(
             DaemonTooOld::from_error(METHOD_NOT_FOUND, None).is_none(),
             "an unknown method from this very build is a bug, not skew"
+        );
+    }
+
+    /// A create refused by a daemon that retired as it arrived (nothing was
+    /// applied) is sent once more, to whatever serves the socket next.
+    #[tokio::test]
+    async fn a_call_a_retiring_daemon_refused_is_sent_to_its_successor() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("d.sock");
+        stub(&socket, |n, method| match (n, method) {
+            (_, "system.version") => Some(version(CLIENT_GIT_SHA)),
+            (1, "session.create") => Some(json!({ "error": {
+                "code": -32603, "message": "internal_error",
+                "data": { "kind": crate::rpc::convert::DAEMON_RETIRING },
+            } })),
+            (_, "session.create") => Some(json!({ "result": { "created_on": n } })),
+            _ => Some(sessions(0)),
+        });
+        let mut stream = ensure_daemon_running_at(&socket).await.unwrap();
+        let created = crate::cli::rpc::rpc_call(&mut stream, "session.create", json!({}))
+            .await
+            .expect("sent again");
+        assert!(
+            created["created_on"].as_u64().is_some_and(|n| n > 1),
+            "{created}"
         );
     }
 

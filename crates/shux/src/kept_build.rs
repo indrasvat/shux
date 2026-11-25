@@ -1,24 +1,25 @@
-//! A daemon runs from its own copy of the binary that started it.
+//! Each daemon keeps a file of its own build.
 //!
 //! An upgrade replaces or deletes the installed binary while daemons of the
-//! old build keep running. Each daemon therefore execs itself, before it
-//! daemonizes, from `<runtime dir>/builds/<build>/shux`: a hard link where the
-//! file system allows (Linux refuses to rewrite a running binary in place) and
-//! a copy otherwise (APFS clones it). Its own helpers (`__share_supervise`)
-//! then always run its own build, and a CLI that cannot speak to it (another
-//! wire generation) can hand a command to exactly that build.
+//! old build keep running: the running image survives, its path does not. A
+//! daemon therefore opens its binary as soon as it has daemonized and, once it
+//! serves, keeps those very bytes at `<runtime dir>/builds/<build>/shux`: a
+//! clone on macOS, a link to the same inode on Linux, a copy across file
+//! systems. Its own helpers (`__share_supervise`) run from it, so they are
+//! always its build, and a CLI that cannot speak to it (another wire
+//! generation) can hand a command to exactly that build.
+//!
+//! Never a link on macOS: a new link to a binary can make the system assess
+//! it again on its next exec, a cost the next `shux` command would pay.
 //!
 //! Each daemon holds a shared lock on its build's `lock` file while it runs;
-//! a build no daemon holds is removed by the next daemon to start.
+//! a build no daemon holds is removed by the next daemon to keep one.
 
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
-
-/// Set on the exec into the kept copy: the path it was exec'd as.
-const KEPT_ENV: &str = "SHUX_KEPT_EXE";
 
 /// Set on a command handed to the daemon's own build: that build's id. The
 /// command trusts that daemon as its own and never hands off again.
@@ -32,7 +33,10 @@ const UNUSED_GRACE: Duration = Duration::from_secs(10 * 60);
 /// that removes files nobody touched for days.
 pub(crate) const TOUCH_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 
-/// The copy this daemon runs from, once adopted.
+/// The binary this daemon runs, opened right after it daemonized.
+static IMAGE: OnceLock<Result<fs::File, String>> = OnceLock::new();
+
+/// This daemon's kept build.
 struct Kept {
     exe: PathBuf,
     dev: u64,
@@ -58,43 +62,37 @@ fn builds_dir() -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-/// In `__daemon`, first thing: exec this build from its kept copy, making it
-/// if needed. Returns when already running from it, or when no copy could be
-/// made or run, which is logged and advertised; the daemon then runs from
-/// the installed binary.
-pub(crate) fn exec_from_kept_copy() {
-    if let Some(kept) = std::env::var_os(KEPT_ENV) {
-        // SAFETY: called first thing in `__daemon`, before any thread exists.
-        unsafe { std::env::remove_var(KEPT_ENV) };
-        KEPT_PATH.get_or_init(|| PathBuf::from(kept));
-        return;
-    }
-    let target = match make_copy() {
-        Ok(target) => target,
-        Err(e) => {
-            let _ = KEPT.set(Err(e));
-            return;
-        }
-    };
-    use std::os::unix::process::CommandExt as _;
-    let err = std::process::Command::new(&target)
-        .args(std::env::args_os().skip(1))
-        .env(KEPT_ENV, &target)
-        .exec();
-    let _ = KEPT.set(Err(format!("exec {}: {err}", target.display())));
+/// Right after daemonizing: hold the binary this daemon runs, before an
+/// install can replace the path.
+pub(crate) fn open_image() {
+    let image = std::env::current_exe()
+        .and_then(fs::File::open)
+        .map_err(|e| format!("open this daemon's binary: {e}"));
+    let _ = IMAGE.set(image);
 }
 
-/// The path `exec_from_kept_copy` found itself exec'd as.
-static KEPT_PATH: OnceLock<PathBuf> = OnceLock::new();
-
-/// After daemonizing: lock the copy this daemon runs from, so no other daemon
-/// removes it, and remove the builds no daemon holds.
-pub(crate) fn adopt() {
-    let Some(exe) = KEPT_PATH.get().cloned() else {
-        return;
-    };
-    let adopted = (|| {
-        let dir = exe.parent().ok_or("kept copy has no directory")?;
+/// Once the daemon serves, off its request path: keep the binary it holds,
+/// lock it, remove the builds no daemon holds, and write the build file.
+pub(crate) fn keep(socket: &Path) {
+    let kept = (|| {
+        let image = IMAGE
+            .get()
+            .ok_or("the binary was never opened")?
+            .as_ref()
+            .map_err(Clone::clone)?;
+        let meta = image.metadata().map_err(|e| format!("binary: {e}"))?;
+        let builds = builds_dir()?;
+        let dir = builds.join(format!(
+            "{}-{}-{}-{}",
+            build_id(),
+            meta.dev(),
+            meta.ino(),
+            meta.len()
+        ));
+        let exe = dir.join("shux");
+        if !fs::metadata(&exe).is_ok_and(|m| m.is_file() && m.len() == meta.len()) {
+            publish(image, &builds, &dir)?;
+        }
         let lock = fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -103,103 +101,119 @@ pub(crate) fn adopt() {
             .open(dir.join("lock"))
             .map_err(|e| format!("lock: {e}"))?;
         lock.lock_shared().map_err(|e| format!("lock: {e}"))?;
-        let meta = fs::metadata(&exe).map_err(|e| format!("{}: {e}", exe.display()))?;
+        let kept = fs::metadata(&exe).map_err(|e| format!("{}: {e}", exe.display()))?;
         Ok::<_, String>(Kept {
-            dev: meta.dev(),
-            ino: meta.ino(),
-            exe: exe.clone(),
+            dev: kept.dev(),
+            ino: kept.ino(),
+            exe,
             _lock: lock,
         })
     })();
-    if let Err(e) = &adopted {
-        tracing::warn!(error = %e, "could not hold this daemon's kept build");
+    if let Err(e) = &kept {
+        tracing::warn!(error = %e, "could not keep this daemon's build");
     }
-    let _ = KEPT.set(adopted);
-    if let Ok(dir) = builds_dir() {
-        remove_unused(&dir, SystemTime::now());
+    let _ = KEPT.set(kept);
+    if let Ok(builds) = builds_dir() {
+        remove_unused(&builds, SystemTime::now());
+    }
+    write_build_file(socket);
+}
+
+/// Make `<dir>/shux` from `image`, published whole by one rename.
+fn publish(image: &fs::File, builds: &Path, dir: &Path) -> Result<(), String> {
+    let staging = builds.join(format!(".new-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&staging);
+    fs::create_dir(&staging).map_err(|e| format!("{}: {e}", staging.display()))?;
+    let placed = materialize(image, &staging.join("shux")).and_then(|()| fs::rename(&staging, dir));
+    match placed {
+        Ok(()) => Ok(()),
+        // Another daemon of this very binary published it first.
+        Err(_) if dir.join("shux").is_file() => {
+            let _ = fs::remove_dir_all(&staging);
+            Ok(())
+        }
+        Err(e) => {
+            let _ = fs::remove_dir_all(&staging);
+            Err(format!("keep the build at {}: {e}", dir.display()))
+        }
+    }
+}
+
+/// The bytes of `image` at `to`: a clone or a link where the system makes one
+/// from the open file, a copy otherwise.
+fn materialize(image: &fs::File, to: &Path) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    let fd = image.as_raw_fd();
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        let dst = std::ffi::CString::new(to.as_os_str().as_bytes())?;
+        // SAFETY: `fd` is open for the call's length, `dst` is a NUL-ended
+        // path that outlives it; the call only reads both.
+        if unsafe { nix::libc::fclonefileat(fd, nix::libc::AT_FDCWD, dst.as_ptr(), 0) } == 0 {
+            return Ok(());
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let proc_fd = format!("/proc/self/fd/{fd}");
+        let linked = nix::unistd::linkat(
+            nix::fcntl::AT_FDCWD,
+            proc_fd.as_str(),
+            nix::fcntl::AT_FDCWD,
+            to,
+            nix::fcntl::AtFlags::AT_SYMLINK_FOLLOW,
+        );
+        if linked.is_ok() {
+            return Ok(());
+        }
+    }
+    let mut src = image.try_clone()?;
+    std::io::Seek::rewind(&mut src)?;
+    let mut dst = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(to)?;
+    std::io::copy(&mut src, &mut dst)?;
+    dst.set_permissions(fs::Permissions::from_mode(0o755))?;
+    dst.sync_all()
+}
+
+/// The binary this daemon runs a helper of its own with: its kept build, so
+/// the helper is this build however the installed binary changed since.
+pub(crate) fn helper_exe() -> std::io::Result<PathBuf> {
+    match KEPT.get() {
+        Some(Ok(k)) => Ok(k.exe.clone()),
+        _ => std::env::current_exe(),
     }
 }
 
 /// What `system.version` and the daemon's build file say of its copy:
-/// `{exe, dev, ino}`, or `{error}` when it runs from the installed binary.
+/// `{exe, dev, ino}`, or `{error}` when it could not keep one.
 pub(crate) fn advertised() -> serde_json::Value {
     match KEPT.get() {
         Some(Ok(k)) => serde_json::json!({ "exe": k.exe, "dev": k.dev, "ino": k.ino }),
         Some(Err(e)) => serde_json::json!({ "exe": null, "error": e }),
-        None => serde_json::json!({ "exe": null, "error": "not started from a kept copy" }),
+        None => serde_json::json!({ "exe": null, "error": "not kept yet" }),
     }
 }
 
-/// Refresh the copy's times, so an age-based tmp cleaner leaves it alone.
+/// Refresh the kept build's times, so an age-based tmp cleaner leaves it
+/// alone. Access time only on the binary: on Linux it may be the installed
+/// file itself.
 pub(crate) fn touch() {
     if let Some(Ok(k)) = KEPT.get() {
-        for path in [k.exe.as_path(), k.exe.parent().unwrap_or(&k.exe)] {
-            if let Err(e) = touch_path(path) {
-                tracing::warn!(path = %path.display(), error = %e, "could not refresh kept build");
-            }
+        let now = SystemTime::now();
+        let dir = k.exe.parent().unwrap_or(&k.exe);
+        let everything = fs::FileTimes::new().set_accessed(now).set_modified(now);
+        let touched = fs::File::open(&k.exe)
+            .and_then(|f| f.set_times(fs::FileTimes::new().set_accessed(now)))
+            .and_then(|()| fs::File::open(dir)?.set_times(everything))
+            .and_then(|()| fs::File::open(dir.join("lock"))?.set_times(everything));
+        if let Err(e) = touched {
+            tracing::warn!(build = %dir.display(), error = %e, "could not refresh kept build");
         }
     }
-}
-
-fn touch_path(path: &Path) -> std::io::Result<()> {
-    let now = fs::FileTimes::new()
-        .set_accessed(SystemTime::now())
-        .set_modified(SystemTime::now());
-    fs::File::open(path)?.set_times(now)
-}
-
-/// `<builds>/<id>-<size>-<mtime>/shux` for the running binary, made if
-/// missing: two builds of one commit (a dirty tree) are told apart.
-fn make_copy() -> Result<PathBuf, String> {
-    let source = std::env::current_exe().map_err(|e| format!("current exe: {e}"))?;
-    let meta = fs::metadata(&source).map_err(|e| format!("{}: {e}", source.display()))?;
-    let stamp = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_nanos());
-    let builds = builds_dir()?;
-    let key = builds.join(format!("{}-{}-{stamp}", build_id(), meta.len()));
-    let target = key.join("shux");
-    if fs::metadata(&target).is_ok_and(|m| m.is_file() && m.len() == meta.len()) {
-        touch_path(&key).map_err(|e| format!("{}: {e}", key.display()))?;
-        return Ok(target);
-    }
-    let staging = builds.join(format!(".new-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&staging);
-    fs::create_dir(&staging).map_err(|e| format!("{}: {e}", staging.display()))?;
-    let staged = staging.join("shux");
-    let placed = place(&source, &staged).and_then(|()| {
-        fs::set_permissions(&staged, fs::Permissions::from_mode(0o755))?;
-        fs::rename(&staging, &key)
-    });
-    match placed {
-        Ok(()) => Ok(target),
-        // Another daemon of this build published it first.
-        Err(_) if fs::metadata(&target).is_ok_and(|m| m.len() == meta.len()) => {
-            let _ = fs::remove_dir_all(&staging);
-            Ok(target)
-        }
-        Err(e) => {
-            let _ = fs::remove_dir_all(&staging);
-            Err(format!(
-                "copy {} to {}: {e}",
-                source.display(),
-                key.display()
-            ))
-        }
-    }
-}
-
-/// A hard link where it is safe, a copy otherwise.
-fn place(source: &Path, staged: &Path) -> std::io::Result<()> {
-    // macOS lets a running binary be rewritten in place, which a link would
-    // see; `copy` clones it on APFS, at no cost.
-    if cfg!(target_os = "linux") && fs::hard_link(source, staged).is_ok() {
-        return Ok(());
-    }
-    fs::copy(source, staged)?;
-    fs::File::open(staged)?.sync_all()
 }
 
 /// Remove every build in `builds` that no daemon holds and nobody touched
@@ -243,8 +257,8 @@ pub(crate) fn build_file_for(socket: &Path) -> Result<PathBuf, crate::daemon::Da
     Ok(crate::daemon::pid_file_path_for(socket)?.with_extension("build.json"))
 }
 
-/// Write this daemon's build file. Called once it holds the instance lock.
-pub(crate) fn write_build_file(socket: &Path) {
+/// Write this daemon's build file.
+fn write_build_file(socket: &Path) {
     let written = (|| {
         let path = build_file_for(socket).map_err(|e| e.to_string())?;
         let mut answer = shux_rpc::server::version_answer();
@@ -260,7 +274,7 @@ pub(crate) fn write_build_file(socket: &Path) {
 }
 
 /// The build a command was handed to, when it was: see [`HANDOFF_ENV`].
-pub(crate) fn handed_to() -> Option<String> {
+pub fn handed_to() -> Option<String> {
     std::env::var(HANDOFF_ENV).ok().filter(|id| !id.is_empty())
 }
 
@@ -376,5 +390,22 @@ mod tests {
         drop(lock);
         remove_unused(root.path(), now);
         assert!(!held.exists(), "a released build outlived its daemon");
+    }
+
+    /// The kept build is the bytes of the open binary even after its path
+    /// is replaced: what a daemon keeps is what it runs.
+    #[test]
+    fn the_kept_build_is_the_open_binary_not_the_path() {
+        let root = tempfile::tempdir().unwrap();
+        let installed = root.path().join("shux");
+        fs::write(&installed, b"old build").unwrap();
+        let image = fs::File::open(&installed).unwrap();
+        // An install replaces the file, as `install` and package managers do.
+        fs::remove_file(&installed).unwrap();
+        fs::write(&installed, b"new build").unwrap();
+
+        let kept = root.path().join("kept");
+        materialize(&image, &kept).unwrap();
+        assert_eq!(fs::read(&kept).unwrap(), b"old build");
     }
 }
