@@ -44,6 +44,10 @@ const INBOUND_PER_SEC: u32 = 256;
 const WATCHING_EVERY: Duration = Duration::from_secs(1);
 /// The most an ended viewer's farewell may hold up its cutoff.
 const FAREWELL: Duration = Duration::from_millis(100);
+/// The most messages a farewell reads from the viewer before closing: a
+/// window's acks, with room to spare.
+const FAREWELL_READS: usize = 32;
+const _: () = assert!(FAREWELL_READS as u64 >= wire::WINDOW / wire::CHUNK as u64);
 /// How long an ended stream waits for its attach to finish, once its socket
 /// is closed.
 const ATTACH_JOIN: Duration = Duration::from_secs(2);
@@ -291,7 +295,18 @@ pub(super) async fn run(mut ws: WebSocket, gw: Gateway, admitted: Admitted, guar
         // taking bytes.
         let _ = tokio::time::timeout(FAREWELL, async {
             ws.send(Message::Text(text.into())).await?;
-            ws.send(Message::Close(Some(close))).await
+            ws.send(Message::Close(Some(close))).await?;
+            // Read what the viewer sent meanwhile, up to its own Close: a
+            // socket closed with input unread is reset, and the reset throws
+            // away the frames above before the viewer has read them. An
+            // honest viewer owes a window's acks at most; a flood is not read.
+            for _ in 0..FAREWELL_READS {
+                match ws.next().await {
+                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                    Some(Ok(_)) => {}
+                }
+            }
+            Ok::<(), axum::Error>(())
         })
         .await;
     }
