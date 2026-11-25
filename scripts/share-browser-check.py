@@ -325,7 +325,7 @@ async def run_browser(kind: str, browser, rig: Rig, env: dict, bin_: str, work: 
     for gone, want in ((revoked, "owner ended this link"), (expired, "has expired")):
         fresh = await browser.new_context(**PINNED)
         p = await open_link(fresh, gone["url"], violations)
-        await p.click("#watch")
+        # The first page asks before a use is spent, so it says why with no click.
         msg = await ended(p)
         check(want in msg, f"a fresh browser is told why: {want} ({msg!r})")
         await fresh.close()
@@ -336,6 +336,18 @@ async def run_browser(kind: str, browser, rig: Rig, env: dict, bin_: str, work: 
     await holds(p, "document.querySelector('#gate-when')?.textContent.includes('1m more')")
     msg = await ended(p)
     check("has expired" in msg, f"an open first page ends when its link does ({msg!r})")
+    await fresh.close()
+    # A phone asleep on the first page: its clock stops while the link ends.
+    # On waking, the server's answer ends the page, whatever its clock says.
+    asleep = rig.call(op="create", session=t_sess["id"], uses=1, ttl_ms=3000)
+    fresh = await browser.new_context(**PINNED)
+    p = await open_link(fresh, asleep["url"], violations)
+    await holds(p, "document.querySelector('#gate-when')?.textContent.includes('1m more')")
+    await p.evaluate("(() => { const t = performance.now(); performance.now = () => t; })()")
+    await asyncio.sleep(3.5)  # past the link's end, as the phone sleeps
+    await p.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
+    msg = await ended(p)
+    check("has expired" in msg, f"a first page woken after its link ended says so ({msg!r})")
     await fresh.close()
     shux(bin_, env, "session.kill", {"id": t_sess["id"]})
 

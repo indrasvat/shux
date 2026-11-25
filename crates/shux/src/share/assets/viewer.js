@@ -137,6 +137,11 @@ async function peek() {
       credentials: "same-origin",
       cache: "no-store",
     });
+    // Ended while this page slept: the server says so, whatever its clock says.
+    if (r.status === 410) {
+      const why = (await r.json().catch(() => ({}))).reason;
+      return end(FINAL[why] ?? "This link has already been used.");
+    }
     if (!r.ok) return;
     const { expires_in_ms: ms, uses_left: left } = await r.json();
     gateUses = left;
