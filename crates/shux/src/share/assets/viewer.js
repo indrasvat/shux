@@ -95,7 +95,8 @@ function showExpiry() {
   if (view.phase === "idle") {
     if (ms <= 0) return end(FINAL.expired);
     let text = `This link works for ${timeLeft(ms)} more, until ${when(expiresAt)}`;
-    if (gateUses != null) text += ` · ${gateUses} ${gateUses === 1 ? "use" : "uses"} left`;
+    // Non-breaking: "1 use left" never wraps in the middle.
+    if (gateUses != null) text += ` · ${gateUses} ${gateUses === 1 ? "use" : "uses"} left`;
     $("#gate-when").textContent = text;
     $("#gate-when").hidden = false;
     return;
