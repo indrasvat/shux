@@ -155,7 +155,8 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
     }
     let socket_path = args.socket_path();
 
-    // Decided before anything reads stdin or changes state.
+    // Decided before anything reads stdin or changes state. A command that
+    // never reaches a daemon is this build's, whatever runs.
     let local = matches!(
         args.command,
         Some(
@@ -164,6 +165,11 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
                 | Command::Config { .. }
                 | Command::Init { .. }
                 | Command::ShellIntegration { .. }
+                | Command::Plugin {
+                    command: cli::PluginCommand::Scaffold { .. }
+                        | cli::PluginCommand::Create { .. }
+                        | cli::PluginCommand::Init { .. },
+                }
         )
     );
     if !local {

@@ -314,6 +314,9 @@ pub fn lens_emit_error_and_exit(
     data: Option<serde_json::Value>,
     exit_code: i32,
 ) -> ! {
+    if let Some(too_old) = crate::client::DaemonTooOld::from_error(code, data.as_ref()) {
+        super::exit_daemon_too_old(&too_old, format);
+    }
     emit_error(format, verb, code, message, data);
     std::process::exit(exit_code);
 }

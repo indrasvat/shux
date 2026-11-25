@@ -210,6 +210,31 @@ async fn every_method_refuses_a_parameter_it_does_not_take() {
     }
 }
 
+/// A field inside `state.apply` ops that this build does not know is refused
+/// as `unknown_params` naming it, like a top-level key, at any depth.
+#[tokio::test]
+async fn an_unknown_op_field_is_refused_as_unknown_params() {
+    let router = daemon_router();
+    for (op, field) in [
+        (
+            serde_json::json!({"op": "create_session", "cwd": "/tmp", "zz_new": 1}),
+            "ops.zz_new",
+        ),
+        (
+            serde_json::json!({"op": "create_window", "session": {"ref_op": 0, "zz_ref": 1}, "title": "t"}),
+            "ops.zz_ref",
+        ),
+    ] {
+        let call = router.dispatch("state.apply", Some(serde_json::json!({ "ops": [op] })));
+        let err = shux_rpc::with_transport(shux_rpc::Transport::Uds, call)
+            .await
+            .expect_err("refused");
+        let data = err.data.unwrap_or_default();
+        assert_eq!(data["kind"], shux_rpc::UNKNOWN_PARAMS, "{data}");
+        assert_eq!(data["params"], serde_json::json!([field]), "{data}");
+    }
+}
+
 /// The table names only methods the daemon serves: a stale entry would be
 /// published as a capability the daemon does not have.
 #[tokio::test]
@@ -234,7 +259,7 @@ fn no_method_or_parameter_of_an_earlier_release_is_gone() {
     );
     let now: std::collections::HashMap<&str, &[&str]> =
         super::accepts::ACCEPTS.iter().copied().collect();
-    for (method, keys) in super::accepts::LEGACY_0_64 {
+    for (method, keys) in super::legacy_0_64::LEGACY_0_64 {
         let served = now
             .get(method)
             .unwrap_or_else(|| panic!("{method} was removed"));

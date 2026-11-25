@@ -3,7 +3,7 @@
 //! The router maintains a HashMap of method names to handler trait objects.
 //! New methods are registered via `router.register("method.name", handler)`.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -109,8 +109,14 @@ impl Router {
         }
         match self.methods.get(method) {
             Some(handler) => {
+                let mut params = params;
                 if let Some(accepted) = self.accepts.get(method) {
                     check_params(method, accepted, params.as_ref())?;
+                    // An unknown key set to `null` asks for nothing: gone, so
+                    // a handler that parses strictly sees an absent key.
+                    if let Some(Value::Object(object)) = params.as_mut() {
+                        object.retain(|k, v| accepted.contains(&k.as_str()) || !v.is_null());
+                    }
                 }
                 debug!(method, "dispatching RPC method");
                 handler.handle(params).await
@@ -136,19 +142,6 @@ impl Router {
     /// plugin permission enforcer; direct CLI clients ignore this.
     pub fn policy(&self, method: &str) -> Option<&Policy> {
         self.policies.get(method)
-    }
-
-    /// Every method's accepted top-level parameters, sorted: the same
-    /// declarations dispatch enforces.
-    pub fn capabilities(&self) -> BTreeMap<&str, Vec<&'static str>> {
-        self.methods
-            .keys()
-            .map(|m| {
-                let mut keys = self.accepts.get(m).map(|a| a.to_vec()).unwrap_or_default();
-                keys.sort_unstable();
-                (m.as_str(), keys)
-            })
-            .collect()
     }
 
     /// Panic on boot if any registered method has no declared parameters.
@@ -432,6 +425,26 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.data.unwrap()["kind"], "params_not_object");
         assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
+    /// An unknown key set to `null` never reaches the handler: one that
+    /// parses strictly itself sees exactly what an absent key gives it.
+    #[tokio::test]
+    async fn an_unknown_null_key_is_removed_before_the_handler() {
+        let router = Router::builder()
+            .register("m.echo", |p: Option<Value>| async move {
+                Ok(p.unwrap_or(Value::Null))
+            })
+            .accepts(&[("m.echo", &["a", "b"])])
+            .build();
+        let seen = router
+            .dispatch(
+                "m.echo",
+                Some(serde_json::json!({"a": 1, "b": null, "zz": null})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(seen, serde_json::json!({"a": 1, "b": null}));
     }
 
     #[test]

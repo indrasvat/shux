@@ -42,8 +42,8 @@ pub(crate) fn graph_error_to_rpc(e: shux_core::graph::GraphError) -> shux_rpc::R
             expected,
             actual,
         } => shux_rpc::RpcError::version_conflict(resource, id, expected, actual),
-        GraphError::Shutdown => shux_rpc::RpcError::internal(&e.to_string()),
-        GraphError::Retired => shux_rpc::RpcError::with_data(
+        // The graph loop is gone: the daemon is leaving and changed nothing.
+        GraphError::Shutdown | GraphError::Retired => shux_rpc::RpcError::with_data(
             shux_rpc::ErrorCode::InternalError,
             serde_json::json!({ "kind": DAEMON_RETIRING, "detail": e.to_string() }),
         ),

@@ -90,6 +90,11 @@ fn report_failed(
     format: OutputFormat,
     created: Option<&serde_json::Value>,
 ) -> i32 {
+    if let RpcClientError::Rpc { code, data, .. } = err
+        && let Some(too_old) = crate::client::DaemonTooOld::from_error(*code, data.as_ref())
+    {
+        super::exit_daemon_too_old(&too_old, format);
+    }
     let (code, message, mut data, exit) = match err {
         RpcClientError::Rpc {
             code,

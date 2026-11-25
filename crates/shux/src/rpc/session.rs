@@ -494,6 +494,8 @@ pub(crate) fn register_session_methods(
                         .map_err(graph_error_to_rpc)?
                     {
                         Ok(()) => {
+                            let _ =
+                                tokio::task::spawn_blocking(crate::kept_build::mark_retiring).await;
                             cancel.cancel();
                             Ok(serde_json::json!({ "retired": true, "sessions": 0 }))
                         }

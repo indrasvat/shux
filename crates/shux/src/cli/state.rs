@@ -97,6 +97,11 @@ pub async fn handle_apply(
     let params = serde_json::json!({ "ops": ops });
     let result = match rpc_call(stream, "state.apply", params).await {
         Ok(v) => v,
+        Err(RpcClientError::Rpc { code, data, .. })
+            if let Some(too_old) = crate::client::DaemonTooOld::from_error(code, data.as_ref()) =>
+        {
+            super::exit_daemon_too_old(&too_old, format)
+        }
         Err(RpcClientError::Rpc {
             code,
             message,

@@ -161,19 +161,45 @@ pub async fn rpc_call(
             data: Some(data),
         });
     }
-    match call_once(stream, method, &params).await {
-        Err(RpcClientError::Rpc { data: Some(d), .. })
-            if d.get("kind").and_then(|k| k.as_str())
-                == Some(crate::rpc::convert::DAEMON_RETIRING)
-                && let Some(socket) = crate::client::last_socket() =>
-        {
-            *stream = crate::client::ensure_daemon_running_at(&socket)
-                .await
-                .map_err(RpcClientError::Reconnect)?;
-            call_once(stream, method, &params).await
+    let answer = call_once(stream, method, &params).await;
+    let Some((socket, pid)) = crate::client::last_daemon() else {
+        return answer;
+    };
+    let again = match &answer {
+        Err(RpcClientError::Rpc { data: Some(d), .. }) => {
+            d.get("kind").and_then(|k| k.as_str()) == Some(crate::rpc::convert::DAEMON_RETIRING)
         }
-        answer => answer,
+        // Dropped by a daemon that retired (it took no new session, and held
+        // none): nothing of this call can survive to be done twice. A watch
+        // or a wait was for that daemon, and ends with it.
+        Err(RpcClientError::Io(e))
+            if connection_lost(e) && !method.contains("watch") && !method.contains("wait") =>
+        {
+            match pid {
+                Some(pid) => {
+                    crate::client::daemon_left(pid, &socket).await
+                        && crate::kept_build::retired(&socket, pid)
+                }
+                None => false,
+            }
+        }
+        _ => false,
+    };
+    if !again {
+        return answer;
     }
+    *stream = crate::client::ensure_daemon_running_at(&socket)
+        .await
+        .map_err(RpcClientError::Reconnect)?;
+    call_once(stream, method, &params).await
+}
+
+fn connection_lost(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::*;
+    matches!(
+        e.kind(),
+        BrokenPipe | UnexpectedEof | ConnectionReset | ConnectionAborted
+    )
 }
 
 async fn call_once(

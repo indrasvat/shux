@@ -357,11 +357,12 @@ pub fn append_upgrade(
     let Some(version) = newer else {
         return;
     };
+    // A leading gap: the zone's last segment may end flush (a clock).
     let mut ladder = Vec::new();
     if pending {
-        ladder.push(format!("↑ {version} at idle "));
+        ladder.push(format!(" ↑ {version} at idle "));
     }
-    ladder.extend([format!("↑ {version} "), "↑ ".to_string()]);
+    ladder.extend([format!(" ↑ {version} "), " ↑ ".to_string()]);
     let Rgb { r, g, b } = theme.status_accent;
     let width = StatusBar::segments_width;
     let (lw, cw, rw) = (width(&bar.left), width(&bar.center), width(&bar.right));
@@ -663,11 +664,11 @@ mod tests {
             append_upgrade(&mut b, Some("0.65.0"), pending, &Theme::DEFAULT, cols);
             b
         };
-        assert_eq!(last(&at(80, true)).as_deref(), Some("↑ 0.65.0 at idle "));
-        assert_eq!(last(&at(80, false)).as_deref(), Some("↑ 0.65.0 "));
-        assert_eq!(last(&at(24, true)).as_deref(), Some("↑ 0.65.0 "));
-        assert_eq!(last(&at(16, true)).as_deref(), Some("↑ "));
-        let full = at(14, true);
+        assert_eq!(last(&at(80, true)).as_deref(), Some(" ↑ 0.65.0 at idle "));
+        assert_eq!(last(&at(80, false)).as_deref(), Some(" ↑ 0.65.0 "));
+        assert_eq!(last(&at(24, true)).as_deref(), Some(" ↑ 0.65.0 "));
+        assert_eq!(last(&at(17, true)).as_deref(), Some(" ↑ "));
+        let full = at(15, true);
         assert_eq!(
             last(&full).as_deref(),
             Some("up 3m"),
@@ -682,7 +683,10 @@ mod tests {
         let mut plain = at(80, true);
         monochrome(&mut plain);
         let badge = plain.right.last().expect("badge");
-        assert_eq!((badge.text.as_str(), badge.fg), ("↑ 0.65.0 at idle ", None));
+        assert_eq!(
+            (badge.text.as_str(), badge.fg),
+            (" ↑ 0.65.0 at idle ", None)
+        );
     }
 
     #[test]

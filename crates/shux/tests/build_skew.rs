@@ -146,12 +146,27 @@ impl Harness {
     /// starts serving).
     #[track_caller]
     fn build_file(&self) -> serde_json::Value {
+        let file = self.build_file_raw();
+        assert!(file["build"]["exe"].is_string(), "no build kept: {file}");
+        file
+    }
+
+    /// The daemon's build file once written, whether or not it kept a build.
+    #[track_caller]
+    fn build_file_raw(&self) -> serde_json::Value {
         let path = self.pid_dir().join("shux.build.json");
-        shux_testkit::wait_for("the daemon to keep its build", || {
-            let file: serde_json::Value =
-                serde_json::from_str(&std::fs::read_to_string(&path).ok()?).ok()?;
-            file["build"]["exe"].is_string().then_some(file)
+        shux_testkit::wait_for("the daemon's build file", || {
+            serde_json::from_str(&std::fs::read_to_string(&path).ok()?).ok()
         })
+    }
+
+    /// A private runtime dir as the daemon makes it, before any daemon runs.
+    fn make_runtime_dir(&self) -> PathBuf {
+        let dir = self.pid_dir();
+        std::fs::create_dir_all(&dir).expect("runtime dir");
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .expect("chmod runtime dir");
+        dir
     }
 }
 
@@ -290,15 +305,22 @@ fn every_common_command_runs_against_a_busy_daemon_of_another_build() {
     assert!(alive(daemon));
 }
 
-/// A call the older daemon cannot serve fails alone, as `daemon_too_old`,
-/// exit 11, naming what it lacks and the way forward; the next call works.
-/// From this very build the same errors are reported as they are.
+/// A call the older daemon cannot serve (a method or key this build has and
+/// it lacks) fails alone, as `daemon_too_old`, exit 11, naming what it lacks
+/// and the way forward; the next call works. A name this build does not know
+/// either is a mistake, reported as it is, against any build.
 #[test]
 fn a_call_the_daemon_cannot_serve_fails_alone_and_says_why() {
     let h = Harness::new();
-    let pane = h.occupied_by(SIBLING);
+    let pane = h.occupied_by(V0_64);
 
-    let missing = h.run(&["rpc", "call", "pane.teleport", "--params", "{}"]);
+    let missing = h.run(&[
+        "rpc",
+        "call",
+        shux_rpc::UPGRADE,
+        "--params",
+        r#"{"when":"idle"}"#,
+    ]);
     assert_eq!(
         missing.status.code(),
         Some(DAEMON_TOO_OLD),
@@ -309,37 +331,35 @@ fn a_call_the_daemon_cannot_serve_fails_alone_and_says_why() {
     for want in [
         "needs a newer shux daemon",
         OTHER_SHA,
-        "pane.teleport",
+        shux_rpc::UPGRADE,
         "daemon upgrade --when-idle",
     ] {
         assert!(said.contains(want), "lacks {want:?}: {said}");
     }
-
-    let params = serde_json::json!({ "pane_id": pane, "zz_new_option": true }).to_string();
-    let (code, refused) = h.json(&["rpc", "call", "pane.capture", "--params", &params]);
-    assert_eq!(code, Some(DAEMON_TOO_OLD), "{refused}");
-    assert_eq!(
-        refused["error"]["data"]["kind"], "unknown_params",
-        "{refused}"
-    );
-    assert_eq!(
-        refused["error"]["data"]["params"],
-        serde_json::json!(["zz_new_option"])
-    );
-
     ok(
         &h.run(&["pane", "capture", "-s", "agent", "-p", &pane]),
         "the next call",
     );
 
-    let same = Harness::new();
-    ok(&same.run(&["session", "list"]), "start this build's daemon");
-    let raw = same.run(&["rpc", "call", "pane.teleport", "--params", "{}"]);
-    assert_eq!(
-        raw.status.code(),
-        Some(2),
-        "a same-build miss is a plain error"
-    );
+    for build in [V0_64, SIBLING] {
+        let h = Harness::new();
+        let pane = h.occupied_by(build);
+        let typo = h.run(&["rpc", "call", "pane.teleport", "--params", "{}"]);
+        assert_eq!(
+            typo.status.code(),
+            Some(2),
+            "an unknown method: {}",
+            text(&typo.stderr)
+        );
+        let params = serde_json::json!({ "pane_id": pane, "Pane_id": "x" }).to_string();
+        let (code, refused) = h.json(&["rpc", "call", "pane.capture", "--params", &params]);
+        assert_eq!(code, Some(2), "a misspelt key: {refused}");
+        assert_eq!(
+            refused["error"]["data"]["params"],
+            serde_json::json!(["Pane_id"]),
+            "{refused}"
+        );
+    }
 }
 
 /// An idle daemon of an older release is replaced; a newer release is never
@@ -503,6 +523,110 @@ fn a_create_racing_a_pending_upgrade_lands_on_the_successor() {
         listed.contains("late") && !listed.contains("agent"),
         "{listed}"
     );
+}
+
+/// Commands racing the moment a pending upgrade retires the daemon, from
+/// other processes, all succeed: on the old daemon before it retires, or
+/// once on its successor. Repeated, because the window is narrow.
+#[test]
+fn every_command_racing_the_retirement_succeeds() {
+    for round in 0..20 {
+        let h = Harness::new();
+        h.occupied_by(OLDER);
+        assert_eq!(h.json(&["daemon", "upgrade", "--when-idle"]).0, Some(0));
+        let spawn = |args: &[&str]| {
+            h.shux()
+                .args(args)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn")
+        };
+        let killer = spawn(&["session", "kill", "agent"]);
+        let racers: Vec<_> = (0..4)
+            .map(|i| match i % 2 {
+                0 => spawn(&["session", "list"]),
+                _ => spawn(&[
+                    "session",
+                    "create",
+                    &format!("late{i}"),
+                    "-d",
+                    "--",
+                    "/bin/sh",
+                ]),
+            })
+            .collect();
+        let killed = killer.wait_with_output().expect("kill");
+        assert!(
+            killed.status.success(),
+            "round {round}: kill: {}",
+            text(&killed.stderr)
+        );
+        for racer in racers {
+            ok(
+                &racer.wait_with_output().expect("racer"),
+                &format!("round {round}: racing the retirement"),
+            );
+        }
+        let after = ok(&h.run(&["session", "list"]), "list");
+        assert!(
+            after.contains("late1") && after.contains("late3"),
+            "round {round}: {after}"
+        );
+    }
+}
+
+/// `daemon upgrade` against another wire generation is asked through the
+/// daemon's own build, and does what it says: pending until the last
+/// session ends, never "already this build".
+#[test]
+fn upgrading_another_wire_generation_really_upgrades() {
+    let h = Harness::new();
+    h.occupied_by(Build {
+        version: "0.0.1",
+        wire: "2",
+    });
+    h.build_file();
+    let (code, r) = h.json(&["daemon", "upgrade", "--when-idle"]);
+    assert_eq!((code, &r["outcome"]), (Some(0), &"pending".into()), "{r}");
+    let old = h.daemon_pid();
+    ok(
+        &h.run(&["session", "kill", "agent"]),
+        "end the last session",
+    );
+    shux_testkit::wait_until("the old generation to retire", || !alive(old));
+    ok(&h.run(&["session", "list"]), "the next command");
+    assert_eq!(h.version()["mismatch"], false);
+}
+
+/// `--force` ends a daemon even when it does not answer.
+#[test]
+fn force_ends_a_daemon_that_does_not_answer() {
+    let h = Harness::new();
+    h.occupied_by(OLDER);
+    let pid = h.daemon_pid();
+    kill(Pid::from_raw(pid), nix::sys::signal::Signal::SIGSTOP).expect("stop it");
+    let out = h.run(&["daemon", "upgrade", "--force"]);
+    let _ = kill(Pid::from_raw(pid), nix::sys::signal::Signal::SIGCONT);
+    ok(&out, "force against a stopped daemon");
+    shux_testkit::wait_until("the forced daemon to exit", || !alive(pid));
+}
+
+/// A call refused for skew is `daemon_too_old` under `--format json` too, on
+/// paths that print their own errors.
+#[test]
+fn a_refused_apply_is_daemon_too_old_under_json() {
+    let h = Harness::new();
+    h.occupied_by(V0_64);
+    let spec = h.runtime.path().join("t.toml");
+    std::fs::write(
+        &spec,
+        "[session]\nname = \"tpl\"\n[[windows]]\ntitle = \"w\"\n[[windows.panes]]\ncommand = [\"/bin/sh\"]\n",
+    )
+    .expect("template");
+    let (code, r) = h.json(&["state", "apply", spec.to_str().expect("utf-8")]);
+    assert_eq!(code, Some(DAEMON_TOO_OLD), "{r}");
+    assert_eq!(r["error"]["data"]["kind"], "daemon_too_old", "{r}");
 }
 
 /// 0.64.0 ignores keys it does not know: a call it would not serve as asked
@@ -674,6 +798,100 @@ fn a_kept_build_that_is_not_the_recorded_file_is_never_run() {
         text(&listed.stderr)
     );
     assert!(!marker.exists(), "ran a file the daemon never recorded");
+}
+
+/// A `builds` that is a symlink is never followed: nothing behind it is
+/// swept, and no build is kept through it.
+#[test]
+fn a_symlinked_builds_dir_is_refused_not_swept() {
+    let h = Harness::new();
+    let victim = tempfile::tempdir().expect("victim");
+    let precious = victim.path().join("precious");
+    std::fs::create_dir(&precious).expect("dir");
+    std::fs::write(precious.join("notes"), b"keep").expect("file");
+    std::fs::File::open(&precious)
+        .expect("open")
+        .set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))
+        .expect("age it");
+    std::os::unix::fs::symlink(victim.path(), h.make_runtime_dir().join("builds")).expect("plant");
+    ok(
+        &h.run(&["session", "create", "a", "-d", "--", "/bin/sh"]),
+        "start",
+    );
+    let file = h.build_file_raw();
+    assert!(precious.join("notes").exists(), "swept through the symlink");
+    assert!(
+        file["build"]["exe"].is_null(),
+        "kept a build through it: {file}"
+    );
+    assert!(file["build"]["error"].is_string(), "{file}");
+}
+
+/// A file planted where the daemon keeps its build, of the right length, is
+/// never taken for it: the daemon keeps its own bytes, and a hand-off never
+/// runs the plant.
+#[test]
+fn a_planted_build_is_never_taken_for_the_daemons() {
+    let h = Harness::new();
+    let install = tempfile::tempdir().expect("install dir");
+    let installed = install.path().join("shux");
+    std::fs::copy(&h.bin, &installed).expect("install");
+    let start = |build: Option<Build>| {
+        let mut cmd = h.shux_at(&installed);
+        if let Some(b) = build {
+            cmd.env("SHUX_TEST_DAEMON_GIT_SHA", OTHER_SHA)
+                .env("SHUX_TEST_DAEMON_VERSION", b.version)
+                .env("SHUX_TEST_DAEMON_WIRE", b.wire);
+        }
+        ok(
+            &cmd.args(["session", "create", "agent", "-d", "--", "/bin/sh"])
+                .output()
+                .expect("run"),
+            "start",
+        );
+    };
+    start(None);
+    let kept = PathBuf::from(h.build_file()["build"]["exe"].as_str().expect("exe"));
+    ok(&h.run(&["daemon", "stop"]), "stop");
+
+    let marker = h.runtime.path().join("ran");
+    std::fs::remove_file(&kept).expect("remove");
+    std::fs::write(&kept, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).expect("plant");
+    let len = std::fs::metadata(&installed).expect("len").len();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&kept)
+        .expect("open")
+        .set_len(len)
+        .expect("pad");
+    std::fs::set_permissions(&kept, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .expect("chmod");
+
+    let _ = std::fs::remove_file(h.pid_dir().join("shux.build.json"));
+    start(Some(NEXT_WIRE));
+    let file = h.build_file();
+    let _ = h.run(&["session", "list"]);
+    assert!(!marker.exists(), "ran the planted file");
+    let now_kept = PathBuf::from(file["build"]["exe"].as_str().expect("exe"));
+    assert_eq!(
+        std::fs::read(&now_kept).expect("kept"),
+        std::fs::read(&installed).expect("installed"),
+        "the kept build is not the daemon's bytes"
+    );
+}
+
+/// `shux version` says where the daemon's build is kept, or why it is not.
+#[test]
+fn version_says_why_no_build_was_kept() {
+    let h = Harness::new();
+    std::fs::write(h.make_runtime_dir().join("builds"), b"not a dir").expect("plant");
+    ok(
+        &h.run(&["session", "create", "a", "-d", "--", "/bin/sh"]),
+        "start",
+    );
+    h.build_file_raw();
+    let v = h.version();
+    assert!(v["daemon"]["build"]["error"].is_string(), "{v}");
 }
 
 /// One request on `conn`; `{"gone": ...}` when it is closed.

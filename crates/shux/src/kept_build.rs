@@ -16,7 +16,7 @@
 //! a build no daemon holds is removed by the next daemon to keep one.
 
 use std::fs;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
@@ -52,20 +52,46 @@ pub(crate) fn build_id() -> String {
     format!("{}-{}", shux_rpc::VERSION, shux_rpc::GIT_SHA)
 }
 
+/// `<runtime dir>/builds`, made if missing: a real directory of this user
+/// that only this user can write, never followed through a link.
 fn builds_dir() -> Result<PathBuf, String> {
     let dir = crate::daemon::ensure_runtime_dir()
         .map_err(|e| format!("runtime dir: {e}"))?
         .join("builds");
-    fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
-        .map_err(|e| format!("{}: {e}", dir.display()))?;
+    match fs::create_dir(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(format!("{}: {e}", dir.display())),
+    }
+    private_dir(&dir)?;
     Ok(dir)
 }
 
+/// `dir` is a directory, not a link, of this user, writable by nobody else.
+fn private_dir(dir: &Path) -> Result<(), String> {
+    let meta = fs::symlink_metadata(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    if !meta.is_dir() || meta.uid() != nix::unistd::getuid().as_raw() {
+        return Err(format!(
+            "{} is not a directory of this user (a link, a file, or another owner's)",
+            dir.display()
+        ));
+    }
+    if meta.mode() & 0o077 != 0 {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    Ok(())
+}
+
 /// Right after daemonizing: hold the binary this daemon runs, before an
-/// install can replace the path.
+/// install can replace the path. On Linux the running image itself.
 pub(crate) fn open_image() {
-    let image = std::env::current_exe()
+    let exe = if cfg!(target_os = "linux") {
+        Ok(PathBuf::from("/proc/self/exe"))
+    } else {
+        std::env::current_exe()
+    };
+    let image = exe
         .and_then(fs::File::open)
         .map_err(|e| format!("open this daemon's binary: {e}"));
     let _ = IMAGE.set(image);
@@ -90,24 +116,27 @@ pub(crate) fn keep(socket: &Path) {
             meta.len()
         ));
         let exe = dir.join("shux");
-        if !fs::metadata(&exe).is_ok_and(|m| m.is_file() && m.len() == meta.len()) {
-            publish(image, &builds, &dir)?;
+        // Locked before it is judged, so a sweep cannot remove it after.
+        for _ in 0..3 {
+            if fs::symlink_metadata(&dir).is_err() {
+                publish(image, &builds, &dir)?;
+            }
+            let lock = held_lock(&dir)?;
+            if private_dir(&dir).is_ok() && same_bytes(image, &exe) {
+                let kept =
+                    fs::symlink_metadata(&exe).map_err(|e| format!("{}: {e}", exe.display()))?;
+                return Ok(Kept {
+                    dev: kept.dev(),
+                    ino: kept.ino(),
+                    exe,
+                    _lock: lock,
+                });
+            }
+            // Not this binary's bytes (a plant, a crash mid-copy): replaced.
+            drop(lock);
+            let _ = fs::remove_dir_all(&dir);
         }
-        let lock = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(dir.join("lock"))
-            .map_err(|e| format!("lock: {e}"))?;
-        lock.lock_shared().map_err(|e| format!("lock: {e}"))?;
-        let kept = fs::metadata(&exe).map_err(|e| format!("{}: {e}", exe.display()))?;
-        Ok::<_, String>(Kept {
-            dev: kept.dev(),
-            ino: kept.ino(),
-            exe,
-            _lock: lock,
-        })
+        Err(format!("could not keep the build at {}", dir.display()))
     })();
     if let Err(e) = &kept {
         tracing::warn!(error = %e, "could not keep this daemon's build");
@@ -117,6 +146,65 @@ pub(crate) fn keep(socket: &Path) {
         remove_unused(&builds, SystemTime::now());
     }
     write_build_file(socket);
+}
+
+/// A shared lock on `<dir>/lock` that is still the dir's own: a sweep that
+/// took the dir away before the lock landed is seen, not trusted.
+fn held_lock(dir: &Path) -> Result<fs::File, String> {
+    let path = dir.join("lock");
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(&path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    lock.lock_shared().map_err(|e| format!("lock: {e}"))?;
+    let held = lock.metadata().map_err(|e| format!("lock: {e}"))?;
+    let named = fs::symlink_metadata(&path).map_err(|e| format!("lock: {e}"))?;
+    if (held.dev(), held.ino()) != (named.dev(), named.ino()) {
+        return Err(format!("{} was swept as it was locked", dir.display()));
+    }
+    Ok(lock)
+}
+
+/// Whether `exe` is a regular file of this user holding exactly `image`'s
+/// bytes: the same inode, or the same contents.
+fn same_bytes(image: &fs::File, exe: &Path) -> bool {
+    let (Ok(want), Ok(have)) = (image.metadata(), fs::symlink_metadata(exe)) else {
+        return false;
+    };
+    if !have.is_file() || have.uid() != nix::unistd::getuid().as_raw() || have.mode() & 0o022 != 0 {
+        return false;
+    }
+    if (want.dev(), want.ino()) == (have.dev(), have.ino()) {
+        return true;
+    }
+    if want.len() != have.len() {
+        return false;
+    }
+    same_contents(image, exe, want.len()).unwrap_or(false)
+}
+
+/// Whether the `len` bytes of `image` and of `exe` are equal.
+fn same_contents(image: &fs::File, exe: &Path, len: u64) -> std::io::Result<bool> {
+    use std::io::{Read as _, Seek as _};
+    let mut a = image.try_clone()?;
+    a.rewind()?;
+    let mut b = fs::File::open(exe)?;
+    let (mut x, mut y) = (vec![0u8; 1 << 16], vec![0u8; 1 << 16]);
+    let mut left = len;
+    while left > 0 {
+        let n = usize::try_from(left.min(x.len() as u64)).unwrap_or(x.len());
+        a.read_exact(&mut x[..n])?;
+        b.read_exact(&mut y[..n])?;
+        if x[..n] != y[..n] {
+            return Ok(false);
+        }
+        left -= n as u64;
+    }
+    Ok(true)
 }
 
 /// Make `<dir>/shux` from `image`, published whole by one rename.
@@ -224,8 +312,15 @@ pub(crate) fn remove_unused(builds: &Path, now: SystemTime) {
     };
     for entry in entries.flatten() {
         let dir = entry.path();
-        let fresh = fs::metadata(&dir)
-            .and_then(|m| m.modified())
+        // Never followed: only a real directory of this user is swept.
+        let Ok(meta) = fs::symlink_metadata(&dir) else {
+            continue;
+        };
+        if !meta.is_dir() || meta.uid() != nix::unistd::getuid().as_raw() {
+            continue;
+        }
+        let fresh = meta
+            .modified()
             .is_ok_and(|t| now.duration_since(t).unwrap_or_default() < UNUSED_GRACE);
         if fresh {
             continue;
@@ -235,17 +330,24 @@ pub(crate) fn remove_unused(builds: &Path, now: SystemTime) {
             .write(true)
             .create(true)
             .truncate(false)
+            .custom_flags(nix::libc::O_NOFOLLOW)
             .open(dir.join("lock"));
         let unused = match &lock {
             Ok(file) => file.try_lock().is_ok(),
-            // A staging dir with no lock file yet, or not a dir at all.
+            // A staging dir that cannot hold a lock file: a crash's leftover.
             Err(_) => true,
         };
-        if unused {
-            match fs::remove_dir_all(&dir) {
-                Ok(()) => tracing::info!(build = %dir.display(), "removed an unused kept build"),
-                Err(e) => tracing::warn!(build = %dir.display(), error = %e, "could not remove"),
-            }
+        if !unused {
+            continue;
+        }
+        // Moved aside while still locked, so a daemon that locks it next sees
+        // its lock is no longer the dir's (`held_lock`) and makes its own.
+        let tomb = builds.join(format!(".dead-{}-{}", std::process::id(), meta.ino()));
+        let removed = fs::rename(&dir, &tomb).and_then(|()| fs::remove_dir_all(&tomb));
+        drop(lock);
+        match removed {
+            Ok(()) => tracing::info!(build = %dir.display(), "removed an unused kept build"),
+            Err(e) => tracing::warn!(build = %dir.display(), error = %e, "could not remove"),
         }
     }
 }
@@ -257,12 +359,39 @@ pub(crate) fn build_file_for(socket: &Path) -> Result<PathBuf, crate::daemon::Da
     Ok(crate::daemon::pid_file_path_for(socket)?.with_extension("build.json"))
 }
 
+/// The socket this daemon serves, once it keeps its build.
+static SOCKET: OnceLock<PathBuf> = OnceLock::new();
+
+/// Set once the daemon retires: its build file then outlives it, saying so.
+static RETIRING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The daemon retires: say so in its build file, which it then leaves behind,
+/// so a client whose call it dropped knows nothing of that call survives.
+pub(crate) fn mark_retiring() {
+    RETIRING.store(true, std::sync::atomic::Ordering::SeqCst);
+    if let Some(socket) = SOCKET.get() {
+        write_build_file(socket);
+    }
+}
+
+/// Whether daemon `pid`, now gone, retired from `socket`, as its build file
+/// says. A daemon that was stopped or crashed did not.
+pub(crate) fn retired(socket: &Path, pid: u32) -> bool {
+    let read = || {
+        let text = fs::read_to_string(build_file_for(socket).ok()?).ok()?;
+        serde_json::from_str::<serde_json::Value>(&text).ok()
+    };
+    read().is_some_and(|f| f["pid"] == pid && f["retiring"] == true)
+}
+
 /// Write this daemon's build file.
 fn write_build_file(socket: &Path) {
+    let _ = SOCKET.set(socket.to_path_buf());
     let written = (|| {
         let path = build_file_for(socket).map_err(|e| e.to_string())?;
         let mut answer = shux_rpc::server::version_answer();
         answer["pid"] = std::process::id().into();
+        answer["retiring"] = RETIRING.load(std::sync::atomic::Ordering::SeqCst).into();
         answer["build"] = advertised();
         let tmp = path.with_extension("build.json.tmp");
         fs::write(&tmp, answer.to_string()).map_err(|e| e.to_string())?;
@@ -330,6 +459,15 @@ fn handoff_target(socket: &Path) -> Option<(PathBuf, String)> {
     );
     let build = file.get("build")?;
     let exe = PathBuf::from(build.get("exe")?.as_str()?);
+    // In this runtime dir's own `builds`, through directories only this
+    // user can write.
+    let key_dir = exe.parent()?;
+    let builds = key_dir.parent()?;
+    let expected = crate::daemon::runtime_dir().ok()?.join("builds");
+    if builds != expected || private_dir(builds).is_err() || private_dir(key_dir).is_err() {
+        tracing::warn!(exe = %exe.display(), "the daemon's kept build is not in a private builds dir");
+        return None;
+    }
     let meta = fs::symlink_metadata(&exe).ok()?;
     let ours = meta.is_file()
         && meta.uid() == nix::unistd::getuid().as_raw()
@@ -343,8 +481,11 @@ fn handoff_target(socket: &Path) -> Option<(PathBuf, String)> {
     Some((exe, id))
 }
 
-/// Remove this daemon's build file as it leaves.
+/// Remove this daemon's build file as it leaves, unless it retired.
 pub(crate) fn remove_build_file(socket: &Path) {
+    if RETIRING.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
     if let Ok(path) = build_file_for(socket) {
         let _ = fs::remove_file(path);
     }

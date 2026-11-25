@@ -47,7 +47,9 @@ pub(crate) fn note_client(params: Option<&Value>) {
         .and_then(crate::client::semver)
         .is_none_or(|was| seen > was);
     if newer {
-        *newest = Some(version.to_string());
+        // Only the numbers: what any caller sends is not shown verbatim.
+        let (major, minor, patch) = seen;
+        *newest = Some(format!("{major}.{minor}.{patch}"));
     }
 }
 
@@ -116,6 +118,8 @@ pub(crate) fn register_daemon_methods(
                         .map_err(graph_error_to_rpc)?;
                     Ok(match outcome {
                         Ok(()) => {
+                            let _ =
+                                tokio::task::spawn_blocking(crate::kept_build::mark_retiring).await;
                             cancel.cancel();
                             json!({ "retired": true, "pending": false, "sessions": 0 })
                         }
@@ -145,6 +149,7 @@ pub(crate) async fn retire_when_idle(
                 // A lagged subscription is still a wake: the graph decides.
                 if graph.snapshot().retired {
                     tracing::info!("last session ended with an upgrade pending; retiring");
+                    let _ = tokio::task::spawn_blocking(crate::kept_build::mark_retiring).await;
                     cancel.cancel();
                     return;
                 }

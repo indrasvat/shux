@@ -128,9 +128,10 @@ pub fn is_build_refusal(err: &anyhow::Error) -> bool {
         || crate::client::DaemonTooOld::find(err).is_some()
 }
 
-/// `shux daemon upgrade`: replace the daemon serving `socket` with this build.
-/// Exits 0 when it is done or will be done unasked, 1 when it was refused (the
-/// daemon holds sessions, or is a newer release). Never starts a daemon.
+/// `shux daemon upgrade`: replace the daemon serving `socket` with the
+/// installed build. Exits 0 when it is done or will be done unasked, 1 when it
+/// was refused (the daemon holds sessions, or is a newer release), 3 when the
+/// daemon could not be asked. Never starts a daemon.
 pub async fn handle_daemon_upgrade(
     socket: &std::path::Path,
     when_idle: bool,
@@ -138,140 +139,145 @@ pub async fn handle_daemon_upgrade(
     format: OutputFormat,
 ) -> anyhow::Result<()> {
     use crate::client::{Compat, DaemonAnswer};
-    // A daemon of another wire generation is asked by its own build.
-    if !force {
-        crate::kept_build::hand_off(socket);
+    // A command handed to the daemon's own build names no build of its own.
+    let this = match crate::kept_build::handed_to() {
+        Some(_) => "the installed shux".to_string(),
+        None => format!("shux {} ({})", shux_rpc::VERSION, shux_rpc::GIT_SHA),
+    };
+    let starts = format!("the next shux command starts {this}");
+    let mut report = Report {
+        format,
+        daemon: None,
+        sessions: None,
+    };
+    if force {
+        // Asked nothing first: a daemon that does not answer is ended too.
+        let Some(pid) = crate::daemon_boot::our_live_daemon(socket) else {
+            return report.say(0, "absent", "no shux daemon is running", &starts);
+        };
+        // A stopped process takes no SIGTERM until it runs again.
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGCONT,
+        );
+        if !crate::daemon_boot::stop_and_wait(pid, socket) {
+            return report.say(3, "not_stopped", &crate::daemon_boot::not_gone(pid), "");
+        }
+        return report.say(
+            0,
+            "stopped",
+            "stopped the daemon, ending its sessions",
+            &starts,
+        );
     }
-    let this = format!("shux {} ({})", shux_rpc::VERSION, shux_rpc::GIT_SHA);
+    // A daemon of another wire generation is asked by its own build.
+    crate::kept_build::hand_off(socket);
     let (answer, held) = crate::client::ask_daemon_version(socket).await;
+    report.sessions = held;
     let dv = match answer {
         DaemonAnswer::Absent => {
-            return upgrade_outcome(
-                format,
-                "absent",
-                None,
-                held,
-                "no daemon is running",
-                &format!("the next shux command starts {this}"),
+            return report.say(0, "absent", "no daemon is running", &starts);
+        }
+        DaemonAnswer::Answered(dv) => dv,
+        DaemonAnswer::Unreadable => {
+            return report.say(
+                3,
+                "unreadable",
+                "the daemon serving this socket did not say which build it is",
+                "`daemon upgrade --force` stops it",
             );
         }
-        DaemonAnswer::Answered(dv) => Some(dv),
-        DaemonAnswer::Unreadable if force => None,
-        DaemonAnswer::Unreadable => anyhow::bail!(
-            "the daemon serving this socket did not say which build it is; `daemon upgrade \
-             --force` stops it"
-        ),
-        DaemonAnswer::Unresponsive => anyhow::bail!(
-            "the daemon did not answer within {:?}; retry, or `daemon upgrade --force`",
-            crate::patience::peer_patience()
-        ),
-        DaemonAnswer::Unreachable(e) => anyhow::bail!("could not reach the daemon: {e}"),
+        DaemonAnswer::Unresponsive => {
+            let headline = format!(
+                "the daemon did not answer within {:?}",
+                crate::patience::peer_patience()
+            );
+            return report.say(
+                3,
+                "unresponsive",
+                &headline,
+                "retry, or `daemon upgrade --force`",
+            );
+        }
+        DaemonAnswer::Unreachable(e) => {
+            return report.say(
+                3,
+                "unreachable",
+                &format!("could not reach the daemon: {e}"),
+                "",
+            );
+        }
     };
-    if let Some(dv) = dv.as_ref().filter(|dv| dv.is_current()) {
-        return upgrade_outcome(
-            format,
+    report.daemon = Some(dv.clone());
+    if dv.is_current() && crate::kept_build::handed_to().is_none() {
+        return report.say(
+            0,
             "current",
-            Some(dv),
-            held,
             "the daemon is already this build",
             "nothing to do",
         );
     }
-    if force {
-        let Some(pid) = crate::daemon_boot::our_live_daemon(socket) else {
-            anyhow::bail!("no shux daemon process serves this socket; stop whatever does");
-        };
-        if !crate::daemon_boot::stop_and_wait(pid, socket) {
-            anyhow::bail!(crate::daemon_boot::not_gone(pid));
-        }
-        return upgrade_outcome(
-            format,
-            "stopped",
-            dv.as_ref(),
-            held,
-            "stopped the daemon, ending its sessions",
-            &format!("the next shux command starts {this}"),
-        );
-    }
-    let Some(dv) = dv else {
-        anyhow::bail!("the daemon did not say which build it is");
-    };
     let sessions = crate::client::holding(held);
     if dv.is_newer_than_this_cli() {
-        return upgrade_refused(
-            format,
+        return report.say(
+            1,
             "newer",
-            &dv,
-            held,
             "the daemon is a newer release than this CLI",
-            &format!(
-                "left as it is; `--force` ends its sessions and the next command starts this older {this}"
-            ),
+            &format!("left as it is; `--force` ends its sessions and {starts}"),
         );
     }
     match dv.compat() {
         Compat::Same | Compat::Wire => {
             let mut stream = crate::client::try_connect(socket).await?;
-            let when = if when_idle { "idle" } else { "now" };
-            let params = serde_json::json!({
-                "when": when,
-                "client": { "version": shux_rpc::VERSION, "git_sha": shux_rpc::GIT_SHA },
-            });
+            let mut params = crate::client::client_build();
+            params["when"] = if when_idle { "idle" } else { "now" }.into();
             let r = rpc_call(&mut stream, shux_rpc::UPGRADE, params).await?;
             let flag = |k: &str| r.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
             if flag("retired") {
-                upgrade_outcome(
-                    format,
-                    "retired",
-                    Some(&dv),
-                    held,
-                    "the daemon held no sessions and is retiring",
-                    &format!("the next shux command starts {this}"),
-                )
+                report.say(0, "retired", "the daemon held no sessions and is retiring", &starts)
             } else if flag("pending") {
-                upgrade_outcome(
-                    format,
+                report.say(
+                    0,
                     "pending",
-                    Some(&dv),
-                    held,
                     &format!("the daemon retires when its last session ends ({sessions})"),
                     &format!("the first shux command after that starts {this}"),
                 )
             } else {
-                upgrade_refused(
-                    format,
+                report.say(
+                    1,
                     "busy",
-                    &dv,
-                    held,
                     &format!("the daemon is in use: {sessions}"),
                     "left running; `--when-idle` swaps it when its last session ends, `--force` ends them now",
                 )
             }
         }
-        Compat::Legacy064 | Compat::Legacy if when_idle || held == Some(0) => upgrade_outcome(
-            format,
+        Compat::Legacy064 | Compat::Legacy if held == Some(0) => report.say(
+            0,
             "automatic",
-            Some(&dv),
-            held,
-            &format!(
-                "shux {} predates deferred upgrades, and is replaced on its own",
-                dv.version
-            ),
+            "the daemon holds no sessions",
+            &format!("{starts}, replacing it"),
+        ),
+        Compat::Legacy064 | Compat::Legacy if when_idle => report.say(
+            0,
+            "automatic",
+            &format!("shux {} predates deferred upgrades, and is replaced on its own", dv.version),
             &format!("the first shux command after its last session ends starts {this}"),
         ),
-        Compat::Legacy064 | Compat::Legacy => upgrade_refused(
-            format,
+        Compat::Legacy064 | Compat::Legacy => report.say(
+            1,
             "busy",
-            &dv,
-            held,
             &format!("the daemon is in use: {sessions}"),
             "left running; it is replaced by the first shux command after its last session ends, or `--force` ends them now",
         ),
-        Compat::WireBreak => anyhow::bail!(
-            "the daemon is shux {} ({}), which speaks another protocol, and no copy of its build \
-             is left to ask it; `daemon upgrade --force` ends its sessions",
-            dv.version,
-            dv.git_sha
+        Compat::WireBreak => report.say(
+            3,
+            "wire_break",
+            &format!(
+                "the daemon is shux {} ({}), which speaks another protocol, and no copy of its \
+                 build is left to ask it",
+                dv.version, dv.git_sha
+            ),
+            "`daemon upgrade --force` ends its sessions",
         ),
     }
 }
@@ -336,67 +342,49 @@ fn version_next(
     }
 }
 
-fn upgrade_outcome(
+/// What `daemon upgrade` says, as one line or one JSON document.
+struct Report {
     format: OutputFormat,
-    outcome: &str,
-    daemon: Option<&crate::client::DaemonVersion>,
+    daemon: Option<crate::client::DaemonVersion>,
     sessions: Option<usize>,
-    headline: &str,
-    next: &str,
-) -> anyhow::Result<()> {
-    print_upgrade(format, true, outcome, daemon, sessions, headline, next)
 }
 
-fn upgrade_refused(
-    format: OutputFormat,
-    outcome: &str,
-    daemon: &crate::client::DaemonVersion,
-    sessions: Option<usize>,
-    headline: &str,
-    next: &str,
-) -> anyhow::Result<()> {
-    print_upgrade(
-        format,
-        false,
-        outcome,
-        Some(daemon),
-        sessions,
-        headline,
-        next,
-    )?;
-    std::process::exit(1)
-}
-
-fn print_upgrade(
-    format: OutputFormat,
-    done: bool,
-    outcome: &str,
-    daemon: Option<&crate::client::DaemonVersion>,
-    sessions: Option<usize>,
-    headline: &str,
-    next: &str,
-) -> anyhow::Result<()> {
-    match format {
-        OutputFormat::Json => {
-            let doc = serde_json::json!({
-                "outcome": outcome,
-                "done": done,
-                "daemon_version": daemon.map(|d| &d.version),
-                "daemon_git_sha": daemon.map(|d| &d.git_sha),
-                "client_version": shux_rpc::VERSION,
-                "client_git_sha": shux_rpc::GIT_SHA,
-                "sessions": sessions,
-                "detail": format!("{headline}; {next}"),
-            });
-            println!(
-                "{}",
-                crate::style::json_safe(&serde_json::to_string_pretty(&doc)?)
-            );
+impl Report {
+    /// Print the outcome, and exit `code` when it is not 0.
+    fn say(&self, code: i32, outcome: &str, headline: &str, next: &str) -> anyhow::Result<()> {
+        let daemon = self.daemon.as_ref();
+        let detail = match next {
+            "" => headline.to_string(),
+            next => format!("{headline}; {next}"),
+        };
+        match self.format {
+            OutputFormat::Json => {
+                let doc = serde_json::json!({
+                    "outcome": outcome,
+                    "done": code == 0,
+                    "exit_code": code,
+                    "daemon_version": daemon.map(|d| &d.version),
+                    "daemon_git_sha": daemon.map(|d| &d.git_sha),
+                    "client_version": shux_rpc::VERSION,
+                    "client_git_sha": shux_rpc::GIT_SHA,
+                    "sessions": self.sessions,
+                    "detail": detail,
+                });
+                println!(
+                    "{}",
+                    crate::style::json_safe(&serde_json::to_string_pretty(&doc)?)
+                );
+            }
+            OutputFormat::Plain => println!("{outcome}\t{headline}\t{next}"),
+            OutputFormat::Text => crate::style::print_upgrade(code == 0, headline, next)?,
         }
-        OutputFormat::Plain => println!("{outcome}\t{headline}\t{next}"),
-        OutputFormat::Text => crate::style::print_upgrade(done, headline, next)?,
+        if code != 0 {
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+            std::process::exit(code);
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 /// Handle the `shux version` command: this CLI's build, and the daemon's
@@ -451,6 +439,7 @@ pub async fn handle_version(
                     "compat": compat_name(dv.compat()),
                     "upgrade_pending": dv.answer.get("upgrade_pending"),
                     "superseded_by": dv.answer.get("superseded_by"),
+                    "build": dv.answer.get("build"),
                     "methods": dv.answer.get("capabilities").and_then(|c| c.as_object()).map(|c| c.len()),
                 }),
                 Some(Err((status, error))) => serde_json::json!({

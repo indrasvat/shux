@@ -27,8 +27,8 @@ use crate::model::{PaneId, SessionId, WindowId};
 ///
 /// Back-references let templates express "create a window in the session I
 /// just created" without two round-trips. Resolved during validation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged, deny_unknown_fields)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
 pub enum SessionRef {
     /// Absolute SessionId.
     Id(SessionId),
@@ -39,14 +39,56 @@ pub enum SessionRef {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged, deny_unknown_fields)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
 pub enum PaneRef {
     Id(PaneId),
     BackRef {
         #[serde(rename = "ref_op")]
         op_index: usize,
     },
+}
+
+/// `{"ref_op": n}` and nothing else.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackRef {
+    ref_op: usize,
+}
+
+/// An id, or a back-reference whose unknown field is named in the error:
+/// derived `untagged` would only say no variant matched.
+fn id_or_back_ref<'de, D, T>(d: D) -> Result<Result<T, usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    use serde::de::Error as _;
+    let v = serde_json::Value::deserialize(d)?;
+    if v.is_object() {
+        return serde_json::from_value::<BackRef>(v)
+            .map(|b| Err(b.ref_op))
+            .map_err(D::Error::custom);
+    }
+    serde_json::from_value(v).map(Ok).map_err(D::Error::custom)
+}
+
+impl<'de> Deserialize<'de> for SessionRef {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(match id_or_back_ref(d)? {
+            Ok(id) => Self::Id(id),
+            Err(op_index) => Self::BackRef { op_index },
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for PaneRef {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(match id_or_back_ref(d)? {
+            Ok(id) => Self::Id(id),
+            Err(op_index) => Self::BackRef { op_index },
+        })
+    }
 }
 
 /// A single operation in a batch. Each op is validated against the staging
@@ -197,7 +239,8 @@ mod tests {
         nested["session"]["zz_new"] = 1.into();
         for op in [extra, nested] {
             let parsed = serde_json::from_value::<Op>(op.clone());
-            assert!(parsed.is_err(), "accepted {op}: {parsed:?}");
+            let err = parsed.expect_err(&format!("accepted {op}"));
+            assert!(err.to_string().contains("unknown field `zz_new`"), "{err}");
         }
     }
 }

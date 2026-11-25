@@ -16,6 +16,7 @@ pub(crate) mod client;
 pub(crate) mod convert;
 pub(crate) mod daemon;
 pub(crate) mod events;
+pub(crate) mod legacy_0_64;
 pub(crate) mod pane;
 pub(crate) mod pane_io;
 pub(crate) mod params;
