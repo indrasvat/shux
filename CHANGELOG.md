@@ -1,3 +1,10 @@
+# [0.64.0](https://github.com/indrasvat/shux/compare/v0.63.0...v0.64.0) (2026-11-25)
+
+
+### Features
+
+* **share:** say how long a link has left, and when, in the reader's zone ([#320](https://github.com/indrasvat/shux/issues/320)) ([6d14102](https://github.com/indrasvat/shux/commit/6d14102ad30d87ecbbd6659c7df3a9449752bbb0)), closes [#319](https://github.com/indrasvat/shux/issues/319)
+
 # [0.63.0](https://github.com/indrasvat/shux/compare/v0.62.0...v0.63.0) (2026-11-25)
 
 
