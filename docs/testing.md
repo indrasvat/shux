@@ -177,9 +177,7 @@ a changed helper, module or fixture, run 5 times (`FLAKE_HELPER_COUNT`). An
 edited test keeps 20 when its file falls back to a coarser selection, and when
 nextest cannot name it (the selection it widens to runs 20). The 5-run tier
 catches a flake failing one run in two 97% of the time, one in five 67%, one in
-twenty 23%; on the record, 8 of the gate's 12 catches would have been caught in
-it, and the 4 it misses first failed at runs 9, 18, 18 and 19, all in tests
-already on main. "Changed" is an integration-test
+twenty 23% (what that costs on the record: `docs/agents/test-selection.md`). "Changed" is an integration-test
 file, a shared helper under `tests/<dir>/` (every binary that declares it, by
 `mod` or `#[path]`), a hunk reaching a src file's `cfg(test)` code, a
 test-only src file (its module's tests; for a helper with none, the tests of

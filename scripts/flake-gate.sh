@@ -210,15 +210,18 @@ fn_select() {
     done <"$tmp/new.spans"
     # The tests this diff adds or edits run FLAKE_COUNT times, even when the
     # file falls back to a coarser term below.
-    local -a edited=()
     for name in "${!reached[@]}" "${!gone[@]}"; do
-        if [[ -n "${present[$name]+set}" ]]; then edited+=("binary_id(=$bin) & test(=$prefix$name)"); fi
-    done
-    for name in "${!declared[@]}"; do edited+=("binary_id(=$bin) & test(/^$prefix$name::/)"); done
-    for t in ${edited[@]+"${edited[@]}"}; do
+        [[ -n "${present[$name]+set}" ]] || continue
+        t="binary_id(=$bin) & test(=$prefix$name)"
         terms+=("$t")
         direct[$t]=1
-        if [[ "$t" == *"& test(/^"* ]]; then may_be_empty[$t]=1; else coarse_of[$t]="$coarse"; fi
+        coarse_of[$t]="$coarse"
+    done
+    for name in "${!declared[@]}"; do
+        t="binary_id(=$bin) & test(/^$prefix$name::/)"
+        terms+=("$t")
+        direct[$t]=1
+        may_be_empty[$t]=1
     done
     # A test whose old lines all went, and that the new side lacks, is deleted
     # (a rename's new name is reached on its own). One the new side lacks but
@@ -396,8 +399,6 @@ if ((n == 0)); then
     echo "flake-gate: the changed files hold no tests; nothing to gate"
     exit 0
 fi
-# Two tiers: the tests the diff adds or edits, FLAKE_COUNT runs; the tests it
-# reaches only through a changed helper, module or fixture, FLAKE_HELPER_COUNT.
 edited_terms=()
 for t in "${terms[@]}"; do
     if [[ -n "${direct[$t]+set}" ]]; then edited_terms+=("$t"); fi

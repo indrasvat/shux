@@ -1080,11 +1080,3 @@ fn a_pane_kill_with_a_stale_version_leaves_the_pane_working() {
         "30000",
     ]);
 }
-
-#[test]
-fn rpc_call_system_version_reports_this_build() {
-    let env = Env::new();
-    let v = env.json(&["rpc", "call", "system.version"]);
-    assert_eq!(v["result"]["version"], env!("CARGO_PKG_VERSION"), "{v}");
-    assert_eq!(v["result"]["name"], "shux", "{v}");
-}

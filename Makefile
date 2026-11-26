@@ -748,7 +748,6 @@ test-lens-scratch-reap: nextest-ready ## Run the P5 scratch reap signal-order te
 test-lens-gate: nextest-ready ## Run the lens-gate GREEN dogfood suite (task 078; capture on real shux TUIs + cross-path PNG) serially under the leak guard
 	$(call lens_run,Running lens-gate dogfood suite (task 078),--test lens_gate_capture)
 
-
 .PHONY: test-lens-gate-comparator
 test-lens-gate-comparator: nextest-ready ## Run the task-079 comparator suite (parity corpus + divergence fixtures + OSC-4 daemon isolation) serially under the leak guard
 	$(call lens_run,Running lens-gate comparator suite (task 079),--test lens_gate_parity --test lens_gate_divergence --test diff_palette_isolation)

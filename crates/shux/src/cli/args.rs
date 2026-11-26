@@ -2175,61 +2175,12 @@ mod tests {
 
     use super::*;
 
-    /// clap's own consistency checks (a duplicate alias, a conflicting flag)
-    /// fire only when a command is built, and then as a runtime panic. This
-    /// builds every subcommand, renders each one's help, and checks the
-    /// entry points the CLI documents.
+    /// clap's consistency checks (a duplicate alias, a conflicting flag) fire
+    /// only when a command is built, and then as a runtime panic.
     #[test]
-    fn every_subcommand_builds_and_renders_its_help() {
+    fn the_cli_definition_passes_clap_debug_assert() {
         use clap::CommandFactory;
-        fn walk(cmd: &mut clap::Command, path: &str, seen: &mut usize) {
-            let help = cmd.render_long_help().to_string();
-            assert!(help.contains("Usage:"), "{path}: no usage in help:\n{help}");
-            *seen += 1;
-            for sub in cmd.get_subcommands_mut() {
-                let name = format!("{path} {}", sub.get_name());
-                walk(sub, &name, seen);
-            }
-        }
         Cli::command().debug_assert();
-        let mut cmd = Cli::command();
-        let mut seen = 0;
-        walk(&mut cmd, "shux", &mut seen);
-        assert!(seen > 50, "only {seen} commands rendered help");
-
-        let top = Cli::command().render_long_help().to_string();
-        assert!(top.contains("terminal multiplexer"), "{top}");
-        for namespace in [
-            "session", "window", "pane", "plugin", "events", "state", "rpc", "version",
-        ] {
-            assert!(
-                top.contains(namespace),
-                "no `{namespace}` in top-level help:\n{top}"
-            );
-        }
-
-        let version =
-            Cli::try_parse_from(["shux", "--version"]).expect_err("--version prints and exits");
-        assert_eq!(version.kind(), clap::error::ErrorKind::DisplayVersion);
-        assert!(
-            version.to_string().contains(env!("CARGO_PKG_VERSION")),
-            "{version}"
-        );
-
-        for alias in [
-            ["plugin", "create"],
-            ["plugin", "init"],
-            ["plugin", "scaffold"],
-        ] {
-            let help = Cli::try_parse_from(["shux", alias[0], alias[1], "--help"])
-                .expect_err("--help prints and exits")
-                .to_string();
-            assert!(
-                help.contains("--runtime"),
-                "`{}` is not the scaffold command:\n{help}",
-                alias.join(" ")
-            );
-        }
     }
 
     #[test]

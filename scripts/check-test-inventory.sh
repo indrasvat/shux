@@ -70,7 +70,6 @@ if [[ "${COMPARE_ONLY}" -eq 1 ]]; then
   fi
   BASE_LIST="$1" CURRENT_LIST="$2" BASE_SHA="$3"
 else
-# The listing half, unindented: it was the whole script before `--compare`.
 
 BASE_REF="${1:-${BASE_REF:-origin/main}}"
 
@@ -292,8 +291,9 @@ trailers() {
 # test, `<binary-id> <leaf> <reason>`, or `<binary-id> * <reason>` for a binary
 # that lists no tests at all any more. A trailer never licenses a test it does
 # not name, and a reason is required.
-retire_rules="$(trailers TEST-RETIRE | awk 'NF >= 3 { print $1 "\t" $2 }' | sort -u)"
-bad_retire="$(trailers TEST-RETIRE | awk 'NF < 3' || true)"
+retire_trailers="$(trailers TEST-RETIRE)"
+retire_rules="$(awk 'NF >= 3 { print $1 "\t" $2 }' <<<"${retire_trailers}" | sort -u)"
+bad_retire="$(awk 'NF > 0 && NF < 3' <<<"${retire_trailers}")"
 if [[ -n "${bad_retire}" ]]; then
   echo "" >&2
   echo "error: a TEST-RETIRE: trailer needs <binary-id> <test|*> <reason>:" >&2
@@ -315,7 +315,7 @@ if [[ -n "${retire_rules}" ]]; then
   fi
   retired="$(awk -F'\t' 'FILENAME == ARGV[1] { ok[$1 "\t" $2] = 1; next }
     (($1 "\t" $2) in ok) || (($1 "\t*") in ok)' <(printf '%s\n' "${retire_rules}") \
-    <(printf '%s\n' "${removed}" | sed '/^$/d') || true)"
+    <(printf '%s\n' "${removed}" | sed '/^$/d'))"
   if [[ -n "${retired}" ]]; then
     echo ""
     echo "  retired (TEST-RETIRE:):"
@@ -386,16 +386,7 @@ fi
 if [[ -n "${removed}" ]]; then
   # Every removal is matched by an addition elsewhere. Demand the trailer.
   moved_ok=0
-  if git rev-parse --verify --quiet "${BASE_SHA}" >/dev/null; then
-    for sha in $(git rev-list "${BASE_SHA}..HEAD"); do
-      if git log -1 --format='%B' "${sha}" \
-        | git interpret-trailers --parse 2>/dev/null \
-        | grep -qE '^TEST-MOVE: [^[:space:]].*'; then
-        moved_ok=1
-        break
-      fi
-    done
-  fi
+  if grep -qE '^[^[:space:]]' <<<"$(trailers TEST-MOVE)"; then moved_ok=1; fi
 
   echo ""
   echo "  moved to another crate (leaf name still runs):"

@@ -131,10 +131,9 @@ Colour-probed `printf`/`cat` is the letter, not the spirit.
   test does, then add it only if it runs production code (never a copy of a handler
   or helper), was seen red for that defect (a fix: the unfixed tree; a feature: the
   behaviour broken, or a surviving `cargo mutants` mutant killed), sits at the
-  cheapest layer that can see the defect, and repeats no existing assertion. No
-  `--help`-only, exit-status-only, file-exists or does-not-panic tests, no loops for
-  confidence, nothing written to raise coverage. A deletion names each test in a
-  `TEST-RETIRE:` trailer. The table per kind of change: `docs/testing.md#adding-a-test`.
+  cheapest layer that can see the defect, and repeats no existing assertion. A
+  deletion names each test in a `TEST-RETIRE:` trailer. What to add per kind of
+  change, and what review rejects: `docs/testing.md#adding-a-test`.
 - **Prove a check can FAIL before trusting it to pass.** Run every gate/guard/comparator
   against a reintroduced defect AND empty input.
 - **Anything that parses cargo output pins `--color never` at the call site.** CI
