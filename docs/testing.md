@@ -137,11 +137,49 @@ starts with `generator:` for a test run by hand to write fixtures.
 issue, and one naming an issue `gh` reports closed or that is a pull request:
 an ignore does not outlive its fix.
 
+## Adding a test
+
+A test costs every later run of the suite and of the flake gate, so it has to
+catch something. Before adding one, name the defect it catches that no
+existing test does.
+
+| The change | Add | It must prove |
+|---|---|---|
+| Bug fix | one regression test, at the lowest layer where the bug reproduces | red on the unfixed tree, for the bug's reason (quote the failure in the commit) |
+| New pure logic (parser, layout, graph, styling) | unit tests in the module's `cfg(test)` | each fails with the logic it covers broken, or kills a mutant the suite let survive (`cargo mutants -f <file>`) |
+| New RPC or CLI surface | a route test through `rpc::test_harness`, plus one real-daemon test of the user-visible path | the real-daemon test drives `CARGO_BIN_EXE_shux`; the route test drives the production router |
+| A race, lifecycle or process behaviour | one real-daemon test, in an existing binary | the race is forced (a gate, a FIFO, a held process), never hoped for |
+| A resource bound | one exact-count test (allocations, rows, frames) | fails with the bound removed; counts, never wall time |
+| A refactor with no behaviour change | none | the existing tests pass unchanged |
+
+Rejected in review:
+- a test of a copy of production code: widen access or test in-crate instead;
+- a second test of an assertion an existing test already makes (grep first,
+  then extend or strengthen the existing one);
+- a test that checks only an exit status, `--help` text, that a file exists,
+  or that a call does not panic;
+- a loop inside a test for confidence: repetition is the flake gate's job;
+- a test that waits out a real production timeout a `cfg(test)` seam could drive;
+- a test added to raise coverage. Codecov's patch figure is informational.
+
+Deleting a test is the same judgement run the other way. `make
+check-test-inventory` fails a test that stopped being compiled unless a commit
+names it in a `TEST-RETIRE: <binary-id> <test> <reason>` trailer, or `TEST-RETIRE:
+<binary-id> * <reason>` for a binary deleted whole.
+
 ## The flake gate
 
-On every pull request, CI's `Flake gate` job runs the tests the branch adds or
-changes 20 times, next to twice as many CPU hogs as cores, on ubuntu and
-macOS (`make flake-gate BASE=origin/main`). "Changed" is an integration-test
+On every pull request, CI's `Flake gate` job runs the tests the branch selects
+next to twice as many CPU hogs as cores, on ubuntu and macOS (`make flake-gate
+BASE=origin/main`). The tests the branch adds or edits run 20 times
+(`FLAKE_COUNT`). The rest of what it selects, the tests it reaches only through
+a changed helper, module or fixture, run 5 times (`FLAKE_HELPER_COUNT`). An
+edited test keeps 20 when its file falls back to a coarser selection, and when
+nextest cannot name it (the selection it widens to runs 20). The 5-run tier
+catches a flake failing one run in two 97% of the time, one in five 67%, one in
+twenty 23%; on the record, 8 of the gate's 12 catches would have been caught in
+it, and the 4 it misses first failed at runs 9, 18, 18 and 19, all in tests
+already on main. "Changed" is an integration-test
 file, a shared helper under `tests/<dir>/` (every binary that declares it, by
 `mod` or `#[path]`), a hunk reaching a src file's `cfg(test)` code, a
 test-only src file (its module's tests; for a helper with none, the tests of

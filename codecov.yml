@@ -12,10 +12,13 @@ coverage:
         target: 60%
         threshold: 2%
         base: auto
+    # Reported, never a failed check: a coverage target on changed lines
+    # rewards tests written to cover lines rather than to catch a defect
+    # (docs/testing.md#adding-a-test).
     patch:
       default:
         target: 70%
-        threshold: 5%
+        informational: true
       non_code:
         informational: true
         paths:

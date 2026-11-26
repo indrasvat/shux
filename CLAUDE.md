@@ -35,7 +35,7 @@ make prune / disk-check # dry-run report of regenerable disk (APPLY=1 removes) /
 make test-stress        # repeat tests under CPU load (STRESS_COUNT/FILTER/LOAD) to expose timing
 make check-test-timing  # ast-grep bans on timing in disguise in test code (lint/ast-grep/)
 make check-test-ignores # every #[ignore] names an open issue ("see #N") or is a "generator:"
-make flake-gate         # the tests a branch adds or changes, 20x under CPU load (CI runs it on PRs)
+make flake-gate         # under CPU load: tests a branch adds or edits 20x, those it reaches via helpers 5x (CI runs it on PRs)
 make fuzz               # libFuzzer targets in fuzz/ (FUZZ_SECONDS each); crashes land in fuzz/artifacts/
 make install / hooks    # install binary / lefthook hooks
 ```
@@ -124,8 +124,17 @@ Colour-probed `printf`/`cat` is the letter, not the spirit.
   `make check-test-timing` bans the shapes that hide one (wall-clock bounds, absence
   by timeout, timed waits, sleep-then-act fixtures). A flaky test is fixed by its
   shape, never retried, never given a longer timeout, never `#[ignore]`d without an
-  open issue. New and changed tests run 20x under load in CI's flake gate. Patterns,
-  the escape form and how to prove a de-flake: `docs/testing.md`.
+  open issue. New and edited tests run 20x under load in CI's flake gate, tests a
+  change reaches through a helper 5x. Patterns, the escape form and how to prove a
+  de-flake: `docs/testing.md`.
+- **A new test must earn its place.** Name the defect it catches that no existing
+  test does, then add it only if it runs production code (never a copy of a handler
+  or helper), was seen red for that defect (a fix: the unfixed tree; a feature: the
+  behaviour broken, or a surviving `cargo mutants` mutant killed), sits at the
+  cheapest layer that can see the defect, and repeats no existing assertion. No
+  `--help`-only, exit-status-only, file-exists or does-not-panic tests, no loops for
+  confidence, nothing written to raise coverage. A deletion names each test in a
+  `TEST-RETIRE:` trailer. The table per kind of change: `docs/testing.md#adding-a-test`.
 - **Prove a check can FAIL before trusting it to pass.** Run every gate/guard/comparator
   against a reintroduced defect AND empty input.
 - **Anything that parses cargo output pins `--color never` at the call site.** CI
@@ -252,7 +261,8 @@ Every feature/fix PR.
    agent/chair/model overrides. **`dootsabha` unavailable → the council step is not skipped.** Spawn
    context-appropriate parallel adversarial agents on disjoint surfaces instead and say
    in the PR that you did. See *Tooling fallbacks*.
-2. **Build with tests** — unit + integration for every new path.
+2. **Build with tests** — unit + integration for every new path, each one passing
+   *A new test must earn its place*.
 3. **Verify every render path touched** — live attach, `pane`/`window`/`session.snapshot`,
    `events.watch`, web preview. Enumerate the matrix at design time.
 4. **Verify every config state** — default, `shux config init`, feature-maxed, malformed,

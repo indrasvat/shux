@@ -378,9 +378,10 @@ jobs:
 
   flake-gate:
     name: Flake gate (${{ matrix.os }})
-    # The tests a PR adds or changes, 20 runs each next to twice as many CPU
-    # hogs as cores: a test that only passes on an idle machine fails here,
-    # before it merges (docs/testing.md#the-flake-gate).
+    # The tests a PR adds or edits, 20 runs each, and those it reaches through
+    # a changed helper, 5, next to twice as many CPU hogs as cores: a test
+    # that only passes on an idle machine fails here, before it merges
+    # (docs/testing.md#the-flake-gate).
     if: github.event_name == 'pull_request'
     strategy:
       fail-fast: false
