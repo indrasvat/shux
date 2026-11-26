@@ -13,13 +13,8 @@
 #                                      name it, else the package's whole unit-test binary
 #   any other file under tests/ or     the tests whose sources name it (a proptest
 #   .shux/fixtures/                    regressions file: the binary it is named after)
-# Narrowed to single tests: when every hunk reaching the test code of
-# tests/<name>.rs, a src file (not main.rs) or a test-only file with tests lies
-# inside test functions (lint/ast-grep/test-spans.yml: attributes, doc comments
-# and `proptest!` fns included; blank and comment-only lines aside), the gate
-# selects just those tests, and a deleted one selects nothing. A hunk anywhere
-# else in test code (a helper, a `use`, a const, a macro) keeps the rule above,
-# and so does a test nextest does not list under the name worked out for it.
+# Within a .rs file, a change that stays inside test functions selects just
+# those tests (docs/testing.md#the-flake-gate, lint/ast-grep/test-spans.yml).
 # shux-testkit's dependents are not re-run when it changes: that is most of the
 # suite, which CI runs once anyway; its own tests are gated like any others.
 #
@@ -60,31 +55,42 @@ test_attr='^[[:space:]]*#\[[[:space:]]*(::)?([A-Za-z_][A-Za-z0-9_]*::)*(test|rst
 # attributes and doc comments included; "t <first> <last>" per stretch of
 # cfg(test) code; "m <first> <last> <path in file>" per cfg(test) `mod x;`;
 # "c <line> <column>" per line comment; "q <first> <last>" per string over
-# several lines.
+# several lines. An s or m span claims no line it shares with other code.
 test_spans() {
     local out
     out="$(ast-grep scan -r "$spans_rules" --json=stream "$1")"
-    jq -r '[.ruleId, .range.start.line + 1, .range.start.column, .range.end.line + 1,
-            .range.byteOffset.start, .range.byteOffset.end,
-            (.metaVariables.single.NAME.text // "-")] | @tsv' <<<"$out" |
-        sort -t$'\t' -k5,5n -k6,6nr |
+    jq -r '.metaVariables.single as $v |
+        [.ruleId, .range.start.line + 1, .range.start.column, .range.end.line + 1, .range.end.column,
+         .range.byteOffset.start, .range.byteOffset.end, ($v.NAME.text // "-"),
+         (($v.LEAD.range.start.line // .range.start.line) + 1),
+         ($v.LEAD.range.start.column // .range.start.column)] | @tsv' <<<"$out" |
+        sort -t$'\t' -k6,6n -k7,7nr |
         awk -F'\t' -v OFS='\t' '
             function path(b,  i, p) {
                 for (i = 1; i <= nm; i++) if (ms[i] < b && b < me[i]) p = p mn[i] "::"
                 return p
             }
-            $1 == "mod" { nm++; ms[nm] = $5; me[nm] = $6; mn[nm] = $7 }
+            # The first line a span starting at (line, column) may claim: not
+            # one with code before it, a `#` aside (an attribute in proptest!).
+            function from(l, c,  p) {
+                p = substr(src[l], 1, c)
+                sub(/#[[:space:]]*$/, "", p)
+                return p ~ /[^[:space:]]/ ? l + 1 : l
+            }
+            function to(l, c) { return substr(src[l], c + 1) ~ /[^[:space:]]/ ? l - 1 : l }
+            FILENAME == ARGV[1] { src[FNR] = $0; next }
+            $1 == "mod" { nm++; ms[nm] = $6; me[nm] = $7; mn[nm] = $8 }
             $1 == "cmt" && !($2 in seen) { seen[$2] = 1; print "c", $2, $3 }
             $1 == "str" { print "q", $2, $4 }
-            $1 == "cfga" { if (!cfg) cfg = $2 }
-            $1 == "cfgt" { print "t", (cfg ? cfg : $2), $4; cfg = 0 }
-            $1 == "cfgm" { print "m", (cfg ? cfg : $2), $4, path($5) $7; cfg = 0 }
+            $1 == "cfgt" { print "t", $9, $4 }
+            $1 == "cfgm" { print "m", from($9, $10), to($4, $5), path($6) $8 }
             $1 == "cfgo" { print "t", $2, 2147483647 }
             $1 == "cfgf" { print "t", 1, 2147483647 }
-            $1 == "lead" || $1 == "plead" { if (!lead || $2 < lead) lead = $2 }
-            $1 == "fn" { print "s", (lead ? lead : $2), $4, path($5) $7; lead = 0 }
-            $1 == "pfn" { ps = (lead ? lead : $2); pn = path($5) $7; lead = 0; open = 1 }
-            $1 == "pend" && open { print "s", ps, $4, pn; open = 0 }'
+            $1 == "fn" { print "s", from($9, $10), to($4, $5), path($6) $8 }
+            $1 == "plead" && !pl { pl = $2; pc = $3 }
+            $1 == "ptattr" { pt = 1 }
+            $1 == "pname" { ps = pl ? from(pl, pc) : from($2, $3); ok = pt; pl = pt = 0 }
+            $1 == "ptest" && ok { print "s", ps, to($4, $5), path($6) $8 }' "$1" -
 }
 
 # touched_lines <side> <all|cfg> <spans> <diff> <source>: what one side (old
@@ -131,15 +137,20 @@ touched_lines() {
 
 terms=()
 declare -A coarse_of=()
-# fn_select <file> <binary id> <module prefix> <all|cfg> <coarse term>: the
-# tests a change to <file> reaches, one term each, into terms; the coarse term
-# instead when it reaches test code outside a test function. A changed
-# cfg(test) `mod x;` selects x's tests. "all": the whole file is test code;
-# "cfg": its cfg(test) code is.
+# fn_select <known> <file> <binary id> <module prefix> <all|cfg> <coarse term>:
+# the tests a change to <file> reaches, one term each, into terms; the coarse
+# term instead when it reaches test code outside a test function, or when
+# <known> is "test" (a fixture it names changed). A changed cfg(test) `mod x;`
+# selects x's tests. "all": the whole file is test code; "cfg": its cfg(test)
+# code is.
 fn_select() {
-    local f="$1" bin="$2" prefix="${3:+$3::}" mode="$4" coarse="$5" side src
+    local known="$1" f="$2" bin="$3" prefix="${4:+$4::}" mode="$5" coarse="$6" side src
     local -A reached=() declared=() present=()
     local kind name
+    if [[ "$known" == test ]]; then
+        terms+=("$coarse")
+        return 0
+    fi
     git diff -U0 "$base"...HEAD -- "$f" >"$tmp/diff"
     # The diff's line numbers are HEAD's, whatever the working tree holds.
     git show "HEAD:$f" >"$tmp/new.rs"
@@ -158,10 +169,6 @@ fn_select() {
             [[ "$kind" != d ]] || declared[$name]=1
         done <"$tmp/$side.hit"
     done
-    if [[ -z "$bin" ]]; then
-        ((${#reached[@]} + ${#declared[@]} == 0)) || terms+=("$coarse")
-        return 0
-    fi
     for name in "${!declared[@]}"; do
         terms+=("binary_id(=$bin) & test(/^$prefix$name::/)")
     done
@@ -206,10 +213,8 @@ select_rs() {
     local f="$1" known="${2:-}"
     [[ "$f" =~ ^crates/([^/]+)/(tests|src)/(.+)\.rs$ ]] || return 0
     local pkg="${BASH_REMATCH[1]}" kind="${BASH_REMATCH[2]}" rest="${BASH_REMATCH[3]}"
-    if [[ "$kind" == tests && "$rest" != */* && "$known" != test ]]; then
-        fn_select "$f" "$pkg::$rest" "" all "binary_id(=$pkg::$rest)"
-    elif [[ "$kind" == tests && "$rest" != */* ]]; then
-        terms+=("binary_id(=$pkg::$rest)")
+    if [[ "$kind" == tests && "$rest" != */* ]]; then
+        fn_select "$known" "$f" "$pkg::$rest" "" all "binary_id(=$pkg::$rest)"
     elif [[ "$kind" == tests ]]; then
         local dir="${rest%%/*}" user
         while IFS= read -r user; do
@@ -217,32 +222,19 @@ select_rs() {
         done < <(grep -lE "^[[:space:]]*(#\[[[:space:]]*path[[:space:]]*=[[:space:]]*\"$dir/[^\"]*\"[[:space:]]*\]|(pub(\([^)]*\))?[[:space:]]+)?mod[[:space:]]+${dir}[[:space:]]*;)" \
             "crates/$pkg/tests/"*.rs || true)
     elif [[ -n "${test_only[$f]+set}" ]]; then
-        local coarse="binary_id(=$pkg) & test(/^${test_only[$f]}::/)"
         if [[ -f "$f" ]] && grep -qE "$test_attr" "$f"; then
-            if [[ "$known" == test ]]; then
-                terms+=("$coarse")
-            else
-                fn_select "$f" "$pkg" "${test_only[$f]}" all "$coarse"
-            fi
+            fn_select "$known" "$f" "$pkg" "${test_only[$f]}" all "binary_id(=$pkg) & test(/^${test_only[$f]}::/)"
         else
             users_of "$f" "$pkg" || terms+=("binary_id(=$pkg)")
         fi
     else
-        local path="${rest%/mod}" coarse
+        local path="${rest%/mod}"
         case "$path" in
-        lib | main) coarse="binary_id(=$pkg)" ;;
-        *) coarse="binary_id(=$pkg) & test(/^${path//\//::}::/)" ;;
+        lib) fn_select "$known" "$f" "$pkg" "" cfg "binary_id(=$pkg)" ;;
+        # A bin target's unit tests are its own binary, named after the package.
+        main) fn_select "$known" "$f" "$pkg::bin/$pkg" "" cfg "binary_id(=$pkg::bin/$pkg)" ;;
+        *) fn_select "$known" "$f" "$pkg" "${path//\//::}" cfg "binary_id(=$pkg) & test(/^${path//\//::}::/)" ;;
         esac
-        if [[ "$known" == test ]]; then
-            terms+=("$coarse")
-        elif [[ "$path" == main ]]; then
-            # Not narrowed: main.rs's tests are not in binary_id(=$pkg).
-            fn_select "$f" "" "" cfg "$coarse"
-        elif [[ "$path" == lib ]]; then
-            fn_select "$f" "$pkg" "" cfg "$coarse"
-        else
-            fn_select "$f" "$pkg" "${path//\//::}" cfg "$coarse"
-        fi
     fi
 }
 
@@ -277,14 +269,18 @@ list() {
 list
 # A test listed under another name than the one worked out for it (a module
 # moved by #[path], an rstest case, a cfg'd-out test) is selected by its file's
-# coarse term instead.
+# coarse term instead, or by its whole binary when that lists nothing either.
 missed=0
 for i in "${!terms[@]}"; do
     t="${terms[$i]}"
     [[ -n "${coarse_of[$t]+set}" && "$t" =~ ^binary_id\(=(.+)\)\ \&\ test\(=(.+)\)$ ]] || continue
-    grep -qxF "${BASH_REMATCH[1]} ${BASH_REMATCH[2]}" <<<"$listed" && continue
-    echo "flake-gate: nextest lists no ${BASH_REMATCH[1]} ${BASH_REMATCH[2]}; selecting ${coarse_of[$t]}" >&2
-    terms[i]="${coarse_of[$t]}"
+    bin="${BASH_REMATCH[1]}" name="${BASH_REMATCH[2]}"
+    grep -qxF "$bin $name" <<<"$listed" && continue
+    wide="${coarse_of[$t]}"
+    [[ -n "$(cargo nextest list --color never --workspace -E "$wide" --message-format oneline)" ]] ||
+        wide="binary_id(=$bin)"
+    echo "flake-gate: nextest lists no $bin $name; selecting $wide" >&2
+    terms[i]="$wide"
     missed=1
 done
 ((missed == 0)) || list

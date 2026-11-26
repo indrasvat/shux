@@ -5,7 +5,8 @@
 # test-stress.sh that prints the filter it was handed, against one change per
 # selection rule and changes that must select nothing. The stub lists one test
 # for any filter, plus "<binary> <name>" for each single test the filter names,
-# except the one in FLAKE_SELFTEST_UNLISTED.
+# except the one in FLAKE_SELFTEST_UNLISTED; for the filter in
+# FLAKE_SELFTEST_EMPTY it lists nothing.
 
 set -euo pipefail
 
@@ -22,6 +23,7 @@ mkdir -p "$work/bin" "$work/repo/scripts" "$work/repo/lint/ast-grep"
 cat >"$work/bin/cargo" <<'EOF'
 #!/usr/bin/env bash
 while (($#)) && [[ "$1" != -E ]]; do shift; done
+[[ "${2:-}" != "${FLAKE_SELFTEST_EMPTY:-none}" ]] || exit 0
 echo "k::t"
 grep -oE 'binary_id\(=[^)]*\) & test\(=[^)]*\)' <<<"${2:-}" |
     sed -E 's/^binary_id\(=(.*)\) & test\(=(.*)\)$/\1 \2/' |
@@ -53,19 +55,28 @@ w crates/p/src/helperfn.rs 'pub fn c() { let y = 1; }' '#[cfg(test)]' 'fn helper
     '#[cfg(test)]' 'mod tests {' '    #[test]' '    fn t() {}' '}'
 w crates/p/src/fns.rs 'pub fn c() { let y = 1; }' '' '#[cfg(test)]' 'mod tests {' '    use super::*;' '' \
     '    const LIMIT: u8 = 1;' '' '    macro_rules! check { () => { let m = 1; }; }' '' \
+    '    const STEP: u8 = 1; // a note' '    #[test]' '    fn uses_step() { let s = STEP; }' '' \
+    '    #[test] fn anchor() {} const LIM2: u8 = 1;' '' \
     '    /// Doc.' '    #[test]' '    fn a() { let a = 1; }' '' \
     '    #[test]' '    fn b() {' '        let b = 1;' '        let b2 = 1;' '    }' '' \
     '    #[test]' '    fn gone() { let g = 1; }' '' '    #[test]' '    fn old_name() { let r = 1; }' '' \
     '    fn outer() {' '        #[test]' '        fn nested() { let n = 1; }' '    }' '' \
     '    const TEXT: &str = "' '// not a comment' '";' '' \
     '    mod inner {' '        #[test]' '        fn d() { let d = 1; }' '    }' '' \
-    '    proptest! {' '        #![proptest_config(ProptestConfig::with_cases(4))]' '        #[test]' \
-    '        fn prop(x in 0..4u8) { let p = x; }' '    }' '    // trailing note' '}'
+    '    proptest! {' '        #![proptest_config(ProptestConfig::with_cases(4))] // keep CI fast' \
+    '        #![proptest_config(ProptestConfig {' '            max_shrink_iters: 4,' '        })]' \
+    '        #[test]' '        fn /* sig */ commented(x in 0..4u8) { let c = x; }' \
+    '        #[test]' '        fn odd(x in 0..4u8) -> () { let k = x; }' \
+    '        fn untested(x in 0..4u8) {' '            let h = x;' '        }' \
+    '        #[test]' '        fn prop(x in 0..4u8) { let p = x; }' '    }' '    // trailing note' '}'
 w crates/p/src/early.rs 'use std::fmt;' '#[cfg(test)]' 'use std::fmt::Write;' \
-    '#[cfg(test)]' '#[path = "early_more.rs"]' 'mod more;' 'pub fn c() { let y = 1; }' \
+    '#[cfg(test)]' '#[path = "early_more.rs"]' 'mod more;' '#[path = "early_z.rs"]' '#[cfg(test)]' 'mod zed;' \
+    'pub fn c() { let y = 1; }' \
     '#[cfg(test)]' 'mod tests {' '    #[test]' '    fn t() { let x = 1; }' '}'
 w crates/p/src/orphan.rs '#[cfg(test)]' 'mod tests {' '    #[test]' '    fn t() { let x = 1; }' '}' \
     'pub fn g(v: u8) -> u8 {' '    match v {' '        #[cfg(test)]' '        9 => 0,' '        _ => 1,' '    }' '}'
+w crates/p/src/attr.rs 'pub fn c() {}' '#[cfg_attr(test, test)]' 'fn conf() { let q = 1; }' \
+    '#[cfg(any(test, all(not(test), feature = "x")))]' 'mod mixed {' '    #[test]' '    fn changed() { let w = 1; }' '}'
 w crates/p/src/main.rs 'fn main() {}' '#[cfg(test)]' 'mod tests {' '    #[test]' '    fn t() { let x = 1; }' '}'
 w crates/p/tests/common/mod.rs 'pub fn h() { let x = 1; }'
 w crates/p/tests/sub/helper.rs 'pub fn h() { let x = 1; }'
@@ -147,7 +158,6 @@ case_ "a deleted test selects nothing" "fns 's/    #\\[test\\]\\n    fn gone\\(\
 case_ "a renamed test: the new name" "fns 's/fn old_name/fn new_name/'" 'binary_id(=p) & test(=fns::tests::new_name)'
 case_ "two tests" "fns 's/let a = 1;/let a = 2;/; s/let d = 1;/let d = 2;/'" \
     'binary_id(=p) & test(=fns::tests::a)' 'binary_id(=p) & test(=fns::tests::inner::d)'
-case_ "a test in a nested mod" "fns 's/let d = 1;/let d = 2;/'" 'binary_id(=p) & test(=fns::tests::inner::d)'
 case_ "a proptest! fn" "fns 's/let p = x;/let p = x + 1;/'" 'binary_id(=p) & test(=fns::tests::prop)'
 case_ "a comment on no item" "fns 's|// trailing note|// trailing notes|'" -
 case_ "a test and a helper: the whole module" "fns 's/let a = 1;/let a = 2;/; s/const LIMIT: u8 = 1/const LIMIT: u8 = 2/'" "$fns_coarse"
@@ -158,16 +168,28 @@ case_ "a string line that reads as a comment" "fns 's|// not a comment|// not a 
 case_ "a blank line in a string" "fns 's|// not a comment\\n|// not a comment\\n\\n|'" "$fns_coarse"
 case_ "a test nested in a fn" "fns 's/let n = 1;/let n = 2;/'" "$fns_coarse"
 case_ "a proptest! config, which every fn in it shares" "fns 's/with_cases\\(4\\)/with_cases(8)/'" "$fns_coarse"
+case_ "a helper whose line ends in a comment, above a test" "fns 's/STEP: u8 = 1/STEP: u8 = 2/'" "$fns_coarse"
+case_ "a proptest! fn the rules do not see, above one they do" "fns 's/let k = x;/let k = x + 1;/'" "$fns_coarse"
+case_ "a proptest! fn with a comment in its signature" "fns 's/let c = x;/let c = x + 1;/'" 'binary_id(=p) & test(=fns::tests::commented)'
+case_ "a proptest! fn without #[test], changed" "fns 's/let h = x;/let h = x + 1;/'" "$fns_coarse"
+case_ "a proptest! fn without #[test], deleted" "fns 's/ *fn untested[^\\n]*\\n[^\\n]*\\n[^\\n]*\\n//'" "$fns_coarse"
+case_ "a proptest! config over several lines" "fns 's/max_shrink_iters: 4/max_shrink_iters: 8/'" "$fns_coarse"
+case_ "an item on a test's line" "fns 's/LIM2: u8 = 1/LIM2: u8 = 2/'" "$fns_coarse"
+case_ "a fn cfg_attr(test, test) makes a test" "perl -pi -e 's/let q = 1;/let q = 2;/' crates/p/src/attr.rs" 'binary_id(=p) & test(/^attr::/)'
+case_ "cfg(any(test, not(test)))" "perl -pi -e 's/let w = 1;/let w = 2;/' crates/p/src/attr.rs" 'binary_id(=p) & test(=attr::mixed::changed)'
 case_ "production code above the test module" "fns 's/let y = 1;/let y = 2;/'" -
 FLAKE_SELFTEST_UNLISTED='p fns::tests::a' \
     case_ "a test nextest does not list by that name: the whole module" "fns 's/let a = 1;/let a = 2;/'" "$fns_coarse"
+FLAKE_SELFTEST_UNLISTED='p fns::tests::a' FLAKE_SELFTEST_EMPTY="$fns_coarse" \
+    case_ "... and when that module lists nothing: the whole binary" "fns 's/let a = 1;/let a = 2;/'" 'binary_id(=p)'
 case_ "production code after a cfg(test) use" "perl -pi -e 's/let y = 1;/let y = 2;/' crates/p/src/early.rs" -
 case_ "a cfg(test) use" "perl -pi -e 's/fmt::Write;/fmt::Display;/' crates/p/src/early.rs" 'binary_id(=p) & test(/^early::/)'
 case_ "a cfg(test) mod x; declaration: x's tests" "perl -pi -e 's/early_more/early_other/' crates/p/src/early.rs" 'binary_id(=p) & test(/^early::more::/)'
 case_ "a new test module and its declaration" "perl -0pi -e 's/^/#[cfg(test)]\\nmod added;\\n/' crates/p/src/early.rs; w crates/p/src/early/added.rs '#[test]' 'fn t() {}'" \
     'binary_id(=p) & test(/^early::added::/)' 'binary_id(=p) & test(=early::added::t)'
 case_ "cfg(test) on a match arm: test code to the end" "perl -pi -e 's/9 => 0/9 => 2/' crates/p/src/orphan.rs" 'binary_id(=p) & test(/^orphan::/)'
-case_ "a test in main.rs: the whole binary" "edit crates/p/src/main.rs" 'binary_id(=p)'
+case_ "an attribute above cfg(test) on a mod x;" "perl -pi -e 's/early_z/early_y/' crates/p/src/early.rs" 'binary_id(=p) & test(/^early::zed::/)'
+case_ "a test in main.rs: its bin target" "edit crates/p/src/main.rs" 'binary_id(=p::bin/p) & test(=tests::t)'
 
 # Discovery that fails must fail the gate, never read as "nothing to gate".
 git checkout -q -f main
