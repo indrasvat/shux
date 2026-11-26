@@ -61,8 +61,11 @@ w crates/p/src/fns.rs 'pub fn c() { let y = 1; }' '' '#[cfg(test)]' 'mod tests {
     '    mod inner {' '        #[test]' '        fn d() { let d = 1; }' '    }' '' \
     '    proptest! {' '        #![proptest_config(ProptestConfig::with_cases(4))]' '        #[test]' \
     '        fn prop(x in 0..4u8) { let p = x; }' '    }' '    // trailing note' '}'
-w crates/p/src/early.rs 'use std::fmt;' '#[cfg(test)]' 'use std::fmt::Write;' 'pub fn c() { let y = 1; }' \
-    '#[cfg(test)]' '#[path = "early_more.rs"]' 'mod more;' '#[cfg(test)]' 'mod tests {' '    #[test]' '    fn t() { let x = 1; }' '}'
+w crates/p/src/early.rs 'use std::fmt;' '#[cfg(test)]' 'use std::fmt::Write;' \
+    '#[cfg(test)]' '#[path = "early_more.rs"]' 'mod more;' 'pub fn c() { let y = 1; }' \
+    '#[cfg(test)]' 'mod tests {' '    #[test]' '    fn t() { let x = 1; }' '}'
+w crates/p/src/orphan.rs '#[cfg(test)]' 'mod tests {' '    #[test]' '    fn t() { let x = 1; }' '}' \
+    'pub fn g(v: u8) -> u8 {' '    match v {' '        #[cfg(test)]' '        9 => 0,' '        _ => 1,' '    }' '}'
 w crates/p/src/main.rs 'fn main() {}' '#[cfg(test)]' 'mod tests {' '    #[test]' '    fn t() { let x = 1; }' '}'
 w crates/p/tests/common/mod.rs 'pub fn h() { let x = 1; }'
 w crates/p/tests/sub/helper.rs 'pub fn h() { let x = 1; }'
@@ -160,7 +163,10 @@ FLAKE_SELFTEST_UNLISTED='p fns::tests::a' \
     case_ "a test nextest does not list by that name: the whole module" "fns 's/let a = 1;/let a = 2;/'" "$fns_coarse"
 case_ "production code after a cfg(test) use" "perl -pi -e 's/let y = 1;/let y = 2;/' crates/p/src/early.rs" -
 case_ "a cfg(test) use" "perl -pi -e 's/fmt::Write;/fmt::Display;/' crates/p/src/early.rs" 'binary_id(=p) & test(/^early::/)'
-case_ "an attribute between cfg(test) and its mod" "perl -pi -e 's/early_more/early_other/' crates/p/src/early.rs" 'binary_id(=p) & test(/^early::/)'
+case_ "a cfg(test) mod x; declaration: x's tests" "perl -pi -e 's/early_more/early_other/' crates/p/src/early.rs" 'binary_id(=p) & test(/^early::more::/)'
+case_ "a new test module and its declaration" "perl -0pi -e 's/^/#[cfg(test)]\\nmod added;\\n/' crates/p/src/early.rs; w crates/p/src/early/added.rs '#[test]' 'fn t() {}'" \
+    'binary_id(=p) & test(/^early::added::/)' 'binary_id(=p) & test(=early::added::t)'
+case_ "cfg(test) on a match arm: test code to the end" "perl -pi -e 's/9 => 0/9 => 2/' crates/p/src/orphan.rs" 'binary_id(=p) & test(/^orphan::/)'
 case_ "a test in main.rs: the whole binary" "edit crates/p/src/main.rs" 'binary_id(=p)'
 
 # Discovery that fails must fail the gate, never read as "nothing to gate".

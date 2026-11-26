@@ -13,6 +13,10 @@
 #   cfga/cfgt  code compiled only for tests: a `cfg` attribute naming `test`
 #              (never `not(test)`), and the item, field or statement it
 #              applies to; the span runs from the one to the end of the other
+#   cfgm       the same for `mod name;`, whose code is name's own file: a
+#              change to it selects that module's tests
+#   cfgo       a `cfg` attribute naming `test` on anything else: test code
+#              from there to the end of the file
 #   cfgf       an inner `#![cfg(test)]`: the whole file is test code
 #   str        a string over several lines, whose blank lines are content
 # A test the rules do not see (one a macro writes, one nested in a fn) leaves
@@ -161,28 +165,48 @@ utils:
     not: { regex: '\bnot\s*\(\s*test\s*\)' }
   attr-or-comment:
     any: [{ kind: attribute_item }, { kind: line_comment }, { kind: block_comment }]
+  cfg-able:
+    any:
+      - kind: function_item
+      - kind: function_signature_item
+      - kind: mod_item
+      - kind: foreign_mod_item
+      - kind: use_declaration
+      - kind: extern_crate_declaration
+      - kind: const_item
+      - kind: static_item
+      - kind: struct_item
+      - kind: enum_item
+      - kind: union_item
+      - kind: impl_item
+      - kind: trait_item
+      - kind: type_item
+      - kind: macro_definition
+      - kind: macro_invocation
+      - kind: field_declaration
+      - kind: enum_variant
+      - kind: let_declaration
+      - kind: expression_statement
+      - kind: match_arm
 rule:
-  any:
-    - kind: function_item
-    - kind: function_signature_item
-    - kind: mod_item
-    - kind: use_declaration
-    - kind: extern_crate_declaration
-    - kind: const_item
-    - kind: static_item
-    - kind: struct_item
-    - kind: enum_item
-    - kind: union_item
-    - kind: impl_item
-    - kind: trait_item
-    - kind: type_item
-    - kind: macro_definition
-    - kind: macro_invocation
-    - kind: field_declaration
-    - kind: enum_variant
-    - kind: let_declaration
-    - kind: expression_statement
-    - kind: match_arm
+  matches: cfg-able
+  follows:
+    stopBy: { not: { matches: attr-or-comment } }
+    matches: cfg-test-attr
+---
+id: cfgm
+language: rust
+utils:
+  cfg-test-attr:
+    kind: attribute_item
+    regex: '^#\[\s*cfg\s*\((?s:.)*\btest\b'
+    not: { regex: '\bnot\s*\(\s*test\s*\)' }
+  attr-or-comment:
+    any: [{ kind: attribute_item }, { kind: line_comment }, { kind: block_comment }]
+rule:
+  kind: mod_item
+  not: { has: { field: body, kind: declaration_list } }
+  has: { field: name, pattern: $NAME }
   follows:
     stopBy: { not: { matches: attr-or-comment } }
     matches: cfg-test-attr
@@ -193,6 +217,44 @@ rule:
   kind: attribute_item
   regex: '^#\[\s*cfg\s*\((?s:.)*\btest\b'
   not: { regex: '\bnot\s*\(\s*test\s*\)' }
+---
+id: cfgo
+language: rust
+utils:
+  attr-or-comment:
+    any: [{ kind: attribute_item }, { kind: line_comment }, { kind: block_comment }]
+  cfg-able:
+    any:
+      - kind: function_item
+      - kind: function_signature_item
+      - kind: mod_item
+      - kind: foreign_mod_item
+      - kind: use_declaration
+      - kind: extern_crate_declaration
+      - kind: const_item
+      - kind: static_item
+      - kind: struct_item
+      - kind: enum_item
+      - kind: union_item
+      - kind: impl_item
+      - kind: trait_item
+      - kind: type_item
+      - kind: macro_definition
+      - kind: macro_invocation
+      - kind: field_declaration
+      - kind: enum_variant
+      - kind: let_declaration
+      - kind: expression_statement
+      - kind: match_arm
+rule:
+  kind: attribute_item
+  regex: '^#\[\s*cfg\s*\((?s:.)*\btest\b'
+  not:
+    any:
+      - regex: '\bnot\s*\(\s*test\s*\)'
+      - precedes:
+          stopBy: { not: { matches: attr-or-comment } }
+          matches: cfg-able
 ---
 id: cfgf
 language: rust

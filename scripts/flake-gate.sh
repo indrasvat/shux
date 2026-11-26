@@ -58,8 +58,9 @@ test_attr='^[[:space:]]*#\[[[:space:]]*(::)?([A-Za-z_][A-Za-z0-9_]*::)*(test|rst
 
 # test_spans <file>: "s <first> <last> <path in file>" per test function, its
 # attributes and doc comments included; "t <first> <last>" per stretch of
-# cfg(test) code; "c <line> <column>" per line comment; "q <first> <last>" per
-# string over several lines.
+# cfg(test) code; "m <first> <last> <path in file>" per cfg(test) `mod x;`;
+# "c <line> <column>" per line comment; "q <first> <last>" per string over
+# several lines.
 test_spans() {
     local out
     out="$(ast-grep scan -r "$spans_rules" --json=stream "$1")"
@@ -77,6 +78,8 @@ test_spans() {
             $1 == "str" { print "q", $2, $4 }
             $1 == "cfga" { if (!cfg) cfg = $2 }
             $1 == "cfgt" { print "t", (cfg ? cfg : $2), $4; cfg = 0 }
+            $1 == "cfgm" { print "m", (cfg ? cfg : $2), $4, path($5) $7; cfg = 0 }
+            $1 == "cfgo" { print "t", $2, 2147483647 }
             $1 == "cfgf" { print "t", 1, 2147483647 }
             $1 == "lead" || $1 == "plead" { if (!lead || $2 < lead) lead = $2 }
             $1 == "fn" { print "s", (lead ? lead : $2), $4, path($5) $7; lead = 0 }
@@ -86,13 +89,15 @@ test_spans() {
 
 # touched_lines <side> <all|cfg> <spans> <diff> <source>: what one side (old
 # or new) of the diff changes in test code (all: the whole file; cfg: its
-# cfg(test) code): "f <path>" per test function it reaches, and "coarse
-# <line>" with the first line it reaches outside every one. Blank and
-# comment-only lines reach nothing, but a blank line in a string is content.
+# cfg(test) code): "f <path>" per test function it reaches, "d <path>" per
+# cfg(test) `mod x;` in a cfg file, and "coarse <line>" with the first line it
+# reaches outside all of those. Blank and comment-only lines reach nothing,
+# but a blank line in a string is content.
 touched_lines() {
     awk -F'\t' -v side="$1" -v mode="$2" '
         FILENAME == ARGV[1] && $1 == "s" { ns++; s0[ns] = $2; s1[ns] = $3; sp[ns] = $4; next }
         FILENAME == ARGV[1] && $1 == "t" { nt++; t0[nt] = $2; t1[nt] = $3; next }
+        FILENAME == ARGV[1] && $1 == "m" && mode == "cfg" { nd++; d0[nd] = $2; d1[nd] = $3; dp[nd] = $4; next }
         FILENAME == ARGV[1] && $1 == "c" { cmt[$2] = $3; next }
         FILENAME == ARGV[1] && $1 == "q" { for (l = $2; l <= $3; l++) instr[l] = 1; next }
         FILENAME == ARGV[2] {
@@ -104,6 +109,9 @@ touched_lines() {
         }
         !(FNR in want) || (/^[[:space:]]*$/ && !(FNR in instr)) { next }
         {
+            hit = 0
+            for (i = 1; i <= nd; i++) if (d0[i] <= FNR && FNR <= d1[i]) { decl[dp[i]] = 1; hit = 1 }
+            if (hit) next
             hit = (mode == "all")
             for (i = 1; i <= nt && !hit; i++) hit = (t0[i] <= FNR && FNR <= t1[i])
             if (!hit) next
@@ -114,18 +122,23 @@ touched_lines() {
             if ((FNR in cmt) && cmt[FNR] == RLENGTH) next
             if (!coarse) coarse = FNR
         }
-        END { for (p in fns) print "f\t" p; if (coarse) print "coarse\t" coarse }' "$3" "$4" "$5"
+        END {
+            for (p in fns) print "f\t" p
+            for (p in decl) print "d\t" p
+            if (coarse) print "coarse\t" coarse
+        }' "$3" "$4" "$5"
 }
 
 terms=()
 declare -A coarse_of=()
 # fn_select <file> <binary id> <module prefix> <all|cfg> <coarse term>: the
 # tests a change to <file> reaches, one term each, into terms; the coarse term
-# instead when it reaches test code outside a test function. "all": the whole
-# file is test code; "cfg": its cfg(test) code is.
+# instead when it reaches test code outside a test function. A changed
+# cfg(test) `mod x;` selects x's tests. "all": the whole file is test code;
+# "cfg": its cfg(test) code is.
 fn_select() {
     local f="$1" bin="$2" prefix="${3:+$3::}" mode="$4" coarse="$5" side src
-    local -A reached=() present=()
+    local -A reached=() declared=() present=()
     local kind name
     git diff -U0 "$base"...HEAD -- "$f" >"$tmp/diff"
     # The diff's line numbers are HEAD's, whatever the working tree holds.
@@ -141,13 +154,17 @@ fn_select() {
                 terms+=("$coarse")
                 return 0
             fi
-            [[ -z "$kind" ]] || reached[$name]=1
+            [[ "$kind" != f ]] || reached[$name]=1
+            [[ "$kind" != d ]] || declared[$name]=1
         done <"$tmp/$side.hit"
     done
     if [[ -z "$bin" ]]; then
-        ((${#reached[@]} == 0)) || terms+=("$coarse")
+        ((${#reached[@]} + ${#declared[@]} == 0)) || terms+=("$coarse")
         return 0
     fi
+    for name in "${!declared[@]}"; do
+        terms+=("binary_id(=$bin) & test(/^$prefix$name::/)")
+    done
     while IFS=$'\t' read -r kind _ _ name; do
         if [[ "$kind" == s ]]; then present[$name]=1; fi
     done <"$tmp/new.spans"
