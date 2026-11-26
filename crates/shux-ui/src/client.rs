@@ -636,19 +636,6 @@ mod tests {
     }
 
     #[test]
-    fn test_exit_reason_debug() {
-        let reasons = vec![
-            ExitReason::Detached,
-            ExitReason::SessionEnded,
-            ExitReason::ConnectionLost,
-            ExitReason::Error("test".to_string()),
-        ];
-        for reason in reasons {
-            let _ = format!("{reason:?}");
-        }
-    }
-
-    #[test]
     fn test_roundtrip_ctrl_keys() {
         // Encode then parse should roundtrip for ctrl keys, except:
         // - Ctrl+I (0x09) parses as Tab

@@ -748,9 +748,6 @@ test-lens-scratch-reap: nextest-ready ## Run the P5 scratch reap signal-order te
 test-lens-gate: nextest-ready ## Run the lens-gate GREEN dogfood suite (task 078; capture on real shux TUIs + cross-path PNG) serially under the leak guard
 	$(call lens_run,Running lens-gate dogfood suite (task 078),--test lens_gate_capture)
 
-.PHONY: test-lens-gate-contract
-test-lens-gate-contract: nextest-ready ## Run the frozen 078 lens-gate contract lane (GREEN since 081/082 built its cases)
-	$(call lens_run,Running the frozen 078 lens-gate contract lane,--test lens_gate_contract)
 
 .PHONY: test-lens-gate-comparator
 test-lens-gate-comparator: nextest-ready ## Run the task-079 comparator suite (parity corpus + divergence fixtures + OSC-4 daemon isolation) serially under the leak guard

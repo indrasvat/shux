@@ -59,7 +59,7 @@ not (binary_id(=shux::lens_settle) & test(=s2_settle_flake_gate_100x))
 # carefully-reasoned comment then describes a membership that does not exist.
 # It happened here — `pty-pool` and `daemon-backed` started out as separate
 # groups listing many of the same binaries, and every heavyweight suite
-# (`m0_integration`, `pane_io_integration`, `decaln_pane_e2e`, `rep_pane_e2e`)
+# (`decaln_pane_e2e`, `rep_pane_e2e` among them)
 # resolved into the earlier one. The two are now a single group, and
 # `make check-test-groups` asserts that no test is claimed by two groups, so the
 # next overlap fails loudly instead of quietly re-tuning the suite.

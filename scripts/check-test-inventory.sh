@@ -102,7 +102,7 @@ mkdir -p "${CACHE_DIR}"
 # `shux::bin/shux` to `shux` without changing one line of test code. Keeping the
 # target in the key made that read as 506 removals plus 506 additions — a guard
 # firing on the refactor it exists to protect. Integration-test binaries
-# (`shux::m0_integration`) keep their own ids: those are separate files, and a
+# (`shux::cli_contract`) keep their own ids: those are separate files, and a
 # test vanishing from one is a real loss.
 #
 # This does mean a unit test moving between the bin and lib target of one

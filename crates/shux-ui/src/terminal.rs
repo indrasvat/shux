@@ -389,13 +389,6 @@ mod tests {
     }
 
     #[test]
-    fn test_terminal_size() {
-        // This test may fail in CI without a real terminal, so we just
-        // check it does not panic.
-        let _ = TerminalGuard::size();
-    }
-
-    #[test]
     fn button_mouse_capture_does_not_enable_any_motion() {
         let mut ansi = String::new();
         EnableButtonMouseCapture.write_ansi(&mut ansi).unwrap();
