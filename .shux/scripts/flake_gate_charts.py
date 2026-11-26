@@ -112,27 +112,39 @@ if replay.exists():
                  fontweight="bold", pad=26)
     finish(fig, ax, "prs-tests.png", ".shux/scripts/flake_gate_replay.sh, each PR against its parent")
 
-    # Time: measured where timed; elsewhere seconds-per-test from the measured runs.
+    # Time: measured where timed; elsewhere a fixed cost plus a cost per test,
+    # fitted (least squares) to every measured run, the change-kind ones too.
     measured = [(r["before"], r["after"]) for r in prs if r["before"]["secs"] is not None]
     if measured:
         pts = [(s["tests"], s["secs"]) for pair in measured for s in pair if s["tests"]]
-        rate = sum(t for _, t in pts) / max(sum(n for n, _ in pts), 1)
+        if proof.exists():
+            pts += [(c[s]["tests"], c[s]["secs"]) for c in rows(proof) for s in ("before", "after")
+                    if c[s]["secs"] is not None and c[s]["tests"]]
+        n = len(pts)
+        mx = sum(x for x, _ in pts) / n
+        my = sum(y for _, y in pts) / n
+        rate = sum((x - mx) * (y - my) for x, y in pts) / sum((x - mx) ** 2 for x, _ in pts)
+        fixed = my - rate * mx
         fig, ax = plt.subplots(figsize=(9, max(4, 0.32 * len(prs) + 1.5)))
         ys = range(len(prs))
         h = 0.38
         for y, r in zip(ys, prs):
             for side, off, color in (("before", -h / 2, BEFORE), ("after", h / 2, AFTER)):
                 s = r[side]
+                if not s["tests"]:
+                    ax.text(0, y + off, " no tests", va="center", fontsize=8, color="#5f6368")
+                    continue
                 real = s["secs"] is not None
-                secs = s["secs"] if real else s["tests"] * rate
+                secs = s["secs"] if real else fixed + s["tests"] * rate
                 ax.barh(y + off, secs / 60, h, color=color if real else PROJECTED[color],
                         hatch=None if real else "///", edgecolor="white" if real else color)
-                ax.text(secs / 60, y + off, f" {secs / 60:.1f}{'' if real else '*'}", va="center", fontsize=8)
+                mins = int(secs / 6 + 0.5) / 10  # half up
+                ax.text(secs / 60, y + off, f" {mins:.1f}{'' if real else '*'}", va="center", fontsize=8)
         ax.set_yticks(list(ys), labels)
         ax.invert_yaxis()
         ax.set_xlabel("minutes for 20 runs under CPU load")
         ax.set_title(f"Flake gate on merged PRs: wall clock\n"
-                     f"* projected at {rate:.2f} s per selected test, the rate of the {len(pts)} measured runs",
+                     f"* projected: {fixed:.0f} s + {rate:.2f} s per selected test, fitted to {len(pts)} measured runs",
                      fontweight="bold", pad=26)
         from matplotlib.patches import Patch
 

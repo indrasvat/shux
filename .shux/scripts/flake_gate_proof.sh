@@ -85,7 +85,7 @@ case_() {
         fail=1
         return
     fi
-    git -C "$wt" -c core.hooksPath=/dev/null commit -qam "flake gate proof: $name"
+    git -C "$wt" -c core.hooksPath=/dev/null -c user.name=flake-gate-proof -c user.email=flake-gate-proof@example.invalid commit -qam "flake gate proof: $name"
     printf '\033[1;36m▶ %s\033[0m\n' "$name"
     pick before
     pick after
