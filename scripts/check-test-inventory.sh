@@ -52,10 +52,25 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
 WRITE_BASELINE=0
+COMPARE_ONLY=0
 if [[ "${1:-}" == "--write-baseline" ]]; then
   WRITE_BASELINE=1
   shift
+elif [[ "${1:-}" == "--compare" ]]; then
+  # `--compare <base list> <current list> <base sha>`: the comparison alone, on
+  # two lists already in `normalize`'s form (scripts/check-test-inventory-selftest.sh).
+  COMPARE_ONLY=1
+  shift
 fi
+
+if [[ "${COMPARE_ONLY}" -eq 1 ]]; then
+  if [[ $# -ne 3 ]]; then
+    echo "usage: scripts/check-test-inventory.sh --compare <base list> <current list> <base sha>" >&2
+    exit 2
+  fi
+  BASE_LIST="$1" CURRENT_LIST="$2" BASE_SHA="$3"
+else
+# The listing half, unindented: it was the whole script before `--compare`.
 
 BASE_REF="${1:-${BASE_REF:-origin/main}}"
 
@@ -136,9 +151,11 @@ list_tests() {
     echo "error: building the workspace for \`nextest list\` failed (see cargo's output above)" >&2
     return 1
   fi
+  # --ignore-default-filter: a test the default profile keeps out of routine
+  # runs (a soak, a bench) is still compiled, and still counts.
   raw="$(bash "${REPO_ROOT}/scripts/run-bounded.sh" "${LIST_TIMEOUT}" cargo nextest list \
     --binaries-metadata "${meta}/binaries.json" --cargo-metadata "${meta}/cargo.json" \
-    --run-ignored all --color never)" || rc=$?
+    --run-ignored all --ignore-default-filter --color never)" || rc=$?
   find "${meta}" -delete
   if [[ "${rc}" -eq 124 ]]; then
     echo "error: a test binary is stuck answering --list (the build already ran)." >&2
@@ -244,6 +261,7 @@ if [[ ! -s "${CURRENT_LIST}" ]]; then
   echo "error: listed zero tests in the working tree — the suite does not build" >&2
   exit 2
 fi
+fi
 
 BASE_COUNT="$(wc -l <"${BASE_LIST}" | tr -d ' ')"
 CUR_COUNT="$(wc -l <"${CURRENT_LIST}" | tr -d ' ')"
@@ -258,6 +276,52 @@ if [[ -n "${added}" ]]; then
   echo ""
   echo "  added (allowed):"
   echo "${added}" | cut -f1,2 | sed 's/^/    + /'
+fi
+
+# trailers <key>: every value of that trailer in BASE_SHA..HEAD, one per line.
+trailers() {
+  local sha
+  git rev-parse --verify --quiet "${BASE_SHA}^{commit}" >/dev/null || return 0
+  for sha in $(git rev-list "${BASE_SHA}..HEAD"); do
+    git log -1 --format='%B' "${sha}" | git interpret-trailers --parse 2>/dev/null \
+      | sed -n "s/^$1: //p"
+  done
+}
+
+# A deliberate deletion names what it deletes: one `TEST-RETIRE:` trailer per
+# test, `<binary-id> <leaf> <reason>`, or `<binary-id> * <reason>` for a binary
+# that lists no tests at all any more. A trailer never licenses a test it does
+# not name, and a reason is required.
+retire_rules="$(trailers TEST-RETIRE | awk 'NF >= 3 { print $1 "\t" $2 }' | sort -u)"
+bad_retire="$(trailers TEST-RETIRE | awk 'NF < 3' || true)"
+if [[ -n "${bad_retire}" ]]; then
+  echo "" >&2
+  echo "error: a TEST-RETIRE: trailer needs <binary-id> <test|*> <reason>:" >&2
+  printf '%s\n' "${bad_retire}" | sed 's/^/    /' >&2
+  exit 1
+fi
+if [[ -n "${retire_rules}" ]]; then
+  still_listed="$(awk -F'\t' '$2 == "*" { print $1 }' <<<"${retire_rules}" | while IFS= read -r bin; do
+    if awk -F'\t' -v b="${bin}" '$1 == b { found = 1; exit } END { exit !found }' "${CURRENT_LIST}"; then
+      echo "${bin}"
+    fi
+  done)"
+  if [[ -n "${still_listed}" ]]; then
+    echo "" >&2
+    echo "error: TEST-RETIRE: retires these whole binaries, but they still list tests:" >&2
+    printf '%s\n' "${still_listed}" | sed 's/^/    /' >&2
+    echo "  Name each test you delete instead." >&2
+    exit 1
+  fi
+  retired="$(awk -F'\t' 'FILENAME == ARGV[1] { ok[$1 "\t" $2] = 1; next }
+    (($1 "\t" $2) in ok) || (($1 "\t*") in ok)' <(printf '%s\n' "${retire_rules}") \
+    <(printf '%s\n' "${removed}" | sed '/^$/d') || true)"
+  if [[ -n "${retired}" ]]; then
+    echo ""
+    echo "  retired (TEST-RETIRE:):"
+    echo "${retired}" | cut -f1,2 | sed 's/^/    - /'
+    removed="$(comm -23 <(printf '%s\n' "${removed}" | sed '/^$/d') <(printf '%s\n' "${retired}"))"
+  fi
 fi
 
 # A removal whose leaf name reappears in a DIFFERENT PACKAGE is a cross-crate
@@ -295,8 +359,10 @@ added_keys="$(printf '%s' "${added}" | sed '/^$/d' \
 # For each removed (package, leaf), a move requires the SAME leaf under a
 # DIFFERENT package. Multiset-aware: two removals of `foo` need two such
 # additions, else one of them is genuinely gone.
+# FILENAME, not NR == FNR: with no additions the first file is empty, and
+# NR == FNR would read every removal as an addition and report none vanished.
 vanished="$(awk -F'\t' '
-  NR == FNR { avail[$2 "\t" $1]++; leaf_total[$2]++; next }
+  FILENAME == ARGV[1] { avail[$2 "\t" $1]++; leaf_total[$2]++; next }
   {
     pkg = $1; leaf = $2
     same = avail[leaf "\t" pkg] + 0

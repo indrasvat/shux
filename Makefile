@@ -196,7 +196,8 @@ check-test-opt-out: ## Assert no integration test declares test = false (so make
 	@bash scripts/check-test-opt-out.sh
 
 .PHONY: check-test-inventory
-check-test-inventory: nextest-ready ## Assert no test stopped being compiled since BASE_REF (default origin/main)
+check-test-inventory: nextest-ready ## Assert no test stopped being compiled since BASE_REF, unless a TEST-MOVE:/TEST-RETIRE: trailer names it
+	@bash scripts/check-test-inventory-selftest.sh
 	@bash scripts/check-test-inventory.sh
 
 .PHONY: bench-test-suite
