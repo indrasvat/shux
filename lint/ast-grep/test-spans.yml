@@ -31,7 +31,7 @@ utils:
     any: [{ kind: attribute_item }, { kind: line_comment }, { kind: block_comment }]
   test-attr:
     kind: attribute_item
-    regex: '^#\[\s*(::)?([A-Za-z_][A-Za-z0-9_]*::)*(test|rstest|proptest)\s*[(\]]'
+    regex: '^#\[\s*(::)?([A-Za-z_][A-Za-z0-9_]*::)*(test|rstest|proptest)\s*([(\]]|/[*/])'
 rule:
   kind: function_item
   inside:

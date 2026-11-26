@@ -28,6 +28,7 @@ f="${f#(}"
 one='^binary_id\(=([^)]*)\) & test\(=(.*)\)$'
 module='^binary_id\(=([^)]*)\) & test\(/\^(.*)/\)$'
 binary='^binary_id\(=([^)]*)\)'
+package='^package\(=([^)]*)\)'
 while IFS= read -r t; do
     [[ "$t" != "${FLAKE_SELFTEST_EMPTY:-none}" ]] || continue
     if [[ "$t" =~ $one ]]; then
@@ -35,6 +36,8 @@ while IFS= read -r t; do
         [[ "$l" == "${FLAKE_SELFTEST_UNLISTED:-none}" ]] || echo "$l"
     elif [[ "$t" =~ $module ]]; then
         echo "${BASH_REMATCH[1]} ${BASH_REMATCH[2]}stub"
+    elif [[ "$t" =~ $package ]]; then
+        echo "${BASH_REMATCH[1]} stub"
     elif [[ "$t" =~ $binary ]]; then
         echo "${BASH_REMATCH[1]} stub"
     fi
@@ -53,10 +56,20 @@ printf '#!/usr/bin/env bash\necho "FILTER: $STRESS_FILTER"\n' >scripts/test-stre
 w() { mkdir -p "$(dirname "$1")"; printf '%s\n' "${@:2}" >"$1"; }
 w crates/p/src/lib.rs 'pub mod foo;' '#[cfg(any(test, fuzzing))]' 'pub mod fz;' 'pub fn a() {}' \
     '#[cfg(test)]' '/* harness */' 'mod blk;' '#[cfg(test)]' 'mod suite;' \
+    '#[cfg(test)]' 'mod cmtattr;' '#[cfg(test)]' 'mod suite3;' '#[cfg(test)]' '#[path = r"raw_p.rs"]' 'mod rawp;' \
+    '#[cfg(test)]' 'mod macrot;' \
     '#[cfg(test)]' 'mod tests {' '    #[test]' '    fn t() {}' '}'
 w crates/p/src/blk.rs 'const B: u8 = 1;' '#[test]' 'fn t() { let x = 1; }'
 w crates/p/src/suite.rs 'pub fn helper() {}' '#[cfg_attr(test, test)]' 'fn changed() { let x = 1; }'
-w crates/p/src/bare.rs 'pub fn prod() {}' '#[test]' 'fn bare() { let x = 1; }'
+w crates/p/src/cmtattr.rs 'pub fn h() {}' '#[test /* c */]' 'fn ct() { let x = 1; }'
+w crates/p/src/suite3.rs 'pub fn h() {}' '#[cfg_attr(' '    test,' '    test' ')]' 'fn m() { let x = 1; }'
+w crates/p/src/raw_p.rs '#[test]' 'fn r() { let x = 1; }'
+w crates/q/src/main.rs 'mod owner;' 'fn main() {}'
+w crates/r/src/lib.rs 'pub mod bin {' '    pub mod tool;' '}'
+w crates/r/src/bin/tool.rs '#[cfg(test)]' 'mod tests {' '    #[test]' '    fn tt() { let x = 1; }' '}'
+w crates/p/src/macrot.rs 'macro_rules! gen { () => { #[test] fn g() {} }; }' 'gen!();' 'const M: u8 = 1;'
+w crates/q/src/owner.rs '#[cfg(test)]' 'mod tests {' '    #[test]' '    fn o() { let x = 1; }' '}'
+w crates/p/src/bare.rs 'pub fn prod() {}' '#[test]' 'fn bare() { let x = 1; }' '#[test]' 'fn bare2() { let b2 = 1; }'
 w crates/p/src/helps.rs 'pub fn c() {}' '#[cfg(test)]' 'pub fn helper() -> u8 { 1 }'
 w crates/p/src/early_more.rs '#[test]' 'fn m() { let x = 1; }'
 w crates/p/src/bin/tool.rs 'fn main() {}' '#[cfg(test)]' 'mod tests {' '    #[test]' '    fn tool_t() { let x = 1; }' '}'
@@ -79,6 +92,7 @@ w crates/p/src/fns.rs 'pub fn c() { let y = 1; }' '' '#[cfg(test)]' 'mod tests {
     '    const STEP: u8 = 1; // a note' '    #[test]' '    fn uses_step() { let s = STEP; }' '' \
     '    #[test] fn anchor() {} const LIM2: u8 = 1;' '' \
     '    #[test]' '    fn shared() { let sh = 1; }' '' '    #[rstest::fixture]' '    fn fx() -> u8 { 1 }' '' \
+    '    #[test]' '    fn rewr() { let rw = 1; }' '' \
     '    /// Doc.' '    #[test]' '    fn a() { let a = 1; }' '' \
     '    #[test]' '    fn b() {' '        let b = 1;' '        let b2 = 1;' '    }' '' \
     '    #[test]' '    fn gone() { let g = 1; }' '' '    #[test]' '    fn old_name() { let r = 1; }' '' \
@@ -149,6 +163,7 @@ edit() { perl -pi -e 's/let x = 1;/let x = 2;/' "$@"; }
 
 echo "flake-gate self-test"
 fns() { perl -0pi -e "$1" crates/p/src/fns.rs; }
+units_p='package(=p) & (kind(=lib) + kind(=bin))'
 fns_coarse='binary_id(=p) & test(/^fns::/)'
 
 case_ "an integration-test binary, outside its tests" "echo 'const C: u8 = 0;' >>crates/p/tests/old.rs" 'binary_id(=p::old)'
@@ -182,6 +197,7 @@ case_ "a deleted test selects nothing" "fns 's/    #\\[test\\]\\n    fn gone\\(\
 case_ "a renamed test: the old name may be called, so the module" "fns 's/fn old_name/fn new_name/'" "$fns_coarse"
 case_ "a test made a helper: the module" "fns 's/    #\\[test\\]\\n    fn shared/    fn shared/'" "$fns_coarse"
 case_ "an rstest fixture is not a test" "fns 's/fn fx\\(\\) -> u8 \\{ 1 \\}/fn fx() -> u8 { 2 }/'" "$fns_coarse"
+case_ "a test rewritten whole into a helper: the module" "fns 's/    #\\[test\\]\\n    fn rewr\\(\\) \\{ let rw = 1; \\}/    fn rewr() { let rw = 2; }/'" "$fns_coarse"
 case_ "two tests" "fns 's/let a = 1;/let a = 2;/; s/let d = 1;/let d = 2;/'" \
     'binary_id(=p) & test(=fns::tests::a)' 'binary_id(=p) & test(=fns::tests::inner::d)'
 case_ "a proptest! fn" "fns 's/let p = x;/let p = x + 1;/'" 'binary_id(=p) & test(=fns::tests::prop)'
@@ -207,9 +223,9 @@ case_ "production code above the test module" "fns 's/let y = 1;/let y = 2;/'" -
 FLAKE_SELFTEST_UNLISTED='p fns::tests::a' \
     case_ "a test nextest does not list by that name: the whole module" "fns 's/let a = 1;/let a = 2;/'" "$fns_coarse"
 FLAKE_SELFTEST_UNLISTED='p fns::tests::a' FLAKE_SELFTEST_EMPTY="$fns_coarse" \
-    case_ "... and when that module lists nothing: its package's unit tests" "fns 's/let a = 1;/let a = 2;/'" 'binary_id(=p) + binary_id(p::bin/*)'
+    case_ "... and when that module lists nothing: its package's unit tests" "fns 's/let a = 1;/let a = 2;/'" "$units_p"
 FLAKE_SELFTEST_EMPTY='binary_id(=p) & test(/^helps::/)' \
-    case_ "a cfg(test) helper in a module with no tests: its package's unit tests" "perl -pi -e 's/u8 \\{ 1 \\}/u8 { 2 }/' crates/p/src/helps.rs" 'binary_id(=p) + binary_id(p::bin/*)'
+    case_ "a cfg(test) helper in a module with no tests: its package's unit tests" "perl -pi -e 's/u8 \\{ 1 \\}/u8 { 2 }/' crates/p/src/helps.rs" "$units_p"
 case_ "production code after a cfg(test) use" "perl -pi -e 's/let y = 1;/let y = 2;/' crates/p/src/early.rs" -
 case_ "a cfg(test) use" "perl -pi -e 's/fmt::Write;/fmt::Display;/' crates/p/src/early.rs" 'binary_id(=p) & test(/^early::/)'
 case_ "a changed cfg(test) mod x; declaration: the declaring module" "perl -pi -e 's/early_more/early_other/' crates/p/src/early.rs" 'binary_id(=p) & test(/^early::/)'
@@ -222,11 +238,18 @@ case_ "a test in src/bin/<name>.rs: that bin" "edit crates/p/src/bin/tool.rs" 'b
 case_ "a #[test] outside cfg(test)" "edit crates/p/src/bare.rs" 'binary_id(=p) & test(=bare::bare)'
 case_ "a comment inside cfg(…)" "perl -pi -e 's/CV: u8 = 1/CV: u8 = 2/' crates/p/src/attr.rs" 'binary_id(=p) & test(/^attr::/)'
 case_ "core::cfg(not(not(test)))" "perl -pi -e 's/NV: u8 = 1/NV: u8 = 2/' crates/p/src/attr.rs" 'binary_id(=p) & test(/^attr::/)'
-case_ "a file a #[path] names: its package's unit tests" "edit crates/p/src/early_more.rs" 'binary_id(=p) + binary_id(p::bin/*)'
+case_ "a file a #[path] names: its package's unit tests" "edit crates/p/src/early_more.rs" "$units_p"
 case_ "a test-only file declared past a block comment" "perl -pi -e 's/B: u8 = 1/B: u8 = 2/' crates/p/src/blk.rs" 'binary_id(=p) & test(/^blk::/)'
 case_ "a test-only file whose test is a cfg_attr" "edit crates/p/src/suite.rs" 'binary_id(=p) & test(/^suite::/)'
 case_ "a tests/ helper its binary declares under an attribute" "edit crates/p/tests/support/mod.rs" 'binary_id(=p::c)'
 case_ "a NUL byte in a test file" "perl -pi -e 's/let v = 1;/let v = 2;/' crates/p/tests/nul.rs" 'binary_id(=p::nul) & test(=n)'
+case_ "a test attribute with a comment in it" "edit crates/p/src/cmtattr.rs" 'binary_id(=p) & test(=cmtattr::ct)'
+case_ "a test-only file whose cfg_attr spans lines" "edit crates/p/src/suite3.rs" 'binary_id(=p) & test(/^suite3::/)'
+case_ "a file a raw-string #[path] names" "edit crates/p/src/raw_p.rs" "$units_p"
+case_ "a file a bin's mod x; owns" "edit crates/q/src/owner.rs" 'package(=q) & (kind(=lib) + kind(=bin))'
+case_ "src/bin/ in a package whose lib has a mod bin" "edit crates/r/src/bin/tool.rs" 'package(=r) & (kind(=lib) + kind(=bin))'
+case_ "a bare test rewritten whole into a helper: the module" "perl -0pi -e 's/#\\[test\\]\\nfn bare2\\(\\) \\{ let b2 = 1; \\}/fn bare2() { let b2 = 2; }/' crates/p/src/bare.rs" 'binary_id(=p) & test(/^bare::/)'
+case_ "a test-only file whose tests a macro writes" "perl -pi -e 's/M: u8 = 1/M: u8 = 2/' crates/p/src/macrot.rs" 'binary_id(=p) & test(/^macrot::/)'
 
 # Discovery that fails must fail the gate, never read as "nothing to gate".
 git checkout -q -f main

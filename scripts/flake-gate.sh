@@ -14,7 +14,8 @@
 #   any other file under tests/ or     the tests whose sources name it (a proptest
 #   .shux/fixtures/                    regressions file: the binary it is named after)
 # Within a .rs file, a change that stays inside test functions selects just
-# those tests (docs/testing.md#the-flake-gate, lint/ast-grep/test-spans.yml).
+# those tests, and a term that lists nothing widens until it does
+# (docs/testing.md#the-flake-gate, lint/ast-grep/test-spans.yml).
 # shux-testkit's dependents are not re-run when it changes: that is most of the
 # suite, which CI runs once anyway; its own tests are gated like any others.
 #
@@ -48,16 +49,23 @@ while IFS=$'\t' read -r file _ modp; do
     [[ -n "$file" ]] && test_only[$file]="$modp"
 done <<<"$test_only_out"
 
-# A test attribute (test-spans.yml's test-attr), or a cfg_attr that may be one.
-test_attr='^[[:space:]]*#\[[[:space:]]*(::)?([A-Za-z_][A-Za-z0-9_]*::)*(test|rstest|proptest)[[:space:]]*[](]|proptest!|cfg_attr[[:space:]]*\(.*(^|[^A-Za-z0-9_])test([^A-Za-z0-9_]|$)'
 
 # units <pkg>: every unit-test binary of <pkg>: its lib's, and its bins'.
-units() {
-    if [[ -f "crates/$1/src/main.rs" || -d "crates/$1/src/bin" ]]; then
-        echo "binary_id(=$1) + binary_id($1::bin/*)"
-    else
-        echo "binary_id(=$1)"
-    fi
+units() { echo "package(=$1) & (kind(=lib) + kind(=bin))"; }
+
+# unowned <pkg> <file>: whether which unit-test binary holds <file>'s tests is
+# not what its path says: a bin of <pkg> declares a `mod x;` of its own, or
+# <file> is under src/bin/ and the lib declares a `mod bin`, or a #[path]
+# names <file>, whose module path is then not its file path either.
+unowned() {
+    local name
+    name="$(basename "$2")"
+    # -s: a package need not have either.
+    grep -rqsE --include='*.rs' '^[[:space:]]*(pub(\([^)]*\))?[[:space:]]+)?mod[[:space:]]+[A-Za-z0-9_]+[[:space:]]*;' \
+        "crates/$1/src/main.rs" "crates/$1/src/bin" && return 0
+    [[ "$2" == "crates/$1/src/bin/"* ]] &&
+        grep -rqE --include='*.rs' '(^|[^A-Za-z0-9_])mod[[:space:]]+bin([^A-Za-z0-9_]|$)' "crates/$1/src" && return 0
+    grep -rqE --include='*.rs' "#\[[[:space:]]*path[[:space:]]*=[[:space:]]*r?#*\"([^\"]*/)?${name//./\\.}\"" "crates/$1/src"
 }
 
 # test_spans <file>: "s <first> <last> <path in file>" per test function, its
@@ -67,7 +75,7 @@ units() {
 # several lines. An s or m span claims no line it shares with other code.
 test_spans() {
     local out
-    out="$(ast-grep scan -r "$spans_rules" --json=stream "$1")"
+    out="$(ast-grep scan -r "$spans_rules" --json=stream "$1")" || return 1
     jq -r '.metaVariables.single as $v |
         [.ruleId, .range.start.line + 1, .range.start.column, .range.end.line + 1, .range.end.column,
          .range.byteOffset.start, .range.byteOffset.end, ($v.NAME.text // "-"),
@@ -100,6 +108,16 @@ test_spans() {
             $1 == "ptattr" { pt = 1 }
             $1 == "pname" { ps = pl ? from(pl, pc) : from($2, $3); ok = pt; pl = pt = 0 }
             $1 == "ptest" && ok { print "s", ps, to($4, $5), path($6) $8 }' "$1" -
+}
+
+# has_tests <file>: whether it may hold a test: one the spans see, code under
+# a cfg naming test (a `#[cfg_attr(test, test)]` fn), or text that reads like
+# a test attribute (one a macro_rules! writes). A wrong yes selects more: the
+# file's own module, which widens when it lists nothing.
+has_tests() {
+    local spans
+    spans="$(test_spans "$1")" || { echo "flake-gate: ast-grep failed on $1" >&2; exit 1; }
+    grep -qE '^[st]'$'\t' <<<"$spans" || grep -qE '#\[([^]]*[^A-Za-z0-9_])?test([^A-Za-z0-9_]|$)|proptest!' "$1"
 }
 
 # touched_lines <side> <all|cfg> <spans> <diff> <source>: what one side (old
@@ -192,6 +210,13 @@ fn_select() {
     for name in "${!reached[@]}"; do
         if [[ -z "$why" && -z "${present[$name]+set}" ]]; then why="test $name is no longer a test"; fi
     done
+    for name in "${!gone[@]}"; do
+        # Rewritten whole, but still a fn: a helper now, which callers may use.
+        if [[ -z "$why" && -z "${present[$name]+set}" ]] &&
+            grep -qE "(^|[^A-Za-z0-9_])fn[[:space:]]+${name##*::}([^A-Za-z0-9_]|$)" "$tmp/new.rs"; then
+            why="test $name is no longer a test"
+        fi
+    done
     if [[ -n "$why" ]]; then
         echo "flake-gate: $f: $why; selecting $coarse" >&2
         terms+=("$coarse")
@@ -219,7 +244,7 @@ users_of() {
     while IFS= read -r user; do
         [[ -n "$user" && "$user" != "$f" ]] || continue
         if [[ -n "${test_only[$user]+set}" ]]; then
-            grep -qE "$test_attr" "$user" || return 1
+            has_tests "$user" || return 1
             path="${test_only[$user]}"
         else
             path="${user#"crates/$pkg/src/"}"
@@ -248,12 +273,11 @@ select_rs() {
             terms+=("binary_id(=$pkg::$(basename "$user" .rs))")
         done < <(grep -lE "^[[:space:]]*(#\[[[:space:]]*path[[:space:]]*=[[:space:]]*\"$dir/[^\"]*\"[[:space:]]*\]|(#\[[^]]*\][[:space:]]*)*(pub(\([^)]*\))?[[:space:]]+)?mod[[:space:]]+${dir}[[:space:]]*;)" \
             "crates/$pkg/tests/"*.rs || true)
-    elif grep -rqE --include='*.rs' "#\[[[:space:]]*path[[:space:]]*=[[:space:]]*\"([^\"]*/)?$(basename "${f//./\\.}")\"" "crates/$pkg/src"; then
-        # Loaded by #[path]: its module path is not its file path.
-        echo "flake-gate: $f is a #[path] module; selecting $(units "$pkg")" >&2
+    elif unowned "$pkg" "$f"; then
+        echo "flake-gate: $f's module path or binary is not its file path's; selecting $(units "$pkg")" >&2
         terms+=("$(units "$pkg")")
     elif [[ -n "${test_only[$f]+set}" ]]; then
-        if [[ -f "$f" ]] && grep -qE "$test_attr" "$f"; then
+        if [[ -f "$f" ]] && has_tests "$f"; then
             fn_select "$known" "$f" "$pkg" "${test_only[$f]}" all "binary_id(=$pkg) & test(/^${test_only[$f]}::/)"
         else
             users_of "$f" "$pkg" || terms+=("binary_id(=$pkg)")
