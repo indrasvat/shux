@@ -8,18 +8,17 @@
 # origin/main and checks the failed test is in the list nextest returns. Any
 # test left out fails the run.
 #
-#   $1                  the input (default .shux/flake-gate-catches.txt)
-#   FLAKE_MISSES_OUT    default .shux/out/flake-gate-misses (catches.jsonl)
+#   $1    the input (default .shux/flake-gate-catches.txt): `#` comments and
+#         blank lines aside, CRLF or LF, a last line with no newline too
 
 set -euo pipefail
 
 root="$(git rev-parse --show-toplevel)"
 input="${1:-$root/.shux/flake-gate-catches.txt}"
-out="${FLAKE_MISSES_OUT:-$root/.shux/out/flake-gate-misses}"
 command -v ast-grep >/dev/null || { echo "✗ no ast-grep on PATH" >&2; exit 1; }
-[[ -s "$input" ]] || { echo "✗ no catches in $input" >&2; exit 1; }
-mkdir -p "$out"
-: >"$out/catches.jsonl"
+[[ -f "$input" ]] || { echo "✗ no file $input" >&2; exit 1; }
+catches="$(awk '{ sub(/\r$/, "") } !/^[[:space:]]*(#|$)/' "$input")"
+[[ -n "$catches" ]] || { echo "✗ no catches in $input" >&2; exit 1; }
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$root/target}"
 
 scratch="$(mktemp -d "${TMPDIR:-/tmp}/shux-flake-misses.XXXXXX")"
@@ -36,7 +35,6 @@ printf '#!/usr/bin/env bash\nprintf "%%s" "$STRESS_FILTER" >"$FLAKE_PROOF_FILTER
 fail=0
 n=0
 while read -r commit bin test; do
-    [[ -n "$commit" && "$commit" != \#* ]] || continue
     n=$((n + 1))
     # A PR's commits outlive its squash merge only under refs/pull/*: fetch by id.
     git -C "$root" cat-file -e "$commit^{commit}" 2>/dev/null || git -C "$root" fetch -q origin "$commit"
@@ -64,18 +62,14 @@ while read -r commit bin test; do
         : >"$scratch/set"
     fi
     if grep -qxF "$bin $test" "$scratch/set"; then
-        kept=true
         printf '\033[1;32m  ✓ kept, among %d selected\033[0m\n' "$selected"
     else
-        kept=false
         fail=1
         printf '\033[1;31m  ✗ dropped: %d selected, not this one\033[0m\n' "$selected"
     fi
-    jq -cn --arg c "$commit" --arg b "$bin" --arg t "$test" --argjson s "$selected" --argjson k "$kept" \
-        '{commit: $c, binary: $b, test: $t, selected: $s, kept: $k}' >>"$out/catches.jsonl"
-done <"$input"
+done <<<"$catches"
 if ((fail)); then
-    printf '\033[1;31m✗ flake gate misses: a caught flake is no longer selected (%s)\033[0m\n' "$out/catches.jsonl"
+    printf '\033[1;31m✗ flake gate misses: a caught flake is no longer selected\033[0m\n'
     exit 1
 fi
-printf '\033[1;32m✓ flake gate misses: all %d caught flakes still selected (%s)\033[0m\n' "$n" "$out/catches.jsonl"
+printf '\033[1;32m✓ flake gate misses: all %d caught flakes still selected\033[0m\n' "$n"

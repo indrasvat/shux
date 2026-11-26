@@ -6,10 +6,13 @@
 #   STRESS_FILTER  nextest filterset                      (default all())
 #   STRESS_LOAD    CPU hogs to run alongside, via stress-ng (default 0)
 #   NEXTEST_JOBS   nextest -j                             (Makefile default)
+#   NEXTEST_PROFILE  the nextest profile every run uses   (default "default")
 #
 # Every run after the first starts the tests that were slowest in the first:
 # a run lasts until its slowest test ends, and one that starts last stretches
-# the run by its whole length. The tests and their number are the same.
+# the run by its whole length. The tests and their number are the same. Each
+# run uses a profile that inherits NEXTEST_PROFILE and adds only a JUnit
+# report (the first) or priorities (the rest).
 
 set -euo pipefail
 
@@ -17,18 +20,28 @@ count="${STRESS_COUNT:-10}"
 filter="${STRESS_FILTER:-all()}"
 load="${STRESS_LOAD:-0}"
 jobs="${NEXTEST_JOBS:-16}"
+base_profile="${NEXTEST_PROFILE:-default}"
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/shux-test-stress.XXXXXX")"
 hog=""
 cleanup() {
-    if [[ -n "$hog" ]]; then kill "$hog" 2>/dev/null; wait "$hog" 2>/dev/null || true; fi
+    if [[ -n "$hog" ]]; then
+        kill "$hog" 2>/dev/null || true
+        wait "$hog" 2>/dev/null || true
+    fi
     rm -rf "$tmp"
 }
 trap cleanup EXIT
-# The first run writes its JUnit report; later runs read their order from it.
+# toml_str <s>: <s> as a TOML basic string.
+toml_str() {
+    local s="${1//\\/\\\\}"
+    printf '"%s"' "${s//\"/\\\"}"
+}
 config="$tmp/nextest.toml"
 cp "$root/.config/nextest.toml" "$config"
-printf '\n[profile.default.junit]\npath = "%s"\n' "$tmp/first.xml" >>"$config"
+printf '\n[profile.stress-first]\ninherits = %s\n[profile.stress-first.junit]\npath = %s\n' \
+    "$(toml_str "$base_profile")" "$(toml_str "$tmp/first.xml")" >>"$config"
+profile=stress-first
 
 if ((load > 0)); then
     command -v stress-ng >/dev/null || {
@@ -40,21 +53,30 @@ if ((load > 0)); then
 fi
 
 # slowest_first: the repo config, plus a nextest priority (100 down to 1) for
-# the 100 slowest tests of the first run.
+# the 100 slowest tests of the first run. A name a filterset or the JUnit
+# escaping could misread (anything but a Rust path) keeps nextest's order.
 slowest_first() {
     [[ -s "$tmp/first.xml" ]] || { echo "test-stress: the first run wrote no JUnit report" >&2; exit 1; }
     cp "$root/.config/nextest.toml" "$config"
+    printf '\n[profile.stress-rest]\ninherits = %s\n' "$(toml_str "$base_profile")" >>"$config"
     awk '/<testcase / {
             n = $0; sub(/.* name="/, "", n); sub(/".*/, "", n)
             b = $0; sub(/.* classname="/, "", b); sub(/".*/, "", b)
             t = $0; sub(/.* time="/, "", t); sub(/".*/, "", t)
-            print t "\t" b "\t" n
+            if (n ~ /^[A-Za-z0-9_:]+$/ && b ~ /^[A-Za-z0-9_:\/.-]+$/) print t "\t" b "\t" n
          }' "$tmp/first.xml" | sort -t$'\t' -k1,1gr |
-        awk -F'\t' 'NR <= 100 { printf "\n[[profile.default.overrides]]\nfilter = '\''binary_id(=%s) & test(=%s)'\''\npriority = %d\n", $2, $3, 101 - NR }' \
+        awk -F'\t' 'NR <= 100 { printf "\n[[profile.stress-rest.overrides]]\nfilter = '\''binary_id(=%s) & test(=%s)'\''\npriority = %d\n", $2, $3, 101 - NR }' \
             >>"$config"
+    profile=stress-rest
 }
 # A hog that died leaves the run unloaded, which proves nothing about load.
-hogs_alive() { ((load == 0)) || kill -0 "$hog" 2>/dev/null; }
+# A hog that exited but is not reaped yet still answers kill -0: read its state.
+hogs_alive() {
+    ((load == 0)) && return 0
+    local state
+    state="$(ps -o stat= -p "$hog" 2>/dev/null || true)"
+    [[ -n "$state" && "$state" != Z* ]]
+}
 
 echo "▶ $count run(s) of '$filter' with $load CPU hog(s), -j $jobs"
 hogs_alive || { echo "test-stress: stress-ng exited before the run started" >&2; exit 1; }
@@ -63,7 +85,7 @@ hogs_alive || { echo "test-stress: stress-ng exited before the run started" >&2;
 failed=0
 for ((i = 1; i <= count; i++)); do
     status=0
-    (cd "$root" && cargo nextest run --config-file "$config" -j "$jobs" --status-level fail --workspace -E "$filter") ||
+    (cd "$root" && cargo nextest run --config-file "$config" --profile "$profile" -j "$jobs" --status-level fail --workspace -E "$filter") ||
         status=$?
     # 100 is a test failure; anything else (a build error, no test matched) ends the run.
     case "$status" in
