@@ -6,8 +6,8 @@
   ast-grep (`scripts/flake-gate.sh`, since #324). No coverage map, no stored
   state, no LLM.
 - **The flake gate starts the slowest tests first** in every run after the
-  first (`scripts/test-stress.sh`). On #321's 399 tests, 20 runs under load
-  went from 1137 s to 1019 s (−10%), main's script against this one. The
+  first (`scripts/test-stress.sh`). On #321's 399 tests under load, runs 2–20
+  went from 1083 s to 973 s (−10%), main's script against this one. The
   tests and their count are unchanged. A small PR's gate is no slower (#320:
   74 s either way).
 - **Measured and not adopted:** a per-test coverage probe, overlapping the 20
@@ -106,7 +106,7 @@ new test alone takes 24 s.
 
 | Idea | Measured on #321 | Verdict |
 |---|---|---|
-| Start the slowest tests first in runs 2–20 | 1137 s → 1019 s (−10%), 0 failures: main's `test-stress.sh` against this one, back to back. Runs vary ±10 s under load, so treat it as about 10%. A prototype that ranked from an unloaded run and ordered all 20 runs measured 1069 s → 887 s | **shipped** |
+| Start the slowest tests first in runs 2–20 | runs 2–20: 1083 s → 973 s (−10%), 0 failures: main's `test-stress.sh` against this one, back to back (all 20 runs: 1137 s → 1019 s; run 1 alone varied 54.5 s against 46.2 s). Runs vary ±10 s under load, so treat it as about 10%. A prototype that ranked from an unloaded run and ordered all 20 runs measured 1069 s → 887 s | **shipped** |
 | Run the 20 runs as 4 overlapping lanes, the daemon cap split between them | 881 s, against the prototype's 1069 s in order (one run, and an unrelated build shared the machine for two minutes of it) | not adopted: copies of one test then run at once, which no test was written for; measuring whether every test tolerates that is its own piece of work, and one run is too noisy to say it beats ordering |
 | Coverage probe: one instrumented run, then keep only the tests that entered a changed helper fn | 399 → about 280 tests; costs 110 s to build and 37 s to run, before the 20 runs | not adopted: about 10% net (a projection, not measured end to end), and an unloaded run cannot show which paths a test takes under load, which is the one thing the gate is for |
 | A coverage map built on `main` and stored | not built | same objection, and it goes stale |
