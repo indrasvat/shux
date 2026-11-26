@@ -1438,6 +1438,38 @@ pub fn print_error(msg: &str) {
     let _ = writeln!(err, "{}", safe_diagnostic(msg));
 }
 
+/// `shux daemon upgrade`: what happened, then what happens next.
+pub fn print_upgrade(done: bool, headline: &str, next: &str) -> Printed {
+    writeln!(
+        io::stdout().lock(),
+        "{}",
+        upgrade_line(done, headline, next)
+    )?;
+    Ok(())
+}
+
+fn upgrade_line(done: bool, headline: &str, next: &str) -> String {
+    let mark = if done {
+        success("\u{2713}").to_string()
+    } else {
+        warning("!").to_string()
+    };
+    match next {
+        "" => format!("{mark} {}", bold(headline)),
+        next => format!(
+            "{mark} {}{}",
+            bold(headline),
+            muted(format!("; {}", safe_diagnostic(next)))
+        ),
+    }
+}
+
+/// One muted line on stderr: a note on how the command ran, never its output.
+pub fn print_muted_note(msg: &str) {
+    let mut err = io::stderr().lock();
+    let _ = writeln!(err, "{}", muted(safe_diagnostic(msg)));
+}
+
 // ── Egress Guard (issue #104) ──────────────────────────────────
 
 /// Render an untrusted label — an entity name, a title, an error message
@@ -2666,6 +2698,27 @@ pub fn print_share_stopped(links: u64) -> Printed {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Without colour the headline and the next step stay apart, as JSON's
+    /// `detail` keeps them; with nothing next, nothing trails the headline.
+    #[test]
+    fn an_upgrade_line_keeps_its_headline_and_next_step_apart_without_colour() {
+        let plain = |done: bool, headline: &str, next: &str| {
+            shux_pty::strip_ansi(&upgrade_line(done, headline, next))
+        };
+        assert_eq!(
+            plain(
+                true,
+                "no daemon is running",
+                "the next shux command starts this build"
+            ),
+            "\u{2713} no daemon is running; the next shux command starts this build"
+        );
+        assert_eq!(
+            plain(false, "could not reach it", ""),
+            "! could not reach it"
+        );
+    }
 
     /// The time left comes first, then the local end with its day and zone.
     #[test]

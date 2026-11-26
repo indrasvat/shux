@@ -218,6 +218,7 @@ mod tests {
                 windows,
                 panes,
                 version: 1,
+                ..Default::default()
             },
             sid,
         )

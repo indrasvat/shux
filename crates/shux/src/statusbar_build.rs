@@ -343,6 +343,45 @@ pub fn append_viewing(
     }
 }
 
+/// A newer shux than this daemon is installed: `↑ <version>`, and `at idle`
+/// once the daemon will hand over when its last session ends. The badge
+/// sheds words to fit and is dropped whole rather than cut; any other
+/// segment outranks it.
+pub fn append_upgrade(
+    bar: &mut StatusBar,
+    newer: Option<&str>,
+    pending: bool,
+    theme: &Theme,
+    cols: u16,
+) {
+    // A leading gap: the zone's last segment may end flush (a clock).
+    let mut ladder = Vec::new();
+    match (newer, pending) {
+        (None, false) => return,
+        // Asked for by a build of the same release: no number to show.
+        (None, true) => ladder.push(" ↑ at idle ".to_string()),
+        (Some(version), pending) => {
+            if pending {
+                ladder.push(format!(" ↑ {version} at idle "));
+            }
+            ladder.push(format!(" ↑ {version} "));
+        }
+    }
+    ladder.push(" ↑ ".to_string());
+    let Rgb { r, g, b } = theme.status_accent;
+    let width = StatusBar::segments_width;
+    let (lw, cw, rw) = (width(&bar.left), width(&bar.center), width(&bar.right));
+    let gaps = if cw > 0 { 2 } else { 1 };
+    let room = usize::from(cols).saturating_sub(lw + cw + rw + gaps);
+    let fits = ladder
+        .into_iter()
+        .map(|t| StatusSegment::styled(t, Color::Rgb { r, g, b }, false))
+        .find(|s| width(std::slice::from_ref(s)) <= room);
+    if let Some(segment) = fits {
+        bar.right.push(segment);
+    }
+}
+
 /// Marks the segments of a sharing badge: no fitting pass drops one.
 const BADGE: usize = usize::MAX;
 
@@ -617,6 +656,49 @@ mod tests {
             }
         }
         b
+    }
+
+    /// The upgrade badge sheds words to fit, is dropped whole rather than
+    /// cut or squeezing anything out, and loses only its colour under
+    /// NO_COLOR.
+    #[test]
+    fn the_upgrade_badge_sheds_words_then_goes() {
+        let last = |b: &StatusBar| b.right.last().map(|s| s.text.clone());
+        let at = |cols, pending| {
+            let mut b = bar("session", "", "up 3m");
+            append_upgrade(&mut b, Some("0.65.0"), pending, &Theme::DEFAULT, cols);
+            b
+        };
+        assert_eq!(last(&at(80, true)).as_deref(), Some(" ↑ 0.65.0 at idle "));
+        assert_eq!(last(&at(80, false)).as_deref(), Some(" ↑ 0.65.0 "));
+        assert_eq!(last(&at(24, true)).as_deref(), Some(" ↑ 0.65.0 "));
+        assert_eq!(last(&at(17, true)).as_deref(), Some(" ↑ "));
+        let full = at(15, true);
+        assert_eq!(
+            last(&full).as_deref(),
+            Some("up 3m"),
+            "the badge pushed nothing out"
+        );
+        assert_eq!(full.left[0].text, "session");
+
+        let mut none = bar("session", "", "up 3m");
+        append_upgrade(&mut none, None, false, &Theme::DEFAULT, 80);
+        assert_eq!(none.right.len(), 1, "no newer build, no badge");
+        let mut same = bar("session", "", "up 3m");
+        append_upgrade(&mut same, None, true, &Theme::DEFAULT, 80);
+        assert_eq!(
+            last(&same).as_deref(),
+            Some(" ↑ at idle "),
+            "pending, by a same-release build"
+        );
+
+        let mut plain = at(80, true);
+        monochrome(&mut plain);
+        let badge = plain.right.last().expect("badge");
+        assert_eq!(
+            (badge.text.as_str(), badge.fg),
+            (" ↑ 0.65.0 at idle ", None)
+        );
     }
 
     #[test]

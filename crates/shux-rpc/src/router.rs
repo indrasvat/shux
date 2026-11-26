@@ -56,7 +56,14 @@ pub struct Router {
     methods: Arc<HashMap<String, Arc<dyn Handler>>>,
     policies: Arc<HashMap<String, Policy>>,
     owner_local: Arc<HashSet<String>>,
+    accepts: Arc<HashMap<String, Accepts>>,
+    keeps_null: Arc<HashMap<String, Accepts>>,
 }
+
+/// The top-level parameters a method accepts. Any other key is refused before
+/// the handler runs, so a newer client's field never reaches a daemon that
+/// would ignore it.
+pub type Accepts = &'static [&'static str];
 
 impl Router {
     /// Create a new empty router.
@@ -65,6 +72,8 @@ impl Router {
             methods: Arc::new(HashMap::new()),
             policies: Arc::new(HashMap::new()),
             owner_local: Arc::default(),
+            accepts: Arc::default(),
+            keeps_null: Arc::default(),
         }
     }
 
@@ -74,6 +83,8 @@ impl Router {
             methods: HashMap::new(),
             policies: HashMap::new(),
             owner_local: HashSet::new(),
+            accepts: HashMap::new(),
+            keeps_null: HashMap::new(),
         }
     }
 
@@ -101,6 +112,16 @@ impl Router {
         }
         match self.methods.get(method) {
             Some(handler) => {
+                let mut params = params;
+                if let Some(accepted) = self.accepts.get(method) {
+                    check_params(method, accepted, params.as_ref())?;
+                    // A key set to `null` asks for nothing, unless it is one
+                    // whose `null` means something: gone, as if absent.
+                    let keep = self.keeps_null.get(method).copied().unwrap_or_default();
+                    if let Some(Value::Object(object)) = params.as_mut() {
+                        object.retain(|k, v| !v.is_null() || keep.contains(&k.as_str()));
+                    }
+                }
                 debug!(method, "dispatching RPC method");
                 handler.handle(params).await
             }
@@ -125,6 +146,20 @@ impl Router {
     /// plugin permission enforcer; direct CLI clients ignore this.
     pub fn policy(&self, method: &str) -> Option<&Policy> {
         self.policies.get(method)
+    }
+
+    /// Panic on boot if any registered method has no declared parameters.
+    pub fn assert_every_route_declares_params(&self) {
+        let mut missing: Vec<&str> = self
+            .methods
+            .keys()
+            .filter(|m| !self.accepts.contains_key(*m))
+            .map(|s| s.as_str())
+            .collect();
+        missing.sort_unstable();
+        if !missing.is_empty() {
+            panic!("RPC method(s) registered without declared parameters: {missing:?}");
+        }
     }
 
     /// Panic on boot if any registered handler has no declared policy.
@@ -171,6 +206,8 @@ pub struct RouterBuilder {
     methods: HashMap<String, Arc<dyn Handler>>,
     policies: HashMap<String, Policy>,
     owner_local: HashSet<String>,
+    accepts: HashMap<String, Accepts>,
+    keeps_null: HashMap<String, Accepts>,
 }
 
 impl RouterBuilder {
@@ -222,15 +259,77 @@ impl RouterBuilder {
         self
     }
 
+    /// Declare the top-level parameters each named method accepts.
+    pub fn accepts(mut self, table: &[(&str, Accepts)]) -> Self {
+        for (method, keys) in table {
+            self.accepts.insert((*method).to_string(), keys);
+        }
+        self
+    }
+
+    /// The keys whose `null` reaches the handler, per method: every other
+    /// key set to `null` is removed first, as if absent.
+    pub fn keeps_null(mut self, table: &[(&str, Accepts)]) -> Self {
+        for (method, keys) in table {
+            self.keeps_null.insert((*method).to_string(), keys);
+        }
+        self
+    }
+
     /// Build the router.
     pub fn build(self) -> Router {
         Router {
             methods: Arc::new(self.methods),
             policies: Arc::new(self.policies),
             owner_local: Arc::new(self.owner_local),
+            accepts: Arc::new(self.accepts),
+            keeps_null: Arc::new(self.keeps_null),
         }
     }
 }
+
+/// `params` is absent, `null` or an object holding only `accepted` keys.
+fn check_params(method: &str, accepted: Accepts, params: Option<&Value>) -> Result<(), RpcError> {
+    let object = match params {
+        None | Some(Value::Null) => return Ok(()),
+        Some(Value::Object(object)) => object,
+        Some(_) => {
+            return Err(RpcError::with_data(
+                crate::ErrorCode::InvalidParams,
+                serde_json::json!({
+                    "kind": "params_not_object",
+                    "method": method,
+                    "detail": format!("{method} takes its parameters as a JSON object"),
+                }),
+            ));
+        }
+    };
+    // An unknown key set to `null` asks for nothing, as if it were absent.
+    let mut unknown: Vec<&str> = object
+        .iter()
+        .filter(|(k, v)| !accepted.contains(&k.as_str()) && !v.is_null())
+        .map(|(k, _)| k.as_str())
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    unknown.sort_unstable();
+    let mut known = accepted.to_vec();
+    known.sort_unstable();
+    Err(RpcError::with_data(
+        crate::ErrorCode::InvalidParams,
+        serde_json::json!({
+            "kind": UNKNOWN_PARAMS,
+            "method": method,
+            "params": unknown,
+            "accepted": known,
+            "detail": format!("{method} does not take {}", unknown.join(", ")),
+        }),
+    ))
+}
+
+/// `error.data.kind` of a call naming a parameter its method does not take.
+pub const UNKNOWN_PARAMS: &str = "unknown_params";
 
 #[cfg(test)]
 mod tests {
@@ -289,6 +388,89 @@ mod tests {
         assert!(router.has_method("system.version"));
         assert!(router.has_method("system.health"));
         assert!(!router.has_method("nonexistent"));
+    }
+
+    fn counting_router() -> (Router, Arc<std::sync::atomic::AtomicUsize>) {
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = ran.clone();
+        let router = Router::builder()
+            .register("m.one", move |_: Option<Value>| {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Ok(Value::Null) }
+            })
+            .accepts(&[("m.one", &["a", "b"])])
+            .build();
+        (router, ran)
+    }
+
+    /// A key the method does not take is refused before its handler runs,
+    /// naming the key: an older daemon never silently ignores a newer field.
+    #[tokio::test]
+    async fn an_undeclared_parameter_is_refused_before_the_handler_runs() {
+        let (router, ran) = counting_router();
+        let err = router
+            .dispatch("m.one", Some(serde_json::json!({"a": 1, "zz": 2, "c": 3})))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, -32602);
+        let data = err.data.unwrap();
+        assert_eq!(data["kind"], UNKNOWN_PARAMS);
+        assert_eq!(data["params"], serde_json::json!(["c", "zz"]));
+        assert_eq!(data["accepted"], serde_json::json!(["a", "b"]));
+        assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// Declared keys, no params and `null` params all reach the handler; a
+    /// non-object is refused.
+    #[tokio::test]
+    async fn declared_absent_and_null_params_pass_and_a_non_object_does_not() {
+        let (router, ran) = counting_router();
+        for ok in [
+            None,
+            Some(Value::Null),
+            Some(serde_json::json!({"a": 1, "b": null})),
+            Some(serde_json::json!({"a": 1, "zz": null})),
+        ] {
+            router.dispatch("m.one", ok).await.unwrap();
+        }
+        assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 4);
+        let err = router
+            .dispatch("m.one", Some(serde_json::json!(["a"])))
+            .await
+            .unwrap_err();
+        assert_eq!(err.data.unwrap()["kind"], "params_not_object");
+        assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
+    /// A key set to `null`, declared or not, never reaches the handler, but
+    /// for the keys whose `null` means something: no other parameter can give
+    /// `null` a meaning a daemon of an older build would drop.
+    #[tokio::test]
+    async fn a_null_key_is_removed_before_the_handler() {
+        let router = Router::builder()
+            .register("m.echo", |p: Option<Value>| async move {
+                Ok(p.unwrap_or(Value::Null))
+            })
+            .accepts(&[("m.echo", &["a", "b", "c"])])
+            .keeps_null(&[("m.echo", &["b"])])
+            .build();
+        let seen = router
+            .dispatch(
+                "m.echo",
+                Some(serde_json::json!({"a": 1, "b": null, "c": null, "zz": null})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(seen, serde_json::json!({"a": 1, "b": null}));
+    }
+
+    #[test]
+    #[should_panic(expected = "without declared parameters")]
+    fn a_route_without_declared_params_fails_the_boot_check() {
+        Router::builder()
+            .register("m.undeclared", |_: Option<Value>| async { Ok(Value::Null) })
+            .build()
+            .assert_every_route_declares_params();
     }
 
     #[test]

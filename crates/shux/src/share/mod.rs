@@ -588,7 +588,7 @@ impl Gateway {
             let s = server.as_ref().ok_or(TunnelError::SpawnFailed)?;
             s.fd.try_clone().map_err(|_| TunnelError::SpawnFailed)?
         };
-        let shux = std::env::current_exe().map_err(|_| TunnelError::SpawnFailed)?;
+        let shux = crate::kept_build::helper_exe().map_err(|_| TunnelError::SpawnFailed)?;
         let probe = default_probe(addr);
         let supervisor = held.insert(tunnel::Supervisor::spawn(
             &shux,

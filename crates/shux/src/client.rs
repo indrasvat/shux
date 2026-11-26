@@ -21,7 +21,7 @@ use tracing::{debug, info, warn};
 use crate::daemon::{self, DaemonError};
 
 /// The version of this binary, baked in at compile time.
-const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+const CLIENT_VERSION: &str = shux_rpc::VERSION;
 
 /// The git SHA of this binary, baked in at compile time.
 const CLIENT_GIT_SHA: &str = shux_rpc::GIT_SHA;
@@ -38,10 +38,12 @@ struct ConnectBudget {
     deadline: Duration,
 }
 
+/// A daemon binds a few hundred milliseconds after it is spawned; a probe
+/// that just misses it costs at most `max_backoff` more.
 const CONNECT_BUDGET: ConnectBudget = ConnectBudget {
-    retries: 10,
-    backoff: Duration::from_millis(50),
-    max_backoff: Duration::from_millis(2000),
+    retries: 20,
+    backoff: Duration::from_millis(25),
+    max_backoff: Duration::from_millis(100),
     deadline: Duration::from_secs(30),
 };
 
@@ -100,6 +102,11 @@ pub enum ClientError {
     StartLockTimeout(std::path::PathBuf),
     #[error("{0}")]
     DaemonInUse(Box<DaemonInUse>),
+    #[error(
+        "this command was handed to the running daemon's own build ({0}), and that daemon no \
+         longer serves the socket; nothing was done. Rerun it"
+    )]
+    HandoffLost(String),
 }
 
 /// Exit code of a command refused with [`ClientError::DaemonInUse`].
@@ -142,8 +149,8 @@ impl DaemonInUse {
                     "exit_code": DAEMON_IN_USE_EXIT,
                     "daemon_version": self.daemon.as_ref().map(|d| &d.version),
                     "daemon_git_sha": self.daemon.as_ref().map(|d| &d.git_sha),
-                    "client_version": CLIENT_VERSION,
-                    "client_git_sha": CLIENT_GIT_SHA,
+                    "client_version": caller().0,
+                    "client_git_sha": caller().1,
                     "sessions": self.sessions,
                     "stoppable": self.stoppable,
                 },
@@ -154,7 +161,8 @@ impl DaemonInUse {
 
 impl std::fmt::Display for DaemonInUse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let this = format!("shux {CLIENT_VERSION} ({CLIENT_GIT_SHA})");
+        let (version, sha) = caller();
+        let this = format!("shux {version} ({sha})");
         match &self.daemon {
             Some(dv) => write!(
                 f,
@@ -177,13 +185,228 @@ impl std::fmt::Display for DaemonInUse {
                 "; no shux daemon process serves it, so stop whatever does and retry"
             );
         }
+        let why = match self.daemon.as_ref().map(DaemonVersion::compat) {
+            Some(Compat::WireBreak) => {
+                " (it speaks another protocol, and no copy of its build is \
+                                       left to run this command with)"
+            }
+            _ => "",
+        };
         write!(
             f,
-            ". Run `{}` to end its sessions, and the next shux command starts this build; \
-             or use {}",
+            "{why}. The first shux command after its last session ends replaces it with this \
+             build. Run `{}` to end its sessions now",
             self.stop,
-            matching_cli(self.daemon.as_ref())
         )
+    }
+}
+
+/// Exit code of a call the running daemon, an older build, cannot serve.
+pub const DAEMON_TOO_OLD_EXIT: i32 = 11;
+
+/// `error.code` of that refusal under `--format json`.
+pub const DAEMON_TOO_OLD_CODE: i64 = -32016;
+
+/// A call refused because the daemon serving it is a build without the method
+/// or a parameter it names. Nothing of the call ran.
+#[derive(Debug)]
+pub struct DaemonTooOld {
+    pub peer: Peer,
+    pub method: Option<String>,
+    /// The parameters it does not take; empty when it lacks the method.
+    pub params: Vec<String>,
+}
+
+impl DaemonTooOld {
+    /// The refusal `e` carries, if it is one: an unknown method or parameter
+    /// reported by (or, for 0.64.0, on behalf of) a daemon of another build.
+    /// From this very build the same error is a bug, reported as it is.
+    pub fn find(e: &anyhow::Error) -> Option<Self> {
+        e.chain().find_map(|c| match c.downcast_ref() {
+            Some(crate::cli::rpc::RpcClientError::Rpc { code, data, .. }) => {
+                Self::from_error(*code, data.as_ref())
+            }
+            _ => None,
+        })
+    }
+
+    /// Only a method or key this build itself serves counts: anything else
+    /// is a mistake no upgrade fixes.
+    pub fn from_error(code: i64, data: Option<&serde_json::Value>) -> Option<Self> {
+        let peer = peer()?;
+        let field = |k: &str| data.and_then(|d| d.get(k));
+        let method = field("method")?.as_str()?.to_string();
+        let (_, ours) = crate::rpc::accepts::ACCEPTS
+            .iter()
+            .find(|(m, _)| *m == method)?;
+        let params: Vec<String> = match code {
+            METHOD_NOT_FOUND => Vec::new(),
+            INVALID_PARAMS
+                if field("kind").and_then(|k| k.as_str()) == Some(shux_rpc::UNKNOWN_PARAMS) =>
+            {
+                let named = field("params")?
+                    .as_array()?
+                    .iter()
+                    .filter_map(|p| p.as_str());
+                let known: Vec<String> = named
+                    .filter(|p| {
+                        ours.contains(p)
+                            || p.strip_prefix(OP_FIELD)
+                                .is_some_and(|f| shux_core::apply::OP_FIELDS.contains(&f))
+                    })
+                    .map(String::from)
+                    .collect();
+                if known.is_empty() {
+                    return None;
+                }
+                known
+            }
+            _ => return None,
+        };
+        Some(Self {
+            peer,
+            method: Some(method),
+            params,
+        })
+    }
+
+    /// What it lacks, in words.
+    fn lacks(&self) -> String {
+        let method = self
+            .method
+            .as_deref()
+            .unwrap_or("the method this command calls");
+        match self.params.as_slice() {
+            [] => format!("it has no `{method}`"),
+            many => format!("`{method}` there does not take `{}`", many.join("`, `")),
+        }
+    }
+
+    pub fn to_json(&self) -> serde_json::Value {
+        let d = &self.peer.build;
+        json!({
+            "error": {
+                "code": DAEMON_TOO_OLD_CODE,
+                "message": self.to_string(),
+                "data": {
+                    "kind": "daemon_too_old",
+                    "exit_code": DAEMON_TOO_OLD_EXIT,
+                    "method": self.method,
+                    "params": self.params,
+                    "daemon_version": d.version,
+                    "daemon_git_sha": d.git_sha,
+                    "client_version": caller().0,
+                    "client_git_sha": caller().1,
+                    "upgrade": upgrade_command(&self.peer.socket, "--when-idle"),
+                },
+            }
+        })
+    }
+}
+
+impl std::fmt::Display for DaemonTooOld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let d = &self.peer.build;
+        write!(
+            f,
+            "this command needs a newer shux daemon: the running daemon is shux {} ({}) and \
+             this CLI is shux {} ({}); {}, so nothing was done. \
+             Run `{}` to switch to this build when its last session ends, or `--force` instead \
+             of `--when-idle` to end its sessions now",
+            d.version,
+            d.git_sha,
+            caller().0,
+            caller().1,
+            self.lacks(),
+            upgrade_command(&self.peer.socket, "--when-idle"),
+        )
+    }
+}
+
+const INVALID_PARAMS: i64 = -32602;
+
+/// Prefix of a field inside `state.apply` ops, as its refusal names it.
+pub(crate) const OP_FIELD: &str = "ops.";
+
+/// `shux daemon upgrade <flag>` for the daemon on `socket`, runtime dir
+/// included, as [`stop_command`] names it.
+pub(crate) fn upgrade_command(socket: &Path, flag: &str) -> String {
+    let stop = stop_command(socket);
+    let base = stop.strip_suffix(" daemon stop").unwrap_or(&stop);
+    format!("{base} daemon upgrade {flag}")
+}
+
+/// The refusal a call to a daemon of 0.64.0 gets before it is sent, when
+/// 0.64.0 would not serve it as asked: it ignores parameters it does not know.
+pub(crate) fn refuse_for_legacy_peer(
+    method: &str,
+    params: &serde_json::Value,
+) -> Option<(i64, serde_json::Value)> {
+    let peer = peer()?;
+    if peer.build.compat() != Compat::Legacy064 {
+        return None;
+    }
+    let Some((_, accepted)) = crate::rpc::legacy_0_64::LEGACY_0_64
+        .iter()
+        .find(|(m, _)| *m == method)
+    else {
+        // A name this build does not serve either: 0.64.0 says so itself.
+        let ours = crate::rpc::accepts::ACCEPTS
+            .iter()
+            .any(|(m, _)| *m == method);
+        return ours.then(|| (METHOD_NOT_FOUND, json!({ "method": method })));
+    };
+    let mut unknown: Vec<&str> = match params {
+        serde_json::Value::Object(o) => o
+            .iter()
+            .filter(|(k, v)| !accepted.contains(&k.as_str()) && !v.is_null())
+            .map(|(k, _)| k.as_str())
+            .collect(),
+        _ => Vec::new(),
+    };
+    let mut in_ops = Vec::new();
+    if method == "state.apply" {
+        legacy_op_fields_dropped(params, &mut in_ops);
+    }
+    unknown.extend(in_ops.iter().map(String::as_str));
+    if unknown.is_empty() {
+        return None;
+    }
+    unknown.sort_unstable();
+    unknown.dedup();
+    Some((
+        INVALID_PARAMS,
+        json!({ "kind": shux_rpc::UNKNOWN_PARAMS, "method": method, "params": unknown }),
+    ))
+}
+
+/// The non-null fields of `state.apply` ops that 0.64.0 would drop, as
+/// `ops.<field>`. An op kind it lacks is left to it: it refuses that itself.
+fn legacy_op_fields_dropped(params: &serde_json::Value, out: &mut Vec<String>) {
+    use crate::rpc::legacy_0_64::{LEGACY_0_64_BACK_REF, LEGACY_0_64_OPS};
+    let ops = params.get("ops").and_then(|o| o.as_array());
+    for op in ops.into_iter().flatten().filter_map(|op| op.as_object()) {
+        let kind = op.get("op").and_then(|k| k.as_str());
+        let Some((_, fields)) = LEGACY_0_64_OPS.iter().find(|(k, _)| Some(*k) == kind) else {
+            continue;
+        };
+        for (key, value) in op {
+            if value.is_null() {
+                continue;
+            }
+            if !fields.contains(&key.as_str()) {
+                out.push(format!("{OP_FIELD}{key}"));
+            } else if let Some(back_ref) = value.as_object() {
+                out.extend(
+                    back_ref
+                        .iter()
+                        .filter(|(k, v)| {
+                            !v.is_null() && !LEGACY_0_64_BACK_REF.contains(&k.as_str())
+                        })
+                        .map(|(k, _)| format!("{OP_FIELD}{k}")),
+                );
+            }
+        }
     }
 }
 
@@ -194,14 +417,6 @@ pub(crate) fn holding(sessions: Option<usize>) -> String {
         Some(1) => "it holds 1 session".to_string(),
         Some(n) => format!("it holds {n} sessions"),
         None => "its sessions could not be counted".to_string(),
-    }
-}
-
-/// The CLI that matches `daemon`.
-pub(crate) fn matching_cli(daemon: Option<&DaemonVersion>) -> String {
-    match daemon {
-        Some(dv) => format!("the shux {} ({}) CLI", dv.version, dv.git_sha),
-        None => "the shux CLI that started it".to_string(),
     }
 }
 
@@ -231,17 +446,131 @@ async fn probe_socket(socket_path: &Path) -> Result<UnixStream, io::Error> {
 }
 
 /// Version info returned by the daemon's `system.version` RPC call.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DaemonVersion {
     pub version: String,
     pub git_sha: String,
+    /// Its [`shux_rpc::WIRE_GENERATION`]; `None` from builds before it.
+    pub wire: Option<u32>,
+    /// The whole `system.version` answer.
+    pub answer: serde_json::Value,
+}
+
+/// How a daemon of some build can serve this CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Compat {
+    /// This very build.
+    Same,
+    /// Another build of this wire generation: it serves every call it can,
+    /// and refuses the rest one by one.
+    Wire,
+    /// 0.64.0, which says no generation and ignores unknown parameters: a call
+    /// is sent only if 0.64.0 takes every key of it.
+    Legacy064,
+    /// An older build that says no generation.
+    Legacy,
+    /// Another wire generation: only its own build can talk to it.
+    WireBreak,
 }
 
 impl DaemonVersion {
-    /// Whether the daemon is this very build.
+    /// Whether the daemon is this very build, or the build this command was
+    /// handed to: a kept copy of that daemon's own binary.
     pub fn is_current(&self) -> bool {
-        self.version == CLIENT_VERSION && self.git_sha == CLIENT_GIT_SHA
+        (self.version == CLIENT_VERSION && self.git_sha == CLIENT_GIT_SHA)
+            || crate::kept_build::handed_to()
+                .is_some_and(|id| id == format!("{}-{}", self.version, self.git_sha))
     }
+
+    pub fn compat(&self) -> Compat {
+        match self.wire {
+            _ if self.is_current() => Compat::Same,
+            Some(shux_rpc::WIRE_GENERATION) => Compat::Wire,
+            Some(_) => Compat::WireBreak,
+            None if self.version == "0.64.0" => Compat::Legacy064,
+            None => Compat::Legacy,
+        }
+    }
+
+    /// Whether this CLI is an older release than the daemon: it never
+    /// replaces a newer daemon, even an idle one.
+    pub fn is_newer_than_this_cli(&self) -> bool {
+        match (semver(&self.version), semver(caller().0)) {
+            (Some(daemon), Some(cli)) => daemon > cli,
+            _ => false,
+        }
+    }
+}
+
+/// `major.minor.patch` of a release version, ignoring any suffix.
+pub(crate) fn semver(v: &str) -> Option<(u64, u64, u64)> {
+    let core = v.split(['-', '+']).next()?;
+    let mut parts = core.split('.').map(|p| p.parse().ok());
+    let triple = (parts.next()??, parts.next()??, parts.next()??);
+    parts.next().is_none().then_some(triple)
+}
+
+/// The daemon of another build this process last connected to, if it did.
+#[derive(Debug, Clone)]
+pub struct Peer {
+    pub build: DaemonVersion,
+    pub socket: std::path::PathBuf,
+}
+
+static PEER: std::sync::Mutex<Option<Peer>> = std::sync::Mutex::new(None);
+
+/// See [`Peer`]. `None` while every connection was to this very build.
+pub fn peer() -> Option<Peer> {
+    PEER.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+fn set_peer(peer: Option<Peer>) {
+    *PEER.lock().unwrap_or_else(|e| e.into_inner()) = peer;
+}
+
+static LAST_DAEMON: std::sync::Mutex<Option<(std::path::PathBuf, Option<u32>)>> =
+    std::sync::Mutex::new(None);
+
+/// The socket this process last connected to through
+/// [`ensure_daemon_running_at`], and the daemon that served it then.
+pub(crate) fn last_daemon() -> Option<(std::path::PathBuf, Option<u32>)> {
+    LAST_DAEMON
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// Whether daemon `pid` on `socket` is leaving: it exits within
+/// [`crate::patience::peer_patience`]. A daemon that is not leaving keeps its
+/// state, so a call it dropped is never sent again.
+pub(crate) async fn daemon_left(pid: u32, socket: &Path) -> bool {
+    let deadline = tokio::time::Instant::now() + crate::patience::peer_patience();
+    while crate::daemon_boot::is_live_shux_daemon(pid, socket) {
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "another process's exit has no event to wait on; poll its identity"
+        )]
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    true
+}
+
+/// The CLI this command speaks for: the one that handed it off to this
+/// build, else this build.
+pub(crate) fn caller() -> (&'static str, &'static str) {
+    match crate::kept_build::handoff() {
+        Some(h) => (&h.caller_version, &h.caller_git_sha),
+        None => (CLIENT_VERSION, CLIENT_GIT_SHA),
+    }
+}
+
+/// This CLI's build, as `system.version` and the retire call take it.
+pub(crate) fn client_build() -> serde_json::Value {
+    let (version, git_sha) = caller();
+    json!({ "client": { "version": version, "git_sha": git_sha } })
 }
 
 /// What the daemon serving a socket said when asked which build it is.
@@ -259,18 +588,23 @@ pub(crate) enum DaemonAnswer {
 }
 
 /// Asks the daemon serving `socket_path` which build it is and, when it says,
-/// how many sessions it holds, scratch included, on one connection. Never
-/// starts or stops one.
-pub(crate) async fn ask_daemon_version(socket_path: &Path) -> (DaemonAnswer, Option<usize>) {
-    let (mut stream, asked) = match ask_version(socket_path).await {
+/// how many sessions it holds, scratch included, on one connection, which is
+/// returned when it answered. Never starts or stops one.
+pub(crate) async fn ask_daemon_version(
+    socket_path: &Path,
+) -> (DaemonAnswer, Option<usize>, Option<UnixStream>) {
+    let (mut stream, asked) = match ask_version(socket_path, false).await {
         Ok(asked) => asked,
-        Err(unanswered) => return (unanswered, None),
+        Err(unanswered) => return (unanswered, None, None),
     };
-    let Some(dv) = (match asked {
+    let dv = match asked {
         Asked::Result(result) => version_in(&result),
+        // On its way out: as good as gone.
+        Asked::Error(e) if stopping(&e) => return (DaemonAnswer::Absent, None, None),
         _ => None,
-    }) else {
-        return (DaemonAnswer::Unreadable, None);
+    };
+    let Some(dv) = dv else {
+        return (DaemonAnswer::Unreadable, None, None);
     };
     let params = json!({ "include_scratch": true });
     let listed = ask(&mut stream, "session-count", "session.list", params);
@@ -278,18 +612,26 @@ pub(crate) async fn ask_daemon_version(socket_path: &Path) -> (DaemonAnswer, Opt
         Ok(Asked::Result(r)) => r.get("sessions").and_then(|s| s.as_array()).map(Vec::len),
         _ => None,
     };
-    (DaemonAnswer::Answered(dv), sessions)
+    // A count that never came back may still: that stream is spent.
+    let stream = sessions.is_some().then_some(stream);
+    (DaemonAnswer::Answered(dv), sessions, stream)
 }
 
 /// The connection that asked `socket_path`'s daemon which build it is, and its
-/// reply. `Err` holds only `Absent`, `Unresponsive` and `Unreachable`.
-async fn ask_version(socket_path: &Path) -> Result<(UnixStream, Asked), DaemonAnswer> {
+/// reply. `Err` holds only `Absent`, `Unresponsive` and `Unreachable`. With
+/// `identify` the daemon is told this CLI's build, and notes a newer one.
+async fn ask_version(
+    socket_path: &Path,
+    identify: bool,
+) -> Result<(UnixStream, Asked), DaemonAnswer> {
     let mut stream = match probe_socket(socket_path).await {
         Ok(stream) => stream,
         Err(e) if nothing_listening(&e) => return Err(DaemonAnswer::Absent),
         Err(e) => return Err(DaemonAnswer::Unreachable(e)),
     };
-    let asked = ask(&mut stream, "version-check", "system.version", json!({}));
+    // Builds before 0.65 ignore these params.
+    let params = if identify { client_build() } else { json!({}) };
+    let asked = ask(&mut stream, "version-check", "system.version", params);
     match tokio::time::timeout(crate::patience::peer_patience(), asked).await {
         Err(_) => Err(DaemonAnswer::Unresponsive),
         Ok(asked) => Ok((stream, asked)),
@@ -303,7 +645,16 @@ fn version_in(result: &serde_json::Value) -> Option<DaemonVersion> {
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_string();
-    Some(DaemonVersion { version, git_sha })
+    let wire = result
+        .get("wire")
+        .and_then(|w| w.as_u64())
+        .and_then(|w| u32::try_from(w).ok());
+    Some(DaemonVersion {
+        version,
+        git_sha,
+        wire,
+        answer: result.clone(),
+    })
 }
 
 /// The reply to one request.
@@ -401,6 +752,8 @@ enum Probe {
     Absent,
     /// It closed the connection before answering: probe again.
     Gone,
+    /// It answered that it is shutting down: wait for it to go.
+    Leaving,
     /// Something accepted the connection and never answered.
     Unresponsive,
 }
@@ -410,7 +763,7 @@ async fn probe_daemon(socket_path: &Path) -> Result<Probe, ClientError> {
 }
 
 async fn probe(socket_path: &Path, confirmed: bool) -> Result<Probe, ClientError> {
-    let (stream, asked) = match ask_version(socket_path).await {
+    let (stream, asked) = match ask_version(socket_path, true).await {
         Ok(asked) => asked,
         Err(DaemonAnswer::Unreachable(e)) => return Err(ClientError::Io(e)),
         Err(DaemonAnswer::Unresponsive) => return Ok(Probe::Unresponsive),
@@ -418,6 +771,7 @@ async fn probe(socket_path: &Path, confirmed: bool) -> Result<Probe, ClientError
     };
     let found = match asked {
         Asked::Gone => return Ok(Probe::Gone),
+        Asked::Error(e) if stopping(&e) => return Ok(Probe::Leaving),
         Asked::Result(result) => version_in(&result),
         Asked::Error(_) | Asked::Malformed => None,
     };
@@ -459,10 +813,15 @@ enum Verdict {
     LegacyIdle,
     /// It closed the connection before answering: probe again.
     Gone,
+    /// It can serve this CLI, and keeps running: use this connection.
+    Serve(UnixStream),
 }
 
-/// Asks the stale daemon on `stream`, the connection that identified it, to
-/// retire; refused unless it agrees or is a legacy build that is idle.
+/// Asks the daemon of another build on `stream`, the connection that
+/// identified it, to retire. One that can serve this CLI ([`Compat::Wire`],
+/// [`Compat::Legacy064`]) and holds sessions is served instead; one that is a
+/// newer release is never asked. Any other is refused unless it agrees or is
+/// a legacy build that is idle.
 ///
 /// A legacy build is counted and then stopped: a session created between the
 /// two is lost. That window closes once daemons answer the retire call.
@@ -489,27 +848,43 @@ async fn verdict(
     };
     let patience = crate::patience::peer_patience();
     let unresponsive = || ClientError::DaemonUnresponsive(holder(socket), socket.to_path_buf());
+    let servable = matches!(dv.compat(), Compat::Wire | Compat::Legacy064);
+    if servable && (!retire || dv.is_newer_than_this_cli()) {
+        return Ok(Verdict::Serve(stream));
+    }
+    // An older CLI never swaps a newer daemon for itself, idle or not.
+    if dv.is_newer_than_this_cli() {
+        return Err(refuse(Some(dv), None, ours()));
+    }
 
     let asked = async {
         if !retire {
             return Ok(Asked::Error(json!({ "code": METHOD_NOT_FOUND })));
         }
-        let retire = ask(&mut stream, "retire", shux_rpc::RETIRE_IF_IDLE, json!({}));
+        let retire = ask(
+            &mut stream,
+            "retire",
+            shux_rpc::RETIRE_IF_IDLE,
+            client_build(),
+        );
         tokio::time::timeout(patience, retire).await
     };
     match asked.await {
         Err(_) => return Err(unresponsive()),
         Ok(Asked::Gone) => return Ok(Verdict::Gone),
+        Ok(Asked::Error(e)) if stopping(&e) => return Ok(Verdict::Gone),
         Ok(Asked::Result(r)) => {
             let sessions = r.get("sessions").and_then(|n| n.as_u64());
             return match r.get("retired").and_then(|b| b.as_bool()) {
                 Some(true) => Ok(Verdict::Retiring),
+                _ if servable => Ok(Verdict::Serve(stream)),
                 Some(false) if sessions.is_some_and(|n| n > 0) => {
                     Err(refuse(Some(dv), sessions.map(|n| n as usize), ours()))
                 }
                 _ => Err(refuse(Some(dv), None, ours())),
             };
         }
+        Ok(_) if servable => return Ok(Verdict::Serve(stream)),
         Ok(Asked::Error(e)) if e.get("code").and_then(|c| c.as_i64()) == Some(METHOD_NOT_FOUND) => {
         }
         Ok(_) => return Err(refuse(Some(dv), None, ours())),
@@ -520,6 +895,7 @@ async fn verdict(
     let sessions = match tokio::time::timeout(patience, listed).await {
         Err(_) => return Err(unresponsive()),
         Ok(Asked::Gone) => return Ok(Verdict::Gone),
+        Ok(Asked::Error(e)) if stopping(&e) => return Ok(Verdict::Gone),
         Ok(Asked::Result(r)) => r.get("sessions").and_then(|s| s.as_array()).map(Vec::len),
         Ok(_) => None,
     };
@@ -531,6 +907,26 @@ async fn verdict(
 }
 
 const METHOD_NOT_FOUND: i64 = -32601;
+
+/// A `daemon_stopping` refusal: the daemon is leaving and ran nothing.
+fn stopping(error: &serde_json::Value) -> bool {
+    error.pointer("/data/kind").and_then(|k| k.as_str()) == Some(shux_rpc::server::DAEMON_STOPPING)
+}
+
+/// Records the daemon of another build this process is about to use.
+fn serve(socket: &Path, found: Option<DaemonVersion>) {
+    if let Some(build) = found {
+        info!(
+            daemon_version = build.version,
+            daemon_sha = build.git_sha,
+            "Using a daemon of another build"
+        );
+        set_peer(Some(Peer {
+            build,
+            socket: socket.to_path_buf(),
+        }));
+    }
+}
 
 /// The refusal of a server on `socket` that did not say which build it is.
 fn unidentified(socket: &Path) -> ClientError {
@@ -563,28 +959,39 @@ async fn claim_socket(socket: &Path) -> Result<Option<UnixStream>, ClientError> 
             Ok(())
         };
         match probe_daemon(socket).await? {
-            Probe::Current(stream) => return Ok(Some(stream)),
+            Probe::Current(stream) => {
+                set_peer(None);
+                return Ok(Some(stream));
+            }
             Probe::Unresponsive => {
                 return Err(ClientError::DaemonUnresponsive(
                     holder(socket),
                     socket.to_path_buf(),
                 ));
             }
-            Probe::Stale(found, stream) => match verdict(socket, found, stream, true).await? {
-                // It exits on its own; wait for the socket below.
-                Verdict::Retiring => {}
-                Verdict::Gone => hang_up(&mut hung_up)?,
-                Verdict::LegacyIdle => {
-                    if stops == MAX_STALE_STOPS {
-                        return Err(ClientError::StaleDaemonsKeepStarting);
+            Probe::Stale(found, stream) => {
+                match verdict(socket, found.clone(), stream, true).await? {
+                    Verdict::Serve(stream) => {
+                        serve(socket, found);
+                        return Ok(Some(stream));
                     }
-                    stops += 1;
-                    stop_stale_daemon(socket).await?;
-                    deadline = tokio::time::Instant::now() + crate::patience::peer_patience();
-                    continue;
+                    // It exits on its own; wait for the socket below.
+                    Verdict::Retiring => {}
+                    Verdict::Gone => hang_up(&mut hung_up)?,
+                    Verdict::LegacyIdle => {
+                        if stops == MAX_STALE_STOPS {
+                            return Err(ClientError::StaleDaemonsKeepStarting);
+                        }
+                        stops += 1;
+                        stop_stale_daemon(socket).await?;
+                        deadline = tokio::time::Instant::now() + crate::patience::peer_patience();
+                        continue;
+                    }
                 }
-            },
+            }
             Probe::Gone => hang_up(&mut hung_up)?,
+            // It said it is going: waited for below, like one that left.
+            Probe::Leaving => {}
             Probe::Absent => {
                 if daemon::try_lock_file(&lock_path)?.is_some() {
                     return Ok(None);
@@ -634,19 +1041,39 @@ async fn acquire_start_lock(socket: &Path) -> Result<std::fs::File, ClientError>
 ///    that holds any, or cannot say, is refused
 /// 4. Spawn, and retry with exponential backoff until connected
 pub async fn ensure_daemon_running_at(socket_path: &Path) -> Result<UnixStream, ClientError> {
+    let stream = connect_at(socket_path).await?;
+    let pid = crate::daemon_boot::our_live_daemon(socket_path);
+    *LAST_DAEMON.lock().unwrap_or_else(|e| e.into_inner()) = Some((socket_path.to_path_buf(), pid));
+    Ok(stream)
+}
+
+async fn connect_at(socket_path: &Path) -> Result<UnixStream, ClientError> {
     match probe_daemon(socket_path).await? {
-        Probe::Current(stream) => return Ok(stream),
+        Probe::Current(stream) => {
+            set_peer(None);
+            return Ok(stream);
+        }
         Probe::Unresponsive => {
             return Err(ClientError::DaemonUnresponsive(
                 holder(socket_path),
                 socket_path.to_path_buf(),
             ));
         }
-        // Refused before the start lock too, so a refusal never waits on it.
+        // Served or refused before the start lock, so neither waits on it.
         Probe::Stale(found, stream) => {
-            verdict(socket_path, found, stream, true).await?;
+            if let Verdict::Serve(stream) =
+                verdict(socket_path, found.clone(), stream, true).await?
+            {
+                serve(socket_path, found);
+                return Ok(stream);
+            }
         }
-        Probe::Gone | Probe::Absent => {}
+        Probe::Gone | Probe::Leaving | Probe::Absent => {}
+    }
+    // A command handed to a daemon's own build is for that daemon alone: it
+    // never starts or replaces one.
+    if let Some(id) = crate::kept_build::handed_to() {
+        return Err(ClientError::HandoffLost(id));
     }
 
     // Held until this function returns, i.e. until the daemon it started (or
@@ -665,6 +1092,10 @@ pub async fn ensure_daemon_running_at(socket_path: &Path) -> Result<UnixStream, 
             || crate::daemon_boot::our_live_daemon(socket_path).is_some()
     };
     let connected = wait_for_daemon(socket_path, &CONNECT_BUDGET, starting).await;
+    // This very build now: nothing of a predecessor's build applies.
+    if connected.is_ok() {
+        set_peer(None);
+    }
     // Reap it: a long-lived client would otherwise keep a zombie. It may
     // still be on its way out, since the daemon can bind before it exits.
     std::thread::spawn(move || child.wait());
@@ -871,8 +1302,392 @@ mod tests {
         });
     }
 
+    /// This build at its own SHA; otherwise a release from before wire
+    /// generations, which a CLI cannot serve itself from while it is busy.
     fn version(sha: &str) -> serde_json::Value {
-        json!({ "result": { "version": CLIENT_VERSION, "git_sha": sha } })
+        let version = if sha == CLIENT_GIT_SHA {
+            CLIENT_VERSION
+        } else {
+            "0.63.0"
+        };
+        json!({ "result": { "version": version, "git_sha": sha } })
+    }
+
+    /// A build of this wire generation.
+    fn wire_build(version: &str) -> serde_json::Value {
+        json!({ "result": {
+            "version": version, "git_sha": "0ther00", "wire": shux_rpc::WIRE_GENERATION,
+        } })
+    }
+
+    /// `daemon upgrade` asks the daemon it judged, on the connection that
+    /// judged it: a daemon that replaced it in between is never asked.
+    #[tokio::test]
+    async fn daemon_upgrade_asks_the_daemon_it_judged() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("d.sock");
+        let asked_on = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked_on.clone();
+        stub(&socket, move |conn, method| match method {
+            "system.version" => Some(wire_build(CLIENT_VERSION)),
+            "session.list" => Some(sessions(1)),
+            shux_rpc::UPGRADE => {
+                seen.lock().unwrap().push(conn);
+                Some(json!({ "result": { "pending": true } }))
+            }
+            _ => None,
+        });
+        crate::cli::system::handle_daemon_upgrade(
+            &socket,
+            true,
+            false,
+            crate::cli::args::OutputFormat::Json,
+        )
+        .await
+        .expect("pending");
+        assert_eq!(
+            *asked_on.lock().unwrap(),
+            vec![0],
+            "asked on another connection"
+        );
+    }
+
+    /// A connection whose session count never came back is not handed on:
+    /// a late reply would be read as the next call's.
+    #[tokio::test]
+    async fn a_connection_left_mid_call_is_not_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("d.sock");
+        stub(&socket, |_, method| match method {
+            "system.version" => Some(wire_build(CLIENT_VERSION)),
+            _ => None,
+        });
+        let (answer, held, stream) = ask_daemon_version(&socket).await;
+        assert!(matches!(answer, DaemonAnswer::Answered(_)));
+        assert_eq!(held, None);
+        assert!(stream.is_none(), "handed on a connection mid-call");
+    }
+
+    /// A daemon of this wire generation that holds a session is served, on
+    /// the connection that asked, not refused; the CLI remembers it.
+    #[tokio::test]
+    async fn a_busy_daemon_of_this_wire_generation_is_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("d.sock");
+        stub(&socket, |_, method| match method {
+            "system.version" => Some(wire_build(CLIENT_VERSION)),
+            "session.list" => Some(sessions(1)),
+            _ => Some(json!({ "result": { "retired": false, "sessions": 1 } })),
+        });
+        let mut stream = ensure_daemon_running_at(&socket).await.expect("served");
+        let listed = ask(&mut stream, "l", "session.list", json!({})).await;
+        assert!(
+            matches!(listed, Asked::Result(_)),
+            "the connection is not usable"
+        );
+        let peer = peer().expect("the daemon of another build is remembered");
+        assert_eq!(peer.build.git_sha, "0ther00");
+        assert_eq!(peer.build.compat(), Compat::Wire);
+    }
+
+    /// A CLI never asks a newer release to retire, even an idle one: an
+    /// older binary run by hand would otherwise swap a fresh daemon for itself.
+    #[tokio::test]
+    async fn a_newer_release_is_never_asked_to_retire() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("d.sock");
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = asked.clone();
+        stub(&socket, move |_, method| match method {
+            "system.version" => Some(wire_build("999.0.0")),
+            "session.list" => Some(sessions(0)),
+            _ => {
+                seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                Some(json!({ "result": { "retired": true, "sessions": 0 } }))
+            }
+        });
+        ensure_daemon_running_at(&socket).await.expect("served");
+        assert!(
+            !asked.load(std::sync::atomic::Ordering::SeqCst),
+            "asked a newer daemon to retire"
+        );
+
+        // One this CLI cannot serve itself from is refused, still unasked.
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("d.sock");
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = asked.clone();
+        stub(&socket, move |_, method| match method {
+            "system.version" => Some(json!({ "result": { "version": "999.0.0", "git_sha": "x" } })),
+            "session.list" => Some(sessions(0)),
+            _ => {
+                seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                Some(json!({ "result": { "retired": true, "sessions": 0 } }))
+            }
+        });
+        refusal(ensure_daemon_running_at(&socket).await);
+        assert!(
+            !asked.load(std::sync::atomic::Ordering::SeqCst),
+            "asked a newer daemon it cannot serve to retire"
+        );
+    }
+
+    /// Against 0.64.0, which ignores keys it does not know, a call is sent
+    /// only when 0.64.0 takes all of it: a method it lacks or a key it would
+    /// drop is refused here, before it is sent. A key set to `null` asks for
+    /// nothing and passes.
+    #[test]
+    fn a_call_0_64_would_not_serve_as_asked_is_refused_before_it_is_sent() {
+        set_peer(Some(Peer {
+            build: DaemonVersion {
+                version: "0.64.0".into(),
+                git_sha: "0ther00".into(),
+                wire: None,
+                answer: json!({}),
+            },
+            socket: std::path::PathBuf::from("/nonexistent.sock"),
+        }));
+        let refused = |m, p| refuse_for_legacy_peer(m, &p);
+        assert!(refused("pane.capture", json!({ "pane_id": "x", "lines": 5 })).is_none());
+        assert!(refused("pane.capture", json!({ "pane_id": "x", "zz_new": null })).is_none());
+        let (code, data) = refused("pane.capture", json!({ "pane_id": "x", "zz_new": 1 })).unwrap();
+        assert_eq!(
+            (code, &data["params"]),
+            (INVALID_PARAMS, &json!(["zz_new"]))
+        );
+        let (code, _) = refused(shux_rpc::UPGRADE, json!({})).unwrap();
+        assert_eq!(code, METHOD_NOT_FOUND);
+        let template = json!({ "ops": [
+            { "op": "create_session", "name": "s", "cwd": "/", "initial_command": ["sh"],
+              "initial_window_title": "t" },
+            { "op": "create_window", "session": { "ref_op": 0 }, "title": "w", "cwd": null },
+            { "op": "split_pane", "target": { "ref_op": 1 }, "direction": "horizontal",
+              "ratio": 0.5, "command": [], "cwd": "/", "zz_new": null },
+        ] });
+        assert!(
+            refused("state.apply", template.clone()).is_none(),
+            "a template 0.64.0 serves as written"
+        );
+        let mut newer = template.clone();
+        newer["ops"][2]["zz_new"] = json!(1);
+        newer["ops"][1]["session"]["zz_ref"] = json!(true);
+        let (code, data) = refused("state.apply", newer).unwrap();
+        assert_eq!(
+            (code, &data["params"]),
+            (INVALID_PARAMS, &json!(["ops.zz_new", "ops.zz_ref"])),
+            "0.64.0 would drop these op fields, so the batch never reaches it"
+        );
+        assert!(
+            refused("state.apply", json!({ "ops": [{ "op": "zz_op" }] })).is_none(),
+            "0.64.0 refuses an op kind it lacks itself"
+        );
+
+        assert!(
+            DaemonTooOld::from_error(code, Some(&data)).is_none(),
+            "an op field this build lacks too is a mistake, not skew"
+        );
+
+        let refusal = DaemonTooOld::from_error(
+            METHOD_NOT_FOUND,
+            Some(&json!({ "method": shux_rpc::UPGRADE })),
+        )
+        .expect("a refusal while a daemon of another build serves");
+        let said = refusal.to_string();
+        assert!(
+            said.contains("shux 0.64.0 (0ther00)") && said.contains(shux_rpc::UPGRADE),
+            "{said}"
+        );
+        assert!(said.contains("daemon upgrade --when-idle"), "{said}");
+        assert_eq!(
+            refusal.to_json()["error"]["data"]["exit_code"],
+            DAEMON_TOO_OLD_EXIT
+        );
+
+        set_peer(None);
+        assert!(
+            refused("state.apply", json!({})).is_none(),
+            "this very build serves anything"
+        );
+        assert!(
+            DaemonTooOld::from_error(METHOD_NOT_FOUND, None).is_none(),
+            "an unknown method from this very build is a bug, not skew"
+        );
+    }
+
+    /// A create refused by a daemon that retired as it arrived (nothing was
+    /// applied) is sent once more, to whatever serves the socket next.
+    #[tokio::test]
+    async fn a_call_a_retiring_daemon_refused_is_sent_to_its_successor() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("d.sock");
+        stub(&socket, |n, method| match (n, method) {
+            (_, "system.version") => Some(version(CLIENT_GIT_SHA)),
+            (1, "session.create") => Some(json!({ "error": {
+                "code": -32603, "message": "internal_error",
+                "data": { "kind": crate::rpc::convert::DAEMON_RETIRING },
+            } })),
+            (_, "session.create") => Some(json!({ "result": { "created_on": n } })),
+            _ => Some(sessions(0)),
+        });
+        let mut stream = ensure_daemon_running_at(&socket).await.unwrap();
+        let created = crate::cli::rpc::rpc_call(&mut stream, "session.create", json!({}))
+            .await
+            .expect("sent again");
+        assert!(
+            created["created_on"].as_u64().is_some_and(|n| n > 1),
+            "{created}"
+        );
+    }
+
+    /// Only what this build itself serves can be blamed on an older daemon:
+    /// a method or key this build does not know is a mistake an upgrade
+    /// cannot fix, reported as it is.
+    #[test]
+    fn a_name_this_build_does_not_declare_is_not_skew() {
+        set_peer(Some(Peer {
+            build: DaemonVersion {
+                version: "0.0.1".into(),
+                git_sha: "0ther00".into(),
+                wire: Some(shux_rpc::WIRE_GENERATION),
+                answer: json!({}),
+            },
+            socket: std::path::PathBuf::from("/nonexistent.sock"),
+        }));
+        let missing =
+            |m: &str| DaemonTooOld::from_error(METHOD_NOT_FOUND, Some(&json!({ "method": m })));
+        assert!(
+            missing("pane.teleport").is_none(),
+            "a typo was blamed on the daemon"
+        );
+        assert!(
+            missing(shux_rpc::UPGRADE).is_some(),
+            "a method this build has, the daemon lacks"
+        );
+        let unknown = |keys: serde_json::Value| {
+            DaemonTooOld::from_error(
+                INVALID_PARAMS,
+                Some(
+                    &json!({ "kind": shux_rpc::UNKNOWN_PARAMS, "method": "pane.capture", "params": keys }),
+                ),
+            )
+        };
+        assert!(
+            unknown(json!(["Pane_id"])).is_none(),
+            "a misspelt key was blamed on the daemon"
+        );
+        let skew = unknown(json!(["lines", "Pane_id"])).expect("a key this build takes");
+        assert_eq!(skew.params, vec!["lines".to_string()]);
+        let op = |field: &str| {
+            DaemonTooOld::from_error(
+                INVALID_PARAMS,
+                Some(
+                    &json!({ "kind": shux_rpc::UNKNOWN_PARAMS, "method": "state.apply", "params": [field] }),
+                ),
+            )
+        };
+        assert!(
+            op("ops.titel").is_none(),
+            "a misspelt op field was blamed on the daemon"
+        );
+        assert!(
+            op("ops.title").is_some(),
+            "an op field this build has, the daemon lacks"
+        );
+        set_peer(None);
+    }
+
+    /// A daemon that answers every probe `daemon_stopping` for a while (it
+    /// is leaving) is waited out, never refused as unidentified (exit 10).
+    #[tokio::test]
+    async fn a_daemon_on_its_way_out_is_waited_out_not_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("d.sock");
+        stub(&socket, |n, method| match (n, method) {
+            (0..=5, _) => Some(json!({ "error": {
+                "code": -32603, "message": "internal_error",
+                "data": { "kind": shux_rpc::server::DAEMON_STOPPING },
+            } })),
+            (_, "system.version") => Some(version(CLIENT_GIT_SHA)),
+            _ => Some(sessions(0)),
+        });
+        let connected = ensure_daemon_running_at(&socket).await;
+        assert!(connected.is_ok(), "{connected:?}");
+    }
+
+    /// A call sent again after a retirement passes the same checks as the
+    /// first: a key 0.64.0 would drop is never sent to a 0.64.0 successor.
+    #[tokio::test]
+    async fn a_resent_call_is_checked_against_the_new_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("d.sock");
+        let got_key = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = got_key.clone();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            for n in 0.. {
+                let Ok((mut conn, _)) = listener.accept().await else {
+                    return;
+                };
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let mut len = [0u8; 4];
+                        if conn.read_exact(&mut len).await.is_err() {
+                            return;
+                        }
+                        let mut req = vec![0u8; u32::from_be_bytes(len) as usize];
+                        if conn.read_exact(&mut req).await.is_err() {
+                            return;
+                        }
+                        let req: serde_json::Value = serde_json::from_slice(&req).unwrap();
+                        let method = req["method"].as_str().unwrap_or_default();
+                        let mut resp = match (n, method) {
+                            (0 | 1, "system.version") => version(CLIENT_GIT_SHA),
+                            (0 | 1, _) => json!({ "error": {
+                                "code": -32603, "message": "internal_error",
+                                "data": { "kind": crate::rpc::convert::DAEMON_RETIRING },
+                            } }),
+                            (_, "system.version") => {
+                                json!({ "result": { "version": "0.64.0", "git_sha": "old" } })
+                            }
+                            (_, "session.create") => {
+                                seen.store(
+                                    req["params"].get("zz_new").is_some(),
+                                    std::sync::atomic::Ordering::SeqCst,
+                                );
+                                json!({ "result": {} })
+                            }
+                            _ => json!({ "result": { "retired": false, "sessions": 1 } }),
+                        };
+                        resp["jsonrpc"] = "2.0".into();
+                        resp["id"] = req["id"].clone();
+                        let resp = serde_json::to_vec(&resp).unwrap();
+                        let framed = [&(resp.len() as u32).to_be_bytes()[..], &resp].concat();
+                        if conn.write_all(&framed).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let mut stream = ensure_daemon_running_at(&socket).await.unwrap();
+        let params = json!({ "name": "x", "zz_new": 1 });
+        let _ = crate::cli::rpc::rpc_call(&mut stream, "session.create", params).await;
+        assert!(
+            !got_key.load(std::sync::atomic::Ordering::SeqCst),
+            "a key 0.64.0 would drop reached it on the resend"
+        );
+        set_peer(None);
+    }
+
+    #[test]
+    fn release_versions_compare_by_number() {
+        assert_eq!(semver("0.64.0"), Some((0, 64, 0)));
+        assert_eq!(semver("1.2.3-rc.1"), Some((1, 2, 3)));
+        assert!(semver("0.9.10") > semver("0.9.9"));
+        assert_eq!(semver("1.2"), None);
+        assert_eq!(semver("1.2.3.4"), None);
+        assert_eq!(semver("dev"), None);
     }
 
     fn sessions(n: usize) -> serde_json::Value {
@@ -995,7 +1810,7 @@ mod tests {
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let path = socket.clone();
         let client = tokio::spawn(async move {
-            match ask_version(&path).await {
+            match ask_version(&path, true).await {
                 Ok((_, Asked::Result(r))) => {
                     version_in(&r).map_or(DaemonAnswer::Unreadable, DaemonAnswer::Answered)
                 }

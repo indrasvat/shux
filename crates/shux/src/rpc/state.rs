@@ -38,14 +38,13 @@ pub(crate) fn register_state_methods(
             async move {
                 // Parse `{ ops: [...] }`.
                 let params = params.unwrap_or_default();
-                let ops_value = params
+                let mut ops_value = params
                     .get("ops")
                     .cloned()
                     .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'ops' array"))?;
+                drop_nulls(&mut ops_value);
                 let ops: Vec<shux_core::apply::Op> =
-                    serde_json::from_value(ops_value).map_err(|e| {
-                        shux_rpc::RpcError::invalid_params(&format!("ops parse error: {e}"))
-                    })?;
+                    serde_json::from_value(ops_value).map_err(ops_error)?;
 
                 // serde proves each command is a `Vec<String>`; it does not
                 // prove the strings can reach `execve`. `[""]` and a NUL-bearing
@@ -181,6 +180,42 @@ pub(crate) fn register_state_methods(
 }
 
 /// Map BatchError to an appropriate RPC error.
+/// An op field this build does not know is `unknown_params`, named
+/// `ops.<field>`, as a top-level key would be; any other parse error is plain.
+/// Removes every op field set to `null`, at any depth: as a top-level key
+/// does, it asks for nothing.
+fn drop_nulls(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::Object(o) => {
+            o.retain(|_, v| !v.is_null());
+            o.values_mut().for_each(drop_nulls);
+        }
+        serde_json::Value::Array(a) => a.iter_mut().for_each(drop_nulls),
+        _ => {}
+    }
+}
+
+fn ops_error(e: serde_json::Error) -> shux_rpc::RpcError {
+    let detail = format!("ops parse error: {e}");
+    let unknown = e
+        .to_string()
+        .strip_prefix("unknown field `")
+        .and_then(|rest| rest.split('`').next())
+        .map(|field| format!("{}{field}", crate::client::OP_FIELD));
+    match unknown {
+        Some(field) => shux_rpc::RpcError::with_data(
+            shux_rpc::ErrorCode::InvalidParams,
+            serde_json::json!({
+                "kind": shux_rpc::UNKNOWN_PARAMS,
+                "method": "state.apply",
+                "params": [field],
+                "detail": detail,
+            }),
+        ),
+        None => shux_rpc::RpcError::invalid_params(&detail),
+    }
+}
+
 fn batch_error_to_rpc(e: shux_core::apply::BatchError) -> shux_rpc::RpcError {
     use shux_core::apply::BatchError;
     match e {

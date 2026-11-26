@@ -107,6 +107,10 @@ pub enum GraphError {
 
     #[error("graph loop shut down")]
     Shutdown,
+
+    /// Refused before anything changed: the daemon is retiring.
+    #[error("this daemon is retiring and takes no new session")]
+    Retired,
 }
 
 /// The immutable snapshot of all session state.
@@ -118,6 +122,13 @@ pub struct SessionGraphSnapshot {
     pub windows: HashMap<WindowId, Window>,
     pub panes: HashMap<PaneId, Pane>,
     pub version: Version,
+    /// Set by [`SessionGraph::retire_when_empty`] while sessions remain: the
+    /// step that removes the last one also retires the graph.
+    #[serde(skip)]
+    pub retire_pending: bool,
+    /// The graph refuses every new session: its daemon is leaving.
+    #[serde(skip)]
+    pub retired: bool,
 }
 
 impl SessionGraphSnapshot {
@@ -493,16 +504,54 @@ impl SessionGraph {
         }
         match self.current().sessions.len() {
             0 => {
-                self.retiring.store(true, Ordering::SeqCst);
+                self.retire_now();
                 Ok(())
             }
             n => Err(n),
         }
     }
 
+    /// [`Self::retire_if_empty`], or, while sessions remain, retire in the
+    /// step that removes the last of them: `Err` with the count then.
+    pub fn retire_when_empty(&self) -> Result<(), usize> {
+        let n = match self.retire_if_empty() {
+            Ok(()) => return Ok(()),
+            Err(n) => n,
+        };
+        let current = self.current();
+        if !current.retire_pending {
+            let mut snapshot = (*current).clone();
+            snapshot.retire_pending = true;
+            self.commit_snapshot(snapshot);
+        }
+        Err(n)
+    }
+
+    /// [`Self::retire_when_empty`] while sessions remain; an empty graph is
+    /// left as it is. `true` when a retirement is now pending.
+    pub fn retire_when_empty_if_busy(&self) -> bool {
+        if self.retiring.load(std::sync::atomic::Ordering::SeqCst)
+            || self.current().sessions.is_empty()
+        {
+            return false;
+        }
+        self.retire_when_empty().is_err()
+    }
+
+    fn retire_now(&self) {
+        self.retiring
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let current = self.current();
+        if !current.retired {
+            let mut snapshot = (*current).clone();
+            snapshot.retired = true;
+            self.commit_snapshot(snapshot);
+        }
+    }
+
     fn refuse_if_retiring(&self) -> Result<(), GraphError> {
         if self.retiring.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(GraphError::Shutdown);
+            return Err(GraphError::Retired);
         }
         Ok(())
     }
@@ -911,6 +960,13 @@ impl SessionGraph {
             snapshot.windows.remove(wid);
         }
         snapshot.sessions.remove(&id);
+        // A pending retire lands in this same step: no session is created
+        // between the last one ending and the refusal of every later one.
+        if snapshot.retire_pending && snapshot.sessions.is_empty() {
+            snapshot.retired = true;
+            self.retiring
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
 
         self.commit_snapshot(snapshot);
         // Fire cascade events innermost-out (panes → windows → session) so
@@ -3333,6 +3389,30 @@ mod tests {
         assert_eq!(snap.panes.len(), 1);
     }
 
+    /// A retire asked for while sessions remain waits for them, through any
+    /// number of creates, and lands in the very step that ends the last one.
+    #[test]
+    fn a_pending_retire_lands_with_the_last_session() {
+        let (graph, state) = SessionGraph::new();
+        let a = graph.create_session("a".into(), home()).unwrap();
+        assert_eq!(graph.retire_when_empty(), Err(1));
+        assert!(state.load().retire_pending && !state.load().retired);
+        let b = graph
+            .create_session("b".into(), home())
+            .expect("still serving");
+        graph.destroy_session(a, None).unwrap();
+        assert!(!state.load().retired, "one session still runs");
+        graph.destroy_session(b, None).unwrap();
+        assert!(state.load().retired);
+        assert!(matches!(
+            graph.create_session("late".into(), home()),
+            Err(GraphError::Retired)
+        ));
+        let (idle, idle_state) = SessionGraph::new();
+        assert_eq!(idle.retire_when_empty(), Ok(()));
+        assert!(idle_state.load().retired && !idle_state.load().retire_pending);
+    }
+
     /// A retired graph takes no session, by either path; one that holds a
     /// session is not retired.
     #[test]
@@ -3347,7 +3427,7 @@ mod tests {
 
         let created = graph.create_session("late".into(), home());
         assert!(
-            matches!(created, Err(GraphError::Shutdown)),
+            matches!(created, Err(GraphError::Retired)),
             "session.create after retiring: {created:?}"
         );
         let applied = graph.apply_batch(vec![Op::CreateSession {
@@ -3360,7 +3440,7 @@ mod tests {
             matches!(
                 applied,
                 Err(BatchError::OpFailed {
-                    source: GraphError::Shutdown,
+                    source: GraphError::Retired,
                     ..
                 })
             ),

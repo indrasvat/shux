@@ -36,6 +36,7 @@ pub struct Server {
     router: Router,
     cancel: tokio_util::sync::CancellationToken,
     rebind_gate: Option<crate::uds::RebindGate>,
+    connections: tokio_util::task::TaskTracker,
 }
 
 /// A JSON-RPC 2.0 request (parsed from incoming frames).
@@ -95,7 +96,14 @@ impl Server {
             router,
             cancel,
             rebind_gate: None,
+            connections: tokio_util::task::TaskTracker::new(),
         }
+    }
+
+    /// Every connection this server serves. A daemon leaving waits on it,
+    /// so the reply to the call that ended it is written before it exits.
+    pub fn connections(&self) -> tokio_util::task::TaskTracker {
+        self.connections.clone()
     }
 
     /// Rebind an unlinked socket only while `gate` says this process may.
@@ -176,7 +184,7 @@ impl BoundServer {
                             debug!("accepted UDS connection");
                             let router = router.clone();
                             let cancel = cancel.clone();
-                            tokio::spawn(async move {
+                            server.connections.spawn(async move {
                                 if let Err(e) = handle_uds_connection(stream, router, cancel).await {
                                     warn!(error = %e, "UDS connection error");
                                 }
@@ -202,7 +210,7 @@ impl BoundServer {
                             let router = router.clone();
                             let cancel = cancel.clone();
                             let token = auth_token.clone();
-                            tokio::spawn(async move {
+                            server.connections.spawn(async move {
                                 if let Err(e) = handle_tcp_connection(stream, router, cancel, token).await {
                                     warn!(error = %e, addr = %addr, "TCP connection error");
                                 }
@@ -560,9 +568,29 @@ where
     // Executor loop. Errors (`?` on writes) must still abort the read task,
     // so run the loop in an inner async block and join on `result` below.
     let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
+        // Once the daemon is leaving, a request it never dispatched is told
+        // so (`daemon_stopping`) rather than dropped: a client then knows
+        // nothing of it ran. Bounded, so an idle connection does not hold it.
+        let mut stopping = false;
         loop {
+            if stopping {
+                let Ok(Some(Ok(data))) =
+                    tokio::time::timeout(STOPPING_DRAIN, frame_rx.recv()).await
+                else {
+                    break;
+                };
+                pending_frames.fetch_sub(1, Ordering::SeqCst);
+                pending_bytes.fetch_sub(data.len(), Ordering::SeqCst);
+                framed_tx
+                    .send(Bytes::from(encode_response(&stopping_response(&data))?))
+                    .await?;
+                continue;
+            }
             let maybe_frame = tokio::select! {
-                _ = cancel.cancelled() => break,
+                _ = cancel.cancelled() => {
+                    stopping = true;
+                    continue;
+                }
                 // Client DEAD (peer-death monitor / IO read error) or cap
                 // violation: stop deterministically instead of draining a
                 // dead client's queued frames (accepted fire-and-forget
@@ -692,6 +720,39 @@ async fn process_frame(data: impl AsRef<[u8]>, router: &Router) -> JsonRpcRespon
     }
 }
 
+/// How long a leaving daemon still answers requests it will not dispatch.
+const STOPPING_DRAIN: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// `error.data.kind` of a request a leaving daemon never dispatched.
+pub const DAEMON_STOPPING: &str = "daemon_stopping";
+
+/// The answer to a frame a leaving daemon will not dispatch.
+fn stopping_response(data: &[u8]) -> JsonRpcResponse {
+    let id = parse_request(data).ok().and_then(|r| r.id);
+    JsonRpcResponse::error(id, stopping_error())
+}
+
+static RETIRING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// This daemon is leaving because it retired (no session, none admitted),
+/// not because it was stopped: what it refuses from now on says so.
+pub fn mark_retiring() {
+    RETIRING.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// A leaving daemon's refusal of a request it did not run; `retiring` when
+/// it retired, so a client knows sending it on cannot do anything twice.
+pub fn stopping_error() -> RpcError {
+    RpcError::with_data(
+        ErrorCode::InternalError,
+        serde_json::json!({
+            "kind": DAEMON_STOPPING,
+            "retiring": RETIRING.load(std::sync::atomic::Ordering::SeqCst),
+            "detail": "the daemon is shutting down and did not run this request",
+        }),
+    )
+}
+
 /// A frame's request, or the error response it gets instead.
 fn parse_request(data: &[u8]) -> Result<JsonRpcRequest, Box<JsonRpcResponse>> {
     let request: JsonRpcRequest = match serde_json::from_slice(data) {
@@ -751,26 +812,50 @@ fn try_authenticate(
     Ok(token == Some(expected.as_str()))
 }
 
-/// Debug builds only: a daemon started with this set reports that git SHA as
-/// its build, or no version at all when it is `-`, so tests can stand up a
-/// daemon of "another build" from this one.
+/// Debug builds only: a daemon started with these set reports that git SHA,
+/// version or wire generation as its build, so tests can stand up a daemon
+/// of "another build" from this one. A SHA of `-` reports no version at all;
+/// a wire of `-` reports none, as builds before it did.
 #[cfg(debug_assertions)]
 const TEST_DAEMON_GIT_SHA_ENV: &str = "SHUX_TEST_DAEMON_GIT_SHA";
+#[cfg(debug_assertions)]
+const TEST_DAEMON_VERSION_ENV: &str = "SHUX_TEST_DAEMON_VERSION";
+#[cfg(debug_assertions)]
+const TEST_DAEMON_WIRE_ENV: &str = "SHUX_TEST_DAEMON_WIRE";
 
-fn version_answer() -> serde_json::Value {
-    let answer = serde_json::json!({
-        "version": env!("CARGO_PKG_VERSION"),
+/// What this daemon says of its build: `version`, `git_sha`, `wire`.
+pub fn version_answer() -> serde_json::Value {
+    #[cfg_attr(
+        not(debug_assertions),
+        expect(unused_mut, reason = "mutated by the debug-only overrides")
+    )]
+    let mut answer = serde_json::json!({
+        "version": crate::VERSION,
         "git_sha": crate::GIT_SHA,
         "name": "shux",
+        "wire": crate::WIRE_GENERATION,
     });
     #[cfg(debug_assertions)]
-    if let Ok(sha) = std::env::var(TEST_DAEMON_GIT_SHA_ENV) {
-        if sha == "-" {
+    {
+        let var = |name| std::env::var(name).ok();
+        if var(TEST_DAEMON_GIT_SHA_ENV).as_deref() == Some("-") {
             return serde_json::json!({ "name": "shux" });
         }
-        let mut answer = answer;
-        answer["git_sha"] = sha.into();
-        return answer;
+        if let Some(sha) = var(TEST_DAEMON_GIT_SHA_ENV) {
+            answer["git_sha"] = sha.into();
+        }
+        if let Some(version) = var(TEST_DAEMON_VERSION_ENV) {
+            answer["version"] = version.into();
+        }
+        match var(TEST_DAEMON_WIRE_ENV).as_deref() {
+            Some("-") => {
+                if let Some(o) = answer.as_object_mut() {
+                    o.remove("wire");
+                }
+            }
+            Some(wire) => answer["wire"] = wire.parse::<u64>().unwrap_or(u64::MAX).into(),
+            None => {}
+        }
     }
     answer
 }

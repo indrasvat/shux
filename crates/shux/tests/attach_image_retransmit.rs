@@ -358,7 +358,6 @@ async fn a_large_client_still_receives_frames_when_its_pane_holds_a_picture() {
         serde_json::json!({
             "name": "img-big",
             "command": ["/bin/sh", "-c", dense_workload(tmp.path(), 800, 250, (1536, 1024))],
-            "size": { "cols": 800, "rows": 250 },
         }),
     );
     // The pane has to have CONSUMED the payload before the attach: the frame

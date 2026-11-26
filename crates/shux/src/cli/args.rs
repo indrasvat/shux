@@ -446,6 +446,26 @@ pub enum DaemonCommand {
 
     /// Report whether a daemon is running for this runtime dir, and its pid.
     Status,
+
+    /// Replace the running daemon with this build, keeping its sessions unless told not to.
+    ///
+    /// A daemon of another build keeps serving every command this CLI sends it, and
+    /// refuses (exit 11) only a call it cannot serve. This swaps it for the installed
+    /// build: at once when it holds no sessions, and then the next command starts this
+    /// build. With sessions, `--when-idle` makes it retire the moment its last session
+    /// ends, and `--force` ends them now, as `daemon stop` does. Never starts a daemon,
+    /// and never replaces a newer one without `--force`.
+    ///
+    /// Exits 0 when it is done or will be done on its own, 1 when it was refused (the
+    /// daemon holds sessions, or is a newer release), 3 when the daemon could not be asked.
+    Upgrade {
+        /// Retire when its last session ends, instead of refusing while it holds any.
+        #[arg(long, conflicts_with = "force")]
+        when_idle: bool,
+        /// End its sessions now and stop it.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]

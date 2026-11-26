@@ -51,9 +51,7 @@ fn main() {
     };
 
     if let Err(e) = result {
-        if let Some(refusal) = shux::client::DaemonInUse::find(&e) {
-            cli::exit_daemon_in_use(refusal, format);
-        }
+        cli::exit_if_build_refusal(&e, format);
         report_fatal(&e, format);
     }
 }
@@ -93,6 +91,23 @@ fn end_on_a_failed_print() {
 /// What `clap::Error::exit` does, without discarding a failed write: help or
 /// version that never arrived fails the command as any other output does.
 fn exit_from_clap(e: &clap::Error) -> ! {
+    use clap::error::ErrorKind;
+    // A command handed to the daemon's own, older build that this build
+    // cannot parse was written for a newer one: say that, not a usage error.
+    if let Some(id) = shux::kept_build::handed_to()
+        && matches!(
+            e.kind(),
+            ErrorKind::InvalidSubcommand | ErrorKind::UnknownArgument | ErrorKind::InvalidValue
+        )
+    {
+        style::print_error(&format!(
+            "this command needs a newer shux than the running daemon's own build, shux {id}, \
+             which runs it because the daemon speaks another protocol; nothing was done. Run \
+             `shux daemon upgrade --when-idle` to switch to the installed build when its last \
+             session ends, or `--force` instead of `--when-idle` to end them now"
+        ));
+        std::process::exit(shux::client::DAEMON_TOO_OLD_EXIT);
+    }
     match e.print() {
         Ok(()) => {}
         // A usage error goes to stderr, which cannot report its own failure.

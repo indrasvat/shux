@@ -106,6 +106,13 @@ pub(crate) async fn build_snapshot_status_bar(
     );
     statusbar_build::append_watchers(&mut bar, attached, &theme, cols, false);
     statusbar_build::append_viewing(&mut bar, size_label, &theme, cols);
+    statusbar_build::append_upgrade(
+        &mut bar,
+        crate::rpc::daemon::superseded_by().as_deref(),
+        snap.retire_pending,
+        &theme,
+        cols,
+    );
     bar
 }
 

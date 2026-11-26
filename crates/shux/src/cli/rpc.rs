@@ -139,14 +139,202 @@ pub enum RpcClientError {
         message: String,
         data: Option<serde_json::Value>,
     },
+    #[error("the daemon retired as this call reached it, and no successor could be reached")]
+    Reconnect(#[source] crate::client::ClientError),
+    #[error("could not send the request: {0}")]
+    NotSent(std::io::Error),
 }
 
 /// Send a JSON-RPC request over a UDS and read the response.
 /// Uses 4-byte big-endian length-prefix framing (matching server in task 008).
+///
+/// A call a retiring daemon refused before changing anything (a new session
+/// as its last one ended) is sent once more, to the daemon that serves the
+/// socket next, and `stream` becomes that connection.
 pub async fn rpc_call(
     stream: &mut tokio::net::UnixStream,
     method: &str,
     params: serde_json::Value,
+) -> Result<serde_json::Value, RpcClientError> {
+    let answer = checked_call(stream, method, &params).await;
+    let Some((socket, pid)) = crate::client::last_daemon() else {
+        return answer;
+    };
+    // Sent again only what provably never ran, and only to a daemon that
+    // retired (not one stopped on purpose, or that crashed): a retired graph's
+    // refusal; or, from a daemon that retired, a request it never dispatched
+    // or never read. A request read and left unanswered is never resent: it
+    // may have run. A watch or a wait was for that daemon, and ends with it.
+    let retired = pid.is_some_and(|pid| crate::kept_build::retired(&socket, pid));
+    // To the daemon after it, once it has gone: probing it as it leaves
+    // could reach it again.
+    let gone = || async {
+        match pid {
+            Some(pid) => crate::client::daemon_left(pid, &socket).await,
+            None => true,
+        }
+    };
+    let again = match resend(&answer, method, retired) {
+        Resend::No => false,
+        Resend::Yes => {
+            gone().await;
+            true
+        }
+        Resend::OnceGone => pid.is_some() && gone().await,
+    };
+    if !again {
+        return answer;
+    }
+    *stream = crate::client::ensure_daemon_running_at(&socket)
+        .await
+        .map_err(RpcClientError::Reconnect)?;
+    // Checked as a first send is: the successor may be another build.
+    checked_call(stream, method, &params).await
+}
+
+/// One call, unless the daemon is 0.64.0 and would not serve it as asked.
+async fn checked_call(
+    stream: &mut tokio::net::UnixStream,
+    method: &str,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, RpcClientError> {
+    if let Some((code, data)) = crate::client::refuse_for_legacy_peer(method, params) {
+        return Err(RpcClientError::Rpc {
+            code,
+            message: "not served by shux 0.64.0".into(),
+            data: Some(data),
+        });
+    }
+    call_once(stream, method, params).await
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Resend {
+    No,
+    Yes,
+    /// Once the daemon has exited.
+    OnceGone,
+}
+
+/// Whether a failed call is sent again to the daemon's successor. `retired`:
+/// the daemon's build file says it retired.
+fn resend(
+    answer: &Result<serde_json::Value, RpcClientError>,
+    method: &str,
+    retired: bool,
+) -> Resend {
+    let kind = |d: &serde_json::Value| d.get("kind").and_then(|k| k.as_str()).map(String::from);
+    // A retirement was asked of that daemon; a watch or a wait was for it.
+    if method.contains("watch")
+        || method.contains("wait")
+        || [shux_rpc::UPGRADE, shux_rpc::RETIRE_IF_IDLE].contains(&method)
+    {
+        return Resend::No;
+    }
+    match answer {
+        Err(RpcClientError::Rpc { data: Some(d), .. }) => match kind(d).as_deref() {
+            Some(crate::rpc::convert::DAEMON_RETIRING) => Resend::Yes,
+            // The reply says whether it retired; its build file may already
+            // be its successor's.
+            Some(shux_rpc::server::DAEMON_STOPPING) if retired || d["retiring"] == true => {
+                Resend::Yes
+            }
+            _ => Resend::No,
+        },
+        Err(RpcClientError::NotSent(_)) if retired => Resend::OnceGone,
+        _ => Resend::No,
+    }
+}
+
+#[cfg(test)]
+mod resend_tests {
+    use super::*;
+
+    fn rpc(kind: &str) -> Result<serde_json::Value, RpcClientError> {
+        Err(RpcClientError::Rpc {
+            code: -32603,
+            message: "internal_error".into(),
+            data: Some(serde_json::json!({ "kind": kind })),
+        })
+    }
+
+    fn io(kind: std::io::ErrorKind, sent: bool) -> Result<serde_json::Value, RpcClientError> {
+        let e = std::io::Error::from(kind);
+        Err(if sent {
+            RpcClientError::Io(e)
+        } else {
+            RpcClientError::NotSent(e)
+        })
+    }
+
+    /// Only what provably never ran is sent again, and only away from a daemon
+    /// that retired: never a request it read and left unanswered (it may have
+    /// run, as the kill that ended its last session did), never one a stopped
+    /// or crashed daemon dropped, never a watch or a wait.
+    #[test]
+    fn only_a_call_that_never_ran_is_sent_again() {
+        use std::io::ErrorKind::{BrokenPipe, UnexpectedEof};
+        let create = "session.create";
+        assert_eq!(
+            resend(&rpc(crate::rpc::convert::DAEMON_RETIRING), create, false),
+            Resend::Yes
+        );
+        assert_eq!(
+            resend(&rpc(shux_rpc::server::DAEMON_STOPPING), create, true),
+            Resend::Yes
+        );
+        assert_eq!(
+            resend(&rpc(shux_rpc::server::DAEMON_STOPPING), create, false),
+            Resend::No
+        );
+        // Its reply says it retired, whatever its build file says by now.
+        let retiring = Err(RpcClientError::Rpc {
+            code: -32603,
+            message: "internal_error".into(),
+            data: Some(serde_json::json!({
+                "kind": shux_rpc::server::DAEMON_STOPPING, "retiring": true,
+            })),
+        });
+        assert_eq!(resend(&retiring, create, false), Resend::Yes);
+        assert_eq!(
+            resend(&io(BrokenPipe, false), create, true),
+            Resend::OnceGone
+        );
+        assert_eq!(resend(&io(BrokenPipe, false), create, false), Resend::No);
+        assert_eq!(
+            resend(&io(UnexpectedEof, true), "session.kill", true),
+            Resend::No
+        );
+        assert_eq!(
+            resend(&io(BrokenPipe, false), "events.watch", true),
+            Resend::No
+        );
+        assert_eq!(resend(&rpc("not_found"), create, true), Resend::No);
+        let wait = "pane.wait_exit";
+        assert_eq!(
+            resend(&rpc(crate::rpc::convert::DAEMON_RETIRING), wait, true),
+            Resend::No
+        );
+        assert_eq!(
+            resend(&rpc(shux_rpc::server::DAEMON_STOPPING), wait, true),
+            Resend::No
+        );
+        // Asked of that daemon: its successor is the build asked for.
+        for retire in [shux_rpc::UPGRADE, shux_rpc::RETIRE_IF_IDLE] {
+            assert_eq!(resend(&retiring, retire, true), Resend::No, "{retire}");
+            assert_eq!(
+                resend(&io(BrokenPipe, false), retire, true),
+                Resend::No,
+                "{retire}"
+            );
+        }
+    }
+}
+
+async fn call_once(
+    stream: &mut tokio::net::UnixStream,
+    method: &str,
+    params: &serde_json::Value,
 ) -> Result<serde_json::Value, RpcClientError> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -159,11 +347,15 @@ pub async fn rpc_call(
 
     let payload = serde_json::to_vec(&request)?;
 
-    // Write length prefix (4 bytes, big-endian)
+    // Write length prefix (4 bytes, big-endian). A failed write is a request
+    // the daemon never read whole: it cannot have run.
     let len = payload.len() as u32;
-    stream.write_all(&len.to_be_bytes()).await?;
-    stream.write_all(&payload).await?;
-    stream.flush().await?;
+    let sent = async {
+        stream.write_all(&len.to_be_bytes()).await?;
+        stream.write_all(&payload).await?;
+        stream.flush().await
+    };
+    sent.await.map_err(RpcClientError::NotSent)?;
 
     // Read response length prefix
     let mut len_buf = [0u8; 4];

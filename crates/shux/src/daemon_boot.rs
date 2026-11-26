@@ -39,6 +39,8 @@ pub fn run_daemon(socket_override: Option<PathBuf>) -> anyhow::Result<()> {
         return Ok(());
     };
     let instance_lock = Arc::new(instance_lock);
+    // Held before an install can replace the path (see `kept_build`).
+    crate::kept_build::open_image();
 
     // Step 2: Now we are the daemon process — create tokio runtime
     let rt = tokio::runtime::Runtime::new()?;
@@ -124,6 +126,10 @@ pub fn run_daemon(socket_override: Option<PathBuf>) -> anyhow::Result<()> {
             unresolved_scratch,
         )
         .await?;
+        {
+            let socket = sock_path.clone();
+            tokio::task::spawn_blocking(move || crate::kept_build::keep(&socket));
+        }
 
         // Run the daemon state loop (blocks until shutdown)
         shux_core::daemon::run_daemon_state_loop(cmd_rx, tokens.clone(), config_reload_notify)
@@ -136,6 +142,7 @@ pub fn run_daemon(socket_override: Option<PathBuf>) -> anyhow::Result<()> {
         teardown.drain().await;
 
         // The RPC server has already removed its own socket.
+        crate::kept_build::remove_build_file(&sock_path);
         daemon::remove_own_pid_file_for(&sock_path)?;
         tracing::info!("Daemon shut down cleanly");
 
@@ -489,26 +496,7 @@ pub(crate) fn handle_daemon_command(
                 }
                 return Ok(());
             };
-            // SIGTERM → the daemon's signal handler runs a graceful shutdown.
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(p as i32),
-                nix::sys::signal::Signal::SIGTERM,
-            );
-            // Identity, not `kill(pid, 0)`: an exited daemon stays a zombie until
-            // its parent reaps it, which a subreaper may never do.
-            let deadline = std::time::Instant::now() + crate::patience::peer_patience();
-            let mut gone = !is_live_shux_daemon(p, socket);
-            while !gone && std::time::Instant::now() < deadline {
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = "another process's exit has no event to wait on; poll its identity"
-                )]
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                gone = !is_live_shux_daemon(p, socket);
-            }
-            // Nothing is unlinked here: the daemon removes its own socket and
-            // pidfile on the way out, and by now a client may have started its
-            // successor, whose files these would be.
+            let gone = stop_and_wait(p, socket);
             if let cli::OutputFormat::Json = format {
                 println!("{{\"stopped\": {gone}, \"pid\": {p}}}");
             } else if gone {
@@ -519,15 +507,46 @@ pub(crate) fn handle_daemon_command(
                 );
             }
             if !gone {
-                anyhow::bail!(
-                    "daemon (pid {p}) did not exit within {:?} of SIGTERM; it may be busy \
-                     draining its panes, stopped or wedged -- retry, or kill it",
-                    crate::patience::peer_patience()
-                );
+                anyhow::bail!(not_gone(p));
             }
             Ok(())
         }
+        cli::DaemonCommand::Upgrade { .. } => {
+            anyhow::bail!("`daemon upgrade` is dispatched to cli::handle_daemon_upgrade")
+        }
     }
+}
+
+/// SIGTERM daemon `p` and wait for it to go: whether it went.
+pub(crate) fn stop_and_wait(p: u32, socket: &Path) -> bool {
+    // SIGTERM → the daemon's signal handler runs a graceful shutdown.
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(p as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    );
+    // Identity, not `kill(pid, 0)`: an exited daemon stays a zombie until
+    // its parent reaps it, which a subreaper may never do.
+    let deadline = std::time::Instant::now() + crate::patience::peer_patience();
+    let mut gone = !is_live_shux_daemon(p, socket);
+    while !gone && std::time::Instant::now() < deadline {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "another process's exit has no event to wait on; poll its identity"
+        )]
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        gone = !is_live_shux_daemon(p, socket);
+    }
+    // Nothing is unlinked here: the daemon removes its own socket and pidfile
+    // on the way out, and by now a client may have started its successor.
+    gone
+}
+
+pub(crate) fn not_gone(p: u32) -> String {
+    format!(
+        "daemon (pid {p}) did not exit within {:?} of SIGTERM; it may be busy draining its \
+         panes, stopped or wedged -- retry, or kill it",
+        crate::patience::peer_patience()
+    )
 }
 
 /// What daemon shutdown drains once the state loop has returned.
@@ -535,16 +554,34 @@ pub(crate) struct Teardown {
     io_state: Arc<Mutex<PaneIoState>>,
     plugins: shux_plugin::PluginManager,
     share: crate::share::Gateway,
+    connections: tokio_util::task::TaskTracker,
 }
 
+/// How long a leaving daemon waits for its connections to write their last
+/// replies: the call that ended it, and the refusals of calls it will not run.
+const CONNECTIONS_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
+
 impl Teardown {
-    /// End every share viewer, then reap every pane and every plugin, side
-    /// by side.
+    /// End every share viewer, then reap every pane and every plugin, and let
+    /// every connection write its last reply, side by side.
     pub(crate) async fn drain(self) {
         if let Err(e) = self.share.stop().await {
             tracing::warn!(error = %e, "share gateway stop");
         }
-        tokio::join!(shutdown_all_pane_io(self.io_state), self.plugins.shutdown());
+        self.connections.close();
+        let connections = async {
+            if tokio::time::timeout(CONNECTIONS_DRAIN, self.connections.wait())
+                .await
+                .is_err()
+            {
+                tracing::warn!("connections still open at shutdown");
+            }
+        };
+        tokio::join!(
+            shutdown_all_pane_io(self.io_state),
+            self.plugins.shutdown(),
+            connections
+        );
     }
 }
 
@@ -839,6 +876,7 @@ pub(crate) async fn run_rpc_server(
     // circular dependency (manager holds Arc<OnceCell<Router>>).
     let plugins = shux_plugin::PluginManager::new(event_bus.clone());
 
+    let event_bus_for_upgrade = event_bus.clone();
     // Build router: system builtins + session + window + pane + pane I/O + lens.run + events + state + plugin methods
     let router = rpc::build_router(
         graph_handle.clone(),
@@ -860,6 +898,27 @@ pub(crate) async fn run_rpc_server(
     // classify it" at boot. See
     // `docs/designs/permissions/README.md` §9.6.
     router.assert_every_route_has_policy();
+    router.assert_every_route_declares_params();
+
+    tokio::spawn(rpc::daemon::retire_when_idle(
+        graph_handle.clone(),
+        event_bus_for_upgrade,
+        cancel.clone(),
+    ));
+    {
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(crate::kept_build::TOUCH_EVERY);
+            loop {
+                tokio::select! {
+                    () = cancel.cancelled() => break,
+                    _ = tick.tick() => {
+                        let _ = tokio::task::spawn_blocking(crate::kept_build::touch).await;
+                    }
+                }
+            }
+        });
+    }
 
     // Plugin → daemon RPC calls dispatch through this router clone.
     // Setting it now (post-build) is what lets plugins call any
@@ -903,6 +962,7 @@ pub(crate) async fn run_rpc_server(
 
     let server =
         shux_rpc::Server::new(config, router, cancel.clone()).with_rebind_gate(rebind_gate);
+    let connections = server.connections();
 
     tokio::spawn(async move {
         if let Err(e) = server.run().await {
@@ -924,6 +984,7 @@ pub(crate) async fn run_rpc_server(
         io_state: shutdown_io_state,
         plugins,
         share,
+        connections,
     })
 }
 

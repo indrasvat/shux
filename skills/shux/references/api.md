@@ -776,8 +776,33 @@ flow through the data-plane sealed bus, not the event history).
 ### `system.version`
 
 ```json
-{} → { "name": "shux", "version": "0.8.0", "git_sha": "..." }
+{ "client": {"version": "0.65.0", "git_sha": "..."} }   // optional: the caller's build
+→ { "name": "shux", "version": "0.65.0", "git_sha": "...", "wire": 1,
+    "capabilities": { "pane.capture": ["lines", "pane_id", "session_id", "window_id"], ... },
+    "superseded_by": "0.66.0" | null, "upgrade_pending": false,
+    "build": { "exe": "<runtime>/shux/builds/.../shux", "dev": N, "ino": N } }
 ```
+
+`wire` is the protocol generation: any two builds of one generation serve each
+other, and a call one lacks fails alone. `capabilities` is every method with the
+top-level parameters it takes; any other key is refused (`invalid_params`,
+`data.kind: "unknown_params"`); a key set to `null` is absent (in `state.apply`
+ops at any depth), but for a few that mean something by it, such as
+`share.create`'s `from_pane`. A
+newer caller's `client` sets `superseded_by` and, while sessions remain, arms the
+upgrade: `upgrade_pending` turns true, as `daemon.upgrade` with `"idle"` makes it.
+
+### `daemon.upgrade` — owner-local
+
+```json
+{ "when": "now" | "idle", "client": {...} } → { "retired": bool, "pending": bool, "sessions": N }
+```
+
+With no sessions the daemon retires at once and the next command starts the
+caller's build. With sessions, `"idle"` retires it in the same step that ends
+the last of them; `"now"` refuses, unless the caller is a newer release or an
+upgrade is already armed (`pending: true`). `shux daemon upgrade [--when-idle|--force]`
+wraps it (`--force` stops the daemon instead).
 
 ### `plugin.state.{get,set,delete}` — plugin-only
 

@@ -25,6 +25,7 @@ const EXPECTED_SURFACE: &[&str] = &[
     "client.detach => Grantable",
     "client.list => Public",
     "daemon.retire_if_idle => PluginsForbidden",
+    "daemon.upgrade => PluginsForbidden, owner-local",
     "events.history => ContentRead",
     "events.watch => ParamAware(broad=ContentRead, self_scoped=Public)",
     "lens.run => Grantable",
@@ -124,6 +125,28 @@ fn gateway(
 }
 
 fn actual_surface() -> Vec<String> {
+    let router = daemon_router();
+    let mut lines: Vec<String> = router
+        .methods()
+        .into_iter()
+        .map(|m| {
+            let policy = router
+                .policy(m)
+                .expect("assert_every_route_has_policy covers this");
+            let local = if router.is_owner_local(m) {
+                ", owner-local"
+            } else {
+                ""
+            };
+            format!("{m} => {}{local}", describe(policy))
+        })
+        .collect();
+    lines.sort();
+    lines
+}
+
+/// The daemon's router, built as the daemon builds it.
+fn daemon_router() -> shux_rpc::Router {
     let bus = shux_core::bus::EventBus::new();
     let (_graph, state) = shux_core::graph::SessionGraph::new_with_event_bus(Some(bus.clone()));
     // Registration only stores handles in closures; nothing is dispatched here,
@@ -147,7 +170,7 @@ fn actual_surface() -> Vec<String> {
         shux_plugin::PluginManager::with_state_root(bus.clone(), state_dir.path().join("plugins"));
 
     let share = gateway(&graph, &io_state, &config, &onboarding, &segments);
-    let router = super::build_router(
+    super::build_router(
         graph,
         io_state,
         cancel,
@@ -160,25 +183,182 @@ fn actual_surface() -> Vec<String> {
         bus,
         plugins,
         share,
-    );
+    )
+}
 
-    let mut lines: Vec<String> = router
-        .methods()
-        .into_iter()
-        .map(|m| {
-            let policy = router
-                .policy(m)
-                .expect("assert_every_route_has_policy covers this");
-            let local = if router.is_owner_local(m) {
-                ", owner-local"
-            } else {
-                ""
-            };
-            format!("{m} => {}{local}", describe(policy))
-        })
+/// Every method of the daemon refuses a key it does not take, before its
+/// handler runs: the graph loop here is never spawned, so a handler that ran
+/// would hang rather than answer.
+#[tokio::test]
+async fn every_method_refuses_a_parameter_it_does_not_take() {
+    let router = daemon_router();
+    router.assert_every_route_declares_params();
+    let mut methods = router.methods();
+    methods.sort_unstable();
+    for method in methods {
+        let call = router.dispatch(method, Some(serde_json::json!({ "zz_not_a_param": 1 })));
+        let err = shux_rpc::with_transport(shux_rpc::Transport::Uds, call)
+            .await
+            .expect_err(method);
+        let data = err.data.unwrap_or_default();
+        assert_eq!(data["kind"], shux_rpc::UNKNOWN_PARAMS, "{method}: {data}");
+        assert_eq!(
+            data["params"],
+            serde_json::json!(["zz_not_a_param"]),
+            "{method}"
+        );
+    }
+}
+
+/// A field inside `state.apply` ops that this build does not know is refused
+/// as `unknown_params` naming it, like a top-level key, at any depth.
+#[tokio::test]
+async fn an_unknown_op_field_is_refused_as_unknown_params() {
+    let router = daemon_router();
+    for (op, field) in [
+        (
+            serde_json::json!({"op": "create_session", "cwd": "/tmp", "zz_new": 1}),
+            "ops.zz_new",
+        ),
+        (
+            serde_json::json!({"op": "create_window", "session": {"ref_op": 0, "zz_ref": 1}, "title": "t"}),
+            "ops.zz_ref",
+        ),
+    ] {
+        let call = router.dispatch("state.apply", Some(serde_json::json!({ "ops": [op] })));
+        let err = shux_rpc::with_transport(shux_rpc::Transport::Uds, call)
+            .await
+            .expect_err("refused");
+        let data = err.data.unwrap_or_default();
+        assert_eq!(data["kind"], shux_rpc::UNKNOWN_PARAMS, "{data}");
+        assert_eq!(data["params"], serde_json::json!([field]), "{data}");
+    }
+
+    // Set to `null`, at any depth, a field asks for nothing, as at the top
+    // level: the ops parse, and the batch goes on to the graph.
+    let op = serde_json::json!({
+        "op": "create_window", "session": {"ref_op": 5, "zz_ref": null},
+        "title": "t", "cwd": null, "zz_new": null,
+    });
+    let call = router.dispatch("state.apply", Some(serde_json::json!({ "ops": [op] })));
+    let err = shux_rpc::with_transport(shux_rpc::Transport::Uds, call)
+        .await
+        .expect_err("this router runs no graph");
+    let said = format!("{err:?}");
+    assert!(
+        !said.contains(shux_rpc::UNKNOWN_PARAMS) && !said.contains("ops parse error"),
+        "a null op field was refused: {said}"
+    );
+}
+
+/// Only a caller on the daemon's own socket speaks for a newer CLI: a
+/// plugin's `system.version` neither arms an upgrade nor sets the badge.
+#[tokio::test]
+async fn a_plugin_cannot_arm_an_upgrade_through_system_version() {
+    let router = daemon_router();
+    let newer = serde_json::json!({ "client": { "version": "999.0.0", "git_sha": "x" } });
+    let answer = router
+        .dispatch("system.version", Some(newer))
+        .await
+        .expect("answered");
+    assert!(answer["superseded_by"].is_null(), "{answer}");
+}
+
+/// Generation 1 only grows: what `wire_1.rs` records is still served, and
+/// what is served is recorded there, so a parameter added after 0.64.0 cannot
+/// be removed again without a new generation.
+#[test]
+fn wire_generation_1_only_grows() {
+    use std::collections::{BTreeSet, HashMap};
+    assert_eq!(
+        shux_rpc::WIRE_GENERATION,
+        1,
+        "a new generation starts a baseline of its own"
+    );
+    let served: HashMap<&str, &[&str]> = super::accepts::ACCEPTS.iter().copied().collect();
+    let recorded: HashMap<&str, &[&str]> = super::wire_1::WIRE_1.iter().copied().collect();
+    for (method, keys) in &recorded {
+        let now = served
+            .get(method)
+            .unwrap_or_else(|| panic!("{method} was removed from generation 1"));
+        for key in *keys {
+            assert!(now.contains(key), "{method} no longer takes {key}");
+        }
+    }
+    for (method, keys) in &served {
+        let then = recorded
+            .get(method)
+            .unwrap_or_else(|| panic!("{method} is not recorded in wire_1.rs"));
+        for key in *keys {
+            assert!(
+                then.contains(key),
+                "{method} {key} is not recorded in wire_1.rs"
+            );
+        }
+    }
+    let ops: BTreeSet<&str> = super::wire_1::WIRE_1_OPS
+        .iter()
+        .flat_map(|(_, fields)| fields.iter().copied())
+        .chain(super::wire_1::WIRE_1_BACK_REF.iter().copied())
         .collect();
-    lines.sort();
-    lines
+    let now: BTreeSet<&str> = shux_core::apply::OP_FIELDS.iter().copied().collect();
+    assert_eq!(ops, now, "state.apply op fields differ from wire_1.rs");
+    // Each kind still takes each of its own fields.
+    for (kind, fields) in super::wire_1::WIRE_1_OPS {
+        for field in *fields {
+            let op = serde_json::json!({ "op": kind, *field: 0 });
+            if let Err(e) = serde_json::from_value::<shux_core::apply::Op>(op) {
+                assert!(
+                    !e.to_string().contains("unknown field"),
+                    "{kind} no longer takes {field}: {e}"
+                );
+            }
+        }
+    }
+}
+
+/// The table names only methods the daemon serves: a stale entry would be
+/// published as a capability the daemon does not have.
+#[tokio::test]
+async fn the_accepted_params_name_only_served_methods() {
+    let router = daemon_router();
+    let stale: Vec<&str> = super::accepts::ACCEPTS
+        .iter()
+        .map(|(m, _)| *m)
+        .filter(|m| !router.has_method(m))
+        .collect();
+    assert!(stale.is_empty(), "declared but not served: {stale:?}");
+}
+
+/// Within a wire generation the surface only grows: every method and
+/// parameter 0.64.0 served is still served. Removing one is a generation bump.
+#[test]
+fn no_method_or_parameter_of_an_earlier_release_is_gone() {
+    assert_eq!(
+        shux_rpc::WIRE_GENERATION,
+        1,
+        "a new generation starts a new baseline"
+    );
+    let now: std::collections::HashMap<&str, &[&str]> =
+        super::accepts::ACCEPTS.iter().copied().collect();
+    for (method, keys) in super::legacy_0_64::LEGACY_0_64 {
+        let served = now
+            .get(method)
+            .unwrap_or_else(|| panic!("{method} was removed"));
+        for key in *keys {
+            assert!(served.contains(key), "{method} no longer takes {key}");
+        }
+    }
+    let legacy_ops = super::legacy_0_64::LEGACY_0_64_OPS.iter();
+    for field in legacy_ops
+        .flat_map(|(_, fields)| fields.iter())
+        .chain(super::legacy_0_64::LEGACY_0_64_BACK_REF)
+    {
+        assert!(
+            shux_core::apply::OP_FIELDS.contains(field),
+            "state.apply ops no longer take {field}"
+        );
+    }
 }
 
 #[tokio::test]

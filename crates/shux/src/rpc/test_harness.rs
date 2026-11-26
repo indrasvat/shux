@@ -72,7 +72,11 @@ impl RpcHarness {
             lens_scratch::ScratchRegistry::new(scratch_dir.path(), lens_audit.clone());
 
         let builder = crate::rpc::session::register_session_methods(
-            shux_rpc::Router::builder(),
+            crate::rpc::daemon::register_daemon_methods(
+                shux_rpc::Router::builder(),
+                graph.clone(),
+                cancel.clone(),
+            ),
             graph.clone(),
             io.clone(),
             cancel.clone(),
@@ -127,8 +131,11 @@ impl RpcHarness {
         );
         let router =
             crate::rpc::events::register_events_methods(builder, bus.clone(), graph.clone())
+                .accepts(crate::rpc::accepts::ACCEPTS)
+                .keeps_null(crate::rpc::legacy_0_64::LEGACY_0_64)
                 .build();
         router.assert_every_route_has_policy();
+        router.assert_every_route_declares_params();
 
         Self {
             router,

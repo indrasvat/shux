@@ -2510,6 +2510,16 @@ async fn run_render_loop(
                     if plain { "*" } else { "◉" },
                     has_notice,
                 );
+                // A guest is not shown the host's daemon.
+                if !plain {
+                    crate::statusbar_build::append_upgrade(
+                        &mut bar,
+                        crate::rpc::daemon::superseded_by().as_deref(),
+                        snap.retire_pending,
+                        &live_theme,
+                        cols,
+                    );
+                }
                 if has_notice {
                     crate::statusbar_build::make_room_for_notice(&mut bar, cols);
                 }

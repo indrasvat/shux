@@ -1,9 +1,12 @@
-//! A CLI of another build never stops a daemon that holds sessions (#277).
+//! A CLI never stops a daemon that holds sessions (#277), and refuses to run
+//! against one it cannot safely serve: a build from before wire generations
+//! that is not 0.64.0 (#318). `build_skew.rs` covers the builds it serves.
 //!
 //! The "other build" is this binary's own daemon started with
-//! `SHUX_TEST_DAEMON_GIT_SHA`, which debug builds honour: it then answers the
-//! version check as another commit, or with no version at all for `-`.
-//! Release builds compile that hook out, so these run in debug builds only.
+//! `SHUX_TEST_DAEMON_GIT_SHA`, `_VERSION` and `_WIRE`, which debug builds
+//! honour: it then answers the version check as an older release that says
+//! no wire generation, or with no version at all for a SHA of `-`. Release
+//! builds compile that hook out, so these run in debug builds only.
 #![cfg(debug_assertions)]
 
 use std::fs::File;
@@ -21,6 +24,9 @@ use nix::unistd::Pid;
 const DAEMON_IN_USE: i32 = 10;
 
 const OTHER_SHA: &str = "0ther00";
+
+/// A release from before wire generations, other than 0.64.0.
+const LEGACY_VERSION: &str = "0.63.0";
 
 struct Harness {
     bin: PathBuf,
@@ -42,7 +48,9 @@ impl Harness {
             .env("SHELL", "/bin/sh")
             .env_remove("SHUX_SOCKET")
             .env_remove("SHUX")
-            .env_remove("SHUX_TEST_DAEMON_GIT_SHA");
+            .env_remove("SHUX_TEST_DAEMON_GIT_SHA")
+            .env_remove("SHUX_TEST_DAEMON_VERSION")
+            .env_remove("SHUX_TEST_DAEMON_WIRE");
         cmd
     }
 
@@ -51,10 +59,12 @@ impl Harness {
     }
 
     /// Runs `args` from a client whose daemon, if it starts one, answers the
-    /// version check with `sha`.
+    /// version check as [`LEGACY_VERSION`] at `sha`.
     fn run_as_other_build(&self, sha: &str, args: &[&str]) -> Output {
         self.shux()
             .env("SHUX_TEST_DAEMON_GIT_SHA", sha)
+            .env("SHUX_TEST_DAEMON_VERSION", LEGACY_VERSION)
+            .env("SHUX_TEST_DAEMON_WIRE", "-")
             .args(args)
             .output()
             .expect("run shux")
@@ -143,7 +153,7 @@ fn a_daemon_of_another_build_holding_a_session_is_refused_not_stopped() {
         shux_rpc::GIT_SHA,
         "1 session",
         " daemon stop",
-        "the next shux command starts this build",
+        "after its last session ends replaces it with this build",
     ] {
         assert!(stderr.contains(want), "refusal lacks {want:?}: {stderr}");
     }
@@ -167,11 +177,7 @@ fn a_daemon_of_another_build_holding_a_session_is_refused_not_stopped() {
     assert_eq!(data["kind"], "daemon_in_use", "{parsed}");
     assert_eq!(data["exit_code"], DAEMON_IN_USE, "{parsed}");
     assert_eq!(data["daemon_git_sha"], OTHER_SHA, "{parsed}");
-    assert_eq!(
-        data["daemon_version"],
-        env!("CARGO_PKG_VERSION"),
-        "{parsed}"
-    );
+    assert_eq!(data["daemon_version"], LEGACY_VERSION, "{parsed}");
     assert_eq!(data["client_git_sha"], shux_rpc::GIT_SHA, "{parsed}");
     assert_eq!(
         data["client_version"],

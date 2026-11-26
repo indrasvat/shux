@@ -643,7 +643,7 @@ pub async fn handle_pane_record(
     let outcome = tokio::select! {
         outcome = ended => match outcome {
             Ok(outcome) => outcome,
-            Err(super::RpcClientError::Io(_)) => anyhow::bail!(
+            Err(super::RpcClientError::Io(_) | super::RpcClientError::NotSent(_)) => anyhow::bail!(
                 "the daemon went away while recording {}; the file holds what was written before",
                 path.display()
             ),

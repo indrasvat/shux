@@ -11,9 +11,12 @@ use tokio::sync::Mutex;
 
 use crate::pane_io::PaneIoState;
 
+pub(crate) mod accepts;
 pub(crate) mod client;
 pub(crate) mod convert;
+pub(crate) mod daemon;
 pub(crate) mod events;
+pub(crate) mod legacy_0_64;
 pub(crate) mod pane;
 pub(crate) mod pane_io;
 pub(crate) mod params;
@@ -25,6 +28,8 @@ pub(crate) mod state;
 pub(crate) mod wait_command;
 pub(crate) mod wait_exit;
 pub(crate) mod window;
+#[cfg(test)]
+pub(crate) mod wire_1;
 
 #[cfg(test)]
 pub(crate) mod test_harness;
@@ -62,8 +67,12 @@ pub(crate) fn build_router(
                                     crate::rpc::window::register_window_methods(
                                         crate::rpc::client::register_client_methods(
                                             crate::rpc::session::register_session_methods(
-                                                shux_rpc::server::register_builtin_methods(
-                                                    shux_rpc::Router::builder(),
+                                                crate::rpc::daemon::register_daemon_methods(
+                                                    shux_rpc::server::register_builtin_methods(
+                                                        shux_rpc::Router::builder(),
+                                                    ),
+                                                    graph.clone(),
+                                                    cancel.clone(),
                                                 ),
                                                 graph.clone(),
                                                 io_state.clone(),
@@ -114,6 +123,9 @@ pub(crate) fn build_router(
         ),
         plugins,
     )
+    .accepts(accepts::ACCEPTS)
+    // `null` means absent for every parameter added since 0.64.0.
+    .keeps_null(legacy_0_64::LEGACY_0_64)
     .build()
 }
 
