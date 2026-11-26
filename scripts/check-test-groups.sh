@@ -128,8 +128,9 @@ def matched_tests(filterset):
             "cargo", "nextest", "list",
             "--binaries-metadata", BINARIES_METADATA, "--cargo-metadata", CARGO_METADATA,
             "--color", "never", "--message-format", "json",
-            # An ignored test still runs in its group under `--run-ignored`.
-            "--run-ignored", "all",
+            # An ignored test still runs in its group under `--run-ignored`,
+            # and one the default-filter hides runs in it under its own target.
+            "--run-ignored", "all", "--ignore-default-filter",
             "-E", filterset,
         ],
         capture_output=True,

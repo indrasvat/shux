@@ -36,6 +36,16 @@ slow-timeout = { period = "30s", terminate-after = 4 }
 # (macOS only reports it: see the override at the end).
 leak-timeout = { period = "500ms", result = "fail" }
 
+# Out of `make test` and CI, each with a target of its own that runs it:
+#   s2 repeats s1's settle 100 times on one daemon (94 s); `make test-lens-soak`.
+#   lens_gate_bench records throughput numbers; `make bench-lens-gate`.
+# The flake gate still runs either one the diff edits; listings that must see
+# every test (check-test-inventory, check-test-groups) pass --ignore-default-filter.
+default-filter = '''
+not (binary_id(=shux::lens_settle) & test(=s2_settle_flake_gate_100x))
+  & not binary_id(=shux::lens_gate_bench)
+'''
+
 [test-groups]
 # ── Why these groups exist ────────────────────────────────────────────────
 #

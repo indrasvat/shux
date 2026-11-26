@@ -773,7 +773,11 @@ bench-lens-gate: nextest-ready ## Record task-080 capture/compare/render through
 
 .PHONY: lens-gate-bench-run
 lens-gate-bench-run:
-	$(call lens_run_pure,Recording lens-gate throughput (task 080 §6),--test lens_gate_bench,--no-capture)
+	$(call lens_run_pure,Recording lens-gate throughput (task 080 §6),--test lens_gate_bench,--no-capture --ignore-default-filter)
+
+.PHONY: test-lens-soak
+test-lens-soak: nextest-ready ## Run s2: the lens settle 100 times on one daemon (out of make test; nextest default-filter)
+	$(call lens_run,Running the lens settle soak (s2),--test lens_settle,--ignore-default-filter -E 'test(=s2_settle_flake_gate_100x)')
 
 .PHONY: test-lens-gate-run
 test-lens-gate-run: nextest-ready ## Run the task-081 scenario-runner suite (drives real fixture TUIs via `shux lens gate`) serially under the leak guard
