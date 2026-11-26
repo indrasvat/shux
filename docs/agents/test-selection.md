@@ -7,13 +7,15 @@
   state, no LLM.
 - **The flake gate starts the slowest tests first** in every run after the
   first (`scripts/test-stress.sh`). On #321's 399 tests, 20 runs under load
-  went from 1069 s to 887 s. The tests and their count are unchanged.
+  went from 1137 s to 1019 s (−10%), main's script against this one. The
+  tests and their count are unchanged. A small PR's gate is no slower (#320:
+  74 s either way).
 - **Measured and not adopted:** a per-test coverage probe, overlapping the 20
   runs, and an LLM layer. The numbers are below.
 - **What is left is mostly not waste.** On #321, a PR's own new tests and the
-  tests that run its changed harness code are about three quarters of the
-  time. Cutting further means changing what the gate promises. That is a
-  policy decision, listed at the end.
+  tests that run its changed harness code are 168 of 243 test-seconds (69%).
+  Cutting further means changing what the gate promises. That is a policy
+  decision, listed at the end.
 
 ## Using it
 
@@ -54,8 +56,10 @@ cost.
 **How is a miss detected and recorded?** Two ways, both scripts:
 
 - `make flake-gate-replay` checks, for each merged PR, that the new selection
-  holds every test the PR added or edited. It finds them without the gate's own
-  code: added `fn` lines, and hunks inside a fn's braces.
+  holds every test the PR added or edited that the per-module gate selected.
+  It finds them without the gate's own code: added `fn` lines, and hunks
+  inside a fn's braces. A test both gates would miss is outside what it can
+  see.
 - `make flake-gate-misses` replays each flake the gate caught in CI
   (`.shux/flake-gate-catches.txt`) at the commit where it failed, and fails if
   that test is no longer selected. Add a line there whenever the gate catches
@@ -83,14 +87,15 @@ per-module gate (`8ef34f8`) against the per-test one:
 
 ### Where #321's time goes
 
-#321 is the costliest gate on record: 399 tests, 1101 s for 20 runs. One run of
+#321 is the costliest gate on record: 399 tests, 1101 s for the whole gate
+(selection and 20 runs, as #324 measured it). One run of
 those tests, unloaded, takes 243 s of test time:
 
 | Part | Tests | Test time | Avoidable? |
 |---|---|---|---|
 | Tests #321 adds or edits | 48 | 86 s | no: the gate exists to run these |
 | Unit tests built on `rpc::test_harness`, which #321 changed | 216 | 82 s | no: every one of them runs the changed harness |
-| Three integration binaries with a copy of production's `graph_error_to_rpc`, which a new enum variant forced to change | 120 | 61 s | yes: no test enters that function |
+| Three integration binaries with a copy of production's `graph_error_to_rpc`, which a new enum variant forced to change | 120 | 61 s | mostly: unloaded, 12 of the 120 enter that function, all in m0_integration |
 | The rest | 15 | 14 s | partly |
 
 A run lasts as long as its slowest stretch: at most 12 daemon-backed tests run
@@ -101,16 +106,16 @@ new test alone takes 24 s.
 
 | Idea | Measured on #321 | Verdict |
 |---|---|---|
-| Start the slowest tests first in runs 2–20 | 1069 s → 887 s (−17%), 0 failures | **shipped** |
-| Run the 20 runs as 4 overlapping lanes, the daemon cap split between them | 881 s, against 1069 s in order (one run, and an unrelated build shared the machine for two minutes of it) | not adopted: no better than ordering, and copies of one test run at once, which no test was written for |
-| Coverage probe: one instrumented run, then keep only the tests that entered a changed helper fn | 399 → about 280 tests; costs 110 s to build and 37 s to run, before the 20 runs | not adopted: saves about 10% net, and an unloaded run cannot show which paths a test takes under load, which is the one thing the gate is for |
+| Start the slowest tests first in runs 2–20 | 1137 s → 1019 s (−10%), 0 failures: main's `test-stress.sh` against this one, back to back. Runs vary ±10 s under load, so treat it as about 10%. A prototype that ranked from an unloaded run and ordered all 20 runs measured 1069 s → 887 s | **shipped** |
+| Run the 20 runs as 4 overlapping lanes, the daemon cap split between them | 881 s, against the prototype's 1069 s in order (one run, and an unrelated build shared the machine for two minutes of it) | not adopted: copies of one test then run at once, which no test was written for; measuring whether every test tolerates that is its own piece of work, and one run is too noisy to say it beats ordering |
+| Coverage probe: one instrumented run, then keep only the tests that entered a changed helper fn | 399 → about 280 tests; costs 110 s to build and 37 s to run, before the 20 runs | not adopted: about 10% net (a projection, not measured end to end), and an unloaded run cannot show which paths a test takes under load, which is the one thing the gate is for |
 | A coverage map built on `main` and stored | not built | same objection, and it goes stale |
 | Cheaper runs (`nextest archive`) | 0.55 s a run today; archive 2.5 s | not adopted: slower |
 
 The coverage probe's per-function data is real. On #321, m0_integration's 67
 tests drop to 12, and cli_integration's and pane_io_integration's 53 to none:
-their copy of `graph_error_to_rpc` runs only on error paths, and no test
-reaches one unloaded. The council that reviewed this design found the hole:
+their copy of `graph_error_to_rpc` runs only on error paths, which only those
+12 reach unloaded. The council that reviewed this design found the hole:
 under load, an RPC can fail during teardown and reach exactly that function.
 A gate that drops a test because it did not fail on an idle machine has
 stopped gating that test.
@@ -131,11 +136,15 @@ stopped gating that test.
 These change what the gate promises, so they are a decision, not a fix:
 
 1. **Run tests pulled in only by a helper change fewer times**, say 5 runs
-   instead of 20, and keep 20 for the tests a PR adds or edits. On #321 that is
-   about 157 s of the 243 s per run. Cost: a flake in an unchanged test that a
-   helper change introduces becomes less likely to be caught.
-2. **The coverage probe, enforcing.** About 10% on #321, for the risk above.
+   instead of 20, and keep 20 for the tests a PR adds or edits. On #321 the
+   tests pulled in that way are 157 of the 243 test-seconds a run: the
+   harness users, the three binaries above and the rest. Cost: a flake in an
+   unchanged test that a helper change introduces becomes less likely to be
+   caught.
+2. **The coverage probe, enforcing.** About 10% on #321 (projected), for the
+   risk above.
 3. **Use production's `graph_error_to_rpc` in the three integration binaries**
-   instead of their copies. They test a stale fork, and a new `GraphError`
-   variant then no longer pulls in 120 tests. It happened in 1 of the last 20
-   PRs.
+   instead of their copies. They test a stale fork (the copies still build the
+   not-found message production stopped building), and a new `GraphError`
+   variant then no longer pulls in 120 tests. The copy in m0_integration has
+   changed three times (#113, #247, #321); in the 30 replayed PRs, once.
