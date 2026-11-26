@@ -945,6 +945,11 @@ flake-gate-replay: nextest-ready ## Replay merged PRs through the old and the ne
 	@bin="$$(bash scripts/ensure-ast-grep.sh)" && export PATH="$$bin:$$PATH" && \
 		NEXTEST_JOBS=$(NEXTEST_JOBS) .shux/scripts/no_leak_guard.sh bash .shux/scripts/flake_gate_replay.sh $(COMMITS)
 
+.PHONY: flake-gate-misses
+flake-gate-misses: nextest-ready ## Every flake the gate caught in CI (.shux/flake-gate-catches.txt) is still selected at its commit
+	@bin="$$(bash scripts/ensure-ast-grep.sh)" && export PATH="$$bin:$$PATH" && \
+		bash .shux/scripts/flake_gate_misses.sh
+
 .PHONY: shellcheck
 shellcheck: ## shellcheck every tracked shell script (the layer the guards live in)
 	@bash scripts/check-shell.sh
