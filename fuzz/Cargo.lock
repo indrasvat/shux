@@ -1615,7 +1615,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "shux"
-version = "0.65.0"
+version = "0.66.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1664,7 +1664,7 @@ dependencies = [
 
 [[package]]
 name = "shux-core"
-version = "0.65.0"
+version = "0.66.0"
 dependencies = [
  "arc-swap",
  "notify",
@@ -1695,7 +1695,7 @@ dependencies = [
 
 [[package]]
 name = "shux-plugin"
-version = "0.65.0"
+version = "0.66.0"
 dependencies = [
  "chrono",
  "nix",
@@ -1715,7 +1715,7 @@ dependencies = [
 
 [[package]]
 name = "shux-program-status"
-version = "0.65.0"
+version = "0.66.0"
 dependencies = [
  "base64",
  "serde",
@@ -1723,7 +1723,7 @@ dependencies = [
 
 [[package]]
 name = "shux-pty"
-version = "0.65.0"
+version = "0.66.0"
 dependencies = [
  "nix",
  "serde",
@@ -1736,7 +1736,7 @@ dependencies = [
 
 [[package]]
 name = "shux-raster"
-version = "0.65.0"
+version = "0.66.0"
 dependencies = [
  "flate2",
  "fontdue",
@@ -1748,7 +1748,7 @@ dependencies = [
 
 [[package]]
 name = "shux-rpc"
-version = "0.65.0"
+version = "0.66.0"
 dependencies = [
  "bytes",
  "futures",
@@ -1762,7 +1762,7 @@ dependencies = [
 
 [[package]]
 name = "shux-ui"
-version = "0.65.0"
+version = "0.66.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -1785,7 +1785,7 @@ dependencies = [
 
 [[package]]
 name = "shux-vt"
-version = "0.65.0"
+version = "0.66.0"
 dependencies = [
  "base64",
  "memchr",

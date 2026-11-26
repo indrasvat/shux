@@ -1,3 +1,10 @@
+# [0.66.0](https://github.com/indrasvat/shux/compare/v0.65.0...v0.66.0) (2026-11-26)
+
+
+### Features
+
+* **flake-gate:** select the test functions a diff changes, not their modules ([#324](https://github.com/indrasvat/shux/issues/324)) ([75371a8](https://github.com/indrasvat/shux/commit/75371a8f4155bf93ce9e99a670d87e016268bba7)), closes [#323](https://github.com/indrasvat/shux/issues/323)
+
 # [0.65.0](https://github.com/indrasvat/shux/compare/v0.64.0...v0.65.0) (2026-11-26)
 
 
