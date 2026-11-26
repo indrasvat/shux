@@ -1,0 +1,248 @@
+# Where each test function sits in a Rust file, for scripts/flake-gate.sh.
+# Not a lint (it is outside sgconfig.yml's ruleDirs): run it with
+#   ast-grep scan -r lint/ast-grep/test-spans.yml --json=stream <file>
+#
+#   fn       an item-level `#[test]`-style fn; $LEAD is the first attribute or
+#            comment above it, where its span starts
+#   ptest    the body of a `#[test] fn` inside an item-level `proptest! { … }`;
+#            $NAME is its name
+#   pname    any fn's name inside `proptest!`; plead, an attribute part or
+#            comment directly above one, starts that fn's span, and ptattr,
+#            its `#[test]`, makes it a test (proptest! fns without are not)
+#   mod      an inline `mod name { … }`, for the test's module path
+#   cmt      a line comment, so a comment-only line can be told from a line
+#            inside a string
+#   cfgt     code compiled only for tests: an item, field or statement under a
+#            `cfg` or `cfg_attr` that names `test` anywhere, from $LEAD on.
+#            `not(test)` counts too: telling it apart is where under-selection
+#            hides, and over-selecting is safe
+#   cfgm     the same for `mod name;`, whose code is name's own file: a change
+#            to it selects that module's tests
+#   cfgo     a `cfg` attribute naming `test` on anything else: test code from
+#            there to the end of the file
+#   cfgf     an inner `#![cfg(test)]`: the whole file is test code
+#   str      a string over several lines, whose blank lines are content
+# A test the rules do not see (one a macro writes, one nested in a fn) leaves
+# its lines outside every span, and the gate then selects its whole module.
+id: fn
+language: rust
+utils:
+  aoc:
+    any: [{ kind: attribute_item }, { kind: line_comment }, { kind: block_comment }]
+  test-attr:
+    kind: attribute_item
+    regex: '^#\[\s*(::)?([A-Za-z_][A-Za-z0-9_]*::)*(test|rstest|proptest)\s*([(\]]|/[*/])'
+rule:
+  kind: function_item
+  inside:
+    any:
+      - kind: source_file
+      - kind: declaration_list
+        inside: { kind: mod_item }
+  has: { field: name, pattern: $NAME }
+  all:
+    - follows: { stopBy: { not: { matches: aoc } }, matches: test-attr }
+    - follows:
+        stopBy: { not: { matches: aoc } }
+        matches: aoc
+        pattern: $LEAD
+        not: { follows: { matches: aoc } }
+---
+id: mod
+language: rust
+rule:
+  kind: mod_item
+  all:
+    - has: { field: name, pattern: $NAME }
+    - has: { field: body, kind: declaration_list }
+---
+id: ptest
+language: rust
+rule:
+  kind: token_tree
+  regex: '^\{'
+  inside:
+    kind: token_tree
+    inside:
+      kind: macro_invocation
+      has: { field: macro, regex: '^(proptest::)?proptest$' }
+      inside:
+        any:
+          - kind: source_file
+          - kind: declaration_list
+            inside: { kind: mod_item }
+  follows:
+    kind: token_tree
+    regex: '^\('
+    follows:
+      kind: identifier
+      pattern: $NAME
+      follows:
+        stopBy: { not: { any: [{ kind: line_comment }, { kind: block_comment }] } }
+        regex: '^fn$'
+---
+id: pname
+language: rust
+rule:
+  kind: identifier
+  follows:
+    stopBy: { not: { any: [{ kind: line_comment }, { kind: block_comment }] } }
+    regex: '^fn$'
+  inside:
+    kind: token_tree
+    inside:
+      kind: macro_invocation
+      has: { field: macro, regex: '^(proptest::)?proptest$' }
+---
+id: plead
+language: rust
+utils:
+  # `[…]` after a lone `#` (an outer attribute: `#![…]` is the macro's own
+  # config and covers every fn in it), or a comment.
+  outer-attr-part:
+    any:
+      - kind: token_tree
+        regex: '^\['
+        follows: { regex: '^#$' }
+      - kind: line_comment
+      - kind: block_comment
+rule:
+  any: [{ kind: token_tree }, { kind: line_comment }, { kind: block_comment }]
+  matches: outer-attr-part
+  inside:
+    kind: token_tree
+    inside:
+      kind: macro_invocation
+      has: { field: macro, regex: '^(proptest::)?proptest$' }
+  precedes:
+    stopBy: { not: { any: [{ matches: outer-attr-part }, { regex: '^#$' }] } }
+    regex: '^fn$'
+---
+id: ptattr
+language: rust
+rule:
+  kind: token_tree
+  regex: '^\[\s*test\s*\]$'
+  follows: { regex: '^#$' }
+  inside:
+    kind: token_tree
+    inside:
+      kind: macro_invocation
+      has: { field: macro, regex: '^(proptest::)?proptest$' }
+  precedes:
+    stopBy:
+      not:
+        any:
+          - { kind: token_tree, regex: '^\[' }
+          - { kind: line_comment }
+          - { kind: block_comment }
+          - { regex: '^#$' }
+    regex: '^fn$'
+---
+id: cmt
+language: rust
+rule:
+  kind: line_comment
+---
+id: cfgt
+language: rust
+utils:
+  aoc:
+    any: [{ kind: attribute_item }, { kind: line_comment }, { kind: block_comment }]
+  cfg-test-attr:
+    kind: attribute_item
+    regex: '^#\[\s*(::)?([A-Za-z_][A-Za-z0-9_]*::)*cfg(_attr)?\s*\((?s:.)*\btest\b'
+rule:
+  any:
+    - kind: function_item
+    - kind: function_signature_item
+    - kind: mod_item
+    - kind: foreign_mod_item
+    - kind: use_declaration
+    - kind: extern_crate_declaration
+    - kind: const_item
+    - kind: static_item
+    - kind: struct_item
+    - kind: enum_item
+    - kind: union_item
+    - kind: impl_item
+    - kind: trait_item
+    - kind: type_item
+    - kind: macro_definition
+    - kind: macro_invocation
+    - kind: field_declaration
+    - kind: enum_variant
+    - kind: let_declaration
+    - kind: expression_statement
+  all:
+    - follows: { stopBy: { not: { matches: aoc } }, matches: cfg-test-attr }
+    - follows:
+        stopBy: { not: { matches: aoc } }
+        matches: aoc
+        pattern: $LEAD
+        not: { follows: { matches: aoc } }
+---
+id: cfgm
+language: rust
+utils:
+  aoc:
+    any: [{ kind: attribute_item }, { kind: line_comment }, { kind: block_comment }]
+  cfg-test-attr:
+    kind: attribute_item
+    regex: '^#\[\s*(::)?([A-Za-z_][A-Za-z0-9_]*::)*cfg(_attr)?\s*\((?s:.)*\btest\b'
+rule:
+  kind: mod_item
+  not: { has: { field: body, kind: declaration_list } }
+  has: { field: name, pattern: $NAME }
+  all:
+    - follows: { stopBy: { not: { matches: aoc } }, matches: cfg-test-attr }
+    - follows:
+        stopBy: { not: { matches: aoc } }
+        matches: aoc
+        pattern: $LEAD
+        not: { follows: { matches: aoc } }
+---
+id: cfgo
+language: rust
+utils:
+  aoc:
+    any: [{ kind: attribute_item }, { kind: line_comment }, { kind: block_comment }]
+rule:
+  kind: attribute_item
+  regex: '^#\[\s*(::)?([A-Za-z_][A-Za-z0-9_]*::)*cfg(_attr)?\s*\((?s:.)*\btest\b'
+  not:
+    precedes:
+      stopBy: { not: { matches: aoc } }
+      any:
+        - kind: function_item
+        - kind: function_signature_item
+        - kind: mod_item
+        - kind: foreign_mod_item
+        - kind: use_declaration
+        - kind: extern_crate_declaration
+        - kind: const_item
+        - kind: static_item
+        - kind: struct_item
+        - kind: enum_item
+        - kind: union_item
+        - kind: impl_item
+        - kind: trait_item
+        - kind: type_item
+        - kind: macro_definition
+        - kind: macro_invocation
+        - kind: field_declaration
+        - kind: enum_variant
+        - kind: let_declaration
+        - kind: expression_statement
+---
+id: cfgf
+language: rust
+rule:
+  kind: inner_attribute_item
+  regex: '^#!\[\s*(::)?([A-Za-z_][A-Za-z0-9_]*::)*cfg(_attr)?\s*\((?s:.)*\btest\b'
+---
+id: str
+language: rust
+rule:
+  any: [{ kind: string_literal }, { kind: raw_string_literal }]
+  regex: '\n'

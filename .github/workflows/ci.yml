@@ -409,6 +409,19 @@ jobs:
         run: brew install stress-ng bash
       - name: New and changed tests under load
         run: make flake-gate BASE=origin/${{ github.base_ref }}
+      # A change to the gate's own selection re-proves it on real builds: per
+      # kind of change, fewer tests than the per-module gate, none dropped.
+      - name: Flake gate proof (when the gate's selection changes)
+        if: runner.os == 'Linux'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if git diff --quiet "origin/$BASE_REF...HEAD" -- scripts/flake-gate.sh \
+              lint/ast-grep/test-spans.yml scripts/test-only-files.sh .shux/scripts/flake_gate_proof.sh; then
+            echo "the gate's selection is unchanged; no proof to re-run"
+          else
+            make flake-gate-proof
+          fi
 
   # No `needs:` on purpose. Coverage re-runs the whole suite itself under
   # instrumentation and consumes nothing from `test-ubuntu` — no artifact, no
