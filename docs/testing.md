@@ -162,6 +162,11 @@ that lists no tests (a name worked out wrong, a helper module with no tests
 of its own) widens until it does: one test, then its module, then its
 package's unit-test binaries. The gate prints why each file fell back.
 
+Every run after the first starts the tests that were slowest in the first
+(`scripts/test-stress.sh`), so a long test no longer starts last and stretches
+the run. The tests and their count are the same. Why selection stops here, and
+what was measured and left out: `docs/agents/test-selection.md`.
+
 Any failed run fails the job, and a run that outlasts the job's time limit fails it too. This replaces
 "stress it locally if you remember".
 
