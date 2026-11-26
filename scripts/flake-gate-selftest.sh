@@ -23,25 +23,36 @@ mkdir -p "$work/bin" "$work/repo/scripts" "$work/repo/lint/ast-grep"
 cat >"$work/bin/cargo" <<'EOF'
 #!/usr/bin/env bash
 while (($#)) && [[ "$1" != -E ]]; do shift; done
-f="${2:-}"
-f="${f#(}"
 one='^binary_id\(=([^)]*)\) & test\(=(.*)\)$'
 module='^binary_id\(=([^)]*)\) & test\(/\^(.*)/\)$'
 binary='^binary_id\(=([^)]*)\)'
 package='^package\(=([^)]*)\)'
-while IFS= read -r t; do
-    [[ "$t" != "${FLAKE_SELFTEST_EMPTY:-none}" ]] || continue
-    if [[ "$t" =~ $one ]]; then
-        l="${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
-        [[ "$l" == "${FLAKE_SELFTEST_UNLISTED:-none}" ]] || echo "$l"
-    elif [[ "$t" =~ $module ]]; then
-        echo "${BASH_REMATCH[1]} ${BASH_REMATCH[2]}stub"
-    elif [[ "$t" =~ $package ]]; then
-        echo "${BASH_REMATCH[1]} stub"
-    elif [[ "$t" =~ $binary ]]; then
-        echo "${BASH_REMATCH[1]} stub"
+# lst <filter>: the tests a "(a) + (b)" union, "none()" or "(A) - (B)" lists.
+lst() {
+    local f="$1" a b t l
+    [[ "$f" != 'none()' ]] || return 0
+    if [[ "$f" == *') - ('* ]]; then
+        a="${f%%) - (*}"
+        b="${f#*) - (}"
+        comm -23 <(lst "${a#(}" | sort -u) <(lst "${b%)}" | sort -u)
+        return 0
     fi
-done < <(awk '{ sub(/\)$/, ""); gsub(/\) \+ \(/, "\n"); print }' <<<"$f")
+    while IFS= read -r t; do
+        [[ "$t" != "${FLAKE_SELFTEST_EMPTY:-none}" ]] || continue
+        if [[ "$t" =~ $one ]]; then
+            l="${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
+            [[ "$l" == "${FLAKE_SELFTEST_UNLISTED:-none}" ]] || echo "$l"
+        elif [[ "$t" =~ $module ]]; then
+            echo "${BASH_REMATCH[1]} ${BASH_REMATCH[2]}stub"
+        elif [[ "$t" =~ $package ]]; then
+            echo "${BASH_REMATCH[1]} stub"
+        elif [[ "$t" =~ $binary ]]; then
+            echo "${BASH_REMATCH[1]} stub"
+        fi
+    done < <(awk '{ sub(/^\(/, ""); sub(/\)$/, ""); gsub(/\) \+ \(/, "\n"); print }' <<<"$f")
+}
+if [[ -n "${FLAKE_SELFTEST_FAIL_DIFF:-}" && "${2:-}" == *') - ('* ]]; then exit 101; fi
+lst "${2:-}"
 EOF
 chmod +x "$work/bin/cargo"
 cd "$work/repo"
@@ -51,7 +62,8 @@ git config user.name selftest
 cp "$here/flake-gate.sh" "$here/test-only-files.sh" scripts/
 cp "$spans" lint/ast-grep/
 # shellcheck disable=SC2016  # the stub prints its own environment when it runs
-printf '#!/usr/bin/env bash\necho "FILTER: $STRESS_FILTER"\n' >scripts/test-stress.sh
+printf '#!/usr/bin/env bash\necho "FILTER ${STRESS_COUNT}${STRESS_IGNORE_DEFAULT_FILTER:+ all}: $STRESS_FILTER"\n' \
+    >scripts/test-stress.sh
 
 w() { mkdir -p "$(dirname "$1")"; printf '%s\n' "${@:2}" >"$1"; }
 w crates/p/src/lib.rs 'pub mod foo;' '#[cfg(any(test, fuzzing))]' 'pub mod fz;' 'pub fn a() {}' \
@@ -130,6 +142,31 @@ git add crates .shux scripts lint
 git commit -qm base
 
 fail=0
+# want_runs <term>...: the test-stress runs those terms make. A term naming one
+# test (`& test(=`) is an edited test, run 20 times with every test in scope; a
+# "D:" prefix marks another term edited (a new module, a widened edited test).
+# Any other term is reached through a helper and runs 5 times.
+want_runs() {
+    local t all=() edited=() other=0
+    for t in "$@"; do
+        if [[ "$t" == D:* ]]; then
+            t="${t#D:}"
+            edited+=("$t")
+        elif [[ "$t" == *"& test(="* ]]; then
+            edited+=("$t")
+        else
+            other=1
+        fi
+        all+=("$t")
+    done
+    j() { printf '%s\n' "$@" | sort -u | awk '{ printf "%s(%s)", (NR > 1 ? " + " : ""), $0 }'; }
+    local e="none()"
+    if ((${#edited[@]})); then
+        e="$(j "${edited[@]}")"
+        echo "FILTER 20 all: $e"
+    fi
+    if ((other)); then echo "FILTER 5: ($(j "${all[@]}")) - ($e)"; fi
+}
 # case <label> <change (shell)> <expected term>... ("-" for nothing to gate)
 case_() {
     local label="$1" change="$2"
@@ -149,8 +186,8 @@ case_() {
         want="nothing to gate"
         got="$(grep -o 'nothing to gate' <<<"$out" || true)"
     else
-        want="FILTER: $(printf '%s\n' "$@" | sort -u | awk '{ printf "%s(%s)", (NR > 1 ? " + " : ""), $0 }')"
-        got="$(grep '^FILTER: ' <<<"$out" || true)"
+        want="$(want_runs "$@")"
+        got="$(grep '^FILTER ' <<<"$out" || true)"
     fi
     if [[ "$got" == "$want" ]]; then
         echo "  ✓ $label"
@@ -194,7 +231,8 @@ case_ "a test's attribute" "fns 's/#\\[test\\]\\n    fn b/#[tokio::test]\\n    a
 case_ "a line deleted from inside a test" "fns 's/        let b2 = 1;\\n//'" 'binary_id(=p) & test(=fns::tests::b)'
 case_ "a new test" "fns 's/(        let b2 = 1;\\n    \\}\\n)/\$1\\n    #[test]\\n    fn fresh() {}\\n/'" 'binary_id(=p) & test(=fns::tests::fresh)'
 case_ "a deleted test selects nothing" "fns 's/    #\\[test\\]\\n    fn gone\\(\\) \\{ let g = 1; \\}\\n\\n//'" -
-case_ "a renamed test: the old name may be called, so the module" "fns 's/fn old_name/fn new_name/'" "$fns_coarse"
+case_ "a renamed test: the old name may be called, so the module; the new name x20" "fns 's/fn old_name/fn new_name/'" \
+    "$fns_coarse" 'binary_id(=p) & test(=fns::tests::new_name)'
 case_ "a test made a helper: the module" "fns 's/    #\\[test\\]\\n    fn shared/    fn shared/'" "$fns_coarse"
 case_ "an rstest fixture is not a test" "fns 's/fn fx\\(\\) -> u8 \\{ 1 \\}/fn fx() -> u8 { 2 }/'" "$fns_coarse"
 case_ "a test rewritten whole into a helper: the module" "fns 's/    #\\[test\\]\\n    fn rewr\\(\\) \\{ let rw = 1; \\}/    fn rewr() { let rw = 2; }/'" "$fns_coarse"
@@ -202,7 +240,8 @@ case_ "two tests" "fns 's/let a = 1;/let a = 2;/; s/let d = 1;/let d = 2;/'" \
     'binary_id(=p) & test(=fns::tests::a)' 'binary_id(=p) & test(=fns::tests::inner::d)'
 case_ "a proptest! fn" "fns 's/let p = x;/let p = x + 1;/'" 'binary_id(=p) & test(=fns::tests::prop)'
 case_ "a comment on no item" "fns 's|// trailing note|// trailing notes|'" -
-case_ "a test and a helper: the whole module" "fns 's/let a = 1;/let a = 2;/; s/const LIMIT: u8 = 1/const LIMIT: u8 = 2/'" "$fns_coarse"
+case_ "a test and a helper: the test x20, the rest of its module x5" "fns 's/let a = 1;/let a = 2;/; s/const LIMIT: u8 = 1/const LIMIT: u8 = 2/'" \
+    "$fns_coarse" 'binary_id(=p) & test(=fns::tests::a)'
 case_ "a use in the test module" "fns 's/use super::\\*;/use super::c;/'" "$fns_coarse"
 case_ "a const in the test module" "fns 's/const LIMIT: u8 = 1/const LIMIT: u8 = 2/'" "$fns_coarse"
 case_ "a macro in the test module" "fns 's/let m = 1;/let m = 2;/'" "$fns_coarse"
@@ -221,18 +260,19 @@ case_ "a fn cfg_attr(test, test) makes a test" "perl -pi -e 's/let q = 1;/let q 
 case_ "cfg(any(test, not(test)))" "perl -pi -e 's/let w = 1;/let w = 2;/' crates/p/src/attr.rs" 'binary_id(=p) & test(=attr::mixed::changed)'
 case_ "production code above the test module" "fns 's/let y = 1;/let y = 2;/'" -
 FLAKE_SELFTEST_UNLISTED='p fns::tests::a' \
-    case_ "a test nextest does not list by that name: the whole module" "fns 's/let a = 1;/let a = 2;/'" "$fns_coarse"
+    case_ "a test nextest does not list by that name: the whole module, x20" "fns 's/let a = 1;/let a = 2;/'" "D:$fns_coarse"
 FLAKE_SELFTEST_UNLISTED='p fns::tests::a' FLAKE_SELFTEST_EMPTY="$fns_coarse" \
-    case_ "... and when that module lists nothing: its package's unit tests" "fns 's/let a = 1;/let a = 2;/'" "$units_p"
+    case_ "... and when that module lists nothing: its package's unit tests, x20" "fns 's/let a = 1;/let a = 2;/'" "D:$units_p"
 FLAKE_SELFTEST_EMPTY='binary_id(=p) & test(/^helps::/)' \
     case_ "a cfg(test) helper in a module with no tests: its package's unit tests" "perl -pi -e 's/u8 \\{ 1 \\}/u8 { 2 }/' crates/p/src/helps.rs" "$units_p"
 case_ "production code after a cfg(test) use" "perl -pi -e 's/let y = 1;/let y = 2;/' crates/p/src/early.rs" -
 case_ "a cfg(test) use" "perl -pi -e 's/fmt::Write;/fmt::Display;/' crates/p/src/early.rs" 'binary_id(=p) & test(/^early::/)'
-case_ "a changed cfg(test) mod x; declaration: the declaring module" "perl -pi -e 's/early_more/early_other/' crates/p/src/early.rs" 'binary_id(=p) & test(/^early::/)'
-case_ "a new test module and its declaration" "perl -0pi -e 's/^/#[cfg(test)]\\nmod added;\\n/' crates/p/src/early.rs; w crates/p/src/early/added.rs '#[test]' 'fn t() {}'" \
-    'binary_id(=p) & test(/^early::added::/)' 'binary_id(=p) & test(=early::added::t)'
+case_ "a changed cfg(test) mod x; declaration: the declaring module; the module it now loads x20" \
+    "perl -pi -e 's/early_more/early_other/' crates/p/src/early.rs" 'binary_id(=p) & test(/^early::/)' 'D:binary_id(=p) & test(/^early::more::/)'
+case_ "a new test module and its declaration, all x20" "perl -0pi -e 's/^/#[cfg(test)]\\nmod added;\\n/' crates/p/src/early.rs; w crates/p/src/early/added.rs '#[test]' 'fn t() {}'" \
+    'D:binary_id(=p) & test(/^early::added::/)' 'binary_id(=p) & test(=early::added::t)'
 case_ "cfg(test) on a match arm: test code to the end" "perl -pi -e 's/9 => 0/9 => 2/' crates/p/src/orphan.rs" 'binary_id(=p) & test(/^orphan::/)'
-case_ "a new mod x; with an attribute above its cfg(test)" "perl -0pi -e 's/^/#[path = \"z2.rs\"]\\n#[cfg(test)]\\nmod zed2;\\n/' crates/p/src/early.rs" 'binary_id(=p) & test(/^early::zed2::/)'
+case_ "a new mod x; with an attribute above its cfg(test)" "perl -0pi -e 's/^/#[path = \"z2.rs\"]\\n#[cfg(test)]\\nmod zed2;\\n/' crates/p/src/early.rs" 'D:binary_id(=p) & test(/^early::zed2::/)'
 case_ "a test in main.rs: its bin target" "edit crates/p/src/main.rs" 'binary_id(=p::bin/p) & test(=tests::t)'
 case_ "a test in src/bin/<name>.rs: that bin" "edit crates/p/src/bin/tool.rs" 'binary_id(=p::bin/tool) & test(=tests::tool_t)'
 case_ "a #[test] outside cfg(test)" "edit crates/p/src/bare.rs" 'binary_id(=p) & test(=bare::bare)'
@@ -250,6 +290,33 @@ case_ "a file a bin's mod x; owns" "edit crates/q/src/owner.rs" 'package(=q) & (
 case_ "src/bin/ in a package whose lib has a mod bin" "edit crates/r/src/bin/tool.rs" 'package(=r) & (kind(=lib) + kind(=bin))'
 case_ "a bare test rewritten whole into a helper: the module" "perl -0pi -e 's/#\\[test\\]\\nfn bare2\\(\\) \\{ let b2 = 1; \\}/fn bare2() { let b2 = 2; }/' crates/p/src/bare.rs" 'binary_id(=p) & test(/^bare::/)'
 case_ "a test-only file whose tests a macro writes" "perl -pi -e 's/M: u8 = 1/M: u8 = 2/' crates/p/src/macrot.rs" 'binary_id(=p) & test(/^macrot::/)'
+
+case_ "a new integration-test binary: its tests x20" \
+    "w crates/p/tests/fresh.rs '#[test]' 'fn f1() { let a = 1; }' '#[test]' 'fn f2() { let b = 1; }'" \
+    'binary_id(=p::fresh) & test(=f1)' 'binary_id(=p::fresh) & test(=f2)'
+
+# The helper tier's count is FLAKE_HELPER_COUNT, and a listing that fails
+# fails the gate rather than skipping the tier.
+git checkout -q -f main
+git checkout -q -B feat
+edit crates/p/tests/common/mod.rs
+git commit -qam change
+out="$(PATH="$work/bin:$PATH" BASE=main FLAKE_HELPER_COUNT=3 bash scripts/flake-gate.sh 2>&1)" || true
+if grep -q '^FILTER 3: ' <<<"$out" && ! grep -q '^FILTER 5: ' <<<"$out"; then
+    echo "  ✓ FLAKE_HELPER_COUNT sets the helper tier's runs"
+else
+    echo "  ✗ FLAKE_HELPER_COUNT sets the helper tier's runs: $out"
+    fail=1
+fi
+if out="$(PATH="$work/bin:$PATH" BASE=main FLAKE_SELFTEST_FAIL_DIFF=1 bash scripts/flake-gate.sh 2>&1)"; then
+    echo "  ✗ a failing helper-tier listing fails the gate: it exited 0: $out"
+    fail=1
+elif grep -q '^FILTER ' <<<"$out"; then
+    echo "  ✗ a failing helper-tier listing fails the gate: it ran a tier anyway: $out"
+    fail=1
+else
+    echo "  ✓ a failing helper-tier listing fails the gate"
+fi
 
 # Discovery that fails must fail the gate, never read as "nothing to gate".
 git checkout -q -f main
