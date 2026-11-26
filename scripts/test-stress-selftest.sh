@@ -30,8 +30,10 @@ done
 cp "$cfg" "$STUB_LOG/run$n.toml"
 # The profile's section, and the JUnit path it sets (a TOML basic string).
 awk -v p="[profile.$profile]" '$0 == p { on = 1; next } /^\[/ { on = 0 } on' "$cfg" >"$STUB_LOG/run$n.profile"
-if [[ -n "${STUB_HOG_DIES:-}" ]]; then
+if [[ -n "${STUB_HOG_DIES:-}${STUB_HOG_LIVES:-}" ]]; then
     for _ in $(seq 400); do [[ -s "$STUB_LOG/hog.pid" ]] && break; sleep 0.05; done
+fi
+if [[ -n "${STUB_HOG_DIES:-}" ]]; then
     for _ in $(seq 400); do
         s="$(ps -o stat= -p "$(cat "$STUB_LOG/hog.pid")" 2>/dev/null || true)"
         [[ -n "$s" && "$s" != Z* ]] || break
@@ -52,10 +54,17 @@ fi
 [[ "$n" != "${STUB_FAIL_RUN:-}" ]] || exit 100
 exit "${STUB_STATUS:-0}"
 EOF
-# A hog that dies at once; cargo's first run waits until it is gone.
+# A hog that dies at once (cargo's first run then waits until it is gone), or,
+# with STUB_HOG_LIVES, one that runs until it is sent SIGTERM, which it records,
+# or for 10s at most.
 cat >"$work/bin/stress-ng" <<'EOF'
 #!/usr/bin/env bash
+[[ -n "${STUB_HOG_LIVES:-}" ]] || { echo "$$" >"$STUB_LOG/hog.pid"; exit 0; }
+trap 'touch "$STUB_LOG/hog.term"; kill "$s" 2>/dev/null; exit 0' TERM
+sleep 10 &
+s=$!
 echo "$$" >"$STUB_LOG/hog.pid"
+wait "$s"
 EOF
 chmod +x "$work/bin/cargo" "$work/bin/stress-ng"
 
@@ -109,10 +118,27 @@ done
 if [[ -z "$(find "$work/tmp" -mindepth 1)" ]]; then ok "it leaves no temp files"; else bad "it leaves no temp files"; fi
 
 NEXTEST_PROFILE=ci run 2
-if ((status == 0)) && grep -qx 'inherits = "ci"' "$work/log/run1.profile" && grep -qx 'inherits = "ci"' "$work/log/run2.profile"; then
-    ok "every run inherits NEXTEST_PROFILE"
+if ((status == 0)) && ran 1 ci && ran 2 ci && cmp -s "$work/log/run2.toml" "$work/repo/.config/nextest.toml"; then
+    ok "another NEXTEST_PROFILE runs as it is, unordered"
 else
-    bad "every run inherits NEXTEST_PROFILE (exit $status)"
+    bad "another NEXTEST_PROFILE runs as it is, unordered (exit $status)"
+fi
+
+LC_ALL=de_DE.UTF-8 STUB_TIMES=$'1.2 p a\n1.9 p b\n1.5 p c' run 2
+got="$(priorities 2 2>/dev/null || true)"
+if [[ "$got" == $'100 p b\n99 p c\n98 p a' ]]; then
+    ok "times sort the same in a locale with a decimal comma"
+else
+    bad "times sort the same in a locale with a decimal comma: got [$got]"
+fi
+
+mkdir -p "$work/repo/rel"
+STUB_TMPDIR=rel run 2
+if ((status == 0)) && [[ "$(priorities 2 2>/dev/null || true)" == "100 p::it slow_one"* ]] &&
+    grep -q '^path = "/' "$work/log/run1.toml"; then
+    ok "a relative TMPDIR still yields a report, at an absolute path"
+else
+    bad "a relative TMPDIR still yields a report, at an absolute path (exit $status)"
 fi
 
 STUB_TIMES=$'5.0 p case)tail\n4.0 p a&amp;b\n3.0 p::x y\n2.0 p o,k'
@@ -135,7 +161,7 @@ fi
 
 STUB_TIMES='1.0 p a'
 run 1
-if ((status == 0)) && ran 1 stress-first && [[ ! -e "$work/log/run2.args" ]]; then
+if ((status == 0)) && ran 1 default && [[ ! -e "$work/log/run2.args" ]]; then
     ok "a single run needs no order"
 else
     bad "a single run needs no order (exit $status)"
@@ -168,6 +194,27 @@ if ((status == 100)) && [[ -f "$work/log/run3.args" ]]; then
     ok "a failure in a later run fails the stress run, after every run"
 else
     bad "a failure in a later run fails the stress run, after every run (exit $status)"
+fi
+
+STUB_FAIL_RUN=1 run 2
+if ((status == 100)) && [[ -f "$work/log/run2.args" ]]; then
+    ok "a failure in the first run survives a passing second"
+else
+    bad "a failure in the first run survives a passing second (exit $status)"
+fi
+
+STUB_STATUS=101 run 3
+if ((status == 101)) && [[ ! -e "$work/log/run2.args" ]]; then
+    ok "a run that fails to build stops the stress run at once"
+else
+    bad "a run that fails to build stops the stress run at once (exit $status)"
+fi
+
+LOAD=1 STUB_HOG_LIVES=1 run 2
+if ((status == 0)) && [[ -f "$work/log/hog.term" ]]; then
+    ok "a live hog is stopped when the stress run ends"
+else
+    bad "a live hog is stopped when the stress run ends (exit $status)"
 fi
 
 LOAD=1 STUB_HOG_DIES=1 run 2

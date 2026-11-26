@@ -1,14 +1,16 @@
-# Tests the flake gate caught failing under load in CI, at the PR commit it ran on:
-# <commit> <binary_id> <test>. Read by .shux/scripts/flake_gate_misses.sh.
-2124b831b shux-rpc server::tests::shutdown_leaves_a_socket_bound_in_its_place
-2124b831b shux::pane_wait_command_e2e a_line_submitted_and_not_yet_started_is_never_typed_behind
-2124b831b shux::pane_wait_command_e2e pane_run_refuses_a_program_in_front_of_a_shell_without_integration
-92b2d696f shux-plugin::plugin_lifecycle a_plugin_request_stalled_on_disk_leaves_the_worker_free
-92b2d696f shux::lens_glance g1_glance_atomicity_under_concurrent_flips
-fd5d51bd9 shux::attach_ui_e2e a_mouse_selection_leaves_the_terminal_cursor_on_the_pane_cursor
-4c9f185be shux gate::runner::tests::a_trace_to_a_fifo_is_written
-e6c667323 shux::share_cli a_refusal_from_cloudflare_says_to_wait
-a367a0ff2 shux::build_skew a_create_racing_a_pending_upgrade_lands_on_the_successor
-a367a0ff2 shux::build_skew daemon_upgrade_in_every_state
-2bb1bd75c shux::build_skew daemon_upgrade_in_every_state
-2bb1bd75c shux::build_skew every_command_racing_the_retirement_succeeds
+# Tests the flake gate caught failing under load in CI: "<commit> <binary_id>
+# <test>", the full id of the PR commit the run tested. CI ran that commit merged
+# into the base of the day; .shux/scripts/flake_gate_misses.sh replays it against
+# its merge base with origin/main, the same fork point.
+2124b831b727f73cca16263c289086927997a421 shux-rpc server::tests::shutdown_leaves_a_socket_bound_in_its_place
+2124b831b727f73cca16263c289086927997a421 shux::pane_wait_command_e2e a_line_submitted_and_not_yet_started_is_never_typed_behind
+2124b831b727f73cca16263c289086927997a421 shux::pane_wait_command_e2e pane_run_refuses_a_program_in_front_of_a_shell_without_integration
+92b2d696f59b2f04a59e79fdd6338da5d4c73ce6 shux-plugin::plugin_lifecycle a_plugin_request_stalled_on_disk_leaves_the_worker_free
+92b2d696f59b2f04a59e79fdd6338da5d4c73ce6 shux::lens_glance g1_glance_atomicity_under_concurrent_flips
+fd5d51bd9d40a2b23410b78da49dbaa62aa821f2 shux::attach_ui_e2e a_mouse_selection_leaves_the_terminal_cursor_on_the_pane_cursor
+4c9f185beed5f8b1d5e407236cdbdd1197a775e6 shux gate::runner::tests::a_trace_to_a_fifo_is_written
+e6c6673236a3f7841e8afeaa1432ca2acfe27dbe shux::share_cli a_refusal_from_cloudflare_says_to_wait
+a367a0ff213f2dedfe4d4bcf218d6d1a9ae7849e shux::build_skew a_create_racing_a_pending_upgrade_lands_on_the_successor
+a367a0ff213f2dedfe4d4bcf218d6d1a9ae7849e shux::build_skew daemon_upgrade_in_every_state
+2bb1bd75c2ccd4ead1b85888dad5429f446afcee shux::build_skew daemon_upgrade_in_every_state
+2bb1bd75c2ccd4ead1b85888dad5429f446afcee shux::build_skew every_command_racing_the_retirement_succeeds

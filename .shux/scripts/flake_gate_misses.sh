@@ -32,10 +32,9 @@ git -C "$root" worktree add -q --detach "$wt" origin/main
 # shellcheck disable=SC2016  # expands when the stub runs
 printf '#!/usr/bin/env bash\nprintf "%%s" "$STRESS_FILTER" >"$FLAKE_PROOF_FILTER"\n' >"$scratch/stress-stub.sh"
 
-fail=0
-n=0
-while read -r commit bin test; do
-    n=$((n + 1))
+# select_at <commit>: the tests this checkout's gate selects there, into $scratch/set.
+select_at() {
+    local commit="$1" base
     # A PR's commits outlive its squash merge only under refs/pull/*: fetch by id.
     git -C "$root" cat-file -e "$commit^{commit}" 2>/dev/null || git -C "$root" fetch -q origin "$commit"
     git -C "$wt" checkout -q -- . 2>/dev/null || true
@@ -47,20 +46,32 @@ while read -r commit bin test; do
     cp "$root/lint/ast-grep/test-spans.yml" "$wt/lint/ast-grep/"
     cp "$scratch/stress-stub.sh" "$wt/scripts/test-stress.sh"
     : >"$scratch/filter"
-    printf '\033[1;36m▶ %s: %s %s\033[0m\n' "$commit" "$bin" "$test"
+    printf '\033[1;36m▶ %s: selecting\033[0m\n' "$commit"
     (cd "$wt" && BASE="$base" FLAKE_PROOF_FILTER="$scratch/filter" bash scripts/flake-gate.sh) >"$scratch/gate.log" 2>&1 || {
         status=$?
         tail -20 "$scratch/gate.log" >&2
         echo "✗ the gate failed at $commit (exit $status)" >&2
         exit "$status"
     }
-    selected=0
     if [[ -s "$scratch/filter" ]]; then
         (cd "$wt" && cargo nextest list --color never --workspace -E "$(cat "$scratch/filter")" --message-format oneline) >"$scratch/set"
-        selected="$(grep -c . "$scratch/set" || true)"
     else
         : >"$scratch/set"
     fi
+}
+
+fail=0
+n=0
+done_at=""
+while read -r commit bin test; do
+    n=$((n + 1))
+    if [[ "$commit" != "$done_at" ]]; then
+        # Not from the loop's stdin, which is the list of catches.
+        select_at "$commit" </dev/null
+        done_at="$commit"
+    fi
+    selected="$(grep -c . "$scratch/set" || true)"
+    printf '  %s %s\n' "$bin" "$test"
     if grep -qxF "$bin $test" "$scratch/set"; then
         printf '\033[1;32m  ✓ kept, among %d selected\033[0m\n' "$selected"
     else
