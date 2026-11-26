@@ -23,9 +23,9 @@ filter="${STRESS_FILTER:-all()}"
 load="${STRESS_LOAD:-0}"
 jobs="${NEXTEST_JOBS:-16}"
 base_profile="${NEXTEST_PROFILE:-default}"
-root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+root="$(CDPATH='' cd -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/shux-test-stress.XXXXXX")"
-tmp="$(cd "$tmp" && pwd)"
+tmp="$(CDPATH='' cd -- "$tmp" && pwd)"
 hog=""
 cleanup() {
     if [[ -n "$hog" ]]; then

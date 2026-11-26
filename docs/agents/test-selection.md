@@ -73,7 +73,7 @@ cost.
 per-module gate (`8ef34f8`) against the per-test one:
 
 - **10088 → 4630 tests selected (54% fewer), and none of the 30 drops a test
-  it added or edited.**
+  it added or edited that the per-module gate selected.**
 - 25 PRs changed test code. The median PR selects 40% of what it did before,
   and 10 of them select a quarter or less (#320: 84 → 6, #312: 13 → 1,
   #282: 107 → 3).

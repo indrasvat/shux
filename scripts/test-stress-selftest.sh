@@ -124,16 +124,21 @@ else
     bad "another NEXTEST_PROFILE runs as it is, unordered (exit $status)"
 fi
 
-LC_ALL=de_DE.UTF-8 STUB_TIMES=$'1.2 p a\n1.9 p b\n1.5 p c' run 2
-got="$(priorities 2 2>/dev/null || true)"
-if [[ "$got" == $'100 p b\n99 p c\n98 p a' ]]; then
-    ok "times sort the same in a locale with a decimal comma"
+locales="$(locale -a 2>/dev/null || true)"
+if grep -qiE '^de_DE\.utf-?8$' <<<"$locales"; then
+    LC_ALL=de_DE.UTF-8 STUB_TIMES=$'1.2 p a\n1.9 p b\n1.5 p c' run 2
+    got="$(priorities 2 2>/dev/null || true)"
+    if [[ "$got" == $'100 p b\n99 p c\n98 p a' ]]; then
+        ok "times sort the same in a locale with a decimal comma"
+    else
+        bad "times sort the same in a locale with a decimal comma: got [$got]"
+    fi
 else
-    bad "times sort the same in a locale with a decimal comma: got [$got]"
+    printf '  – skipped: no de_DE.UTF-8 locale here to sort under\n'
 fi
 
 mkdir -p "$work/repo/rel"
-STUB_TMPDIR=rel run 2
+CDPATH="$work/repo" STUB_TMPDIR=rel run 2
 if ((status == 0)) && [[ "$(priorities 2 2>/dev/null || true)" == "100 p::it slow_one"* ]] &&
     grep -q '^path = "/' "$work/log/run1.toml"; then
     ok "a relative TMPDIR still yields a report, at an absolute path"
