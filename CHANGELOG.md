@@ -1,3 +1,10 @@
+# [0.65.0](https://github.com/indrasvat/shux/compare/v0.64.0...v0.65.0) (2026-11-26)
+
+
+### Features
+
+* **rpc:** upgrades no longer strand live sessions: serve a daemon of another build, refuse per call ([#321](https://github.com/indrasvat/shux/issues/321)) ([6c12004](https://github.com/indrasvat/shux/commit/6c12004ca8c33cac5324677e9e909de5c35a49dd)), closes [#318](https://github.com/indrasvat/shux/issues/318) [#318](https://github.com/indrasvat/shux/issues/318)
+
 # [0.64.0](https://github.com/indrasvat/shux/compare/v0.63.0...v0.64.0) (2026-11-25)
 
 
