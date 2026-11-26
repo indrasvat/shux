@@ -147,8 +147,19 @@ file, a shared helper under `tests/<dir>/` (every binary that declares it, by
 test-only src file (its module's tests; for a helper with none, the tests of
 the modules that name it, and the whole unit-test binary only when none does),
 or a fixture a test names. shux-testkit's dependents are
-not re-run when it changes. Any failed run fails the
-job, and a run that outlasts the job's time limit fails it too. This replaces
+not re-run when it changes.
+
+Within a file it narrows to single tests. When every changed line of its test
+code falls inside test functions (`#[test]`, `#[tokio::test]`, a `proptest!`
+fn, each with its attributes and doc comments), only those tests run, and a
+deleted test runs nothing. One changed line anywhere else in its test code (a
+helper, a `use`, a const, a macro) and the gate runs the whole module, or the
+whole binary for an integration-test file. Blank and comment-only lines count
+for nothing. The spans come from `lint/ast-grep/test-spans.yml`, and a test
+nextest does not list under the name worked out for it also falls back to its
+module. The gate prints why each file fell back.
+
+Any failed run fails the job, and a run that outlasts the job's time limit fails it too. This replaces
 "stress it locally if you remember".
 
 ## Proving a de-flake

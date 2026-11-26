@@ -931,8 +931,9 @@ check-test-ignores: ## Every #[ignore] names an open issue ("see #N") or is a "g
 
 .PHONY: flake-gate
 flake-gate: nextest-ready ## Run the tests a branch adds or changes FLAKE_COUNT times under CPU load (BASE=<ref>, FLAKE_COUNT, FLAKE_LOAD)
-	@bash scripts/flake-gate-selftest.sh
-	@NEXTEST_JOBS=$(NEXTEST_JOBS) .shux/scripts/no_leak_guard.sh bash scripts/flake-gate.sh
+	@bin="$$(bash scripts/ensure-ast-grep.sh)" && export PATH="$$bin:$$PATH" && \
+		bash scripts/flake-gate-selftest.sh && \
+		NEXTEST_JOBS=$(NEXTEST_JOBS) .shux/scripts/no_leak_guard.sh bash scripts/flake-gate.sh
 
 .PHONY: shellcheck
 shellcheck: ## shellcheck every tracked shell script (the layer the guards live in)
