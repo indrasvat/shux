@@ -13,8 +13,9 @@
 #   cmt      a line comment, so a comment-only line can be told from a line
 #            inside a string
 #   cfgt     code compiled only for tests: an item, field or statement under a
-#            `cfg` or `cfg_attr` naming `test` other than as `not(test)`
-#            (`any(test, not(test))` counts), from $LEAD on
+#            `cfg` or `cfg_attr` that names `test` anywhere, from $LEAD on.
+#            `not(test)` counts too: telling it apart is where under-selection
+#            hides, and over-selecting is safe
 #   cfgm     the same for `mod name;`, whose code is name's own file: a change
 #            to it selects that module's tests
 #   cfgo     a `cfg` attribute naming `test` on anything else: test code from
@@ -30,7 +31,7 @@ utils:
     any: [{ kind: attribute_item }, { kind: line_comment }, { kind: block_comment }]
   test-attr:
     kind: attribute_item
-    regex: '^#\[\s*(::)?([A-Za-z_][A-Za-z0-9_]*::)*(test|rstest|proptest)\b'
+    regex: '^#\[\s*(::)?([A-Za-z_][A-Za-z0-9_]*::)*(test|rstest|proptest)\s*[(\]]'
 rule:
   kind: function_item
   inside:
@@ -150,7 +151,7 @@ utils:
     any: [{ kind: attribute_item }, { kind: line_comment }, { kind: block_comment }]
   cfg-test-attr:
     kind: attribute_item
-    regex: '^#\[\s*cfg(_attr)?\s*\(((?s:.)*(,|[^t\s]\s*\(|[^o\s]t\s*\(|[^n\s]ot\s*\())?\s*test\b'
+    regex: '^#\[\s*(::)?([A-Za-z_][A-Za-z0-9_]*::)*cfg(_attr)?\s*\((?s:.)*\btest\b'
 rule:
   any:
     - kind: function_item
@@ -188,7 +189,7 @@ utils:
     any: [{ kind: attribute_item }, { kind: line_comment }, { kind: block_comment }]
   cfg-test-attr:
     kind: attribute_item
-    regex: '^#\[\s*cfg(_attr)?\s*\(((?s:.)*(,|[^t\s]\s*\(|[^o\s]t\s*\(|[^n\s]ot\s*\())?\s*test\b'
+    regex: '^#\[\s*(::)?([A-Za-z_][A-Za-z0-9_]*::)*cfg(_attr)?\s*\((?s:.)*\btest\b'
 rule:
   kind: mod_item
   not: { has: { field: body, kind: declaration_list } }
@@ -208,7 +209,7 @@ utils:
     any: [{ kind: attribute_item }, { kind: line_comment }, { kind: block_comment }]
 rule:
   kind: attribute_item
-  regex: '^#\[\s*cfg(_attr)?\s*\(((?s:.)*(,|[^t\s]\s*\(|[^o\s]t\s*\(|[^n\s]ot\s*\())?\s*test\b'
+  regex: '^#\[\s*(::)?([A-Za-z_][A-Za-z0-9_]*::)*cfg(_attr)?\s*\((?s:.)*\btest\b'
   not:
     precedes:
       stopBy: { not: { matches: aoc } }
@@ -238,7 +239,7 @@ id: cfgf
 language: rust
 rule:
   kind: inner_attribute_item
-  regex: '^#!\[\s*cfg(_attr)?\s*\(((?s:.)*(,|[^t\s]\s*\(|[^o\s]t\s*\(|[^n\s]ot\s*\())?\s*test\b'
+  regex: '^#!\[\s*(::)?([A-Za-z_][A-Za-z0-9_]*::)*cfg(_attr)?\s*\((?s:.)*\btest\b'
 ---
 id: str
 language: rust

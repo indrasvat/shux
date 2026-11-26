@@ -4,9 +4,9 @@
 # Runs the shipped gate in a throwaway git repo, with a stub `cargo` and a stub
 # test-stress.sh that prints the filter it was handed, against one change per
 # selection rule and changes that must select nothing. The stub lists one test
-# for any filter, plus "<binary> <name>" for each single test the filter names,
-# except the one in FLAKE_SELFTEST_UNLISTED; for the filter in
-# FLAKE_SELFTEST_EMPTY it lists nothing.
+# per term of the filter: "<binary> <name>" for a single test (except the one
+# in FLAKE_SELFTEST_UNLISTED), one under the module for a module term, one in
+# the binary for a binary term; nothing for the term in FLAKE_SELFTEST_EMPTY.
 
 set -euo pipefail
 
@@ -23,11 +23,22 @@ mkdir -p "$work/bin" "$work/repo/scripts" "$work/repo/lint/ast-grep"
 cat >"$work/bin/cargo" <<'EOF'
 #!/usr/bin/env bash
 while (($#)) && [[ "$1" != -E ]]; do shift; done
-[[ "${2:-}" != "${FLAKE_SELFTEST_EMPTY:-none}" ]] || exit 0
-echo "k::t"
-grep -oE 'binary_id\(=[^)]*\) & test\(=[^)]*\)' <<<"${2:-}" |
-    sed -E 's/^binary_id\(=(.*)\) & test\(=(.*)\)$/\1 \2/' |
-    grep -vxF "${FLAKE_SELFTEST_UNLISTED:-none}" || true
+f="${2:-}"
+f="${f#(}"
+one='^binary_id\(=([^)]*)\) & test\(=(.*)\)$'
+module='^binary_id\(=([^)]*)\) & test\(/\^(.*)/\)$'
+binary='^binary_id\(=([^)]*)\)'
+while IFS= read -r t; do
+    [[ "$t" != "${FLAKE_SELFTEST_EMPTY:-none}" ]] || continue
+    if [[ "$t" =~ $one ]]; then
+        l="${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
+        [[ "$l" == "${FLAKE_SELFTEST_UNLISTED:-none}" ]] || echo "$l"
+    elif [[ "$t" =~ $module ]]; then
+        echo "${BASH_REMATCH[1]} ${BASH_REMATCH[2]}stub"
+    elif [[ "$t" =~ $binary ]]; then
+        echo "${BASH_REMATCH[1]} stub"
+    fi
+done < <(awk '{ sub(/\)$/, ""); gsub(/\) \+ \(/, "\n"); print }' <<<"$f")
 EOF
 chmod +x "$work/bin/cargo"
 cd "$work/repo"
@@ -41,7 +52,17 @@ printf '#!/usr/bin/env bash\necho "FILTER: $STRESS_FILTER"\n' >scripts/test-stre
 
 w() { mkdir -p "$(dirname "$1")"; printf '%s\n' "${@:2}" >"$1"; }
 w crates/p/src/lib.rs 'pub mod foo;' '#[cfg(any(test, fuzzing))]' 'pub mod fz;' 'pub fn a() {}' \
+    '#[cfg(test)]' '/* harness */' 'mod blk;' '#[cfg(test)]' 'mod suite;' \
     '#[cfg(test)]' 'mod tests {' '    #[test]' '    fn t() {}' '}'
+w crates/p/src/blk.rs 'const B: u8 = 1;' '#[test]' 'fn t() { let x = 1; }'
+w crates/p/src/suite.rs 'pub fn helper() {}' '#[cfg_attr(test, test)]' 'fn changed() { let x = 1; }'
+w crates/p/src/bare.rs 'pub fn prod() {}' '#[test]' 'fn bare() { let x = 1; }'
+w crates/p/src/helps.rs 'pub fn c() {}' '#[cfg(test)]' 'pub fn helper() -> u8 { 1 }'
+w crates/p/src/early_more.rs '#[test]' 'fn m() { let x = 1; }'
+w crates/p/src/bin/tool.rs 'fn main() {}' '#[cfg(test)]' 'mod tests {' '    #[test]' '    fn tool_t() { let x = 1; }' '}'
+w crates/p/tests/c.rs '#[cfg(test)] mod support;' '#[test] fn t() {}'
+w crates/p/tests/support/mod.rs 'pub fn r() { let x = 1; }'
+perl -e 'print "#[test]\nfn n() { let s = \"\0\"; let v = 1; }\n"' >crates/p/tests/nul.rs
 w crates/p/src/foo/mod.rs '#[cfg(test)]' 'mod tests;' '#[cfg(test)]' 'pub(crate) mod harness;' \
     '#[cfg(test)]' 'pub(crate) mod lonely;' 'pub fn b() {}'
 w crates/p/src/foo/tests.rs '#[test]' 'fn t() { let x = 1; super::harness::h(); }'
@@ -57,6 +78,7 @@ w crates/p/src/fns.rs 'pub fn c() { let y = 1; }' '' '#[cfg(test)]' 'mod tests {
     '    const LIMIT: u8 = 1;' '' '    macro_rules! check { () => { let m = 1; }; }' '' \
     '    const STEP: u8 = 1; // a note' '    #[test]' '    fn uses_step() { let s = STEP; }' '' \
     '    #[test] fn anchor() {} const LIM2: u8 = 1;' '' \
+    '    #[test]' '    fn shared() { let sh = 1; }' '' '    #[rstest::fixture]' '    fn fx() -> u8 { 1 }' '' \
     '    /// Doc.' '    #[test]' '    fn a() { let a = 1; }' '' \
     '    #[test]' '    fn b() {' '        let b = 1;' '        let b2 = 1;' '    }' '' \
     '    #[test]' '    fn gone() { let g = 1; }' '' '    #[test]' '    fn old_name() { let r = 1; }' '' \
@@ -76,7 +98,9 @@ w crates/p/src/early.rs 'use std::fmt;' '#[cfg(test)]' 'use std::fmt::Write;' \
 w crates/p/src/orphan.rs '#[cfg(test)]' 'mod tests {' '    #[test]' '    fn t() { let x = 1; }' '}' \
     'pub fn g(v: u8) -> u8 {' '    match v {' '        #[cfg(test)]' '        9 => 0,' '        _ => 1,' '    }' '}'
 w crates/p/src/attr.rs 'pub fn c() {}' '#[cfg_attr(test, test)]' 'fn conf() { let q = 1; }' \
-    '#[cfg(any(test, all(not(test), feature = "x")))]' 'mod mixed {' '    #[test]' '    fn changed() { let w = 1; }' '}'
+    '#[cfg(any(test, all(not(test), feature = "x")))]' 'mod mixed {' '    #[test]' '    fn changed() { let w = 1; }' '}' \
+    '#[cfg(/* only */ test)]' 'mod commented {' '    const CV: u8 = 1;' '    #[test]' '    fn ct() { let cc = 1; }' '}' \
+    '#[core::cfg(not(not(test)))]' 'mod nn {' '    const NV: u8 = 1;' '    #[test]' '    fn n() { let nn = 1; }' '}'
 w crates/p/src/main.rs 'fn main() {}' '#[cfg(test)]' 'mod tests {' '    #[test]' '    fn t() { let x = 1; }' '}'
 w crates/p/tests/common/mod.rs 'pub fn h() { let x = 1; }'
 w crates/p/tests/sub/helper.rs 'pub fn h() { let x = 1; }'
@@ -155,7 +179,9 @@ case_ "a test's attribute" "fns 's/#\\[test\\]\\n    fn b/#[tokio::test]\\n    a
 case_ "a line deleted from inside a test" "fns 's/        let b2 = 1;\\n//'" 'binary_id(=p) & test(=fns::tests::b)'
 case_ "a new test" "fns 's/(        let b2 = 1;\\n    \\}\\n)/\$1\\n    #[test]\\n    fn fresh() {}\\n/'" 'binary_id(=p) & test(=fns::tests::fresh)'
 case_ "a deleted test selects nothing" "fns 's/    #\\[test\\]\\n    fn gone\\(\\) \\{ let g = 1; \\}\\n\\n//'" -
-case_ "a renamed test: the new name" "fns 's/fn old_name/fn new_name/'" 'binary_id(=p) & test(=fns::tests::new_name)'
+case_ "a renamed test: the old name may be called, so the module" "fns 's/fn old_name/fn new_name/'" "$fns_coarse"
+case_ "a test made a helper: the module" "fns 's/    #\\[test\\]\\n    fn shared/    fn shared/'" "$fns_coarse"
+case_ "an rstest fixture is not a test" "fns 's/fn fx\\(\\) -> u8 \\{ 1 \\}/fn fx() -> u8 { 2 }/'" "$fns_coarse"
 case_ "two tests" "fns 's/let a = 1;/let a = 2;/; s/let d = 1;/let d = 2;/'" \
     'binary_id(=p) & test(=fns::tests::a)' 'binary_id(=p) & test(=fns::tests::inner::d)'
 case_ "a proptest! fn" "fns 's/let p = x;/let p = x + 1;/'" 'binary_id(=p) & test(=fns::tests::prop)'
@@ -181,15 +207,26 @@ case_ "production code above the test module" "fns 's/let y = 1;/let y = 2;/'" -
 FLAKE_SELFTEST_UNLISTED='p fns::tests::a' \
     case_ "a test nextest does not list by that name: the whole module" "fns 's/let a = 1;/let a = 2;/'" "$fns_coarse"
 FLAKE_SELFTEST_UNLISTED='p fns::tests::a' FLAKE_SELFTEST_EMPTY="$fns_coarse" \
-    case_ "... and when that module lists nothing: the whole binary" "fns 's/let a = 1;/let a = 2;/'" 'binary_id(=p)'
+    case_ "... and when that module lists nothing: its package's unit tests" "fns 's/let a = 1;/let a = 2;/'" 'binary_id(=p) + binary_id(p::bin/*)'
+FLAKE_SELFTEST_EMPTY='binary_id(=p) & test(/^helps::/)' \
+    case_ "a cfg(test) helper in a module with no tests: its package's unit tests" "perl -pi -e 's/u8 \\{ 1 \\}/u8 { 2 }/' crates/p/src/helps.rs" 'binary_id(=p) + binary_id(p::bin/*)'
 case_ "production code after a cfg(test) use" "perl -pi -e 's/let y = 1;/let y = 2;/' crates/p/src/early.rs" -
 case_ "a cfg(test) use" "perl -pi -e 's/fmt::Write;/fmt::Display;/' crates/p/src/early.rs" 'binary_id(=p) & test(/^early::/)'
-case_ "a cfg(test) mod x; declaration: x's tests" "perl -pi -e 's/early_more/early_other/' crates/p/src/early.rs" 'binary_id(=p) & test(/^early::more::/)'
+case_ "a changed cfg(test) mod x; declaration: the declaring module" "perl -pi -e 's/early_more/early_other/' crates/p/src/early.rs" 'binary_id(=p) & test(/^early::/)'
 case_ "a new test module and its declaration" "perl -0pi -e 's/^/#[cfg(test)]\\nmod added;\\n/' crates/p/src/early.rs; w crates/p/src/early/added.rs '#[test]' 'fn t() {}'" \
     'binary_id(=p) & test(/^early::added::/)' 'binary_id(=p) & test(=early::added::t)'
 case_ "cfg(test) on a match arm: test code to the end" "perl -pi -e 's/9 => 0/9 => 2/' crates/p/src/orphan.rs" 'binary_id(=p) & test(/^orphan::/)'
-case_ "an attribute above cfg(test) on a mod x;" "perl -pi -e 's/early_z/early_y/' crates/p/src/early.rs" 'binary_id(=p) & test(/^early::zed::/)'
+case_ "a new mod x; with an attribute above its cfg(test)" "perl -0pi -e 's/^/#[path = \"z2.rs\"]\\n#[cfg(test)]\\nmod zed2;\\n/' crates/p/src/early.rs" 'binary_id(=p) & test(/^early::zed2::/)'
 case_ "a test in main.rs: its bin target" "edit crates/p/src/main.rs" 'binary_id(=p::bin/p) & test(=tests::t)'
+case_ "a test in src/bin/<name>.rs: that bin" "edit crates/p/src/bin/tool.rs" 'binary_id(=p::bin/tool) & test(=tests::tool_t)'
+case_ "a #[test] outside cfg(test)" "edit crates/p/src/bare.rs" 'binary_id(=p) & test(=bare::bare)'
+case_ "a comment inside cfg(…)" "perl -pi -e 's/CV: u8 = 1/CV: u8 = 2/' crates/p/src/attr.rs" 'binary_id(=p) & test(/^attr::/)'
+case_ "core::cfg(not(not(test)))" "perl -pi -e 's/NV: u8 = 1/NV: u8 = 2/' crates/p/src/attr.rs" 'binary_id(=p) & test(/^attr::/)'
+case_ "a file a #[path] names: its package's unit tests" "edit crates/p/src/early_more.rs" 'binary_id(=p) + binary_id(p::bin/*)'
+case_ "a test-only file declared past a block comment" "perl -pi -e 's/B: u8 = 1/B: u8 = 2/' crates/p/src/blk.rs" 'binary_id(=p) & test(/^blk::/)'
+case_ "a test-only file whose test is a cfg_attr" "edit crates/p/src/suite.rs" 'binary_id(=p) & test(/^suite::/)'
+case_ "a tests/ helper its binary declares under an attribute" "edit crates/p/tests/support/mod.rs" 'binary_id(=p::c)'
+case_ "a NUL byte in a test file" "perl -pi -e 's/let v = 1;/let v = 2;/' crates/p/tests/nul.rs" 'binary_id(=p::nul) & test(=n)'
 
 # Discovery that fails must fail the gate, never read as "nothing to gate".
 git checkout -q -f main

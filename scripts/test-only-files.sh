@@ -25,7 +25,7 @@ declared() {
         {
             line = $0
             sub(/^[[:space:]]+/, "", line)
-            if (line ~ /^\/\//) next
+            if (line ~ /^\/\// || line ~ /^\/\*.*\*\/[[:space:]]*$/) next
             # Leading attributes, one at a time; they carry over to the next line.
             while (match(line, /^#\[[^]]*\][[:space:]]*/)) {
                 a = substr(line, 1, RLENGTH)

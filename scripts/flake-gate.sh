@@ -48,8 +48,17 @@ while IFS=$'\t' read -r file _ modp; do
     [[ -n "$file" ]] && test_only[$file]="$modp"
 done <<<"$test_only_out"
 
-# A test attribute: the set test-outside-cfg-test recognises.
-test_attr='^[[:space:]]*#\[[[:space:]]*(::)?([A-Za-z_][A-Za-z0-9_]*::)*(test|rstest|proptest)([^A-Za-z0-9_]|$)|proptest!'
+# A test attribute (test-spans.yml's test-attr), or a cfg_attr that may be one.
+test_attr='^[[:space:]]*#\[[[:space:]]*(::)?([A-Za-z_][A-Za-z0-9_]*::)*(test|rstest|proptest)[[:space:]]*[](]|proptest!|cfg_attr[[:space:]]*\(.*(^|[^A-Za-z0-9_])test([^A-Za-z0-9_]|$)'
+
+# units <pkg>: every unit-test binary of <pkg>: its lib's, and its bins'.
+units() {
+    if [[ -f "crates/$1/src/main.rs" || -d "crates/$1/src/bin" ]]; then
+        echo "binary_id(=$1) + binary_id($1::bin/*)"
+    else
+        echo "binary_id(=$1)"
+    fi
+}
 
 # test_spans <file>: "s <first> <last> <path in file>" per test function, its
 # attributes and doc comments included; "t <first> <last>" per stretch of
@@ -95,10 +104,11 @@ test_spans() {
 
 # touched_lines <side> <all|cfg> <spans> <diff> <source>: what one side (old
 # or new) of the diff changes in test code (all: the whole file; cfg: its
-# cfg(test) code): "f <path>" per test function it reaches, "d <path>" per
-# cfg(test) `mod x;` in a cfg file, and "coarse <line>" with the first line it
-# reaches outside all of those. Blank and comment-only lines reach nothing,
-# but a blank line in a string is content.
+# cfg(test) code, and any test function): "f <path>" per test function it
+# reaches ("g <path>" when it removes all of it), "d <path>" per cfg(test)
+# `mod x;` in a cfg file, and "coarse <line>" with the first line it reaches
+# outside all of those. Blank and comment-only lines reach nothing, but a
+# blank line in a string is content.
 touched_lines() {
     awk -F'\t' -v side="$1" -v mode="$2" '
         FILENAME == ARGV[1] && $1 == "s" { ns++; s0[ns] = $2; s1[ns] = $3; sp[ns] = $4; next }
@@ -117,41 +127,43 @@ touched_lines() {
         {
             hit = 0
             for (i = 1; i <= nd; i++) if (d0[i] <= FNR && FNR <= d1[i]) { decl[dp[i]] = 1; hit = 1 }
+            for (i = 1; i <= ns; i++) if (s0[i] <= FNR && FNR <= s1[i]) { fns[i] = 1; hit = 1 }
             if (hit) next
             hit = (mode == "all")
             for (i = 1; i <= nt && !hit; i++) hit = (t0[i] <= FNR && FNR <= t1[i])
             if (!hit) next
-            hit = 0
-            for (i = 1; i <= ns; i++) if (s0[i] <= FNR && FNR <= s1[i]) { fns[sp[i]] = 1; hit = 1 }
-            if (hit) next
             match($0, /^[[:space:]]*/)
             if ((FNR in cmt) && cmt[FNR] == RLENGTH) next
             if (!coarse) coarse = FNR
         }
         END {
-            for (p in fns) print "f\t" p
+            for (i in fns) {
+                gone = 1
+                for (l = s0[i]; l <= s1[i] && gone; l++) gone = (l in want)
+                print (gone ? "g" : "f") "\t" sp[i]
+            }
             for (p in decl) print "d\t" p
             if (coarse) print "coarse\t" coarse
         }' "$3" "$4" "$5"
 }
 
 terms=()
-declare -A coarse_of=()
+# exact term -> the coarse term of its file; terms that may list nothing.
+declare -A coarse_of=() may_be_empty=()
 # fn_select <known> <file> <binary id> <module prefix> <all|cfg> <coarse term>:
 # the tests a change to <file> reaches, one term each, into terms; the coarse
 # term instead when it reaches test code outside a test function, or when
-# <known> is "test" (a fixture it names changed). A changed cfg(test) `mod x;`
-# selects x's tests. "all": the whole file is test code; "cfg": its cfg(test)
-# code is.
+# <known> is "test" (a fixture it names changed). "all": the whole file is
+# test code; "cfg": its cfg(test) code and its test functions are.
 fn_select() {
-    local known="$1" f="$2" bin="$3" prefix="${4:+$4::}" mode="$5" coarse="$6" side src
-    local -A reached=() declared=() present=()
+    local known="$1" f="$2" bin="$3" prefix="${4:+$4::}" mode="$5" coarse="$6" side src why=""
+    local -A reached=() gone=() declared=() present=()
     local kind name
     if [[ "$known" == test ]]; then
         terms+=("$coarse")
         return 0
     fi
-    git diff -U0 "$base"...HEAD -- "$f" >"$tmp/diff"
+    git diff -U0 --text "$base"...HEAD -- "$f" >"$tmp/diff"
     # The diff's line numbers are HEAD's, whatever the working tree holds.
     git show "HEAD:$f" >"$tmp/new.rs"
     if git cat-file -e "$base:$f" 2>/dev/null; then git show "$base:$f" >"$tmp/old.rs"; else : >"$tmp/old.rs"; fi
@@ -160,25 +172,40 @@ fn_select() {
         test_spans "$src" >"$tmp/$side.spans"
         touched_lines "$side" "$mode" "$tmp/$side.spans" "$tmp/diff" "$src" >"$tmp/$side.hit"
         while IFS=$'\t' read -r kind name; do
-            if [[ "$kind" == coarse ]]; then
-                echo "flake-gate: $f:$name ($side side) is test code outside a test function: $coarse" >&2
-                terms+=("$coarse")
-                return 0
-            fi
-            [[ "$kind" != f ]] || reached[$name]=1
-            [[ "$kind" != d ]] || declared[$name]=1
+            case "$side:$kind" in
+            *:coarse) why="line $name ($side side) is test code outside a test function" ;;
+            # A declaration changed, not just added: what it loads may have.
+            old:d) why="it changes the cfg(test) declaration of mod $name" ;;
+            new:d) declared[$name]=1 ;;
+            *:f) reached[$name]=1 ;;
+            old:g) gone[$name]=1 ;;
+            new:g) reached[$name]=1 ;;
+            esac
         done <"$tmp/$side.hit"
-    done
-    for name in "${!declared[@]}"; do
-        terms+=("binary_id(=$bin) & test(/^$prefix$name::/)")
     done
     while IFS=$'\t' read -r kind _ _ name; do
         if [[ "$kind" == s ]]; then present[$name]=1; fi
     done <"$tmp/new.spans"
-    # A test gone from the new side (deleted, or renamed: the new name is
-    # reached on its own) selects nothing.
+    # A test whose old lines all went, and that the new side lacks, is deleted
+    # (a rename's new name is reached on its own). One the new side lacks but
+    # whose old lines partly stay became something else: what calls it may break.
     for name in "${!reached[@]}"; do
-        [[ -n "${present[$name]+set}" ]] || continue
+        if [[ -z "$why" && -z "${present[$name]+set}" ]]; then why="test $name is no longer a test"; fi
+    done
+    if [[ -n "$why" ]]; then
+        echo "flake-gate: $f: $why; selecting $coarse" >&2
+        terms+=("$coarse")
+        return 0
+    fi
+    for name in "${!gone[@]}"; do
+        if [[ -n "${present[$name]+set}" ]]; then reached[$name]=1; fi
+    done
+    # A new cfg(test) `mod x;`: its file is new too, and selected on its own.
+    for name in "${!declared[@]}"; do
+        terms+=("binary_id(=$bin) & test(/^$prefix$name::/)")
+        may_be_empty["binary_id(=$bin) & test(/^$prefix$name::/)"]=1
+    done
+    for name in "${!reached[@]}"; do
         terms+=("binary_id(=$bin) & test(=$prefix$name)")
         coarse_of["binary_id(=$bin) & test(=$prefix$name)"]="$coarse"
     done
@@ -219,8 +246,12 @@ select_rs() {
         local dir="${rest%%/*}" user
         while IFS= read -r user; do
             terms+=("binary_id(=$pkg::$(basename "$user" .rs))")
-        done < <(grep -lE "^[[:space:]]*(#\[[[:space:]]*path[[:space:]]*=[[:space:]]*\"$dir/[^\"]*\"[[:space:]]*\]|(pub(\([^)]*\))?[[:space:]]+)?mod[[:space:]]+${dir}[[:space:]]*;)" \
+        done < <(grep -lE "^[[:space:]]*(#\[[[:space:]]*path[[:space:]]*=[[:space:]]*\"$dir/[^\"]*\"[[:space:]]*\]|(#\[[^]]*\][[:space:]]*)*(pub(\([^)]*\))?[[:space:]]+)?mod[[:space:]]+${dir}[[:space:]]*;)" \
             "crates/$pkg/tests/"*.rs || true)
+    elif grep -rqE --include='*.rs' "#\[[[:space:]]*path[[:space:]]*=[[:space:]]*\"([^\"]*/)?$(basename "${f//./\\.}")\"" "crates/$pkg/src"; then
+        # Loaded by #[path]: its module path is not its file path.
+        echo "flake-gate: $f is a #[path] module; selecting $(units "$pkg")" >&2
+        terms+=("$(units "$pkg")")
     elif [[ -n "${test_only[$f]+set}" ]]; then
         if [[ -f "$f" ]] && grep -qE "$test_attr" "$f"; then
             fn_select "$known" "$f" "$pkg" "${test_only[$f]}" all "binary_id(=$pkg) & test(/^${test_only[$f]}::/)"
@@ -228,13 +259,19 @@ select_rs() {
             users_of "$f" "$pkg" || terms+=("binary_id(=$pkg)")
         fi
     else
-        local path="${rest%/mod}"
-        case "$path" in
-        lib) fn_select "$known" "$f" "$pkg" "" cfg "binary_id(=$pkg)" ;;
-        # A bin target's unit tests are its own binary, named after the package.
-        main) fn_select "$known" "$f" "$pkg::bin/$pkg" "" cfg "binary_id(=$pkg::bin/$pkg)" ;;
-        *) fn_select "$known" "$f" "$pkg" "${path//\//::}" cfg "binary_id(=$pkg) & test(/^${path//\//::}::/)" ;;
-        esac
+        # The unit-test binary and module path: src/main.rs is the bin named
+        # after the package, src/bin/<name>[/…].rs the bin <name>.
+        local bin="$pkg" path="${rest%/mod}"
+        if [[ "$path" == main ]]; then
+            bin="$pkg::bin/$pkg" path=""
+        elif [[ "$path" =~ ^bin/([^/]+)(/(.+))?$ ]]; then
+            bin="$pkg::bin/${BASH_REMATCH[1]}" path="${BASH_REMATCH[3]}"
+            [[ "$path" != main ]] || path=""
+        elif [[ "$path" == lib ]]; then
+            path=""
+        fi
+        path="${path//\//::}"
+        fn_select "$known" "$f" "$bin" "$path" cfg "binary_id(=$bin)${path:+ & test(/^$path::/)}"
     fi
 }
 
@@ -266,24 +303,48 @@ list() {
     filter="${filter% + }"
     listed="$(cargo nextest list --color never --workspace -E "$filter" --message-format oneline)"
 }
-list
-# A test listed under another name than the one worked out for it (a module
-# moved by #[path], an rstest case, a cfg'd-out test) is selected by its file's
-# coarse term instead, or by its whole binary when that lists nothing either.
-missed=0
-for i in "${!terms[@]}"; do
-    t="${terms[$i]}"
-    [[ -n "${coarse_of[$t]+set}" && "$t" =~ ^binary_id\(=(.+)\)\ \&\ test\(=(.+)\)$ ]] || continue
-    bin="${BASH_REMATCH[1]}" name="${BASH_REMATCH[2]}"
-    grep -qxF "$bin $name" <<<"$listed" && continue
-    wide="${coarse_of[$t]}"
-    [[ -n "$(cargo nextest list --color never --workspace -E "$wide" --message-format oneline)" ]] ||
-        wide="binary_id(=$bin)"
-    echo "flake-gate: nextest lists no $bin $name; selecting $wide" >&2
-    terms[i]="$wide"
-    missed=1
+# wider <term>: the next wider term for one that lists nothing; empty for the
+# widest. A single test -> its file's coarse term -> its package's unit tests.
+wider() {
+    local module='^binary_id\(=([^:)]+)(::bin/[^)]+)?\) & test\(/'
+    if [[ -n "${coarse_of[$1]+set}" ]]; then
+        echo "${coarse_of[$1]}"
+    elif [[ "$1" =~ $module ]]; then
+        units "${BASH_REMATCH[1]}"
+    fi
+}
+# lists <term>: whether the listing holds a test the term names.
+lists() {
+    local prefix
+    case "$1" in
+    *" + "*) return 0 ;;
+    *"& test(="*) [[ "$1" =~ ^binary_id\(=(.+)\)\ \&\ test\(=(.+)\)$ ]]; prefix="${BASH_REMATCH[1]} ${BASH_REMATCH[2]}" ;;
+    *"& test(/^"*) [[ "$1" =~ ^binary_id\(=(.+)\)\ \&\ test\(/\^(.+)/\)$ ]]; prefix="${BASH_REMATCH[1]} ${BASH_REMATCH[2]}" ;;
+    *) [[ "$1" =~ ^binary_id\(=(.+)\)$ ]]; prefix="${BASH_REMATCH[1]} " ;;
+    esac
+    awk -v p="$prefix" -v exact="$([[ "$1" == *"& test(="* ]] && echo 1)" \
+        '(exact ? $0 == p : index($0, p) == 1) { found = 1; exit } END { exit !found }' <<<"$listed"
+}
+# A term that lists nothing was worked out wrong (a module moved by #[path],
+# an rstest case, a module owned by main.rs) or holds no tests of its own (a
+# cfg(test) helper others use): it is widened until it lists something. Only a
+# new module's declaration may list nothing.
+for _ in 1 2 3; do
+    list
+    widened=0
+    for i in "${!terms[@]}"; do
+        t="${terms[$i]}"
+        [[ -z "${may_be_empty[$t]+set}" ]] || continue
+        lists "$t" && continue
+        wide="$(wider "$t")"
+        [[ -n "$wide" ]] || continue
+        echo "flake-gate: nextest lists nothing for $t; selecting $wide" >&2
+        terms[i]="$wide"
+        widened=1
+    done
+    ((widened)) || break
 done
-((missed == 0)) || list
+((widened == 0)) || list
 
 # A filter can name only files with no tests in them; nextest would refuse it.
 n="$(grep -c . <<<"$listed" || true)"
