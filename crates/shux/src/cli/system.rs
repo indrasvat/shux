@@ -226,7 +226,12 @@ pub async fn handle_daemon_upgrade(
     match dv.compat() {
         Compat::Same | Compat::Wire => {
             let Some(mut stream) = asked else {
-                anyhow::bail!("the daemon answered on no connection");
+                return report.say(
+                    3,
+                    "unresponsive",
+                    "the daemon did not say how many sessions it holds",
+                    "retry, or `daemon upgrade --force`",
+                );
             };
             let mut params = crate::client::client_build();
             params["when"] = if when_idle { "idle" } else { "now" }.into();

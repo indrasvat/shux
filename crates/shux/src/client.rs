@@ -612,7 +612,9 @@ pub(crate) async fn ask_daemon_version(
         Ok(Asked::Result(r)) => r.get("sessions").and_then(|s| s.as_array()).map(Vec::len),
         _ => None,
     };
-    (DaemonAnswer::Answered(dv), sessions, Some(stream))
+    // A count that never came back may still: that stream is spent.
+    let stream = sessions.is_some().then_some(stream);
+    (DaemonAnswer::Answered(dv), sessions, stream)
 }
 
 /// The connection that asked `socket_path`'s daemon which build it is, and its
@@ -1348,6 +1350,22 @@ mod tests {
             vec![0],
             "asked on another connection"
         );
+    }
+
+    /// A connection whose session count never came back is not handed on:
+    /// a late reply would be read as the next call's.
+    #[tokio::test]
+    async fn a_connection_left_mid_call_is_not_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("d.sock");
+        stub(&socket, |_, method| match method {
+            "system.version" => Some(wire_build(CLIENT_VERSION)),
+            _ => None,
+        });
+        let (answer, held, stream) = ask_daemon_version(&socket).await;
+        assert!(matches!(answer, DaemonAnswer::Answered(_)));
+        assert_eq!(held, None);
+        assert!(stream.is_none(), "handed on a connection mid-call");
     }
 
     /// A daemon of this wire generation that holds a session is served, on

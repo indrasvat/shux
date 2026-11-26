@@ -251,6 +251,19 @@ async fn an_unknown_op_field_is_refused_as_unknown_params() {
     );
 }
 
+/// Only a caller on the daemon's own socket speaks for a newer CLI: a
+/// plugin's `system.version` neither arms an upgrade nor sets the badge.
+#[tokio::test]
+async fn a_plugin_cannot_arm_an_upgrade_through_system_version() {
+    let router = daemon_router();
+    let newer = serde_json::json!({ "client": { "version": "999.0.0", "git_sha": "x" } });
+    let answer = router
+        .dispatch("system.version", Some(newer))
+        .await
+        .expect("answered");
+    assert!(answer["superseded_by"].is_null(), "{answer}");
+}
+
 /// Generation 1 only grows: what `wire_1.rs` records is still served, and
 /// what is served is recorded there, so a parameter added after 0.64.0 cannot
 /// be removed again without a new generation.
@@ -290,6 +303,18 @@ fn wire_generation_1_only_grows() {
         .collect();
     let now: BTreeSet<&str> = shux_core::apply::OP_FIELDS.iter().copied().collect();
     assert_eq!(ops, now, "state.apply op fields differ from wire_1.rs");
+    // Each kind still takes each of its own fields.
+    for (kind, fields) in super::wire_1::WIRE_1_OPS {
+        for field in *fields {
+            let op = serde_json::json!({ "op": kind, *field: 0 });
+            if let Err(e) = serde_json::from_value::<shux_core::apply::Op>(op) {
+                assert!(
+                    !e.to_string().contains("unknown field"),
+                    "{kind} no longer takes {field}: {e}"
+                );
+            }
+        }
+    }
 }
 
 /// The table names only methods the daemon serves: a stale entry would be

@@ -68,7 +68,9 @@ pub(crate) fn register_daemon_methods(
             "system.version",
             Policy::fixed(Sensitivity::Public),
             move |params: Option<Value>| {
-                let newer = note_client(params.as_ref());
+                // Only the daemon's own socket speaks for a CLI: not a plugin.
+                let owner = shux_rpc::current_transport() == Some(shux_rpc::Transport::Uds);
+                let newer = owner && note_client(params.as_ref());
                 let graph = g_version.clone();
                 async move {
                     // A newer CLI exists: switch to it once this build's sessions end.

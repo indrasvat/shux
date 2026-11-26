@@ -195,7 +195,14 @@ RUNTIMES+=("$bin_dir")
 cp "$PEER" "$bin_dir/shux"
 pane="$(occupy "$bin_dir/shux" "$rt")"
 old="$(daemon_pid "$rt")"
-kept="$(jq -r .build.exe "$rt/shux/shux.build.json")"
+# The daemon publishes its kept build just after it starts serving.
+kept=""
+for _ in $(seq 300); do
+  kept="$(jq -r '.build.exe // empty' "$rt/shux/shux.build.json" 2>/dev/null || true)"
+  [ -n "$kept" ] && break
+  sleep 0.1
+done
+if [ -z "$kept" ]; then fail "the daemon never published its kept build"; fi
 # Written into the very file the daemon runs: Linux refuses it (text file busy).
 if cp "$NEW" "$bin_dir/shux" 2>"$OUT/err"; then
   pass "the install rewritten in place"
@@ -208,7 +215,12 @@ expect 0 "rewritten in place: session list" "$NEW" "$rt" session list
 colours "rewritten in place" "$NEW" "$rt" "$pane"
 same_daemon "$rt" "$old" "the same daemon, after the rewrite in place"
 expect 0 "its kept build still runs" "$kept" "$rt" --format json version
-contains "its kept build is still the peer build" "$(XDG_RUNTIME_DIR="$rt" "$PEER" --format json version | jq -r .cli.git_sha)"
+peer_sha="$("$PEER" --format json version | jq -r .cli.git_sha)"
+if [ "$(jq -r .cli.git_sha "$OUT/out")" = "$peer_sha" ]; then
+  pass "its kept build is still the peer build"
+else
+  fail "its kept build is $(jq -r .cli.git_sha "$OUT/out"), not the peer build $peer_sha"
+fi
 cp "$NEW" "$bin_dir/shux.new" && mv -f "$bin_dir/shux.new" "$bin_dir/shux"
 common "replaced by rename" "$bin_dir/shux" "$rt" "$pane"
 rm -f "$bin_dir/shux"

@@ -2703,9 +2703,11 @@ mod tests {
     /// `detail` keeps them; with nothing next, nothing trails the headline.
     #[test]
     fn an_upgrade_line_keeps_its_headline_and_next_step_apart_without_colour() {
-        assert!(!colors_enabled(), "tests run without a terminal");
+        let plain = |done: bool, headline: &str, next: &str| {
+            shux_pty::strip_ansi(&upgrade_line(done, headline, next))
+        };
         assert_eq!(
-            upgrade_line(
+            plain(
                 true,
                 "no daemon is running",
                 "the next shux command starts this build"
@@ -2713,7 +2715,7 @@ mod tests {
             "\u{2713} no daemon is running; the next shux command starts this build"
         );
         assert_eq!(
-            upgrade_line(false, "could not reach it", ""),
+            plain(false, "could not reach it", ""),
             "! could not reach it"
         );
     }

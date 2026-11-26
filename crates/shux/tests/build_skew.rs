@@ -511,6 +511,15 @@ fn a_newer_cli_arms_the_upgrade_of_a_busy_older_daemon() {
     sibling.occupied_by(SIBLING);
     ok(&sibling.run(&["session", "list"]), "a sibling CLI");
     assert_eq!(sibling.version()["daemon"]["upgrade_pending"], false);
+
+    // A newer CLI's retire, refused because a session landed after its
+    // probe found the daemon idle, arms the upgrade all the same.
+    let newer = r#"{"client":{"version":"999.0.0","git_sha":"x"}}"#;
+    ok(
+        &sibling.run(&["rpc", "call", "daemon.retire_if_idle", "--params", newer]),
+        "a newer CLI's retire",
+    );
+    assert_eq!(sibling.version()["daemon"]["upgrade_pending"], true);
 }
 
 /// `daemon upgrade` in every state: same build, idle, busy, busy and

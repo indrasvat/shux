@@ -482,14 +482,21 @@ pub(crate) fn register_session_methods(
             shux_rpc::RETIRE_IF_IDLE,
             Policy::fixed(Sensitivity::PluginsForbidden),
             move |params: Option<serde_json::Value>| {
-                let _ = crate::rpc::daemon::note_client(params.as_ref());
+                let newer = crate::rpc::daemon::note_client(params.as_ref());
                 let gh = g7.clone();
                 let cancel = cancel_retire.clone();
                 async move {
                     // One graph step: no session lands between the check
-                    // and the refusal of every later one.
+                    // and the refusal of every later one. A newer caller that
+                    // finds it busy after all arms the upgrade instead.
                     match gh
-                        .atomically(|g| g.retire_if_empty())
+                        .atomically(move |g| {
+                            if newer {
+                                g.retire_when_empty()
+                            } else {
+                                g.retire_if_empty()
+                            }
+                        })
                         .await
                         .map_err(graph_error_to_rpc)?
                     {
