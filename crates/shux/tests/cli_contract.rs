@@ -954,3 +954,137 @@ fn an_unreachable_daemon_is_a_json_error() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+// ── state apply, version conflicts and system.version on the real daemon ────
+
+const APPLY_TEMPLATE: &str = "[session]\nname = \"applied\"\n\n[[windows]]\ntitle = \"main\"\n\n\
+                              [[windows.panes]]\ncommand = [\"sh\", \"-c\", \"exec sleep 900\"]\n";
+
+fn stdout_json(out: &Output) -> serde_json::Value {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "stdout is not JSON ({e}):\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+    })
+}
+
+#[test]
+fn state_apply_json_prints_its_result_and_a_second_apply_is_a_name_conflict() {
+    let mut env = Env::new();
+    let path = env.write_template("apply.toml", APPLY_TEMPLATE);
+    let path = path.to_str().unwrap();
+    env.sessions.push("applied".to_string());
+
+    let first = env.run(&["--format", "json", "state", "apply", path]);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let applied = stdout_json(&first);
+    assert!(applied["spawn_results"].is_array(), "{applied}");
+    assert_eq!(env.pane_count("applied"), 1);
+
+    let second = env.run(&["--format", "json", "state", "apply", path]);
+    assert!(
+        !second.status.success(),
+        "a second apply of one session name succeeded"
+    );
+    let refused = stdout_json(&second);
+    assert_eq!(refused["error"]["code"], -32007, "{refused}");
+    assert_eq!(refused["error"]["message"], "name_conflict", "{refused}");
+    assert_eq!(
+        env.pane_count("applied"),
+        1,
+        "the refused apply changed the session"
+    );
+}
+
+#[test]
+fn state_apply_refuses_watch_with_json_output() {
+    let env = Env::new();
+    let path = env.write_template("apply.toml", APPLY_TEMPLATE);
+    let out = env.run(&[
+        "--format",
+        "json",
+        "state",
+        "apply",
+        path.to_str().unwrap(),
+        "--watch",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(stdout_json(&out)["error"]["code"], -32602);
+}
+
+/// A kill carrying a stale version is refused before the pane's I/O is torn
+/// down: the pane stays listed, and still takes input.
+#[test]
+fn a_pane_kill_with_a_stale_version_leaves_the_pane_working() {
+    let mut env = Env::new();
+    let s = env.session("stale");
+    env.ok(&["pane", "split", "-s", &s, "--", "cat"]);
+    let panes = env.json(&["pane", "list", "-s", &s]);
+    let target = panes
+        .as_array()
+        .and_then(|p| p.iter().find(|p| p["command"].to_string().contains("cat")))
+        .unwrap_or_else(|| panic!("no cat pane in {panes}"));
+    let id = target["id"].as_str().expect("pane id").to_string();
+    let stale = target["version"].as_u64().expect("pane version") + 99;
+
+    let params = env.write_template(
+        "kill.json",
+        &serde_json::json!({ "pane_id": id, "expected_version": stale }).to_string(),
+    );
+    let out = env.run(&[
+        "--format",
+        "json",
+        "rpc",
+        "call",
+        "pane.kill",
+        "--params",
+        &format!("@{}", params.display()),
+    ]);
+    assert!(!out.status.success(), "a stale kill succeeded");
+    let err = stdout_json(&out);
+    assert_eq!(err["error"]["code"], -32002, "{err}");
+    assert_eq!(err["error"]["data"]["resource"], "pane", "{err}");
+
+    assert_eq!(env.pane_count(&s), 2, "the refused kill removed the pane");
+    env.ok(&[
+        "pane",
+        "send-keys",
+        "-s",
+        &s,
+        "-p",
+        &id,
+        "--text",
+        "KEPT-INPUT",
+    ]);
+    env.ok(&[
+        "pane",
+        "wait-for",
+        "-s",
+        &s,
+        "-p",
+        &id,
+        "-t",
+        "KEPT-INPUT",
+        "--timeout-ms",
+        "30000",
+    ]);
+}
+
+#[test]
+fn rpc_call_system_version_reports_this_build() {
+    let env = Env::new();
+    let v = env.json(&["rpc", "call", "system.version"]);
+    assert_eq!(v["result"]["version"], env!("CARGO_PKG_VERSION"), "{v}");
+    assert_eq!(v["result"]["name"], "shux", "{v}");
+}

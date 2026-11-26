@@ -273,9 +273,9 @@ test-window-snapshot-images: nextest-ready ## Inline images survive multi-pane c
 	@echo "$(COLOR_GREEN)✓ Multi-pane inline image tests passed$(COLOR_RESET)"
 
 .PHONY: test-pane-io
-test-pane-io: nextest-ready ## Run pane I/O integration tests; optionally pass FILTER=<test-name>
+test-pane-io: nextest-ready ## Run the real-daemon pane capture tests; optionally pass FILTER=<test-name>
 	@echo "$(COLOR_BLUE)▶ Running pane I/O integration tests...$(COLOR_RESET)"
-	@.shux/scripts/no_leak_guard.sh $(NEXTEST_RUN) -p shux --test pane_io_integration $(FILTER)
+	@.shux/scripts/no_leak_guard.sh $(NEXTEST_RUN) -p shux --test pane_capture_e2e $(FILTER)
 	@echo "$(COLOR_GREEN)✓ Pane I/O integration tests passed$(COLOR_RESET)"
 
 .PHONY: test-daemon-lifecycle
