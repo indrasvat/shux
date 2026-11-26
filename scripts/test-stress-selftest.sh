@@ -76,7 +76,9 @@ run() {
     rm -rf "$work/log" "$work/tmp"
     mkdir -p "$work/log" "$work/tmp"
     status=0
+    # The caller's NEXTEST_PROFILE is not this run's: PROFILE sets it.
     (cd "$work/repo" && PATH="$work/bin:$PATH" STUB_LOG="$work/log" STRESS_COUNT="$1" STRESS_LOAD="${LOAD:-0}" \
+        NEXTEST_PROFILE="${PROFILE:-default}" \
         TMPDIR="${STUB_TMPDIR:-$work/tmp}" bash scripts/test-stress.sh) >"$work/out" 2>&1 || status=$?
 }
 # priorities <run>: "<priority> <binary> <test>" per override the run's config adds.
@@ -117,7 +119,7 @@ for r in 2 3; do
 done
 if [[ -z "$(find "$work/tmp" -mindepth 1)" ]]; then ok "it leaves no temp files"; else bad "it leaves no temp files"; fi
 
-NEXTEST_PROFILE=ci run 2
+PROFILE=ci run 2
 if ((status == 0)) && ran 1 ci && ran 2 ci && cmp -s "$work/log/run2.toml" "$work/repo/.config/nextest.toml"; then
     ok "another NEXTEST_PROFILE runs as it is, unordered"
 else
