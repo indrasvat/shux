@@ -1,3 +1,10 @@
+## [0.66.1](https://github.com/indrasvat/shux/compare/v0.66.0...v0.66.1) (2026-11-26)
+
+
+### Performance Improvements
+
+* **flake-gate:** start the slowest tests first; record the [#323](https://github.com/indrasvat/shux/issues/323) decision with its numbers ([#325](https://github.com/indrasvat/shux/issues/325)) ([64bd892](https://github.com/indrasvat/shux/commit/64bd892fbd9972d52e92693ea78a23f3ee7166c7)), closes [#320](https://github.com/indrasvat/shux/issues/320) [#321](https://github.com/indrasvat/shux/issues/321) [#113](https://github.com/indrasvat/shux/issues/113) [#247](https://github.com/indrasvat/shux/issues/247) [#321](https://github.com/indrasvat/shux/issues/321)
+
 # [0.66.0](https://github.com/indrasvat/shux/compare/v0.65.0...v0.66.0) (2026-11-26)
 
 
