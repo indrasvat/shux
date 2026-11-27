@@ -125,7 +125,7 @@ test_spans() {
 has_tests() {
     local spans
     spans="$(test_spans "$1")" || { echo "flake-gate: ast-grep failed on $1" >&2; exit 1; }
-    grep -qE '^[st]'$'\t' <<<"$spans" || grep -qE '#\[([^]]*[^A-Za-z0-9_])?test([^A-Za-z0-9_]|$)|proptest!' "$1"
+    grep -qE '^[stp]'$'\t' <<<"$spans" || grep -qE '#\[([^]]*[^A-Za-z0-9_])?test([^A-Za-z0-9_]|$)|proptest!' "$1"
 }
 
 # touched_lines <side> <all|cfg> <spans> <diff> <source>: what one side (old

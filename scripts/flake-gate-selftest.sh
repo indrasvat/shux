@@ -69,7 +69,10 @@ w() { mkdir -p "$(dirname "$1")"; printf '%s\n' "${@:2}" >"$1"; }
 w crates/p/src/lib.rs 'pub mod foo;' '#[cfg(any(test, fuzzing))]' 'pub mod fz;' 'pub fn a() {}' \
     '#[cfg(test)]' '/* harness */' 'mod blk;' '#[cfg(test)]' 'mod suite;' \
     '#[cfg(test)]' 'mod cmtattr;' '#[cfg(test)]' 'mod suite3;' '#[cfg(test)]' '#[path = r"raw_p.rs"]' 'mod rawp;' \
-    '#[cfg(test)]' 'mod macrot;' \
+    '#[cfg(test)]' 'mod macrot;' '#[cfg(test)]' 'mod extgen;' \
+    '#[cfg(test)]' 'mod tests {' '    #[test]' '    fn t() {}' '}'
+w crates/p/src/extgen.rs 'crate::sample_tests!(e1);'
+w crates/p/src/allowh.rs 'pub fn c() {}' '#[cfg_attr(test, allow(dead_code))]' 'fn helper() { let h = 1; }' \
     '#[cfg(test)]' 'mod tests {' '    #[test]' '    fn t() {}' '}'
 w crates/p/src/blk.rs 'const B: u8 = 1;' '#[test]' 'fn t() { let x = 1; }'
 w crates/p/src/suite.rs 'pub fn helper() {}' '#[cfg_attr(test, test)]' 'fn changed() { let x = 1; }'
@@ -298,6 +301,13 @@ case_ "a test-only file whose tests a macro writes" "perl -pi -e 's/M: u8 = 1/M:
 
 case_ "a macro call that writes a test: its binary, x20" "perl -pi -e 's/sample!\\(made, 1\\)/sample!(made, 2)/' crates/p/tests/gen.rs" \
     'D:binary_id(=p::gen)'
+case_ "only the cfg_attr(…, test) attribute changed: its module, x20" \
+    "perl -pi -e 's/cfg_attr\\(test, test\\)\\]\$/cfg_attr(all(test, unix), test)]/' crates/p/src/attr.rs" \
+    'D:binary_id(=p) & test(/^attr::/)'
+case_ "a helper under cfg_attr(test, allow(…)): x5" "perl -pi -e 's/let h = 1;/let h = 2;/' crates/p/src/allowh.rs" \
+    'binary_id(=p) & test(/^allowh::/)'
+case_ "a test-only file of one macro call defined elsewhere, x20" "perl -pi -e 's/e1/e2/' crates/p/src/extgen.rs" \
+    'D:binary_id(=p) & test(/^extgen::/)'
 case_ "a macro call over several lines, changed inside: its binary, x20" "perl -pi -e 's/^    7\$/    8/' crates/p/tests/gen.rs" \
     'D:binary_id(=p::gen)'
 case_ "an assert! line in a helper fn: x5" "perl -pi -e 's/assert!\\(true\\)/assert!(!false)/' crates/p/tests/gen.rs" \

@@ -271,8 +271,8 @@ fi
 BASE_COUNT="$(wc -l <"${BASE_LIST}" | tr -d ' ')"
 CUR_COUNT="$(wc -l <"${CURRENT_LIST}" | tr -d ' ')"
 
-removed="$(comm -23 "${BASE_LIST}" "${CURRENT_LIST}" || true)"
-added="$(comm -13 "${BASE_LIST}" "${CURRENT_LIST}" || true)"
+removed="$(comm -23 "${BASE_LIST}" "${CURRENT_LIST}")"
+added="$(comm -13 "${BASE_LIST}" "${CURRENT_LIST}")"
 
 echo "  base ${BASE_SHA:0:12}: ${BASE_COUNT} tests"
 echo "  working tree:      ${CUR_COUNT} tests"
@@ -300,7 +300,9 @@ trailers() {
 # the test's name without its module path. A trailer never licenses a test it
 # does not name, and a reason is required.
 retire_trailers="$(trailers TEST-RETIRE | sed 's/^TEST-RETIRE:[[:space:]]*//')"
-retire_rules="$(awk 'NF >= 3 { print $1 "\t" $2 }' <<<"${retire_trailers}" | sort)"
+# A pasted nextest name works too: its module path and ::bin/<name> go, as in normalize.
+retire_rules="$(awk 'NF >= 3 { b = $1; sub(/::bin\/[^\/]+$/, "", b); l = $2; sub(/^.*::/, "", l); print b "\t" l }' \
+  <<<"${retire_trailers}" | sort)"
 # Read from the trailer lines themselves: `$(…)` drops an empty last value.
 bad_retire="$(trailers TEST-RETIRE | awk '{ v = $0; sub(/^TEST-RETIRE:[[:space:]]*/, "", v); if (split(v, w) < 3) print }')"
 if [[ -n "${bad_retire}" ]]; then

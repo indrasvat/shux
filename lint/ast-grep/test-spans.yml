@@ -267,14 +267,22 @@ rule:
 ---
 id: cfgatest
 language: rust
-rule:
-  kind: function_item
-  inside:
+utils:
+  # `cfg_attr(<predicate>, <a test attribute>)`, not cfg_attr(test, allow(…)).
+  test-cfg-attr:
+    kind: attribute_item
+    regex: '^#\[\s*cfg_attr\s*\((?s:.)*,\s*(::)?([A-Za-z_][A-Za-z0-9_]*::)*(test|rstest|proptest)\s*\)\s*\]$'
+  item-level:
     any:
       - kind: source_file
       - kind: declaration_list
         inside: { kind: mod_item }
-  follows:
-    stopBy: { not: { any: [{ kind: attribute_item }, { kind: line_comment }, { kind: block_comment }] } }
-    kind: attribute_item
-    regex: '^#\[\s*cfg_attr\b(?s:.)*\btest\b'
+  between: { not: { any: [{ kind: attribute_item }, { kind: line_comment }, { kind: block_comment }] } }
+rule:
+  any:
+    - matches: test-cfg-attr
+      inside: { matches: item-level }
+      precedes: { stopBy: { matches: between }, kind: function_item }
+    - kind: function_item
+      inside: { matches: item-level }
+      follows: { stopBy: { matches: between }, matches: test-cfg-attr }

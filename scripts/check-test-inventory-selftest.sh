@@ -65,6 +65,8 @@ expect "a removed test fails though an unrelated TEST-MOVE: trailer is there" 1 
     'TEST-MOVE: something else moved'
 expect "TEST-RETIRE: naming the test lets it go" 0 "$work/base" "$work/one" \
     'TEST-RETIRE: shux::m0 b duplicated by c'
+expect "TEST-RETIRE: with nextest's own name for it (module path, ::bin/) lets it go" 0 "$work/base" "$work/one" \
+    'TEST-RETIRE: shux::m0::bin/m0 tests::inner::b duplicated by c'
 expect "TEST-RETIRE: naming another test does not" 1 "$work/base" "$work/one" \
     'TEST-RETIRE: shux::m0 a duplicated by c'
 expect "TEST-RETIRE: in another binary does not" 1 "$work/base" "$work/one" \

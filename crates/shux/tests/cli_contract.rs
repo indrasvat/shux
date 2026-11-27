@@ -1258,5 +1258,9 @@ fn pane_focus_reports_the_pane_it_took_focus_from() {
         "pane.focus",
         serde_json::json!({ "pane_id": original }),
     ));
-    assert!(stayed["result"]["previous_pane_id"].is_null(), "{stayed}");
+    assert_eq!(
+        stayed["result"],
+        serde_json::json!({ "pane_id": original, "previous_pane_id": null }),
+        "{stayed}"
+    );
 }
