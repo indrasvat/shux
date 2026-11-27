@@ -74,6 +74,8 @@ w crates/p/src/lib.rs 'pub mod foo;' '#[cfg(any(test, fuzzing))]' 'pub mod fz;' 
 w crates/p/src/extgen.rs 'crate::sample_tests!(e1);'
 w crates/p/src/allowh.rs 'pub fn c() {}' '#[cfg_attr(test, allow(dead_code))]' 'fn helper() { let h = 1; }' \
     '#[cfg(test)]' 'mod tests {' '    #[test]' '    fn t() {}' '}'
+w crates/p/src/trail.rs 'pub fn c() {}' '#[cfg_attr(test, test,)]' 'fn tr() { let a = 1; }' \
+    '#[cfg_attr(test, test, allow(dead_code))]' 'fn tr2() { let b = 1; }'
 w crates/p/src/blk.rs 'const B: u8 = 1;' '#[test]' 'fn t() { let x = 1; }'
 w crates/p/src/suite.rs 'pub fn helper() {}' '#[cfg_attr(test, test)]' 'fn changed() { let x = 1; }'
 w crates/p/src/cmtattr.rs 'pub fn h() {}' '#[test /* c */]' 'fn ct() { let x = 1; }'
@@ -304,6 +306,10 @@ case_ "a macro call that writes a test: its binary, x20" "perl -pi -e 's/sample!
 case_ "only the cfg_attr(…, test) attribute changed: its module, x20" \
     "perl -pi -e 's/cfg_attr\\(test, test\\)\\]\$/cfg_attr(all(test, unix), test)]/' crates/p/src/attr.rs" \
     'D:binary_id(=p) & test(/^attr::/)'
+case_ "a test under cfg_attr(test, test,): its module, x20" "perl -pi -e 's/let a = 1;/let a = 2;/' crates/p/src/trail.rs" \
+    'D:binary_id(=p) & test(/^trail::/)'
+case_ "a test under cfg_attr(test, test, allow(…)): its module, x20" "perl -pi -e 's/let b = 1;/let b = 2;/' crates/p/src/trail.rs" \
+    'D:binary_id(=p) & test(/^trail::/)'
 case_ "a helper under cfg_attr(test, allow(…)): x5" "perl -pi -e 's/let h = 1;/let h = 2;/' crates/p/src/allowh.rs" \
     'binary_id(=p) & test(/^allowh::/)'
 case_ "a test-only file of one macro call defined elsewhere, x20" "perl -pi -e 's/e1/e2/' crates/p/src/extgen.rs" \

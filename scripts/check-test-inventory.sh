@@ -304,7 +304,8 @@ retire_trailers="$(trailers TEST-RETIRE | sed 's/^TEST-RETIRE:[[:space:]]*//')"
 retire_rules="$(awk 'NF >= 3 { b = $1; sub(/::bin\/[^\/]+$/, "", b); l = $2; sub(/^.*::/, "", l); print b "\t" l }' \
   <<<"${retire_trailers}" | sort)"
 # Read from the trailer lines themselves: `$(…)` drops an empty last value.
-bad_retire="$(trailers TEST-RETIRE | awk '{ v = $0; sub(/^TEST-RETIRE:[[:space:]]*/, "", v); if (split(v, w) < 3) print }')"
+# `*` is a whole binary or nothing: `mod::*` would strip to it.
+bad_retire="$(trailers TEST-RETIRE | awk '{ v = $0; sub(/^TEST-RETIRE:[[:space:]]*/, "", v); if (split(v, w) < 3 || w[2] ~ /.\*$/) print }')"
 if [[ -n "${bad_retire}" ]]; then
   echo "" >&2
   echo "error: a TEST-RETIRE: trailer needs <binary-id> <test|*> <reason>:" >&2

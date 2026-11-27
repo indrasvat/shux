@@ -271,7 +271,7 @@ utils:
   # `cfg_attr(<predicate>, <a test attribute>)`, not cfg_attr(test, allow(…)).
   test-cfg-attr:
     kind: attribute_item
-    regex: '^#\[\s*cfg_attr\s*\((?s:.)*,\s*(::)?([A-Za-z_][A-Za-z0-9_]*::)*(test|rstest|proptest)\s*\)\s*\]$'
+    regex: '^#\[\s*cfg_attr\s*\((?s:.)*,\s*(::)?([A-Za-z_][A-Za-z0-9_]*::)*(test|rstest|proptest)\s*(,(?s:.)*)?\)\s*\]$'
   item-level:
     any:
       - kind: source_file
