@@ -156,6 +156,8 @@ touched_lines() {
             match($0, /^[[:space:]]*/)
             if ((FNR in cmt) && cmt[FNR] == RLENGTH) next
             if (!coarse) coarse = FNR
+            # A macro call among items writes items, tests among them.
+            if ($0 ~ /^[[:space:]]*[A-Za-z_][A-Za-z0-9_:]*![[:space:]]*[(\[{]/ && $0 !~ /macro_rules!/) gen = 1
         }
         END {
             for (i in fns) {
@@ -165,6 +167,7 @@ touched_lines() {
             }
             for (p in decl) print "d\t" p
             if (coarse) print "coarse\t" coarse
+            if (gen) print "gen\t1"
         }' "$3" "$4" "$5"
 }
 
@@ -178,7 +181,7 @@ declare -A coarse_of=() may_be_empty=() direct=()
 # <known> is "test" (a fixture it names changed). "all": the whole file is
 # test code; "cfg": its cfg(test) code and its test functions are.
 fn_select() {
-    local known="$1" f="$2" bin="$3" prefix="${4:+$4::}" mode="$5" coarse="$6" side src why=""
+    local known="$1" f="$2" bin="$3" prefix="${4:+$4::}" mode="$5" coarse="$6" side src why="" gen=0
     local -A reached=() gone=() declared=() present=()
     local kind name t
     if [[ "$known" == test ]]; then
@@ -202,6 +205,7 @@ fn_select() {
             *:f) reached[$name]=1 ;;
             old:g) gone[$name]=1 ;;
             new:g) reached[$name]=1 ;;
+            *:gen) gen=1 ;;
             esac
         done <"$tmp/$side.hit"
     done
@@ -239,7 +243,25 @@ fn_select() {
     if [[ -n "$why" ]]; then
         echo "flake-gate: $f: $why; selecting $coarse" >&2
         terms+=("$coarse")
+        # Tests a changed macro call writes cannot be named: their scope keeps 20.
+        if ((gen)); then direct[$coarse]=1; fi
     fi
+}
+
+# edits_a_test <file> <all|cfg>: whether the diff changes a line of a test
+# function in <file>, for the selections that cannot name the test.
+edits_a_test() {
+    local f="$1" mode="$2" side
+    git diff -U0 --text "$base"...HEAD -- "$f" >"$tmp/ediff"
+    if git cat-file -e "HEAD:$f" 2>/dev/null; then git show "HEAD:$f" >"$tmp/enew.rs"; else : >"$tmp/enew.rs"; fi
+    if git cat-file -e "$base:$f" 2>/dev/null; then git show "$base:$f" >"$tmp/eold.rs"; else : >"$tmp/eold.rs"; fi
+    for side in new old; do
+        test_spans "$tmp/e$side.rs" >"$tmp/e$side.spans" ||
+            { echo "flake-gate: ast-grep failed on $f" >&2; exit 1; }
+        touched_lines "$side" "$mode" "$tmp/e$side.spans" "$tmp/ediff" "$tmp/e$side.rs" >"$tmp/e$side.hit"
+        if grep -qE $'^(f|g|gen)\t' "$tmp/e$side.hit"; then return 0; fi
+    done
+    return 1
 }
 
 # users_of <helper> <pkg>: the unit tests of every module in <pkg> that names
@@ -274,14 +296,17 @@ select_rs() {
     if [[ "$kind" == tests && "$rest" != */* ]]; then
         fn_select "$known" "$f" "$pkg::$rest" "" all "binary_id(=$pkg::$rest)"
     elif [[ "$kind" == tests ]]; then
-        local dir="${rest%%/*}" user
+        local dir="${rest%%/*}" user edited=0
+        if [[ -z "$known" ]] && edits_a_test "$f" all; then edited=1; fi
         while IFS= read -r user; do
             terms+=("binary_id(=$pkg::$(basename "$user" .rs))")
+            if ((edited)); then direct["binary_id(=$pkg::$(basename "$user" .rs))"]=1; fi
         done < <(grep -lE "^[[:space:]]*(#\[[[:space:]]*path[[:space:]]*=[[:space:]]*\"$dir/[^\"]*\"[[:space:]]*\]|(#\[[^]]*\][[:space:]]*)*(pub(\([^)]*\))?[[:space:]]+)?mod[[:space:]]+${dir}[[:space:]]*;)" \
             "crates/$pkg/tests/"*.rs || true)
     elif unowned "$pkg" "$f"; then
         echo "flake-gate: $f's module path or binary is not its file path's; selecting $(units "$pkg")" >&2
         terms+=("$(units "$pkg")")
+        if [[ -z "$known" ]] && edits_a_test "$f" cfg; then direct["$(units "$pkg")"]=1; fi
     elif [[ -n "${test_only[$f]+set}" ]]; then
         if [[ -f "$f" ]] && has_tests "$f"; then
             fn_select "$known" "$f" "$pkg" "${test_only[$f]}" all "binary_id(=$pkg) & test(/^${test_only[$f]}::/)"

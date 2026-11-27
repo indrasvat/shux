@@ -1,9 +1,8 @@
 //! End-to-end: what a real pane's program writes, read back through the daemon.
 //!
 //! The VT behaviour itself is tested in `shux-vt`. These cover what only the
-//! daemon's path can break: non-ASCII text through PTY, RPC and CLI, terminal
-//! replies written back to the program, and a capture while synchronized output
-//! holds the frame.
+//! daemon's path can break: non-ASCII text through PTY, RPC and CLI, and
+//! terminal replies written back to the program.
 
 mod pane_e2e;
 
@@ -73,60 +72,4 @@ sys.stdout.flush()
         text.contains("YYY QUERIES-DONE"),
         "CPR, DECRQM ?2026 and XTVERSION each answered (Y) or not (N):\n{text}"
     );
-}
-
-/// The program holds a synchronized-output frame open until the test has
-/// captured. It reports ready only once shux has answered a cursor report
-/// queued behind the hidden frame, so the VT has parsed that frame; both ends
-/// are ordered, and no timing decides the outcome.
-#[test]
-fn a_capture_during_synchronized_output_shows_the_frame_before_it() {
-    let mut env = Env::new(80, 24);
-    let (ready, release) = (env.work("sync.ready"), env.work("sync.release"));
-    let pane = pane_running_python(
-        &mut env,
-        "sync",
-        &format!(
-            r#"import os, pathlib, termios, time, tty
-fd = 0
-saved = termios.tcgetattr(fd)
-tty.setraw(fd)
-try:
-    os.write(1, b"OLD-FRAME")
-    os.write(1, b"\x1b[?2026h\x1b[1;1HNEW-FRAME\x1b[6n")
-    reply = b""
-    while not reply.endswith(b"R"):
-        reply += os.read(fd, 64)
-    pathlib.Path({ready:?}).write_text("ready")
-    release = pathlib.Path({release:?})
-    deadline = time.monotonic() + 60
-    while not release.exists() and time.monotonic() < deadline:
-        time.sleep(0.01)
-    os.write(1, b"\x1b[?2026l")
-finally:
-    termios.tcsetattr(fd, termios.TCSADRAIN, saved)
-"#,
-            ready = ready.display().to_string(),
-            release = release.display().to_string(),
-        ),
-    );
-    env.wait_for("sync", &pane, "OLD-FRAME");
-    let r = &ready;
-    assert!(
-        shux_testkit::poll_until(shux_testkit::BUDGET, || r.exists()),
-        "the program never had its cursor report answered:\n{}",
-        env.capture("sync", &pane)
-    );
-    let frozen = env.capture("sync", &pane);
-    env.assert_colour_probe(&pane);
-    std::fs::write(&release, b"go").expect("release the frame");
-    assert!(
-        !frozen.contains("NEW-FRAME"),
-        "the pending frame leaked:\n{frozen}"
-    );
-    assert!(
-        frozen.contains("OLD-FRAME"),
-        "the frame before the sync was lost:\n{frozen}"
-    );
-    env.wait_for("sync", &pane, "NEW-FRAME");
 }

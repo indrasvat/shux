@@ -33,6 +33,10 @@ lst "$work/one" shux::m0 a
 printf 'shux::m0\ta\t1\nshux::m0\tb\t1\nshux\tc\t1\n' | sort >"$work/base3"
 printf 'shux::m0\ta\t1\nshux::m0\tb\t1\nshux-core\tc\t1\n' | sort >"$work/moved"
 : >"$work/none"
+printf 'shux::m0\ta\t1\nshux::m0\tb\t1\nshux::m0\tb\t2\n' | sort >"$work/twins"
+# b moves shux-core -> shux-vt, and shux-vt's own b moves to shux.
+printf 'shux-core\tb\t1\nshux-vt::old\tb\t1\n' | sort >"$work/chain-base"
+printf 'shux-vt::new\tb\t1\nshux\tb\t1\n' | sort >"$work/chain-moved"
 
 fail=0
 # expect <label> <want exit> <base list> <current list> [trailer]...
@@ -74,6 +78,12 @@ expect "a whole binary retired, but still listing a test, fails" 1 "$work/base" 
 expect "a move to another package with TEST-MOVE: passes" 0 "$work/base3" "$work/moved" \
     'TEST-MOVE: c moved to shux-core'
 expect "a move to another package without it fails" 1 "$work/base3" "$work/moved"
+expect "one TEST-RETIRE: does not license two tests of one name" 1 "$work/twins" "$work/one" \
+    'TEST-RETIRE: shux::m0 b one was redundant'
+expect "two TEST-RETIRE: trailers license two" 0 "$work/twins" "$work/one" \
+    'TEST-RETIRE: shux::m0 b one was redundant' 'TEST-RETIRE: shux::m0 b the other too'
+expect "two moves chained through one package pass with TEST-MOVE:" 0 "$work/chain-base" "$work/chain-moved" \
+    'TEST-MOVE: b moved twice'
 
 if ((fail)); then
     printf '\033[1;31m✗ check-test-inventory self-test failed\033[0m\n'

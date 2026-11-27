@@ -136,6 +136,11 @@ w crates/p/tests/a.rs 'mod common;' '#[path = "sub/helper.rs"]' 'mod helper;' \
 w crates/p/tests/a.proptest-regressions 'cc 00'
 w crates/p/tests/b.rs 'pub mod common;' '#[test] fn t() { let _ = "frame.bin"; }'
 w crates/p/tests/old.rs '#[test] fn t() {}'
+# shellcheck disable=SC2016  # Rust source: its $n and $v are macro variables
+w crates/p/tests/gen.rs 'macro_rules! sample { ($n:ident, $v:literal) => { #[test] fn $n() { let _ = $v; } }; }' \
+    'sample!(made, 1);' 'sample!(other, 1);' 'fn gen_helper() -> u8 { 1 }'
+w crates/p/tests/shared/mod.rs '#[test]' 'fn st() { let x = 1; }' 'pub fn sh() { let y = 1; }'
+w crates/p/tests/d.rs 'mod shared;' '#[test] fn t() {}'
 w crates/shux-testkit/src/lib.rs 'pub fn w() {}' '#[cfg(test)]' 'mod tests {' '    #[test]' '    fn t() { let x = 1; }' '}'
 w .shux/fixtures/frames/frame.bin 'x'
 git add crates .shux scripts lint
@@ -278,19 +283,27 @@ case_ "a test in src/bin/<name>.rs: that bin" "edit crates/p/src/bin/tool.rs" 'b
 case_ "a #[test] outside cfg(test)" "edit crates/p/src/bare.rs" 'binary_id(=p) & test(=bare::bare)'
 case_ "a comment inside cfg(…)" "perl -pi -e 's/CV: u8 = 1/CV: u8 = 2/' crates/p/src/attr.rs" 'binary_id(=p) & test(/^attr::/)'
 case_ "core::cfg(not(not(test)))" "perl -pi -e 's/NV: u8 = 1/NV: u8 = 2/' crates/p/src/attr.rs" 'binary_id(=p) & test(/^attr::/)'
-case_ "a file a #[path] names: its package's unit tests" "edit crates/p/src/early_more.rs" "$units_p"
+case_ "a test in a file a #[path] names: its package's unit tests, x20" "edit crates/p/src/early_more.rs" "D:$units_p"
 case_ "a test-only file declared past a block comment" "perl -pi -e 's/B: u8 = 1/B: u8 = 2/' crates/p/src/blk.rs" 'binary_id(=p) & test(/^blk::/)'
 case_ "a test-only file whose test is a cfg_attr" "edit crates/p/src/suite.rs" 'binary_id(=p) & test(/^suite::/)'
 case_ "a tests/ helper its binary declares under an attribute" "edit crates/p/tests/support/mod.rs" 'binary_id(=p::c)'
 case_ "a NUL byte in a test file" "perl -pi -e 's/let v = 1;/let v = 2;/' crates/p/tests/nul.rs" 'binary_id(=p::nul) & test(=n)'
 case_ "a test attribute with a comment in it" "edit crates/p/src/cmtattr.rs" 'binary_id(=p) & test(=cmtattr::ct)'
 case_ "a test-only file whose cfg_attr spans lines" "edit crates/p/src/suite3.rs" 'binary_id(=p) & test(/^suite3::/)'
-case_ "a file a raw-string #[path] names" "edit crates/p/src/raw_p.rs" "$units_p"
-case_ "a file a bin's mod x; owns" "edit crates/q/src/owner.rs" 'package(=q) & (kind(=lib) + kind(=bin))'
-case_ "src/bin/ in a package whose lib has a mod bin" "edit crates/r/src/bin/tool.rs" 'package(=r) & (kind(=lib) + kind(=bin))'
+case_ "a test in a file a raw-string #[path] names, x20" "edit crates/p/src/raw_p.rs" "D:$units_p"
+case_ "a test in a file a bin's mod x; owns, x20" "edit crates/q/src/owner.rs" 'D:package(=q) & (kind(=lib) + kind(=bin))'
+case_ "a test in src/bin/ in a package whose lib has a mod bin, x20" "edit crates/r/src/bin/tool.rs" 'D:package(=r) & (kind(=lib) + kind(=bin))'
 case_ "a bare test rewritten whole into a helper: the module" "perl -0pi -e 's/#\\[test\\]\\nfn bare2\\(\\) \\{ let b2 = 1; \\}/fn bare2() { let b2 = 2; }/' crates/p/src/bare.rs" 'binary_id(=p) & test(/^bare::/)'
 case_ "a test-only file whose tests a macro writes" "perl -pi -e 's/M: u8 = 1/M: u8 = 2/' crates/p/src/macrot.rs" 'binary_id(=p) & test(/^macrot::/)'
 
+case_ "a macro call that writes a test: its binary, x20" "perl -pi -e 's/sample!\\(made, 1\\)/sample!(made, 2)/' crates/p/tests/gen.rs" \
+    'D:binary_id(=p::gen)'
+case_ "a macro's definition: a helper, x5" "perl -pi -e 's/let _ = \\\$v;/let _ = \\\$v + 0;/' crates/p/tests/gen.rs" \
+    'binary_id(=p::gen)'
+case_ "a test in a shared tests/ module: the binaries that declare it, x20" "edit crates/p/tests/shared/mod.rs" \
+    'D:binary_id(=p::d)'
+case_ "a helper in a shared tests/ module: x5" "perl -pi -e 's/let y = 1;/let y = 2;/' crates/p/tests/shared/mod.rs" \
+    'binary_id(=p::d)'
 case_ "a new integration-test binary: its tests x20" \
     "w crates/p/tests/fresh.rs '#[test]' 'fn f1() { let a = 1; }' '#[test]' 'fn f2() { let b = 1; }'" \
     'binary_id(=p::fresh) & test(=f1)' 'binary_id(=p::fresh) & test(=f2)'

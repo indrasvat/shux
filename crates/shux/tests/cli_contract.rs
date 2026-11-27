@@ -1023,18 +1023,21 @@ fn state_apply_refuses_watch_with_json_output() {
     assert_eq!(stdout_json(&out)["error"]["code"], -32602);
 }
 
+/// Reads one line and answers with it twice, which the PTY's echo of the line cannot.
+const ANSWER_TWICE: &str = r#"read -r x; echo "got-$x-$x"; exec sleep 900"#;
+
 /// A kill carrying a stale version is refused before the pane's I/O is torn
-/// down: the pane stays listed, and still takes input.
+/// down: the pane stays listed, and its program still reads what is sent to it.
 #[test]
 fn a_pane_kill_with_a_stale_version_leaves_the_pane_working() {
     let mut env = Env::new();
     let s = env.session("stale");
-    env.ok(&["pane", "split", "-s", &s, "--", "cat"]);
+    env.ok(&["pane", "split", "-s", &s, "--", "sh", "-c", ANSWER_TWICE]);
     let panes = env.json(&["pane", "list", "-s", &s]);
     let target = panes
         .as_array()
-        .and_then(|p| p.iter().find(|p| p["command"].to_string().contains("cat")))
-        .unwrap_or_else(|| panic!("no cat pane in {panes}"));
+        .and_then(|p| p.iter().find(|p| p["command"].to_string().contains("read")))
+        .unwrap_or_else(|| panic!("no answering pane in {panes}"));
     let id = target["id"].as_str().expect("pane id").to_string();
     let stale = target["version"].as_u64().expect("pane version") + 99;
 
@@ -1057,16 +1060,8 @@ fn a_pane_kill_with_a_stale_version_leaves_the_pane_working() {
     assert_eq!(err["error"]["data"]["resource"], "pane", "{err}");
 
     assert_eq!(env.pane_count(&s), 2, "the refused kill removed the pane");
-    env.ok(&[
-        "pane",
-        "send-keys",
-        "-s",
-        &s,
-        "-p",
-        &id,
-        "--text",
-        "KEPT-INPUT",
-    ]);
+    env.ok(&["pane", "send-keys", "-s", &s, "-p", &id, "--text", "kept"]);
+    env.ok(&["pane", "send-keys", "-s", &s, "-p", &id, "--data", "DQ=="]);
     env.ok(&[
         "pane",
         "wait-for",
@@ -1075,8 +1070,39 @@ fn a_pane_kill_with_a_stale_version_leaves_the_pane_working() {
         "-p",
         &id,
         "-t",
-        "KEPT-INPUT",
+        "got-kept-kept",
         "--timeout-ms",
         "30000",
     ]);
+}
+
+#[test]
+fn a_window_rename_with_a_stale_version_changes_nothing() {
+    let mut env = Env::new();
+    let s = env.session("wstale");
+    let before = env.json(&["window", "list", "-s", &s])[0].clone();
+    let id = before["id"].as_str().expect("window id");
+    let stale = before["version"].as_u64().expect("window version") + 99;
+    let params = env.write_template(
+        "rename.json",
+        &serde_json::json!({ "id": id, "name": "stale-write", "expected_version": stale })
+            .to_string(),
+    );
+    let out = env.run(&[
+        "--format",
+        "json",
+        "rpc",
+        "call",
+        "window.rename",
+        "--params",
+        &format!("@{}", params.display()),
+    ]);
+    assert!(!out.status.success(), "a stale rename succeeded");
+    assert_eq!(stdout_json(&out)["error"]["code"], -32002);
+    let after = env.json(&["window", "list", "-s", &s])[0].clone();
+    assert_eq!(
+        (&after["title"], &after["version"]),
+        (&before["title"], &before["version"]),
+        "the refused rename changed the window"
+    );
 }

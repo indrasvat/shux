@@ -292,7 +292,7 @@ trailers() {
 # that lists no tests at all any more. A trailer never licenses a test it does
 # not name, and a reason is required.
 retire_trailers="$(trailers TEST-RETIRE)"
-retire_rules="$(awk 'NF >= 3 { print $1 "\t" $2 }' <<<"${retire_trailers}" | sort -u)"
+retire_rules="$(awk 'NF >= 3 { print $1 "\t" $2 }' <<<"${retire_trailers}" | sort)"
 bad_retire="$(awk 'NF > 0 && NF < 3' <<<"${retire_trailers}")"
 if [[ -n "${bad_retire}" ]]; then
   echo "" >&2
@@ -301,7 +301,7 @@ if [[ -n "${bad_retire}" ]]; then
   exit 1
 fi
 if [[ -n "${retire_rules}" ]]; then
-  still_listed="$(awk -F'\t' '$2 == "*" { print $1 }' <<<"${retire_rules}" | while IFS= read -r bin; do
+  still_listed="$(awk -F'\t' '$2 == "*" { print $1 }' <<<"${retire_rules}" | sort -u | while IFS= read -r bin; do
     if awk -F'\t' -v b="${bin}" '$1 == b { found = 1; exit } END { exit !found }' "${CURRENT_LIST}"; then
       echo "${bin}"
     fi
@@ -313,8 +313,11 @@ if [[ -n "${retire_rules}" ]]; then
     echo "  Name each test you delete instead." >&2
     exit 1
   fi
-  retired="$(awk -F'\t' 'FILENAME == ARGV[1] { ok[$1 "\t" $2] = 1; next }
-    (($1 "\t" $2) in ok) || (($1 "\t*") in ok)' <(printf '%s\n' "${retire_rules}") \
+  # One trailer licenses one test: two removed tests sharing a binary and a
+  # leaf name need two.
+  retired="$(awk -F'\t' 'FILENAME == ARGV[1] { ok[$1 "\t" $2]++; next }
+    (($1 "\t*") in ok) { print; next }
+    ok[$1 "\t" $2] > 0 { ok[$1 "\t" $2]--; print }' <(printf '%s\n' "${retire_rules}") \
     <(printf '%s\n' "${removed}" | sed '/^$/d'))"
   if [[ -n "${retired}" ]]; then
     echo ""
@@ -356,22 +359,29 @@ removed_keys="$(printf '%s' "${removed}" | sed '/^$/d' \
 added_keys="$(printf '%s' "${added}" | sed '/^$/d' \
   | awk -F'\t' '{ pkg = $1; sub(/::.*/, "", pkg); print pkg "\t" $2 }' | sort)"
 
-# For each removed (package, leaf), a move requires the SAME leaf under a
-# DIFFERENT package. Multiset-aware: two removals of `foo` need two such
-# additions, else one of them is genuinely gone.
+# Each removed (package, leaf) needs its own addition of the SAME leaf under
+# a DIFFERENT package. Per leaf, such a pairing exists exactly when there are
+# no more removals than additions, and no package's removals plus additions
+# outnumber all additions (Hall's condition): a greedy pairing can miss one,
+# when two moves chain through a package. A leaf without one fails whole.
 # FILENAME, not NR == FNR: with no additions the first file is empty, and
 # NR == FNR would read every removal as an addition and report none vanished.
 vanished="$(awk -F'\t' '
-  FILENAME == ARGV[1] { avail[$2 "\t" $1]++; leaf_total[$2]++; next }
-  {
-    pkg = $1; leaf = $2
-    same = avail[leaf "\t" pkg] + 0
-    elsewhere = leaf_total[leaf] - same
-    if (elsewhere > 0) { leaf_total[leaf]--; next }
-    print leaf "  (was in " pkg ")"
+  FILENAME == ARGV[1] { add[$2 "\t" $1]++; adds[$2]++; next }
+  { rem[$2 "\t" $1]++; rems[$2]++; row[++n] = $2 "\t" $1 }
+  END {
+    for (k in rem) {
+      split(k, kl, "\t")
+      if (rem[k] + add[k] > adds[kl[1]]) bad[kl[1]] = 1
+    }
+    for (l in rems) if (rems[l] > adds[l]) bad[l] = 1
+    for (i = 1; i <= n; i++) {
+      split(row[i], r, "\t")
+      if (r[1] in bad) print r[1] "  (was in " r[2] ")"
+    }
   }
 ' <(printf '%s\n' "${added_keys}" | sed '/^$/d') \
-  <(printf '%s\n' "${removed_keys}" | sed '/^$/d') || true)"
+  <(printf '%s\n' "${removed_keys}" | sed '/^$/d'))"
 
 if [[ -n "${vanished}" ]]; then
   echo "" >&2
