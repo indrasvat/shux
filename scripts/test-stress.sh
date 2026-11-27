@@ -7,6 +7,8 @@
 #   STRESS_LOAD    CPU hogs to run alongside, via stress-ng (default 0)
 #   NEXTEST_JOBS   nextest -j                             (Makefile default)
 #   NEXTEST_PROFILE  the nextest profile                  (default "default")
+#   STRESS_IGNORE_DEFAULT_FILTER  1: also run tests the profile's default-filter
+#                  keeps out of routine runs (the flake gate's edited tests)
 #
 # Every run after the first starts the tests that were slowest in the first:
 # a run lasts until its slowest test ends, and one that starts last stretches
@@ -19,10 +21,17 @@
 set -euo pipefail
 
 count="${STRESS_COUNT:-10}"
+[[ "$count" =~ ^[1-9][0-9]*$ ]] || { echo "test-stress: STRESS_COUNT must be a positive integer, not '$count'" >&2; exit 2; }
 filter="${STRESS_FILTER:-all()}"
 load="${STRESS_LOAD:-0}"
 jobs="${NEXTEST_JOBS:-16}"
 base_profile="${NEXTEST_PROFILE:-default}"
+scope=()
+case "${STRESS_IGNORE_DEFAULT_FILTER:-}" in
+"") ;;
+1) scope=(--ignore-default-filter) ;;
+*) echo "test-stress: STRESS_IGNORE_DEFAULT_FILTER must be 1 or unset, not '$STRESS_IGNORE_DEFAULT_FILTER'" >&2; exit 2 ;;
+esac
 root="$(CDPATH='' cd -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/shux-test-stress.XXXXXX")"
 tmp="$(CDPATH='' cd -- "$tmp" && pwd)"
@@ -93,7 +102,7 @@ hogs_alive || { echo "test-stress: stress-ng exited before the run started" >&2;
 failed=0
 for ((i = 1; i <= count; i++)); do
     status=0
-    (cd "$root" && cargo nextest run --config-file "$config" --profile "$profile" -j "$jobs" --status-level fail --workspace -E "$filter") ||
+    (cd "$root" && cargo nextest run --config-file "$config" --profile "$profile" -j "$jobs" --status-level fail --workspace ${scope[@]+"${scope[@]}"} -E "$filter") ||
         status=$?
     # 100 is a test failure; anything else (a build error, no test matched) ends the run.
     case "$status" in

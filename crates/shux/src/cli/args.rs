@@ -2175,6 +2175,14 @@ mod tests {
 
     use super::*;
 
+    /// clap's consistency checks (a duplicate alias, a conflicting flag) fire
+    /// only when a command is built, and then as a runtime panic.
+    #[test]
+    fn the_cli_definition_passes_clap_debug_assert() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
+
     #[test]
     fn test_socket_path_explicit() {
         let cli = Cli {

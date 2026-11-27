@@ -19,14 +19,21 @@
 # shux-testkit's dependents are not re-run when it changes: that is most of the
 # suite, which CI runs once anyway; its own tests are gated like any others.
 #
-#   BASE          ref to diff against   (default origin/main)
-#   FLAKE_COUNT   runs                  (default 20)
-#   FLAKE_LOAD    CPU hogs              (default twice the core count)
+#   BASE                ref to diff against                        (default origin/main)
+#   FLAKE_COUNT         runs of the tests the diff adds or edits   (default 20)
+#   FLAKE_HELPER_COUNT  runs of the tests it reaches only through
+#                       a changed helper, module or fixture        (default 5)
+#   FLAKE_LOAD          CPU hogs                                   (default twice the core count)
 
 set -euo pipefail
 
 base_ref="${BASE:-origin/main}"
 count="${FLAKE_COUNT:-20}"
+helper_count="${FLAKE_HELPER_COUNT:-5}"
+for n in "$count" "$helper_count"; do
+    [[ "$n" =~ ^[1-9][0-9]*$ ]] ||
+        { echo "flake-gate: FLAKE_COUNT and FLAKE_HELPER_COUNT must be positive integers, not '$n'" >&2; exit 2; }
+done
 cores="$(getconf _NPROCESSORS_ONLN)"
 load="${FLAKE_LOAD:-$((2 * cores))}"
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -99,6 +106,7 @@ test_spans() {
             $1 == "mod" { nm++; ms[nm] = $6; me[nm] = $7; mn[nm] = $8 }
             $1 == "cmt" && !($2 in seen) { seen[$2] = 1; print "c", $2, $3 }
             $1 == "str" { print "q", $2, $4 }
+            $1 == "gen" || $1 == "cfgatest" { print "p", $2, $4 }
             $1 == "cfgt" { print "t", $9, $4 }
             $1 == "cfgm" { print "m", from($9, $10), to($4, $5), path($6) $8 }
             $1 == "cfgo" { print "t", $2, 2147483647 }
@@ -117,7 +125,7 @@ test_spans() {
 has_tests() {
     local spans
     spans="$(test_spans "$1")" || { echo "flake-gate: ast-grep failed on $1" >&2; exit 1; }
-    grep -qE '^[st]'$'\t' <<<"$spans" || grep -qE '#\[([^]]*[^A-Za-z0-9_])?test([^A-Za-z0-9_]|$)|proptest!' "$1"
+    grep -qE '^[stp]'$'\t' <<<"$spans" || grep -qE '#\[([^]]*[^A-Za-z0-9_])?test([^A-Za-z0-9_]|$)|proptest!' "$1"
 }
 
 # touched_lines <side> <all|cfg> <spans> <diff> <source>: what one side (old
@@ -134,6 +142,7 @@ touched_lines() {
         FILENAME == ARGV[1] && $1 == "m" && mode == "cfg" { nd++; d0[nd] = $2; d1[nd] = $3; dp[nd] = $4; next }
         FILENAME == ARGV[1] && $1 == "c" { cmt[$2] = $3; next }
         FILENAME == ARGV[1] && $1 == "q" { for (l = $2; l <= $3; l++) instr[l] = 1; next }
+        FILENAME == ARGV[1] && $1 == "p" { np++; p0[np] = $2; p1[np] = $3; next }
         FILENAME == ARGV[2] {
             if ($0 !~ /^@@ /) next
             split($0, h, " ")
@@ -153,6 +162,7 @@ touched_lines() {
             match($0, /^[[:space:]]*/)
             if ((FNR in cmt) && cmt[FNR] == RLENGTH) next
             if (!coarse) coarse = FNR
+            for (i = 1; i <= np; i++) if (p0[i] <= FNR && FNR <= p1[i]) gen = 1
         }
         END {
             for (i in fns) {
@@ -162,21 +172,23 @@ touched_lines() {
             }
             for (p in decl) print "d\t" p
             if (coarse) print "coarse\t" coarse
+            if (gen) print "gen\t1"
         }' "$3" "$4" "$5"
 }
 
 terms=()
-# exact term -> the coarse term of its file; terms that may list nothing.
-declare -A coarse_of=() may_be_empty=()
+# exact term -> the coarse term of its file; terms that may list nothing; terms
+# naming tests the diff adds or edits.
+declare -A coarse_of=() may_be_empty=() direct=()
 # fn_select <known> <file> <binary id> <module prefix> <all|cfg> <coarse term>:
 # the tests a change to <file> reaches, one term each, into terms; the coarse
 # term instead when it reaches test code outside a test function, or when
 # <known> is "test" (a fixture it names changed). "all": the whole file is
 # test code; "cfg": its cfg(test) code and its test functions are.
 fn_select() {
-    local known="$1" f="$2" bin="$3" prefix="${4:+$4::}" mode="$5" coarse="$6" side src why=""
+    local known="$1" f="$2" bin="$3" prefix="${4:+$4::}" mode="$5" coarse="$6" side src why="" gen=0
     local -A reached=() gone=() declared=() present=()
-    local kind name
+    local kind name t
     if [[ "$known" == test ]]; then
         terms+=("$coarse")
         return 0
@@ -198,12 +210,28 @@ fn_select() {
             *:f) reached[$name]=1 ;;
             old:g) gone[$name]=1 ;;
             new:g) reached[$name]=1 ;;
+            *:gen) gen=1 ;;
             esac
         done <"$tmp/$side.hit"
     done
     while IFS=$'\t' read -r kind _ _ name; do
         if [[ "$kind" == s ]]; then present[$name]=1; fi
     done <"$tmp/new.spans"
+    # The tests this diff adds or edits run FLAKE_COUNT times, even when the
+    # file falls back to a coarser term below.
+    for name in "${!reached[@]}" "${!gone[@]}"; do
+        [[ -n "${present[$name]+set}" ]] || continue
+        t="binary_id(=$bin) & test(=$prefix$name)"
+        terms+=("$t")
+        direct[$t]=1
+        coarse_of[$t]="$coarse"
+    done
+    for name in "${!declared[@]}"; do
+        t="binary_id(=$bin) & test(/^$prefix$name::/)"
+        terms+=("$t")
+        direct[$t]=1
+        may_be_empty[$t]=1
+    done
     # A test whose old lines all went, and that the new side lacks, is deleted
     # (a rename's new name is reached on its own). One the new side lacks but
     # whose old lines partly stay became something else: what calls it may break.
@@ -220,20 +248,25 @@ fn_select() {
     if [[ -n "$why" ]]; then
         echo "flake-gate: $f: $why; selecting $coarse" >&2
         terms+=("$coarse")
-        return 0
+        # Tests a changed macro call writes cannot be named: their scope keeps 20.
+        if ((gen)); then direct[$coarse]=1; fi
     fi
-    for name in "${!gone[@]}"; do
-        if [[ -n "${present[$name]+set}" ]]; then reached[$name]=1; fi
+}
+
+# edits_a_test <file> <all|cfg>: whether the diff changes a line of a test
+# function in <file>, for the selections that cannot name the test.
+edits_a_test() {
+    local f="$1" mode="$2" side
+    git diff -U0 --text "$base"...HEAD -- "$f" >"$tmp/ediff"
+    if git cat-file -e "HEAD:$f" 2>/dev/null; then git show "HEAD:$f" >"$tmp/enew.rs"; else : >"$tmp/enew.rs"; fi
+    if git cat-file -e "$base:$f" 2>/dev/null; then git show "$base:$f" >"$tmp/eold.rs"; else : >"$tmp/eold.rs"; fi
+    for side in new old; do
+        test_spans "$tmp/e$side.rs" >"$tmp/e$side.spans" ||
+            { echo "flake-gate: ast-grep failed on $f" >&2; exit 1; }
+        touched_lines "$side" "$mode" "$tmp/e$side.spans" "$tmp/ediff" "$tmp/e$side.rs" >"$tmp/e$side.hit"
+        if grep -qE $'^(f|g|gen)\t' "$tmp/e$side.hit"; then return 0; fi
     done
-    # A new cfg(test) `mod x;`: its file is new too, and selected on its own.
-    for name in "${!declared[@]}"; do
-        terms+=("binary_id(=$bin) & test(/^$prefix$name::/)")
-        may_be_empty["binary_id(=$bin) & test(/^$prefix$name::/)"]=1
-    done
-    for name in "${!reached[@]}"; do
-        terms+=("binary_id(=$bin) & test(=$prefix$name)")
-        coarse_of["binary_id(=$bin) & test(=$prefix$name)"]="$coarse"
-    done
+    return 1
 }
 
 # users_of <helper> <pkg>: the unit tests of every module in <pkg> that names
@@ -268,14 +301,17 @@ select_rs() {
     if [[ "$kind" == tests && "$rest" != */* ]]; then
         fn_select "$known" "$f" "$pkg::$rest" "" all "binary_id(=$pkg::$rest)"
     elif [[ "$kind" == tests ]]; then
-        local dir="${rest%%/*}" user
+        local dir="${rest%%/*}" user edited=0
+        if [[ -z "$known" ]] && edits_a_test "$f" all; then edited=1; fi
         while IFS= read -r user; do
             terms+=("binary_id(=$pkg::$(basename "$user" .rs))")
+            if ((edited)); then direct["binary_id(=$pkg::$(basename "$user" .rs))"]=1; fi
         done < <(grep -lE "^[[:space:]]*(#\[[[:space:]]*path[[:space:]]*=[[:space:]]*\"$dir/[^\"]*\"[[:space:]]*\]|(#\[[^]]*\][[:space:]]*)*(pub(\([^)]*\))?[[:space:]]+)?mod[[:space:]]+${dir}[[:space:]]*;)" \
             "crates/$pkg/tests/"*.rs || true)
     elif unowned "$pkg" "$f"; then
         echo "flake-gate: $f's module path or binary is not its file path's; selecting $(units "$pkg")" >&2
         terms+=("$(units "$pkg")")
+        if [[ -z "$known" ]] && edits_a_test "$f" cfg; then direct["$(units "$pkg")"]=1; fi
     elif [[ -n "${test_only[$f]+set}" ]]; then
         if [[ -f "$f" ]] && has_tests "$f"; then
             fn_select "$known" "$f" "$pkg" "${test_only[$f]}" all "binary_id(=$pkg) & test(/^${test_only[$f]}::/)"
@@ -321,11 +357,25 @@ if ((${#terms[@]} == 0)); then
     echo "flake-gate: no test code changed since $(git rev-parse --short "$base"); nothing to gate"
     exit 0
 fi
+# join <term>...: the terms as one filterset; none() for no terms.
+join() {
+    if (($# == 0)); then echo 'none()'; return; fi
+    local f
+    f="$(printf '(%s) + ' "$@")"
+    echo "${f% + }"
+}
+# nextest_list <filter> [nextest arg]...: the tests it selects, one per line.
+nextest_list() {
+    local f="$1"
+    shift
+    cargo nextest list --color never --workspace "$@" -E "$f" --message-format oneline
+}
+# Terms resolve against every test, including those the repo's default-filter
+# keeps out of routine runs: an edited one is still an edited test.
 list() {
     mapfile -t terms < <(printf '%s\n' "${terms[@]}" | sort -u)
-    filter="$(printf '(%s) + ' "${terms[@]}")"
-    filter="${filter% + }"
-    listed="$(cargo nextest list --color never --workspace -E "$filter" --message-format oneline)"
+    filter="$(join "${terms[@]}")"
+    listed="$(nextest_list "$filter" --ignore-default-filter)"
 }
 # wider <term>: the next wider term for one that lists nothing; empty for the
 # widest. A single test -> its file's coarse term -> its package's unit tests.
@@ -364,6 +414,9 @@ for _ in 1 2 3; do
         [[ -n "$wide" ]] || continue
         echo "flake-gate: nextest lists nothing for $t; selecting $wide" >&2
         terms[i]="$wide"
+        # An edited test nextest cannot name keeps its count through the
+        # widening: the smallest scope known to hold it runs as often as it would.
+        if [[ -n "${direct[$t]+set}" ]]; then direct[$wide]=1; fi
         widened=1
     done
     ((widened)) || break
@@ -376,6 +429,28 @@ if ((n == 0)); then
     echo "flake-gate: the changed files hold no tests; nothing to gate"
     exit 0
 fi
-printf '\033[1;36m▶ flake gate: %d test(s), %d runs, %d CPU hogs\033[0m\n' "$n" "$count" "$load"
+edited_terms=()
+for t in "${terms[@]}"; do
+    if [[ -n "${direct[$t]+set}" ]]; then edited_terms+=("$t"); fi
+done
+edited_filter="$(join ${edited_terms[@]+"${edited_terms[@]}"})"
+helper_filter="($filter) - ($edited_filter)"
+edited_listed=""
+if ((${#edited_terms[@]})); then
+    edited_listed="$(nextest_list "$edited_filter" --ignore-default-filter)"
+fi
+# The default-filter applies here: a soak or bench the diff only reaches stays out.
+helper_listed="$(nextest_list "$helper_filter")"
+n_edited="$(grep -c . <<<"$edited_listed" || true)"
+n_helper="$(grep -c . <<<"$helper_listed" || true)"
+printf '\033[1;36m▶ flake gate: %d edited test(s) x %d runs, %d reached through helpers x %d runs, %d CPU hogs\033[0m\n' \
+    "$n_edited" "$count" "$n_helper" "$helper_count" "$load"
 printf '%s\n' "${terms[@]}" | sed 's/^/    /'
-STRESS_FILTER="$filter" STRESS_COUNT="$count" STRESS_LOAD="$load" bash scripts/test-stress.sh
+if ((n_edited > 0)); then
+    STRESS_FILTER="$edited_filter" STRESS_COUNT="$count" STRESS_LOAD="$load" STRESS_IGNORE_DEFAULT_FILTER=1 \
+        bash scripts/test-stress.sh
+fi
+if ((n_helper > 0)); then
+    STRESS_FILTER="$helper_filter" STRESS_COUNT="$helper_count" STRESS_LOAD="$load" STRESS_IGNORE_DEFAULT_FILTER="" \
+        bash scripts/test-stress.sh
+fi

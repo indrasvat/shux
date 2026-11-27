@@ -52,10 +52,24 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
 WRITE_BASELINE=0
+COMPARE_ONLY=0
 if [[ "${1:-}" == "--write-baseline" ]]; then
   WRITE_BASELINE=1
   shift
+elif [[ "${1:-}" == "--compare" ]]; then
+  # `--compare <base list> <current list> <base sha>`: the comparison alone, on
+  # two lists already in `normalize`'s form (scripts/check-test-inventory-selftest.sh).
+  COMPARE_ONLY=1
+  shift
 fi
+
+if [[ "${COMPARE_ONLY}" -eq 1 ]]; then
+  if [[ $# -ne 3 ]]; then
+    echo "usage: scripts/check-test-inventory.sh --compare <base list> <current list> <base sha>" >&2
+    exit 2
+  fi
+  BASE_LIST="$1" CURRENT_LIST="$2" BASE_SHA="$3"
+else
 
 BASE_REF="${1:-${BASE_REF:-origin/main}}"
 
@@ -87,7 +101,7 @@ mkdir -p "${CACHE_DIR}"
 # `shux::bin/shux` to `shux` without changing one line of test code. Keeping the
 # target in the key made that read as 506 removals plus 506 additions — a guard
 # firing on the refactor it exists to protect. Integration-test binaries
-# (`shux::m0_integration`) keep their own ids: those are separate files, and a
+# (`shux::cli_contract`) keep their own ids: those are separate files, and a
 # test vanishing from one is a real loss.
 #
 # This does mean a unit test moving between the bin and lib target of one
@@ -99,8 +113,14 @@ normalize() {
     | awk '{ id = $1; $1 = ""; sub(/^ /, ""); leaf = $0; sub(/^.*::/, "", leaf);
              sub(/::bin\/[^\/]+$/, "", id); print id "\t" leaf }' \
     | sort \
-    | awk '{ print $0 "\t" (++seen[$0]) }'
+    | awk '{ print $0 "\t" (++seen[$0]) }' \
+    | sort
 }
+# `--normalize`: normalize stdin (nextest's oneline listing) to stdout.
+if [[ "${BASE_REF}" == "--normalize" ]]; then
+  normalize
+  exit 0
+fi
 
 # Baselines are cached by content, so they must also be keyed by the code that
 # produced them. `normalize` just changed shape; a baseline written by the old
@@ -136,9 +156,11 @@ list_tests() {
     echo "error: building the workspace for \`nextest list\` failed (see cargo's output above)" >&2
     return 1
   fi
+  # --ignore-default-filter: a test the default profile keeps out of routine
+  # runs (a soak, a bench) is still compiled, and still counts.
   raw="$(bash "${REPO_ROOT}/scripts/run-bounded.sh" "${LIST_TIMEOUT}" cargo nextest list \
     --binaries-metadata "${meta}/binaries.json" --cargo-metadata "${meta}/cargo.json" \
-    --run-ignored all --color never)" || rc=$?
+    --run-ignored all --ignore-default-filter --color never)" || rc=$?
   find "${meta}" -delete
   if [[ "${rc}" -eq 124 ]]; then
     echo "error: a test binary is stuck answering --list (the build already ran)." >&2
@@ -244,12 +266,13 @@ if [[ ! -s "${CURRENT_LIST}" ]]; then
   echo "error: listed zero tests in the working tree — the suite does not build" >&2
   exit 2
 fi
+fi
 
 BASE_COUNT="$(wc -l <"${BASE_LIST}" | tr -d ' ')"
 CUR_COUNT="$(wc -l <"${CURRENT_LIST}" | tr -d ' ')"
 
-removed="$(comm -23 "${BASE_LIST}" "${CURRENT_LIST}" || true)"
-added="$(comm -13 "${BASE_LIST}" "${CURRENT_LIST}" || true)"
+removed="$(comm -23 "${BASE_LIST}" "${CURRENT_LIST}")"
+added="$(comm -13 "${BASE_LIST}" "${CURRENT_LIST}")"
 
 echo "  base ${BASE_SHA:0:12}: ${BASE_COUNT} tests"
 echo "  working tree:      ${CUR_COUNT} tests"
@@ -258,6 +281,62 @@ if [[ -n "${added}" ]]; then
   echo ""
   echo "  added (allowed):"
   echo "${added}" | cut -f1,2 | sed 's/^/    + /'
+fi
+
+# trailers <key>: every `<key>: <value>` trailer line in BASE_SHA..HEAD, empty
+# values included.
+trailers() {
+  local sha
+  git rev-parse --verify --quiet "${BASE_SHA}^{commit}" >/dev/null || return 0
+  for sha in $(git rev-list "${BASE_SHA}..HEAD"); do
+    git log -1 --format='%B' "${sha}" | git interpret-trailers --parse | grep -E "^$1:" || true
+  done
+}
+
+# A deliberate deletion names what it deletes: one `TEST-RETIRE:` trailer per
+# test, `<binary-id> <leaf> <reason>`, or `<binary-id> * <reason>` for a binary
+# that lists no tests at all any more. <binary-id> and <leaf> are as this guard
+# prints them: `shux::cli_contract`, or `shux` for a package's unit tests, and
+# the test's name without its module path. A trailer never licenses a test it
+# does not name, and a reason is required.
+retire_trailers="$(trailers TEST-RETIRE | sed 's/^TEST-RETIRE:[[:space:]]*//')"
+# A pasted nextest name works too: its module path and ::bin/<name> go, as in normalize.
+retire_rules="$(awk 'NF >= 3 { b = $1; sub(/::bin\/[^\/]+$/, "", b); l = $2; sub(/^.*::/, "", l); print b "\t" l }' \
+  <<<"${retire_trailers}" | sort)"
+# Read from the trailer lines themselves: `$(…)` drops an empty last value.
+# `*` is a whole binary or nothing: `mod::*` would strip to it.
+bad_retire="$(trailers TEST-RETIRE | awk '{ v = $0; sub(/^TEST-RETIRE:[[:space:]]*/, "", v); if (split(v, w) < 3 || w[2] ~ /.\*$/) print }')"
+if [[ -n "${bad_retire}" ]]; then
+  echo "" >&2
+  echo "error: a TEST-RETIRE: trailer needs <binary-id> <test|*> <reason>:" >&2
+  printf '%s\n' "${bad_retire}" | sed 's/^/    /' >&2
+  exit 1
+fi
+if [[ -n "${retire_rules}" ]]; then
+  still_listed="$(awk -F'\t' '$2 == "*" { print $1 }' <<<"${retire_rules}" | sort -u | while IFS= read -r bin; do
+    if awk -F'\t' -v b="${bin}" '$1 == b { found = 1; exit } END { exit !found }' "${CURRENT_LIST}"; then
+      echo "${bin}"
+    fi
+  done)"
+  if [[ -n "${still_listed}" ]]; then
+    echo "" >&2
+    echo "error: TEST-RETIRE: retires these whole binaries, but they still list tests:" >&2
+    printf '%s\n' "${still_listed}" | sed 's/^/    /' >&2
+    echo "  Name each test you delete instead." >&2
+    exit 1
+  fi
+  # One trailer licenses one test: two removed tests sharing a binary and a
+  # leaf name need two.
+  retired="$(awk -F'\t' 'FILENAME == ARGV[1] { ok[$1 "\t" $2]++; next }
+    (($1 "\t*") in ok) { print; next }
+    ok[$1 "\t" $2] > 0 { ok[$1 "\t" $2]--; print }' <(printf '%s\n' "${retire_rules}") \
+    <(printf '%s\n' "${removed}" | sed '/^$/d'))"
+  if [[ -n "${retired}" ]]; then
+    echo ""
+    echo "  retired (TEST-RETIRE:):"
+    echo "${retired}" | cut -f1,2 | sed 's/^/    - /'
+    removed="$(comm -23 <(printf '%s\n' "${removed}" | sed '/^$/d') <(printf '%s\n' "${retired}"))"
+  fi
 fi
 
 # A removal whose leaf name reappears in a DIFFERENT PACKAGE is a cross-crate
@@ -292,20 +371,29 @@ removed_keys="$(printf '%s' "${removed}" | sed '/^$/d' \
 added_keys="$(printf '%s' "${added}" | sed '/^$/d' \
   | awk -F'\t' '{ pkg = $1; sub(/::.*/, "", pkg); print pkg "\t" $2 }' | sort)"
 
-# For each removed (package, leaf), a move requires the SAME leaf under a
-# DIFFERENT package. Multiset-aware: two removals of `foo` need two such
-# additions, else one of them is genuinely gone.
+# Each removed (package, leaf) needs its own addition of the SAME leaf under
+# a DIFFERENT package. Per leaf, such a pairing exists exactly when there are
+# no more removals than additions, and no package's removals plus additions
+# outnumber all additions (Hall's condition): a greedy pairing can miss one,
+# when two moves chain through a package. A leaf without one fails whole.
+# FILENAME, not NR == FNR: with no additions the first file is empty, and
+# NR == FNR would read every removal as an addition and report none vanished.
 vanished="$(awk -F'\t' '
-  NR == FNR { avail[$2 "\t" $1]++; leaf_total[$2]++; next }
-  {
-    pkg = $1; leaf = $2
-    same = avail[leaf "\t" pkg] + 0
-    elsewhere = leaf_total[leaf] - same
-    if (elsewhere > 0) { leaf_total[leaf]--; next }
-    print leaf "  (was in " pkg ")"
+  FILENAME == ARGV[1] { add[$2 "\t" $1]++; adds[$2]++; next }
+  { rem[$2 "\t" $1]++; rems[$2]++; row[++n] = $2 "\t" $1 }
+  END {
+    for (k in rem) {
+      split(k, kl, "\t")
+      if (rem[k] + add[k] > adds[kl[1]]) bad[kl[1]] = 1
+    }
+    for (l in rems) if (rems[l] > adds[l]) bad[l] = 1
+    for (i = 1; i <= n; i++) {
+      split(row[i], r, "\t")
+      if (r[1] in bad) print r[1] "  (was in " r[2] ")"
+    }
   }
 ' <(printf '%s\n' "${added_keys}" | sed '/^$/d') \
-  <(printf '%s\n' "${removed_keys}" | sed '/^$/d') || true)"
+  <(printf '%s\n' "${removed_keys}" | sed '/^$/d'))"
 
 if [[ -n "${vanished}" ]]; then
   echo "" >&2
@@ -320,16 +408,7 @@ fi
 if [[ -n "${removed}" ]]; then
   # Every removal is matched by an addition elsewhere. Demand the trailer.
   moved_ok=0
-  if git rev-parse --verify --quiet "${BASE_SHA}" >/dev/null; then
-    for sha in $(git rev-list "${BASE_SHA}..HEAD"); do
-      if git log -1 --format='%B' "${sha}" \
-        | git interpret-trailers --parse 2>/dev/null \
-        | grep -qE '^TEST-MOVE: [^[:space:]].*'; then
-        moved_ok=1
-        break
-      fi
-    done
-  fi
+  if grep -qE '^TEST-MOVE:[[:space:]]*[^[:space:]]' <<<"$(trailers TEST-MOVE)"; then moved_ok=1; fi
 
   echo ""
   echo "  moved to another crate (leaf name still runs):"
@@ -349,4 +428,4 @@ if [[ -n "${removed}" ]]; then
   echo "  ✓ TEST-MOVE: trailer present for the relocation"
 fi
 
-echo "✓ every test at ${BASE_SHA:0:12} still runs"
+echo "✓ every test at ${BASE_SHA:0:12} still runs, or was retired by a TEST-RETIRE: trailer naming it"

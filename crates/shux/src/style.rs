@@ -2984,24 +2984,6 @@ mod tests {
     }
 
     #[test]
-    fn test_styled_plain_text() {
-        let styled = Styled::new("hello").fg(Color::Red).bold();
-        let _ = styled.to_string();
-    }
-
-    #[test]
-    fn test_accent_display() {
-        let text = accent("shux");
-        let _ = text.to_string();
-    }
-
-    #[test]
-    fn test_muted_display() {
-        let text = muted("[abc-123]");
-        let _ = text.to_string();
-    }
-
-    #[test]
     fn test_banner_contains_shux() {
         let b = banner();
         assert!(b.contains("___"), "banner should contain ASCII art");
@@ -3103,16 +3085,6 @@ mod tests {
         }
     }
 
-    fn plain_ctx() -> TerminalContext {
-        TerminalContext {
-            is_tty: false,
-            colors: false,
-            unicode: false,
-            width: 100,
-            format: OutputFormat::Plain,
-        }
-    }
-
     #[test]
     fn styled_if_applies_all_requested_attributes_when_enabled() {
         let styled = styled_if("active", true, Some(Color::Cyan), true, true);
@@ -3210,134 +3182,6 @@ mod tests {
         assert!(ascii.contains("Windows"));
         assert!(ascii.contains("|"));
         assert!(!ascii.contains("Create one"));
-    }
-
-    #[test]
-    fn rich_list_renderers_cover_plain_empty_and_active_text_paths() {
-        let sessions = vec![
-            SessionInfo {
-                name: "dev".to_string(),
-                id: "12345678-aaaa-bbbb-cccc-000000000000".to_string(),
-                window_count: 1,
-                created: "now".to_string(),
-                attached: 2,
-                scratch: false,
-            },
-            SessionInfo {
-                name: "ops".to_string(),
-                id: "87654321-aaaa-bbbb-cccc-000000000000".to_string(),
-                window_count: 2,
-                created: "later".to_string(),
-                attached: 0,
-                scratch: true,
-            },
-        ];
-        let windows = vec![
-            WindowInfo {
-                id: "11111111-2222-3333-4444-555555555555".to_string(),
-                title: "editor".to_string(),
-                index: 1,
-                pane_count: 2,
-                is_active: true,
-            },
-            WindowInfo {
-                id: "66666666-7777-8888-9999-aaaaaaaaaaaa".to_string(),
-                title: "logs".to_string(),
-                index: 2,
-                pane_count: 1,
-                is_active: false,
-            },
-        ];
-        let panes = vec![
-            PaneInfo {
-                id: "abcdef0123456789".to_string(),
-                title: "shell".to_string(),
-                cwd: "/tmp".to_string(),
-                command: vec!["bash".to_string()],
-                is_focused: true,
-                is_zoomed: true,
-            },
-            PaneInfo {
-                id: "fedcba9876543210".to_string(),
-                title: "tail".to_string(),
-                cwd: "/var/log".to_string(),
-                command: ["tail", "-f", "app.log"].map(String::from).to_vec(),
-                is_focused: false,
-                is_zoomed: false,
-            },
-        ];
-
-        let colored = text_ctx(true, true);
-        render_session_list(&colored, &sessions).unwrap();
-        render_window_list(&colored, "dev", &windows).unwrap();
-        render_pane_list(&colored, "dev", "editor", &panes).unwrap();
-
-        let plain = plain_ctx();
-        render_session_list(&plain, &sessions).unwrap();
-        render_window_list(&plain, "dev", &windows).unwrap();
-        render_pane_list(&plain, "dev", "editor", &panes).unwrap();
-
-        let ascii_text = text_ctx(false, false);
-        render_session_list(&ascii_text, &[]).unwrap();
-        render_window_list(&ascii_text, "dev", &[]).unwrap();
-        render_pane_list(&ascii_text, "dev", "editor", &[]).unwrap();
-    }
-
-    #[test]
-    fn confirmation_printers_cover_optional_and_status_branches() {
-        print_version("0.26.0", Some("abc1234"), Some("daemon offline")).unwrap();
-        print_version("0.26.0", None, None).unwrap();
-        print_success("Created", "session", Some("123456789")).unwrap();
-        print_success("Updated", "config", None).unwrap();
-        print_error("boom");
-
-        print_session_created("dev", "123456789", false).unwrap();
-        print_session_created("dev", "123456789", true).unwrap();
-        print_session_killed("dev").unwrap();
-        print_session_renamed("old", "new").unwrap();
-        print_window_created("editor", 2).unwrap();
-        print_window_killed("editor").unwrap();
-        print_window_renamed("old", "new").unwrap();
-        print_window_focused("editor").unwrap();
-        print_window_reordered("editor", 1).unwrap();
-        print_pane_split("abcdef012345", "vertical").unwrap();
-        print_pane_focused("abcdef012345").unwrap();
-        print_pane_zoomed("abcdef012345", true).unwrap();
-        print_pane_zoomed("abcdef012345", false).unwrap();
-        print_pane_swapped("abcdef012345", "fedcba987654").unwrap();
-        print_pane_killed("abcdef012345").unwrap();
-        print_pane_resized("abcdef012345").unwrap();
-        print_pane_title_set("abcdef012345", "editor").unwrap();
-        print_send_keys("abcdef012345", 42);
-
-        print_run_command(&serde_json::json!({"command_id": "123456789abcdef"}), true);
-        print_run_command(
-            &serde_json::json!({
-                "state": "completed",
-                "exit_code": 0,
-                "runtime_ms": 12,
-                "stdout": "ok\n",
-            }),
-            false,
-        );
-        print_run_command(
-            &serde_json::json!({
-                "state": "completed",
-                "exit_code": 2,
-                "runtime_ms": 13,
-            }),
-            false,
-        );
-        print_run_command(
-            &serde_json::json!({"state": "timed_out", "runtime_ms": 14}),
-            false,
-        );
-        print_run_command(
-            &serde_json::json!({"state": "cancelled", "runtime_ms": 15}),
-            false,
-        );
-        print_run_command(&serde_json::json!({"state": "weird"}), false);
-        print_run_command(&serde_json::json!({}), false);
     }
 
     // ── issue #135: the human pane list named no pane and lost argv shape ──

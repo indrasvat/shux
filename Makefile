@@ -196,7 +196,8 @@ check-test-opt-out: ## Assert no integration test declares test = false (so make
 	@bash scripts/check-test-opt-out.sh
 
 .PHONY: check-test-inventory
-check-test-inventory: nextest-ready ## Assert no test stopped being compiled since BASE_REF (default origin/main)
+check-test-inventory: nextest-ready ## Assert no test stopped being compiled since BASE_REF, unless a TEST-MOVE:/TEST-RETIRE: trailer names it
+	@bash scripts/check-test-inventory-selftest.sh
 	@bash scripts/check-test-inventory.sh
 
 .PHONY: bench-test-suite
@@ -272,9 +273,9 @@ test-window-snapshot-images: nextest-ready ## Inline images survive multi-pane c
 	@echo "$(COLOR_GREEN)✓ Multi-pane inline image tests passed$(COLOR_RESET)"
 
 .PHONY: test-pane-io
-test-pane-io: nextest-ready ## Run pane I/O integration tests; optionally pass FILTER=<test-name>
+test-pane-io: nextest-ready ## Run the real-daemon pane capture tests; optionally pass FILTER=<test-name>
 	@echo "$(COLOR_BLUE)▶ Running pane I/O integration tests...$(COLOR_RESET)"
-	@.shux/scripts/no_leak_guard.sh $(NEXTEST_RUN) -p shux --test pane_io_integration $(FILTER)
+	@.shux/scripts/no_leak_guard.sh $(NEXTEST_RUN) -p shux --test pane_capture_e2e $(FILTER)
 	@echo "$(COLOR_GREEN)✓ Pane I/O integration tests passed$(COLOR_RESET)"
 
 .PHONY: test-daemon-lifecycle
@@ -747,10 +748,6 @@ test-lens-scratch-reap: nextest-ready ## Run the P5 scratch reap signal-order te
 test-lens-gate: nextest-ready ## Run the lens-gate GREEN dogfood suite (task 078; capture on real shux TUIs + cross-path PNG) serially under the leak guard
 	$(call lens_run,Running lens-gate dogfood suite (task 078),--test lens_gate_capture)
 
-.PHONY: test-lens-gate-contract
-test-lens-gate-contract: nextest-ready ## Run the frozen 078 lens-gate contract lane (GREEN since 081/082 built its cases)
-	$(call lens_run,Running the frozen 078 lens-gate contract lane,--test lens_gate_contract)
-
 .PHONY: test-lens-gate-comparator
 test-lens-gate-comparator: nextest-ready ## Run the task-079 comparator suite (parity corpus + divergence fixtures + OSC-4 daemon isolation) serially under the leak guard
 	$(call lens_run,Running lens-gate comparator suite (task 079),--test lens_gate_parity --test lens_gate_divergence --test diff_palette_isolation)
@@ -772,7 +769,11 @@ bench-lens-gate: nextest-ready ## Record task-080 capture/compare/render through
 
 .PHONY: lens-gate-bench-run
 lens-gate-bench-run:
-	$(call lens_run_pure,Recording lens-gate throughput (task 080 §6),--test lens_gate_bench,--no-capture)
+	$(call lens_run_pure,Recording lens-gate throughput (task 080 §6),--test lens_gate_bench,--no-capture --ignore-default-filter)
+
+.PHONY: test-lens-soak
+test-lens-soak: nextest-ready ## Run s2: the lens settle 100 times on one daemon (out of make test; nextest default-filter)
+	$(call lens_run,Running the lens settle soak (s2),--test lens_settle,--ignore-default-filter -E 'test(=s2_settle_flake_gate_100x)')
 
 .PHONY: test-lens-gate-run
 test-lens-gate-run: nextest-ready ## Run the task-081 scenario-runner suite (drives real fixture TUIs via `shux lens gate`) serially under the leak guard
@@ -930,10 +931,14 @@ check-test-ignores: ## Every #[ignore] names an open issue ("see #N") or is a "g
 	@bash scripts/check-test-ignores-selftest.sh
 	@bash scripts/check-test-ignores.sh
 
-.PHONY: flake-gate
-flake-gate: nextest-ready ## Run the tests a branch adds or changes FLAKE_COUNT times under CPU load (BASE=<ref>, FLAKE_COUNT, FLAKE_LOAD)
+.PHONY: flake-gate-selftest
+flake-gate-selftest: ## Prove the flake gate selects, tiers and counts what it says (stub cargo; no build)
 	@bin="$$(bash scripts/ensure-ast-grep.sh)" && export PATH="$$bin:$$PATH" && \
-		bash scripts/flake-gate-selftest.sh && bash scripts/test-stress-selftest.sh && \
+		bash scripts/flake-gate-selftest.sh && bash scripts/test-stress-selftest.sh
+
+.PHONY: flake-gate
+flake-gate: nextest-ready flake-gate-selftest ## Run the tests a branch adds or edits FLAKE_COUNT times, and those it reaches through helpers FLAKE_HELPER_COUNT times, under CPU load (BASE=<ref>, FLAKE_LOAD)
+	@bin="$$(bash scripts/ensure-ast-grep.sh)" && export PATH="$$bin:$$PATH" && \
 		NEXTEST_JOBS=$(NEXTEST_JOBS) .shux/scripts/no_leak_guard.sh bash scripts/flake-gate.sh
 
 .PHONY: flake-gate-proof

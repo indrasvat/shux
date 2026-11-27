@@ -442,14 +442,41 @@ fn write_build_file(socket: &Path) {
     let _one = WRITING.lock().unwrap_or_else(|e| e.into_inner());
     let _ = SOCKET.set(socket.to_path_buf());
     let written = (|| {
+        use nix::fcntl::{OFlag, openat, renameat};
+        use nix::sys::stat::Mode;
+        use std::io::Write as _;
         let path = build_file_for(socket).map_err(|e| e.to_string())?;
+        let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+            return Err(format!("{} has no directory", path.display()));
+        };
+        // Through a handle on the runtime dir itself, never through a link
+        // that replaced it after the daemon started.
+        let dir = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
+            .open(dir)
+            .map_err(|e| format!("{}: {e}", dir.display()))?;
         let mut answer = shux_rpc::server::version_answer();
         answer["pid"] = std::process::id().into();
         answer["retiring"] = RETIRING.load(std::sync::atomic::Ordering::SeqCst).into();
         answer["build"] = advertised();
-        let tmp = path.with_extension(format!("build.json.{}.tmp", std::process::id()));
-        fs::write(&tmp, answer.to_string()).map_err(|e| e.to_string())?;
-        fs::rename(&tmp, &path).map_err(|e| e.to_string())
+        let mut tmp_name = name.to_os_string();
+        tmp_name.push(format!(".{}.tmp", std::process::id()));
+        let tmp = openat(
+            &dir,
+            tmp_name.as_os_str(),
+            OFlag::O_WRONLY
+                | OFlag::O_CREAT
+                | OFlag::O_TRUNC
+                | OFlag::O_NOFOLLOW
+                | OFlag::O_CLOEXEC,
+            Mode::from_bits_truncate(0o600),
+        )
+        .map_err(|e| e.to_string())?;
+        fs::File::from(tmp)
+            .write_all(answer.to_string().as_bytes())
+            .map_err(|e| e.to_string())?;
+        renameat(&dir, tmp_name.as_os_str(), &dir, name).map_err(|e| e.to_string())
     })();
     if let Err(e) = written {
         tracing::warn!(error = %e, "could not write the daemon's build file");
@@ -631,6 +658,27 @@ mod tests {
             w.join().unwrap();
         }
         assert!(seen > 0, "never read a build file");
+    }
+
+    /// The build file is written after the daemon serves, so the runtime dir
+    /// can have been replaced by a link by then: it must not be followed.
+    #[test]
+    fn the_build_file_is_never_written_through_a_runtime_dir_replaced_by_a_link() {
+        let runtime = tempfile::tempdir().unwrap();
+        // SAFETY: nextest runs this test alone in its process.
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", runtime.path()) };
+        let dir = crate::daemon::ensure_runtime_dir().unwrap();
+        let socket = dir.join("t.sock");
+        let elsewhere = tempfile::tempdir().unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), &dir).unwrap();
+        write_build_file(&socket);
+        let planted: Vec<_> = fs::read_dir(elsewhere.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect();
+        assert!(planted.is_empty(), "wrote into the linked dir: {planted:?}");
     }
 
     /// The kept build is the bytes of the open binary even after its path

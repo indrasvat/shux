@@ -78,7 +78,7 @@ run() {
     status=0
     # The caller's NEXTEST_PROFILE is not this run's: PROFILE sets it.
     (cd "$work/repo" && PATH="$work/bin:$PATH" STUB_LOG="$work/log" STRESS_COUNT="$1" STRESS_LOAD="${LOAD:-0}" \
-        NEXTEST_PROFILE="${PROFILE:-default}" \
+        NEXTEST_PROFILE="${PROFILE:-default}" STRESS_IGNORE_DEFAULT_FILTER="${IGNORE:-}" \
         TMPDIR="${STUB_TMPDIR:-$work/tmp}" bash scripts/test-stress.sh) >"$work/out" 2>&1 || status=$?
 }
 # priorities <run>: "<priority> <binary> <test>" per override the run's config adds.
@@ -229,6 +229,32 @@ if ((status == 1)) && grep -q 'stress-ng exited' "$work/out" && [[ -z "$(find "$
     ok "a hog that dies fails the stress run and leaves no temp files"
 else
     bad "a hog that dies fails the stress run and leaves no temp files (exit $status)"
+fi
+
+IGNORE=1 run 2
+if ((status == 0)) && grep -qx -- --ignore-default-filter "$work/log/run1.args" &&
+    grep -qx -- --ignore-default-filter "$work/log/run2.args"; then
+    ok "STRESS_IGNORE_DEFAULT_FILTER=1 runs every test, in every run"
+else
+    bad "STRESS_IGNORE_DEFAULT_FILTER=1 runs every test, in every run (exit $status)"
+fi
+run 1
+if ((status == 0)) && ! grep -qx -- --ignore-default-filter "$work/log/run1.args"; then
+    ok "without it, the profile's default-filter applies"
+else
+    bad "without it, the profile's default-filter applies (exit $status)"
+fi
+run 0
+if ((status == 2)) && [[ ! -e "$work/log/run1.args" ]]; then
+    ok "a STRESS_COUNT of 0 is refused, not a pass that ran nothing"
+else
+    bad "a STRESS_COUNT of 0 is refused, not a pass that ran nothing (exit $status)"
+fi
+IGNORE=yes run 1
+if ((status == 2)) && [[ ! -e "$work/log/run1.args" ]]; then
+    ok "any other STRESS_IGNORE_DEFAULT_FILTER is refused before a run"
+else
+    bad "any other STRESS_IGNORE_DEFAULT_FILTER is refused before a run (exit $status)"
 fi
 
 if ((fails > 0)); then

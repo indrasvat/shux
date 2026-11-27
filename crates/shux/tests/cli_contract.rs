@@ -954,3 +954,313 @@ fn an_unreachable_daemon_is_a_json_error() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+// ── state apply, version conflicts and system.version on the real daemon ────
+
+const APPLY_TEMPLATE: &str = "[session]\nname = \"applied\"\n\n[[windows]]\ntitle = \"main\"\n\n\
+                              [[windows.panes]]\ncommand = [\"sh\", \"-c\", \"exec sleep 900\"]\n";
+
+fn stdout_json(out: &Output) -> serde_json::Value {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "stdout is not JSON ({e}):\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+    })
+}
+
+#[test]
+fn state_apply_json_prints_its_result_and_a_second_apply_is_a_name_conflict() {
+    let mut env = Env::new();
+    let path = env.write_template("apply.toml", APPLY_TEMPLATE);
+    let path = path.to_str().unwrap();
+    env.sessions.push("applied".to_string());
+
+    let first = env.run(&["--format", "json", "state", "apply", path]);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let applied = stdout_json(&first);
+    assert!(
+        applied["correlation_id"]
+            .as_str()
+            .is_some_and(|c| c.starts_with("apply-")),
+        "{applied}"
+    );
+    let spawned = applied["spawn_results"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{applied}"));
+    assert!(
+        spawned.len() == 1 && spawned[0]["spawned"] == true && spawned[0]["pane_id"].is_string(),
+        "{applied}"
+    );
+    assert_eq!(env.pane_count("applied"), 1);
+
+    let second = env.run(&["--format", "json", "state", "apply", path]);
+    assert!(
+        !second.status.success(),
+        "a second apply of one session name succeeded"
+    );
+    let refused = stdout_json(&second);
+    assert_eq!(refused["error"]["code"], -32007, "{refused}");
+    assert_eq!(refused["error"]["message"], "name_conflict", "{refused}");
+    assert!(
+        second.stderr.is_empty(),
+        "a JSON refusal also printed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(
+        env.pane_count("applied"),
+        1,
+        "the refused apply changed the session"
+    );
+}
+
+#[test]
+fn state_apply_refuses_watch_with_json_output() {
+    let env = Env::new();
+    let path = env.write_template("apply.toml", APPLY_TEMPLATE);
+    let out = env.run(&[
+        "--format",
+        "json",
+        "state",
+        "apply",
+        path.to_str().unwrap(),
+        "--watch",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(stdout_json(&out)["error"]["code"], -32602);
+    let sessions = env.json(&["rpc", "call", "session.list"]);
+    assert!(
+        !sessions.to_string().contains("\"applied\""),
+        "the refused apply created its session: {sessions}"
+    );
+}
+
+/// `rpc call <method>` with `params`, through a params file.
+fn rpc(env: &Env, method: &str, params: serde_json::Value) -> Output {
+    let file = env.write_template(&format!("{method}.json"), &params.to_string());
+    env.run(&[
+        "--format",
+        "json",
+        "rpc",
+        "call",
+        method,
+        "--params",
+        &format!("@{}", file.display()),
+    ])
+}
+
+#[track_caller]
+fn version_conflict(out: &Output, resource: &str) -> serde_json::Value {
+    assert!(
+        !out.status.success(),
+        "a write with a stale version succeeded"
+    );
+    let err = stdout_json(out);
+    assert_eq!(err["error"]["code"], -32002, "{err}");
+    assert_eq!(err["error"]["data"]["resource"], resource, "{err}");
+    err
+}
+
+/// Reads one line and answers with it twice, which the PTY's echo of the line cannot.
+const ANSWER_TWICE: &str = r#"read -r x; echo "got-$x-$x"; exec sleep 900"#;
+
+fn answering_pane(env: &Env, s: &str) -> serde_json::Value {
+    let panes = env.json(&["pane", "list", "-s", s]);
+    panes
+        .as_array()
+        .and_then(|p| p.iter().find(|p| p["command"].to_string().contains("read")))
+        .cloned()
+        .unwrap_or_else(|| panic!("no answering pane in {panes}"))
+}
+
+/// A kill carrying a version an earlier write made stale is refused before the
+/// pane's I/O is torn down: the pane stays listed, and its program still reads.
+#[test]
+fn a_pane_kill_with_a_stale_version_leaves_the_pane_working() {
+    let mut env = Env::new();
+    let s = env.session("stale");
+    env.ok(&["pane", "split", "-s", &s, "--", "sh", "-c", ANSWER_TWICE]);
+    let pane = answering_pane(&env, &s);
+    let id = pane["id"].as_str().expect("pane id").to_string();
+    let stale = pane["version"].as_u64().expect("pane version");
+    env.ok(&["pane", "title", "-s", &s, "-p", &id, "-t", "renamed"]);
+    let now = answering_pane(&env, &s)["version"]
+        .as_u64()
+        .expect("pane version");
+    assert!(
+        now > stale,
+        "the title change did not move the version ({stale} -> {now})"
+    );
+
+    version_conflict(
+        &rpc(
+            &env,
+            "pane.kill",
+            serde_json::json!({ "pane_id": id, "expected_version": stale }),
+        ),
+        "pane",
+    );
+    assert_eq!(env.pane_count(&s), 2, "the refused kill removed the pane");
+    env.ok(&["pane", "send-keys", "-s", &s, "-p", &id, "--text", "kept"]);
+    env.ok(&["pane", "send-keys", "-s", &s, "-p", &id, "--data", "DQ=="]);
+    env.ok(&[
+        "pane",
+        "wait-for",
+        "-s",
+        &s,
+        "-p",
+        &id,
+        "-t",
+        "got-kept-kept",
+        "--timeout-ms",
+        "30000",
+    ]);
+}
+
+#[test]
+fn a_window_rename_with_a_stale_version_changes_nothing() {
+    let mut env = Env::new();
+    let s = env.session("wstale");
+    let first = env.json(&["window", "list", "-s", &s])[0].clone();
+    let id = first["id"].as_str().expect("window id").to_string();
+    let stale = first["version"].as_u64().expect("window version");
+    let ok = rpc(
+        &env,
+        "window.rename",
+        serde_json::json!({ "id": id, "name": "current", "expected_version": stale }),
+    );
+    assert!(
+        ok.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ok.stdout)
+    );
+    let before = env.json(&["window", "list", "-s", &s])[0].clone();
+
+    version_conflict(
+        &rpc(
+            &env,
+            "window.rename",
+            serde_json::json!({ "id": id, "name": "stale-write", "expected_version": stale }),
+        ),
+        "window",
+    );
+    let after = env.json(&["window", "list", "-s", &s])[0].clone();
+    assert_eq!(
+        (&after["title"], &after["version"]),
+        (&before["title"], &before["version"]),
+        "the refused rename changed the window"
+    );
+}
+
+/// The conflict names what changed and how to recover; retrying with the
+/// version it reports succeeds.
+#[test]
+fn a_session_rename_conflict_reports_the_current_version_and_a_retry_succeeds() {
+    let mut env = Env::new();
+    env.session("first");
+    let id = env.json(&["rpc", "call", "session.list"])["result"]["sessions"][0]["id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let first = rpc(
+        &env,
+        "session.rename",
+        serde_json::json!({ "id": id, "new_name": "second", "expected_version": 1 }),
+    );
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stdout)
+    );
+    env.sessions = vec!["second".to_string()];
+
+    let err = version_conflict(
+        &rpc(
+            &env,
+            "session.rename",
+            serde_json::json!({ "id": id, "new_name": "third", "expected_version": 1 }),
+        ),
+        "session",
+    );
+    let data = &err["error"]["data"];
+    assert_eq!(err["error"]["message"], "version_conflict", "{err}");
+    assert_eq!(
+        (&data["id"], &data["expected_version"]),
+        (&serde_json::json!(id), &serde_json::json!(1)),
+        "{err}"
+    );
+    let actual = data["actual_version"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("no actual_version: {err}"));
+    assert!(actual > 1, "{err}");
+    assert!(
+        data["hint"].as_str().is_some_and(|h| h.contains("Re-read")),
+        "{err}"
+    );
+
+    let retry = rpc(
+        &env,
+        "session.rename",
+        serde_json::json!({ "id": id, "new_name": "third", "expected_version": actual }),
+    );
+    assert!(
+        retry.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retry.stdout)
+    );
+    env.sessions = vec!["third".to_string()];
+    assert_eq!(
+        env.json(&["rpc", "call", "session.list"])["result"]["sessions"][0]["name"],
+        "third"
+    );
+}
+
+/// pane.focus reports the pane it took focus from, and none when nothing moved.
+#[test]
+fn pane_focus_reports_the_pane_it_took_focus_from() {
+    let mut env = Env::new();
+    let s = env.session("focus");
+    let original = env.json(&["pane", "list", "-s", &s])[0]["id"]
+        .as_str()
+        .expect("pane id")
+        .to_string();
+    let split = env.json(&["pane", "split", "-s", &s, "--", "sleep", "900"]);
+    let new = split["pane"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no pane in {split}"))
+        .to_string();
+
+    let moved = stdout_json(&rpc(
+        &env,
+        "pane.focus",
+        serde_json::json!({ "pane_id": original }),
+    ));
+    assert_eq!(
+        (
+            &moved["result"]["pane_id"],
+            &moved["result"]["previous_pane_id"]
+        ),
+        (&serde_json::json!(original), &serde_json::json!(new)),
+        "{moved}"
+    );
+    let stayed = stdout_json(&rpc(
+        &env,
+        "pane.focus",
+        serde_json::json!({ "pane_id": original }),
+    ));
+    assert_eq!(
+        stayed["result"],
+        serde_json::json!({ "pane_id": original, "previous_pane_id": null }),
+        "{stayed}"
+    );
+}

@@ -141,6 +141,11 @@ impl Env {
         self.ok(&["pane", "capture", "-s", session, "-p", pane])
     }
 
+    /// A path in the directory the panes run in.
+    pub fn work(&self, name: &str) -> PathBuf {
+        self.root.path().join("work").join(name)
+    }
+
     /// The pane's visible rows, padded to the full width — `pane glance` is
     /// byte-stable in a way `pane capture` deliberately is not, which is what
     /// makes "every cell on every row" assertable.

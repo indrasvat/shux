@@ -155,6 +155,30 @@ fn missing_golden_report_is_ci_safe_regression() {
         reason.contains(searched.trim_start_matches("/private")),
         "missing_golden must name the directory it searched ({searched}), got {reason:?}"
     );
+
+    // The checked-in scenario the docs point at runs, and is missing its golden too.
+    let hello = h
+        .repo_root()
+        .join(".shux/fixtures/lens-gate/scenarios/hello.toml");
+    let out = gate(
+        &h,
+        &[
+            "--report",
+            "-",
+            "--golden-dir",
+            &g.path().to_string_lossy(),
+            &hello.to_string_lossy(),
+        ],
+        false,
+    );
+    assert_eq!(
+        out.exit, 1,
+        "hello.toml without a golden; stderr:\n{}",
+        out.stderr
+    );
+    let report = out.report();
+    assert_eq!(report[0].scenario, "hello");
+    assert_eq!(report[0].status, GateStatus::MissingGolden);
 }
 
 #[test]
@@ -614,13 +638,24 @@ fn fail_writes_a_heat_png_to_out_and_records_it() {
         .heat_png
         .as_ref()
         .expect("a headless fail must record diff.heat_png");
-    // The referenced heat PNG exists on disk and is a real PNG.
-    let bytes = std::fs::read(heat).expect("heat png written to --out");
+    // The referenced heat PNG is under --out, and marks the changed cells: they
+    // carry the heat tint, and the unchanged rest is desaturated to grey.
+    let canon = |p: &std::path::Path| std::fs::canonicalize(p).expect("canonicalize");
     assert!(
-        bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
-        "heat_png is a valid PNG"
+        canon(std::path::Path::new(heat)).starts_with(canon(out.path())),
+        "heat_png {heat} is not under --out {od}"
     );
-    assert!(bytes.len() > 100, "heat png is non-trivial");
+    let img = image::open(heat).expect("heat png decodes").to_rgb8();
+    let tinted = |p: &image::Rgb<u8>| {
+        p.0[0] > p.0[1].saturating_add(40) && p.0[0] > p.0[2].saturating_add(40)
+    };
+    let heat_pixels = img.pixels().filter(|p| tinted(p)).count();
+    assert!(heat_pixels > 0, "no cell carries the heat tint");
+    let last_row = img.height() - 1;
+    assert!(
+        (0..img.width()).all(|x| !tinted(img.get_pixel(x, last_row))),
+        "an unchanged row carries the heat tint"
+    );
 }
 
 // ── L1 privacy ────────────────────────────────────────────────────────────────

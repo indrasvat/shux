@@ -10,6 +10,8 @@
 #   a change inside test functions   after ⊂ before (strictly), and after
 #                                    holds the edited or added test
 #   a change to a test helper        after ⊇ before: the old answer was right
+#   a test and a helper together     the test runs 20 times and only there;
+#                                    the rest of its module runs 5 times
 #
 #   $1                  count (default) or time: also run each gate's 20 runs
 #   FLAKE_PROOF_BEFORE  the old gate's commit (default 8ef34f8, the last per-module one)
@@ -40,9 +42,11 @@ cleanup() {
 trap cleanup EXIT
 git -C "$root" worktree add -q --detach "$wt" HEAD
 
-# The stub test-stress.sh a count run gets: it hands back the filter.
+# The stub test-stress.sh a count run gets: it hands back each run it was
+# asked for, as "<count>\t<1 if every test is in scope>\t<filter>".
 # shellcheck disable=SC2016  # expands when the stub runs
-printf '#!/usr/bin/env bash\nprintf "%%s" "$STRESS_FILTER" >"$FLAKE_PROOF_FILTER"\n' >"$scratch/stress-stub.sh"
+printf '#!/usr/bin/env bash\nprintf "%%s\\t%%s\\t%%s\\n" "$STRESS_COUNT" "${STRESS_IGNORE_DEFAULT_FILTER:-0}" "$STRESS_FILTER" >>"$FLAKE_PROOF_FILTER"\n' \
+    >"$scratch/stress-stub.sh"
 
 fail=0
 # pick <side>: run that gate on the scratch commit; the tests it selects
@@ -64,15 +68,22 @@ pick() {
         (cd "$wt" && BASE=HEAD~1 FLAKE_PROOF_FILTER="$scratch/filter" bash scripts/flake-gate.sh) >"$scratch/$side.log" 2>&1
         echo null >"$scratch/$side.secs"
     fi
-    filter="$(cat "$scratch/filter")"
-    if [[ -z "$filter" ]]; then
-        : >"$scratch/$side.set"
-    else
-        (cd "$wt" && cargo nextest list --color never --workspace -E "$filter" --message-format oneline) |
-            sort -u >"$scratch/$side.set"
-    fi
+    # Each run's tests into <side>.<count>.set, and their union into <side>.set.
+    local count all scope=()
+    : >"$scratch/$side.set"
+    rm -f "$scratch/$side".*.set
+    while IFS=$'\t' read -r count all filter; do
+        scope=()
+        if [[ "$all" == 1 ]]; then scope=(--ignore-default-filter); fi
+        (cd "$wt" && cargo nextest list --color never --workspace ${scope[@]+"${scope[@]}"} -E "$filter" \
+            --message-format oneline) | sort -u >"$scratch/$side.$count.set"
+        sort -u "$scratch/$side.set" "$scratch/$side.$count.set" -o "$scratch/$side.set"
+    done <"$scratch/filter"
     git -C "$wt" checkout -q -- scripts
 }
+
+# tier <side> <count>: how many tests that side ran <count> times.
+tier() { if [[ -f "$scratch/$1.$2.set" ]]; then grep -c . "$scratch/$1.$2.set" || true; else echo 0; fi; }
 
 # case_ <name> <file> <perl edit> <narrow|superset> [<test it must keep>]
 case_() {
@@ -101,9 +112,16 @@ case_() {
         ok=0 why="after is not a strict subset of before ($extra outside it)"
     elif [[ "$kind" == superset ]] && [[ -n "$(comm -23 "$scratch/before.set" "$scratch/after.set")" ]]; then
         ok=0 why="after misses tests before selects"
+    elif [[ "$kind" == mixed ]] && ! grep -qxF "$must" "$scratch/after.20.set" 2>/dev/null; then
+        ok=0 why="the edited test is not in the 20-run tier"
+    elif [[ "$kind" == mixed ]] && grep -qxF "$must" "$scratch/after.5.set" 2>/dev/null; then
+        ok=0 why="the edited test also runs in the 5-run tier"
+    elif [[ "$kind" == mixed ]] && (($(tier after 5) == 0)); then
+        ok=0 why="no helper-reached test runs in the 5-run tier"
     fi
-    printf '{"case":"%s","kind":"%s","before":{"tests":%d,"secs":%s},"after":{"tests":%d,"secs":%s},"must":"%s","ok":%s}\n' \
-        "$name" "$kind" "$b" "$(cat "$scratch/before.secs")" "$a" "$(cat "$scratch/after.secs")" "$must" \
+    printf '{"case":"%s","kind":"%s","before":{"tests":%d,"secs":%s},"after":{"tests":%d,"x20":%d,"x5":%d,"secs":%s},"must":"%s","ok":%s}\n' \
+        "$name" "$kind" "$b" "$(cat "$scratch/before.secs")" "$a" "$(tier after 20)" "$(tier after 5)" \
+        "$(cat "$scratch/after.secs")" "$must" \
         "$([[ $ok == 1 ]] && echo true || echo false)" >>"$out/cases.jsonl"
     if ((ok)); then
         printf '\033[1;32m  ✓ before %d → after %d%s\033[0m\n' "$b" "$a" "${must:+, keeps $must}"
@@ -119,9 +137,12 @@ case_ unit-test-edit crates/shux/src/client.rs \
 case_ unit-test-new crates/shux/src/client.rs \
     's/(\nmod tests \{\n)/$1    #[test]\n    fn flake_gate_proof_new() {}\n/' \
     narrow 'shux client::tests::flake_gate_proof_new'
-case_ integration-test-edit crates/shux/tests/m0_integration.rs \
-    's/(async fn test_m0_system_version\(\) \{\n)/$1    let _proof = 1;\n/' \
-    narrow 'shux::m0_integration test_m0_system_version'
+case_ integration-test-edit crates/shux/tests/cli_contract.rs \
+    's/(fn a_failing_command_prints_its_error_exactly_once\(\) \{\n)/$1    let _proof = 1;\n/' \
+    narrow 'shux::cli_contract a_failing_command_prints_its_error_exactly_once'
+case_ test-and-helper-edit crates/shux/src/client.rs \
+    's/(\nmod tests \{\n    use super::\*;\n)/$1\n    #[allow(dead_code)]\n    fn flake_gate_proof_helper() {}\n/; s/(fn a_connection_reset_while_connecting_means_nothing_is_listening\(\) \{\n)/$1        let _proof = 1;\n/' \
+    mixed 'shux client::tests::a_connection_reset_while_connecting_means_nothing_is_listening'
 case_ integration-test-new crates/shux/tests/cli_integration.rs \
     's/\z/\n#[test]\nfn flake_gate_proof_new() {}\n/' \
     narrow 'shux::cli_integration flake_gate_proof_new'

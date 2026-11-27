@@ -16,6 +16,9 @@
   tests that run its changed harness code are 168 of 243 test-seconds (69%).
   Cutting further means changing what the gate promises. That is a policy
   decision, listed at the end.
+- **Since #326 the gate runs in two tiers:** the tests a diff adds or edits 20
+  times, and the tests it reaches only through a helper 5 times. On #321 that
+  is 86 s × 20 + 157 s × 5 of test time against 243 s × 20, about half.
 
 ## Using it
 
@@ -135,16 +138,15 @@ stopped gating that test.
 
 These change what the gate promises, so they are a decision, not a fix:
 
-1. **Run tests pulled in only by a helper change fewer times**, say 5 runs
-   instead of 20, and keep 20 for the tests a PR adds or edits. On #321 the
-   tests pulled in that way are 157 of the 243 test-seconds a run: the
-   harness users, the three binaries above and the rest. Cost: a flake in an
-   unchanged test that a helper change introduces becomes less likely to be
-   caught.
+1. **Done in #326: tests pulled in only by a helper change run 5 times**, and
+   the tests a PR adds or edits keep 20. On #321 the tests pulled in that way
+   are 157 of the 243 test-seconds a run. Cost: a flake in an unchanged test
+   is less likely to be caught; of the 12 catches on record, the 4 in
+   unchanged tests first failed at runs 9, 18, 18 and 19, so 5 runs would
+   have missed them. All 4 were flakes already on main.
 2. **The coverage probe, enforcing.** About 10% on #321 (projected), for the
-   risk above.
-3. **Use production's `graph_error_to_rpc` in the three integration binaries**
-   instead of their copies. They test a stale fork (the copies still build the
-   not-found message production stopped building), and a new `GraphError`
-   variant then no longer pulls in 120 tests. The copy in m0_integration has
-   changed three times (#113, #247, #321); in the 30 replayed PRs, once.
+   risk above. Not adopted.
+3. **Done in #326, by deletion:** `m0_integration`, `pane_io_integration` and
+   most of `cli_integration` tested copies of production's RPC layer, so they
+   are gone; what only they checked runs on the real daemon in
+   `pane_capture_e2e` and `cli_contract`.

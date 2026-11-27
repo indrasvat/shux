@@ -36,6 +36,16 @@ slow-timeout = { period = "30s", terminate-after = 4 }
 # (macOS only reports it: see the override at the end).
 leak-timeout = { period = "500ms", result = "fail" }
 
+# Out of `make test` and CI, each with a target of its own that runs it:
+#   s2 repeats s1's settle 100 times on one daemon (94 s); `make test-lens-soak`.
+#   lens_gate_bench records throughput numbers; `make bench-lens-gate`.
+# The flake gate still runs either one the diff edits; listings that must see
+# every test (check-test-inventory, check-test-groups) pass --ignore-default-filter.
+default-filter = '''
+not (binary_id(=shux::lens_settle) & test(=s2_settle_flake_gate_100x))
+  & not binary_id(=shux::lens_gate_bench)
+'''
+
 [test-groups]
 # ── Why these groups exist ────────────────────────────────────────────────
 #
@@ -49,7 +59,7 @@ leak-timeout = { period = "500ms", result = "fail" }
 # carefully-reasoned comment then describes a membership that does not exist.
 # It happened here — `pty-pool` and `daemon-backed` started out as separate
 # groups listing many of the same binaries, and every heavyweight suite
-# (`m0_integration`, `pane_io_integration`, `decaln_pane_e2e`, `rep_pane_e2e`)
+# (`decaln_pane_e2e`, `rep_pane_e2e` among them)
 # resolved into the earlier one. The two are now a single group, and
 # `make check-test-groups` asserts that no test is claimed by two groups, so the
 # next overlap fails loudly instead of quietly re-tuning the suite.
