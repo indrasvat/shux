@@ -30,7 +30,8 @@ cleanup() {
 trap cleanup EXIT
 git -C "$root" worktree add -q --detach "$wt" origin/main
 # shellcheck disable=SC2016  # expands when the stub runs
-printf '#!/usr/bin/env bash\nprintf "%%s" "$STRESS_FILTER" >"$FLAKE_PROOF_FILTER"\n' >"$scratch/stress-stub.sh"
+# One line per tier the gate runs; what it selects is their union.
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$STRESS_FILTER" >>"$FLAKE_PROOF_FILTER"\n' >"$scratch/stress-stub.sh"
 
 # select_at <commit>: the tests this checkout's gate selects there, into $scratch/set.
 select_at() {
@@ -54,7 +55,7 @@ select_at() {
         exit "$status"
     }
     if [[ -s "$scratch/filter" ]]; then
-        (cd "$wt" && cargo nextest list --color never --workspace -E "$(cat "$scratch/filter")" --message-format oneline) >"$scratch/set"
+        (cd "$wt" && cargo nextest list --color never --workspace --ignore-default-filter -E "$(awk 'NF { printf "%s(%s)", (n++ ? " + " : ""), $0 }' "$scratch/filter")" --message-format oneline) >"$scratch/set"
     else
         : >"$scratch/set"
     fi

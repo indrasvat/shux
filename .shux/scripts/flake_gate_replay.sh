@@ -57,7 +57,8 @@ trap cleanup EXIT
 git -C "$root" worktree add -q --detach "$wt" "${commits[0]}"
 printf '*.rs diff=rust\n' >"$scratch/attributes"
 # shellcheck disable=SC2016  # expands when the stub runs
-printf '#!/usr/bin/env bash\nprintf "%%s" "$STRESS_FILTER" >"$FLAKE_PROOF_FILTER"\n' >"$scratch/stress-stub.sh"
+# One line per tier the gate runs; what it selects is their union.
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$STRESS_FILTER" >>"$FLAKE_PROOF_FILTER"\n' >"$scratch/stress-stub.sh"
 
 # install <side>: that gate, and the new gate's own files, into the worktree.
 install() {
@@ -76,12 +77,11 @@ pick() {
     cp "$scratch/stress-stub.sh" "$wt/scripts/test-stress.sh"
     : >"$scratch/filter"
     (cd "$wt" && BASE=HEAD~1 FLAKE_PROOF_FILTER="$scratch/filter" bash scripts/flake-gate.sh) >"$scratch/$1.log" 2>&1
-    filter="$(cat "$scratch/filter")"
+    filter="$(awk 'NF { printf "%s(%s)", (n++ ? " + " : ""), $0 }' "$scratch/filter")"
     if [[ -z "$filter" ]]; then
         : >"$scratch/$1.set"
     else
-        (cd "$wt" && cargo nextest list --color never --workspace -E "$filter" --message-format oneline) |
-            sort -u >"$scratch/$1.set"
+        (cd "$wt" && cargo nextest list --color never --workspace --ignore-default-filter -E "$filter" --message-format oneline) | sort -u >"$scratch/$1.set"
     fi
 }
 
