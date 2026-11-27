@@ -22,8 +22,11 @@
 #            there to the end of the file
 #   cfgf     an inner `#![cfg(test)]`: the whole file is test code
 #   str      a string over several lines, whose blank lines are content
+#   gen      an item-level macro call (not proptest!), which may write tests
+#   cfgatest a fn under `cfg_attr(…test…)`, which may be a test
 # A test the rules do not see (one a macro writes, one nested in a fn) leaves
-# its lines outside every span, and the gate then selects its whole module.
+# its lines outside every span, and the gate then selects its whole module;
+# a change inside gen or cfgatest runs that module as often as an edited test.
 id: fn
 language: rust
 utils:
@@ -246,3 +249,32 @@ language: rust
 rule:
   any: [{ kind: string_literal }, { kind: raw_string_literal }]
   regex: '\n'
+---
+id: gen
+language: rust
+utils:
+  item-level:
+    any:
+      - kind: source_file
+      - kind: declaration_list
+        inside: { kind: mod_item }
+rule:
+  kind: macro_invocation
+  not: { has: { field: macro, regex: '^(proptest::)?proptest$' } }
+  any:
+    - inside: { matches: item-level }
+    - inside: { kind: expression_statement, inside: { matches: item-level } }
+---
+id: cfgatest
+language: rust
+rule:
+  kind: function_item
+  inside:
+    any:
+      - kind: source_file
+      - kind: declaration_list
+        inside: { kind: mod_item }
+  follows:
+    stopBy: { not: { any: [{ kind: attribute_item }, { kind: line_comment }, { kind: block_comment }] } }
+    kind: attribute_item
+    regex: '^#\[\s*cfg_attr\b(?s:.)*\btest\b'

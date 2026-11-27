@@ -85,6 +85,19 @@ expect "two TEST-RETIRE: trailers license two" 0 "$work/twins" "$work/one" \
 expect "two moves chained through one package pass with TEST-MOVE:" 0 "$work/chain-base" "$work/chain-moved" \
     'TEST-MOVE: b moved twice'
 
+expect "an empty TEST-RETIRE: fails, whatever else is there" 1 "$work/base" "$work/one" \
+    'TEST-RETIRE: shux::m0 b duplicated by c' 'TEST-RETIRE:'
+
+# Ten tests of one name in one binary: the occurrence count must not break
+# the sort order comm depends on (10 sorts before 2 as text).
+for i in $(seq 1 10); do echo "shux::m0 mod$i::t"; done >"$work/ten.raw"
+if bash scripts/check-test-inventory.sh --normalize <"$work/ten.raw" | sort -c 2>/dev/null; then
+    echo "  ✓ normalize output stays sorted past nine same-named tests"
+else
+    echo "  ✗ normalize output stays sorted past nine same-named tests"
+    fail=1
+fi
+
 if ((fail)); then
     printf '\033[1;31m✗ check-test-inventory self-test failed\033[0m\n'
     exit 1

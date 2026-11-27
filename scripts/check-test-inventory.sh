@@ -113,8 +113,14 @@ normalize() {
     | awk '{ id = $1; $1 = ""; sub(/^ /, ""); leaf = $0; sub(/^.*::/, "", leaf);
              sub(/::bin\/[^\/]+$/, "", id); print id "\t" leaf }' \
     | sort \
-    | awk '{ print $0 "\t" (++seen[$0]) }'
+    | awk '{ print $0 "\t" (++seen[$0]) }' \
+    | sort
 }
+# `--normalize`: normalize stdin (nextest's oneline listing) to stdout.
+if [[ "${BASE_REF}" == "--normalize" ]]; then
+  normalize
+  exit 0
+fi
 
 # Baselines are cached by content, so they must also be keyed by the code that
 # produced them. `normalize` just changed shape; a baseline written by the old
@@ -277,23 +283,26 @@ if [[ -n "${added}" ]]; then
   echo "${added}" | cut -f1,2 | sed 's/^/    + /'
 fi
 
-# trailers <key>: every value of that trailer in BASE_SHA..HEAD, one per line.
+# trailers <key>: every `<key>: <value>` trailer line in BASE_SHA..HEAD, empty
+# values included.
 trailers() {
   local sha
   git rev-parse --verify --quiet "${BASE_SHA}^{commit}" >/dev/null || return 0
   for sha in $(git rev-list "${BASE_SHA}..HEAD"); do
-    git log -1 --format='%B' "${sha}" | git interpret-trailers --parse 2>/dev/null \
-      | sed -n "s/^$1: //p"
+    git log -1 --format='%B' "${sha}" | git interpret-trailers --parse | grep -E "^$1:" || true
   done
 }
 
 # A deliberate deletion names what it deletes: one `TEST-RETIRE:` trailer per
 # test, `<binary-id> <leaf> <reason>`, or `<binary-id> * <reason>` for a binary
-# that lists no tests at all any more. A trailer never licenses a test it does
-# not name, and a reason is required.
-retire_trailers="$(trailers TEST-RETIRE)"
+# that lists no tests at all any more. <binary-id> and <leaf> are as this guard
+# prints them: `shux::cli_contract`, or `shux` for a package's unit tests, and
+# the test's name without its module path. A trailer never licenses a test it
+# does not name, and a reason is required.
+retire_trailers="$(trailers TEST-RETIRE | sed 's/^TEST-RETIRE:[[:space:]]*//')"
 retire_rules="$(awk 'NF >= 3 { print $1 "\t" $2 }' <<<"${retire_trailers}" | sort)"
-bad_retire="$(awk 'NF > 0 && NF < 3' <<<"${retire_trailers}")"
+# Read from the trailer lines themselves: `$(…)` drops an empty last value.
+bad_retire="$(trailers TEST-RETIRE | awk '{ v = $0; sub(/^TEST-RETIRE:[[:space:]]*/, "", v); if (split(v, w) < 3) print }')"
 if [[ -n "${bad_retire}" ]]; then
   echo "" >&2
   echo "error: a TEST-RETIRE: trailer needs <binary-id> <test|*> <reason>:" >&2
@@ -396,7 +405,7 @@ fi
 if [[ -n "${removed}" ]]; then
   # Every removal is matched by an addition elsewhere. Demand the trailer.
   moved_ok=0
-  if grep -qE '^[^[:space:]]' <<<"$(trailers TEST-MOVE)"; then moved_ok=1; fi
+  if grep -qE '^TEST-MOVE:[[:space:]]*[^[:space:]]' <<<"$(trailers TEST-MOVE)"; then moved_ok=1; fi
 
   echo ""
   echo "  moved to another crate (leaf name still runs):"
@@ -416,4 +425,4 @@ if [[ -n "${removed}" ]]; then
   echo "  ✓ TEST-MOVE: trailer present for the relocation"
 fi
 
-echo "✓ every test at ${BASE_SHA:0:12} still runs"
+echo "✓ every test at ${BASE_SHA:0:12} still runs, or was retired by a TEST-RETIRE: trailer naming it"

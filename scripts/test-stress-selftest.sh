@@ -244,6 +244,12 @@ if ((status == 0)) && ! grep -qx -- --ignore-default-filter "$work/log/run1.args
 else
     bad "without it, the profile's default-filter applies (exit $status)"
 fi
+run 0
+if ((status == 2)) && [[ ! -e "$work/log/run1.args" ]]; then
+    ok "a STRESS_COUNT of 0 is refused, not a pass that ran nothing"
+else
+    bad "a STRESS_COUNT of 0 is refused, not a pass that ran nothing (exit $status)"
+fi
 IGNORE=yes run 1
 if ((status == 2)) && [[ ! -e "$work/log/run1.args" ]]; then
     ok "any other STRESS_IGNORE_DEFAULT_FILTER is refused before a run"

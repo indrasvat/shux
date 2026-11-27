@@ -47,29 +47,27 @@ fn terminal_queries_get_their_replies_on_the_programs_stdin() {
     let pane = pane_running_python(
         &mut env,
         "query",
-        r#"import os, select, sys, termios, time, tty
+        &format!(
+            r#"import os, sys, termios, tty
 fd = 0
 saved = termios.tcgetattr(fd)
 tty.setraw(fd)
-want = (b"\x1b[5;10R", b"\x1b[?2026;2$y", b"\x1bP>|shux ")
+want = (b"\x1b[5;10R", b"\x1b[?2026;2$y", b"\x1bP>|shux {version}\x1b\\")
 data = b""
 try:
     os.write(1, b"\x1b[5;10H\x1b[6n\x1b[?2026$p\x1b[>0q")
-    deadline = time.monotonic() + 30
-    while time.monotonic() < deadline and not all(w in data for w in want):
-        if select.select([fd], [], [], 0.2)[0]:
-            data += os.read(fd, 256)
+    while not all(w in data for w in want):
+        data += os.read(fd, 256)
 finally:
     termios.tcsetattr(fd, termios.TCSADRAIN, saved)
-sys.stdout.write("\r\n" + "".join("Y" if w in data else "N" for w in want) + " QUERIES-" + "DONE\r\n")
+sys.stdout.write("\r\nQUERIES-" + "DONE\r\n")
 sys.stdout.flush()
 "#,
+            version = env!("CARGO_PKG_VERSION"),
+        ),
     );
+    // The program prints its marker only once all three replies (CPR,
+    // DECRQM ?2026 and the whole XTVERSION string) have reached its stdin.
     env.wait_for("query", &pane, "QUERIES-DONE");
     env.assert_colour_probe(&pane);
-    let text = env.capture("query", &pane);
-    assert!(
-        text.contains("YYY QUERIES-DONE"),
-        "CPR, DECRQM ?2026 and XTVERSION each answered (Y) or not (N):\n{text}"
-    );
 }

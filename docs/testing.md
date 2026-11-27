@@ -164,8 +164,11 @@ Rejected in review:
 
 Deleting a test is the same judgement run the other way. `make
 check-test-inventory` fails a test that stopped being compiled unless a commit
-names it in a `TEST-RETIRE: <binary-id> <test> <reason>` trailer, or `TEST-RETIRE:
-<binary-id> * <reason>` for a binary deleted whole.
+names it in a `TEST-RETIRE: <binary-id> <test> <reason>` trailer, one per test,
+or `TEST-RETIRE: <binary-id> * <reason>` for a binary deleted whole. Both names
+are as the guard prints them: `shux::cli_contract`, or `shux` for a package's
+unit tests, and the test's name without its module path
+(`TEST-RETIRE: shux test_muted_display asserts nothing`).
 
 ## The flake gate
 

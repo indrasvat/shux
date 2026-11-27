@@ -30,6 +30,10 @@ set -euo pipefail
 base_ref="${BASE:-origin/main}"
 count="${FLAKE_COUNT:-20}"
 helper_count="${FLAKE_HELPER_COUNT:-5}"
+for n in "$count" "$helper_count"; do
+    [[ "$n" =~ ^[1-9][0-9]*$ ]] ||
+        { echo "flake-gate: FLAKE_COUNT and FLAKE_HELPER_COUNT must be positive integers, not '$n'" >&2; exit 2; }
+done
 cores="$(getconf _NPROCESSORS_ONLN)"
 load="${FLAKE_LOAD:-$((2 * cores))}"
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -102,6 +106,7 @@ test_spans() {
             $1 == "mod" { nm++; ms[nm] = $6; me[nm] = $7; mn[nm] = $8 }
             $1 == "cmt" && !($2 in seen) { seen[$2] = 1; print "c", $2, $3 }
             $1 == "str" { print "q", $2, $4 }
+            $1 == "gen" || $1 == "cfgatest" { print "p", $2, $4 }
             $1 == "cfgt" { print "t", $9, $4 }
             $1 == "cfgm" { print "m", from($9, $10), to($4, $5), path($6) $8 }
             $1 == "cfgo" { print "t", $2, 2147483647 }
@@ -137,6 +142,7 @@ touched_lines() {
         FILENAME == ARGV[1] && $1 == "m" && mode == "cfg" { nd++; d0[nd] = $2; d1[nd] = $3; dp[nd] = $4; next }
         FILENAME == ARGV[1] && $1 == "c" { cmt[$2] = $3; next }
         FILENAME == ARGV[1] && $1 == "q" { for (l = $2; l <= $3; l++) instr[l] = 1; next }
+        FILENAME == ARGV[1] && $1 == "p" { np++; p0[np] = $2; p1[np] = $3; next }
         FILENAME == ARGV[2] {
             if ($0 !~ /^@@ /) next
             split($0, h, " ")
@@ -156,8 +162,7 @@ touched_lines() {
             match($0, /^[[:space:]]*/)
             if ((FNR in cmt) && cmt[FNR] == RLENGTH) next
             if (!coarse) coarse = FNR
-            # A macro call among items writes items, tests among them.
-            if ($0 ~ /^[[:space:]]*[A-Za-z_][A-Za-z0-9_:]*![[:space:]]*[(\[{]/ && $0 !~ /macro_rules!/) gen = 1
+            for (i = 1; i <= np; i++) if (p0[i] <= FNR && FNR <= p1[i]) gen = 1
         }
         END {
             for (i in fns) {
@@ -446,5 +451,6 @@ if ((n_edited > 0)); then
         bash scripts/test-stress.sh
 fi
 if ((n_helper > 0)); then
-    STRESS_FILTER="$helper_filter" STRESS_COUNT="$helper_count" STRESS_LOAD="$load" bash scripts/test-stress.sh
+    STRESS_FILTER="$helper_filter" STRESS_COUNT="$helper_count" STRESS_LOAD="$load" STRESS_IGNORE_DEFAULT_FILTER="" \
+        bash scripts/test-stress.sh
 fi

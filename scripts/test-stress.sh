@@ -21,6 +21,7 @@
 set -euo pipefail
 
 count="${STRESS_COUNT:-10}"
+[[ "$count" =~ ^[1-9][0-9]*$ ]] || { echo "test-stress: STRESS_COUNT must be a positive integer, not '$count'" >&2; exit 2; }
 filter="${STRESS_FILTER:-all()}"
 load="${STRESS_LOAD:-0}"
 jobs="${NEXTEST_JOBS:-16}"
