@@ -1192,7 +1192,6 @@ async fn spawn_pane_pty_unshared(
     let (write_tx, write_rx) = crate::pane_input::channel();
     let (resize_tx, resize_rx) = mpsc::channel::<ResizeRequest>(16);
     let (done_tx, done_rx) = oneshot::channel::<()>();
-    let pane_shutdown = shutdown.child_token();
     let mut vt = shux_vt::VirtualTerminal::new(size.rows as usize, size.cols as usize);
     let probe = handle.output_probe();
     // LENS-R-003: seed the per-pane revision watch with the VT's initial
@@ -1228,6 +1227,7 @@ async fn spawn_pane_pty_unshared(
             return Err(pane_gone(pane_id, &e));
         }
     }
+    let pane_shutdown;
     {
         let mut state = io_state.lock().await;
         // Daemon shutdown cancels this token before it collects the panes to
@@ -1246,6 +1246,12 @@ async fn spawn_pane_pty_unshared(
             discard_child(handle);
             return Ok(());
         }
+        // While the workspace is saved, panes outlive root until the last save.
+        pane_shutdown = if state.persist.is_enabled() {
+            state.pane_lifetime.child_token()
+        } else {
+            shutdown.child_token()
+        };
         if let Some(old) = state.shutdowns.insert(pane_id, pane_shutdown.clone()) {
             old.cancel();
         }
@@ -1274,6 +1280,10 @@ async fn spawn_pane_pty_unshared(
         // Now resizable: a pane created from the CLI takes its rect.
         state.clients.touch();
         state.pty_done.insert(pane_id, done_rx);
+        if let Some(notice) = state.pending_notices.remove(&pane_id) {
+            vt.process(notice.as_bytes());
+        }
+        state.persist.note_process(pane_id, pid);
         let replaced = state.vts.insert(pane_id, vt).is_some();
         state.status_sealed.remove(&pane_id);
         state.revisions.insert(pane_id, rev_tx);

@@ -124,6 +124,7 @@ pub fn run_daemon(socket_override: Option<PathBuf>) -> anyhow::Result<()> {
             cancel.clone(),
             lens_audit,
             unresolved_scratch,
+            true,
         )
         .await?;
         {
@@ -460,7 +461,7 @@ pub(crate) fn our_live_daemon(socket: &Path) -> Option<u32> {
 ///
 /// Deliberately never auto-starts a daemon: starting one in order to stop it would be
 /// absurd, and `status` must be able to report "not running".
-pub(crate) fn handle_daemon_command(
+pub(crate) async fn handle_daemon_command(
     command: cli::DaemonCommand,
     format: cli::OutputFormat,
     socket: &Path,
@@ -469,23 +470,36 @@ pub(crate) fn handle_daemon_command(
 
     match command {
         cli::DaemonCommand::Status => {
-            match ours {
-                Some(p) => match format {
-                    cli::OutputFormat::Json => println!("{{\"running\": true, \"pid\": {p}}}"),
-                    _ => println!(
-                        "{} {}",
-                        style::success("daemon running"),
-                        style::muted(format!("pid {p}"))
+            let workspace = match ours {
+                Some(_) => ask_workspace(socket).await,
+                None => serde_json::Value::Null,
+            };
+            match format {
+                // The first two fields keep their bytes: scripts match on them.
+                cli::OutputFormat::Json => match ours {
+                    Some(p) => {
+                        println!("{{\"running\": true, \"pid\": {p}, \"workspace\": {workspace}}}")
+                    }
+                    None => println!(
+                        "{{\"running\": false, \"pid\": null, \"workspace\": {workspace}}}"
                     ),
                 },
-                None => match format {
-                    cli::OutputFormat::Json => println!("{{\"running\": false, \"pid\": null}}"),
-                    _ => println!("{}", style::warning("daemon not running")),
-                },
+                _ => {
+                    match ours {
+                        Some(p) => println!(
+                            "{} {}",
+                            style::success("daemon running"),
+                            style::muted(format!("pid {p}"))
+                        ),
+                        None => println!("{}", style::warning("daemon not running")),
+                    }
+                    style::print_workspace_status(&workspace);
+                }
             }
             Ok(())
         }
-        cli::DaemonCommand::Stop => {
+        cli::DaemonCommand::Stop { discard: true } => discard_workspace(socket, format).await,
+        cli::DaemonCommand::Stop { discard: false } => {
             let Some(p) = ours else {
                 // Idempotent, and exit 0: a cleanup trap may run this twice
                 // (skills/shux/references/gate.md).
@@ -517,13 +531,117 @@ pub(crate) fn handle_daemon_command(
     }
 }
 
+/// `daemon.workspace` from the running daemon, bounded; `null` when it does not
+/// answer in time. Never starts a daemon.
+async fn ask_workspace(socket: &Path) -> serde_json::Value {
+    let ask = async {
+        let mut stream = crate::client::try_connect(socket).await.ok()?;
+        crate::cli::rpc_call(&mut stream, "daemon.workspace", serde_json::json!({}))
+            .await
+            .ok()
+    };
+    tokio::time::timeout(crate::patience::peer_patience(), ask)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// `daemon stop --discard`: stop the daemon, then delete its saved workspace,
+/// holding the start lock throughout so no client starts (and restores) one
+/// in between.
+async fn discard_workspace(socket: &Path, format: cli::OutputFormat) -> anyhow::Result<()> {
+    // After a reboot the runtime dir is gone; the saved workspace is not.
+    daemon::ensure_runtime_dir()?;
+    let start_lock_path = daemon::start_lock_path_for(socket)?;
+    let deadline = std::time::Instant::now() + crate::patience::peer_patience();
+    let _start_lock = loop {
+        if let Some(lock) = daemon::try_lock_file(&start_lock_path)? {
+            break lock;
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("another shux command is starting a daemon here; retry");
+        }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "another process holds the start lock; there is no event to wait on"
+        )]
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    // Under the start lock: no client can start one after this look.
+    let ours = our_live_daemon(socket);
+    if let Some(p) = ours {
+        let pid = nix::unistd::Pid::from_raw(p as i32);
+        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGCONT);
+        if !stop_and_wait(p, socket) && is_live_shux_daemon(p, socket) {
+            // Discarding is asked for outright: one that will not stop is ended.
+            let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+            let gone = std::time::Instant::now() + crate::patience::peer_patience();
+            while is_live_shux_daemon(p, socket) {
+                if std::time::Instant::now() >= gone {
+                    anyhow::bail!(
+                        "daemon (pid {p}) survived SIGKILL; its workspace was not discarded"
+                    );
+                }
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "another process's exit has no event to wait on; poll its identity"
+                )]
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    }
+    let root = crate::workspace_store::state_root().ok_or_else(|| {
+        anyhow::anyhow!("no state directory: neither XDG_STATE_HOME nor HOME is set")
+    })?;
+    let key = crate::workspace_store::key_for(&daemon::socket_key(socket));
+    let store = match crate::workspace_store::Store::open(&root, &key) {
+        Ok(store) => store,
+        Err(crate::workspace_store::OpenError::Held { holder }) => anyhow::bail!(
+            "the workspace is still held by pid {}; it was not discarded",
+            holder.map_or("unknown".into(), |p| p.to_string())
+        ),
+        Err(crate::workspace_store::OpenError::Unusable(e)) => {
+            anyhow::bail!(
+                "cannot open the saved workspace under {}: {e}",
+                root.display()
+            )
+        }
+    };
+    // The saved workspace is the only record of shells a killed daemon left
+    // running; end them before it goes.
+    let saved = store.read_workspace(shux_core::persist::MAX_FILE_BYTES);
+    if let Ok(Some(bytes)) = saved
+        && let Ok(ws) =
+            shux_core::persist::decode(&bytes, &daemon::socket_key(socket).to_string_lossy())
+    {
+        let shells = ws
+            .sessions
+            .iter()
+            .flat_map(|s| &s.windows)
+            .flat_map(|w| &w.panes)
+            .filter_map(|p| p.process.as_ref());
+        for shell in shells {
+            crate::workspace::reap_orphan(shell).await;
+        }
+    }
+    store.discard()?;
+    if let cli::OutputFormat::Json = format {
+        println!(
+            "{}",
+            serde_json::json!({"stopped": ours.is_some(), "pid": ours, "discarded": true})
+        );
+    } else {
+        style::print_success("Discarded", "the saved workspace", None)?;
+    }
+    Ok(())
+}
+
 /// SIGTERM daemon `p` and wait for it to go: whether it went.
 pub(crate) fn stop_and_wait(p: u32, socket: &Path) -> bool {
     // SIGTERM → the daemon's signal handler runs a graceful shutdown.
-    let _ = nix::sys::signal::kill(
-        nix::unistd::Pid::from_raw(p as i32),
-        nix::sys::signal::Signal::SIGTERM,
-    );
+    let pid = nix::unistd::Pid::from_raw(p as i32);
+    let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
     // Identity, not `kill(pid, 0)`: an exited daemon stays a zombie until
     // its parent reaps it, which a subreaper may never do.
     let deadline = std::time::Instant::now() + crate::patience::peer_patience();
@@ -552,6 +670,8 @@ pub(crate) fn not_gone(p: u32) -> String {
 /// What daemon shutdown drains once the state loop has returned.
 pub(crate) struct Teardown {
     io_state: Arc<Mutex<PaneIoState>>,
+    graph: shux_core::graph::GraphHandle,
+    graph_stop: tokio_util::sync::CancellationToken,
     plugins: shux_plugin::PluginManager,
     share: crate::share::Gateway,
     connections: tokio_util::task::TaskTracker,
@@ -565,6 +685,9 @@ impl Teardown {
     /// End every share viewer, then reap every pane and every plugin, and let
     /// every connection write its last reply, side by side.
     pub(crate) async fn drain(self) {
+        // First, while every pane is still alive: the workspace as left.
+        crate::workspace::save_before_teardown(&self.io_state, &self.graph).await;
+        self.graph_stop.cancel();
         if let Err(e) = self.share.stop().await {
             tracing::warn!(error = %e, "share gateway stop");
         }
@@ -604,6 +727,7 @@ impl InProcess {
             cancel.clone(),
             lens_scratch::LensAuditLog::open_default(),
             Vec::new(),
+            false,
         )
         .await?;
         Ok(Self {
@@ -633,22 +757,66 @@ pub(crate) async fn run_rpc_server(
     cancel: tokio_util::sync::CancellationToken,
     lens_audit: Arc<lens_scratch::LensAuditLog>,
     unresolved_scratch: Vec<lens_scratch::RegistryRow>,
+    // Save and restore the workspace (#329): the forked daemon only, never an
+    // in-process harness.
+    restore: bool,
 ) -> anyhow::Result<Teardown> {
     // EventBus: typed pub/sub for lifecycle events. Wired into SessionGraph
     // so every successful mutation publishes a typed event to subscribers.
     // events.watch / events.history RPC methods read from here.
     let event_bus = shux_core::bus::EventBus::new();
 
+    // Read before the graph exists: `[restore]` decides what it starts from.
+    let config_path = shux_core::config::default_config_path();
+    let config_handle = shux_core::config::ConfigHandle::load_or_default(&config_path);
+    let mut boot = crate::workspace::boot(
+        &daemon::socket_key(&socket_path),
+        restore && config_handle.current().restore.workspace,
+    )
+    .await?;
+    let restored = boot.restored.take();
+    let restored_panes: Vec<_> = restored
+        .as_ref()
+        .map(|r| {
+            r.snapshot
+                .panes
+                .values()
+                .map(|p| (p.id, p.cwd.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+
     // Create SessionGraph + graph loop. Pass the bus so mutations fire events.
-    let (graph, state) =
-        shux_core::graph::SessionGraph::new_with_event_bus(Some(event_bus.clone()));
+    let (graph, state, extras) = match restored {
+        Some(r) => {
+            shux_core::model::advance_session_seq_past(r.max_created_seq);
+            let (g, s) =
+                shux_core::graph::SessionGraph::from_snapshot(r.snapshot, Some(event_bus.clone()));
+            (g, s, r.extras)
+        }
+        None => {
+            let (g, s) =
+                shux_core::graph::SessionGraph::new_with_event_bus(Some(event_bus.clone()));
+            (g, s, Default::default())
+        }
+    };
+    // Before the loop runs, so the writer sees every commit.
+    let persist = boot.start(&graph, state.clone(), extras);
     let (graph_tx, graph_rx) = mpsc::channel(256);
     let graph_handle = shux_core::graph::GraphHandle::new(graph_tx, state);
-
-    let graph_cancel = cancel.clone();
-    tokio::spawn(async move {
-        shux_core::graph::run_graph_loop(graph, graph_rx, graph_cancel).await;
-    });
+    // Every close, from any caller, is saved before it commits.
+    let durability = persist
+        .is_enabled()
+        .then(|| Arc::new(persist.clone()) as Arc<dyn shux_core::graph::Durability>);
+    // Its own lifetime, not root's: shutdown seals the graph (every command
+    // already sent is applied) before it saves the last time.
+    let graph_stop = tokio_util::sync::CancellationToken::new();
+    {
+        let graph_stop = graph_stop.clone();
+        tokio::spawn(async move {
+            shux_core::graph::run_graph_loop_durable(graph, graph_rx, graph_stop, durability).await;
+        });
+    }
 
     // Create shared pane I/O state (PTY writers, VTs, command engine,
     // data-plane publisher). The event bus is the SAME bus the
@@ -658,8 +826,18 @@ pub(crate) async fn run_rpc_server(
     let io_state = Arc::new(Mutex::new(
         PaneIoState::new()
             .with_event_bus(event_bus.clone())
-            .with_shutdown(cancel.clone()),
+            .with_shutdown(cancel.clone())
+            .with_persist(persist),
     ));
+    // Before any socket binds: these panes get their shell from the restore,
+    // and calls about panes wait for it (`Router::wait_until_ready`).
+    let (ready_tx, ready_rx) = tokio::sync::watch::channel(restored_panes.is_empty());
+    {
+        let mut io = io_state.lock().await;
+        io.awaiting_restore
+            .extend(restored_panes.iter().map(|(p, _)| *p));
+        io.restore_ready = ready_rx.clone();
+    }
     let shutdown_io_state = io_state.clone();
 
     // Lens scratch registry (§8 SPEC-E, LENS-R-040..046). One per daemon
@@ -684,11 +862,9 @@ pub(crate) async fn run_rpc_server(
         )
         .await;
 
-    // Load user config (~/.config/shux/config.toml). Missing file is
+    // User config (~/.config/shux/config.toml), loaded above. Missing file is
     // valid — defaults match current hardcoded behavior. Spawn a watcher
     // task so edits to the file are picked up live.
-    let config_path = shux_core::config::default_config_path();
-    let config_handle = shux_core::config::ConfigHandle::load_or_default(&config_path);
     // Publish before the RPC server accepts connections, so the very first
     // pane spawn already sees `[shell]` (issue #132).
     publish_daemon_config(config_handle.clone());
@@ -899,6 +1075,8 @@ pub(crate) async fn run_rpc_server(
     // `docs/designs/permissions/README.md` §9.6.
     router.assert_every_route_has_policy();
     router.assert_every_route_declares_params();
+    // Over the socket and from plugins alike.
+    let router = router.wait_until_ready(ready_rx);
 
     tokio::spawn(rpc::daemon::retire_when_idle(
         graph_handle.clone(),
@@ -963,6 +1141,7 @@ pub(crate) async fn run_rpc_server(
     let server =
         shux_rpc::Server::new(config, router, cancel.clone()).with_rebind_gate(rebind_gate);
     let connections = server.connections();
+    let workspace_cancel = cancel.clone();
 
     tokio::spawn(async move {
         if let Err(e) = server.run().await {
@@ -980,8 +1159,24 @@ pub(crate) async fn run_rpc_server(
         }
     });
 
+    // Serving already, so a large workspace never holds the socket back.
+    tokio::spawn(crate::workspace::restore_panes(
+        restored_panes,
+        shutdown_io_state.clone(),
+        graph_handle.clone(),
+        workspace_cancel.clone(),
+        ready_tx,
+    ));
+    tokio::spawn(crate::workspace::run_cwd_sampler(
+        shutdown_io_state.clone(),
+        graph_handle.clone(),
+        workspace_cancel,
+    ));
+
     Ok(Teardown {
         io_state: shutdown_io_state,
+        graph: graph_handle,
+        graph_stop,
         plugins,
         share,
         connections,

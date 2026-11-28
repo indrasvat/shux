@@ -214,6 +214,19 @@ pub struct PaneIoState {
     /// to the pane's writer, under this lock, so it follows the channel's
     /// order: take room in the channel first, then this lock.
     pub(crate) open_pastes: HashMap<shux_core::model::PaneId, OpenPaste>,
+    /// Saves the workspace across restarts (#329); a no-op where nothing is saved.
+    pub(crate) persist: crate::workspace::Persist,
+    /// The parent of every pane's own token while the workspace is saved: it
+    /// outlives root, so a stopping daemon saves its panes' last directories
+    /// before it ends them. Otherwise panes hang off the spawner's token.
+    pub(crate) pane_lifetime: tokio_util::sync::CancellationToken,
+    /// A line drawn into a pane's next VT (never sent to its program).
+    pub(crate) pending_notices: HashMap<shux_core::model::PaneId, String>,
+    /// Restored panes whose shell the restore has yet to start: no one else
+    /// starts one there (an attach would, in the wrong directory).
+    pub(crate) awaiting_restore: std::collections::HashSet<shux_core::model::PaneId>,
+    /// Raised once every restored pane's shell has started or failed.
+    pub(crate) restore_ready: tokio::sync::watch::Receiver<bool>,
 }
 
 /// A generation counter every attach render loop watches. A bump wakes every
@@ -285,6 +298,11 @@ impl PaneIoState {
             status_sealed: Default::default(),
             open_pastes: HashMap::new(),
             clients: Default::default(),
+            persist: crate::workspace::Persist::disabled("not a daemon"),
+            pane_lifetime: tokio_util::sync::CancellationToken::new(),
+            pending_notices: HashMap::new(),
+            awaiting_restore: Default::default(),
+            restore_ready: tokio::sync::watch::channel(true).1,
         }
     }
 
@@ -297,6 +315,37 @@ impl PaneIoState {
     pub(crate) fn with_shutdown(mut self, root: tokio_util::sync::CancellationToken) -> Self {
         self.recordings = Recordings::new(root);
         self
+    }
+
+    /// Save the workspace through `persist`. Panes then outlive root until
+    /// [`Self::end_panes`], so the last save sees them alive.
+    pub(crate) fn with_persist(mut self, persist: crate::workspace::Persist) -> Self {
+        self.persist = persist;
+        self
+    }
+
+    /// Panes with a program or a screen here that `snap` no longer has: what
+    /// a kill must end, whatever it saw before (a pane a zoom hides, a split
+    /// made while the kill was being saved).
+    pub(crate) fn panes_gone_from(
+        &self,
+        snap: &shux_core::graph::SessionGraphSnapshot,
+    ) -> Vec<shux_core::model::PaneId> {
+        let mut gone: Vec<_> = self
+            .shutdowns
+            .keys()
+            .chain(self.writers.keys())
+            .chain(self.vts.keys())
+            .filter(|p| !snap.panes.contains_key(p))
+            .copied()
+            .collect();
+        gone.sort_by_key(|p| p.0);
+        gone.dedup();
+        gone
+    }
+
+    pub(crate) fn end_panes(&self) {
+        self.pane_lifetime.cancel();
     }
 
     pub fn teardown_panes(

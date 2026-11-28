@@ -89,6 +89,15 @@ border = true
 # "N waiting", led by the blocked icon, while panes in the session are blocked.
 status_bar = true
 
+[restore]
+# Bring the workspace back when the daemon restarts (a crash, kill -9, a
+# reboot, `daemon stop`, `daemon upgrade --force`): sessions, windows, the
+# split layout, titles and focus, with a fresh shell in each pane's last
+# directory. Programs and scrollback are not kept. Read at daemon start.
+# false: nothing is saved or restored; what was saved stays until
+# `shux daemon stop --discard`.
+workspace = true
+
 [keybindings]
 # Optional attach key overrides. Keys use the same notation as prefix:
 # "alt-h" targets the root table; "prefix h" targets the key pressed

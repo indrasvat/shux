@@ -108,6 +108,11 @@ pub enum GraphError {
     #[error("graph loop shut down")]
     Shutdown,
 
+    /// A close refused because nothing durable could be recorded: done, a
+    /// restart would bring the closed thing back.
+    #[error("the close could not be saved, so it was not done: {0}")]
+    NotDurable(String),
+
     /// Refused before anything changed: the daemon is retiring.
     #[error("this daemon is retiring and takes no new session")]
     Retired,
@@ -254,6 +259,8 @@ pub enum GraphCommand {
         /// session.create path, only apply_batch persisted it). Empty
         /// vector means "spawn the user's default shell".
         initial_command: Vec<String>,
+        /// A lens scratch session, never saved to a workspace.
+        scratch: bool,
         reply: tokio::sync::oneshot::Sender<Result<SessionId, GraphError>>,
     },
     DestroySession {
@@ -425,6 +432,10 @@ pub enum GraphCommand {
     },
     /// See [`GraphHandle::atomically`].
     Atomically(Transaction),
+    /// See [`GraphHandle::seal`].
+    Seal {
+        reply: tokio::sync::oneshot::Sender<Arc<SessionGraphSnapshot>>,
+    },
 }
 
 /// Work the graph task runs between two commands.
@@ -468,6 +479,9 @@ pub struct SessionGraph {
     event_bus: Option<EventBus>,
     /// Set by [`Self::retire_if_empty`]: no session is created after it.
     retiring: std::sync::atomic::AtomicBool,
+    /// The version of each commit, for the workspace writer. It covers every
+    /// change, including the ones that publish no event.
+    commits: tokio::sync::watch::Sender<Version>,
 }
 
 impl SessionGraph {
@@ -482,16 +496,31 @@ impl SessionGraph {
     pub fn new_with_event_bus(
         event_bus: Option<EventBus>,
     ) -> (Self, Arc<ArcSwap<SessionGraphSnapshot>>) {
-        let snapshot = Arc::new(SessionGraphSnapshot::default());
-        let state = Arc::new(ArcSwap::from(snapshot));
+        Self::from_snapshot(SessionGraphSnapshot::default(), event_bus)
+    }
+
+    /// A graph that starts from `snapshot`: a restored workspace at boot, or
+    /// a scratch copy on which a removal is tried before it is made.
+    pub fn from_snapshot(
+        snapshot: SessionGraphSnapshot,
+        event_bus: Option<EventBus>,
+    ) -> (Self, Arc<ArcSwap<SessionGraphSnapshot>>) {
+        let version = snapshot.version;
+        let state = Arc::new(ArcSwap::from(Arc::new(snapshot)));
         let graph = Self {
             state: Arc::clone(&state),
             status_generations: Default::default(),
             pty_owners: Default::default(),
             event_bus,
             retiring: Default::default(),
+            commits: tokio::sync::watch::Sender::new(version),
         };
         (graph, state)
+    }
+
+    /// Notified with the snapshot version after every commit.
+    pub fn subscribe_commits(&self) -> tokio::sync::watch::Receiver<Version> {
+        self.commits.subscribe()
     }
 
     /// With no sessions, refuse every session created from now on and
@@ -749,10 +778,12 @@ impl SessionGraph {
         for map in [&self.pty_owners, &self.status_generations] {
             side_map(map).retain(|pid, _| snapshot.panes.contains_key(pid));
         }
+        let version = snapshot.version;
         self.state.store(Arc::new(snapshot));
+        self.commits.send_replace(version);
     }
 
-    fn validate_session_name(name: &str) -> Result<(), GraphError> {
+    pub(crate) fn validate_session_name(name: &str) -> Result<(), GraphError> {
         if name.is_empty() {
             return Err(GraphError::EmptySessionName);
         }
@@ -850,6 +881,16 @@ impl SessionGraph {
         cwd: std::path::PathBuf,
         command: Vec<String>,
     ) -> Result<SessionId, GraphError> {
+        self.create_session_flagged(name, cwd, command, false)
+    }
+
+    pub(crate) fn create_session_flagged(
+        &self,
+        name: String,
+        cwd: std::path::PathBuf,
+        command: Vec<String>,
+        scratch: bool,
+    ) -> Result<SessionId, GraphError> {
         self.refuse_if_retiring()?;
         Self::validate_session_name(&name)?;
 
@@ -878,7 +919,8 @@ impl SessionGraph {
         window.id = window_id;
 
         let session_name = name.clone();
-        let session = Session::new(name, window_id);
+        let mut session = Session::new(name, window_id);
+        session.scratch = scratch;
         let session_id = session.id;
 
         window.session_id = session_id;
@@ -2658,18 +2700,53 @@ fn resolve_pane_ref(
 /// Run the graph command processing loop (single-writer task).
 pub async fn run_graph_loop(
     graph: SessionGraph,
-    mut cmd_rx: mpsc::Receiver<GraphCommand>,
+    cmd_rx: mpsc::Receiver<GraphCommand>,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
+    run_graph_loop_durable(graph, cmd_rx, shutdown, None).await;
+}
+
+/// Run `close` on the graph, first making its result durable when it is a
+/// valid close: tried on a copy, saved as that copy, then committed. One that
+/// the graph refuses is never saved; the loop's order is the save order.
+async fn durable_close(
+    graph: &SessionGraph,
+    durability: Option<&Arc<dyn Durability>>,
+    close: impl Fn(&SessionGraph) -> Result<(), GraphError>,
+) -> Result<(), GraphError> {
+    if let Some(durability) = durability {
+        let (preview, _) = SessionGraph::from_snapshot((*graph.current()).clone(), None);
+        close(&preview)?;
+        durability
+            .close(preview.current())
+            .await
+            .map_err(GraphError::NotDurable)?;
+    }
+    close(graph)
+}
+
+/// [`run_graph_loop`], with every session, window and pane close made
+/// durable by `durability` before it commits. A scratch session is never
+/// saved, so its close is not.
+pub async fn run_graph_loop_durable(
+    graph: SessionGraph,
+    mut cmd_rx: mpsc::Receiver<GraphCommand>,
+    shutdown: tokio_util::sync::CancellationToken,
+    durability: Option<Arc<dyn Durability>>,
+) {
+    let durability = durability.as_ref();
     loop {
         tokio::select! {
             cmd = cmd_rx.recv() => {
                 match cmd {
-                    Some(GraphCommand::CreateSession { name, cwd, initial_command, reply }) => {
-                        let _ = reply.send(graph.create_session_with_command(name, cwd, initial_command));
+                    Some(GraphCommand::CreateSession { name, cwd, initial_command, scratch, reply }) => {
+                        let _ = reply.send(graph.create_session_flagged(name, cwd, initial_command, scratch));
                     }
                     Some(GraphCommand::DestroySession { id, expected_version, reply }) => {
-                        let _ = reply.send(graph.destroy_session(id, expected_version));
+                        let scratch = graph.current().sessions.get(&id).is_some_and(|s| s.scratch);
+                        let durability = durability.filter(|_| !scratch);
+                        let out = durable_close(&graph, durability, |g| g.destroy_session(id, expected_version)).await;
+                        let _ = reply.send(out);
                     }
                     Some(GraphCommand::RenameSession { id, new_name, expected_version, reply }) => {
                         let _ = reply.send(graph.rename_session(id, new_name, expected_version));
@@ -2678,7 +2755,8 @@ pub async fn run_graph_loop(
                         let _ = reply.send(graph.create_window_with_command(session_id, title, cwd, initial_command));
                     }
                     Some(GraphCommand::DestroyWindow { id, expected_version, reply }) => {
-                        let _ = reply.send(graph.destroy_window(id, expected_version));
+                        let out = durable_close(&graph, durability, |g| g.destroy_window(id, expected_version)).await;
+                        let _ = reply.send(out);
                     }
                     Some(GraphCommand::RenameWindow { id, new_title, expected_version, reply }) => {
                         let _ = reply.send(graph.rename_window(id, new_title, expected_version));
@@ -2693,7 +2771,8 @@ pub async fn run_graph_loop(
                         let _ = reply.send(graph.create_pane(window_id, cwd, command));
                     }
                     Some(GraphCommand::DestroyPane { id, expected_version, reply }) => {
-                        let _ = reply.send(graph.destroy_pane(id, expected_version));
+                        let out = durable_close(&graph, durability, |g| g.destroy_pane(id, expected_version)).await;
+                        let _ = reply.send(out);
                     }
                     Some(GraphCommand::SetPaneExitStatus { id, exit_status, reply }) => {
                         let _ = reply.send(graph.set_pane_exit_status(id, exit_status));
@@ -2744,7 +2823,8 @@ pub async fn run_graph_loop(
                         let _ = reply.send(graph.zoom_pane_if_focused(id, focused));
                     }
                     Some(GraphCommand::DestroyPaneAndEmptyParents { id, reply }) => {
-                        let _ = reply.send(graph.destroy_pane_and_empty_parents(id));
+                        let out = durable_close(&graph, durability, |g| g.destroy_pane_and_empty_parents(id)).await;
+                        let _ = reply.send(out);
                     }
                     Some(GraphCommand::SwapPanes { a, b, expected_version, reply }) => {
                         let _ = reply.send(graph.swap_panes(a, b, expected_version));
@@ -2756,6 +2836,11 @@ pub async fn run_graph_loop(
                         let _ = reply.send(graph.apply_batch(ops));
                     }
                     Some(GraphCommand::Atomically(Transaction(work))) => work(&graph),
+                    Some(GraphCommand::Seal { reply }) => {
+                        let _ = reply.send(graph.current());
+                        info!("Graph sealed: no further mutation is accepted");
+                        break;
+                    }
                     None => {
                         debug!("All graph command senders dropped, shutting down graph loop");
                         break;
@@ -2768,6 +2853,18 @@ pub async fn run_graph_loop(
             }
         }
     }
+}
+
+/// Makes a close durable before it commits: the workspace writer (#329), which
+/// must never let a saved workspace bring back what a user closed.
+pub trait Durability: Send + Sync {
+    /// Make `after` (the graph exactly as a valid close will leave it) durable.
+    /// The graph task waits for this, then commits the close; `Err` refuses
+    /// it, when nothing durable could be recorded.
+    fn close(
+        &self,
+        after: Arc<SessionGraphSnapshot>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>>;
 }
 
 /// A cloneable handle for sending commands to the SessionGraph.
@@ -2813,12 +2910,33 @@ impl GraphHandle {
         cwd: std::path::PathBuf,
         command: Vec<String>,
     ) -> Result<SessionId, GraphError> {
+        self.create_session_flagged(name, cwd, command, false).await
+    }
+
+    /// Create a lens scratch session: one no saved workspace ever holds.
+    pub async fn create_scratch_session(
+        &self,
+        name: String,
+        cwd: std::path::PathBuf,
+        command: Vec<String>,
+    ) -> Result<SessionId, GraphError> {
+        self.create_session_flagged(name, cwd, command, true).await
+    }
+
+    async fn create_session_flagged(
+        &self,
+        name: String,
+        cwd: std::path::PathBuf,
+        command: Vec<String>,
+        scratch: bool,
+    ) -> Result<SessionId, GraphError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.cmd_tx
             .send(GraphCommand::CreateSession {
                 name,
                 cwd,
                 initial_command: command,
+                scratch,
                 reply: tx,
             })
             .await
@@ -2826,21 +2944,37 @@ impl GraphHandle {
         rx.await.map_err(|_| GraphError::Shutdown)?
     }
 
+    /// Stop the graph taking mutations and return its final state. Every
+    /// command already ahead of this one has been applied; every one after it
+    /// fails with [`GraphError::Shutdown`]. A daemon seals before it stops its
+    /// panes, so what it saves last is the workspace as the user left it.
+    pub async fn seal(&self) -> Option<Arc<SessionGraphSnapshot>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(GraphCommand::Seal { reply: tx })
+            .await
+            .ok()?;
+        rx.await.ok()
+    }
+
     pub async fn destroy_session(
         &self,
         id: SessionId,
         expected_version: Option<Version>,
     ) -> Result<(), GraphError> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.cmd_tx
-            .send(GraphCommand::DestroySession {
-                id,
-                expected_version,
-                reply: tx,
-            })
-            .await
-            .map_err(|_| GraphError::Shutdown)?;
-        rx.await.map_err(|_| GraphError::Shutdown)?
+        (async {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            self.cmd_tx
+                .send(GraphCommand::DestroySession {
+                    id,
+                    expected_version,
+                    reply: tx,
+                })
+                .await
+                .map_err(|_| GraphError::Shutdown)?;
+            rx.await.map_err(|_| GraphError::Shutdown)?
+        })
+        .await
     }
 
     pub async fn rename_session(
@@ -2901,16 +3035,19 @@ impl GraphHandle {
         id: WindowId,
         expected_version: Option<Version>,
     ) -> Result<(), GraphError> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.cmd_tx
-            .send(GraphCommand::DestroyWindow {
-                id,
-                expected_version,
-                reply: tx,
-            })
-            .await
-            .map_err(|_| GraphError::Shutdown)?;
-        rx.await.map_err(|_| GraphError::Shutdown)?
+        (async {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            self.cmd_tx
+                .send(GraphCommand::DestroyWindow {
+                    id,
+                    expected_version,
+                    reply: tx,
+                })
+                .await
+                .map_err(|_| GraphError::Shutdown)?;
+            rx.await.map_err(|_| GraphError::Shutdown)?
+        })
+        .await
     }
 
     pub async fn rename_window(
@@ -2992,16 +3129,19 @@ impl GraphHandle {
         id: PaneId,
         expected_version: Option<Version>,
     ) -> Result<(), GraphError> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.cmd_tx
-            .send(GraphCommand::DestroyPane {
-                id,
-                expected_version,
-                reply: tx,
-            })
-            .await
-            .map_err(|_| GraphError::Shutdown)?;
-        rx.await.map_err(|_| GraphError::Shutdown)?
+        (async {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            self.cmd_tx
+                .send(GraphCommand::DestroyPane {
+                    id,
+                    expected_version,
+                    reply: tx,
+                })
+                .await
+                .map_err(|_| GraphError::Shutdown)?;
+            rx.await.map_err(|_| GraphError::Shutdown)?
+        })
+        .await
     }
 
     pub async fn set_pane_exit_status(
@@ -3303,12 +3443,15 @@ impl GraphHandle {
 
     /// See [`SessionGraph::destroy_pane_and_empty_parents`].
     pub async fn destroy_pane_and_empty_parents(&self, id: PaneId) -> Result<(), GraphError> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.cmd_tx
-            .send(GraphCommand::DestroyPaneAndEmptyParents { id, reply: tx })
-            .await
-            .map_err(|_| GraphError::Shutdown)?;
-        rx.await.map_err(|_| GraphError::Shutdown)?
+        (async {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            self.cmd_tx
+                .send(GraphCommand::DestroyPaneAndEmptyParents { id, reply: tx })
+                .await
+                .map_err(|_| GraphError::Shutdown)?;
+            rx.await.map_err(|_| GraphError::Shutdown)?
+        })
+        .await
     }
 
     pub async fn swap_panes(
@@ -3375,6 +3518,68 @@ mod tests {
 
     fn home() -> PathBuf {
         PathBuf::from("/home/test")
+    }
+
+    /// Records what it is asked to make durable, and what the live graph held
+    /// at that moment.
+    #[derive(Default)]
+    struct Recorder {
+        live: std::sync::Mutex<Option<Arc<ArcSwap<SessionGraphSnapshot>>>>,
+        seen: std::sync::Mutex<Vec<(usize, usize)>>,
+    }
+
+    impl Durability for Recorder {
+        fn close(
+            &self,
+            after: Arc<SessionGraphSnapshot>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>>
+        {
+            let live = self
+                .live
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .load()
+                .sessions
+                .len();
+            self.seen.lock().unwrap().push((after.sessions.len(), live));
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// A close is made durable as the graph will be after it, before it
+    /// commits; a close the graph refuses is never made durable at all.
+    #[tokio::test]
+    async fn a_close_is_durable_before_it_commits_and_only_if_valid() {
+        let (graph, state) = SessionGraph::new();
+        let a = graph.create_session("a".into(), home()).expect("create");
+        graph.create_session("b".into(), home()).expect("create");
+        let recorder = Arc::new(Recorder::default());
+        *recorder.live.lock().unwrap() = Some(state.clone());
+        let (tx, rx) = mpsc::channel(4);
+        let stop = tokio_util::sync::CancellationToken::new();
+        let durability: Arc<dyn Durability> = recorder.clone();
+        tokio::spawn(run_graph_loop_durable(
+            graph,
+            rx,
+            stop.clone(),
+            Some(durability),
+        ));
+        let handle = GraphHandle::new(tx, state);
+
+        let stale = handle.snapshot().sessions[&a].version + 1;
+        assert!(handle.destroy_session(a, Some(stale)).await.is_err());
+        assert!(
+            recorder.seen.lock().unwrap().is_empty(),
+            "a refused close was saved"
+        );
+
+        handle.destroy_session(a, None).await.unwrap();
+        // Saved as one session, while the graph still held two.
+        assert_eq!(*recorder.seen.lock().unwrap(), [(1, 2)]);
+        assert_eq!(handle.snapshot().sessions.len(), 1);
+        stop.cancel();
     }
 
     #[test]

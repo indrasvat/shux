@@ -72,6 +72,7 @@ pub(crate) fn build_router(
                                                         shux_rpc::Router::builder(),
                                                     ),
                                                     graph.clone(),
+                                                    io_state.clone(),
                                                     cancel.clone(),
                                                 ),
                                                 graph.clone(),

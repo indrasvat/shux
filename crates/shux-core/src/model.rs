@@ -106,9 +106,18 @@ pub struct Session {
     /// explicit grant (see `docs/designs/permissions/README.md` §5.2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_by_plugin: Option<PluginId>,
+    /// A lens scratch session: never written to a saved workspace. Set in the
+    /// commit that creates the session, so no snapshot ever lacks it.
+    #[serde(skip)]
+    pub scratch: bool,
 }
 
 static NEXT_SESSION_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Sessions created from now on sort after every session up to `seq`.
+pub fn advance_session_seq_past(seq: u64) {
+    NEXT_SESSION_SEQ.fetch_max(seq.saturating_add(1), std::sync::atomic::Ordering::Relaxed);
+}
 
 impl Session {
     pub fn new(name: impl Into<String>, initial_window_id: WindowId) -> Self {
@@ -124,6 +133,7 @@ impl Session {
             tags: HashMap::new(),
             version: 1,
             created_by_plugin: None,
+            scratch: false,
         }
     }
 }

@@ -221,6 +221,7 @@ install-tools: ## Install dev dependencies (nextest, llvm-cov, deny, hyperfine, 
 	@bash scripts/ensure-deny.sh
 	@bash scripts/ensure-hyperfine.sh
 	cargo install lefthook --locked || npm i -g lefthook
+	cargo install cargo-mutants --locked
 	@echo "$(COLOR_GREEN)✓ Dev tools installed$(COLOR_RESET)"
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -247,6 +248,12 @@ test-verbose: nextest-ready ## Run tests with output visible
 test-focus: nextest-ready ## Run one crate's tests matching a filter: PKG=<crate> FILTER=<nextest filter>
 	@test -n "$(PKG)" || { echo "test-focus: PKG=<crate> is required" >&2; exit 2; }
 	@.shux/scripts/no_leak_guard.sh $(NEXTEST_RUN) -p $(PKG) $(FILTER)
+
+.PHONY: mutants
+mutants: nextest-ready ## Mutants of one file the suite lets survive: PKG=<crate> FILE=<path> (docs/testing.md#adding-a-test)
+	@test -n "$(PKG)" && test -n "$(FILE)" || { echo "mutants: PKG=<crate> FILE=<path> are required" >&2; exit 2; }
+	@command -v cargo-mutants >/dev/null || { echo "mutants: cargo-mutants is not installed (make install-tools)" >&2; exit 2; }
+	@.shux/scripts/no_leak_guard.sh cargo mutants --colors always --test-tool nextest -p $(PKG) -f $(FILE) --output .shux/out/mutants
 
 .PHONY: test-lib
 test-lib: nextest-ready ## Run library tests only
@@ -987,7 +994,11 @@ FUZZ_SECONDS ?= 60
 FUZZ_PROGRAM_STATUS := program_status_decode program_status_table scanner_vs_vte vt_program_status_stream vt_command_capture
 
 .PHONY: fuzz
-fuzz: fuzz-program-status fuzz-pane-mouse fuzz-pane-record ## Run every libFuzzer target (FUZZ_SECONDS each, default 60)
+fuzz: fuzz-program-status fuzz-pane-mouse fuzz-pane-record fuzz-workspace ## Run every libFuzzer target (FUZZ_SECONDS each, default 60)
+
+.PHONY: fuzz-workspace
+fuzz-workspace: ## Saved-workspace decoding: any bytes on disk are refused or restored whole (FUZZ_SECONDS)
+	@bash scripts/fuzz.sh $(FUZZ_SECONDS) workspace_decode
 
 .PHONY: fuzz-pane-record
 fuzz-pane-record: ## Recording lifecycle: overlapping starts, stops, faults, shutdown (FUZZ_SECONDS)

@@ -163,7 +163,7 @@ pub async fn handle_daemon_upgrade(
         return report.say(
             0,
             "stopped",
-            "stopped the daemon, ending its sessions",
+            "stopped the daemon, ending its programs; its workspace comes back on the new build",
             &starts,
         );
     }

@@ -31,7 +31,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use shux_core::config::ConfigHandle;
-use shux_core::graph::{GraphError, GraphHandle};
+use shux_core::graph::GraphHandle;
 use shux_core::layout::{NavDirection, Rect};
 use shux_core::model::{PaneId, SessionId, WindowId};
 use shux_core::theme::Theme;
@@ -636,9 +636,22 @@ async fn serve_connection(
     //
     // A watcher starts nothing: it shows what is there.
     if !read_only {
+        // A pane a restore owns gets its shell there, in its last directory.
+        // Not ready until it has: input sent before would have no writer.
+        let restoring = {
+            let state = io_state.lock().await;
+            (!state.writers.contains_key(&session.active_pane_id)
+                && state.awaiting_restore.contains(&session.active_pane_id))
+            .then(|| state.restore_ready.clone())
+        };
+        if let Some(mut ready) = restoring {
+            let _ = tokio::time::timeout(shux_rpc::router::READY_PATIENCE, ready.wait_for(|r| *r))
+                .await;
+        }
         let writer_present = {
             let state = io_state.lock().await;
             state.writers.contains_key(&session.active_pane_id)
+                || state.awaiting_restore.contains(&session.active_pane_id)
         };
         if !writer_present {
             let snap = graph.snapshot();
@@ -5187,93 +5200,23 @@ async fn kill_pane(
 ) -> anyhow::Result<()> {
     let pane_id = attached.active_pane_id;
 
-    // Resolve the pane's window + session BEFORE we mutate anything, so
-    // the cascade fallbacks have valid IDs even after destroy_pane bumps
-    // the snapshot. Without this, a fresh `shux` session (single pane,
-    // single window) silently no-op'd on Ctrl+Space x — destroy_pane
-    // returned LastPane, the warn-log went nowhere, the user saw nothing.
-    let snap = graph.snapshot();
-    let (window_id, session_id) = match snap.panes.get(&pane_id) {
-        Some(p) => {
-            let sid = snap.windows.get(&p.window_id).map(|w| w.session_id);
-            match sid {
-                Some(s) => (p.window_id, s),
-                None => {
-                    warn!(%pane_id, "kill_pane: pane's window has no session");
-                    return Ok(());
-                }
-            }
-        }
-        None => {
-            warn!(%pane_id, "kill_pane: active pane not in snapshot");
-            return Ok(());
-        }
-    };
-    drop(snap);
-
-    // tmux-style cascade: pane → window → session. The graph API stays
-    // strict (LastPane/LastWindow are real errors for programmatic
-    // clients that want pinned semantics); the human-interactive
-    // Ctrl+Space x action cascades so the user can always kill what's
-    // in front of them. When the cascade reaches destroy_session, the
-    // attach frame loop notices the session is gone on its next tick
-    // and sends SessionEnded — the client detaches naturally.
-    match graph.destroy_pane(pane_id, None).await {
-        Ok(()) => {
-            cleanup_pane_io(io_state, &[pane_id]).await;
-            return Ok(());
-        }
-        Err(GraphError::LastPane) => {
-            // Fall through to window kill.
-        }
-        Err(e) => {
-            warn!(error = %e, "kill_pane: destroy_pane failed");
-            return Ok(());
-        }
-    }
-
-    let window_pane_ids: Vec<PaneId> = {
-        let snap = graph.snapshot();
-        snap.panes
-            .values()
-            .filter(|p| p.window_id == window_id)
-            .map(|p| p.id)
-            .collect()
-    };
-
-    match graph.destroy_window(window_id, None).await {
-        Ok(()) => {
-            cleanup_pane_io(io_state, &window_pane_ids).await;
-            return Ok(());
-        }
-        Err(GraphError::LastWindow) => {
-            // Fall through to session kill.
-        }
-        Err(e) => {
-            warn!(error = %e, "kill_pane: destroy_window failed");
-            return Ok(());
-        }
-    }
-
-    let session_pane_ids: Vec<PaneId> = {
-        let snap = graph.snapshot();
-        let win_ids: std::collections::HashSet<WindowId> = snap
-            .sessions
-            .get(&session_id)
-            .map(|s| s.windows.iter().copied().collect())
-            .unwrap_or_default();
-        snap.panes
-            .values()
-            .filter(|p| win_ids.contains(&p.window_id))
-            .map(|p| p.id)
-            .collect()
-    };
-
-    if let Err(e) = graph.destroy_session(session_id, None).await {
-        warn!(error = %e, "kill_pane: destroy_session failed");
+    // tmux-style cascade: the pane, then its window if that empties, then
+    // the session if that empties, in one graph step so nothing (a split
+    // from another client) lands between the steps. When the session goes,
+    // the attach frame loop notices on its next tick and sends SessionEnded.
+    let before = graph.snapshot();
+    if let Err(e) = graph.destroy_pane_and_empty_parents(pane_id).await {
+        warn!(error = %e, "kill_pane: destroy failed");
         return Ok(());
     }
-    cleanup_pane_io(io_state, &session_pane_ids).await;
+    let after = graph.snapshot();
+    let gone: Vec<PaneId> = before
+        .panes
+        .keys()
+        .filter(|p| !after.panes.contains_key(p))
+        .copied()
+        .collect();
+    cleanup_pane_io(io_state, &gone).await;
     Ok(())
 }
 
@@ -7135,6 +7078,97 @@ mod tests {
         .expect("zoomed mouse noop");
         assert_eq!(session.lock().await.active_pane_id, before);
 
+        fixture.stop();
+    }
+
+    /// An attach to a pane whose shell a restore is still starting is ready
+    /// only once that shell is there: what is typed at once reaches it.
+    #[tokio::test]
+    async fn an_attach_to_a_pane_being_restored_waits_for_its_shell() {
+        let fixture = attach_fixture().await;
+        let pane = fixture.first_pane;
+        let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
+        {
+            let mut io = fixture.io_state.lock().await;
+            io.awaiting_restore.insert(pane);
+            io.restore_ready = ready_rx;
+        }
+        // The restore, finishing once the attach waits for it.
+        let restore = tokio::spawn({
+            let io = fixture.io_state.clone();
+            async move {
+                shux_testkit::wait_until_async("the attach to wait for the restore", || {
+                    let waiting = ready_tx.receiver_count() > 1;
+                    async move { waiting }
+                })
+                .await;
+                let (writer_rx, _, _) = seed_io_for_pane(&io, pane).await;
+                io.lock().await.awaiting_restore.remove(&pane);
+                ready_tx.send_replace(true);
+                writer_rx
+            }
+        });
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = ConfigHandle::load_or_default(&temp.path().join("missing.toml"));
+        let onboarding = crate::onboarding::OnboardingHandle::from_state_for_test(
+            crate::onboarding::OnboardingState {
+                prefix_discovered: true,
+                welcome_toast_seen: true,
+            },
+        );
+        let (server_stream, client_stream) = UnixStream::pair().expect("unix pair");
+        tokio::spawn(handle_attach_connection(
+            server_stream,
+            fixture.graph.clone(),
+            fixture.io_state.clone(),
+            config,
+            SegmentCache::new(),
+            crate::session_meta::SessionMetaCache::new(),
+            onboarding,
+            std::time::Instant::now(),
+            fixture.cancel.child_token(),
+        ));
+        let mut framed = Framed::new(client_stream, create_codec());
+        let hello = AttachHello {
+            protocol: ATTACH_PROTOCOL_VERSION,
+            session_name: Some(fixture.attached.name.clone()),
+            cols: 90,
+            rows: 24,
+            client_version: "test".to_string(),
+            graphics: false,
+            plain: false,
+            read_only: false,
+            no_color: false,
+        };
+        framed
+            .send(Bytes::from(serde_json::to_vec(&hello).expect("hello json")))
+            .await
+            .expect("send hello");
+        let ready = tokio::time::timeout(shux_testkit::BUDGET, framed.next())
+            .await
+            .expect("ready timeout")
+            .expect("ready frame")
+            .expect("ready bytes");
+        assert!(matches!(
+            serde_json::from_slice(&ready).expect("ready json"),
+            AttachReady::Ok { .. }
+        ));
+        framed
+            .send(Bytes::from(
+                serde_json::to_vec(&AttachClientFrame::Input {
+                    data: BASE64.encode(b"ls\n"),
+                })
+                .expect("input json"),
+            ))
+            .await
+            .expect("send input");
+        let mut writer_rx = restore.await.expect("the restore");
+        let written = tokio::time::timeout(shux_testkit::BUDGET, writer_rx.recv())
+            .await
+            .expect("typed at once, lost")
+            .expect("writer bytes");
+        assert_eq!(written, b"ls\n");
         fixture.stop();
     }
 

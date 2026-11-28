@@ -35,7 +35,9 @@ pub(crate) fn graph_error_to_rpc(e: shux_core::graph::GraphError) -> shux_rpc::R
         GraphError::PaneSwapSelf | GraphError::PaneCrossWindow | GraphError::NoNeighbor(_) => {
             shux_rpc::RpcError::invalid_params(&e.to_string())
         }
-        GraphError::LayoutError(_) => shux_rpc::RpcError::internal(&e.to_string()),
+        GraphError::LayoutError(_) | GraphError::NotDurable(_) => {
+            shux_rpc::RpcError::internal(&e.to_string())
+        }
         GraphError::VersionConflict {
             resource,
             ref id,

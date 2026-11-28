@@ -26,6 +26,7 @@ pub(crate) fn register_window_methods(
 ) -> shux_rpc::RouterBuilder {
     let g1 = graph.clone();
     let g2 = graph.clone();
+    let g_layout = graph.clone();
     let g3 = graph.clone();
     let g4 = graph.clone();
     let g5 = graph.clone();
@@ -117,6 +118,67 @@ pub(crate) fn register_window_methods(
                     result["pane_id"] = serde_json::Value::String(pane_id.to_string());
 
                     Ok(result)
+                }
+            },
+        )
+        // A window's split tree and where each pane sits in a `cols`×`rows`
+        // window, from the layout engine itself. The tree is unzoomed, as a
+        // flat node table: a nested one could be deeper than a JSON reader takes.
+        .register_with_policy(
+            "window.layout",
+            Policy::fixed(Sensitivity::Public),
+            move |params: Option<serde_json::Value>| {
+                let gh = g_layout.clone();
+                async move {
+                    let params = params.unwrap_or_default();
+                    let id = required_str(&params, "id")?;
+                    let window_id = resolve_window_ref(&gh, id, "id")?;
+                    let size = |key: &str| -> Result<u16, shux_rpc::RpcError> {
+                        params
+                            .get(key)
+                            .and_then(serde_json::Value::as_u64)
+                            .and_then(|n| u16::try_from(n).ok())
+                            .filter(|n| (1..=10_000).contains(n))
+                            .ok_or_else(|| {
+                                shux_rpc::RpcError::invalid_params(&format!(
+                                    "`{key}` is required: a whole number from 1 to 10000"
+                                ))
+                            })
+                    };
+                    let (cols, rows) = (size("cols")?, size("rows")?);
+                    let snap = gh.snapshot();
+                    let window = snap
+                        .windows
+                        .get(&window_id)
+                        .ok_or_else(|| shux_rpc::RpcError::not_found("window", id))?;
+                    let (tree, zoomed) = match &window.layout.zoom {
+                        Some(z) => (&z.saved_layout, Some(z.zoomed_pane)),
+                        None => (&window.layout.tree, None),
+                    };
+                    let mut nodes = Vec::new();
+                    let root = shux_core::persist::flatten(tree, &mut nodes);
+                    let mut panes: Vec<serde_json::Value> = window
+                        .layout
+                        .compute_rects(shux_core::layout::Rect::new(0, 0, cols, rows))
+                        .into_iter()
+                        .map(|(pane, r)| {
+                            serde_json::json!({
+                                "pane_id": pane,
+                                "x": r.x, "y": r.y, "cols": r.width, "rows": r.height,
+                            })
+                        })
+                        .collect();
+                    panes.sort_by_key(|p| (p["y"].as_u64(), p["x"].as_u64()));
+                    Ok(serde_json::json!({
+                        "window_id": window_id,
+                        "cols": cols,
+                        "rows": rows,
+                        "zoomed_pane": zoomed,
+                        "active_pane": window.active_pane,
+                        "root": root,
+                        "nodes": nodes,
+                        "panes": panes,
+                    }))
                 }
             },
         )
@@ -401,7 +463,9 @@ pub(crate) fn register_window_methods(
 
                     {
                         let mut state = io.lock().await;
-                        let pulse = state.teardown_panes(&pane_ids, true);
+                        let mut gone = state.panes_gone_from(&gh.snapshot());
+                        gone.extend(pane_ids);
+                        let pulse = state.teardown_panes(&gone, true);
                         drop(state);
                         pulse.bump();
                     }
@@ -410,4 +474,72 @@ pub(crate) fn register_window_methods(
                 }
             },
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::rpc::test_harness::{RpcHarness, dispatch_err, dispatch_ok};
+    use shux_core::layout::Direction;
+
+    /// A zoomed window reports its real tree, unzoomed, with the zoomed pane
+    /// covering the whole window; unzoomed, each pane gets its own share. A
+    /// size the layout cannot use is refused.
+    #[tokio::test]
+    async fn layout_reports_the_real_tree_and_where_each_pane_sits() {
+        let h = RpcHarness::new();
+        let (_, window, left) = h.seed_session("lay").await;
+        let right = h
+            .graph
+            .split_pane(left, Direction::Vertical, 0.25)
+            .await
+            .unwrap();
+        h.graph.zoom_pane(right, None).await.unwrap();
+        let ask = || serde_json::json!({"id": window.to_string(), "cols": 100, "rows": 20});
+
+        let zoomed = dispatch_ok(&h.router, "window.layout", ask()).await;
+        assert_eq!(zoomed["zoomed_pane"], right.to_string());
+        let root = &zoomed["nodes"][zoomed["root"].as_u64().unwrap() as usize];
+        assert_eq!(
+            root["t"], "split",
+            "the unzoomed tree, not the zoom leaf: {zoomed}"
+        );
+        assert_eq!(root["dir"], "vertical");
+        assert_eq!(
+            zoomed["panes"],
+            serde_json::json!([{"pane_id": right.to_string(), "x": 0, "y": 0, "cols": 100, "rows": 20}])
+        );
+
+        h.graph.zoom_pane(right, None).await.unwrap();
+        let split = dispatch_ok(&h.router, "window.layout", ask()).await;
+        assert!(split["zoomed_pane"].is_null());
+        let panes = split["panes"].as_array().unwrap();
+        assert_eq!(panes.len(), 2, "{split}");
+        let cols = |p: &str| {
+            panes
+                .iter()
+                .find(|x| x["pane_id"] == p)
+                .and_then(|x| x["cols"].as_u64())
+                .unwrap()
+        };
+        assert!(
+            cols(&left.to_string()) < cols(&right.to_string()),
+            "{split}"
+        );
+
+        for bad in [0, 10_001] {
+            let err = dispatch_err(
+                &h.router,
+                "window.layout",
+                serde_json::json!({"id": window.to_string(), "cols": bad, "rows": 20}),
+            )
+            .await;
+            let detail = err
+                .data
+                .as_ref()
+                .and_then(|d| d["detail"].as_str())
+                .unwrap_or("");
+            assert!(detail.contains("cols"), "{bad}: {err:?}");
+        }
+        h.stop().await;
+    }
 }

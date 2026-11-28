@@ -75,6 +75,7 @@ impl RpcHarness {
             crate::rpc::daemon::register_daemon_methods(
                 shux_rpc::Router::builder(),
                 graph.clone(),
+                io.clone(),
                 cancel.clone(),
             ),
             graph.clone(),

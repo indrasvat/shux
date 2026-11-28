@@ -53,6 +53,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "workspace_decode"
+path = "fuzz_targets/workspace_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "vt_command_capture"
 path = "fuzz_targets/vt_command_capture.rs"
 test = false
