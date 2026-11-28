@@ -1,3 +1,10 @@
+# [0.67.0](https://github.com/indrasvat/shux/compare/v0.66.1...v0.67.0) (2026-11-28)
+
+
+### Features
+
+* **workspace:** the daemon saves its workspace and restores it on start ([#331](https://github.com/indrasvat/shux/issues/331)) ([2145871](https://github.com/indrasvat/shux/commit/2145871068a9764737b05fe15896458bf450ec80)), closes [#329](https://github.com/indrasvat/shux/issues/329) [#329](https://github.com/indrasvat/shux/issues/329) [#322](https://github.com/indrasvat/shux/issues/322) [#330](https://github.com/indrasvat/shux/issues/330)
+
 ## [0.66.1](https://github.com/indrasvat/shux/compare/v0.66.0...v0.66.1) (2026-11-26)
 
 
