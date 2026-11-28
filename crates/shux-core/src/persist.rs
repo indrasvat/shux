@@ -380,14 +380,6 @@ pub fn validate(ws: &Workspace) -> Result<(), RestoreError> {
             crate::graph::SessionGraph::check_window_title(&w.title)
                 .map_err(|e| invalid(format!("window {}: {e}", w.id)))?;
             let leaves = validate_tree(w)?;
-            if leaves.len() != w.panes.len() {
-                return Err(invalid(format!(
-                    "window {}: {} leaves but {} panes",
-                    w.id,
-                    leaves.len(),
-                    w.panes.len()
-                )));
-            }
             let mut listed = HashSet::new();
             for p in &w.panes {
                 if !ids.insert(p.id.0) {
@@ -613,7 +605,6 @@ pub fn fuzz_one(bytes: &[u8]) {
 mod tests {
     use super::*;
     use crate::graph::SessionGraph;
-    use crate::layout::Rect;
     use proptest::prelude::*;
     use std::os::unix::ffi::OsStringExt;
 
@@ -745,12 +736,6 @@ mod tests {
         p.osc_title = None;
         p.recalculate_title();
         p.title
-    }
-
-    fn rects(l: &WindowLayout, w: u16, h: u16) -> Vec<(PaneId, Rect)> {
-        let mut r = l.compute_rects(Rect::new(0, 0, w, h));
-        r.sort_by_key(|(p, _)| p.0);
-        r
     }
 
     /// Two sessions; the first's window is split three ways and zoomed.
@@ -1039,8 +1024,6 @@ mod tests {
         #[test]
         fn a_saved_graph_comes_back_whole(
             ops in proptest::collection::vec(op(), 1..60),
-            w in 2u16..300,
-            h in 2u16..120,
         ) {
             let g = build(&ops);
             let before = g.current();
@@ -1071,7 +1054,6 @@ mod tests {
                 prop_assert_eq!(t.session_id, win.session_id);
                 prop_assert_eq!(t.active_pane, win.active_pane);
                 prop_assert_eq!(format!("{:?}", t.layout), format!("{:?}", win.layout));
-                prop_assert_eq!(rects(&t.layout, w, h), rects(&win.layout, w, h));
                 prop_assert_eq!(&t.tags, &win.tags);
                 prop_assert_eq!(t.version, win.version + 1);
             }

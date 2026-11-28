@@ -498,7 +498,7 @@ pub(crate) async fn handle_daemon_command(
             }
             Ok(())
         }
-        cli::DaemonCommand::Stop { discard: true } => discard_workspace(ours, socket, format),
+        cli::DaemonCommand::Stop { discard: true } => discard_workspace(ours, socket, format).await,
         cli::DaemonCommand::Stop { discard: false } => {
             let Some(p) = ours else {
                 // Idempotent, and exit 0: a cleanup trap may run this twice
@@ -550,11 +550,13 @@ async fn ask_workspace(socket: &Path) -> serde_json::Value {
 /// `daemon stop --discard`: stop the daemon, then delete its saved workspace,
 /// holding the start lock throughout so no client starts (and restores) one
 /// in between.
-fn discard_workspace(
+async fn discard_workspace(
     ours: Option<u32>,
     socket: &Path,
     format: cli::OutputFormat,
 ) -> anyhow::Result<()> {
+    // After a reboot the runtime dir is gone; the saved workspace is not.
+    daemon::ensure_runtime_dir()?;
     let start_lock_path = daemon::start_lock_path_for(socket)?;
     let deadline = std::time::Instant::now() + crate::patience::peer_patience();
     let _start_lock = loop {
@@ -608,6 +610,25 @@ fn discard_workspace(
             )
         }
     };
+    // The saved workspace is the only record of shells a killed daemon left
+    // running; end them before it goes.
+    let saved = store.read_workspace(shux_core::persist::MAX_FILE_BYTES);
+    if let Ok(Some(bytes)) = saved
+        && let Ok(ws) =
+            shux_core::persist::decode(&bytes, &daemon::socket_key(socket).to_string_lossy())
+    {
+        let shells = ws
+            .sessions
+            .iter()
+            .flat_map(|s| &s.windows)
+            .flat_map(|w| &w.panes)
+            .filter_map(|p| p.process);
+        for shell in shells {
+            if let Ok(pgid) = u32::try_from(shell.pid) {
+                let _ = crate::lens_scratch::kill_pgid_lens_sequence(pgid, shell.start_token).await;
+            }
+        }
+    }
     store.discard()?;
     if let cli::OutputFormat::Json = format {
         println!(
@@ -622,11 +643,11 @@ fn discard_workspace(
 
 /// SIGTERM daemon `p` and wait for it to go: whether it went.
 pub(crate) fn stop_and_wait(p: u32, socket: &Path) -> bool {
-    // SIGTERM → the daemon's signal handler runs a graceful shutdown.
-    let _ = nix::sys::signal::kill(
-        nix::unistd::Pid::from_raw(p as i32),
-        nix::sys::signal::Signal::SIGTERM,
-    );
+    // SIGTERM → the daemon's signal handler runs a graceful shutdown. A
+    // stopped process takes none until it runs again.
+    let pid = nix::unistd::Pid::from_raw(p as i32);
+    let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGCONT);
+    let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
     // Identity, not `kill(pid, 0)`: an exited daemon stays a zombie until
     // its parent reaps it, which a subreaper may never do.
     let deadline = std::time::Instant::now() + crate::patience::peer_patience();
@@ -1106,6 +1127,9 @@ pub(crate) async fn run_rpc_server(
         auth_token: None,
     };
 
+    // Calls about panes wait until every restored pane's shell has started.
+    let (ready_tx, ready_rx) = tokio::sync::watch::channel(restored_panes.is_empty());
+    let router = router.wait_until_ready(ready_rx);
     let server =
         shux_rpc::Server::new(config, router, cancel.clone()).with_rebind_gate(rebind_gate);
     let connections = server.connections();
@@ -1133,6 +1157,7 @@ pub(crate) async fn run_rpc_server(
         shutdown_io_state.clone(),
         graph_handle.clone(),
         workspace_cancel.clone(),
+        ready_tx,
     ));
     tokio::spawn(crate::workspace::run_cwd_sampler(
         shutdown_io_state.clone(),

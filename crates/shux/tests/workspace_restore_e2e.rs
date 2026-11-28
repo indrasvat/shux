@@ -67,23 +67,17 @@ fn wait_saved(env: &Env, also: impl Fn(&str) -> bool) {
     });
 }
 
+fn server_dir(env: &Env) -> Option<std::path::PathBuf> {
+    let servers = env.path("state/shux/servers");
+    Some(std::fs::read_dir(servers).ok()?.next()?.ok()?.path())
+}
+
 fn saved_file(env: &Env) -> Option<String> {
-    let servers = env.path("state/shux/servers");
-    let dir = std::fs::read_dir(servers).ok()?.next()?.ok()?.path();
-    std::fs::read_to_string(dir.join("workspace.json")).ok()
+    std::fs::read_to_string(server_dir(env)?.join("workspace.json")).ok()
 }
 
-fn server_dir(env: &Env) -> std::path::PathBuf {
-    let servers = env.path("state/shux/servers");
-    std::fs::read_dir(servers)
-        .expect("servers")
-        .next()
-        .expect("one server dir")
-        .expect("entry")
-        .path()
-}
-
-fn pwd(env: &Env, session: &str, pane: &str) -> String {
+/// Run `cmd` in the pane's shell and return what it printed.
+fn run(env: &Env, session: &str, pane: &str, cmd: &str) -> String {
     let r = json(
         env,
         &[
@@ -98,7 +92,7 @@ fn pwd(env: &Env, session: &str, pane: &str) -> String {
             "--boundaries",
             "markers",
             "-c",
-            "pwd",
+            cmd,
         ],
     );
     r["stdout"].as_str().unwrap_or("").trim().to_string()
@@ -188,21 +182,7 @@ fn workspace(env: &mut Env) -> (String, std::path::PathBuf) {
     env.ok(&["pane", "zoom", "-s", "ws", "-p", &z]);
     env.ok(&["window", "focus", "-s", "ws", "-w", "1"]);
 
-    let cd = format!("cd '{}'", moved.display());
-    env.ok(&[
-        "pane",
-        "run",
-        "-s",
-        "ws",
-        "-p",
-        &p1,
-        "--timeout",
-        "60s",
-        "--boundaries",
-        "markers",
-        "-c",
-        &cd,
-    ]);
+    run(env, "ws", &p1, &format!("cd '{}'", moved.display()));
     (p1, moved.canonicalize().unwrap())
 }
 
@@ -243,25 +223,16 @@ fn every_way_a_daemon_ends_keeps_its_workspace() {
             );
         }
         assert_eq!(
-            pwd(&env, "ws", &moved_pane),
+            run(&env, "ws", &moved_pane, "pwd"),
             want_dir,
             "after {how}: wrong directory"
         );
-        let probe = format!("printf '{COLOUR_PROBE}\\n'");
-        env.ok(&[
-            "pane",
-            "run",
-            "-s",
+        run(
+            &env,
             "ws",
-            "-p",
             &moved_pane,
-            "--timeout",
-            "60s",
-            "--boundaries",
-            "markers",
-            "-c",
-            &probe,
-        ]);
+            &format!("printf '{COLOUR_PROBE}\\n'"),
+        );
         env.assert_colour_probe(&moved_pane);
         wait_saved(&env, |f| f.contains(&want_dir));
     }
@@ -326,15 +297,9 @@ fn a_workspace_it_cannot_trust_is_set_aside() {
     env.owns("s");
     wait_saved(&env, |f| f.contains("\"s\""));
     env.ok(&["daemon", "stop"]);
-    let dir = server_dir(&env);
+    let dir = server_dir(&env).expect("a server dir");
     let good = std::fs::read(dir.join("workspace.json")).unwrap();
-    let digest = {
-        use sha2::Digest;
-        sha2::Sha256::digest(&good)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()
-    };
+    let digest = shux::workspace_store::digest(&good);
     let future =
         String::from_utf8(good.clone())
             .unwrap()
@@ -351,7 +316,8 @@ fn a_workspace_it_cannot_trust_is_set_aside() {
     for (reason, bytes, marked) in cases {
         std::fs::write(dir.join("workspace.json"), &bytes).unwrap();
         if marked {
-            std::fs::write(dir.join("restoring"), &digest).unwrap();
+            // Two restores of these bytes already died part way.
+            std::fs::write(dir.join("restoring"), format!("{digest} 2")).unwrap();
         }
         assert_eq!(
             sessions(&env),
@@ -382,13 +348,17 @@ fn a_workspace_it_cannot_trust_is_set_aside() {
 #[test]
 fn discard_forgets_the_workspace() {
     let mut env = Env::new(100, 30);
-    let states: [Step; 3] = [
+    let states: [Step; 4] = [
         ("running", &|_| {}),
         ("stopped", &|env| {
             // SAFETY: kill(2) on this fixture's own daemon.
             assert_eq!(unsafe { libc::kill(daemon_pid(env), libc::SIGSTOP) }, 0);
         }),
         ("absent", &|env| kill_daemon(env)),
+        ("after a reboot", &|env| {
+            kill_daemon(env);
+            std::fs::remove_dir_all(env.path("runtime/shux")).unwrap();
+        }),
     ];
     for (state, prepare) in states {
         env.ok(&["session", "create", "gone", "-d"]);
@@ -404,33 +374,96 @@ fn discard_forgets_the_workspace() {
     }
 }
 
-/// A shell that ignores SIGHUP outlives a `kill -9`'d daemon; the next daemon
-/// ends it before starting a fresh shell in its pane, so they never pile up.
+/// A shell that ignores SIGHUP outlives a `kill -9`'d daemon. The next daemon
+/// ends it before starting a fresh shell in its pane, and so does
+/// `daemon stop --discard`, which deletes the only record of it.
 #[test]
 fn a_shell_left_by_a_killed_daemon_is_reaped() {
     let mut env = Env::new(100, 30);
-    let pidfile = env.work("orphan.pid");
-    let script = format!(
-        "trap '' HUP; echo $$ > '{}'; while :; do sleep 1; done",
-        pidfile.display()
-    );
-    env.ok(&["session", "create", "o", "-d", "--", "sh", "-c", &script]);
-    env.owns("o");
-    let orphan: i32 = shux_testkit::wait_for("the pane's shell pid", || {
-        std::fs::read_to_string(&pidfile).ok()?.trim().parse().ok()
-    });
-    wait_saved(&env, |f| f.contains("start_token"));
+    let ends: [Step; 2] = [
+        ("restart", &|env| {
+            env.ok(&["session", "list"]);
+        }),
+        ("discard", &|env| {
+            env.ok(&["daemon", "stop", "--discard"]);
+        }),
+    ];
+    for (how, end) in ends {
+        let pidfile = env.work(&format!("{how}.pid"));
+        let script = format!(
+            "trap '' HUP; echo $$ > '{}'; while :; do sleep 1; done",
+            pidfile.display()
+        );
+        env.ok(&["session", "create", how, "-d", "--", "sh", "-c", &script]);
+        env.owns(how);
+        let orphan: i32 = shux_testkit::wait_for("the pane's shell pid", || {
+            std::fs::read_to_string(&pidfile).ok()?.trim().parse().ok()
+        });
+        wait_saved(&env, |f| f.contains(how) && f.contains("start_token"));
+        kill_daemon(&env);
+        // SAFETY: kill(2) with signal 0 only probes.
+        assert_eq!(
+            unsafe { libc::kill(orphan, 0) },
+            0,
+            "{how}: the shell did not survive"
+        );
+        end(&env);
+        shux_testkit::wait_until(
+            &format!("{how}: the orphaned shell to be reaped"),
+            || unsafe { libc::kill(orphan, 0) != 0 },
+        );
+    }
+}
+
+/// A state directory made read-only can save nothing, so a session killed
+/// there would come back from the old file: the daemon refuses to restore
+/// from a directory it cannot write.
+#[test]
+fn a_read_only_state_dir_never_resurrects_a_close() {
+    let mut env = Env::new(100, 30);
+    env.ok(&["session", "create", "keep", "-d"]);
+    env.owns("keep");
+    env.ok(&["session", "create", "doomed", "-d"]);
+    wait_saved(&env, |f| f.contains("doomed"));
+    let dir = server_dir(&env).expect("a server dir");
+    let mode = |m| std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(m));
+    mode(0o500).unwrap();
+    env.ok(&["session", "kill", "doomed"]);
     kill_daemon(&env);
-    // SAFETY: kill(2) with signal 0 only probes.
-    assert_eq!(
-        unsafe { libc::kill(orphan, 0) },
-        0,
-        "the shell did not survive"
+    let back = sessions(&env);
+    mode(0o700).unwrap();
+    assert!(
+        !back.contains(&"doomed".to_string()),
+        "a killed session came back: {back:?}"
     );
-    env.ok(&["session", "list"]);
-    shux_testkit::wait_until("the orphaned shell to be reaped", || unsafe {
-        libc::kill(orphan, 0) != 0
+}
+
+/// A pane whose shell cannot start again comes back as an exited pane that
+/// says why, never as a pane with no program behind it.
+#[test]
+fn a_pane_that_cannot_restart_says_why() {
+    let mut env = Env::new(100, 30);
+    env.ok(&["session", "create", "s", "-d"]);
+    env.owns("s");
+    wait_saved(&env, |f| f.contains("\"s\""));
+    env.ok(&["daemon", "stop"]);
+    let out = env
+        .shux()
+        .env("SHELL", "/nonexistent/shell")
+        .args(["--format", "json", "pane", "list", "-s", "s"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let pane = pane_ids(&env, "s").remove(0);
+    shux_testkit::wait_until("the pane to be marked exited", || {
+        json(&env, &["pane", "list", "-s", "s"])[0]["exit_status"] == 127
     });
+    let screen = env.capture("s", &pane);
+    assert!(screen.contains("could not restart"), "{screen}");
 }
 
 /// `[restore] workspace = false`: nothing is saved and nothing comes back.

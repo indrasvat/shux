@@ -58,7 +58,13 @@ pub struct Router {
     owner_local: Arc<HashSet<String>>,
     accepts: Arc<HashMap<String, Accepts>>,
     keeps_null: Arc<HashMap<String, Accepts>>,
+    /// See [`Router::wait_until_ready`].
+    ready: Option<tokio::sync::watch::Receiver<bool>>,
 }
+
+/// How long a call waits for [`Router::wait_until_ready`]'s signal before it
+/// is served anyway.
+const READY_PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The top-level parameters a method accepts. Any other key is refused before
 /// the handler runs, so a newer client's field never reaches a daemon that
@@ -74,7 +80,16 @@ impl Router {
             owner_local: Arc::default(),
             accepts: Arc::default(),
             keeps_null: Arc::default(),
+            ready: None,
         }
+    }
+
+    /// Hold every call but `system.*` and `daemon.*` until `ready` is true
+    /// (at most [`READY_PATIENCE`]): a daemon restoring its workspace serves
+    /// at once, but a call about a pane waits for that pane's shell.
+    pub fn wait_until_ready(mut self, ready: tokio::sync::watch::Receiver<bool>) -> Self {
+        self.ready = Some(ready);
+        self
     }
 
     /// Create a router builder for registering methods.
@@ -109,6 +124,13 @@ impl Router {
                     "hint": "only the daemon's own socket may call this; run the shux CLI as its user",
                 }),
             ));
+        }
+        if let Some(ready) = &self.ready
+            && !method.starts_with("system.")
+            && !method.starts_with("daemon.")
+        {
+            let mut ready = ready.clone();
+            let _ = tokio::time::timeout(READY_PATIENCE, ready.wait_for(|r| *r)).await;
         }
         match self.methods.get(method) {
             Some(handler) => {
@@ -284,6 +306,7 @@ impl RouterBuilder {
             owner_local: Arc::new(self.owner_local),
             accepts: Arc::new(self.accepts),
             keeps_null: Arc::new(self.keeps_null),
+            ready: None,
         }
     }
 }
@@ -334,6 +357,32 @@ pub const UNKNOWN_PARAMS: &str = "unknown_params";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Until ready, a call about a pane waits (a restored pane's shell is
+    /// still starting) while `system.*` answers at once; then it runs.
+    #[tokio::test]
+    async fn a_call_waits_for_ready_and_system_calls_do_not() {
+        let (ready, rx) = tokio::sync::watch::channel(false);
+        let router = Router::builder()
+            .register("system.version", |_: Option<Value>| async {
+                Ok(Value::Null)
+            })
+            .register("pane.capture", |_: Option<Value>| async {
+                Ok(Value::Bool(true))
+            })
+            .build()
+            .wait_until_ready(rx);
+        let mut held = Box::pin(router.dispatch("pane.capture", None));
+        assert!(
+            tokio::time::timeout(std::time::Duration::ZERO, &mut held)
+                .await
+                .is_err(),
+            "a pane call ran before the panes were ready"
+        );
+        assert!(router.dispatch("system.version", None).await.is_ok());
+        ready.send_replace(true);
+        assert_eq!(held.await.unwrap(), Value::Bool(true));
+    }
 
     #[tokio::test]
     async fn test_dispatch_registered_method() {

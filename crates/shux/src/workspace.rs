@@ -40,6 +40,8 @@ pub struct PersistStatus {
     pub durable_version: u64,
     pub writes: u64,
     pub restored_panes: usize,
+    /// Which attempt at restoring the saved workspace this boot is (0: none).
+    pub restore_attempt: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quarantined: Option<String>,
 }
@@ -63,7 +65,6 @@ enum Msg {
 struct Shared {
     tx: Option<mpsc::UnboundedSender<Msg>>,
     status: Mutex<PersistStatus>,
-    durable: watch::Sender<u64>,
     extras: Mutex<HashMap<PaneId, PaneExtras>>,
     /// Panes whose shell has started, or that were restored.
     admitted: Mutex<std::collections::HashSet<PaneId>>,
@@ -89,7 +90,6 @@ impl Persist {
                 reason: Some(reason.into()),
                 ..Default::default()
             }),
-            durable: watch::Sender::new(0),
             extras: Mutex::default(),
             admitted: Mutex::default(),
             extras_changed: tokio::sync::Notify::new(),
@@ -103,11 +103,6 @@ impl Persist {
 
     pub fn is_enabled(&self) -> bool {
         self.0.tx.is_some()
-    }
-
-    /// The graph version the saved workspace holds.
-    pub fn durable(&self) -> watch::Receiver<u64> {
-        self.0.durable.subscribe()
     }
 
     fn update(&self, pane: PaneId, f: impl FnOnce(&mut PaneExtras)) {
@@ -228,6 +223,10 @@ struct Writer {
     last: Option<Vec<u8>>,
     /// Set when a save could not happen: nothing more is written.
     poisoned: bool,
+    /// Until every restored shell has started: each save first marks the
+    /// restore with the bytes it writes, so a crash at any point of it is
+    /// caught on the next boot.
+    restoring: Option<u32>,
 }
 
 /// Run a store operation off the runtime: every one of them syncs to disk.
@@ -284,12 +283,15 @@ impl Writer {
         }
         let bytes = self.bytes_for(snapshot);
         if self.last.as_deref() != Some(&bytes[..]) {
+            if let Some(attempt) = self.restoring {
+                let digest = crate::workspace_store::digest(&bytes);
+                blocking(&self.store, move |s| s.mark_restoring(&digest, attempt)).await?;
+            }
             let written = bytes.clone();
             blocking(&self.store, move |s| s.write_workspace(&written)).await?;
             self.last = Some(bytes);
             lock(&self.shared.status).writes += 1;
         }
-        self.shared.durable.send_replace(snapshot.version);
         let mut st = lock(&self.shared.status);
         st.durable_version = snapshot.version;
         if st.state == "failing" {
@@ -299,7 +301,8 @@ impl Writer {
         Ok(())
     }
 
-    async fn clear_marker(&self) {
+    async fn clear_marker(&mut self) {
+        self.restoring = None;
         if let Err(e) = blocking(&self.store, Store::clear_restoring).await {
             tracing::warn!("workspace: could not clear the restore marker: {e}");
         }
@@ -348,7 +351,10 @@ impl Writer {
                         if let Err(e) = self.save(&snap).await {
                             self.forget(&e).await;
                         }
-                        let _ = done.send(());
+                        if done.send(()).is_err() {
+                            // Its close was abandoned before it ran.
+                            self.tombstones.retain(|(t, _)| *t != id);
+                        }
                     }
                     Some(Msg::Settle { id }) => {
                         self.tombstones.retain(|(t, _)| *t != id);
@@ -440,30 +446,19 @@ const HANDOFF: Duration = Duration::from_secs(10);
 /// a storage problem: those boot empty, with persistence disabled and the
 /// reason in `daemon status`. Fails only when a live daemon owns the state.
 pub async fn boot(socket_key: &Path, enabled: bool) -> Result<Boot, BootError> {
-    let socket = socket_key.to_string_lossy().into_owned();
-    let disabled = |reason: String| Boot {
-        restored: None,
-        owned: Err(reason),
-        socket: socket.clone(),
-    };
+    let off = |reason: &str| Ok(Boot::disabled(socket_key, reason.to_string()));
     if !enabled {
-        return Ok(disabled("turned off ([restore] workspace = false)".into()));
+        return off("turned off ([restore] workspace = false)");
     }
     let Some(root) = crate::workspace_store::state_root() else {
-        return Ok(disabled(
-            "no state directory: neither XDG_STATE_HOME nor HOME is set".into(),
-        ));
+        return off("no state directory: neither XDG_STATE_HOME nor HOME is set");
     };
     boot_at(&root, socket_key).await
 }
 
 async fn boot_at(root: &Path, socket_key: &Path) -> Result<Boot, BootError> {
     let socket = socket_key.to_string_lossy().into_owned();
-    let disabled = |reason: String| Boot {
-        restored: None,
-        owned: Err(reason),
-        socket: socket.clone(),
-    };
+    let disabled = |reason: String| Boot::disabled(socket_key, reason);
     let key = crate::workspace_store::key_for(socket_key);
     let started = tokio::time::Instant::now();
     let store = loop {
@@ -491,6 +486,14 @@ async fn boot_at(root: &Path, socket_key: &Path) -> Result<Boot, BootError> {
         dir: Some(store.dir().to_path_buf()),
         ..Default::default()
     };
+    // A directory it cannot write is one where a later close could not be
+    // saved: never restore from it.
+    if let Err(e) = nix::unistd::access(store.dir(), nix::unistd::AccessFlags::W_OK) {
+        return Ok(disabled(format!(
+            "cannot write {}: {e}",
+            store.dir().display()
+        )));
+    }
     let restored = match read(&store, &socket) {
         Ok(r) => r,
         Err(Unreadable::Quarantined { path, reason }) => {
@@ -503,6 +506,10 @@ async fn boot_at(root: &Path, socket_key: &Path) -> Result<Boot, BootError> {
             return Ok(disabled(reason));
         }
     };
+    let restored = restored.map(|(r, attempt)| {
+        status.restore_attempt = attempt;
+        r
+    });
     status.restored_panes = restored.as_ref().map_or(0, |r| r.snapshot.panes.len());
     Ok(Boot {
         restored,
@@ -511,12 +518,18 @@ async fn boot_at(root: &Path, socket_key: &Path) -> Result<Boot, BootError> {
     })
 }
 
+/// Restores of one workspace that may die part way before it is set aside:
+/// a kill or a power cut is not the workspace's fault, a second in a row is
+/// a crash loop.
+const RESTORE_ATTEMPTS: u32 = 2;
+
 enum Unreadable {
     Quarantined { path: PathBuf, reason: String },
     Stuck(String),
 }
 
-fn read(store: &Store, socket: &str) -> Result<Option<Restored>, Unreadable> {
+/// The saved workspace and which attempt at restoring it this is.
+fn read(store: &Store, socket: &str) -> Result<Option<(Restored, u32)>, Unreadable> {
     let stuck = |what: &str, e: &dyn std::fmt::Display| Unreadable::Stuck(format!("{what}: {e}"));
     let bytes = match store.read_workspace(persist::MAX_FILE_BYTES) {
         Ok(None) => {
@@ -527,23 +540,31 @@ fn read(store: &Store, socket: &str) -> Result<Option<Restored>, Unreadable> {
         }
         Ok(Some(b)) => b,
         Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-            return quarantine(store, &e.to_string());
+            return Err(quarantine(store, "too-large", &e.to_string()));
         }
         Err(e) => return Err(stuck("cannot read the workspace", &e)),
     };
     let digest = crate::workspace_store::digest(&bytes);
     let marker = store
-        .restoring_digest()
+        .restoring()
         .map_err(|e| stuck("cannot read the restore marker", &e))?;
-    if marker.as_deref() == Some(digest.as_str()) {
-        return quarantine(store, "crashed-during-restore");
+    let attempts = match marker {
+        Some((d, n)) if d == digest => n,
+        _ => 0,
+    };
+    if attempts >= RESTORE_ATTEMPTS {
+        return Err(quarantine(
+            store,
+            "crashed-during-restore",
+            &format!("{attempts} restores of it died part way"),
+        ));
     }
-    // Marked before decoding, so a decoder that crashes is caught next time.
+    // Marked before decoding, so a decoder that crashes is caught too.
     store
-        .mark_restoring(&digest)
+        .mark_restoring(&digest, attempts + 1)
         .map_err(|e| stuck("cannot write the restore marker", &e))?;
     match persist::decode(&bytes, socket) {
-        Ok(ws) => Ok(Some(persist::rebuild(&ws))),
+        Ok(ws) => Ok(Some((persist::rebuild(&ws), attempts + 1))),
         Err(e) => {
             let reason = match &e {
                 RestoreError::FutureSchema { .. } => "future-schema",
@@ -551,29 +572,43 @@ fn read(store: &Store, socket: &str) -> Result<Option<Restored>, Unreadable> {
                 RestoreError::TooLarge(_) => "too-large",
                 RestoreError::Decode(_) | RestoreError::Invalid(_) => "invalid",
             };
-            tracing::warn!("workspace: refusing the saved workspace: {e}");
-            quarantine(store, reason)
+            Err(quarantine(store, reason, &e.to_string()))
         }
     }
 }
 
-fn quarantine(store: &Store, reason: &str) -> Result<Option<Restored>, Unreadable> {
-    let path = store.quarantine(reason).map_err(|e| {
-        Unreadable::Stuck(format!(
-            "cannot set aside a refused workspace ({reason}): {e}"
-        ))
-    })?;
-    store
-        .clear_restoring()
-        .map_err(|e| Unreadable::Stuck(format!("cannot clear the restore marker: {e}")))?;
-    tracing::warn!("workspace: set aside as {}", path.display());
-    Err(Unreadable::Quarantined {
+/// Set the workspace aside, as `reason`; `detail` says what was wrong.
+fn quarantine(store: &Store, reason: &str, detail: &str) -> Unreadable {
+    let path = match store.quarantine(reason) {
+        Ok(p) => p,
+        Err(e) => {
+            return Unreadable::Stuck(format!(
+                "cannot set aside a refused workspace ({reason}: {detail}): {e}"
+            ));
+        }
+    };
+    if let Err(e) = store.clear_restoring() {
+        return Unreadable::Stuck(format!("cannot clear the restore marker: {e}"));
+    }
+    tracing::warn!(
+        "workspace: {reason} ({detail}); set aside as {}",
+        path.display()
+    );
+    Unreadable::Quarantined {
         path,
-        reason: reason.to_string(),
-    })
+        reason: format!("{reason} ({detail})"),
+    }
 }
 
 impl Boot {
+    fn disabled(socket_key: &Path, reason: String) -> Self {
+        Self {
+            restored: None,
+            owned: Err(reason),
+            socket: socket_key.to_string_lossy().into_owned(),
+        }
+    }
+
     /// Start saving. `graph` must be the graph the daemon serves, before its
     /// loop starts, so no commit is missed.
     /// `extras` are the restored panes' own (`Restored::extras`).
@@ -601,7 +636,6 @@ impl Boot {
         let shared = Arc::new(Shared {
             tx: Some(tx),
             status: Mutex::new(status),
-            durable: watch::Sender::new(0),
             admitted: Mutex::new(extras.keys().copied().collect()),
             extras: Mutex::new(extras),
             extras_changed: tokio::sync::Notify::new(),
@@ -615,6 +649,7 @@ impl Boot {
             tombstones: Vec::new(),
             last: None,
             poisoned: false,
+            restoring: Some(lock(&shared.status).restore_attempt).filter(|n| *n > 0),
             timing,
         };
         tokio::spawn(writer.run(rx, graph.subscribe_commits()));
@@ -689,6 +724,9 @@ pub(crate) async fn restore_panes(
     io_state: Arc<tokio::sync::Mutex<crate::pane_io::PaneIoState>>,
     graph: shux_core::graph::GraphHandle,
     cancel: tokio_util::sync::CancellationToken,
+    // Raised once every pane's shell has started or failed: see
+    // `Router::wait_until_ready`.
+    ready: tokio::sync::watch::Sender<bool>,
 ) {
     let persist = io_state.lock().await.persist.clone();
     let orphans: Vec<_> = panes
@@ -723,6 +761,7 @@ pub(crate) async fn restore_panes(
         );
         spawns.spawn(async move {
             let Ok(_slot) = slots.acquire_owned().await else { return };
+            let mut why = "no directory it can start in exists".to_string();
             for cwd in candidates.into_iter().filter(|c| c.is_dir()) {
                 if cancel.is_cancelled() {
                     return;
@@ -742,15 +781,26 @@ pub(crate) async fn restore_panes(
                 .await;
                 match spawned {
                     Ok(()) => return,
-                    Err(e) => tracing::warn!(%pane, cwd = %cwd.display(), "restore: shell did not start: {e}"),
+                    Err(e) => {
+                        tracing::warn!(%pane, cwd = %cwd.display(), "restore: shell did not start: {e}");
+                        why = crate::pane_spawn::spawn_failure_message(&e);
+                    }
                 }
             }
-            io.lock().await.pending_notices.remove(&pane);
-            tracing::warn!(%pane, "restore: no directory to start the shell in");
+            // An exited pane that says why, never one with no program at all.
+            let mut vt = shux_vt::VirtualTerminal::new(24, 80);
+            vt.process(format!("\x1b[31mshux: could not restart this pane's shell: {why}\x1b[0m\r\n").as_bytes());
+            {
+                let mut state = io.lock().await;
+                state.pending_notices.remove(&pane);
+                state.vts.insert(pane, vt);
+            }
+            let _ = graph.set_pane_exit_status(pane, 127).await;
         });
     }
     while spawns.join_next().await.is_some() {}
     persist.restore_finished();
+    ready.send_replace(true);
 }
 
 /// The last save, at shutdown: after the graph stops taking changes and while
@@ -848,7 +898,11 @@ mod tests {
             .await
             .unwrap();
         let want = r.graph.snapshot().version;
-        r.persist.durable().wait_for(|v| *v >= want).await.unwrap();
+        shux_testkit::wait_until_async("the change to be saved", || {
+            let persist = r.persist.clone();
+            async move { persist.status().durable_version >= want }
+        })
+        .await;
         let racing = saved(&r);
         assert!(
             racing.contains("renamed") && !racing.contains("doomed"),
@@ -898,6 +952,75 @@ mod tests {
             "a failed close left the old workspace in place"
         );
         assert_eq!(r.persist.status().state, "failing");
+    }
+
+    /// A daemon that dies part way through a restore, even after the restore
+    /// has saved, is caught on the next boot: the workspace is set aside
+    /// instead of restored again into the same crash.
+    #[tokio::test]
+    async fn a_crash_after_a_restore_saved_is_still_caught() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("shux");
+        let fast = (Duration::ZERO, Duration::ZERO);
+        let boot_graph = move |boot: Boot, snapshot: SessionGraphSnapshot| {
+            let (g, snap) = SessionGraph::from_snapshot(snapshot, None);
+            let persist = boot.start_timed(&g, snap.clone(), HashMap::new(), fast);
+            let (tx, rx) = mpsc::channel(16);
+            tokio::spawn(shux_core::graph::run_graph_loop(
+                g,
+                rx,
+                tokio_util::sync::CancellationToken::new(),
+            ));
+            (GraphHandle::new(tx, snap), persist)
+        };
+
+        // A first daemon saves a session and stops in order.
+        let (graph, persist) = boot_graph(
+            boot_at(&state, Path::new("/sock")).await.unwrap(),
+            Default::default(),
+        );
+        graph.create_session("s".into(), "/".into()).await.unwrap();
+        let pane = *graph.snapshot().panes.keys().next().unwrap();
+        persist.note_process(pane, std::process::id());
+        persist.seal(graph.snapshot(), Duration::from_secs(5)).await;
+
+        // A daemon restores it and saves (its shells started), then dies: its
+        // whole runtime goes, as a process's does, with no seal. The first
+        // such death is retried; the workspace is still there to restore.
+        let crash_mid_restore = || {
+            let state = state.clone();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async {
+                    let mut boot = boot_at(&state, Path::new("/sock")).await.unwrap();
+                    let restored = boot.restored.take().expect("not restored after one crash");
+                    let (_graph, persist) = boot_graph(boot, restored.snapshot);
+                    persist.note_process(pane, std::process::id());
+                    shux_testkit::wait_until_async("the restoring daemon to save", || {
+                        let persist = persist.clone();
+                        async move { persist.status().writes > 0 }
+                    })
+                    .await;
+                });
+            })
+            .join()
+            .unwrap();
+        };
+        crash_mid_restore();
+        crash_mid_restore();
+
+        let third = boot_at(&state, Path::new("/sock")).await.unwrap();
+        assert!(third.restored.is_none(), "restored into the same crash");
+        let quarantined = third.owned.as_ref().unwrap().1.quarantined.clone();
+        assert!(
+            quarantined
+                .as_deref()
+                .is_some_and(|q| q.starts_with("crashed-during-restore")),
+            "{quarantined:?}"
+        );
     }
 
     /// A successor whose predecessor still holds the state waits for it to

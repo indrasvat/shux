@@ -2965,10 +2965,16 @@ impl GraphHandle {
         {
             return close.await;
         }
-        let ticket = guard.before_close(removal).await;
-        let out = close.await;
-        guard.after_close(ticket);
-        out
+        // Settled however this ends, a caller dropping the future included:
+        // a close that never ran must not stay left out of every save.
+        struct Settle<'a>(&'a dyn CloseGuard, u64);
+        impl Drop for Settle<'_> {
+            fn drop(&mut self) {
+                self.0.after_close(self.1);
+            }
+        }
+        let _settle = Settle(guard.as_ref(), guard.before_close(removal).await);
+        close.await
     }
 
     pub async fn destroy_session(
@@ -3532,6 +3538,45 @@ mod tests {
 
     fn home() -> PathBuf {
         PathBuf::from("/home/test")
+    }
+
+    #[derive(Default)]
+    struct Recorder(std::sync::Mutex<Vec<&'static str>>);
+
+    impl CloseGuard for Recorder {
+        fn before_close(
+            &self,
+            _: Removal,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = u64> + Send + '_>> {
+            self.0.lock().unwrap().push("before");
+            Box::pin(async { 7 })
+        }
+        fn after_close(&self, ticket: u64) {
+            assert_eq!(ticket, 7);
+            self.0.lock().unwrap().push("after");
+        }
+    }
+
+    /// A close whose caller drops it part way (a client hanging up) still
+    /// settles with the guard, so what it guarded is not left out of every
+    /// later save while it lives on.
+    #[tokio::test]
+    async fn an_abandoned_close_is_still_settled() {
+        let (graph, state) = SessionGraph::new();
+        let id = graph.create_session("s".into(), home()).expect("create");
+        let recorder = Arc::new(Recorder::default());
+        // No graph loop: the destroy is sent and then waits for a reply forever.
+        let (tx, _rx) = mpsc::channel(4);
+        let handle = GraphHandle::new(tx, state).with_close_guard(recorder.clone());
+        let mut close = Box::pin(handle.destroy_session(id, None));
+        assert!(
+            tokio::time::timeout(std::time::Duration::ZERO, &mut close)
+                .await
+                .is_err(),
+            "the close finished with no graph to answer it"
+        );
+        drop(close);
+        assert_eq!(*recorder.0.lock().unwrap(), ["before", "after"]);
     }
 
     #[test]

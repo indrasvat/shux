@@ -67,7 +67,12 @@ fn own_dir(path: &Path) -> io::Result<File> {
             format!("{} is owned by uid {owner}, not {me}", path.display()),
         ));
     }
-    dir.set_permissions(fs::Permissions::from_mode(0o700))?;
+    // Only ever take permission away: a directory its owner made read-only
+    // stays read-only, and is then refused as unwritable.
+    let mode = dir.metadata()?.permissions().mode() & 0o7777;
+    if mode & 0o077 != 0 {
+        dir.set_permissions(fs::Permissions::from_mode(mode & 0o700))?;
+    }
     Ok(dir)
 }
 
@@ -82,6 +87,38 @@ fn open_regular(path: &Path, opts: &mut OpenOptions) -> io::Result<File> {
         ));
     }
     Ok(file)
+}
+
+/// Quarantined workspaces kept as evidence; older ones are deleted, so a
+/// workspace refused on every boot cannot fill the disk.
+const QUARANTINE_KEEP: usize = 10;
+
+fn prune_quarantine(q: &Path) -> io::Result<()> {
+    let mut names: Vec<_> = fs::read_dir(q)?
+        .filter_map(Result::ok)
+        .map(|e| e.file_name())
+        .collect();
+    // Fixed-width names: oldest first once sorted.
+    names.sort();
+    let excess = names.len().saturating_sub(QUARANTINE_KEEP);
+    for name in names.into_iter().take(excess) {
+        fs::remove_file(q.join(name))?;
+    }
+    Ok(())
+}
+
+/// A small bookkeeping file (`owner`, `restoring`): a regular file, read no
+/// further than 128 bytes, so a planted FIFO or `/dev/zero` cannot hang or
+/// swamp a booting daemon. `None` when it is not there.
+fn read_small(path: &Path) -> io::Result<Option<String>> {
+    let file = match open_regular(path, OpenOptions::new().read(true)) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut s = String::new();
+    file.take(128).read_to_string(&mut s)?;
+    Ok(Some(s))
 }
 
 /// Why a daemon cannot use its state directory.
@@ -129,8 +166,9 @@ impl Store {
         match lock.try_lock() {
             Ok(()) => {}
             Err(fs::TryLockError::WouldBlock) => {
-                let holder = fs::read_to_string(dir.join(OWNER))
+                let holder = read_small(&dir.join(OWNER))
                     .ok()
+                    .flatten()
                     .and_then(|s| s.trim().parse().ok());
                 return Err(OpenError::Held { holder });
             }
@@ -191,41 +229,46 @@ impl Store {
         self.remove(WORKSPACE)
     }
 
-    pub fn restoring_digest(&self) -> io::Result<Option<String>> {
-        match fs::read_to_string(self.dir.join(RESTORING)) {
-            Ok(s) => Ok(Some(s.trim().to_string())),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
-        }
+    /// The workspace a restore was under way for, and how many restores of it
+    /// have started without finishing.
+    pub fn restoring(&self) -> io::Result<Option<(String, u32)>> {
+        Ok(read_small(&self.dir.join(RESTORING))?.map(|s| {
+            let mut parts = s.split_whitespace();
+            let digest = parts.next().unwrap_or_default().to_string();
+            let attempts = parts.next().and_then(|n| n.parse().ok()).unwrap_or(1);
+            (digest, attempts)
+        }))
     }
 
-    pub fn mark_restoring(&self, digest: &str) -> io::Result<()> {
-        self.replace(RESTORING, digest.as_bytes())
+    pub fn mark_restoring(&self, digest: &str, attempts: u32) -> io::Result<()> {
+        self.replace(RESTORING, format!("{digest} {attempts}").as_bytes())
     }
 
     pub fn clear_restoring(&self) -> io::Result<()> {
         self.remove(RESTORING)
     }
 
-    /// Move the workspace aside as `quarantine/<seconds>-<n>-<reason>.json`.
+    /// Move the workspace aside as `quarantine/<nanos>-<n>-<reason>.json`.
     pub fn quarantine(&self, reason: &str) -> io::Result<PathBuf> {
         let q = self.dir.join(QUARANTINE);
         own_dir(&q)?;
-        let secs = std::time::SystemTime::now()
+        // Fixed-width nanoseconds: names sort in the order they were made.
+        let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
+            .map_or(0, |d| d.as_nanos());
         let reason: String = reason
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
             .take(40)
             .collect();
         for n in 0..1000u32 {
-            let to = q.join(format!("{secs}-{n}-{reason}.json"));
-            // `link` refuses an existing name, so two quarantines in one
-            // second never overwrite each other's evidence.
+            let to = q.join(format!("{nanos:020}-{n:03}-{reason}.json"));
+            // `link` refuses an existing name, so two quarantines at one
+            // instant never overwrite each other's evidence.
             match fs::hard_link(self.dir.join(WORKSPACE), &to) {
                 Ok(()) => {
                     self.remove(WORKSPACE)?;
+                    prune_quarantine(&q)?;
                     File::open(&q)?.sync_all()?;
                     return Ok(to);
                 }
@@ -294,6 +337,32 @@ mod tests {
         Store::open(&r, "k").unwrap();
     }
 
+    /// A planted FIFO, or a link to an endless file, where the restore marker
+    /// lives is refused at once: it cannot hang or swamp a booting daemon.
+    #[test]
+    fn a_planted_marker_neither_blocks_nor_floods() {
+        let (_t, r) = root();
+        let s = Store::open(&r, "k").unwrap();
+        let marker = s.dir().join(RESTORING);
+        nix::unistd::mkfifo(&marker, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        assert!(s.restoring().is_err(), "a FIFO was read as a marker");
+        fs::remove_file(&marker).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", &marker).unwrap();
+        assert!(s.restoring().is_err(), "a link was followed");
+    }
+
+    /// A state directory its owner made read-only stays read-only.
+    #[test]
+    fn opening_never_grants_write_permission() {
+        let (_t, r) = root();
+        let dir = Store::open(&r, "k").unwrap().dir().to_path_buf();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+        let _ = Store::open(&r, "k");
+        let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(mode, 0o500);
+    }
+
     /// A planted symlink at the server directory is refused, not followed.
     #[test]
     fn a_symlinked_server_dir_is_refused() {
@@ -317,8 +386,18 @@ mod tests {
         let b = s.quarantine("bad").unwrap();
         assert_ne!(a, b);
         assert_eq!(fs::read(a).unwrap(), b"one");
-        assert_eq!(fs::read(b).unwrap(), b"two");
+        assert_eq!(fs::read(&b).unwrap(), b"two");
         assert_eq!(s.read_workspace(1 << 20).unwrap(), None);
+
+        // Kept: the newest QUARANTINE_KEEP, however many boots refused one.
+        let mut last = b;
+        for i in 0..QUARANTINE_KEEP + 5 {
+            s.write_workspace(format!("n{i}").as_bytes()).unwrap();
+            last = s.quarantine("bad").unwrap();
+        }
+        let kept = fs::read_dir(s.dir().join(QUARANTINE)).unwrap().count();
+        assert_eq!(kept, QUARANTINE_KEEP);
+        assert!(last.exists(), "the newest evidence was deleted");
     }
 
     #[test]
