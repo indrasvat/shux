@@ -221,6 +221,7 @@ install-tools: ## Install dev dependencies (nextest, llvm-cov, deny, hyperfine, 
 	@bash scripts/ensure-deny.sh
 	@bash scripts/ensure-hyperfine.sh
 	cargo install lefthook --locked || npm i -g lefthook
+	cargo install cargo-mutants --locked
 	@echo "$(COLOR_GREEN)✓ Dev tools installed$(COLOR_RESET)"
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -247,6 +248,12 @@ test-verbose: nextest-ready ## Run tests with output visible
 test-focus: nextest-ready ## Run one crate's tests matching a filter: PKG=<crate> FILTER=<nextest filter>
 	@test -n "$(PKG)" || { echo "test-focus: PKG=<crate> is required" >&2; exit 2; }
 	@.shux/scripts/no_leak_guard.sh $(NEXTEST_RUN) -p $(PKG) $(FILTER)
+
+.PHONY: mutants
+mutants: nextest-ready ## Mutants of one file the suite lets survive: PKG=<crate> FILE=<path> (docs/testing.md#adding-a-test)
+	@test -n "$(PKG)" && test -n "$(FILE)" || { echo "mutants: PKG=<crate> FILE=<path> are required" >&2; exit 2; }
+	@command -v cargo-mutants >/dev/null || { echo "mutants: cargo-mutants is not installed (make install-tools)" >&2; exit 2; }
+	@.shux/scripts/no_leak_guard.sh cargo mutants --colors always --test-tool nextest -p $(PKG) -f $(FILE) --output .shux/out/mutants
 
 .PHONY: test-lib
 test-lib: nextest-ready ## Run library tests only

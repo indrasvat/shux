@@ -254,6 +254,8 @@ pub enum GraphCommand {
         /// session.create path, only apply_batch persisted it). Empty
         /// vector means "spawn the user's default shell".
         initial_command: Vec<String>,
+        /// A lens scratch session, never saved to a workspace.
+        scratch: bool,
         reply: tokio::sync::oneshot::Sender<Result<SessionId, GraphError>>,
     },
     DestroySession {
@@ -425,6 +427,10 @@ pub enum GraphCommand {
     },
     /// See [`GraphHandle::atomically`].
     Atomically(Transaction),
+    /// See [`GraphHandle::seal`].
+    Seal {
+        reply: tokio::sync::oneshot::Sender<Arc<SessionGraphSnapshot>>,
+    },
 }
 
 /// Work the graph task runs between two commands.
@@ -468,6 +474,9 @@ pub struct SessionGraph {
     event_bus: Option<EventBus>,
     /// Set by [`Self::retire_if_empty`]: no session is created after it.
     retiring: std::sync::atomic::AtomicBool,
+    /// The version of each commit, for the workspace writer. It covers every
+    /// change, including the ones that publish no event.
+    commits: tokio::sync::watch::Sender<Version>,
 }
 
 impl SessionGraph {
@@ -482,16 +491,31 @@ impl SessionGraph {
     pub fn new_with_event_bus(
         event_bus: Option<EventBus>,
     ) -> (Self, Arc<ArcSwap<SessionGraphSnapshot>>) {
-        let snapshot = Arc::new(SessionGraphSnapshot::default());
-        let state = Arc::new(ArcSwap::from(snapshot));
+        Self::from_snapshot(SessionGraphSnapshot::default(), event_bus)
+    }
+
+    /// A graph that starts from `snapshot`: a restored workspace at boot, or
+    /// a scratch copy on which a removal is tried before it is made.
+    pub fn from_snapshot(
+        snapshot: SessionGraphSnapshot,
+        event_bus: Option<EventBus>,
+    ) -> (Self, Arc<ArcSwap<SessionGraphSnapshot>>) {
+        let version = snapshot.version;
+        let state = Arc::new(ArcSwap::from(Arc::new(snapshot)));
         let graph = Self {
             state: Arc::clone(&state),
             status_generations: Default::default(),
             pty_owners: Default::default(),
             event_bus,
             retiring: Default::default(),
+            commits: tokio::sync::watch::Sender::new(version),
         };
         (graph, state)
+    }
+
+    /// Notified with the snapshot version after every commit.
+    pub fn subscribe_commits(&self) -> tokio::sync::watch::Receiver<Version> {
+        self.commits.subscribe()
     }
 
     /// With no sessions, refuse every session created from now on and
@@ -749,10 +773,12 @@ impl SessionGraph {
         for map in [&self.pty_owners, &self.status_generations] {
             side_map(map).retain(|pid, _| snapshot.panes.contains_key(pid));
         }
+        let version = snapshot.version;
         self.state.store(Arc::new(snapshot));
+        self.commits.send_replace(version);
     }
 
-    fn validate_session_name(name: &str) -> Result<(), GraphError> {
+    pub(crate) fn validate_session_name(name: &str) -> Result<(), GraphError> {
         if name.is_empty() {
             return Err(GraphError::EmptySessionName);
         }
@@ -850,6 +876,16 @@ impl SessionGraph {
         cwd: std::path::PathBuf,
         command: Vec<String>,
     ) -> Result<SessionId, GraphError> {
+        self.create_session_flagged(name, cwd, command, false)
+    }
+
+    pub(crate) fn create_session_flagged(
+        &self,
+        name: String,
+        cwd: std::path::PathBuf,
+        command: Vec<String>,
+        scratch: bool,
+    ) -> Result<SessionId, GraphError> {
         self.refuse_if_retiring()?;
         Self::validate_session_name(&name)?;
 
@@ -878,7 +914,8 @@ impl SessionGraph {
         window.id = window_id;
 
         let session_name = name.clone();
-        let session = Session::new(name, window_id);
+        let mut session = Session::new(name, window_id);
+        session.scratch = scratch;
         let session_id = session.id;
 
         window.session_id = session_id;
@@ -2665,8 +2702,8 @@ pub async fn run_graph_loop(
         tokio::select! {
             cmd = cmd_rx.recv() => {
                 match cmd {
-                    Some(GraphCommand::CreateSession { name, cwd, initial_command, reply }) => {
-                        let _ = reply.send(graph.create_session_with_command(name, cwd, initial_command));
+                    Some(GraphCommand::CreateSession { name, cwd, initial_command, scratch, reply }) => {
+                        let _ = reply.send(graph.create_session_flagged(name, cwd, initial_command, scratch));
                     }
                     Some(GraphCommand::DestroySession { id, expected_version, reply }) => {
                         let _ = reply.send(graph.destroy_session(id, expected_version));
@@ -2756,6 +2793,11 @@ pub async fn run_graph_loop(
                         let _ = reply.send(graph.apply_batch(ops));
                     }
                     Some(GraphCommand::Atomically(Transaction(work))) => work(&graph),
+                    Some(GraphCommand::Seal { reply }) => {
+                        let _ = reply.send(graph.current());
+                        info!("Graph sealed: no further mutation is accepted");
+                        break;
+                    }
                     None => {
                         debug!("All graph command senders dropped, shutting down graph loop");
                         break;
@@ -2813,17 +2855,51 @@ impl GraphHandle {
         cwd: std::path::PathBuf,
         command: Vec<String>,
     ) -> Result<SessionId, GraphError> {
+        self.create_session_flagged(name, cwd, command, false).await
+    }
+
+    /// Create a lens scratch session: one no saved workspace ever holds.
+    pub async fn create_scratch_session(
+        &self,
+        name: String,
+        cwd: std::path::PathBuf,
+        command: Vec<String>,
+    ) -> Result<SessionId, GraphError> {
+        self.create_session_flagged(name, cwd, command, true).await
+    }
+
+    async fn create_session_flagged(
+        &self,
+        name: String,
+        cwd: std::path::PathBuf,
+        command: Vec<String>,
+        scratch: bool,
+    ) -> Result<SessionId, GraphError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.cmd_tx
             .send(GraphCommand::CreateSession {
                 name,
                 cwd,
                 initial_command: command,
+                scratch,
                 reply: tx,
             })
             .await
             .map_err(|_| GraphError::Shutdown)?;
         rx.await.map_err(|_| GraphError::Shutdown)?
+    }
+
+    /// Stop the graph taking mutations and return its final state. Every
+    /// command already ahead of this one has been applied; every one after it
+    /// fails with [`GraphError::Shutdown`]. A daemon seals before it stops its
+    /// panes, so what it saves last is the workspace as the user left it.
+    pub async fn seal(&self) -> Option<Arc<SessionGraphSnapshot>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(GraphCommand::Seal { reply: tx })
+            .await
+            .ok()?;
+        rx.await.ok()
     }
 
     pub async fn destroy_session(

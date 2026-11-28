@@ -551,7 +551,7 @@ fn preserve_corrupt_registry_with(
 ///
 /// `None` when the process is gone or the read fails.
 #[cfg(target_os = "macos")]
-fn process_start_token(pid: u32) -> Option<u64> {
+pub(crate) fn process_start_token(pid: u32) -> Option<u64> {
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
     // SAFETY: proc_pidinfo writes at most `size` bytes into `info`, which is
@@ -572,7 +572,7 @@ fn process_start_token(pid: u32) -> Option<u64> {
 }
 
 #[cfg(target_os = "linux")]
-fn process_start_token(pid: u32) -> Option<u64> {
+pub(crate) fn process_start_token(pid: u32) -> Option<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // comm (field 2) may contain spaces/parens; fields 3.. start after the
     // LAST ')'. starttime is field 22 overall → the 20th token after state.
@@ -581,7 +581,7 @@ fn process_start_token(pid: u32) -> Option<u64> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn process_start_token(_pid: u32) -> Option<u64> {
+pub(crate) fn process_start_token(_pid: u32) -> Option<u64> {
     // Unsupported platform: registration stores 0 → startup reap falls
     // back to liveness-only (documented).
     None
@@ -1922,7 +1922,7 @@ async fn spawn_scratch_core(
     // it that then execs argv directly (no shell, ever).
     let scratch_name = format!("__scratch-{}", uuid::Uuid::new_v4());
     let session_id = graph
-        .create_session_with_command(scratch_name, cwd.clone(), p.argv.clone())
+        .create_scratch_session(scratch_name, cwd.clone(), p.argv.clone())
         .await
         .map_err(|e| match e {
             // Refused before anything changed: the caller may send it on.

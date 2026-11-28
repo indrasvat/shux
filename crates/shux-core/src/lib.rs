@@ -9,6 +9,7 @@ pub mod graph;
 pub mod idref;
 pub mod layout;
 pub mod model;
+pub mod persist;
 pub mod theme;
 
 // Re-export key event bus types.
