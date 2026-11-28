@@ -498,7 +498,7 @@ pub(crate) async fn handle_daemon_command(
             }
             Ok(())
         }
-        cli::DaemonCommand::Stop { discard: true } => discard_workspace(ours, socket, format).await,
+        cli::DaemonCommand::Stop { discard: true } => discard_workspace(socket, format).await,
         cli::DaemonCommand::Stop { discard: false } => {
             let Some(p) = ours else {
                 // Idempotent, and exit 0: a cleanup trap may run this twice
@@ -550,11 +550,7 @@ async fn ask_workspace(socket: &Path) -> serde_json::Value {
 /// `daemon stop --discard`: stop the daemon, then delete its saved workspace,
 /// holding the start lock throughout so no client starts (and restores) one
 /// in between.
-async fn discard_workspace(
-    ours: Option<u32>,
-    socket: &Path,
-    format: cli::OutputFormat,
-) -> anyhow::Result<()> {
+async fn discard_workspace(socket: &Path, format: cli::OutputFormat) -> anyhow::Result<()> {
     // After a reboot the runtime dir is gone; the saved workspace is not.
     daemon::ensure_runtime_dir()?;
     let start_lock_path = daemon::start_lock_path_for(socket)?;
@@ -572,6 +568,8 @@ async fn discard_workspace(
         )]
         std::thread::sleep(std::time::Duration::from_millis(50));
     };
+    // Under the start lock: no client can start one after this look.
+    let ours = our_live_daemon(socket);
     if let Some(p) = ours {
         let pid = nix::unistd::Pid::from_raw(p as i32);
         let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGCONT);
@@ -622,7 +620,8 @@ async fn discard_workspace(
             .iter()
             .flat_map(|s| &s.windows)
             .flat_map(|w| &w.panes)
-            .filter_map(|p| p.process);
+            .filter_map(|p| p.process.clone())
+            .filter(|p| crate::workspace::boot_id().is_some_and(|b| b == p.boot));
         for shell in shells {
             if let Ok(pgid) = u32::try_from(shell.pid) {
                 let _ = crate::lens_scratch::kill_pgid_lens_sequence(pgid, shell.start_token).await;
@@ -677,6 +676,7 @@ pub(crate) fn not_gone(p: u32) -> String {
 pub(crate) struct Teardown {
     io_state: Arc<Mutex<PaneIoState>>,
     graph: shux_core::graph::GraphHandle,
+    graph_stop: tokio_util::sync::CancellationToken,
     plugins: shux_plugin::PluginManager,
     share: crate::share::Gateway,
     connections: tokio_util::task::TaskTracker,
@@ -692,6 +692,7 @@ impl Teardown {
     pub(crate) async fn drain(self) {
         // First, while every pane is still alive: the workspace as left.
         crate::workspace::save_before_teardown(&self.io_state, &self.graph).await;
+        self.graph_stop.cancel();
         if let Err(e) = self.share.stop().await {
             tracing::warn!(error = %e, "share gateway stop");
         }
@@ -807,16 +808,20 @@ pub(crate) async fn run_rpc_server(
     // Before the loop runs, so the writer sees every commit.
     let persist = boot.start(&graph, state.clone(), extras);
     let (graph_tx, graph_rx) = mpsc::channel(256);
-    let mut graph_handle = shux_core::graph::GraphHandle::new(graph_tx, state);
-    if persist.is_enabled() {
-        // Every close, from any caller, is saved before it is made.
-        graph_handle = graph_handle.with_close_guard(Arc::new(persist.clone()));
+    let graph_handle = shux_core::graph::GraphHandle::new(graph_tx, state);
+    // Every close, from any caller, is saved before it commits.
+    let durability = persist
+        .is_enabled()
+        .then(|| Arc::new(persist.clone()) as Arc<dyn shux_core::graph::Durability>);
+    // Its own lifetime, not root's: shutdown seals the graph (every command
+    // already sent is applied) before it saves the last time.
+    let graph_stop = tokio_util::sync::CancellationToken::new();
+    {
+        let graph_stop = graph_stop.clone();
+        tokio::spawn(async move {
+            shux_core::graph::run_graph_loop_durable(graph, graph_rx, graph_stop, durability).await;
+        });
     }
-
-    let graph_cancel = cancel.clone();
-    tokio::spawn(async move {
-        shux_core::graph::run_graph_loop(graph, graph_rx, graph_cancel).await;
-    });
 
     // Create shared pane I/O state (PTY writers, VTs, command engine,
     // data-plane publisher). The event bus is the SAME bus the
@@ -829,6 +834,12 @@ pub(crate) async fn run_rpc_server(
             .with_shutdown(cancel.clone())
             .with_persist(persist),
     ));
+    // Before any socket binds: these panes get their shell from the restore.
+    io_state
+        .lock()
+        .await
+        .awaiting_restore
+        .extend(restored_panes.iter().map(|(p, _)| *p));
     let shutdown_io_state = io_state.clone();
 
     // Lens scratch registry (§8 SPEC-E, LENS-R-040..046). One per daemon
@@ -1066,6 +1077,10 @@ pub(crate) async fn run_rpc_server(
     // `docs/designs/permissions/README.md` §9.6.
     router.assert_every_route_has_policy();
     router.assert_every_route_declares_params();
+    // Calls about panes wait until every restored pane's shell has started:
+    // over the socket and from plugins alike.
+    let (ready_tx, ready_rx) = tokio::sync::watch::channel(restored_panes.is_empty());
+    let router = router.wait_until_ready(ready_rx);
 
     tokio::spawn(rpc::daemon::retire_when_idle(
         graph_handle.clone(),
@@ -1127,9 +1142,6 @@ pub(crate) async fn run_rpc_server(
         auth_token: None,
     };
 
-    // Calls about panes wait until every restored pane's shell has started.
-    let (ready_tx, ready_rx) = tokio::sync::watch::channel(restored_panes.is_empty());
-    let router = router.wait_until_ready(ready_rx);
     let server =
         shux_rpc::Server::new(config, router, cancel.clone()).with_rebind_gate(rebind_gate);
     let connections = server.connections();
@@ -1168,6 +1180,7 @@ pub(crate) async fn run_rpc_server(
     Ok(Teardown {
         io_state: shutdown_io_state,
         graph: graph_handle,
+        graph_stop,
         plugins,
         share,
         connections,

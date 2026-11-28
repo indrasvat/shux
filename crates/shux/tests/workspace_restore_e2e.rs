@@ -299,7 +299,6 @@ fn a_workspace_it_cannot_trust_is_set_aside() {
     env.ok(&["daemon", "stop"]);
     let dir = server_dir(&env).expect("a server dir");
     let good = std::fs::read(dir.join("workspace.json")).unwrap();
-    let digest = shux::workspace_store::digest(&good);
     let future =
         String::from_utf8(good.clone())
             .unwrap()
@@ -317,7 +316,7 @@ fn a_workspace_it_cannot_trust_is_set_aside() {
         std::fs::write(dir.join("workspace.json"), &bytes).unwrap();
         if marked {
             // Two restores of these bytes already died part way.
-            std::fs::write(dir.join("restoring"), format!("{digest} 2")).unwrap();
+            std::fs::write(dir.join("restoring"), "2").unwrap();
         }
         assert_eq!(
             sessions(&env),
@@ -436,6 +435,29 @@ fn a_read_only_state_dir_never_resurrects_a_close() {
         !back.contains(&"doomed".to_string()),
         "a killed session came back: {back:?}"
     );
+}
+
+/// Killing a session ends every pane's program, a pane hidden behind a zoom
+/// included.
+#[test]
+fn a_session_kill_ends_a_pane_hidden_by_zoom() {
+    let env = Env::new(100, 30);
+    let pidfile = env.work("hidden.pid");
+    env.ok(&["session", "create", "z", "-d"]);
+    let first = pane_ids(&env, "z").remove(0);
+    let cmd = format!("echo $$ > '{}'; exec sleep 600", pidfile.display());
+    env.ok(&[
+        "pane", "split", "-s", "z", "-p", &first, "-d", "vertical", "--cmd", &cmd,
+    ]);
+    let hidden: i32 = shux_testkit::wait_for("the hidden pane's shell pid", || {
+        std::fs::read_to_string(&pidfile).ok()?.trim().parse().ok()
+    });
+    env.ok(&["pane", "focus", "-s", "z", "-p", &first]);
+    env.ok(&["pane", "zoom", "-s", "z", "-p", &first]);
+    env.ok(&["session", "kill", "z"]);
+    shux_testkit::wait_until("the hidden pane's program to end", || unsafe {
+        libc::kill(hidden, 0) != 0
+    });
 }
 
 /// A pane whose shell cannot start again comes back as an exited pane that

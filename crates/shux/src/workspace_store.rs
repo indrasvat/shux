@@ -6,7 +6,8 @@
 //! | `lock` | held by the live daemon for its whole run; never unlinked |
 //! | `owner` | that daemon's pid, so a contended successor can name it |
 //! | `workspace.json` | the last durable workspace |
-//! | `restoring` | the digest of the workspace a boot is restoring |
+//! | `restoring` | present while a restore runs: how many have started |
+//! | `poisoned` | a close could neither be saved nor the workspace deleted |
 //! | `quarantine/` | workspaces a boot refused, kept as evidence |
 
 use std::fs::{self, File, OpenOptions};
@@ -18,6 +19,7 @@ use sha2::{Digest, Sha256};
 
 const WORKSPACE: &str = "workspace.json";
 const RESTORING: &str = "restoring";
+const POISONED: &str = "poisoned";
 const OWNER: &str = "owner";
 const QUARANTINE: &str = "quarantine";
 
@@ -38,13 +40,6 @@ pub fn state_root() -> Option<PathBuf> {
 pub fn key_for(socket_key: &Path) -> String {
     let digest = Sha256::digest(socket_key.as_os_str().as_encoded_bytes());
     digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
-}
-
-pub fn digest(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
 }
 
 /// Open (creating if needed) a directory we own, refusing a symlink or a
@@ -140,6 +135,9 @@ pub struct Store {
     /// Every workspace write fails, as on a full disk.
     #[cfg(test)]
     pub(crate) fail_writes: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Every removal fails, as in a directory gone read-only.
+    #[cfg(test)]
+    pub(crate) fail_removes: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Store {
@@ -180,6 +178,8 @@ impl Store {
             _lock: lock,
             #[cfg(test)]
             fail_writes: Default::default(),
+            #[cfg(test)]
+            fail_removes: Default::default(),
         };
         store
             .replace(OWNER, std::process::id().to_string().as_bytes())
@@ -231,17 +231,32 @@ impl Store {
 
     /// The workspace a restore was under way for, and how many restores of it
     /// have started without finishing.
-    pub fn restoring(&self) -> io::Result<Option<(String, u32)>> {
+    pub fn restoring(&self) -> io::Result<Option<u32>> {
         Ok(read_small(&self.dir.join(RESTORING))?.map(|s| {
-            let mut parts = s.split_whitespace();
-            let digest = parts.next().unwrap_or_default().to_string();
-            let attempts = parts.next().and_then(|n| n.parse().ok()).unwrap_or(1);
-            (digest, attempts)
+            // Unreadable counts as one: a restore began and did not finish.
+            s.split_whitespace()
+                .last()
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(1)
         }))
     }
 
-    pub fn mark_restoring(&self, digest: &str, attempts: u32) -> io::Result<()> {
-        self.replace(RESTORING, format!("{digest} {attempts}").as_bytes())
+    pub fn mark_restoring(&self, attempts: u32) -> io::Result<()> {
+        self.replace(RESTORING, attempts.to_string().as_bytes())
+    }
+
+    /// The workspace could be neither saved nor deleted after a close: the
+    /// next start must not restore it.
+    pub fn mark_poisoned(&self) -> io::Result<()> {
+        self.replace(POISONED, b"1")
+    }
+
+    pub fn is_poisoned(&self) -> io::Result<bool> {
+        Ok(read_small(&self.dir.join(POISONED))?.is_some())
+    }
+
+    pub fn clear_poisoned(&self) -> io::Result<()> {
+        self.remove(POISONED)
     }
 
     pub fn clear_restoring(&self) -> io::Result<()> {
@@ -283,7 +298,8 @@ impl Store {
     /// keeps, but not quarantined evidence.
     pub fn discard(&self) -> io::Result<()> {
         self.remove(WORKSPACE)?;
-        self.remove(RESTORING)
+        self.remove(RESTORING)?;
+        self.remove(POISONED)
     }
 
     fn replace(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
@@ -306,6 +322,10 @@ impl Store {
     }
 
     fn remove(&self, name: &str) -> io::Result<()> {
+        #[cfg(test)]
+        if self.fail_removes.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(io::Error::from_raw_os_error(libc::EACCES));
+        }
         match fs::remove_file(self.dir.join(name)) {
             Ok(()) => self.dir_handle.sync_all(),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),

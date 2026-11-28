@@ -463,7 +463,9 @@ pub(crate) fn register_window_methods(
 
                     {
                         let mut state = io.lock().await;
-                        let pulse = state.teardown_panes(&pane_ids, true);
+                        let mut gone = state.panes_gone_from(&gh.snapshot());
+                        gone.extend(pane_ids);
+                        let pulse = state.teardown_panes(&gone, true);
                         drop(state);
                         pulse.bump();
                     }

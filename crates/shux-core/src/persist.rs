@@ -21,7 +21,6 @@ use crate::model::{
 pub const SCHEMA: u32 = 1;
 /// Checked on the file's size before reading it.
 pub const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
-pub const MAX_TOTAL_PANES: usize = 4 * MAX_PANES_PER_SESSION;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -96,12 +95,14 @@ pub struct PPane {
     pub version: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessId {
     pub pid: i32,
     /// The process's start time, so a reused pid is never taken for it.
     pub start_token: u64,
+    /// The machine's boot it ran in: start times only compare within one.
+    pub boot: String,
 }
 
 /// A path, byte for byte: UTF-8 as a string, anything else as hex.
@@ -347,7 +348,6 @@ pub fn decode(bytes: &[u8], expected_socket: &str) -> Result<Workspace, RestoreE
 pub fn validate(ws: &Workspace) -> Result<(), RestoreError> {
     let mut ids: HashSet<uuid::Uuid> = HashSet::new();
     let mut names: HashSet<&str> = HashSet::new();
-    let mut total_panes = 0usize;
     for s in &ws.sessions {
         if !ids.insert(s.id.0) {
             return Err(invalid(format!("duplicate id {}", s.id)));
@@ -360,7 +360,7 @@ pub fn validate(ws: &Workspace) -> Result<(), RestoreError> {
         }
         crate::graph::SessionGraph::validate_session_name(&s.name)
             .map_err(|e| invalid(format!("session {:?}: {e}", s.name)))?;
-        if s.created_seq > u64::MAX - MAX_TOTAL_PANES as u64 {
+        if s.created_seq > u64::MAX / 2 {
             return Err(invalid("session sequence out of range"));
         }
         if s.windows.is_empty() {
@@ -417,10 +417,6 @@ pub fn validate(ws: &Workspace) -> Result<(), RestoreError> {
                 s.name
             )));
         }
-        total_panes += session_panes;
-    }
-    if total_panes > MAX_TOTAL_PANES {
-        return Err(invalid(format!("{total_panes} panes in total")));
     }
     Ok(())
 }
@@ -552,7 +548,7 @@ pub fn rebuild(ws: &Workspace) -> Restored {
                     p.id,
                     PaneExtras {
                         last_cwd: p.last_cwd.as_ref().and_then(PathRepr::to_path),
-                        process: p.process,
+                        process: p.process.clone(),
                     },
                 );
                 snapshot.panes.insert(p.id, pane);
@@ -722,9 +718,10 @@ mod tests {
         let b = p.0.as_bytes()[0];
         PaneExtras {
             last_cwd: (!b.is_multiple_of(3)).then(|| cwd(b.wrapping_add(1))),
-            process: (b.is_multiple_of(2)).then_some(ProcessId {
+            process: (b.is_multiple_of(2)).then(|| ProcessId {
                 pid: i32::from(b) + 100,
                 start_token: u64::from(b) * 7,
+                boot: format!("boot-{b}"),
             }),
         }
     }
@@ -899,14 +896,15 @@ mod tests {
         Workspace { sessions, ..good() }
     }
 
-    /// The pane caps are exact: a workspace at a cap restores, one past it is
-    /// refused. A cap set too low would quarantine a legitimate workspace.
+    /// The per-session pane cap is the graph's own, exactly: a workspace at it
+    /// restores, one past it is refused. Across sessions there is no cap but
+    /// the file's size, as the graph has none either; a reader stricter than
+    /// the graph would quarantine a workspace its writer saved.
     #[test]
-    fn the_pane_caps_are_exact() {
+    fn the_pane_cap_is_the_graphs() {
         assert!(validate(&wide(1, MAX_PANES_PER_SESSION)).is_ok());
         assert!(validate(&wide(1, MAX_PANES_PER_SESSION + 1)).is_err());
-        assert!(validate(&wide(4, MAX_TOTAL_PANES)).is_ok());
-        assert!(validate(&wide(5, MAX_TOTAL_PANES + 1)).is_err());
+        assert!(validate(&wide(6, 5 * MAX_PANES_PER_SESSION)).is_ok());
     }
 
     /// The decoder's own refusals: before validation can even run.

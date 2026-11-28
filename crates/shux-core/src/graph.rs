@@ -2695,9 +2695,38 @@ fn resolve_pane_ref(
 /// Run the graph command processing loop (single-writer task).
 pub async fn run_graph_loop(
     graph: SessionGraph,
-    mut cmd_rx: mpsc::Receiver<GraphCommand>,
+    cmd_rx: mpsc::Receiver<GraphCommand>,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
+    run_graph_loop_durable(graph, cmd_rx, shutdown, None).await;
+}
+
+/// Run `close` on the graph, first making its result durable when it is a
+/// valid close: tried on a copy, saved as that copy, then committed. One that
+/// the graph refuses is never saved; the loop's order is the save order.
+async fn durable_close(
+    graph: &SessionGraph,
+    durability: Option<&Arc<dyn Durability>>,
+    close: impl Fn(&SessionGraph) -> Result<(), GraphError>,
+) -> Result<(), GraphError> {
+    if let Some(durability) = durability {
+        let (preview, _) = SessionGraph::from_snapshot((*graph.current()).clone(), None);
+        close(&preview)?;
+        durability.close(preview.current()).await;
+    }
+    close(graph)
+}
+
+/// [`run_graph_loop`], with every session, window and pane close made
+/// durable by `durability` before it commits. A scratch session is never
+/// saved, so its close is not.
+pub async fn run_graph_loop_durable(
+    graph: SessionGraph,
+    mut cmd_rx: mpsc::Receiver<GraphCommand>,
+    shutdown: tokio_util::sync::CancellationToken,
+    durability: Option<Arc<dyn Durability>>,
+) {
+    let durability = durability.as_ref();
     loop {
         tokio::select! {
             cmd = cmd_rx.recv() => {
@@ -2706,7 +2735,10 @@ pub async fn run_graph_loop(
                         let _ = reply.send(graph.create_session_flagged(name, cwd, initial_command, scratch));
                     }
                     Some(GraphCommand::DestroySession { id, expected_version, reply }) => {
-                        let _ = reply.send(graph.destroy_session(id, expected_version));
+                        let scratch = graph.current().sessions.get(&id).is_some_and(|s| s.scratch);
+                        let durability = durability.filter(|_| !scratch);
+                        let out = durable_close(&graph, durability, |g| g.destroy_session(id, expected_version)).await;
+                        let _ = reply.send(out);
                     }
                     Some(GraphCommand::RenameSession { id, new_name, expected_version, reply }) => {
                         let _ = reply.send(graph.rename_session(id, new_name, expected_version));
@@ -2715,7 +2747,8 @@ pub async fn run_graph_loop(
                         let _ = reply.send(graph.create_window_with_command(session_id, title, cwd, initial_command));
                     }
                     Some(GraphCommand::DestroyWindow { id, expected_version, reply }) => {
-                        let _ = reply.send(graph.destroy_window(id, expected_version));
+                        let out = durable_close(&graph, durability, |g| g.destroy_window(id, expected_version)).await;
+                        let _ = reply.send(out);
                     }
                     Some(GraphCommand::RenameWindow { id, new_title, expected_version, reply }) => {
                         let _ = reply.send(graph.rename_window(id, new_title, expected_version));
@@ -2730,7 +2763,8 @@ pub async fn run_graph_loop(
                         let _ = reply.send(graph.create_pane(window_id, cwd, command));
                     }
                     Some(GraphCommand::DestroyPane { id, expected_version, reply }) => {
-                        let _ = reply.send(graph.destroy_pane(id, expected_version));
+                        let out = durable_close(&graph, durability, |g| g.destroy_pane(id, expected_version)).await;
+                        let _ = reply.send(out);
                     }
                     Some(GraphCommand::SetPaneExitStatus { id, exit_status, reply }) => {
                         let _ = reply.send(graph.set_pane_exit_status(id, exit_status));
@@ -2781,7 +2815,8 @@ pub async fn run_graph_loop(
                         let _ = reply.send(graph.zoom_pane_if_focused(id, focused));
                     }
                     Some(GraphCommand::DestroyPaneAndEmptyParents { id, reply }) => {
-                        let _ = reply.send(graph.destroy_pane_and_empty_parents(id));
+                        let out = durable_close(&graph, durability, |g| g.destroy_pane_and_empty_parents(id)).await;
+                        let _ = reply.send(out);
                     }
                     Some(GraphCommand::SwapPanes { a, b, expected_version, reply }) => {
                         let _ = reply.send(graph.swap_panes(a, b, expected_version));
@@ -2812,40 +2847,15 @@ pub async fn run_graph_loop(
     }
 }
 
-/// What a close removes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Removal {
-    Session(SessionId),
-    Window(WindowId),
-    Pane(PaneId),
-    /// A pane and every window and session it leaves empty.
-    PaneCascade(PaneId),
-}
-
-impl Removal {
-    /// Apply it to `g` exactly as the close does. One that no longer applies
-    /// (already gone) changes nothing.
-    pub fn apply(self, g: &SessionGraph) {
-        let _ = match self {
-            Self::Session(id) => g.destroy_session(id, None),
-            Self::Window(id) => g.destroy_window(id, None),
-            Self::Pane(id) => g.destroy_pane(id, None),
-            Self::PaneCascade(id) => g.destroy_pane_and_empty_parents(id),
-        };
-    }
-}
-
-/// Makes a close durable before it happens: the workspace writer (#329),
-/// which must never let a saved workspace bring back what a user closed.
-pub trait CloseGuard: Send + Sync {
-    /// Before the close; the close runs once this resolves. Returns a ticket
-    /// for [`CloseGuard::after_close`].
-    fn before_close(
+/// Makes a close durable before it commits: the workspace writer (#329), which
+/// must never let a saved workspace bring back what a user closed.
+pub trait Durability: Send + Sync {
+    /// Make `after` (the graph exactly as a valid close will leave it) durable.
+    /// The graph task waits for this, then commits the close.
+    fn close(
         &self,
-        removal: Removal,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = u64> + Send + '_>>;
-    /// After the close, whatever its result.
-    fn after_close(&self, ticket: u64);
+        after: Arc<SessionGraphSnapshot>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>;
 }
 
 /// A cloneable handle for sending commands to the SessionGraph.
@@ -2853,7 +2863,6 @@ pub trait CloseGuard: Send + Sync {
 pub struct GraphHandle {
     cmd_tx: mpsc::Sender<GraphCommand>,
     state: Arc<ArcSwap<SessionGraphSnapshot>>,
-    guard: Option<Arc<dyn CloseGuard>>,
 }
 
 impl GraphHandle {
@@ -2861,18 +2870,7 @@ impl GraphHandle {
         cmd_tx: mpsc::Sender<GraphCommand>,
         state: Arc<ArcSwap<SessionGraphSnapshot>>,
     ) -> Self {
-        Self {
-            cmd_tx,
-            state,
-            guard: None,
-        }
-    }
-
-    /// Every session, window and pane close through this handle (and its
-    /// clones) tells `guard` first.
-    pub fn with_close_guard(mut self, guard: Arc<dyn CloseGuard>) -> Self {
-        self.guard = Some(guard);
-        self
+        Self { cmd_tx, state }
     }
 
     /// Read the current snapshot (lock-free, no channel hop).
@@ -2950,39 +2948,12 @@ impl GraphHandle {
         rx.await.ok()
     }
 
-    /// Run `close` with the close guard told first (see [`CloseGuard`]). A
-    /// scratch session is never saved, so its close needs no guard.
-    async fn guarded<T>(
-        &self,
-        removal: Removal,
-        close: impl std::future::Future<Output = Result<T, GraphError>>,
-    ) -> Result<T, GraphError> {
-        let Some(guard) = &self.guard else {
-            return close.await;
-        };
-        if let Removal::Session(id) = removal
-            && self.snapshot().sessions.get(&id).is_some_and(|s| s.scratch)
-        {
-            return close.await;
-        }
-        // Settled however this ends, a caller dropping the future included:
-        // a close that never ran must not stay left out of every save.
-        struct Settle<'a>(&'a dyn CloseGuard, u64);
-        impl Drop for Settle<'_> {
-            fn drop(&mut self) {
-                self.0.after_close(self.1);
-            }
-        }
-        let _settle = Settle(guard.as_ref(), guard.before_close(removal).await);
-        close.await
-    }
-
     pub async fn destroy_session(
         &self,
         id: SessionId,
         expected_version: Option<Version>,
     ) -> Result<(), GraphError> {
-        self.guarded(Removal::Session(id), async {
+        (async {
             let (tx, rx) = tokio::sync::oneshot::channel();
             self.cmd_tx
                 .send(GraphCommand::DestroySession {
@@ -3055,7 +3026,7 @@ impl GraphHandle {
         id: WindowId,
         expected_version: Option<Version>,
     ) -> Result<(), GraphError> {
-        self.guarded(Removal::Window(id), async {
+        (async {
             let (tx, rx) = tokio::sync::oneshot::channel();
             self.cmd_tx
                 .send(GraphCommand::DestroyWindow {
@@ -3149,7 +3120,7 @@ impl GraphHandle {
         id: PaneId,
         expected_version: Option<Version>,
     ) -> Result<(), GraphError> {
-        self.guarded(Removal::Pane(id), async {
+        (async {
             let (tx, rx) = tokio::sync::oneshot::channel();
             self.cmd_tx
                 .send(GraphCommand::DestroyPane {
@@ -3463,7 +3434,7 @@ impl GraphHandle {
 
     /// See [`SessionGraph::destroy_pane_and_empty_parents`].
     pub async fn destroy_pane_and_empty_parents(&self, id: PaneId) -> Result<(), GraphError> {
-        self.guarded(Removal::PaneCascade(id), async {
+        (async {
             let (tx, rx) = tokio::sync::oneshot::channel();
             self.cmd_tx
                 .send(GraphCommand::DestroyPaneAndEmptyParents { id, reply: tx })
@@ -3540,43 +3511,65 @@ mod tests {
         PathBuf::from("/home/test")
     }
 
+    /// Records what it is asked to make durable, and what the live graph held
+    /// at that moment.
     #[derive(Default)]
-    struct Recorder(std::sync::Mutex<Vec<&'static str>>);
+    struct Recorder {
+        live: std::sync::Mutex<Option<Arc<ArcSwap<SessionGraphSnapshot>>>>,
+        seen: std::sync::Mutex<Vec<(usize, usize)>>,
+    }
 
-    impl CloseGuard for Recorder {
-        fn before_close(
+    impl Durability for Recorder {
+        fn close(
             &self,
-            _: Removal,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = u64> + Send + '_>> {
-            self.0.lock().unwrap().push("before");
-            Box::pin(async { 7 })
-        }
-        fn after_close(&self, ticket: u64) {
-            assert_eq!(ticket, 7);
-            self.0.lock().unwrap().push("after");
+            after: Arc<SessionGraphSnapshot>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            let live = self
+                .live
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .load()
+                .sessions
+                .len();
+            self.seen.lock().unwrap().push((after.sessions.len(), live));
+            Box::pin(async {})
         }
     }
 
-    /// A close whose caller drops it part way (a client hanging up) still
-    /// settles with the guard, so what it guarded is not left out of every
-    /// later save while it lives on.
+    /// A close is made durable as the graph will be after it, before it
+    /// commits; a close the graph refuses is never made durable at all.
     #[tokio::test]
-    async fn an_abandoned_close_is_still_settled() {
+    async fn a_close_is_durable_before_it_commits_and_only_if_valid() {
         let (graph, state) = SessionGraph::new();
-        let id = graph.create_session("s".into(), home()).expect("create");
+        let a = graph.create_session("a".into(), home()).expect("create");
+        graph.create_session("b".into(), home()).expect("create");
         let recorder = Arc::new(Recorder::default());
-        // No graph loop: the destroy is sent and then waits for a reply forever.
-        let (tx, _rx) = mpsc::channel(4);
-        let handle = GraphHandle::new(tx, state).with_close_guard(recorder.clone());
-        let mut close = Box::pin(handle.destroy_session(id, None));
+        *recorder.live.lock().unwrap() = Some(state.clone());
+        let (tx, rx) = mpsc::channel(4);
+        let stop = tokio_util::sync::CancellationToken::new();
+        let durability: Arc<dyn Durability> = recorder.clone();
+        tokio::spawn(run_graph_loop_durable(
+            graph,
+            rx,
+            stop.clone(),
+            Some(durability),
+        ));
+        let handle = GraphHandle::new(tx, state);
+
+        let stale = handle.snapshot().sessions[&a].version + 1;
+        assert!(handle.destroy_session(a, Some(stale)).await.is_err());
         assert!(
-            tokio::time::timeout(std::time::Duration::ZERO, &mut close)
-                .await
-                .is_err(),
-            "the close finished with no graph to answer it"
+            recorder.seen.lock().unwrap().is_empty(),
+            "a refused close was saved"
         );
-        drop(close);
-        assert_eq!(*recorder.0.lock().unwrap(), ["before", "after"]);
+
+        handle.destroy_session(a, None).await.unwrap();
+        // Saved as one session, while the graph still held two.
+        assert_eq!(*recorder.seen.lock().unwrap(), [(1, 2)]);
+        assert_eq!(handle.snapshot().sessions.len(), 1);
+        stop.cancel();
     }
 
     #[test]

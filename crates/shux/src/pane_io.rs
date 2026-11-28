@@ -222,6 +222,9 @@ pub struct PaneIoState {
     pub(crate) pane_lifetime: tokio_util::sync::CancellationToken,
     /// A line drawn into a pane's next VT (never sent to its program).
     pub(crate) pending_notices: HashMap<shux_core::model::PaneId, String>,
+    /// Restored panes whose shell the restore has yet to start: no one else
+    /// starts one there (an attach would, in the wrong directory).
+    pub(crate) awaiting_restore: std::collections::HashSet<shux_core::model::PaneId>,
 }
 
 /// A generation counter every attach render loop watches. A bump wakes every
@@ -296,6 +299,7 @@ impl PaneIoState {
             persist: crate::workspace::Persist::disabled("not a daemon"),
             pane_lifetime: tokio_util::sync::CancellationToken::new(),
             pending_notices: HashMap::new(),
+            awaiting_restore: Default::default(),
         }
     }
 
@@ -315,6 +319,26 @@ impl PaneIoState {
     pub(crate) fn with_persist(mut self, persist: crate::workspace::Persist) -> Self {
         self.persist = persist;
         self
+    }
+
+    /// Panes with a program or a screen here that `snap` no longer has: what
+    /// a kill must end, whatever it saw before (a pane a zoom hides, a split
+    /// made while the kill was being saved).
+    pub(crate) fn panes_gone_from(
+        &self,
+        snap: &shux_core::graph::SessionGraphSnapshot,
+    ) -> Vec<shux_core::model::PaneId> {
+        let mut gone: Vec<_> = self
+            .shutdowns
+            .keys()
+            .chain(self.writers.keys())
+            .chain(self.vts.keys())
+            .filter(|p| !snap.panes.contains_key(p))
+            .copied()
+            .collect();
+        gone.sort_by_key(|p| p.0);
+        gone.dedup();
+        gone
     }
 
     pub(crate) fn end_panes(&self) {

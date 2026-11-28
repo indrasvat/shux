@@ -287,7 +287,9 @@ pub(crate) fn register_session_methods(
                     // so rich TUIs do not survive as unreachable children.
                     {
                         let mut state = io.lock().await;
-                        let pulse = state.teardown_panes(&pane_ids, true);
+                        let mut gone = state.panes_gone_from(&gh.snapshot());
+                        gone.extend(pane_ids);
+                        let pulse = state.teardown_panes(&gone, true);
                         drop(state);
                         pulse.bump();
                     }

@@ -636,9 +636,11 @@ async fn serve_connection(
     //
     // A watcher starts nothing: it shows what is there.
     if !read_only {
+        // A pane a restore owns gets its shell there, in its last directory.
         let writer_present = {
             let state = io_state.lock().await;
             state.writers.contains_key(&session.active_pane_id)
+                || state.awaiting_restore.contains(&session.active_pane_id)
         };
         if !writer_present {
             let snap = graph.snapshot();
