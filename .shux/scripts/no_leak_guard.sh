@@ -50,10 +50,32 @@ if [ "${#baseline_shux[@]}" -gt 0 ]; then
   ) >&2 || true
 fi
 
+# A daemon saves its workspace under $XDG_STATE_HOME (issue #329). A wrapped
+# run gets a private one, so test daemons never write into the real one or
+# restore each other's leftovers across runs. A server directory appearing in
+# the real one is a leak like any other.
+real_servers="${HOME:-/nonexistent}/.local/state/shux/servers"
+list_servers() { find "${real_servers}" -mindepth 1 -maxdepth 1 2>/dev/null | sort || true; }
+servers_before="$(list_servers)"
+private_state=""
+if [ -z "${XDG_STATE_HOME:-}" ]; then
+  private_state="$(mktemp -d "${TMPDIR:-/tmp}/shux-state.XXXXXX")"
+  export XDG_STATE_HOME="${private_state}"
+  trap 'rm -rf "${private_state}"' EXIT
+fi
+
 set +e
 "$@"
 cmd_status=$?
 set -e
+
+new_servers="$(comm -13 <(printf '%s\n' "${servers_before}") <(list_servers) | sed '/^$/d')"
+if [ -n "${new_servers}" ]; then
+  echo "shux leak guard: command wrote a workspace into the real state directory:" >&2
+  printf '  %s\n' "${new_servers}" >&2
+  echo "  a daemon there ran with XDG_STATE_HOME set to the real one" >&2
+  cmd_status=1
+fi
 
 # shellcheck disable=SC2207  # mapfile is bash 4+; macOS ships bash 3.2
 after_shux=($(shux_pids))

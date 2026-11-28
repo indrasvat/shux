@@ -453,6 +453,22 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     .await;
                     cli::or_wait_failed(created, waiting, "window create", args.format)
                 }
+                WindowCommand::Layout {
+                    session,
+                    window,
+                    cols,
+                    rows,
+                } => {
+                    cli::handle_window_layout(
+                        &mut stream,
+                        &session,
+                        &window,
+                        cols,
+                        rows,
+                        args.format,
+                    )
+                    .await
+                }
                 WindowCommand::Kill {
                     session,
                     window,
@@ -1105,7 +1121,7 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
         }) => cli::handle_daemon_upgrade(&socket_path, when_idle, force, args.format).await,
 
         Some(Command::Daemon { command }) => {
-            handle_daemon_command(command, args.format, &socket_path)
+            handle_daemon_command(command, args.format, &socket_path).await
         }
 
         Some(Command::Version) => cli::handle_version(&socket_path, args.format).await,

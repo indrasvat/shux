@@ -442,9 +442,19 @@ pub enum DaemonCommand {
     /// exactly the daemon recorded in `$XDG_RUNTIME_DIR/shux/shux.pid`, never other
     /// checkouts' or other agents' daemons the way a `pkill -f shux` would. Exits 0 when
     /// no daemon is running, so it is safe in a cleanup trap.
-    Stop,
+    ///
+    /// Its programs end, but its workspace is kept: the next command starts a daemon
+    /// with the same sessions, windows and layout, and a fresh shell in each pane's
+    /// last directory (`[restore] workspace`). `--discard` forgets it instead.
+    Stop {
+        /// Also delete the saved workspace, so the next daemon starts empty. Works
+        /// with no daemon running; a daemon that ignores SIGTERM is killed.
+        #[arg(long)]
+        discard: bool,
+    },
 
-    /// Report whether a daemon is running for this runtime dir, and its pid.
+    /// Report whether a daemon is running for this runtime dir, its pid, and how its
+    /// workspace is saved.
     Status,
 
     /// Replace the running daemon with this build, keeping its sessions unless told not to.
@@ -453,8 +463,9 @@ pub enum DaemonCommand {
     /// refuses (exit 11) only a call it cannot serve. This swaps it for the installed
     /// build: at once when it holds no sessions, and then the next command starts this
     /// build. With sessions, `--when-idle` makes it retire the moment its last session
-    /// ends, and `--force` ends them now, as `daemon stop` does. Never starts a daemon,
-    /// and never replaces a newer one without `--force`.
+    /// ends, and `--force` stops it now, as `daemon stop` does: its programs end, and
+    /// the next command starts this build with the workspace back as fresh shells.
+    /// Never starts a daemon, and never replaces a newer one without `--force`.
     ///
     /// Exits 0 when it is done or will be done on its own, 1 when it was refused (the
     /// daemon holds sessions, or is a newer release), 3 when the daemon could not be asked.
@@ -462,7 +473,7 @@ pub enum DaemonCommand {
         /// Retire when its last session ends, instead of refusing while it holds any.
         #[arg(long, conflicts_with = "force")]
         when_idle: bool,
-        /// End its sessions now and stop it.
+        /// Stop it now: its programs end, and its workspace comes back on the new build.
         #[arg(long)]
         force: bool,
     },
@@ -847,6 +858,30 @@ pub enum WindowCommand {
 
         #[command(flatten)]
         wait: WaitArgs,
+    },
+
+    /// Show a window's split tree and where each pane sits at a given size.
+    ///
+    /// The size is the window's, given explicitly so the answer is the same for
+    /// every client. `--format json` gives the tree as a flat node table (`root`
+    /// indexes `nodes`; a split names its two children by index), unzoomed, with
+    /// `zoomed_pane` set when a pane is zoomed.
+    Layout {
+        /// Session name or id (full UUID, or the short form `session list` prints)
+        #[arg(short, long)]
+        session: String,
+
+        /// Window number (from 1, as `window list` and the status bar show it), name, or id
+        #[arg(short, long)]
+        window: String,
+
+        /// Window width in cells.
+        #[arg(long)]
+        cols: u16,
+
+        /// Window height in cells.
+        #[arg(long)]
+        rows: u16,
     },
 
     /// Kill a window

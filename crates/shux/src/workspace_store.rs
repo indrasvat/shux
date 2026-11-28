@@ -100,6 +100,9 @@ pub struct Store {
     dir_handle: File,
     /// The flock lives with this handle.
     _lock: File,
+    /// Every workspace write fails, as on a full disk.
+    #[cfg(test)]
+    pub(crate) fail_writes: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Store {
@@ -137,6 +140,8 @@ impl Store {
             dir,
             dir_handle,
             _lock: lock,
+            #[cfg(test)]
+            fail_writes: Default::default(),
         };
         store
             .replace(OWNER, std::process::id().to_string().as_bytes())
@@ -174,6 +179,10 @@ impl Store {
     /// Replace the workspace durably: once this returns, a crash or power
     /// loss leaves either these bytes or nothing newer.
     pub fn write_workspace(&self, bytes: &[u8]) -> io::Result<()> {
+        #[cfg(test)]
+        if self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(io::Error::from_raw_os_error(libc::ENOSPC));
+        }
         self.replace(WORKSPACE, bytes)
     }
 

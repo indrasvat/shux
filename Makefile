@@ -994,7 +994,11 @@ FUZZ_SECONDS ?= 60
 FUZZ_PROGRAM_STATUS := program_status_decode program_status_table scanner_vs_vte vt_program_status_stream vt_command_capture
 
 .PHONY: fuzz
-fuzz: fuzz-program-status fuzz-pane-mouse fuzz-pane-record ## Run every libFuzzer target (FUZZ_SECONDS each, default 60)
+fuzz: fuzz-program-status fuzz-pane-mouse fuzz-pane-record fuzz-workspace ## Run every libFuzzer target (FUZZ_SECONDS each, default 60)
+
+.PHONY: fuzz-workspace
+fuzz-workspace: ## Saved-workspace decoding: any bytes on disk are refused or restored whole (FUZZ_SECONDS)
+	@bash scripts/fuzz.sh $(FUZZ_SECONDS) workspace_decode
 
 .PHONY: fuzz-pane-record
 fuzz-pane-record: ## Recording lifecycle: overlapping starts, stops, faults, shutdown (FUZZ_SECONDS)

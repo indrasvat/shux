@@ -1018,7 +1018,8 @@ fn a_planted_build_is_never_taken_for_the_daemons() {
     };
     start(None);
     let kept = PathBuf::from(h.build_file()["build"]["exe"].as_str().expect("exe"));
-    ok(&h.run(&["daemon", "stop"]), "stop");
+    // A fresh daemon next, not this one's workspace restored.
+    ok(&h.run(&["daemon", "stop", "--discard"]), "stop");
 
     let marker = h.runtime.path().join("ran");
     std::fs::remove_file(&kept).expect("remove");

@@ -1618,6 +1618,73 @@ pub fn print_window_killed(title: &str) -> Printed {
     print_success("Killed", &format!("window '{title}'"), None)
 }
 
+/// One line on how the daemon saves its workspace (`daemon.workspace`), or
+/// nothing when it did not say.
+pub fn print_workspace_status(ws: &serde_json::Value) {
+    let Some(state) = ws.get("state").and_then(|s| s.as_str()) else {
+        return;
+    };
+    let reason = ws.get("reason").and_then(|s| s.as_str()).unwrap_or("");
+    let line = match state {
+        "ok" => success(format!(
+            "workspace saved (version {} of {}), {} panes restored at start",
+            ws["durable_version"], ws["graph_version"], ws["restored_panes"]
+        ))
+        .to_string(),
+        "failing" => warning(format!("workspace not being saved: {reason}")).to_string(),
+        _ => muted(format!("workspace not saved: {reason}")).to_string(),
+    };
+    println!("{line}");
+    if let Some(q) = ws.get("quarantined").and_then(|s| s.as_str()) {
+        println!(
+            "{}",
+            warning(format!("refused a saved workspace at start ({q})"))
+        );
+    }
+}
+
+/// Print where each pane of a window sits (`window.layout`'s answer).
+pub fn print_window_layout(title: &str, layout: &serde_json::Value) -> Printed {
+    let mut out = io::stdout().lock();
+    let num = |v: &serde_json::Value, k: &str| v.get(k).and_then(|n| n.as_u64()).unwrap_or(0);
+    writeln!(
+        out,
+        "{} {}",
+        bold(format!("window '{}'", safe_label(title))),
+        muted(format!(
+            "at {}x{}",
+            num(layout, "cols"),
+            num(layout, "rows")
+        ))
+    )?;
+    let active = layout.get("active_pane").and_then(|v| v.as_str());
+    let zoomed = layout.get("zoomed_pane").and_then(|v| v.as_str());
+    for pane in layout
+        .get("panes")
+        .and_then(|p| p.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let id = pane.get("pane_id").and_then(|v| v.as_str()).unwrap_or("");
+        let mark = match (Some(id) == active, Some(id) == zoomed) {
+            (_, true) => accent("zoomed").to_string(),
+            (true, false) => accent("active").to_string(),
+            _ => String::new(),
+        };
+        writeln!(
+            out,
+            "  {}  {:>4},{:<4} {:>4}x{:<4} {mark}",
+            muted(id.get(..8).unwrap_or(id)),
+            num(pane, "x"),
+            num(pane, "y"),
+            num(pane, "cols"),
+            num(pane, "rows"),
+        )?;
+    }
+    out.flush()?;
+    Ok(())
+}
+
 /// Print a window rename confirmation.
 pub fn print_window_renamed(old_name: &str, new_name: &str) -> Printed {
     let (old_name, new_name) = (safe_label(old_name), safe_label(new_name));

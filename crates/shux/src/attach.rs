@@ -31,7 +31,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use shux_core::config::ConfigHandle;
-use shux_core::graph::{GraphError, GraphHandle};
+use shux_core::graph::GraphHandle;
 use shux_core::layout::{NavDirection, Rect};
 use shux_core::model::{PaneId, SessionId, WindowId};
 use shux_core::theme::Theme;
@@ -5187,93 +5187,23 @@ async fn kill_pane(
 ) -> anyhow::Result<()> {
     let pane_id = attached.active_pane_id;
 
-    // Resolve the pane's window + session BEFORE we mutate anything, so
-    // the cascade fallbacks have valid IDs even after destroy_pane bumps
-    // the snapshot. Without this, a fresh `shux` session (single pane,
-    // single window) silently no-op'd on Ctrl+Space x — destroy_pane
-    // returned LastPane, the warn-log went nowhere, the user saw nothing.
-    let snap = graph.snapshot();
-    let (window_id, session_id) = match snap.panes.get(&pane_id) {
-        Some(p) => {
-            let sid = snap.windows.get(&p.window_id).map(|w| w.session_id);
-            match sid {
-                Some(s) => (p.window_id, s),
-                None => {
-                    warn!(%pane_id, "kill_pane: pane's window has no session");
-                    return Ok(());
-                }
-            }
-        }
-        None => {
-            warn!(%pane_id, "kill_pane: active pane not in snapshot");
-            return Ok(());
-        }
-    };
-    drop(snap);
-
-    // tmux-style cascade: pane → window → session. The graph API stays
-    // strict (LastPane/LastWindow are real errors for programmatic
-    // clients that want pinned semantics); the human-interactive
-    // Ctrl+Space x action cascades so the user can always kill what's
-    // in front of them. When the cascade reaches destroy_session, the
-    // attach frame loop notices the session is gone on its next tick
-    // and sends SessionEnded — the client detaches naturally.
-    match graph.destroy_pane(pane_id, None).await {
-        Ok(()) => {
-            cleanup_pane_io(io_state, &[pane_id]).await;
-            return Ok(());
-        }
-        Err(GraphError::LastPane) => {
-            // Fall through to window kill.
-        }
-        Err(e) => {
-            warn!(error = %e, "kill_pane: destroy_pane failed");
-            return Ok(());
-        }
-    }
-
-    let window_pane_ids: Vec<PaneId> = {
-        let snap = graph.snapshot();
-        snap.panes
-            .values()
-            .filter(|p| p.window_id == window_id)
-            .map(|p| p.id)
-            .collect()
-    };
-
-    match graph.destroy_window(window_id, None).await {
-        Ok(()) => {
-            cleanup_pane_io(io_state, &window_pane_ids).await;
-            return Ok(());
-        }
-        Err(GraphError::LastWindow) => {
-            // Fall through to session kill.
-        }
-        Err(e) => {
-            warn!(error = %e, "kill_pane: destroy_window failed");
-            return Ok(());
-        }
-    }
-
-    let session_pane_ids: Vec<PaneId> = {
-        let snap = graph.snapshot();
-        let win_ids: std::collections::HashSet<WindowId> = snap
-            .sessions
-            .get(&session_id)
-            .map(|s| s.windows.iter().copied().collect())
-            .unwrap_or_default();
-        snap.panes
-            .values()
-            .filter(|p| win_ids.contains(&p.window_id))
-            .map(|p| p.id)
-            .collect()
-    };
-
-    if let Err(e) = graph.destroy_session(session_id, None).await {
-        warn!(error = %e, "kill_pane: destroy_session failed");
+    // tmux-style cascade: the pane, then its window if that empties, then
+    // the session if that empties, in one graph step so nothing (a split
+    // from another client) lands between the steps. When the session goes,
+    // the attach frame loop notices on its next tick and sends SessionEnded.
+    let before = graph.snapshot();
+    if let Err(e) = graph.destroy_pane_and_empty_parents(pane_id).await {
+        warn!(error = %e, "kill_pane: destroy failed");
         return Ok(());
     }
-    cleanup_pane_io(io_state, &session_pane_ids).await;
+    let after = graph.snapshot();
+    let gone: Vec<PaneId> = before
+        .panes
+        .keys()
+        .filter(|p| !after.panes.contains_key(p))
+        .copied()
+        .collect();
+    cleanup_pane_io(io_state, &gone).await;
     Ok(())
 }
 

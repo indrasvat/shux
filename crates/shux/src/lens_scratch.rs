@@ -1099,7 +1099,7 @@ fn persist_rows_atomic(path: &Path, rows: &[RegistryRow]) {
 /// signalable, and callers then removed the registry row — resurrecting
 /// the B3 orphan window for stubborn/unreaped groups).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum KillOutcome {
+pub(crate) enum KillOutcome {
     /// The group did not exist at entry (nothing to kill).
     AlreadyDead,
     /// The group existed and its death was CONFIRMED (signal-0 probe
@@ -1163,7 +1163,7 @@ fn group_is_ours(pgid: u32, start_time: u64) -> bool {
 /// parent reap normally lands within the bounded loops, at which point
 /// the probe flips to `Gone`; if it never lands, the outcome is honestly
 /// `Unconfirmed` and the registry row survives for the next startup reap.
-async fn kill_pgid_lens_sequence(pgid: u32, start_time: u64) -> KillOutcome {
+pub(crate) async fn kill_pgid_lens_sequence(pgid: u32, start_time: u64) -> KillOutcome {
     use nix::sys::signal::{Signal, killpg};
     use nix::unistd::Pid;
     #[cfg(test)]

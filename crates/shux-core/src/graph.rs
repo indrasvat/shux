@@ -2812,11 +2812,48 @@ pub async fn run_graph_loop(
     }
 }
 
+/// What a close removes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Removal {
+    Session(SessionId),
+    Window(WindowId),
+    Pane(PaneId),
+    /// A pane and every window and session it leaves empty.
+    PaneCascade(PaneId),
+}
+
+impl Removal {
+    /// Apply it to `g` exactly as the close does. One that no longer applies
+    /// (already gone) changes nothing.
+    pub fn apply(self, g: &SessionGraph) {
+        let _ = match self {
+            Self::Session(id) => g.destroy_session(id, None),
+            Self::Window(id) => g.destroy_window(id, None),
+            Self::Pane(id) => g.destroy_pane(id, None),
+            Self::PaneCascade(id) => g.destroy_pane_and_empty_parents(id),
+        };
+    }
+}
+
+/// Makes a close durable before it happens: the workspace writer (#329),
+/// which must never let a saved workspace bring back what a user closed.
+pub trait CloseGuard: Send + Sync {
+    /// Before the close; the close runs once this resolves. Returns a ticket
+    /// for [`CloseGuard::after_close`].
+    fn before_close(
+        &self,
+        removal: Removal,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = u64> + Send + '_>>;
+    /// After the close, whatever its result.
+    fn after_close(&self, ticket: u64);
+}
+
 /// A cloneable handle for sending commands to the SessionGraph.
 #[derive(Clone)]
 pub struct GraphHandle {
     cmd_tx: mpsc::Sender<GraphCommand>,
     state: Arc<ArcSwap<SessionGraphSnapshot>>,
+    guard: Option<Arc<dyn CloseGuard>>,
 }
 
 impl GraphHandle {
@@ -2824,7 +2861,18 @@ impl GraphHandle {
         cmd_tx: mpsc::Sender<GraphCommand>,
         state: Arc<ArcSwap<SessionGraphSnapshot>>,
     ) -> Self {
-        Self { cmd_tx, state }
+        Self {
+            cmd_tx,
+            state,
+            guard: None,
+        }
+    }
+
+    /// Every session, window and pane close through this handle (and its
+    /// clones) tells `guard` first.
+    pub fn with_close_guard(mut self, guard: Arc<dyn CloseGuard>) -> Self {
+        self.guard = Some(guard);
+        self
     }
 
     /// Read the current snapshot (lock-free, no channel hop).
@@ -2902,21 +2950,45 @@ impl GraphHandle {
         rx.await.ok()
     }
 
+    /// Run `close` with the close guard told first (see [`CloseGuard`]). A
+    /// scratch session is never saved, so its close needs no guard.
+    async fn guarded<T>(
+        &self,
+        removal: Removal,
+        close: impl std::future::Future<Output = Result<T, GraphError>>,
+    ) -> Result<T, GraphError> {
+        let Some(guard) = &self.guard else {
+            return close.await;
+        };
+        if let Removal::Session(id) = removal
+            && self.snapshot().sessions.get(&id).is_some_and(|s| s.scratch)
+        {
+            return close.await;
+        }
+        let ticket = guard.before_close(removal).await;
+        let out = close.await;
+        guard.after_close(ticket);
+        out
+    }
+
     pub async fn destroy_session(
         &self,
         id: SessionId,
         expected_version: Option<Version>,
     ) -> Result<(), GraphError> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.cmd_tx
-            .send(GraphCommand::DestroySession {
-                id,
-                expected_version,
-                reply: tx,
-            })
-            .await
-            .map_err(|_| GraphError::Shutdown)?;
-        rx.await.map_err(|_| GraphError::Shutdown)?
+        self.guarded(Removal::Session(id), async {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            self.cmd_tx
+                .send(GraphCommand::DestroySession {
+                    id,
+                    expected_version,
+                    reply: tx,
+                })
+                .await
+                .map_err(|_| GraphError::Shutdown)?;
+            rx.await.map_err(|_| GraphError::Shutdown)?
+        })
+        .await
     }
 
     pub async fn rename_session(
@@ -2977,16 +3049,19 @@ impl GraphHandle {
         id: WindowId,
         expected_version: Option<Version>,
     ) -> Result<(), GraphError> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.cmd_tx
-            .send(GraphCommand::DestroyWindow {
-                id,
-                expected_version,
-                reply: tx,
-            })
-            .await
-            .map_err(|_| GraphError::Shutdown)?;
-        rx.await.map_err(|_| GraphError::Shutdown)?
+        self.guarded(Removal::Window(id), async {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            self.cmd_tx
+                .send(GraphCommand::DestroyWindow {
+                    id,
+                    expected_version,
+                    reply: tx,
+                })
+                .await
+                .map_err(|_| GraphError::Shutdown)?;
+            rx.await.map_err(|_| GraphError::Shutdown)?
+        })
+        .await
     }
 
     pub async fn rename_window(
@@ -3068,16 +3143,19 @@ impl GraphHandle {
         id: PaneId,
         expected_version: Option<Version>,
     ) -> Result<(), GraphError> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.cmd_tx
-            .send(GraphCommand::DestroyPane {
-                id,
-                expected_version,
-                reply: tx,
-            })
-            .await
-            .map_err(|_| GraphError::Shutdown)?;
-        rx.await.map_err(|_| GraphError::Shutdown)?
+        self.guarded(Removal::Pane(id), async {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            self.cmd_tx
+                .send(GraphCommand::DestroyPane {
+                    id,
+                    expected_version,
+                    reply: tx,
+                })
+                .await
+                .map_err(|_| GraphError::Shutdown)?;
+            rx.await.map_err(|_| GraphError::Shutdown)?
+        })
+        .await
     }
 
     pub async fn set_pane_exit_status(
@@ -3379,12 +3457,15 @@ impl GraphHandle {
 
     /// See [`SessionGraph::destroy_pane_and_empty_parents`].
     pub async fn destroy_pane_and_empty_parents(&self, id: PaneId) -> Result<(), GraphError> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.cmd_tx
-            .send(GraphCommand::DestroyPaneAndEmptyParents { id, reply: tx })
-            .await
-            .map_err(|_| GraphError::Shutdown)?;
-        rx.await.map_err(|_| GraphError::Shutdown)?
+        self.guarded(Removal::PaneCascade(id), async {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            self.cmd_tx
+                .send(GraphCommand::DestroyPaneAndEmptyParents { id, reply: tx })
+                .await
+                .map_err(|_| GraphError::Shutdown)?;
+            rx.await.map_err(|_| GraphError::Shutdown)?
+        })
+        .await
     }
 
     pub async fn swap_panes(

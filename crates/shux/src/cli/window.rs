@@ -182,6 +182,33 @@ pub async fn handle_window_kill(
     Ok(())
 }
 
+/// Handle the `shux window layout` command.
+pub async fn handle_window_layout(
+    stream: &mut tokio::net::UnixStream,
+    session_name: &str,
+    window_spec: &str,
+    cols: u16,
+    rows: u16,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    let session_id = resolve_session_id(stream, session_name).await?;
+    let (window_id, window_title) = resolve_window_id(stream, &session_id, window_spec).await?;
+    let params = serde_json::json!({"id": window_id, "cols": cols, "rows": rows});
+    let result = rpc_call(stream, "window.layout", params).await?;
+    match format {
+        OutputFormat::Json => {
+            println!(
+                "{}",
+                crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+            );
+        }
+        OutputFormat::Text | OutputFormat::Plain => {
+            crate::style::print_window_layout(&window_title, &result)?;
+        }
+    }
+    Ok(())
+}
+
 /// Handle the `shux window rename` command.
 pub async fn handle_window_rename(
     stream: &mut tokio::net::UnixStream,

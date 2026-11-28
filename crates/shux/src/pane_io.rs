@@ -214,6 +214,14 @@ pub struct PaneIoState {
     /// to the pane's writer, under this lock, so it follows the channel's
     /// order: take room in the channel first, then this lock.
     pub(crate) open_pastes: HashMap<shux_core::model::PaneId, OpenPaste>,
+    /// Saves the workspace across restarts (#329); a no-op where nothing is saved.
+    pub(crate) persist: crate::workspace::Persist,
+    /// The parent of every pane's own token while the workspace is saved: it
+    /// outlives root, so a stopping daemon saves its panes' last directories
+    /// before it ends them. Otherwise panes hang off the spawner's token.
+    pub(crate) pane_lifetime: tokio_util::sync::CancellationToken,
+    /// A line drawn into a pane's next VT (never sent to its program).
+    pub(crate) pending_notices: HashMap<shux_core::model::PaneId, String>,
 }
 
 /// A generation counter every attach render loop watches. A bump wakes every
@@ -285,6 +293,9 @@ impl PaneIoState {
             status_sealed: Default::default(),
             open_pastes: HashMap::new(),
             clients: Default::default(),
+            persist: crate::workspace::Persist::disabled("not a daemon"),
+            pane_lifetime: tokio_util::sync::CancellationToken::new(),
+            pending_notices: HashMap::new(),
         }
     }
 
@@ -297,6 +308,17 @@ impl PaneIoState {
     pub(crate) fn with_shutdown(mut self, root: tokio_util::sync::CancellationToken) -> Self {
         self.recordings = Recordings::new(root);
         self
+    }
+
+    /// Save the workspace through `persist`. Panes then outlive root until
+    /// [`Self::end_panes`], so the last save sees them alive.
+    pub(crate) fn with_persist(mut self, persist: crate::workspace::Persist) -> Self {
+        self.persist = persist;
+        self
+    }
+
+    pub(crate) fn end_panes(&self) {
+        self.pane_lifetime.cancel();
     }
 
     pub fn teardown_panes(

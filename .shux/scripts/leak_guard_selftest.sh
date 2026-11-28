@@ -121,6 +121,29 @@ fi
 
 assert_leaked_daemon_reaped "${selftest_runtime}"
 
+# A wrapped run gets its own XDG_STATE_HOME, gone afterwards; one that writes a
+# workspace into the real state directory fails (issue #329).
+fake_home="$(mktemp -d "${TMPDIR:-/tmp}/shux-leak-guard-home.XXXXXX")"
+# shellcheck disable=SC2016  # the wrapped shell expands these, inside the guard's environment
+seen_state="$(env -u XDG_STATE_HOME HOME="${fake_home}" .shux/scripts/no_leak_guard.sh \
+  bash -c 'test -d "$XDG_STATE_HOME" && printf %s "$XDG_STATE_HOME"')"
+if [ -z "${seen_state}" ] || [ -e "${seen_state}" ]; then
+  echo "no_leak_guard did not give the run a private XDG_STATE_HOME it then removed (${seen_state:-none})" >&2
+  rm -rf "${fake_home}"
+  exit 1
+fi
+set +e
+# shellcheck disable=SC2016  # the wrapped shell expands $HOME, the fake one
+env -u XDG_STATE_HOME HOME="${fake_home}" .shux/scripts/no_leak_guard.sh \
+  bash -c 'mkdir -p "$HOME/.local/state/shux/servers/0123456789abcdef"' 2>/dev/null
+real_state_status=$?
+set -e
+rm -rf "${fake_home}"
+if [ "${real_state_status}" -eq 0 ]; then
+  echo "no_leak_guard did not fail a run that wrote into the real state directory" >&2
+  exit 1
+fi
+
 set +e
 .shux/scripts/no_leak_guard.sh python3 - <<'PY'
 import subprocess

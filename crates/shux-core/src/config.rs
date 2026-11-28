@@ -48,6 +48,8 @@ pub struct Config {
     #[serde(default)]
     pub program_status: ProgramStatusConfig,
     #[serde(default)]
+    pub restore: RestoreConfig,
+    #[serde(default)]
     pub shell: ShellConfig,
     #[serde(default)]
     pub statusbar: StatusBarConfig,
@@ -148,6 +150,23 @@ pub struct ProgramStatusConfig {
     /// The "N waiting" status-bar segment: panes blocked on you.
     #[serde(default = "default_true")]
     pub status_bar: bool,
+}
+
+/// `[restore]`: what comes back after the daemon restarts (issue #329).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RestoreConfig {
+    /// Save the workspace and bring it back on the next start: sessions,
+    /// windows, the layout, titles, focus, and a fresh shell in each pane's
+    /// last directory. Read when the daemon starts. Off neither restores nor
+    /// saves, and leaves what was saved for `daemon stop --discard`.
+    #[serde(default = "default_true")]
+    pub workspace: bool,
+}
+
+impl Default for RestoreConfig {
+    fn default() -> Self {
+        Self { workspace: true }
+    }
 }
 
 impl Default for ProgramStatusConfig {

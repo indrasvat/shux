@@ -58,10 +58,29 @@ pub(crate) fn note_client(params: Option<&Value>) -> bool {
 pub(crate) fn register_daemon_methods(
     builder: shux_rpc::RouterBuilder,
     graph: shux_core::graph::GraphHandle,
+    io_state: std::sync::Arc<tokio::sync::Mutex<crate::pane_io::PaneIoState>>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> shux_rpc::RouterBuilder {
     let g_version = graph.clone();
+    let g_workspace = graph.clone();
     builder
+        // How the workspace is being saved (#329): `durable_version` is the
+        // graph version the saved file holds, `graph_version` the live one.
+        .register_with_policy(
+            "daemon.workspace",
+            Policy::fixed(Sensitivity::Public),
+            move |_params: Option<Value>| {
+                let io = io_state.clone();
+                let graph = g_workspace.clone();
+                async move {
+                    let status = io.lock().await.persist.status();
+                    let mut answer = serde_json::to_value(&status)
+                        .map_err(|e| RpcError::internal(&e.to_string()))?;
+                    answer["graph_version"] = json!(graph.snapshot().version);
+                    Ok(answer)
+                }
+            },
+        )
         // Replaces the builtin: a client of another build learns what this
         // build serves, and whether it is on its way out.
         .register_with_policy(

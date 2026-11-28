@@ -190,7 +190,7 @@ fn sorted(tags: &HashMap<String, String>) -> BTreeMap<String, String> {
 
 /// Flatten `tree` into `nodes`, returning the root's index. Iterative: a
 /// legal tree can be 1023 splits deep.
-fn flatten(tree: &LayoutNode, nodes: &mut Vec<PNode>) -> u32 {
+pub fn flatten(tree: &LayoutNode, nodes: &mut Vec<PNode>) -> u32 {
     let placeholder = || PNode::Leaf {
         pane: PaneId::from_uuid(uuid::Uuid::nil()),
     };
@@ -575,6 +575,38 @@ pub fn rebuild(ws: &Workspace) -> Restored {
         extras,
         max_created_seq,
     }
+}
+
+/// One fuzz case: any bytes a daemon might find on disk. Decoding never
+/// panics; a workspace it accepts rebuilds into a graph whose own workspace
+/// decodes again, to the same sessions, windows and panes.
+pub fn fuzz_one(bytes: &[u8]) {
+    let Ok(ws) = decode(bytes, "/sock") else {
+        return;
+    };
+    let restored = rebuild(&ws);
+    let extras = |p: PaneId| restored.extras.get(&p).cloned().unwrap_or_default();
+    let again = capture(&restored.snapshot, "/sock", &extras);
+    let back = decode(&encode(&again), "/sock")
+        .unwrap_or_else(|e| panic!("an accepted workspace rebuilt into one refused: {e}"));
+    let ids = |w: &Workspace| -> Vec<uuid::Uuid> {
+        let mut ids: Vec<_> =
+            w.sessions
+                .iter()
+                .flat_map(|s| {
+                    std::iter::once(s.id.0).chain(s.windows.iter().flat_map(|w| {
+                        std::iter::once(w.id.0).chain(w.panes.iter().map(|p| p.id.0))
+                    }))
+                })
+                .collect();
+        ids.sort();
+        ids
+    };
+    assert_eq!(
+        ids(&back),
+        ids(&ws),
+        "rebuilding changed what the workspace holds"
+    );
 }
 
 #[cfg(test)]
@@ -966,6 +998,38 @@ mod tests {
             ws.sessions.iter().map(|s| s.id).collect::<Vec<_>>(),
             vec![keep]
         );
+    }
+
+    /// A corrupted file: bytes overwritten, removed, inserted or cut short,
+    /// starting from a real workspace so the damage lands inside valid JSON.
+    fn damaged() -> impl Strategy<Value = Vec<u8>> {
+        let base = encode(&good());
+        let n = base.len();
+        proptest::collection::vec((0..n, any::<u8>(), 0u8..4), 1..8).prop_map(move |edits| {
+            let mut b = base.clone();
+            for (at, byte, kind) in edits {
+                let at = at.min(b.len().saturating_sub(1));
+                match kind {
+                    0 => b[at] = byte,
+                    1 if !b.is_empty() => {
+                        b.remove(at);
+                    }
+                    2 => b.insert(at, byte),
+                    _ => b.truncate(at),
+                }
+            }
+            b
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// The fuzz entry point's properties hold on damaged real workspaces.
+        #[test]
+        fn a_damaged_workspace_is_refused_or_restored_whole(bytes in damaged()) {
+            fuzz_one(&bytes);
+        }
     }
 
     proptest! {

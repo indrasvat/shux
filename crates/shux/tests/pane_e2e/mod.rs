@@ -42,6 +42,8 @@ impl Env {
     pub fn shux(&self) -> Command {
         let mut cmd = Command::new(&self.bin);
         cmd.env("XDG_RUNTIME_DIR", self.root.path().join("runtime"))
+            // Its own: a daemon saves its workspace here, for this fixture only.
+            .env("XDG_STATE_HOME", self.root.path().join("state"))
             .env("XDG_CONFIG_HOME", self.root.path().join("config"))
             .env_remove("SHUX_SOCKET")
             .env("NO_COLOR", "1")
@@ -144,6 +146,16 @@ impl Env {
     /// A path in the directory the panes run in.
     pub fn work(&self, name: &str) -> PathBuf {
         self.root.path().join("work").join(name)
+    }
+
+    /// A path under the fixture's root (`runtime`, `state`, `config`, `work`).
+    pub fn path(&self, rel: &str) -> PathBuf {
+        self.root.path().join(rel)
+    }
+
+    /// Track `session` so the fixture kills it at the end.
+    pub fn owns(&mut self, session: &str) {
+        self.sessions.push(session.to_string());
     }
 
     /// The pane's visible rows, padded to the full width — `pane glance` is

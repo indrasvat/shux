@@ -12,6 +12,7 @@ macro_rules! pane_target {
 pub(crate) const WIRE_1: &[(&str, shux_rpc::Accepts)] = &[
     ("client.detach", &["id"]),
     ("client.list", &[]),
+    ("daemon.workspace", &[]),
     ("daemon.retire_if_idle", &["client"]),
     ("daemon.upgrade", &["client", "when"]),
     ("events.history", pane_target!["count", "filter"]),
@@ -184,6 +185,7 @@ pub(crate) const WIRE_1: &[(&str, shux_rpc::Accepts)] = &[
     ("window.ensure", &["command", "cwd", "name", "session_id"]),
     ("window.focus", &["expected_version", "id"]),
     ("window.kill", &["expected_version", "id"]),
+    ("window.layout", &["cols", "id", "rows"]),
     ("window.list", &["session_id"]),
     ("window.rename", &["expected_version", "id", "name"]),
     ("window.reorder", &["expected_version", "id", "new_index"]),

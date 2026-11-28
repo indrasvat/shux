@@ -55,7 +55,7 @@ Input-to-render latency is sacred. No feature may regress core latency budgets. 
 
 ### P3: Extend, don't bloat
 
-The core is deliberately small: PTY management, layout, rendering, input decoding, API server, plugin host, event bus. Everything else — status bar segments, themes, session persistence, MCP integration, floating panes, session replay — is a plugin. The plugin system is the crown jewel of shux and must be rock-solid, well-documented, and a joy to develop for.
+The core is deliberately small: PTY management, layout, rendering, input decoding, API server, plugin host, event bus. Everything else — status bar segments, themes, MCP integration, floating panes, session replay — is a plugin. The plugin system is the crown jewel of shux and must be rock-solid, well-documented, and a joy to develop for.
 
 ### P4: Humans and agents are equal citizens
 
@@ -103,7 +103,7 @@ Every feature ships with automated verification. Visual elements are screenshot-
 
 ### 2.4 shux's differentiation
 
-1. **Plugin system as crown jewel** — Wasm (WASI Preview 2 + Component Model) + process plugins with capability-based permissions, hot reload, typed WIT interfaces, tool override, event interception, and a rich extension surface. Status bar, themes, floating panes, session persistence, MCP, session replay — all plugins.
+1. **Plugin system as crown jewel** — Wasm (WASI Preview 2 + Component Model) + process plugins with capability-based permissions, hot reload, typed WIT interfaces, tool override, event interception, and a rich extension surface. Status bar, themes, floating panes, MCP, session replay — all plugins. (Workspace restore is the one exception: the daemon owns its own state, so saving and restoring it lives in the core, see §14.2.)
 2. **Dual-citizen API** — JSON-RPC over Unix domain socket (agent-friendly, zero codegen) + optional gRPC for typed streaming. Every CLI command is a thin API wrapper.
 3. **Graded keybindings** — Most common actions on bare keys (no prefix). Less common behind a simple prefix. Fully discoverable via command palette. No memorization needed.
 4. **Per-pane theming** — Color-code prod vs dev, highlight active agent panes, theme by project. A long-standing tmux gap.
@@ -210,7 +210,7 @@ The daemon auto-exits when the last session is destroyed (configurable, with a 5
    │ • shux (TUI attach) │  │ • status-bar (bundled)   │
    │ • shux <subcommand> │  │ • theme-pack (bundled)   │
    │ • Python SDK        │  │ • diagnostics (bundled)  │
-   │ • Node SDK          │  │ • session-persist (v1.x)  │
+   │ • Node SDK          │  │ • replay (1st-party)     │
    │ • Any JSON-RPC      │  │ • mcp-server (1st-party) │
    │   client            │  │ • floating-panes (1st-p.)│
    └─────────────────────┘  │ • session-replay (1st-p.)│
@@ -467,7 +467,7 @@ These are the features that make shux a usable daily-driver multiplexer AND a ca
 | Feature | Implementation |
 |---------|----------------|
 | **Floating panes** | First-party plugin. Overlay layer on layout engine. Scratch terminals, popups, inline help. |
-| **Session persistence** | First-party plugin. Save/restore session graph across reboots (Zellij-style: serialize as layout files every 1s, "Press ENTER to run..." on restore for safety). |
+| **Session persistence** | Core (issue #329). The daemon saves its workspace continuously under `$XDG_STATE_HOME/shux` and restores it on its next start — after a crash, `kill -9`, a reboot, `daemon stop` or `daemon upgrade --force`: sessions, windows, the exact split layout, titles, focus, and a fresh shell in each pane's last directory. Programs are not re-run (program resume is #322), scrollback is not kept (#330). `daemon stop --discard` forgets it; `[restore] workspace = false` turns it off. |
 | **MCP server** | First-party plugin. Exposes shux operations as MCP tools for Claude Code, Codex, Gemini CLI. |
 | **Session replay** | First-party plugin. Records events + PTY output. Replay UX to rewind any pane to any point (inspired by cy). |
 | **Python SDK** | Generated from API schema. High-level helpers for ensure/watch/capture. |
@@ -498,7 +498,7 @@ The plugin system is shux's primary differentiator. It must be so good that the 
 
 ### 7.1 Design goals
 
-1. **Plugins are first-class**: Bundled v1.0 plugins (status-bar, theme-pack, diagnostics) and first-party v1.x plugins (session-persist, MCP, replay) prove the plugin API by using it. If a first-party plugin can't do something, the API is incomplete.
+1. **Plugins are first-class**: Bundled v1.0 plugins (status-bar, theme-pack, diagnostics) and first-party v1.x plugins (MCP, replay) prove the plugin API by using it. If a first-party plugin can't do something, the API is incomplete.
 2. **Safe by default**: Wasm sandbox + capability-based permissions via WASI + `ResourceLimiter`. A theme plugin cannot read your filesystem. A status-bar plugin cannot send network requests (unless granted).
 3. **Hot reloadable**: Enable/disable/reload at runtime. Wasm: drop `Store`, re-instantiate from new `.wasm` file. Process: kill and restart. State is reconstructed from persistent metadata, not in-memory continuity.
 4. **Language-agnostic**: Wasm plugins work from Rust (excellent), Go/TinyGo (good), C/C++ (good), Python/componentize-py (experimental), JS/componentize-js (experimental). Process plugins work from any language with stdin/stdout.
@@ -1550,7 +1550,7 @@ At client attach time, build a `ClientCaps` struct:
 ### 14.2 Reliability
 
 - **Crash-safe design**: Startup IS recovery — the daemon must function correctly after an unclean exit with no special recovery mode. However, the daemon also supports **best-effort graceful shutdown** (`SIGTERM` → `CancellationToken` → subsystem drain → exit) to cleanly notify plugins and flush logs. The graceful path is an optimization, not a correctness requirement.
-- **Session-persist plugin (v1.x)**: Serializes session graph every 1 second as a TOML layout file. On restart, offers to restore (Zellij pattern: "Press ENTER to run..." for safety).
+- **Workspace restore (#329)**: the daemon saves its workspace within a second of each change, and before it acknowledges a close; the next daemon restores it before it serves anyone. A workspace it cannot trust is set aside, never half-restored, and no state problem keeps a daemon from starting.
 - **Plugin isolation**: Crashing plugins are disabled and reported, never stalling the daemon.
 - **Client reaping**: Misbehaving clients (slow readers, abandoned connections) are reaped with timeouts.
 
@@ -1738,7 +1738,7 @@ At client attach time, build a `ClientCaps` struct:
 | Priority | Feature | Implementation |
 |----------|---------|----------------|
 | P1 | Floating panes | First-party plugin (overlay layer) |
-| P1 | Session persistence | First-party plugin (Zellij-style layout serialization) |
+| P1 | Session persistence | Core: workspace restore (#329); program resume (#322) and scrollback (#330) follow |
 | P1 | MCP server | First-party plugin (expose shux as MCP tools for Claude Code et al) |
 | P1 | Session replay | First-party plugin (event recording + rewind UX) |
 | P1 | Python + Node SDKs | Generated from API schema |
