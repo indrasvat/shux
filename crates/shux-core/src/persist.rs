@@ -993,7 +993,7 @@ mod tests {
             for (at, byte, kind) in edits {
                 let at = at.min(b.len().saturating_sub(1));
                 match kind {
-                    0 => b[at] = byte,
+                    0 if !b.is_empty() => b[at] = byte,
                     1 if !b.is_empty() => {
                         b.remove(at);
                     }

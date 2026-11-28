@@ -639,10 +639,8 @@ async fn discard_workspace(socket: &Path, format: cli::OutputFormat) -> anyhow::
 
 /// SIGTERM daemon `p` and wait for it to go: whether it went.
 pub(crate) fn stop_and_wait(p: u32, socket: &Path) -> bool {
-    // SIGTERM → the daemon's signal handler runs a graceful shutdown. A
-    // stopped process takes none until it runs again.
+    // SIGTERM → the daemon's signal handler runs a graceful shutdown.
     let pid = nix::unistd::Pid::from_raw(p as i32);
-    let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGCONT);
     let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
     // Identity, not `kill(pid, 0)`: an exited daemon stays a zombie until
     // its parent reaps it, which a subreaper may never do.
