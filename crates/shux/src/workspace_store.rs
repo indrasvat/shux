@@ -138,6 +138,9 @@ pub struct Store {
     /// Every removal fails, as in a directory gone read-only.
     #[cfg(test)]
     pub(crate) fail_removes: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The poison marker cannot be written either.
+    #[cfg(test)]
+    pub(crate) fail_marks: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Store {
@@ -180,6 +183,8 @@ impl Store {
             fail_writes: Default::default(),
             #[cfg(test)]
             fail_removes: Default::default(),
+            #[cfg(test)]
+            fail_marks: Default::default(),
         };
         store
             .replace(OWNER, std::process::id().to_string().as_bytes())
@@ -248,6 +253,10 @@ impl Store {
     /// The workspace could be neither saved nor deleted after a close: the
     /// next start must not restore it.
     pub fn mark_poisoned(&self) -> io::Result<()> {
+        #[cfg(test)]
+        if self.fail_marks.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(io::Error::from_raw_os_error(libc::EROFS));
+        }
         self.replace(POISONED, b"1")
     }
 

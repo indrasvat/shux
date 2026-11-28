@@ -50,7 +50,7 @@ enum Msg {
     /// Make the graph as a close leaves it durable, before the close commits.
     Close {
         after: Arc<SessionGraphSnapshot>,
-        done: oneshot::Sender<()>,
+        done: oneshot::Sender<Result<(), String>>,
     },
     Seal {
         snapshot: Arc<SessionGraphSnapshot>,
@@ -79,7 +79,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 /// This boot of the machine: a process recorded under another boot is not
 /// the process now holding its pid, whatever its start time says.
-pub(crate) fn boot_id() -> Option<String> {
+fn boot_id() -> Option<String> {
     static BOOT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     BOOT.get_or_init(read_boot_id).clone()
 }
@@ -111,6 +111,17 @@ fn read_boot_id() -> Option<String> {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn read_boot_id() -> Option<String> {
     None
+}
+
+/// End the group of a shell a killed daemon left running. Only one proven to
+/// be that shell: this boot, its leader alive with the same start. A leader
+/// that has gone proves nothing about whoever holds its group id now.
+pub(crate) async fn reap_orphan(process: &ProcessId) {
+    if still_running(process)
+        && let Ok(pgid) = u32::try_from(process.pid)
+    {
+        let _ = crate::lens_scratch::kill_pgid_lens_sequence(pgid, process.start_token).await;
+    }
 }
 
 /// `process` is still the shell it was recorded as: this boot, same start.
@@ -192,11 +203,9 @@ impl Persist {
     /// that is running is kept: a pane created after `snapshot` was taken
     /// may already have one.
     pub fn retain_panes(&self, snapshot: &SessionGraphSnapshot) {
-        let mut extras = lock(&self.0.extras);
-        extras.retain(|p, e| {
+        lock(&self.0.extras).retain(|p, e| {
             snapshot.panes.contains_key(p) || e.process.as_ref().is_some_and(still_running)
         });
-        lock(&self.0.admitted).retain(|p| extras.contains_key(p) || snapshot.panes.contains_key(p));
     }
 
     /// Every pane's shell, to sample.
@@ -233,20 +242,21 @@ impl Persist {
 }
 
 /// Every close is saved, as the graph will be after it, before it commits.
-/// A close is never refused for a storage error: if it cannot be saved, the
-/// saved workspace is deleted instead.
+/// One that cannot be saved deletes the saved workspace, or failing that
+/// marks it poisoned; only when neither works is the close refused.
 impl Durability for Persist {
     fn close(
         &self,
         after: Arc<SessionGraphSnapshot>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>> {
         Box::pin(async move {
-            let Some(tx) = &self.0.tx else { return };
+            let Some(tx) = &self.0.tx else { return Ok(()) };
             let (done, saved) = oneshot::channel();
-            if tx.send(Msg::Close { after, done }).is_ok() {
+            if tx.send(Msg::Close { after, done }).is_err() {
                 // A writer that has gone (sealed) saves nothing more anyway.
-                let _ = saved.await;
+                return Ok(());
             }
+            saved.await.unwrap_or(Ok(()))
         })
     }
 }
@@ -283,19 +293,18 @@ async fn blocking(
 impl Writer {
     /// The workspace `snapshot` makes. A pane is saved only once its shell
     /// has started (or it was restored): a create or split rolled back for a
-    /// failed spawn is never on disk to come back. `sealed` leaves shells out:
-    /// an orderly stop ends every one of them.
-    fn bytes_for(&self, snapshot: &SessionGraphSnapshot, sealed: bool) -> Vec<u8> {
+    /// failed spawn is never on disk to come back. Shells stay recorded even
+    /// in the final save: a daemon killed before it ends them leaves them to
+    /// be reaped.
+    fn bytes_for(&self, snapshot: &SessionGraphSnapshot) -> Vec<u8> {
         let shared = &self.shared;
-        let extras = |p: PaneId| {
-            let mut e = lock(&shared.extras).get(&p).cloned().unwrap_or_default();
-            if sealed {
-                e.process = None;
-            }
-            e
-        };
+        let extras = |p: PaneId| lock(&shared.extras).get(&p).cloned().unwrap_or_default();
         let provisional: Vec<PaneId> = {
-            let admitted = lock(&shared.admitted);
+            let mut admitted = lock(&shared.admitted);
+            // Read under the lock: a pane is in the graph before it is
+            // admitted, so none admitted by now is missing from `live`.
+            let live = self.state.load();
+            admitted.retain(|p| live.panes.contains_key(p) || snapshot.panes.contains_key(p));
             snapshot
                 .panes
                 .keys()
@@ -315,8 +324,17 @@ impl Writer {
         persist::encode(&ws)
     }
 
-    /// Save `snapshot`; `Err` leaves the previous file in place.
-    async fn save(&mut self, snapshot: &SessionGraphSnapshot, sealed: bool) -> std::io::Result<()> {
+    /// Save `snapshot`; `Err` leaves the previous file in place. A finished
+    /// restore is recorded whether or not the save works.
+    async fn save(&mut self, snapshot: &SessionGraphSnapshot) -> std::io::Result<()> {
+        let saved = self.write(snapshot).await;
+        if self.clear_marker && blocking(&self.store, Store::clear_restoring).await.is_ok() {
+            self.clear_marker = false;
+        }
+        saved
+    }
+
+    async fn write(&mut self, snapshot: &SessionGraphSnapshot) -> std::io::Result<()> {
         if snapshot.version < self.floor {
             // A close is durable that this graph has not committed yet.
             return Ok(());
@@ -329,7 +347,7 @@ impl Writer {
             .await?;
             self.poisoned = false;
         }
-        let bytes = self.bytes_for(snapshot, sealed);
+        let bytes = self.bytes_for(snapshot);
         if bytes.len() > self.max_bytes {
             return Err(std::io::Error::other(format!(
                 "the workspace is {} bytes, over the {} a restore reads",
@@ -342,9 +360,6 @@ impl Writer {
             blocking(&self.store, move |s| s.write_workspace(&written)).await?;
             self.last = Some(bytes);
             lock(&self.shared.status).writes += 1;
-        }
-        if self.clear_marker && blocking(&self.store, Store::clear_restoring).await.is_ok() {
-            self.clear_marker = false;
         }
         let mut st = lock(&self.shared.status);
         st.durable_version = snapshot.version;
@@ -365,22 +380,33 @@ impl Writer {
     /// A close that could not be saved: delete the saved workspace, so the
     /// next start restores nothing rather than the closed thing. If even that
     /// fails, mark it poisoned on disk, so the next start sets it aside.
-    async fn forget(&mut self, e: &std::io::Error) {
+    /// `Err` when neither worked: the close must not happen.
+    async fn forget(&mut self, e: &std::io::Error) -> Result<(), String> {
         self.fail(e);
         self.last = None;
         let Err(e2) = blocking(&self.store, Store::remove_workspace).await else {
-            return;
+            return Ok(());
         };
         self.poisoned = true;
         let marked = blocking(&self.store, Store::mark_poisoned).await;
         tracing::error!("workspace: could not delete it after a failed save either: {e2}");
-        let mut st = lock(&self.shared.status);
-        st.reason = Some(match marked {
-            Ok(()) => format!(
-                "cannot save ({e}) or delete ({e2}) the workspace; the next start sets it aside"
+        let (reason, out) = match marked {
+            Ok(()) => (
+                format!(
+                    "cannot save ({e}) or delete ({e2}) the workspace; the next start sets it aside"
+                ),
+                Ok(()),
             ),
-            Err(e3) => format!("cannot save ({e}), delete ({e2}) or mark ({e3}) the workspace"),
-        });
+            Err(e3) => {
+                let why = format!(
+                    "cannot save ({e}), delete ({e2}) or mark ({e3}) the workspace in {}",
+                    self.store.dir().display()
+                );
+                (why.clone(), Err(why))
+            }
+        };
+        lock(&self.shared.status).reason = Some(reason);
+        out
     }
 
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<Msg>, commits: watch::Receiver<u64>) {
@@ -400,16 +426,19 @@ impl Writer {
                 msg = rx.recv() => match msg {
                     None => return,
                     Some(Msg::Close { after, done }) => {
-                        self.floor = self.floor.max(after.version);
-                        if let Err(e) = self.save(&after, false).await {
-                            self.forget(&e).await;
+                        let out = match self.save(&after).await {
+                            Ok(()) => Ok(()),
+                            Err(e) => self.forget(&e).await,
+                        };
+                        if out.is_ok() {
+                            self.floor = self.floor.max(after.version);
                         }
-                        let _ = done.send(());
+                        let _ = done.send(out);
                     }
                     Some(Msg::Seal { snapshot, done }) => {
                         // An orderly stop, even one mid-restore, is not a crash.
                         self.clear_marker = true;
-                        if let Err(e) = self.save(&snapshot, true).await {
+                        if let Err(e) = self.save(&snapshot).await {
                             self.fail(&e);
                         }
                         let _ = done.send(());
@@ -436,7 +465,7 @@ impl Writer {
                     let snap = self.state.load_full();
                     // A marker that would not clear is tried again with the
                     // next save, never by holding saves back.
-                    match self.save(&snap, false).await {
+                    match self.save(&snap).await {
                         Ok(()) => {
                             first_dirty = None;
                             retry = Duration::ZERO;
@@ -583,9 +612,14 @@ fn read(store: &Store, socket: &str) -> Result<Option<(Restored, u32)>, Unreadab
     let stuck = |what: &str, e: &dyn std::fmt::Display| Unreadable::Stuck(format!("{what}: {e}"));
     let bytes = match store.read_workspace(persist::MAX_FILE_BYTES) {
         Ok(None) => {
+            // Markers outlive the file they were about only if a removal
+            // failed after the unlink; left, they would refuse the next one.
             store
                 .clear_restoring()
                 .map_err(|e| stuck("cannot clear the restore marker", &e))?;
+            store
+                .clear_poisoned()
+                .map_err(|e| stuck("cannot clear the poison marker", &e))?;
             return Ok(None);
         }
         Ok(Some(b)) => b,
@@ -847,19 +881,11 @@ pub(crate) async fn restore_panes(
     ready: tokio::sync::watch::Sender<bool>,
 ) {
     let persist = io_state.lock().await.persist.clone();
-    // Only a shell of this boot: across a reboot, a pid and start time can
-    // belong to some other process.
     let orphans: Vec<_> = panes
         .iter()
         .filter_map(|(p, _)| persist.extras(*p).process.map(|pr| (*p, pr)))
-        .filter(|(_, pr)| boot_id().is_some_and(|b| b == pr.boot))
         .collect();
-    futures::future::join_all(orphans.iter().map(|(_, pr)| async move {
-        if let Ok(pgid) = u32::try_from(pr.pid) {
-            let _ = crate::lens_scratch::kill_pgid_lens_sequence(pgid, pr.start_token).await;
-        }
-    }))
-    .await;
+    futures::future::join_all(orphans.iter().map(|(_, pr)| reap_orphan(pr))).await;
     for (p, _) in &orphans {
         persist.update(*p, |e| e.process = None);
     }
@@ -902,14 +928,22 @@ pub(crate) async fn save_before_teardown(
 ) {
     let persist = io_state.lock().await.persist.clone();
     if persist.is_enabled() {
-        let sealed = graph.seal().await.unwrap_or_else(|| graph.snapshot());
-        if tokio::time::timeout(Duration::from_secs(1), sample_cwds(io_state, graph))
-            .await
-            .is_err()
-        {
-            tracing::warn!("workspace: the last cwd sample did not finish in time");
+        // A close stuck on a disk holds the graph: waiting for the seal
+        // must not keep the daemon from stopping. The close was never
+        // acknowledged, so its session is still on disk and still here.
+        match tokio::time::timeout(Duration::from_secs(3), graph.seal()).await {
+            Ok(sealed) => {
+                let sealed = sealed.unwrap_or_else(|| graph.snapshot());
+                if tokio::time::timeout(Duration::from_secs(1), sample_cwds(io_state, graph))
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!("workspace: the last cwd sample did not finish in time");
+                }
+                persist.seal(sealed, Duration::from_secs(3)).await;
+            }
+            Err(_) => tracing::warn!("workspace: a close did not finish; no final save"),
         }
-        persist.seal(sealed, Duration::from_secs(3)).await;
     }
     io_state.lock().await.end_panes();
 }
@@ -919,6 +953,7 @@ mod tests {
     use super::*;
     use shux_core::graph::GraphHandle;
     use shux_core::model::SessionId;
+    use std::sync::atomic::AtomicBool;
 
     /// Saves happen only when a test asks for one (a close, a seal).
     const NEVER: (Duration, Duration) = (Duration::from_secs(3600), Duration::from_secs(3600));
@@ -933,6 +968,7 @@ mod tests {
         persist: Persist,
         fail_writes: Arc<std::sync::atomic::AtomicBool>,
         fail_removes: Arc<std::sync::atomic::AtomicBool>,
+        fail_marks: Arc<std::sync::atomic::AtomicBool>,
     }
 
     async fn rig(sessions: &[&str], timing: (Duration, Duration), max_bytes: usize) -> Rig {
@@ -940,7 +976,11 @@ mod tests {
         let state = root.path().join("shux");
         let boot = boot_at(&state, Path::new("/sock")).await.unwrap();
         let store = &boot.owned.as_ref().unwrap().0;
-        let (fail_writes, fail_removes) = (store.fail_writes.clone(), store.fail_removes.clone());
+        let (fail_writes, fail_removes, fail_marks) = (
+            store.fail_writes.clone(),
+            store.fail_removes.clone(),
+            store.fail_marks.clone(),
+        );
         let (g, snap) = SessionGraph::new();
         let persist = boot.start_with(&g, snap.clone(), HashMap::new(), (timing, max_bytes));
         let (tx, rx) = mpsc::channel(16);
@@ -974,7 +1014,12 @@ mod tests {
             persist,
             fail_writes,
             fail_removes,
+            fail_marks,
         }
+    }
+
+    fn fail(flag: &AtomicBool) {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn saved(r: &Rig) -> String {
@@ -1282,5 +1327,176 @@ mod tests {
             Err(BootError::Held { holder }) => assert_eq!(holder, std::process::id().to_string()),
             Ok(_) => panic!("started while another daemon owns the workspace"),
         }
+    }
+
+    /// A close nothing durable can be recorded for (the workspace can be
+    /// neither saved, deleted nor marked) is refused: done, a restart would
+    /// bring it back.
+    #[tokio::test]
+    async fn a_close_nothing_can_record_is_refused() {
+        let r = rig(&["doomed", "kept", "x"], NEVER, ANY_SIZE).await;
+        r.graph
+            .destroy_session(session(&r, "x"), None)
+            .await
+            .unwrap();
+        fail(&r.fail_writes);
+        fail(&r.fail_removes);
+        fail(&r.fail_marks);
+        let refused = r.graph.destroy_session(session(&r, "doomed"), None).await;
+        assert!(
+            matches!(refused, Err(shux_core::graph::GraphError::NotDurable(_))),
+            "{refused:?}"
+        );
+        assert!(r.graph.snapshot().find_session_by_name("doomed").is_some());
+        assert!(saved(&r).contains("doomed"));
+    }
+
+    /// A close stuck on a disk does not keep the daemon from stopping.
+    #[tokio::test(start_paused = true)]
+    async fn a_close_stuck_on_disk_does_not_hold_up_shutdown() {
+        struct Stuck(Arc<tokio::sync::Notify>);
+        impl Durability for Stuck {
+            fn close(
+                &self,
+                _: Arc<SessionGraphSnapshot>,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>>
+            {
+                self.0.notify_one();
+                Box::pin(std::future::pending())
+            }
+        }
+        let r = rig(&[], NEVER, ANY_SIZE).await;
+        let (g, snap) = SessionGraph::new();
+        let id = g.create_session("s".into(), "/".into()).unwrap();
+        let (tx, rx) = mpsc::channel(16);
+        let called = Arc::new(tokio::sync::Notify::new());
+        tokio::spawn(shux_core::graph::run_graph_loop_durable(
+            g,
+            rx,
+            tokio_util::sync::CancellationToken::new(),
+            Some(Arc::new(Stuck(called.clone()))),
+        ));
+        let graph = GraphHandle::new(tx, snap);
+        tokio::spawn({
+            let graph = graph.clone();
+            async move { graph.destroy_session(id, None).await }
+        });
+        called.notified().await;
+
+        let io = Arc::new(tokio::sync::Mutex::new(
+            crate::pane_io::PaneIoState::new().with_persist(r.persist.clone()),
+        ));
+        tokio::time::timeout(Duration::from_secs(600), save_before_teardown(&io, &graph))
+            .await
+            .expect("shutdown waited for a close that never finishes");
+    }
+
+    /// The final save keeps every shell's identity: a daemon killed after it
+    /// and before it ends them leaves them for the next one to reap.
+    #[tokio::test]
+    async fn the_final_save_keeps_its_shells() {
+        let r = rig(&["s"], NEVER, ANY_SIZE).await;
+        let sealed = r.graph.seal().await.expect("sealed");
+        r.persist.seal(sealed, Duration::from_secs(5)).await;
+        let ws = persist::decode(saved(&r).as_bytes(), "/sock").expect("saved");
+        let pane = &ws.sessions[0].windows[0].panes[0];
+        assert_eq!(
+            pane.process.as_ref().map(|p| p.pid),
+            Some(std::process::id() as i32)
+        );
+    }
+
+    /// A poison marker whose workspace has gone refuses nothing: the next
+    /// workspace saved is restored, not set aside.
+    #[tokio::test]
+    async fn a_poison_marker_without_a_workspace_refuses_nothing() {
+        let r = rig(&[], NEVER, ANY_SIZE).await;
+        let sealed = r.graph.seal().await.expect("sealed");
+        r.persist.seal(sealed, Duration::from_secs(5)).await;
+        std::fs::remove_file(&r.file).unwrap();
+        std::fs::write(r.file.with_file_name("poisoned"), "1").unwrap();
+
+        // A daemon starts with no workspace and that marker, and saves one.
+        let boot = boot_at(&r.state, Path::new("/sock")).await.unwrap();
+        let (g, snap) = SessionGraph::new();
+        let persist = boot.start_with(&g, snap, HashMap::new(), (NEVER, ANY_SIZE));
+        g.create_session("s".into(), "/".into()).unwrap();
+        let pane = *g.current().panes.keys().next().unwrap();
+        persist.note_process(pane, std::process::id());
+        persist.seal(g.current(), Duration::from_secs(5)).await;
+
+        let next = boot_at(&r.state, Path::new("/sock")).await.unwrap();
+        let q = next.owned.as_ref().unwrap().1.quarantined.clone();
+        assert!(next.restored.is_some(), "set aside as {q:?}");
+    }
+
+    /// A restore that finished is recorded even when the save after it
+    /// fails: a stop on a full disk is not a crash during restore.
+    #[tokio::test]
+    async fn a_finished_restore_is_recorded_when_the_save_fails() {
+        let r = rig(&["s"], NEVER, ANY_SIZE).await;
+        let marker = r.file.with_file_name("restoring");
+        std::fs::write(&marker, "1").unwrap();
+        r.persist.restore_finished();
+        fail(&r.fail_writes);
+        r.graph
+            .rename_session(session(&r, "s"), "t".into(), None)
+            .await
+            .unwrap();
+        let sealed = r.graph.seal().await.expect("sealed");
+        r.persist.seal(sealed, Duration::from_secs(5)).await;
+        assert!(
+            !marker.exists(),
+            "a finished restore still counts as crashed"
+        );
+    }
+
+    /// A pane whose shell starts while the cwd sampler works from an older
+    /// graph is still saved.
+    #[tokio::test]
+    async fn a_pane_started_while_the_sampler_ran_is_still_saved() {
+        let r = rig(&[], NEVER, ANY_SIZE).await;
+        let before = r.graph.snapshot();
+        r.graph
+            .create_session("late".into(), "/".into())
+            .await
+            .unwrap();
+        let pane = *r.graph.snapshot().panes.keys().next().unwrap();
+        // A shell that has already exited: no identity to keep it by.
+        let mut gone = std::process::Command::new("true").spawn().unwrap();
+        let pid = gone.id();
+        gone.wait().unwrap();
+        r.persist.note_process(pane, pid);
+        r.persist.retain_panes(&before);
+        let sealed = r.graph.seal().await.expect("sealed");
+        r.persist.seal(sealed, Duration::from_secs(5)).await;
+        assert!(saved(&r).contains("late"), "{}", saved(&r));
+    }
+
+    /// A saved shell whose leader has gone is not reaped: its group id may
+    /// name someone else's group by now.
+    #[tokio::test]
+    async fn a_group_whose_leader_has_gone_is_not_signalled() {
+        use std::os::unix::process::CommandExt;
+        let mut leader = std::process::Command::new("sh")
+            .args(["-c", "sleep 600 & exit 0"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = leader.id() as i32;
+        leader.wait().unwrap();
+        let group = nix::unistd::Pid::from_raw(pgid);
+        reap_orphan(&ProcessId {
+            pid: pgid,
+            start_token: 1,
+            boot: boot_id().unwrap(),
+        })
+        .await;
+        let alive = nix::sys::signal::killpg(group, None).is_ok();
+        let _ = nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL);
+        assert!(
+            alive,
+            "signalled a group its leader no longer proves is ours"
+        );
     }
 }

@@ -64,7 +64,7 @@ pub struct Router {
 
 /// How long a call waits for [`Router::wait_until_ready`]'s signal before it
 /// is served anyway.
-const READY_PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
+pub const READY_PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The top-level parameters a method accepts. Any other key is refused before
 /// the handler runs, so a newer client's field never reaches a daemon that

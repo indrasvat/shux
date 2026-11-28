@@ -108,6 +108,11 @@ pub enum GraphError {
     #[error("graph loop shut down")]
     Shutdown,
 
+    /// A close refused because nothing durable could be recorded: done, a
+    /// restart would bring the closed thing back.
+    #[error("the close could not be saved, so it was not done: {0}")]
+    NotDurable(String),
+
     /// Refused before anything changed: the daemon is retiring.
     #[error("this daemon is retiring and takes no new session")]
     Retired,
@@ -2712,7 +2717,10 @@ async fn durable_close(
     if let Some(durability) = durability {
         let (preview, _) = SessionGraph::from_snapshot((*graph.current()).clone(), None);
         close(&preview)?;
-        durability.close(preview.current()).await;
+        durability
+            .close(preview.current())
+            .await
+            .map_err(GraphError::NotDurable)?;
     }
     close(graph)
 }
@@ -2851,11 +2859,12 @@ pub async fn run_graph_loop_durable(
 /// must never let a saved workspace bring back what a user closed.
 pub trait Durability: Send + Sync {
     /// Make `after` (the graph exactly as a valid close will leave it) durable.
-    /// The graph task waits for this, then commits the close.
+    /// The graph task waits for this, then commits the close; `Err` refuses
+    /// it, when nothing durable could be recorded.
     fn close(
         &self,
         after: Arc<SessionGraphSnapshot>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>>;
 }
 
 /// A cloneable handle for sending commands to the SessionGraph.
@@ -3523,7 +3532,8 @@ mod tests {
         fn close(
             &self,
             after: Arc<SessionGraphSnapshot>,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>>
+        {
             let live = self
                 .live
                 .lock()
@@ -3534,7 +3544,7 @@ mod tests {
                 .sessions
                 .len();
             self.seen.lock().unwrap().push((after.sessions.len(), live));
-            Box::pin(async {})
+            Box::pin(async { Ok(()) })
         }
     }
 

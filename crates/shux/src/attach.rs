@@ -637,6 +637,17 @@ async fn serve_connection(
     // A watcher starts nothing: it shows what is there.
     if !read_only {
         // A pane a restore owns gets its shell there, in its last directory.
+        // Not ready until it has: input sent before would have no writer.
+        let restoring = {
+            let state = io_state.lock().await;
+            (!state.writers.contains_key(&session.active_pane_id)
+                && state.awaiting_restore.contains(&session.active_pane_id))
+            .then(|| state.restore_ready.clone())
+        };
+        if let Some(mut ready) = restoring {
+            let _ = tokio::time::timeout(shux_rpc::router::READY_PATIENCE, ready.wait_for(|r| *r))
+                .await;
+        }
         let writer_present = {
             let state = io_state.lock().await;
             state.writers.contains_key(&session.active_pane_id)
@@ -7067,6 +7078,97 @@ mod tests {
         .expect("zoomed mouse noop");
         assert_eq!(session.lock().await.active_pane_id, before);
 
+        fixture.stop();
+    }
+
+    /// An attach to a pane whose shell a restore is still starting is ready
+    /// only once that shell is there: what is typed at once reaches it.
+    #[tokio::test]
+    async fn an_attach_to_a_pane_being_restored_waits_for_its_shell() {
+        let fixture = attach_fixture().await;
+        let pane = fixture.first_pane;
+        let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
+        {
+            let mut io = fixture.io_state.lock().await;
+            io.awaiting_restore.insert(pane);
+            io.restore_ready = ready_rx;
+        }
+        // The restore, finishing once the attach waits for it.
+        let restore = tokio::spawn({
+            let io = fixture.io_state.clone();
+            async move {
+                shux_testkit::wait_until_async("the attach to wait for the restore", || {
+                    let waiting = ready_tx.receiver_count() > 1;
+                    async move { waiting }
+                })
+                .await;
+                let (writer_rx, _, _) = seed_io_for_pane(&io, pane).await;
+                io.lock().await.awaiting_restore.remove(&pane);
+                ready_tx.send_replace(true);
+                writer_rx
+            }
+        });
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = ConfigHandle::load_or_default(&temp.path().join("missing.toml"));
+        let onboarding = crate::onboarding::OnboardingHandle::from_state_for_test(
+            crate::onboarding::OnboardingState {
+                prefix_discovered: true,
+                welcome_toast_seen: true,
+            },
+        );
+        let (server_stream, client_stream) = UnixStream::pair().expect("unix pair");
+        tokio::spawn(handle_attach_connection(
+            server_stream,
+            fixture.graph.clone(),
+            fixture.io_state.clone(),
+            config,
+            SegmentCache::new(),
+            crate::session_meta::SessionMetaCache::new(),
+            onboarding,
+            std::time::Instant::now(),
+            fixture.cancel.child_token(),
+        ));
+        let mut framed = Framed::new(client_stream, create_codec());
+        let hello = AttachHello {
+            protocol: ATTACH_PROTOCOL_VERSION,
+            session_name: Some(fixture.attached.name.clone()),
+            cols: 90,
+            rows: 24,
+            client_version: "test".to_string(),
+            graphics: false,
+            plain: false,
+            read_only: false,
+            no_color: false,
+        };
+        framed
+            .send(Bytes::from(serde_json::to_vec(&hello).expect("hello json")))
+            .await
+            .expect("send hello");
+        let ready = tokio::time::timeout(shux_testkit::BUDGET, framed.next())
+            .await
+            .expect("ready timeout")
+            .expect("ready frame")
+            .expect("ready bytes");
+        assert!(matches!(
+            serde_json::from_slice(&ready).expect("ready json"),
+            AttachReady::Ok { .. }
+        ));
+        framed
+            .send(Bytes::from(
+                serde_json::to_vec(&AttachClientFrame::Input {
+                    data: BASE64.encode(b"ls\n"),
+                })
+                .expect("input json"),
+            ))
+            .await
+            .expect("send input");
+        let mut writer_rx = restore.await.expect("the restore");
+        let written = tokio::time::timeout(shux_testkit::BUDGET, writer_rx.recv())
+            .await
+            .expect("typed at once, lost")
+            .expect("writer bytes");
+        assert_eq!(written, b"ls\n");
         fixture.stop();
     }
 

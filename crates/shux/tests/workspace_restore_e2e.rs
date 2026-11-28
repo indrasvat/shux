@@ -427,10 +427,19 @@ fn a_read_only_state_dir_never_resurrects_a_close() {
     let dir = server_dir(&env).expect("a server dir");
     let mode = |m| std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(m));
     mode(0o500).unwrap();
+    // Nothing durable can be recorded: refused, saying where.
+    let refused = env.run(&["session", "kill", "doomed"]);
+    mode(0o700).unwrap();
+    let said = String::from_utf8_lossy(&refused.stdout).into_owned()
+        + &String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        !refused.status.success() && said.contains("not done") && said.contains("servers"),
+        "{said}"
+    );
+    assert!(sessions(&env).contains(&"doomed".to_string()));
     env.ok(&["session", "kill", "doomed"]);
     kill_daemon(&env);
     let back = sessions(&env);
-    mode(0o700).unwrap();
     assert!(
         !back.contains(&"doomed".to_string()),
         "a killed session came back: {back:?}"

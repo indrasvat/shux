@@ -225,6 +225,8 @@ pub struct PaneIoState {
     /// Restored panes whose shell the restore has yet to start: no one else
     /// starts one there (an attach would, in the wrong directory).
     pub(crate) awaiting_restore: std::collections::HashSet<shux_core::model::PaneId>,
+    /// Raised once every restored pane's shell has started or failed.
+    pub(crate) restore_ready: tokio::sync::watch::Receiver<bool>,
 }
 
 /// A generation counter every attach render loop watches. A bump wakes every
@@ -300,6 +302,7 @@ impl PaneIoState {
             pane_lifetime: tokio_util::sync::CancellationToken::new(),
             pending_notices: HashMap::new(),
             awaiting_restore: Default::default(),
+            restore_ready: tokio::sync::watch::channel(true).1,
         }
     }
 

@@ -620,12 +620,9 @@ async fn discard_workspace(socket: &Path, format: cli::OutputFormat) -> anyhow::
             .iter()
             .flat_map(|s| &s.windows)
             .flat_map(|w| &w.panes)
-            .filter_map(|p| p.process.clone())
-            .filter(|p| crate::workspace::boot_id().is_some_and(|b| b == p.boot));
+            .filter_map(|p| p.process.as_ref());
         for shell in shells {
-            if let Ok(pgid) = u32::try_from(shell.pid) {
-                let _ = crate::lens_scratch::kill_pgid_lens_sequence(pgid, shell.start_token).await;
-            }
+            crate::workspace::reap_orphan(shell).await;
         }
     }
     store.discard()?;
@@ -834,12 +831,15 @@ pub(crate) async fn run_rpc_server(
             .with_shutdown(cancel.clone())
             .with_persist(persist),
     ));
-    // Before any socket binds: these panes get their shell from the restore.
-    io_state
-        .lock()
-        .await
-        .awaiting_restore
-        .extend(restored_panes.iter().map(|(p, _)| *p));
+    // Before any socket binds: these panes get their shell from the restore,
+    // and calls about panes wait for it (`Router::wait_until_ready`).
+    let (ready_tx, ready_rx) = tokio::sync::watch::channel(restored_panes.is_empty());
+    {
+        let mut io = io_state.lock().await;
+        io.awaiting_restore
+            .extend(restored_panes.iter().map(|(p, _)| *p));
+        io.restore_ready = ready_rx.clone();
+    }
     let shutdown_io_state = io_state.clone();
 
     // Lens scratch registry (§8 SPEC-E, LENS-R-040..046). One per daemon
@@ -1077,9 +1077,7 @@ pub(crate) async fn run_rpc_server(
     // `docs/designs/permissions/README.md` §9.6.
     router.assert_every_route_has_policy();
     router.assert_every_route_declares_params();
-    // Calls about panes wait until every restored pane's shell has started:
-    // over the socket and from plugins alike.
-    let (ready_tx, ready_rx) = tokio::sync::watch::channel(restored_panes.is_empty());
+    // Over the socket and from plugins alike.
     let router = router.wait_until_ready(ready_rx);
 
     tokio::spawn(rpc::daemon::retire_when_idle(
